@@ -71,6 +71,7 @@ mod url_normalizer;
 mod utils;
 mod visitor;
 mod workspace_resolver;
+mod wrapper_call_join;
 mod wrapper_dispatch;
 mod wrapper_request_shape;
 

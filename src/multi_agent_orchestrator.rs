@@ -94,6 +94,10 @@ impl MultiAgentOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
+        // The one module resolver for this service
+        // (`engine::service_module_index`, carrick#1416), read by the passes
+        // that resolve a call's specifier after the model has answered.
+        service_modules: &crate::workspace_resolver::WorkspaceIndex,
         // The warm type sidecar for this service, when one is up: the
         // deterministic layer asks it what a bare `x.verb("/lit", arg)` site's
         // receiver is (carrick#695).
@@ -141,6 +145,7 @@ impl MultiAgentOrchestrator {
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
+                service_modules,
                 sidecar,
             )
             .await?;

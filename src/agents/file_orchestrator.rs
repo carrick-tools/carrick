@@ -206,6 +206,10 @@ pub struct ProcessingStats {
     /// Consumer rows folded onto the request they belong to (carrick#1371),
     /// by the rule that decided it.
     pub consumer_row_folds: crate::consumer_row_fold::ConsumerRowFolds,
+    /// Model rows linked to the request they reach through a declaration in
+    /// another module (carrick#1403), and the rows left unclassified because
+    /// that declaration's module states the operation more than once.
+    pub wrapper_call_joins: crate::wrapper_call_join::WrapperCallJoins,
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
@@ -1036,6 +1040,15 @@ impl FileOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
+        // The one module resolver for THIS service (`engine::service_module_index`,
+        // carrick#1416): every alias the repo's config files declare — tsconfig
+        // `paths`, a Deno import map, package `imports` — plus the tsconfig
+        // `carrick.json` names for this service, which governs the files under
+        // its directory in place of the nearest config. Read by the passes that
+        // run AFTER the model and resolve a specifier to a module
+        // (carrick#1403, carrick#1384); the analyzer-input path still resolves
+        // relatively until carrick#474.
+        service_modules: &WorkspaceIndex,
         // The warm type sidecar for THIS service, when one is up. Read once,
         // before the model pass, to answer what the receiver of a bare
         // `x.verb("/lit", arg)` site is (carrick#695). `None` — no sidecar, a
@@ -2881,6 +2894,34 @@ impl FileOrchestrator {
                 stats.consumer_row_folds.enclosing_setup,
                 stats.consumer_row_folds.anchors_carried,
                 stats.consumer_row_folds.response_reads_kept
+            );
+        }
+
+        // PHASE 5e (carrick#1403): a model row at a call through a client
+        // method is not a second request. One file boundary out from the fold
+        // above: the site's callee resolves to a declaration in another
+        // module, that module states the same operation in its own source, so
+        // this row is the call THROUGH it and carries the request's own site.
+        // Runs after 5d for the same reason 5d runs late — it reads the rows'
+        // final targets — and after it, so a row the fold dropped is not
+        // linked to.
+        //
+        // Resolves through the service's own index (carrick#1416), not the
+        // repo-root one built above: a client imported by an alias this
+        // service's tsconfig declares has to reach its module, and on a repo
+        // whose specifiers are all aliased the relative-only resolver reaches
+        // nothing at all.
+        let wrapper_call_joins = crate::wrapper_call_join::join_wrapper_calls(
+            &mut file_results,
+            normalizer,
+            Some(service_modules),
+        );
+        stats.wrapper_call_joins = wrapper_call_joins;
+        if wrapper_call_joins != crate::wrapper_call_join::WrapperCallJoins::default() {
+            debug!(
+                "  - Model rows linked to the request they reach: {} (left unclassified as the \
+                 declaration states the operation twice: {})",
+                wrapper_call_joins.linked, wrapper_call_joins.ambiguous
             );
         }
 
@@ -5985,6 +6026,9 @@ impl FileOrchestrator {
                     consumers_not_resolved: None,
                     dispatch: None,
                     resolution_source: Some(ResolutionSource::SameFileWrapper),
+                    // The request is made at this site: the wrapper resolved
+                    // here states the target, so there is nothing to reach.
+                    reaches_request: None,
                 })),
             });
         }
@@ -6065,6 +6109,9 @@ impl FileOrchestrator {
             consumers_not_resolved: None,
             dispatch: None,
             resolution_source: Some(source),
+            // A row read off the site's own source IS the request; the join
+            // that links a call through a declaration never touches one.
+            reaches_request: None,
         }
     }
 
@@ -8495,7 +8542,24 @@ impl FileOrchestrator {
                         // the target. Derived HERE, where the row is built
                         // from the cached per-file answer, so it is recomputed
                         // on every scan and no cache version has to move.
-                        role: crate::mount_graph::ConsumerRole::of(data_call.resolution_source),
+                        //
+                        // A row the wrapper-call join linked (carrick#1403)
+                        // reaches a request declared in another module, which
+                        // is the same statement `imported_member` makes about
+                        // its own rows — so the link decides the role where
+                        // the source says nothing, and never overrules a
+                        // source that does.
+                        role: crate::mount_graph::ConsumerRole::of(data_call.resolution_source)
+                            .or_else(|| {
+                                data_call
+                                    .reaches_request
+                                    .as_ref()
+                                    .map(|_| crate::mount_graph::ConsumerRole::WrapperCall)
+                            }),
+                        // The request that call reaches (carrick#1402), so the
+                        // two rows of one request can be grouped rather than
+                        // counted around.
+                        reaches_request: data_call.reaches_request.clone(),
                         // The value this call sends for the field its target
                         // dispatches on (carrick#831). Read by matching, and
                         // only against a producer that dispatches.
@@ -10756,6 +10820,7 @@ export * from "./aFetch.js";"#,
                     consumers_not_resolved: None,
                     resolution_source: None,
                     dispatch: None,
+                    reaches_request: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -10811,6 +10876,7 @@ export * from "./aFetch.js";"#,
                     consumers_not_resolved: None,
                     resolution_source: source,
                     dispatch: None,
+                    reaches_request: None,
                 }
             };
 
@@ -10859,6 +10925,65 @@ export * from "./aFetch.js";"#,
             None,
             "the model's reading is not the scanner's statement about what the \
              row is, and absence is not 'this is a request'"
+        );
+    }
+
+    /// carrick#1403: the join classifies the row the model stated. A model row
+    /// the join linked to the request it reaches is a call THROUGH a
+    /// declaration — the same statement the imported-member source makes — and
+    /// the row carries the site it reaches so a reader can group the two.
+    #[test]
+    fn a_linked_model_row_is_a_wrapper_call_naming_the_request_it_reaches() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/hooks/useThings.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![DataCallResult {
+                    call_kind: None,
+                    candidate_id: "span:40".to_string(),
+                    line_number: 9,
+                    target: "/api/things".to_string(),
+                    method: Some("GET".to_string()),
+                    pattern_matched: "thingsApi.list(".to_string(),
+                    call_expression_span_start: Some(40),
+                    call_expression_span_end: Some(60),
+                    call_expression_text: None,
+                    call_expression_line: Some(9),
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    loopback_default_url: None,
+                    base: None,
+                    consumers_not_resolved: None,
+                    resolution_source: Some(ResolutionSource::Model),
+                    dispatch: None,
+                    reaches_request: Some("src/lib/things.ts:12".to_string()),
+                }],
+                ..Default::default()
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        let call = &graph.data_calls[0];
+        assert_eq!(
+            call.role,
+            Some(crate::mount_graph::ConsumerRole::WrapperCall),
+            "the scan read the declaration this site calls, so this line is \
+             not where the request is made"
+        );
+        assert_eq!(
+            call.reaches_request.as_deref(),
+            Some("src/lib/things.ts:12"),
+            "and it names the row it should be grouped with"
         );
     }
 
@@ -11003,6 +11128,7 @@ export * from "./aFetch.js";"#,
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         }
     }
 
@@ -11357,6 +11483,7 @@ export * from "./aFetch.js";"#,
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             }],
             ..Default::default()
         };
@@ -11448,6 +11575,7 @@ export * from "./aFetch.js";"#,
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         };
 
         let mut file_results = HashMap::new();
@@ -11571,6 +11699,7 @@ export * from "./aFetch.js";"#,
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         };
 
         let mut file_results = HashMap::new();
@@ -11667,6 +11796,7 @@ export * from "./aFetch.js";"#,
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -11757,6 +11887,7 @@ export * from "./aFetch.js";"#,
                         consumers_not_resolved: None,
                         resolution_source: None,
                         dispatch: None,
+                        reaches_request: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -11779,6 +11910,7 @@ export * from "./aFetch.js";"#,
                         consumers_not_resolved: None,
                         resolution_source: None,
                         dispatch: None,
+                        reaches_request: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -11838,6 +11970,7 @@ export * from "./aFetch.js";"#,
                     consumers_not_resolved: None,
                     resolution_source: None,
                     dispatch: None,
+                    reaches_request: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -11900,6 +12033,7 @@ export * from "./aFetch.js";"#,
                         consumers_not_resolved: None,
                         resolution_source: None,
                         dispatch: None,
+                        reaches_request: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -11922,6 +12056,7 @@ export * from "./aFetch.js";"#,
                         consumers_not_resolved: None,
                         resolution_source: None,
                         dispatch: None,
+                        reaches_request: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -12528,6 +12663,7 @@ export * from "./aFetch.js";"#,
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -12633,6 +12769,7 @@ export * from "./aFetch.js";"#,
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -12993,6 +13130,7 @@ export * from "./aFetch.js";"#,
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -15422,6 +15560,7 @@ export { routes };
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         }
     }
 
@@ -17313,6 +17452,7 @@ export function publishWrapped(order: OrderPlaced): void {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         }
     }
 

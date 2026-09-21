@@ -2678,6 +2678,11 @@ async fn analyze_current_repo_incremental(
             let normalizer = UrlNormalizer::new(config);
             let service_root = service_scan_root(repo_path, config);
             crate::phase_timing::mark(crate::phase_timing::Phase::Cache);
+            // One index for this service, built before the analysis and shared
+            // with the type requests below (carrick#1416): the join passes that
+            // run after the model resolve a call's specifier with the same
+            // resolver the sidecar's requests do.
+            let service_modules = service_module_index(repo_path, config);
             // Analysis runs over EVERY discovered file, cached or not: the
             // deterministic layer is re-derived from the AST on every scan and
             // only the model's answer is replayed. That is what lets a resolver
@@ -2697,6 +2702,7 @@ async fn analyze_current_repo_incremental(
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
+                    &service_modules,
                     sidecar,
                 )
                 .await?;
@@ -2825,10 +2831,9 @@ async fn analyze_current_repo_incremental(
             // Every type request below names the file a type was imported
             // from, and the specifier it was imported by is the repo's to
             // resolve: one index reads the config that governs each file
-            // (carrick#1416), built once for this service and shared by the
-            // request builders and the anchor stamp.
-            let service_modules = service_module_index(repo_path, config);
-
+            // (carrick#1416). It is the one built before the analysis above,
+            // so the join passes and the request builders resolve alike.
+            //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
             stamp_manifest_anchor_symbols(
@@ -4413,6 +4418,12 @@ fn relativize_cloud_paths(
         }
         for call in &mut graph.data_calls {
             call.file_location = repo_relative(&call.file_location, repo_path);
+            // The request a wrapper call reaches (carrick#1402) is a location
+            // in the same `"<file>:<line>"` form, written by a join that reads
+            // the scan's own paths, so it is relativized with the row's own.
+            if let Some(site) = call.reaches_request.as_mut() {
+                *site = repo_relative(site, repo_path);
+            }
         }
     }
 
@@ -6258,6 +6269,9 @@ async fn analyze_current_repo(
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
+    // One index for this service's join passes and, below, its type requests
+    // and anchor stamps (carrick#1416).
+    let service_modules = service_module_index(repo_path, config);
     enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
     let analysis_result = orchestrator
         .run_complete_analysis(
@@ -6269,6 +6283,7 @@ async fn analyze_current_repo(
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
+            &service_modules,
             sidecar,
         )
         .await?;
@@ -6351,11 +6366,9 @@ async fn analyze_current_repo(
     attach_sdk_surface(&mut cloud_data, repo_path, config);
     crate::phase_timing::mark(crate::phase_timing::Phase::Surface);
 
-    // One index for this service's type requests and anchor stamps: the
-    // specifier a type was imported by is the repo's config to resolve
-    // (carrick#1416).
-    let service_modules = service_module_index(repo_path, config);
-
+    // The type requests and anchor stamps below read the same index the
+    // analysis above was given: the specifier a type was imported by is the
+    // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
     stamp_manifest_anchor_symbols(
@@ -8118,7 +8131,10 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
-            role: None,
+            role: Some(crate::mount_graph::ConsumerRole::WrapperCall),
+            // A second location on the same row (carrick#1402), written by a
+            // join that reads the scan's own absolute paths.
+            reaches_request: Some(abs("src/lib/search-client.ts:88")),
         });
 
         let mut function_definitions = HashMap::new();
@@ -8331,6 +8347,11 @@ mod tests {
         assert_eq!(
             graph.data_calls[0].file_location,
             "src/providers/search.ts:313"
+        );
+        assert_eq!(
+            graph.data_calls[0].reaches_request.as_deref(),
+            Some("src/lib/search-client.ts:88"),
+            "the request a wrapper call reaches is a location like any other"
         );
         assert_eq!(graph.endpoints[0].file_location, "src/routes/orders.ts:18");
         assert_eq!(
@@ -8741,6 +8762,7 @@ mod tests {
                     consumers_not_resolved: None,
                     resolution_source: None,
                     dispatch: None,
+                    reaches_request: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -8788,6 +8810,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -8961,6 +8984,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -9788,6 +9812,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -9805,6 +9830,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             },
         ];
 
@@ -11089,6 +11115,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }
     }
 
@@ -11148,6 +11175,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

@@ -780,6 +780,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -922,6 +923,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }];
         sdk.mount_graph = Some(graph);
 
@@ -982,6 +984,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }];
         data.mount_graph = Some(graph);
         data

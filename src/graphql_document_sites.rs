@@ -586,16 +586,19 @@ enum Argument {
     Other,
 }
 
+/// One name an importing file binds, and where the module graph reads it from.
+/// Shared with [`crate::wrapper_call_join`], which resolves a call's callee the
+/// same way this pass resolves an argument.
 #[derive(Debug, Clone)]
-struct Import {
-    specifier: String,
+pub(crate) struct Import {
+    pub(crate) specifier: String,
     /// The name the module publishes (`default` for a default import).
-    imported: String,
+    pub(crate) imported: String,
 }
 
 /// Local name → where it was imported from. Namespace imports are left out:
 /// a `ns.Member` argument is not an identifier argument.
-fn import_table(module: &Module) -> HashMap<String, Import> {
+pub(crate) fn import_table(module: &Module) -> HashMap<String, Import> {
     let mut table = HashMap::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
@@ -889,7 +892,7 @@ pub fn is_document_expression(expr: &Expr) -> bool {
     }
 }
 
-fn unwrap_expression(expr: &Expr) -> &Expr {
+pub(crate) fn unwrap_expression(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(inner) => unwrap_expression(&inner.expr),
         Expr::TsAs(inner) => unwrap_expression(&inner.expr),
