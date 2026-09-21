@@ -10,7 +10,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { readCredential, type Credential } from "../auth/credentials.ts";
 import { signIn } from "../auth/run.ts";
 import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";

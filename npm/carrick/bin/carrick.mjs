@@ -141,8 +141,16 @@ async function keepGlobalCurrent() {
   try {
     const sync = await import("../dist/global-install.js");
     if (!sync.syncsOnThisRun(command, process.env)) return;
-    // stderr, so a `--json` answer on stdout stays parseable.
-    sync.syncGlobalInstall({ say: (line) => process.stderr.write(`carrick: ${line}\n`) });
+    // stderr throughout, so a `--json` answer on stdout stays parseable.
+    const outcome = sync.syncGlobalInstall({
+      say: (line) => process.stderr.write(`carrick: ${line}\n`),
+    });
+    // A run that is ending on an older carrick than it is says so at the END of
+    // it. In front of `carrick index` this is the first line of a log that then
+    // runs for minutes, and what it names is the state the machine is left in.
+    if (outcome.warning) {
+      process.once("exit", () => process.stderr.write(`carrick: ${outcome.warning}\n`));
+    }
   } catch {
     // An upgrade that could not even be attempted is not a failed command.
   }

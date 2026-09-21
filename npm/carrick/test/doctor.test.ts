@@ -514,6 +514,13 @@ test("doctor reports the carrick a hook here will actually run", () => {
     assert.match(stale[0]!.text, /on PATH is 0\.3\.81 and 0\.3\.84 set this workspace up/);
     assert.match(stale[0]!.text, /npm install -g carrick@0\.3\.84/);
 
+    // The other way round is a machine somebody already upgraded, so the fix is
+    // the files, not the install: naming a command there names a DOWNGRADE.
+    const ahead = checkPathVersion(dir, found("0.4.0"));
+    assert.equal(findingCount(ahead), 1, texts(ahead).join("\n"));
+    assert.match(ahead[0]!.text, /carrick init/);
+    assert.doesNotMatch(ahead[0]!.text, /install -g/);
+
     // Nothing on PATH at all is the same fault with a different fix: the hooks
     // here name a command this machine cannot resolve.
     const missing = checkPathVersion(dir, null);

@@ -63,8 +63,6 @@ export type FindOptions = {
   platform?: string;
   exists?: (target: string) => boolean;
   real?: (target: string) => string;
-  /** This package's own root, so the copy doing the looking is skipped. */
-  ours?: string;
 };
 
 function defaultExists(target: string): boolean {
@@ -83,26 +81,37 @@ function defaultReal(target: string): string {
   }
 }
 
-function inside(target: string, directory: string): boolean {
-  const slashed = (value: string): string => `${value.split(path.sep).join("/")}/`;
-  return slashed(target).startsWith(slashed(directory));
-}
-
-/** npx resolves a package into a cache tree and puts its `.bin` first on PATH. */
-function fromNpxCache(target: string): boolean {
-  return `/${target.split(path.sep).join("/")}/`.includes("/_npx/");
+function slashed(value: string): string {
+  return `/${value.split(path.sep).join("/")}/`;
 }
 
 /**
- * The `carrick` a PATH lookup finds, skipping the one doing the looking.
+ * A PATH entry that only exists while something is running, not a global.
+ *
+ * Two of them, and both are a `node_modules/.bin` directory: npx resolves a
+ * package into `_npx/<hash>/node_modules` and puts its `.bin` first, and
+ * `npm run` puts the repository's own `node_modules/.bin` there. No global bin
+ * directory is one — npm's is `<prefix>/bin`, and pnpm's, bun's and volta's are
+ * their own — so the shape of the directory is the whole test, and it holds
+ * however the package inside it is arranged.
+ *
+ * Deliberately NOT "the package this code is running from". A global install
+ * running `carrick doctor` IS the `carrick` on PATH, and skipping it would
+ * report the healthiest install shape there is as having nothing on PATH.
+ */
+function transientBin(directory: string, binary: string, resolved: string): boolean {
+  if (slashed(directory).endsWith("/node_modules/.bin/")) return true;
+  return slashed(binary).includes("/_npx/") || slashed(resolved).includes("/_npx/");
+}
+
+/**
+ * The `carrick` a PATH lookup finds, skipping what only exists during a run.
  *
  * `which carrick` cannot answer this question. npm puts the exec tree's own
  * `node_modules/.bin` at the front of PATH for the child it runs, so inside
  * `npx carrick init` a `which` says `carrick` is on PATH on a machine where it
  * is not — and `carrick init` then wrote a bare `carrick hook post-edit` into a
- * settings file, naming a command that stopped existing when npx exited. So the
- * PATH is walked here, and an entry that leads back into this package or into an
- * npx cache is not a global.
+ * settings file, naming a command that stopped existing when npx exited.
  *
  * File reads only: no `which`, no subprocess, so it costs nothing on a command
  * that runs on every edit.
@@ -111,7 +120,6 @@ export function findCarrick(options: FindOptions = {}): GlobalCarrick | null {
   const env = options.env ?? process.env;
   const exists = options.exists ?? defaultExists;
   const real = options.real ?? defaultReal;
-  const ours = options.ours ?? packageRoot();
   const raw = env["PATH"] ?? env["Path"] ?? "";
   for (const directory of raw.split(path.delimiter)) {
     if (directory === "") continue;
@@ -119,8 +127,7 @@ export function findCarrick(options: FindOptions = {}): GlobalCarrick | null {
       const binary = path.join(directory, name);
       if (!exists(binary)) continue;
       const resolved = real(binary);
-      if (fromNpxCache(binary) || fromNpxCache(resolved)) continue;
-      if (inside(resolved, ours) || inside(binary, ours)) continue;
+      if (transientBin(directory, binary, resolved)) continue;
       return { binary, real: resolved, version: null };
     }
   }
@@ -282,18 +289,33 @@ export function realMachine(env: NodeJS.ProcessEnv = process.env): GlobalMachine
   };
 }
 
-/** What a run did about the global install, for the tests and for the log. */
+/**
+ * What a run did about the global install, for the tests and for the log.
+ *
+ * `warning` is the sentence for a run that is ENDING on an older carrick than
+ * it is, and it is returned rather than said because that is where it belongs:
+ * a line printed in front of `carrick index` is the first line of a
+ * multi-minute log, and what it names is the state the machine is left in. The
+ * caller prints it last. Everything else — what is being upgraded, and that it
+ * took — is progress, and is said as it happens.
+ */
 export type SyncOutcome =
-  | { kind: "skipped"; why: string }
-  | { kind: "current"; version: string }
-  | { kind: "upgraded"; from: string; to: string }
-  | { kind: "refused"; from: string; to: string; reason: string; command: string }
-  | { kind: "stale"; path: string | null; version: string | null; command: string | null };
+  | { kind: "skipped"; why: string; warning: null }
+  | { kind: "current"; version: string; warning: null }
+  | { kind: "upgraded"; from: string; to: string; warning: null }
+  | { kind: "refused"; from: string; to: string; reason: string; command: string; warning: string }
+  | {
+      kind: "stale";
+      path: string | null;
+      version: string | null;
+      command: string | null;
+      warning: string;
+    };
 
 export type SyncOptions = {
   /** The version this run is. */
   running?: string | null;
-  /** One line to the reader, before the install and after it. */
+  /** Progress, as it happens: what is being upgraded, and that it took. */
   say: (line: string) => void;
   machine?: GlobalMachine;
   env?: NodeJS.ProcessEnv;
@@ -313,14 +335,23 @@ export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
   const machine = options.machine ?? realMachine(env);
   const running = options.running === undefined ? currentVersion() : options.running;
   if (!running || !/^\d+\.\d+\.\d+$/.test(running)) {
-    return { kind: "skipped", why: "this build does not state a plain version" };
+    return { kind: "skipped", why: "this build does not state a plain version", warning: null };
   }
   const found = machine.find();
-  if (!found) return { kind: "skipped", why: "no carrick on PATH" };
+  if (!found) return { kind: "skipped", why: "no carrick on PATH", warning: null };
   if (found.version === null) {
-    return { kind: "skipped", why: `${found.binary} does not say which version it is` };
+    // An install this cannot identify is one it will not install over. `carrick
+    // doctor` says so in its own words; a command doing something else is not
+    // where somebody should learn it.
+    return {
+      kind: "skipped",
+      why: `${found.binary} does not say which version it is`,
+      warning: null,
+    };
   }
-  if (!isNewer(running, found.version)) return { kind: "current", version: found.version };
+  if (!isNewer(running, found.version)) {
+    return { kind: "current", version: found.version, warning: null };
+  }
 
   const shape = machine.shape(found);
   const argv = globalCommand(shape.kind, running);
@@ -328,20 +359,27 @@ export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
     // A project dependency or an npx cache answering `carrick`. Neither is this
     // run's to replace, and both leave the reader on the older one.
     const where = shape.manifest ? ` (pinned in ${shape.manifest})` : "";
-    options.say(
-      `\`carrick\` here runs ${found.version} from ${found.binary}${where}, not the ${running} this run is. Update it where it is pinned, or put a global install earlier on PATH.`,
-    );
-    return { kind: "stale", path: found.binary, version: found.version, command: shape.command };
+    return {
+      kind: "stale",
+      path: found.binary,
+      version: found.version,
+      command: shape.command,
+      warning: `\`carrick\` here runs ${found.version} from ${found.binary}${where}, not the ${running} this run is. Update it where it is pinned, or put a global install earlier on PATH.`,
+    };
   }
 
   const command = argv.join(" ");
   options.say(`Upgrading the global carrick ${found.version} -> ${running} (${command})`);
   const result = machine.install(argv);
   if (!result.ok) {
-    options.say(
-      `The global carrick is still ${found.version}: ${result.reason ?? "the install did not finish"}. Run \`${command}\` when that is sorted.`,
-    );
-    return { kind: "refused", from: found.version, to: running, reason: result.reason ?? "", command };
+    return {
+      kind: "refused",
+      from: found.version,
+      to: running,
+      reason: result.reason ?? "",
+      command,
+      warning: `The global carrick is still ${found.version}: ${result.reason ?? "the install did not finish"}. Run \`${command}\` when that is sorted.`,
+    };
   }
 
   // The install said it worked, which is not the same as `carrick` now being
@@ -349,20 +387,26 @@ export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
   // answers first and was never touched by it.
   const after = machine.find();
   if (!after) {
-    options.say(
-      `carrick ${running} is installed and nothing answers to \`carrick\` on PATH. The directory ${argv[0]} installs into is not on it; add that directory, so your agent's hooks can run carrick by name.`,
-    );
-    return { kind: "stale", path: null, version: null, command };
+    return {
+      kind: "stale",
+      path: null,
+      version: null,
+      command,
+      warning: `carrick ${running} is installed and nothing answers to \`carrick\` on PATH. The directory ${argv[0]} installs into is not on it; add that directory, so your agent's hooks can run carrick by name.`,
+    };
   }
   if (after.version === running) {
     options.say(`The global carrick is now ${running}.`);
-    return { kind: "upgraded", from: found.version, to: running };
+    return { kind: "upgraded", from: found.version, to: running, warning: null };
   }
-  const theirs = globalCommand(machine.shape(after).kind, running);
-  options.say(
-    `\`carrick\` still runs ${after.version ?? "an unknown version"} from ${after.binary}. Replace that one with \`${(theirs ?? argv).join(" ")}\`, or take it off PATH.`,
-  );
-  return { kind: "stale", path: after.binary, version: after.version, command: (theirs ?? argv).join(" ") };
+  const theirs = (globalCommand(machine.shape(after).kind, running) ?? argv).join(" ");
+  return {
+    kind: "stale",
+    path: after.binary,
+    version: after.version,
+    command: theirs,
+    warning: `\`carrick\` still runs ${after.version ?? "an unknown version"} from ${after.binary}. Replace that one with \`${theirs}\`, or take it off PATH.`,
+  };
 }
 
 /**

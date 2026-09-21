@@ -84,7 +84,7 @@ test("an older global is upgraded to the running version, and the run says so", 
   const said: string[] = [];
   const { machine, installs } = machineWith({ versions: ["0.3.81", "0.3.84"] });
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
-  assert.deepEqual(outcome, { kind: "upgraded", from: "0.3.81", to: "0.3.84" });
+  assert.deepEqual(outcome, { kind: "upgraded", from: "0.3.81", to: "0.3.84", warning: null });
   assert.deepEqual(installs, [["npm", "install", "-g", "carrick@0.3.84"]]);
   assert.equal(said.length, 2, said.join(" | "));
   assert.match(said[0]!, /Upgrading the global carrick 0\.3\.81 -> 0\.3\.84/);
@@ -123,8 +123,9 @@ test("a refused install prints the reason and one command, and does not retry", 
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "refused");
   assert.equal(installs.length, 1, "a refusal is not retried with more force");
-  assert.match(said[1]!, /still 0\.3\.81: npm error notarget/);
-  assert.match(said[1]!, /npm install -g carrick@0\.3\.84/);
+  assert.equal(said.length, 1, "the refusal is the run's closing line, not a progress one");
+  assert.match(outcome.warning!, /still 0\.3\.81: npm error notarget/);
+  assert.match(outcome.warning!, /npm install -g carrick@0\.3\.84/);
 });
 
 test("an install that reported success but left an older carrick first on PATH is named", () => {
@@ -134,8 +135,8 @@ test("an install that reported success but left an older carrick first on PATH i
   const { machine } = machineWith({ versions: ["0.3.81", "0.3.81"], binary: "/opt/shim/carrick" });
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
-  assert.match(said[1]!, /still runs 0\.3\.81 from \/opt\/shim\/carrick/);
-  assert.match(said[1]!, /npm install -g carrick@0\.3\.84/);
+  assert.match(outcome.warning!, /still runs 0\.3\.81 from \/opt\/shim\/carrick/);
+  assert.match(outcome.warning!, /npm install -g carrick@0\.3\.84/);
 });
 
 test("an install that put nothing on PATH says which directory is missing from it", () => {
@@ -143,7 +144,7 @@ test("an install that put nothing on PATH says which directory is missing from i
   const { machine } = machineWith({ versions: ["0.3.81"] });
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
-  assert.match(said[1]!, /nothing answers to `carrick` on PATH/);
+  assert.match(outcome.warning!, /nothing answers to `carrick` on PATH/);
 });
 
 test("a current, newer or unreadable global is left alone and says nothing", () => {
@@ -154,6 +155,7 @@ test("a current, newer or unreadable global is left alone and says nothing", () 
     assert.notEqual(outcome.kind, "upgraded");
     assert.deepEqual(installs, [], `${version} was installed over`);
     assert.deepEqual(said, [], `${version} printed ${said.join(" | ")}`);
+    assert.equal(outcome.warning, null, `${version} warned about nothing`);
   }
 });
 
@@ -167,14 +169,15 @@ test("a global that is a project dependency is reported, never installed over", 
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
   assert.equal(outcome.kind, "stale");
   assert.deepEqual(installs, []);
-  assert.match(said[0]!, /pinned in \/repo\/package\.json/);
+  assert.deepEqual(said, [], "nothing was upgraded, so there is no progress to report");
+  assert.match(outcome.warning!, /pinned in \/repo\/package\.json/);
 });
 
 test("nothing on PATH is not a reason to install anything", () => {
   const said: string[] = [];
   const { machine, installs } = machineWith({ versions: [] });
   const outcome = syncGlobalInstall({ running: "0.3.84", machine, say: (line) => said.push(line) });
-  assert.deepEqual(outcome, { kind: "skipped", why: "no carrick on PATH" });
+  assert.deepEqual(outcome, { kind: "skipped", why: "no carrick on PATH", warning: null });
   assert.deepEqual(installs, []);
   assert.deepEqual(said, []);
 });
@@ -195,27 +198,38 @@ test("the sync runs on a command started through npx, and on nothing else", () =
   assert.equal(syncsOnThisRun("index", { ...env, CARRICK_NO_UPDATE_CHECK: "1" }, npx), false, "suppressed");
 });
 
-test("`which` cannot answer this: the npx cache's own shim is not a global", () => {
+test("`which` cannot answer this: a bin directory a run put there is not a global", () => {
   const home = temporary("carrick-path-");
   const cache = path.join(home, ".npm", "_npx", "abc123", "node_modules", ".bin");
-  const real = path.join(home, "global", "bin");
-  fs.mkdirSync(cache, { recursive: true });
-  fs.mkdirSync(real, { recursive: true });
+  const project = path.join(home, "repo", "node_modules", ".bin");
+  // The npm global shape: a bin directory whose entry links into the installed
+  // package, which is also where THIS code runs from on a global install.
+  const global = path.join(home, "global", "bin");
+  const installed = path.join(home, "global", "lib", "node_modules", "carrick", "bin");
+  for (const directory of [cache, project, global, installed]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
   fs.writeFileSync(path.join(cache, "carrick"), "#!/bin/sh\n");
-  fs.writeFileSync(path.join(real, "carrick"), "#!/bin/sh\n");
+  fs.writeFileSync(path.join(project, "carrick"), "#!/bin/sh\n");
+  fs.writeFileSync(path.join(installed, "carrick.mjs"), "#!/usr/bin/env node\n");
+  fs.symlinkSync(path.join(installed, "carrick.mjs"), path.join(global, "carrick"));
   try {
     // npm puts the exec tree's `.bin` first, which is exactly the entry that
-    // must be skipped: it stops existing when the npx run ends.
+    // must be skipped: it stops existing when the run that added it ends.
     const found = findCarrick({
-      env: { PATH: [cache, real].join(path.delimiter) },
-      ours: path.join(home, ".npm", "_npx", "abc123", "node_modules", "carrick"),
+      env: { PATH: [cache, project, global].join(path.delimiter) },
       platform: "linux",
     });
-    assert.equal(found?.binary, path.join(real, "carrick"));
-    // And a PATH holding only the npx entry has no global on it at all.
+    assert.equal(found?.binary, path.join(global, "carrick"));
+    assert.equal(found?.real, path.join(installed, "carrick.mjs"));
+    // A PATH holding only one of those has no global on it at all.
     assert.equal(findCarrick({ env: { PATH: cache }, platform: "linux" }), null);
-    // As does the copy running this test, wherever it is installed.
-    assert.equal(findCarrick({ env: { PATH: real }, ours: home, platform: "linux" }), null);
+    assert.equal(findCarrick({ env: { PATH: project }, platform: "linux" }), null);
+    // And the global IS found when it is the copy doing the looking, which is
+    // every `carrick doctor` and `carrick init` run off a global install: a
+    // resolver that skipped itself would report the healthiest install shape
+    // there is as having no carrick on PATH.
+    assert.notEqual(findCarrick({ env: { PATH: global }, platform: "linux" }), null);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -443,6 +457,11 @@ test("an npx run that could not replace the older global still names it", posix,
       timeout: 60_000,
     });
     assert.match(answer.stderr, /still runs 0\.0\.1 from /, answer.stderr);
+    // Last, because it is what the machine is left in: the ruling is that the
+    // run ENDS on this, not that it opens with it.
+    const lines = answer.stderr.trimEnd().split("\n");
+    assert.match(lines[lines.length - 1]!, /still runs 0\.0\.1 from /, answer.stderr);
+    assert.match(lines[0]!, /Upgrading the global carrick/, answer.stderr);
   } finally {
     fixture.cleanup();
   }

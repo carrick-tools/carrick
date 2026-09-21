@@ -1044,10 +1044,15 @@ export function checkPathVersion(workspace: string, found: GlobalCarrick | null)
   if (found.version === recorded) {
     return [done(`\`carrick\` on PATH is ${found.version}, the version that set this workspace up.`)];
   }
+  // Which way round it is decides the fix, and one of them is not an upgrade:
+  // a `carrick` NEWER than the files is a machine somebody already upgraded, so
+  // naming an install command there would name a downgrade.
   const command = globalCommand(installShape(found.real).kind, recorded);
-  const fix = command
-    ? `Run \`${command.join(" ")}\`, or \`carrick init\` if ${found.version} is the one you want here.`
-    : `Update ${found.binary} where it is pinned, or run \`carrick init\` if ${found.version} is the one you want here.`;
+  const fix = isNewer(recorded, found.version)
+    ? command
+      ? `Run \`${command.join(" ")}\`, or \`carrick init\` if ${found.version} is the one you want here.`
+      : `Update ${found.binary} where it is pinned, or run \`carrick init\` if ${found.version} is the one you want here.`
+    : "Run `carrick init` to bring the hooks and skills here up to date with it.";
   return [
     warn(
       `\`carrick\` on PATH is ${found.version} and ${recorded} set this workspace up, so every agent hook here runs ${found.version}. ${fix}`,
