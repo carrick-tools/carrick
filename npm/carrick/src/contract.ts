@@ -142,9 +142,10 @@ export type CheckResult = {
   boundary_lines?: string[];
   /**
    * What a `--recheck` call did about this file having moved past the index
-   * (carrick#1036). Absent on every read that did not ask for one, and on a
-   * `--recheck` for a file the tree has not changed: then the items are the
-   * indexed ones, which is what they always were.
+   * (carrick#1036). Present on every `check --recheck`, including the ones
+   * where nothing ran — a file the tree has not changed, or one no longer on
+   * disk — so a reader of `ran` never meets an absent key (carrick#1374).
+   * Absent only on a read that did not ask for a re-check.
    */
   recheck?: Recheck;
 };
@@ -155,13 +156,16 @@ export type Recheck = {
    * `extraction+types` — re-extracted, re-joined, and at least one row carries
    * a type verdict. `extraction` — the same, and no row of this file carries
    * one: nothing pairs with it, or its pairs were not both resolved.
-   * `none` — the items are the indexed ones and `stale_since` says how old.
+   * `none` — the items are the indexed ones, `stale_since` says how old and
+   * `reason` says why nothing ran: the file has not changed, it is no longer
+   * on disk, or a warranted re-check did not finish (carrick#1374).
    */
   ran: "extraction+types" | "extraction" | "none";
+  /** Wall time of the re-check. Zero where none was attempted. */
   elapsed_ms: number;
   /** RFC 3339 time the items were computed. Only on a `none`. */
   stale_since?: string;
-  /** Why the re-check did not run. Only on a `none`. */
+  /** Why the re-check did not run. Only on a `none`, and always there. */
   reason?: string;
   /**
    * Functions the re-extracted file declares that the index does not hold

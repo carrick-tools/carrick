@@ -108,12 +108,30 @@ pub fn answer(
     // nothing), only for a file the tree has moved past, and never for a file
     // that is gone — a deleted producer is already answered from the index,
     // and there is nothing left to extract from it.
-    let recheck = match (freshness, mode, stale && !deleted) {
-        (Freshness::Recheck, Mode::Check, true) => Some(rechecked(
+    //
+    // Every OTHER `check --recheck` states the block too, saying that nothing
+    // ran and why (carrick#1374). A caller told to read `recheck.ran` must not
+    // meet an absent key on the commonest answer of all — a file the tree has
+    // not changed — and "no re-check was asked for" and "one was asked for and
+    // there was nothing to do" are different facts that an absent block cannot
+    // tell apart.
+    let recheck = match (freshness, mode) {
+        (Freshness::Recheck, Mode::Check) if stale && !deleted => Some(rechecked(
             workspace_root,
             &repo_root,
             &relative,
             &indexed_at,
+        )),
+        (Freshness::Recheck, Mode::Check) => Some((
+            None,
+            not_run(
+                if deleted {
+                    "the file is no longer on disk, so there was nothing to re-extract"
+                } else {
+                    "the file has not changed since the index"
+                },
+                &indexed_at,
+            ),
         )),
         _ => None,
     };
@@ -302,6 +320,23 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         analysing: Vec::new(),
         services,
     })
+}
+
+/// The block for a `--recheck` that had nothing to do (carrick#1374).
+///
+/// `ran` is `none`, which is the contract's word for "the rows above are the
+/// indexed ones", and `reason` is the sentence that says why nothing ran. Not
+/// an error and not a degraded answer: for a file the tree has not changed the
+/// indexed rows ARE the file's, and this states that rather than leaving the
+/// reader to infer it from an absent key.
+fn not_run(reason: &str, indexed_at: &str) -> Recheck {
+    Recheck {
+        ran: super::recheck::Ran::None.as_str().to_string(),
+        elapsed_ms: 0,
+        stale_since: Some(indexed_at.to_string()),
+        reason: Some(reason.to_string()),
+        new_functions: Vec::new(),
+    }
 }
 
 /// One indexed row, in the contract's shape.
