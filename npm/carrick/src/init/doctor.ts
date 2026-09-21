@@ -38,6 +38,18 @@ import { DEFAULTS, renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
+import {
+  currentVersion,
+  fetchLatest,
+  installShape,
+  isNewer,
+  isStale,
+  readUpdateState,
+  suppressed,
+  writeUpdateState,
+} from "../update.ts";
+import { findCarrick, globalCommand, installedVersion, type GlobalCarrick } from "../global-install.ts";
+import { recordedCliVersion } from "./outdated.ts";
 import { repoRoots } from "./repos.ts";
 import { excludedRepos } from "./workspace-file.ts";
 import {
@@ -431,6 +443,36 @@ export function workflowVariables(body: string): { variables: Record<string, str
 }
 
 /**
+ * The only action ref that keeps a repository on the current scanner.
+ *
+ * `action.yml` reads the version out of the Cargo.toml sitting beside it in the
+ * action checkout, and `v1` is force-moved onto every release commit, so a
+ * workflow that says `@v1` picks up each release without anybody touching it.
+ * Any other ref — a tag, a branch, a commit SHA — freezes the scanner at
+ * whatever shipped with that ref, for as long as the workflow stands.
+ *
+ * `docs/reference/update-check.md` has the whole picture, including the npm
+ * half of it.
+ */
+const FLOATING_ACTION_REF = "carrick-tools/carrick@v1";
+
+/**
+ * A ref that will never move, said plainly.
+ *
+ * A finding rather than a note, by the rule at the top of this file: a
+ * repository whose CI is frozen on an old scanner keeps re-indexing itself with
+ * defects that are already fixed, and the whole point of the index is that it
+ * is current. The way out is one token in one line.
+ */
+export function pinnedActionRef(ref: string | undefined): string | null {
+  if (!ref || ref === FLOATING_ACTION_REF) return null;
+  return (
+    `${WORKFLOW_PATH} pins \`${ref}\`, so every run here uses the scanner that shipped with that ref ` +
+    `and never a newer one. Use \`${FLOATING_ACTION_REF}\`, which moves to each release.`
+  );
+}
+
+/**
  * The CI workflow of every configured repo, against the template this package
  * renders.
  *
@@ -455,6 +497,8 @@ export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
       continue;
     }
     const { variables, unread } = workflowVariables(body);
+    const pin = pinnedActionRef(variables["ACTION_REF"]);
+    if (pin) lines.push(warn(`${repo.label}: ${pin}`));
     const drift = templateDrift(body, renderTemplate("workflow", variables));
     if (drift.missing.length === 0) {
       matched += 1;
@@ -920,6 +964,108 @@ function short(commit: string): string {
   return commit.slice(0, 7);
 }
 
+/**
+ * The version this machine is running, against the version that is published.
+ *
+ * The one check here that is allowed to touch the network, and the one place in
+ * the CLI where the version check is synchronous: `doctor` is the command a
+ * person runs when they are already suspicious, so an answer worth two seconds
+ * is an answer worth waiting for, and a cached one that is hours old is not
+ * what they came for. It still fails open — a registry that says nothing leaves
+ * a note, never a finding.
+ *
+ * Being behind IS a finding, against the instinct that a check must only fire
+ * on something broken. Running a build with defects already fixed is the
+ * documented cause of a failed scan on a customer's machine, and the fix is one
+ * command that this line names.
+ */
+export async function checkVersion(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch,
+  now: number = Date.now(),
+): Promise<Line[]> {
+  if (suppressed(env)) return [];
+  const current = currentVersion();
+  if (!current) return [];
+  const cached = readUpdateState(env);
+  let latest = cached?.latest ?? null;
+  if (isStale(cached, now)) {
+    const fetched = await fetchLatest(fetchImpl);
+    if (fetched) {
+      latest = fetched;
+      writeUpdateState({ checked_at: new Date(now).toISOString(), latest }, env);
+    }
+  }
+  if (!latest) {
+    return [say(`Running carrick ${current}. The npm registry did not answer, so nothing here says whether it is the current one.`)];
+  }
+  if (!isNewer(latest, current)) {
+    return [done(`Running carrick ${current}, which is the published version.`)];
+  }
+  const shape = installShape(undefined, env);
+  const where = shape.manifest ? ` It is pinned in ${shape.manifest}.` : "";
+  return [
+    warn(
+      `Running carrick ${current}; ${latest} is published.${where} A scan on an older build can fail on defects that are already fixed — update with \`${shape.command}\`.`,
+    ),
+  ];
+}
+
+/**
+ * The carrick a hook here will actually run, against the one that wrote its
+ * files (carrick#1372).
+ *
+ * Different from `checkVersion` above, which asks the registry what is
+ * published. This asks the machine: an agent hook is `carrick hook post-edit`,
+ * resolved on PATH, so what answers it can be an install from three releases
+ * ago that an `npx carrick@latest` run never replaced. The two numbers only
+ * exist together here and in the hooks themselves.
+ *
+ * `findCarrick` rather than `which`, for the reason in `src/global-install.ts`:
+ * a `which` inside an npx run answers with the npx cache's own shim.
+ */
+export function checkPathVersion(workspace: string, found: GlobalCarrick | null): Line[] {
+  const recorded = recordedCliVersion(workspace);
+  if (recorded === null) return [];
+  if (found === null) {
+    return [
+      warn(
+        `carrick ${recorded} set this workspace up, and nothing answers to \`carrick\` on PATH, so the agent hooks here run whatever their command names. \`${installShape().command}\` puts it there.`,
+      ),
+    ];
+  }
+  if (found.version === null) {
+    return [
+      say(
+        `\`carrick\` on PATH is ${found.binary}, which does not say which version it is; ${recorded} set this workspace up.`,
+      ),
+    ];
+  }
+  if (found.version === recorded) {
+    return [done(`\`carrick\` on PATH is ${found.version}, the version that set this workspace up.`)];
+  }
+  // Which way round it is decides the fix, and one of them is not an upgrade:
+  // a `carrick` NEWER than the files is a machine somebody already upgraded, so
+  // naming an install command there would name a downgrade.
+  const command = globalCommand(installShape(found.real).kind, recorded);
+  const fix = isNewer(recorded, found.version)
+    ? command
+      ? `Run \`${command.join(" ")}\`, or \`carrick init\` if ${found.version} is the one you want here.`
+      : `Update ${found.binary} where it is pinned, or run \`carrick init\` if ${found.version} is the one you want here.`
+    : "Run `carrick init` to bring the hooks and skills here up to date with it.";
+  return [
+    warn(
+      `\`carrick\` on PATH is ${found.version} and ${recorded} set this workspace up, so every agent hook here runs ${found.version}. ${fix}`,
+    ),
+  ];
+}
+
+/** The global carrick this machine has, with its version read. */
+function pathCarrick(): GlobalCarrick | null {
+  const found = findCarrick();
+  return found === null ? null : { ...found, version: installedVersion(found) };
+}
+
 /** Print one check's lines through the shared renderer. */
 function print(out: InitOutput, lines: Line[]): void {
   for (const line of lines) {
@@ -944,6 +1090,8 @@ export async function doctor(argv: string[], out: InitOutput = createOutput()): 
 
   const repos = configuredRepos(workspace);
   const lines: Line[] = [
+    ...(await checkVersion()),
+    ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),

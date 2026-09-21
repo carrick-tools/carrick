@@ -280,6 +280,9 @@ globalThis.fetch = async (input, init) => {
       CARRICK_BIN: native,
       CARRICK_TOKEN: "test-token",
       XDG_CONFIG_HOME: path.join(root, "config"),
+      // No registry lookup and no detached child for a test that only wants to
+      // watch `init` write files (src/update.ts).
+      CARRICK_NO_UPDATE_CHECK: "1",
       // The MCP step configures the agent clients this machine has, and the
       // detection is each client's own directory under the home directory.
       // A test that did not state one would edit the developer's own clients.
@@ -541,7 +544,12 @@ test("init reads its arguments", () => {
     project: "payments",
     repos: [],
     editors: [],
+    installGlobal: false,
   });
+  // A global install is a change to the machine, not to this workspace, so
+  // `--yes` is not it either (carrick#1372).
+  assert.equal((parseArgs(["--yes"]) as InitOptions).installGlobal, false);
+  assert.equal((parseArgs(["--install-global"]) as InitOptions).installGlobal, true);
   // The editors an entry may be written for, named the way init prints them.
   // Nothing here is a default: a run with no terminal writes no editor file
   // unless this flag names one (carrick#1365).
@@ -1143,6 +1151,9 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
       pathsUnder(fixture.repo),
       [
         path.join(".carrick", ".gitignore"),
+        // Which build wrote the files below, so a hook running an older
+        // `carrick` than this one says so (carrick#1372).
+        path.join(".carrick", "cli-version"),
         PROPOSAL_FILE,
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
         // The same two-part nudge, for the other host (carrick#1335).

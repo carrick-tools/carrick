@@ -83,6 +83,82 @@ async function refreshNoticeLine() {
 await refreshNoticeLine();
 
 /**
+ * "The carrick you are running is not the carrick that is published."
+ *
+ * At the start of the command, which is the only moment it is useful: told
+ * halfway through a scan, a person has already paid for the scan. An installed
+ * `carrick` never moves on its own, so without this the only upgrade path is a
+ * human remembering — which is exactly the path that failed a pilot customer,
+ * who ran a scan on a build three releases old and hit a defect already fixed.
+ *
+ * On a laptop this reads one small cache file and starts a detached child to
+ * refresh it, so it adds no measurable time; in CI it is one bounded fetch, and
+ * only in front of a scan. Either way it prints and continues: nothing here
+ * installs anything or changes which binary runs. `src/update.ts` has the
+ * reasoning, `docs/reference/update-check.md` the design.
+ *
+ * Silent for `lsp` and `hook post-edit`: those run on a protocol stream and on
+ * every keystroke-ish edit. `hook session-start` prints its own version of this
+ * on stdout, where the agent reading the session actually sees it.
+ */
+async function noticeUpdate() {
+  try {
+    const update = await import("../dist/update.js");
+    if (command === "lsp" || command === "hook") {
+      // Still worth refreshing the cache: hooks are the most frequent
+      // invocation on a developer machine, so they are what keeps the answer
+      // the other commands print from going stale.
+      if (!update.inCi(process.env)) update.scheduleUpdateCheck(process.env);
+      return;
+    }
+    const line = update.inCi(process.env)
+      ? await update.ciUpdateNotice(argv, process.env)
+      : update.updateNoticeFromCache(process.env);
+    // stderr, always: a `--json` answer and `lsp --stdio` own stdout.
+    if (line) process.stderr.write(`${line}\n`);
+  } catch {
+    // A version check is never a reason for a command not to run.
+  }
+}
+
+await noticeUpdate();
+
+/**
+ * Leave no older `carrick` on PATH behind this run (carrick#1372).
+ *
+ * A run through `npx carrick@latest` is current by construction and changes
+ * nothing on the machine, so a global install from an earlier release keeps
+ * answering every hook, every script and every new shell afterwards. Where one
+ * exists, this brings it level, through the package manager that owns it, and
+ * then resolves `carrick` again to check that it took. It installs nothing on a
+ * machine that has no global: that offer is `carrick init`'s, where there is
+ * somebody to ask.
+ *
+ * `src/global-install.ts` has the reasoning. Silent unless it does something,
+ * and never a reason a command does not run.
+ */
+async function keepGlobalCurrent() {
+  try {
+    const sync = await import("../dist/global-install.js");
+    if (!sync.syncsOnThisRun(command, process.env)) return;
+    // stderr throughout, so a `--json` answer on stdout stays parseable.
+    const outcome = sync.syncGlobalInstall({
+      say: (line) => process.stderr.write(`carrick: ${line}\n`),
+    });
+    // A run that is ending on an older carrick than it is says so at the END of
+    // it. In front of `carrick index` this is the first line of a log that then
+    // runs for minutes, and what it names is the state the machine is left in.
+    if (outcome.warning) {
+      process.once("exit", () => process.stderr.write(`carrick: ${outcome.warning}\n`));
+    }
+  } catch {
+    // An upgrade that could not even be attempted is not a failed command.
+  }
+}
+
+await keepGlobalCurrent();
+
+/**
  * Run a build of the index and render it (carrick#1315).
  *
  * The binary writes for a log file as well as for a person: a run banner, a
@@ -211,6 +287,12 @@ function extraHelp() {
     "    templates <name>             print a file to add to a repo: workflow, or",
     "                                 carrick.json",
     "    --version                    the version of this package",
+    "",
+    "ENVIRONMENT:",
+    "    CARRICK_NO_UPDATE_CHECK      set it to stop carrick checking whether a",
+    "                                 newer version is published. The check reads",
+    "                                 one cached file and refreshes it in the",
+    "                                 background; it never installs anything.",
     "",
     "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
     "prints its own arguments. `carrick doctor` re-checks that setup and exits",

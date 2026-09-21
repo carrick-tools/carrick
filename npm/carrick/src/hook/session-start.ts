@@ -17,9 +17,28 @@ import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
+import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { refreshInBackground } from "./refresh.ts";
+import { versionMismatch } from "../init/outdated.ts";
 
 const log = createLogger("carrick-session");
+
+/**
+ * "Start of session, not mid session" — the moment a version notice is worth
+ * anything, because it is the moment before the agent does any work.
+ *
+ * Read from the cache only: a hook has a 300 ms budget and no business dialling
+ * a registry. The cache is refreshed by a detached child the shim starts, so
+ * what this prints is at most one run behind. On stdout, unlike the shim's
+ * stderr line, because stdout is what Claude Code adds to the session — the
+ * agent is the one that can act on it, and an agent that forgets to upgrade is
+ * the failure this exists for.
+ */
+function versionLine(): string | null {
+  if (suppressed(process.env)) return null;
+  const state = readUpdateState(process.env);
+  return updateNotice(currentVersion(), state?.latest ?? null, { env: process.env });
+}
 
 async function main(): Promise<void> {
   if (resolveChannel({ hooksInstalled: true }).channel === "off") {
@@ -33,6 +52,21 @@ async function main(): Promise<void> {
   });
   const note = rootNote(choice);
   if (note) log(note);
+
+  // Printed whatever the index turns out to say, and before the read that may
+  // have nothing to report: a machine with no index yet is a machine about to
+  // run its first scan, which is the worst moment to be on a stale build.
+  const version = versionLine();
+  if (version) process.stdout.write(`${version}\n`);
+
+  // And the other mismatch: not "a newer one is published" but "the one
+  // answering this hook is not the one that wrote these files". Unthrottled,
+  // because this runs once per session and the agent about to work here is the
+  // reader who can act on it (carrick#1372).
+  if (choice.markerFound) {
+    const mismatch = versionMismatch(choice.root, currentVersion());
+    if (mismatch) process.stdout.write(`${mismatch}\n`);
+  }
 
   const outcome = await status({ cwd: choice.root, workspace: choice.markerFound ? choice.root : null });
   if (!outcome.result) {

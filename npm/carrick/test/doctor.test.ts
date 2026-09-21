@@ -23,6 +23,7 @@ import {
   checkHooks,
   checkIndex,
   checkMcp,
+  checkPathVersion,
   checkTaskSkills,
   checkWorkflow,
   configuredRepos,
@@ -30,6 +31,7 @@ import {
   findingCount,
   functionalLines,
   parseArgs,
+  pinnedActionRef,
   templateDrift,
   workflowVariables,
   type GitReader,
@@ -44,6 +46,7 @@ import {
   stamped,
   writeTaskSkills,
 } from "../src/init/task-skills.ts";
+import { recordCliVersion } from "../src/init/outdated.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../src/templates.ts";
 import { statusFixture } from "./helpers.ts";
 import type { StatusResult } from "../src/contract.ts";
@@ -264,13 +267,33 @@ test("a workflow's own action ref and branch are read back, so neither is drift"
     [workflowPath]: `${pinned}      - run: ./deploy.sh\n`,
   });
   const lines = checkWorkflow(configuredRepos(root));
-  assert.equal(findingCount(lines), 0, texts(lines).join("\n"));
+  // Filling the template's variables in is not drift, and a line of your own is
+  // not drift. A ref that cannot move IS a finding, and a separate one: the
+  // Action resolves the scanner from the Cargo.toml beside it in the action
+  // checkout, so a pinned ref freezes the scanner this repo indexes with.
+  assert.equal(findingCount(lines), 1, texts(lines).join("\n"));
+  assert.ok(texts(lines).some((text) => text.includes("pins `carrick-tools/carrick@v1.4.2`")));
   assert.ok(lines.some((line) => line.text.includes("plus 1 line(s) of your own")));
   fs.rmSync(root, { recursive: true, force: true });
 
   // A branch list written as a YAML sequence cannot be read, and the line says so.
   const sequence = renderTemplate("workflow").replace(/branches: \[main\]/g, "branches:\n      - main");
   assert.deepEqual(workflowVariables(sequence).unread, ["DEFAULT_BRANCH"]);
+});
+
+test("only @v1 keeps a workflow on the current scanner", () => {
+  assert.equal(pinnedActionRef("carrick-tools/carrick@v1"), null);
+  assert.equal(pinnedActionRef(undefined), null, "no carrick step at all is the workflow check's own finding");
+  for (const ref of [
+    "carrick-tools/carrick@v1.4.2",
+    "carrick-tools/carrick@main",
+    "carrick-tools/carrick@9632e686e6bc5f9786b750a22450240460f2bded",
+  ]) {
+    const line = pinnedActionRef(ref);
+    assert.ok(line, ref);
+    assert.match(line, /never a newer one/);
+    assert.ok(line.includes("carrick-tools/carrick@v1`"), line);
+  }
 });
 
 test("a repo with no workflow, and one the current template has grown past", () => {
@@ -469,6 +492,93 @@ test("missing skills, skills an older version wrote, and skills edited here", ()
   }
 });
 
+test("doctor reports the carrick a hook here will actually run", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-version-"));
+  const found = (version: string | null) => ({
+    binary: "/usr/local/bin/carrick",
+    real: "/usr/local/lib/node_modules/carrick/bin/carrick.mjs",
+    version,
+  });
+  try {
+    fs.mkdirSync(path.join(dir, ".carrick"), { recursive: true });
+    // A workspace init has never run in says nothing: there are no hooks here
+    // for a version to be wrong for.
+    assert.deepEqual(checkPathVersion(dir, found("0.3.81")), []);
+
+    recordCliVersion(dir, "0.3.84");
+    const healthy = checkPathVersion(dir, found("0.3.84"));
+    assert.equal(findingCount(healthy), 0, texts(healthy).join("\n"));
+
+    const stale = checkPathVersion(dir, found("0.3.81"));
+    assert.equal(findingCount(stale), 1, texts(stale).join("\n"));
+    assert.match(stale[0]!.text, /on PATH is 0\.3\.81 and 0\.3\.84 set this workspace up/);
+    assert.match(stale[0]!.text, /npm install -g carrick@0\.3\.84/);
+
+    // The other way round is a machine somebody already upgraded, so the fix is
+    // the files, not the install: naming a command there names a DOWNGRADE.
+    const ahead = checkPathVersion(dir, found("0.4.0"));
+    assert.equal(findingCount(ahead), 1, texts(ahead).join("\n"));
+    assert.match(ahead[0]!.text, /carrick init/);
+    assert.doesNotMatch(ahead[0]!.text, /install -g/);
+
+    // Nothing on PATH at all is the same fault with a different fix: the hooks
+    // here name a command this machine cannot resolve.
+    const missing = checkPathVersion(dir, null);
+    assert.equal(findingCount(missing), 1, texts(missing).join("\n"));
+    assert.match(missing[0]!.text, /nothing answers to `carrick` on PATH/);
+
+    // A shim that will not say which version it is is a note, not a fault.
+    const unknown = checkPathVersion(dir, found(null));
+    assert.equal(findingCount(unknown), 0, texts(unknown).join("\n"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "a real doctor run reports the carrick on PATH against the one that set the workspace up",
+  { skip: process.platform === "win32" ? "the fake carrick needs a POSIX shebang" : false },
+  () => {
+    // The check above proves what the function answers; this proves the command
+    // asks it. `carrick` is put on PATH here rather than trusted to be on the
+    // machine's, so the line is the same on a laptop and on a runner.
+    const root = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-"));
+    const bin = path.join(home, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, "carrick"), "#!/bin/sh\necho 0.3.81\n", { mode: 0o755 });
+    fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
+    recordCliVersion(root, "0.3.84");
+    try {
+      const run = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "doctor", root],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: [bin, process.env["PATH"] ?? ""].join(path.delimiter),
+            HOME: home,
+            USERPROFILE: home,
+            XDG_CONFIG_HOME: path.join(home, ".config"),
+            CLAUDE_CONFIG_DIR: path.join(home, ".claude-config"),
+            APPDATA: path.join(home, "AppData"),
+            CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
+            CARRICK_NO_UPDATE_CHECK: "1",
+          },
+        },
+      );
+      assert.match(
+        run.stdout,
+        /on PATH is 0\.3\.81 and 0\.3\.84 set this workspace up/,
+        `${run.stdout}\n${run.stderr}`,
+      );
+    } finally {
+      for (const target of [root, home]) fs.rmSync(target, { recursive: true, force: true });
+    }
+  },
+);
+
 test("the hook reader sees exactly what the writer wrote", () => {
   for (const command of ["carrick", '"/opt/my tools/carrick/bin/carrick.mjs"']) {
     const body = mergeCarrickHooks(null, command).body;
@@ -622,6 +732,10 @@ test("the whole command, on a workspace with exactly three findings", () => {
       APPDATA: path.join(home, "AppData"),
       CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
       CARRICK_FAKE_FIXTURE: fixture,
+      // The version check is the one check allowed to reach the registry, and
+      // this test asserts the exact set of lines. Its own coverage is in
+      // test/update.test.ts, with an injected fetch.
+      CARRICK_NO_UPDATE_CHECK: "1",
     },
   });
 

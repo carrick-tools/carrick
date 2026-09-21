@@ -17,6 +17,21 @@ accepts that credential or a `CARRICK_TOKEN` environment override, and signs in
 through the browser itself when a terminal has neither. GitHub CLI credentials
 do not grant Carrick access.
 
+An installed `carrick` does not move on its own, and a scan on an old build can
+fail on a defect that is already fixed. So every command reads a cached answer
+to "is there a newer one", refreshes it in the background, and prints a line
+naming the exact update command for the way this copy was installed. It never
+blocks on the network, and `CARRICK_NO_UPDATE_CHECK=1` turns it off for a
+reproducible run. The one thing it installs is an older **global** `carrick`
+when you run through `npx`: that install answers your agent's hooks and every
+new shell, so it is brought level with the version you just ran, using the
+package manager that owns it and nothing that overrides your own npm
+configuration. A machine with no global is never installed onto without a yes —
+`carrick init` asks, and `carrick init --install-global` is the answer for a
+script. In CI it warns
+and continues, so a workflow decides its own version — and
+`carrick-tools/carrick@v1` in a workflow already moves to each release.
+
 `init` prints one line per thing it did — `◇` done, `▲` a warning with what to
 do about it, `■` something it could not do and why — and ends on the sentence
 to paste to your agent. Everything else, including the editor extension, how

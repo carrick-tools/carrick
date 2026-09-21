@@ -39,12 +39,24 @@ export type Credential = {
   scope?: string;
 };
 
-export function credentialPath(env: NodeJS.ProcessEnv = process.env): string {
+/**
+ * The per-user directory Carrick keeps its own state in.
+ *
+ * Exported because more than the credential lives here: the update check's
+ * cache (`src/update.ts`) is written beside it, and two spellings of one
+ * directory would put a test's temporary state somewhere a later read cannot
+ * find it.
+ */
+export function configDir(env: NodeJS.ProcessEnv = process.env): string {
   const base = env["XDG_CONFIG_HOME"] ||
     (process.platform === "win32" ? env["APPDATA"] : undefined) ||
     path.join(env["HOME"] || os.homedir(), ".config");
   if (!path.isAbsolute(base)) throw new Error("Carrick's configuration directory must be an absolute path.");
-  return path.join(base, "carrick", "credentials.json");
+  return path.join(base, "carrick");
+}
+
+export function credentialPath(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(configDir(env), "credentials.json");
 }
 
 export function readCredential(env: NodeJS.ProcessEnv = process.env): Credential | null {

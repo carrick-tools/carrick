@@ -22,6 +22,8 @@ import { createLogger } from "../log.ts";
 import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
+import { throttledVersionMismatch } from "../init/outdated.ts";
+import { currentVersion } from "../update.ts";
 import { record } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
@@ -166,6 +168,13 @@ async function main(): Promise<void> {
     log(`the ${channel.channel} channel owns delivery in this install; printing nothing`);
     return;
   }
+  // The `carrick` this hook is running is whatever PATH answered with, which
+  // an upgrade elsewhere can leave behind (carrick#1372). Claimed at the last
+  // possible moment, so the once-a-day stamp is spent only on a line that is
+  // actually delivered, and inside `additionalContext` rather than on a bare
+  // stdout line, which this host reads as a malformed hook response.
+  const mismatch = throttledVersionMismatch(choice.root, currentVersion());
+  if (mismatch) contexts.push(mismatch);
   if (contexts.length > 0) emit(contexts.join("\n\n"));
 }
 
