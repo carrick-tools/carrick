@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.86](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.85...carrick-v0.3.86) (2026-09-21)
+
+
+### Bug Fixes
+
+* **consumers:** say whether a row is the request or a call through a wrapper ([#1405](https://github.com/carrick-tools/carrick/issues/1405)) ([f9a7ea0](https://github.com/carrick-tools/carrick/commit/f9a7ea0cfc7227c7ede81299a3d275880176c6be)), closes [#1385](https://github.com/carrick-tools/carrick/issues/1385)
+* **graphql:** follow a named resolver through the aliases the repo declares ([#1415](https://github.com/carrick-tools/carrick/issues/1415)) ([b6b5be2](https://github.com/carrick-tools/carrick/commit/b6b5be20dfe011f815c743322afe33013fd2a59c))
+* **graphql:** follow a named resolver to the function it binds ([#1410](https://github.com/carrick-tools/carrick/issues/1410)) ([ae766d8](https://github.com/carrick-tools/carrick/commit/ae766d84a41fd3762e4a4d54c538a706c0526f06)), closes [#1294](https://github.com/carrick-tools/carrick/issues/1294)
+* **routes:** ask a file-based route for the payload the model located ([#1426](https://github.com/carrick-tools/carrick/issues/1426)) ([a3729e5](https://github.com/carrick-tools/carrick/commit/a3729e5c8d423225498f5f0804491090b91d878f)), closes [#1420](https://github.com/carrick-tools/carrick/issues/1420) [#807](https://github.com/carrick-tools/carrick/issues/807)
+* **scan-health:** print the cloud's own refusal sentence, once per run ([#1417](https://github.com/carrick-tools/carrick/issues/1417)) ([750a898](https://github.com/carrick-tools/carrick/commit/750a8984c97cba3fd1a16c4bc63c15d8e00f126b))
+* **sidecar:** read a response init object as init when its status is a variable ([#1418](https://github.com/carrick-tools/carrick/issues/1418)) ([25e376a](https://github.com/carrick-tools/carrick/commit/25e376a386267cf7e998e31a4af3b05b63c7472a))
+* **types:** resolve a type's import specifier with the one resolver ([#1423](https://github.com/carrick-tools/carrick/issues/1423)) ([a876802](https://github.com/carrick-tools/carrick/commit/a87680268e8bb2534caf6127f129b06b0f43127f))
+
+
+### CI/CD
+
+* **plugin:** resolve the yarn leg's platform pins against packages packed from the same commit ([#1407](https://github.com/carrick-tools/carrick/issues/1407)) ([8e14815](https://github.com/carrick-tools/carrick/commit/8e1481536e511f5bf2124784f4c8f5bc787d503e)), closes [#1406](https://github.com/carrick-tools/carrick/issues/1406)
+
 ## [0.3.85](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.84...carrick-v0.3.85) (2026-09-21)
 
 
