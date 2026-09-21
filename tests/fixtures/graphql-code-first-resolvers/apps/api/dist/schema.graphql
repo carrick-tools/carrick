@@ -10,9 +10,11 @@ type Parcel {
 }
 
 type Query {
+  archivedParcels: [Parcel!]!
   health: String!
   heaviestWeight: Int
   parcel(id: ID!): Parcel
+  parcelCount: Int!
   parcels: [Parcel!]!
   recentParcels: [Parcel!]!
 }

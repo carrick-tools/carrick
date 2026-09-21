@@ -1,4 +1,5 @@
 import { kit } from '../kit.ts';
+import * as store from './store.ts';
 import { findParcel, heaviestParcel, listParcels, listRecentParcels } from './store.ts';
 
 // Colis — lecture
@@ -22,4 +23,15 @@ kit.queryFields((t) => ({
     type: ['Parcel'],
     resolve: listRecentParcels,
   }),
+  parcelCount: t.int({
+    resolve: countParcels,
+  }),
+  archivedParcels: t.field({
+    type: ['Parcel'],
+    resolve: store.listArchived,
+  }),
 }));
+
+function countParcels(): number {
+  return listParcels().length;
+}

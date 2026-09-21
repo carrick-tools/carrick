@@ -24,19 +24,26 @@
 //! GraphQL reference implementation, and it is used only to break a tie
 //! between two function-valued properties (a `validate` beside a `resolve`).
 //!
-//! A field whose resolver is an identifier (`resolve: listRecentParcels`) is
-//! reported as [`ResolverAnchor::Unresolvable`] so the caller sends NO
-//! request: a line-only anchor there binds to a neighbour, which is worse than
-//! abstaining. Following the identifier to its declaration is a follow-up.
+//! A field whose resolver is written as a name rather than a literal
+//! (`resolve: listRecentParcels`, or the resolver-map shorthand `{ orders }`)
+//! is reported as [`ResolverAnchor::Named`], and the caller follows that name
+//! to the function it binds with [`named_resolver`]: a module-scope
+//! declaration in the same file, or an import to chase to the module that
+//! declares it. A line-only anchor at the field would bind to a neighbour
+//! instead, which is worse than abstaining, so anything the name does not
+//! lead to a function literal sends no request at all (carrick#1294).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use swc_common::{SourceMap, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    ClassMethod, Expr, ExprOrSpread, FnDecl, MethodProp, ObjectLit, Prop, PropName, PropOrSpread,
-    VarDeclarator,
+    ClassMethod, Decl, DefaultDecl, Expr, ExprOrSpread, FnDecl, MethodProp, ModuleDecl, ModuleItem,
+    ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::import_bindings::DEFAULT_EXPORT;
 
 /// Nested calls a field value is read through (`t.field(withAuth({ … }))`).
 const CALL_DEPTH: usize = 3;
@@ -49,10 +56,15 @@ pub enum ResolverAnchor {
     /// [`crate::swc_scanner::SWC_SPAN_BASE`]); convert at the request
     /// boundary, never store converted (carrick#805).
     Function { lo: u32, hi: u32 },
-    /// The field's structure is on the line but its resolver is not a
-    /// function literal (an identifier or member, a shorthand property), or
-    /// two function-valued properties compete and neither is `resolve`. The
-    /// caller must send no anchor at all.
+    /// The field names its resolver instead of writing it: `resolve:
+    /// listRecentParcels`, or a resolver-map shorthand whose key IS the
+    /// binding (`{ orders }`). The name is the binding as written in this
+    /// file; [`named_resolver`] says what it leads to.
+    Named(String),
+    /// The field's structure is on the line but its resolver is neither a
+    /// function literal nor a name this pass can follow (a member expression,
+    /// `resolve: this.list`), or two function-valued properties compete and
+    /// neither is `resolve`. The caller must send no anchor at all.
     Unresolvable,
     /// Nothing on the line reads as a field definition or a function
     /// declaration. The caller keeps whatever it did before.
@@ -162,13 +174,18 @@ fn function_span(span: swc_common::Span) -> ResolverAnchor {
     }
 }
 
-/// The function literal `expr` is, if it is one.
-fn function_literal(expr: &Expr) -> Option<ResolverAnchor> {
+/// The span of the function literal `expr` is, if it is one.
+fn function_literal_span(expr: &Expr) -> Option<swc_common::Span> {
     match expr {
-        Expr::Arrow(arrow) => Some(function_span(arrow.span)),
-        Expr::Fn(fn_expr) => Some(function_span(fn_expr.function.span)),
+        Expr::Arrow(arrow) => Some(arrow.span),
+        Expr::Fn(fn_expr) => Some(fn_expr.function.span),
         _ => None,
     }
+}
+
+/// The function literal `expr` is, if it is one.
+fn function_literal(expr: &Expr) -> Option<ResolverAnchor> {
+    function_literal_span(expr).map(function_span)
 }
 
 /// Strip the wrappers TypeScript lets a value wear without changing it.
@@ -189,7 +206,7 @@ fn anchor_from_prop(prop: &Prop) -> ResolverAnchor {
         Prop::KeyValue(kv) => anchor_from_value(unwrap_expr(&kv.value), CALL_DEPTH),
         Prop::Method(MethodProp { function, .. }) => function_span(function.span),
         // `{ orders, users }`: the resolver is a binding, not a literal.
-        Prop::Shorthand(_) => ResolverAnchor::Unresolvable,
+        Prop::Shorthand(ident) => ResolverAnchor::Named(ident.sym.to_string()),
         _ => ResolverAnchor::Absent,
     }
 }
@@ -211,7 +228,14 @@ fn anchor_from_value(value: &Expr, depth: usize) -> ResolverAnchor {
                 .find(|anchor| *anchor != ResolverAnchor::Absent)
                 .unwrap_or(ResolverAnchor::Absent)
         }
-        // A config or resolver passed by name: structure found, function not.
+        // A name in the field property's own value position is the resolver
+        // map's shape (`users: listUsers`), so it is a binding to follow.
+        Expr::Ident(ident) if depth == CALL_DEPTH => ResolverAnchor::Named(ident.sym.to_string()),
+        // A name INSIDE a field call's arguments is a config or a wrapper
+        // passed by name (`t.field(withScope, { … })`), never the resolver —
+        // following it would type the field with a middleware's return. A
+        // member expression names a property of a value this pass cannot
+        // evaluate. Structure found, function not: send nothing.
         Expr::Ident(_) | Expr::Member(_) => ResolverAnchor::Unresolvable,
         _ => ResolverAnchor::Absent,
     }
@@ -235,10 +259,9 @@ fn anchor_from_config(object: &ObjectLit) -> ResolverAnchor {
             _ => (None, None),
         };
         if name.as_deref() == Some("resolve") {
-            // The field names its resolver. A non-literal there is the
-            // identifier case; a literal is the answer, whatever else the
-            // config carries.
-            return value.unwrap_or(ResolverAnchor::Unresolvable);
+            // The field names its resolver. A literal is the answer, whatever
+            // else the config carries; a binding is a name to follow.
+            return value.unwrap_or_else(|| named_binding(prop));
         }
         if let Some(anchor) = value {
             functions.push(anchor);
@@ -249,6 +272,134 @@ fn anchor_from_config(object: &ObjectLit) -> ResolverAnchor {
         1 => functions.remove(0),
         _ => ResolverAnchor::Unresolvable,
     }
+}
+
+/// The binding a property names when its value is not a function literal:
+/// `resolve: listRecentParcels` and the shorthand `{ resolve }` both name one.
+fn named_binding(prop: &Prop) -> ResolverAnchor {
+    match prop {
+        Prop::KeyValue(kv) => match unwrap_expr(&kv.value) {
+            Expr::Ident(ident) => ResolverAnchor::Named(ident.sym.to_string()),
+            _ => ResolverAnchor::Unresolvable,
+        },
+        Prop::Shorthand(ident) => ResolverAnchor::Named(ident.sym.to_string()),
+        _ => ResolverAnchor::Unresolvable,
+    }
+}
+
+/// What a resolver binding leads to, read from the module that uses the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedResolver {
+    /// The name is declared in THIS module as a function, at this span (the
+    /// scanner's own byte units, as [`ResolverAnchor::Function`]) and this
+    /// 1-based line.
+    Declared { lo: u32, hi: u32, line: u32 },
+    /// The name is imported: `specifier` is the module it comes from and
+    /// `imported` the name that module publishes it under (`default` for a
+    /// default import). The caller resolves the module and asks again there.
+    Imported { specifier: String, imported: String },
+}
+
+/// Follow the binding `name` from the module in `content`.
+///
+/// Only MODULE-SCOPE declarations are read: a function of the same name
+/// nested inside another function is a different binding, and answering with
+/// it would be the confident wrong answer this pass exists to avoid. The
+/// declaration must bind a function LITERAL — a `function` declaration, a
+/// `const`/`let` initialised with an arrow or function expression, or a
+/// default export of either. A name bound to anything else (another
+/// identifier, a call's result, a class) yields `None`, and so does a name
+/// the module neither declares nor imports.
+pub fn named_resolver(file_path: &Path, content: &str, name: &str) -> Option<NamedResolver> {
+    let (source_map, module) = crate::swc_scanner::parse_standalone_module(file_path, content)?;
+    let line_of = |span: swc_common::Span| source_map.lookup_char_pos(span.lo).line as u32;
+    let declared = |span: swc_common::Span| {
+        Some(NamedResolver::Declared {
+            lo: span.lo.0,
+            hi: span.hi.0,
+            line: line_of(span),
+        })
+    };
+    // Imports are collected as the body is walked so one pass answers both
+    // questions; a local declaration wins over an import of the same name,
+    // exactly as the language binds it.
+    let mut imports: HashMap<String, (String, String)> = HashMap::new();
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                if import.type_only {
+                    continue;
+                }
+                for spec in &import.specifiers {
+                    let (local, imported) = match spec {
+                        swc_ecma_ast::ImportSpecifier::Named(named) if !named.is_type_only => {
+                            let imported = match &named.imported {
+                                Some(swc_ecma_ast::ModuleExportName::Ident(ident)) => {
+                                    ident.sym.to_string()
+                                }
+                                Some(swc_ecma_ast::ModuleExportName::Str(text)) => {
+                                    text.value.to_string()
+                                }
+                                None => named.local.sym.to_string(),
+                            };
+                            (named.local.sym.to_string(), imported)
+                        }
+                        swc_ecma_ast::ImportSpecifier::Default(default) => {
+                            (default.local.sym.to_string(), DEFAULT_EXPORT.to_string())
+                        }
+                        // A namespace binds a module, not a function, and a
+                        // type-only name binds no value at all.
+                        _ => continue,
+                    };
+                    imports.insert(local, (import.src.value.to_string(), imported));
+                }
+                continue;
+            }
+            // `export default listRecentParcels` republishes a binding this
+            // same walk answers under its own name; `export default () => …`
+            // and `export default function () {}` are the function itself.
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export))
+                if name == DEFAULT_EXPORT =>
+            {
+                return match &export.decl {
+                    DefaultDecl::Fn(function) => declared(function.function.span),
+                    _ => None,
+                };
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export))
+                if name == DEFAULT_EXPORT =>
+            {
+                return declared(function_literal_span(unwrap_expr(&export.expr))?);
+            }
+            _ => continue,
+        };
+        match decl {
+            Decl::Fn(function) if function.ident.sym.as_ref() == name => {
+                return declared(function.function.span);
+            }
+            Decl::Var(var) => {
+                for declarator in &var.decls {
+                    let Pat::Ident(ident) = &declarator.name else {
+                        continue;
+                    };
+                    if ident.id.sym.as_ref() != name {
+                        continue;
+                    }
+                    let init = declarator.init.as_deref()?;
+                    return declared(function_literal_span(unwrap_expr(init))?);
+                }
+            }
+            _ => {}
+        }
+    }
+    imports
+        .remove(name)
+        .map(|(specifier, imported)| NamedResolver::Imported {
+            specifier,
+            imported,
+        })
 }
 
 fn prop_name(name: &PropName) -> Option<String> {
@@ -328,11 +479,42 @@ kit.queryFields((t) => ({
         assert_eq!(text(BUILDER_FIELDS, &anchor), "() => listParcels()[0]");
     }
 
-    /// A resolver passed by name is structure the pass can see but not a
-    /// function it can span: the caller must send nothing.
+    /// A resolver passed by name is a binding for the caller to follow, and
+    /// the name is the one the SOURCE writes — never the field's own name,
+    /// which is what the model reports as the resolver function.
     #[test]
-    fn an_identifier_resolver_is_unresolvable() {
-        assert_eq!(at(BUILDER_FIELDS, 21), ResolverAnchor::Unresolvable);
+    fn an_identifier_resolver_names_its_binding() {
+        assert_eq!(
+            at(BUILDER_FIELDS, 21),
+            ResolverAnchor::Named("listRecentParcels".to_string())
+        );
+    }
+
+    /// A member expression names a property of a value this pass cannot
+    /// evaluate, and a name passed as a field call's ARGUMENT is a config or
+    /// a wrapper rather than the resolver. Both send nothing: following the
+    /// wrapper would type the field with the wrapper's return.
+    #[test]
+    fn a_member_or_an_argument_name_is_unresolvable() {
+        let content = "\
+kit.queryFields((t) => ({
+  archived: t.field({
+    type: ['Parcel'],
+    resolve: store.listArchived,
+  }),
+  scoped: t.field(withScope, {
+    type: ['Parcel'],
+  }),
+  configured: t.field(archivedFieldConfig),
+}));
+
+export function withScope(): string {
+  return 'scope';
+}
+";
+        assert_eq!(at(content, 2), ResolverAnchor::Unresolvable);
+        assert_eq!(at(content, 6), ResolverAnchor::Unresolvable);
+        assert_eq!(at(content, 9), ResolverAnchor::Unresolvable);
     }
 
     /// The model pointed at the `resolve:` line itself.
@@ -390,6 +572,7 @@ const resolvers = {
   Query: {
     users: async (_parent: unknown, _args: unknown, ctx: Ctx) => ctx.users(),
     accounts,
+    invoices: resolveInvoices,
   },
 };
 ";
@@ -402,7 +585,16 @@ const resolvers = {
             text(content, &at(content, 12)),
             "async (_parent: unknown, _args: unknown, ctx: Ctx) => ctx.users()"
         );
-        assert_eq!(at(content, 13), ResolverAnchor::Unresolvable);
+        assert_eq!(
+            at(content, 13),
+            ResolverAnchor::Named("accounts".to_string()),
+            "a resolver-map shorthand names the binding its key is"
+        );
+        assert_eq!(
+            at(content, 14),
+            ResolverAnchor::Named("resolveInvoices".to_string()),
+            "a resolver-map entry whose value IS a name names that binding"
+        );
     }
 
     /// Named resolvers: a function declaration, an arrow binding, a class
@@ -441,5 +633,127 @@ class OrderResolver {
     #[test]
     fn an_unparseable_file_is_absent() {
         assert_eq!(at("const = ;;; {{{", 1), ResolverAnchor::Absent);
+    }
+
+    fn binding(content: &str, name: &str) -> Option<NamedResolver> {
+        named_resolver(&PathBuf::from("resolvers.ts"), content, name)
+    }
+
+    /// The bytes a declaration names, and the line it starts on.
+    fn declared<'a>(content: &'a str, found: &Option<NamedResolver>) -> (&'a str, u32) {
+        let Some(NamedResolver::Declared { lo, hi, line }) = found else {
+            panic!("expected a declaration, got {found:?}");
+        };
+        let base = crate::swc_scanner::SWC_SPAN_BASE as usize;
+        (&content[*lo as usize - base..*hi as usize - base], *line)
+    }
+
+    const DECLARING_MODULE: &str = "\
+import { kit } from './kit.ts';
+import { listArchived as archived } from './archive.ts';
+import loadParcels from './loader.ts';
+import type { Parcel } from './kit.ts';
+import * as store from './store.ts';
+
+// Colis — déclarations
+export function listParcels(): Parcel[] {
+  return [];
+}
+
+export const listRecentParcels = (): Parcel[] => [];
+
+const PAGE_SIZE = 20;
+
+export function wrap(): void {
+  function listParcels(): string[] {
+    return [];
+  }
+}
+
+function countParcels(): number {
+  return 0;
+}
+";
+
+    /// A function declaration and an arrow binding at module scope are each
+    /// found by name, spanned at the function itself.
+    #[test]
+    fn a_module_scope_declaration_answers_its_name() {
+        let found = binding(DECLARING_MODULE, "listParcels");
+        assert_eq!(
+            declared(DECLARING_MODULE, &found),
+            ("function listParcels(): Parcel[] {\n  return [];\n}", 8)
+        );
+        let found = binding(DECLARING_MODULE, "listRecentParcels");
+        assert_eq!(
+            declared(DECLARING_MODULE, &found),
+            ("(): Parcel[] => []", 12)
+        );
+        // A resolver used in the file that declares it need not be exported.
+        let found = binding(DECLARING_MODULE, "countParcels");
+        assert_eq!(
+            declared(DECLARING_MODULE, &found),
+            ("function countParcels(): number {\n  return 0;\n}", 22)
+        );
+    }
+
+    /// An imported name reports the module to ask next and the name that
+    /// module publishes it under, so a renaming import resolves through the
+    /// EXPORTED name rather than the local one.
+    #[test]
+    fn an_imported_name_reports_the_module_to_ask() {
+        assert_eq!(
+            binding(DECLARING_MODULE, "archived"),
+            Some(NamedResolver::Imported {
+                specifier: "./archive.ts".to_string(),
+                imported: "listArchived".to_string(),
+            })
+        );
+        assert_eq!(
+            binding(DECLARING_MODULE, "loadParcels"),
+            Some(NamedResolver::Imported {
+                specifier: "./loader.ts".to_string(),
+                imported: DEFAULT_EXPORT.to_string(),
+            })
+        );
+    }
+
+    /// Names that bind no function this pass can reach: a namespace (a
+    /// module, not a function), a type-only import, a constant, a name
+    /// declared only inside another function, and a name the module neither
+    /// declares nor imports.
+    #[test]
+    fn a_name_binding_no_reachable_function_is_none() {
+        for name in ["store", "Parcel", "PAGE_SIZE", "unknownResolver"] {
+            assert_eq!(binding(DECLARING_MODULE, name), None, "{name}");
+        }
+        let found = binding(DECLARING_MODULE, "listParcels");
+        assert_eq!(
+            declared(DECLARING_MODULE, &found).1,
+            8,
+            "the module-scope declaration, never the same name nested in `wrap`"
+        );
+    }
+
+    /// A default export is reachable under the name the export table
+    /// publishes it as, whether it is written as a declaration or a literal.
+    #[test]
+    fn a_default_export_answers_under_its_published_name() {
+        let content = "export default function (): number {\n  return 1;\n}\n";
+        assert_eq!(
+            declared(content, &binding(content, DEFAULT_EXPORT)),
+            ("function (): number {\n  return 1;\n}", 1)
+        );
+        let content = "export default (): number => 1;\n";
+        assert_eq!(
+            declared(content, &binding(content, DEFAULT_EXPORT)),
+            ("(): number => 1", 1)
+        );
+        let content = "const resolve = (): number => 1;\nexport default resolve;\n";
+        assert_eq!(
+            binding(content, DEFAULT_EXPORT),
+            None,
+            "a default export that republishes a binding is one hop too far"
+        );
     }
 }

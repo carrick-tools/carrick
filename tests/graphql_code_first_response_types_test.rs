@@ -12,22 +12,33 @@
 //! Every site sits below multi-byte prose (`// Colis — lecture`), so a span
 //! sent in byte units would miss the function it names (carrick#805).
 //!
+//! A resolver the field NAMES rather than writes is followed to the function
+//! the name binds, in this file or in the module it is imported from
+//! (carrick#1294); a name that leads to no function declaration still sends
+//! nothing.
+//!
 //! Answer key, read by hand from the fixture:
 //!
 //! | field | resolver | response type |
 //! |---|---|---|
 //! | `health` (`kit.ts:19`) | `() => 'ok'` on the field line | `string` |
-//! | `parcels` (`queries.ts:6`) | `() => listParcels()` two lines down | `Parcel[]` |
-//! | `parcel` (`queries.ts:10`) | arrow four lines down | `Parcel` (the sidecar renders an optional payload as the payload) |
-//! | `heaviestWeight` (`queries.ts:16`) | `resolve` beside a `validate` function | `number` |
+//! | `parcels` (`queries.ts:7`) | `() => listParcels()` two lines down | `Parcel[]` |
+//! | `parcel` (`queries.ts:11`) | arrow four lines down | `Parcel` (the sidecar renders an optional payload as the payload) |
+//! | `heaviestWeight` (`queries.ts:17`) | `resolve` beside a `validate` function | `number` |
 //! | `dispatchParcel` (`mutations.ts:5`) | arrow three lines down | `Parcel` |
-//! | `recentParcels` (`queries.ts:21`) | an identifier, not a literal | none: no anchor is sent |
+//! | `recentParcels` (`queries.ts:22`) | an identifier, declared in `store.ts` | `Parcel[]` |
+//! | `parcelCount` (`queries.ts:26`) | an identifier, declared below in the same file | `number` |
+//! | `archivedParcels` (`queries.ts:29`) | `store.listArchived`, a member of a namespace | none: no anchor is sent |
 //! | `recallParcel`, `retireParcel` | no resolver located | none |
 //!
 //! Without the span, a bare line anchor binds `parcels` and `dispatchParcel`
 //! to the builder callback one line above (the whole fields object), and
 //! `parcel` and `recentParcels` to the PREVIOUS field's resolver two lines
 //! above: confidently wrong types, which is what this test rules out.
+//!
+//! The two functions a named resolver reaches sit below multi-byte prose in
+//! `store.ts` as well, so a span converted against the importing file's source
+//! rather than the declaring file's misses them too.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -151,12 +162,26 @@ fn a_code_first_field_serves_its_resolver_return_type() {
         "a mutation's resolver three lines below its field"
     );
 
-    // A resolver named rather than written: no anchor is sent, so the entry
-    // stays unknown instead of carrying the neighbouring field's type.
+    // A resolver named rather than written: the name is followed to the
+    // function it binds, never to the neighbouring field's resolver.
     assert_eq!(
         typed("query|recentParcels"),
+        ("explicit".to_string(), Some(format!("{PARCEL}[]"))),
+        "an identifier resolver imported from another module is followed to its \
+         declaration there"
+    );
+    assert_eq!(
+        typed("query|parcelCount"),
+        ("explicit".to_string(), Some("number".to_string())),
+        "an identifier resolver declared in the same file is followed to it"
+    );
+
+    // A name the pass cannot follow to a function declaration still sends
+    // nothing: the entry stays unknown instead of carrying a neighbour's type.
+    assert_eq!(
+        typed("query|archivedParcels"),
         ("unknown".to_string(), None),
-        "an identifier resolver is left unresolved, never bound to a neighbour"
+        "a member expression names no binding this pass can follow"
     );
     // Fields no admitted file resolves keep their printed-schema anchor only.
     for field in ["mutation|recallParcel", "mutation|retireParcel"] {
