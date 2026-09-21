@@ -2331,24 +2331,6 @@ export class TypeInferrer {
   }
 
   /**
-   * A shape a JSON body can be: an object, an array, or a union of them.
-   * Top types, primitives, `void` and callables are not.
-   */
-  private isObjectShape(type: Type): boolean {
-    if (type.isAny() || type.isUnknown()) return false;
-    if (type.isUnion()) {
-      const parts = type
-        .getUnionTypes()
-        .filter((part) => !part.isUndefined() && !part.isNull());
-      return parts.length > 0 && parts.every((part) => this.isObjectShape(part));
-    }
-    if (type.isIntersection()) {
-      return type.getIntersectionTypes().every((part) => this.isObjectShape(part));
-    }
-    return type.isObject() && !this.isCallableType(type);
-  }
-
-  /**
    * The member read that takes `identifier` as its RECEIVER — `query` in
    * `query.data`, `envelope` in `envelope.list[0]` — or `undefined` when the
    * identifier names the value itself.
