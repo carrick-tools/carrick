@@ -203,6 +203,7 @@ async function renderNative(args) {
 /** Run the scanner binary, streaming its output and answering with its code. */
 async function runNative(args) {
   const { resolveNativeBinary, nativeEnv, overrideLine } = await import("../dist/native.js");
+  const { relaySignals } = await import("../dist/scan.js");
   const lookup = resolveNativeBinary();
   if (!lookup.binary) {
     process.stderr.write(`carrick: ${lookup.problem}\n`);
@@ -215,11 +216,17 @@ async function runNative(args) {
     stdio: "inherit",
     env: nativeEnv(),
   });
+  // The streams are inherited here, so a scan this process walks out on keeps
+  // writing to the terminal — but it is still a scan nobody told to stop, and
+  // a `kill` on this pid reaches this process alone (carrick#1391).
+  const stopRelaying = relaySignals(child);
   child.on("error", (error) => {
+    stopRelaying();
     process.stderr.write(`carrick: could not run ${lookup.binary}: ${error.message}\n`);
     process.exit(1);
   });
   child.on("exit", (code, signal) => {
+    stopRelaying();
     // A signalled child is reported the way a shell reports it, so a Ctrl-C
     // through this shim looks like a Ctrl-C of the scanner.
     if (signal) {

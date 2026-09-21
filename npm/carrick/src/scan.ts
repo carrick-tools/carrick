@@ -432,6 +432,94 @@ function writeThrough(lines: string[]): void {
 }
 
 /**
+ * The signals a parent passes on to the scan it is running, and the signal it
+ * only waits for (carrick#1391).
+ *
+ * `SIGTERM` and `SIGHUP` reach the process they name and nothing else, so a
+ * harness stopping this command, or a `kill` on its pid, is heard here alone:
+ * they are passed on. A terminal's `SIGINT` has already gone to the whole
+ * foreground process group, child included, and a second one tells the scanner
+ * to abandon the report it is in the middle of making (carrick#1235) — so it
+ * is not passed on, and `kill -INT <this pid>` is the case this leaves to the
+ * scan's own end.
+ */
+const PASSED_ON: NodeJS.Signals[] = ["SIGTERM", "SIGHUP"];
+const AWAITED: NodeJS.Signals[] = ["SIGINT"];
+
+/**
+ * Stay for the child, and tell it what was said to us.
+ *
+ * Node's default action for each of these ends this process, which is what
+ * left a scanner running with nobody holding its streams: orphaned, it wrote
+ * on to a pipe whose other end had gone and died of it, with nothing said to
+ * the cloud. A listener — any listener — takes that default away, so the
+ * important half of this is that it exists at all; what it does with the
+ * signal is the rest.
+ *
+ * The second signal is the way out. Someone who signals twice is asking for
+ * this to be over now, so the listeners go, the child is killed rather than
+ * left, and the signal is re-raised at this process so the shell reads it as
+ * the signal it was.
+ *
+ * Returns the undo, which the caller runs before it reports the child's own
+ * ending: a re-raised signal with these still installed would be caught by
+ * them instead of ending anything.
+ */
+export function relaySignals(
+  child: { kill: (signal: NodeJS.Signals) => boolean },
+  // Injected so a test can drive the whole shape in one process.
+  host: {
+    on: (signal: NodeJS.Signals, handler: () => void) => void;
+    off: (signal: NodeJS.Signals, handler: () => void) => void;
+    raise: (signal: NodeJS.Signals) => void;
+  } = {
+    on: (signal, handler) => void process.on(signal, handler),
+    off: (signal, handler) => void process.off(signal, handler),
+    raise: (signal) => {
+      try {
+        process.kill(process.pid, signal);
+      } catch {
+        // Windows implements a few signals and refuses the rest, and this is
+        // the moment someone asked twice for this to be over: end, rather
+        // than throw out of a handler on the way.
+        process.exit(1);
+      }
+    },
+  },
+): () => void {
+  const installed: [NodeJS.Signals, () => void][] = [];
+  let heard = false;
+  const stop = (): void => {
+    for (const [signal, handler] of installed.splice(0)) host.off(signal, handler);
+  };
+  for (const signal of [...PASSED_ON, ...AWAITED]) {
+    const handler = (): void => {
+      if (heard) {
+        stop();
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone, which is the state this was asking for.
+        }
+        host.raise(signal);
+        return;
+      }
+      heard = true;
+      if (!PASSED_ON.includes(signal)) return;
+      try {
+        child.kill(signal);
+      } catch {
+        // The child ended between the signal and this; its own exit is the
+        // answer the caller is already waiting for.
+      }
+    };
+    installed.push([signal, handler]);
+    host.on(signal, handler);
+  }
+  return stop;
+}
+
+/**
  * Run the binary and render it.
  *
  * stdin stays inherited: a build asks nothing, but a child holding no stdin
@@ -471,6 +559,10 @@ export async function renderScan(options: {
       stream.on("error", () => resolve());
     });
 
+  // Before the first await on the child, because a signal that lands between
+  // the spawn and this one would end this process and orphan it (carrick#1391).
+  const stopRelaying = relaySignals(child);
+
   const ended = new Promise<{ code: number; signal: NodeJS.Signals | null }>(
     (resolve, reject) => {
       child.on("error", reject);
@@ -483,6 +575,10 @@ export async function renderScan(options: {
     read(child.stderr, (line) => render.stderr(line)),
     ended,
   ]);
+  // The child is gone, so there is nothing left to relay — and the caller
+  // answers a signalled child by raising that signal at itself, which these
+  // would otherwise catch.
+  stopRelaying();
 
   const failed = outcome.code !== 0 || outcome.signal !== null;
   const drew = await render.finish(failed);
