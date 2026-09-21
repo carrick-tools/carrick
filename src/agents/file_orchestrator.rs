@@ -12088,8 +12088,13 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (_explicit, infer, _inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            ".",
+            &graph,
+            &config,
+            &modules_without_config(),
+        );
         infer
     }
 

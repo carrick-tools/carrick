@@ -71,6 +71,7 @@ jobs:
           cargo test --verbose
           --test action_install_test
           --test alias_import_callers_test
+          --test alias_shaped_type_imports_test
           --test analysis_failure_keeps_deterministic_rows_test
           --test bundle_row_id_golden_test
           --test commonjs_require_callers_test
