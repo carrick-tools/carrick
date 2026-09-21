@@ -118,6 +118,82 @@ pub struct HandlerSpan {
     pub end_line: u32,
 }
 
+/// What a consumer row IS: the line that opens the connection, or a line that
+/// reaches it through a declaration this scan read (carrick#1385).
+///
+/// One request written the way a client normally writes it raises rows in two
+/// files — the call through the client method, and the request that method's
+/// own body issues — and #1383 folds only the rows WITHIN one file. Nothing on
+/// an indexed row said which of the two is the request, so a reader counting
+/// consumers counted two for one request and could not group them.
+///
+/// Derived from the row's own [`ResolutionSource`], which is the scanner's
+/// statement about which pass read the row and therefore about what the call
+/// site's own source states. It is never the model's: a source the model
+/// stated, or no source at all, produces no role at all.
+///
+/// [`ResolutionSource`]: crate::agents::file_analyzer_agent::ResolutionSource
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerRole {
+    /// The request is made at this line: the site's own source states the
+    /// target, whatever transport it hands the request to.
+    NetworkRequest,
+    /// This line reaches a request stated in a declaration elsewhere, which
+    /// this scan read. The site's own source states neither the method nor the
+    /// path.
+    WrapperCall,
+}
+
+impl ConsumerRole {
+    /// The role a resolution source implies, or `None` where it implies none.
+    ///
+    /// The question each arm answers is one question: **does the call site's
+    /// own source state the request's target?**
+    ///
+    /// [`ImportedMember`] is the one source whose whole definition is that it
+    /// does not — "the site carries no path and no method", both read out of a
+    /// member declared in another module — so its row is a call THROUGH a
+    /// declaration. Every source that read the target off the site's own file
+    /// is the request, including the two wrapper forms: a same-file wrapper
+    /// and a request spec are resolved AT the site that states the path, and
+    /// the wrapper is transport.
+    ///
+    /// The route sources never appear on a call row; they are listed so this
+    /// match states the whole vocabulary rather than falling through, and a
+    /// new variant has to be classified here rather than silently defaulting.
+    ///
+    /// `Model` gets no role. The model row is exactly the shape that cannot be
+    /// read off the site — the target it states may appear nowhere in the
+    /// site's own source — and guessing here would put the scanner's name on
+    /// the model's reading. carrick#1403 is the join that classifies those.
+    ///
+    /// [`ImportedMember`]: crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember
+    pub fn of(
+        source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    ) -> Option<Self> {
+        use crate::agents::file_analyzer_agent::ResolutionSource as S;
+        match source? {
+            S::ImportedMember => Some(Self::WrapperCall),
+            S::RequestSpec
+            | S::SameFileWrapper
+            | S::WholeUrlEnv
+            | S::EnvBasePath
+            | S::NewUrl
+            | S::ReceiverType
+            | S::InlineLiteral => Some(Self::NetworkRequest),
+            // The model's own reading, and the sources that only ever state a
+            // ROUTE. Neither says what a consumer row is.
+            S::Model
+            | S::FileBasedRoute
+            | S::DescriptorRoute
+            | S::ClassController
+            | S::DecoratorRoute
+            | S::DeclaredOperation => None,
+        }
+    }
+}
+
 /// Represents a data-fetching call with its target
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFetchingCall {
@@ -202,6 +278,25 @@ pub struct DataFetchingCall {
     /// Retention only: nothing in matching reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    /// Whether this row is the network request or a call through a declaration
+    /// (carrick#1385). See [`ConsumerRole`].
+    ///
+    /// `None` means the scan did not classify the row — an older scanner, a row
+    /// whose `resolution_source` the scan did not state, or the model's own
+    /// reading — never that the row is a request. Retention only: nothing in
+    /// matching reads it.
+    ///
+    /// HOW A READER COUNTS WITH IT, and the second clause is load-bearing: for
+    /// one operation, the requests are the rows that are NOT `wrapper_call`;
+    /// and where an operation has ONLY `wrapper_call` rows, each of them is
+    /// its own request. The imported-member pass exists precisely for clients
+    /// whose own module states its requests in a form the candidate scanner
+    /// raises nothing for, so the declaration a row reaches often has no row of
+    /// its own, and subtracting it would count the operation to zero.
+    /// carrick#1402 replaces that clause with the link that makes the grouping
+    /// exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ConsumerRole>,
     /// The literal this call sends for the field its target dispatches on
     /// (carrick#831), read off the call site's own request body.
     ///
@@ -612,6 +707,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            role: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -634,6 +730,9 @@ mod tests {
         // Absent, so the read path sees "this scan did not state how the row
         // was resolved" rather than a claim about the row (carrick#660).
         assert_eq!(older.resolution_source, None);
+        // Same rule one field on (carrick#1385): a row with no role is a row
+        // the scan did not classify, never a request.
+        assert_eq!(older.role, None);
 
         let retained = DataFetchingCall {
             host: Some("api.vendor.test".to_string()),
@@ -641,14 +740,70 @@ mod tests {
             resolution_source: Some(
                 crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember,
             ),
+            role: Some(ConsumerRole::WrapperCall),
             ..call
         };
         let json = serde_json::to_value(&retained).unwrap();
         assert_eq!(json["host"], serde_json::json!("api.vendor.test"));
         assert_eq!(json["line"], serde_json::json!(4));
+        assert_eq!(json["role"], serde_json::json!("wrapper_call"));
         assert_eq!(
             json["resolution_source"],
             serde_json::json!("imported_member")
+        );
+    }
+
+    /// The whole vocabulary, stated (carrick#1385). One question decides every
+    /// arm — does the call site's own source state the request's target — and
+    /// the match in `ConsumerRole::of` is exhaustive, so a new resolution
+    /// source cannot reach the blob unclassified by accident: it has to be
+    /// added here, and this test says what the answer has to mean.
+    #[test]
+    fn every_resolution_source_states_the_role_it_implies() {
+        use crate::agents::file_analyzer_agent::ResolutionSource as S;
+
+        for source in [
+            S::RequestSpec,
+            S::SameFileWrapper,
+            S::WholeUrlEnv,
+            S::EnvBasePath,
+            S::NewUrl,
+            S::ReceiverType,
+            S::InlineLiteral,
+        ] {
+            assert_eq!(
+                ConsumerRole::of(Some(source)),
+                Some(ConsumerRole::NetworkRequest),
+                "{source:?} read the target off the call site's own file, so \
+                 the request is made at that line"
+            );
+        }
+
+        assert_eq!(
+            ConsumerRole::of(Some(S::ImportedMember)),
+            Some(ConsumerRole::WrapperCall),
+            "the one source whose site states neither the method nor the path"
+        );
+
+        for source in [
+            S::Model,
+            S::FileBasedRoute,
+            S::DescriptorRoute,
+            S::ClassController,
+            S::DecoratorRoute,
+            S::DeclaredOperation,
+        ] {
+            assert_eq!(
+                ConsumerRole::of(Some(source)),
+                None,
+                "{source:?} says nothing about what a consumer row is"
+            );
+        }
+
+        assert_eq!(
+            ConsumerRole::of(None),
+            None,
+            "a row the scan did not resolve is not a request"
         );
     }
 
@@ -1315,6 +1470,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                role: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

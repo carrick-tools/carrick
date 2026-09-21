@@ -8020,6 +8020,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            role: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -8688,6 +8689,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                role: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -8860,6 +8862,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            role: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -9686,6 +9689,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                role: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -9702,6 +9706,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                role: None,
             },
         ];
 
@@ -10985,6 +10990,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            role: None,
         }
     }
 
@@ -11043,6 +11049,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            role: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
