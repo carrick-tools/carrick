@@ -81,8 +81,10 @@ local credential identity before serving hosted answers; a different or missing
 credential returns `index_unreadable` until the local index is rebuilt. A scoped
 refresh retains other local
 scans only when workspace paths and authenticated hosted inputs are unchanged;
-otherwise it rebuilds the local services before joining them. Nothing uploads
-local source or runs a model on this machine.
+otherwise it rebuilds the local services before joining them. `refresh` uploads
+nothing. `index` sends Carrick Cloud the source of the files the deterministic
+passes could not classify and of the functions it writes intents for, and
+uploads the index it builds. No model runs on this machine.
 
 ## JSON
 
@@ -145,7 +147,7 @@ local source or runs a model on this machine.
 
 `boundary` is the `ServiceBoundary` block from `src/boundary.rs`, verbatim and
 whole; the fields above are a sample of it, not its definition. `files_attempted`
-is 0 on every local index, because a local index asks the model nothing.
+is 0 on every service `refresh` scans, because `refresh` asks the model nothing.
 `candidates_withheld_changed_files`, when present, counts files whose hosted
 model answers were withheld because their working-tree bytes changed. An absent
 counter means this scan did not record it.
@@ -483,6 +485,6 @@ schema: `{ "schema": "carrick.status/0", "error": "not_indexed", "message": "...
 
 ## Out of scope in this version
 
-- Local model calls and uploads.
+- Local model calls.
 - Per-file incremental extraction and a persistent process.
 - Background hosted refresh timers or changes to the MCP tool surface.
