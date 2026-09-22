@@ -412,18 +412,49 @@ async fn report_interruption(repo_path: &str) {
             return;
         }
     };
-    let stage = scan_stage::current();
-    match (report, scan_id) {
-        (InterruptionReport::ScanFailed, Some(scan_id)) => {
+    // The slot this run holds, which the signal dropped the engine and its
+    // storage with. Both the marker and the log have to name it: a laptop
+    // log is stored against its scan, and one that names none can only be
+    // answered `404 scan_not_started` (carrick#1370).
+    if let Some(scan_id) = scan_id {
+        storage.adopt_scan_id(scan_id);
+    }
+    report_interruption_to(&storage, repo_path, report, logging::run_log_file()).await;
+}
+
+/// The report itself: the marker, and then this run's log.
+///
+/// Separated from the gates above so it can be driven against a storage that
+/// records what it was handed. The order is the engine's, and for the same
+/// reason ([`engine::run_analysis_engine_with_sidecar`]): the marker is four
+/// short fields and the log is up to five megabytes, and a process that is
+/// already going may not get to finish both. Nothing here waits on either;
+/// the caller races the whole of it against a second signal and the budget.
+///
+/// The log was simply never sent on this path (carrick#1473). The only call
+/// to the upload was on the analysis future's return, and a dropped future
+/// never reaches it, so the one death class the cloud did hear about arrived
+/// as four fields and nothing to read.
+async fn report_interruption_to<T: cloud_storage::CloudStorage + Sync>(
+    storage: &T,
+    repo_path: &str,
+    report: InterruptionReport,
+    log: Option<&Path>,
+) {
+    match report {
+        InterruptionReport::Nothing => return,
+        InterruptionReport::ScanFailed => {
             storage
-                .report_scan_failed_for(scan_id, stage.as_str(), shutdown::INTERRUPTED_REASON)
+                .report_scan_failed(scan_stage::current().as_str(), shutdown::INTERRUPTED_REASON)
                 .await
         }
-        _ => {
+        InterruptionReport::PreflightFailed => {
             let error = std::io::Error::other(shutdown::INTERRUPTED_REASON);
-            engine::report_preflight_failure(&storage, repo_path, stage, &error).await
+            engine::report_preflight_failure(storage, repo_path, scan_stage::current(), &error)
+                .await
         }
     }
+    engine::upload_run_log_from(storage, repo_path, log).await;
 }
 
 /// Whether a run with these settings talks to Carrick Cloud: the same
@@ -891,6 +922,62 @@ mod tests {
     fn a_package_command_says_where_it_lives() {
         let problem = unknown_command(&args(&["init"])).expect("a package command");
         assert!(problem.contains("npm i -g carrick"), "{problem}");
+    }
+
+    /// An interrupted run sends its marker and then its log, and the log is
+    /// this run's own file (carrick#1473).
+    ///
+    /// Before this, the only call to the upload was on the analysis future's
+    /// return path, which a dropped future never reaches: the one death the
+    /// cloud did hear about arrived as four fields with nothing to read
+    /// beside them.
+    #[tokio::test]
+    async fn an_interrupted_run_ships_its_log_after_its_marker() {
+        let log = tempfile::NamedTempFile::new().expect("a log for the run");
+        std::fs::write(log.path(), "a line this run wrote\n").expect("write the log");
+        let storage = MockStorage::new();
+
+        report_interruption_to(
+            &storage,
+            ".",
+            InterruptionReport::ScanFailed,
+            Some(log.path()),
+        )
+        .await;
+
+        let marked = storage.scan_failures();
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        assert_eq!(marked[0].1, shutdown::INTERRUPTED_REASON);
+        let shipped = storage.uploaded_logs();
+        assert_eq!(shipped.len(), 1, "the log went with the marker");
+        assert!(
+            shipped[0].contains("a line this run wrote"),
+            "{}",
+            shipped[0]
+        );
+    }
+
+    /// A run stopped before `start-scan` answered says so through the other
+    /// event, and still sends what it wrote.
+    #[tokio::test]
+    async fn a_run_interrupted_before_its_scan_opened_reports_the_other_event() {
+        let log = tempfile::NamedTempFile::new().expect("a log for the run");
+        std::fs::write(log.path(), "a line this run wrote\n").expect("write the log");
+        let storage = MockStorage::new();
+
+        report_interruption_to(
+            &storage,
+            ".",
+            InterruptionReport::PreflightFailed,
+            Some(log.path()),
+        )
+        .await;
+
+        assert!(storage.scan_failures().is_empty());
+        let before = storage.preflight_failures();
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0].2, shutdown::INTERRUPTED_REASON);
+        assert_eq!(storage.uploaded_logs().len(), 1);
     }
 
     /// Anything written as a path still reaches the scan, and a path that does
