@@ -159,7 +159,7 @@
         "col": { "type": ["integer", "null"], "minimum": 1 },
         "source": {
           "enum": ["fact", "candidate"],
-          "description": "fact = a deterministic pass stated it; candidate = the model's reading alone. Candidate rows are replayed hosted model answers on unchanged files."
+          "description": "fact = a deterministic pass stated it; candidate = the model's reading alone. Candidate rows are model answers from the scan that built the index, or replayed hosted model answers on unchanged files."
         },
         "resolution_source": {
           "type": ["string", "null"],
