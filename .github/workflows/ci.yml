@@ -53,10 +53,15 @@ jobs:
       # binary reads the other one's signal as its own however they are
       # ordered (carrick#1387 — it passed on the pull request and failed in
       # the merge queue on the order alone).
+      #
+      # panic_hook_test is here for the same reason in a different shape: a
+      # panic hook is process-global too, so a test that installs one would
+      # report for every other test sharing the process (carrick#1470).
       - name: Run the signal tests
         run: |
           cargo test --test shutdown_signal_test --verbose
           cargo test --test shutdown_drain_test --verbose
+          cargo test --test panic_hook_test --verbose
 
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test and span_locator_units_test need
