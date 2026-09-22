@@ -274,10 +274,22 @@ const RUN_ID_HEADER: &str = "X-Carrick-Run-Id";
 /// is otherwise attributed by guessing at timestamps.
 const SCANNER_VERSION_HEADER: &str = "X-Carrick-Scanner-Version";
 
-/// How long the fail marker waits. A run that is already over should not
-/// hold a terminal open on the way out, and the marker is worth exactly one
-/// short attempt.
-const SCAN_FAILED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one attempt at an end-of-run marker waits.
+///
+/// Sized by what an interrupted run has for the whole report
+/// ([`crate::shutdown::INTERRUPTION_REPORT_BUDGET`], five seconds): both
+/// attempts and everything around them have to fit inside it, or the second
+/// one is spent on a process that is already being abandoned. A run that is
+/// already over must not hold a terminal open on the way out either.
+const MARKER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_400);
+
+/// How many attempts an end-of-run marker gets.
+///
+/// Two, because this is the scanner's single chance to say it died and the
+/// first attempt of it used to be the only one. Not more: a run that is
+/// already over must not spend a backoff ladder telling anyone so, and the
+/// cloud's own slot expiry is what covers a marker that never lands.
+const MARKER_ATTEMPTS: u32 = 2;
 
 pub struct AwsStorage {
     lambda_url: String,
@@ -1351,8 +1363,7 @@ impl AwsStorage {
             reason,
         };
 
-        self.post_run_marker_once(token, request.action, &request)
-            .await;
+        self.post_run_marker(token, request.action, &request).await;
     }
 
     /// `close-scan`: the run ended, and it replaced no index (carrick#1262).
@@ -1400,57 +1411,87 @@ impl AwsStorage {
             reason,
         };
 
-        self.post_run_marker_once(token, request.action, &request)
-            .await;
+        self.post_run_marker(token, request.action, &request).await;
     }
 
-    /// Send one end-of-run marker, once, and say what happened at debug only.
+    /// Send one end-of-run marker, with one retry, and say at warn when both
+    /// attempts failed (carrick#1472).
     ///
     /// Shared by `scan-failed`, `preflight-failed` and `close-scan`: all three
-    /// describe a run that is already over, so none of them may retry, wait
-    /// long, or raise a second error — a 4xx from a cloud that predates the
-    /// action, a 5xx and a dead network all end here as one debug line.
+    /// describe a run that is already over, and all three are the scanner's
+    /// single chance to say it died. One attempt with a debug-only failure
+    /// line made that chance best effort in both directions, and nobody could
+    /// tell from either side when it was missed.
     ///
-    /// That line carries the refusal's `code` when the body has one, because
-    /// the status alone cannot tell an action this deploy does not know (403,
-    /// no code) from a scan belonging to another workspace (403
-    /// `scan_not_authorized`) — and after a deploy those two want opposite
+    /// So: a second attempt, but only for the failures a second attempt can
+    /// answer. A transport error or a 5xx is the cloud not having heard; a 4xx
+    /// is the cloud having heard and decided, and sending it again would get
+    /// the same decision. That line carries the refusal's `code` when the body
+    /// has one, because the status alone cannot tell an action this deploy does
+    /// not know (403, no code) from a scan belonging to another workspace (403
+    /// `scan_not_authorized`), and after a deploy those two want opposite
     /// things done about them.
-    async fn post_run_marker_once<B: Serialize + ?Sized>(
-        &self,
-        token: &str,
-        action: &str,
-        body: &B,
-    ) {
-        let sent = self
-            .http_client
-            .post(&self.lambda_url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header(RUN_ID_HEADER, crate::logging::run_id())
-            .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
-            .timeout(SCAN_FAILED_TIMEOUT)
-            .json(body)
-            .send()
-            .await;
+    ///
+    /// Both attempts together fit inside [`crate::shutdown::INTERRUPTION_REPORT_BUDGET`],
+    /// which is what an interrupted run has for the whole report: two attempts
+    /// of [`MARKER_ATTEMPT_TIMEOUT`] with nothing between them. That is shorter
+    /// per attempt than the single ten-second try it replaces, which is the
+    /// trade: a cloud that takes more than a cold start to answer now loses the
+    /// marker on a path where the interruption budget was abandoning it anyway.
+    async fn post_run_marker<B: Serialize + ?Sized>(&self, token: &str, action: &str, body: &B) {
+        let mut last: Option<String> = None;
+        for attempt in 0..MARKER_ATTEMPTS {
+            let sent = self
+                .http_client
+                .post(&self.lambda_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header(RUN_ID_HEADER, crate::logging::run_id())
+                .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+                .timeout(MARKER_ATTEMPT_TIMEOUT)
+                .json(body)
+                .send()
+                .await;
 
-        match sent {
-            Ok(response) if response.status().is_success() => {
-                debug!(action = %action, "Told Carrick Cloud how this run ended");
+            match sent {
+                Ok(response) if response.status().is_success() => {
+                    debug!(action = %action, "Told Carrick Cloud how this run ended");
+                    return;
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    let code = refusal_code(response.text().await.ok().as_deref());
+                    let said = format!(
+                        "{status} ({})",
+                        code.as_deref().unwrap_or("no code in the body")
+                    );
+                    if !is_transient_status(status) {
+                        // A decision, stated once. Retrying it would ask the
+                        // same question and be told the same thing.
+                        debug!(
+                            action = %action,
+                            status = %status,
+                            code = %code.as_deref().unwrap_or("none"),
+                            "Carrick Cloud did not record how this run ended"
+                        );
+                        return;
+                    }
+                    last = Some(said);
+                }
+                Err(e) => last = Some(e.to_string()),
             }
-            Ok(response) => {
-                let status = response.status();
-                let code = refusal_code(response.text().await.ok().as_deref());
-                debug!(
-                    action = %action,
-                    status = %status,
-                    code = %code.as_deref().unwrap_or("none"),
-                    "Carrick Cloud did not record how this run ended"
-                );
-            }
-            Err(e) => {
-                debug!(action = %action, "Could not tell Carrick Cloud how this run ended: {e}");
-            }
+            debug!(
+                action = %action,
+                attempt = attempt + 1,
+                "Carrick Cloud has not recorded how this run ended: {}",
+                last.as_deref().unwrap_or("no answer")
+            );
         }
+
+        warn!(
+            "Carrick Cloud was not told how this run ended ({action}, {}). Its record of this \
+             scan clears on its own; nothing here needs doing.",
+            last.as_deref().unwrap_or("no answer")
+        );
     }
 
     /// Stage an oversized serialized CloudRepoData to the presigned URL from
@@ -2027,11 +2068,11 @@ impl CloudStorage for AwsStorage {
     /// `{ ok: true }`. Sent before the log upload, so the marker exists even
     /// if the log does not.
     ///
-    /// One attempt, a short timeout and no retry loop: a run that is already
-    /// failing must not spend a backoff ladder on telling anyone so, and a
-    /// marker the cloud never receives costs the same as the nothing that was
-    /// sent before this existed — the slot falls to its TTL. Nothing here can
-    /// change the run's exit code.
+    /// Two bounded attempts and no backoff ladder: a run that is already
+    /// failing must not spend one on telling anyone so, and a marker the cloud
+    /// never receives costs the same as the nothing that was sent before this
+    /// existed — the slot falls to its TTL. Nothing here can change the run's
+    /// exit code.
     ///
     /// Only the laptop path: the CI path opens no scan, so there is no slot to
     /// mark and no `scan_id` to name it with. And nothing can be sent at all
@@ -2052,10 +2093,10 @@ impl CloudStorage for AwsStorage {
     /// scanner_version }`, Bearer auth, 202 on accept. `repo` is sent as
     /// `null` when the origin names none, never omitted.
     ///
-    /// Exactly the fail marker's delivery: one attempt, the same short
-    /// timeout, and every refusal read at debug. A cloud deployed before this
-    /// action existed answers 404, and a run that stopped at a missing
-    /// runtime must not add a second error about its own bookkeeping.
+    /// Exactly the fail marker's delivery: the same two bounded attempts, and
+    /// every refusal read at debug. A cloud deployed before this action existed
+    /// answers 404, and a run that stopped at a missing runtime must not add a
+    /// second error about its own bookkeeping.
     ///
     /// Laptop credential only: a CI run is visible in its own Actions log and
     /// its OIDC identity is not a user the cloud could alert about. And never
@@ -2092,8 +2133,7 @@ impl CloudStorage for AwsStorage {
             reason,
             scanner_version: env!("CARGO_PKG_VERSION"),
         };
-        self.post_run_marker_once(token, request.action, &request)
-            .await;
+        self.post_run_marker(token, request.action, &request).await;
     }
 
     async fn post_pr_result(
@@ -3365,9 +3405,9 @@ mod tests {
     }
 
     /// The cloud deployed today has no `close-scan` and answers 403 from its
-    /// action gate. That is the nothing this run sent before the marker
-    /// existed: one attempt, no retry, no error of its own, and the scan the
-    /// cloud is still holding falls to its TTL exactly as it does now.
+    /// action gate. That is a decision rather than a cloud that did not hear,
+    /// so it is stated once and never sent again, with no error of its own,
+    /// and the scan the cloud is still holding falls to its TTL as it does now.
     #[tokio::test]
     async fn a_refused_close_marker_is_swallowed_and_never_retried() {
         let (storage, server) = bearer_storage_in_scan(
@@ -3441,13 +3481,14 @@ mod tests {
         );
     }
 
-    /// A cloud without the action answers 404, another refusal answers 403,
-    /// and a failing cloud answers 500: each is one attempt, swallowed. The
-    /// call returns `()`, so there is no path by which it could change the
-    /// run's exit code; what this pins is that nothing retries.
+    /// A cloud without the action answers 404 and another refusal answers
+    /// 403: each is a decision, made once and swallowed. The call returns
+    /// `()`, so there is no path by which it could change the run's exit code;
+    /// what this pins is that a decision is never asked for twice
+    /// (carrick#1472).
     #[tokio::test]
     async fn a_refused_pre_scan_report_is_swallowed_and_never_retried() {
-        for status in [404u16, 403, 500] {
+        for status in [404u16, 403] {
             let (storage, server) =
                 bearer_storage(vec![(status, r#"{"message":"no"}"#.to_string())]);
             storage
@@ -3457,6 +3498,70 @@ mod tests {
             assert_eq!(requests.len(), 1, "{status} was retried");
             assert_eq!(body_of(&requests[0])["repo"], "example/api");
         }
+    }
+
+    /// The marker is the scanner's one chance to say it died, so a cloud that
+    /// did not hear is asked a second time and the second attempt lands
+    /// (carrick#1472).
+    ///
+    /// The stub holds one answer past the two the marker needs, and the test
+    /// claims it with a request of its own. Without that, a retry that had
+    /// been deleted would leave the server waiting on a connection that never
+    /// comes and the case would hang instead of failing; with it, the second
+    /// recorded request is the probe and the assertion names it.
+    #[tokio::test]
+    async fn a_marker_the_cloud_did_not_hear_is_sent_again() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![
+            (500, r#"{"message":"no"}"#.to_string()),
+            (200, serde_json::json!({ "ok": true }).to_string()),
+            (200, String::new()),
+        ]);
+        let storage = AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+        storage.scan_id.set("scan_01J".to_string()).unwrap();
+
+        storage.report_scan_failed("upload", "interrupted").await;
+
+        // Whatever the marker left, this claims, so the stub's thread ends and
+        // this case fails on an assertion rather than on a join that waits for
+        // a connection nobody is going to make.
+        let client = http_client_builder().no_proxy().build().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() && std::time::Instant::now() < deadline {
+            let _ = client
+                .get(format!("{base}/probe"))
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await;
+        }
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        for sent in &requests[..2] {
+            assert!(
+                !sent.starts_with("GET /probe"),
+                "the marker was sent once and a probe took the answer the retry should have: \
+                 {requests:?}"
+            );
+            let body = body_of(sent);
+            assert_eq!(body["action"], "scan-failed");
+            assert_eq!(body["scan_id"], "scan_01J");
+            assert_eq!(body["reason"], "interrupted");
+        }
+    }
+
+    /// Both attempts fit inside what an interrupted run has for the whole of
+    /// its report, or the second one is spent on a process that is already
+    /// being abandoned (carrick#1235).
+    #[test]
+    fn two_marker_attempts_fit_the_interruption_budget() {
+        assert!(
+            MARKER_ATTEMPT_TIMEOUT * MARKER_ATTEMPTS < crate::shutdown::INTERRUPTION_REPORT_BUDGET,
+            "{MARKER_ATTEMPTS} attempts of {MARKER_ATTEMPT_TIMEOUT:?} do not fit in {:?}",
+            crate::shutdown::INTERRUPTION_REPORT_BUDGET
+        );
     }
 
     /// Never from CI, and never from a storage that opened a scan: that run
