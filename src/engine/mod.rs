@@ -340,7 +340,7 @@ pub async fn report_preflight_failure<T: CloudStorage + Sync>(
 /// rather than panicking on the way out of a run that is already failing.
 /// The cut is marked, so a truncated reason does not read as a complete
 /// sentence that happens to stop.
-fn fail_reason(error: &str, redaction: &logging::Redaction) -> String {
+pub(crate) fn fail_reason(error: &str, redaction: &logging::Redaction) -> String {
     const ELLIPSIS: &str = "...";
     const WITHHELD: &str = "(the error named a credential, so its text was not sent)";
     let kept: Vec<String> = error
