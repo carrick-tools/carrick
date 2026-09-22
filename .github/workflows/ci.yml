@@ -139,7 +139,8 @@ jobs:
 
   # The binaries that drive whole scans through the sidecar over fixture
   # repos: seconds to minutes each, and the reason the single job was slow.
-  # llm_cassette_hard_gate_test is the frozen-LLM-input golden;
+  # llm_cassette_hard_gate_test and file_route_cassette_gate_test are the
+  # frozen-LLM-input goldens;
   # undeclared_external_host_test pins the match key of an absolute
   # third-party URL (carrick-cloud#656); neither makes a model call.
   rust-scan:
@@ -156,6 +157,7 @@ jobs:
           cargo test --verbose
           --test deterministic_emission_test
           --test env_var_whole_url_test
+          --test file_route_cassette_gate_test
           --test hosted_enrichment_test
           --test imported_request_member_test
           --test inline_handler_response_test
