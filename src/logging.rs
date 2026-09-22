@@ -1001,9 +1001,26 @@ mod tests {
     #[test]
     fn the_cap_deletes_the_days_it_is_past_on_the_first_write() {
         let dir = tempfile::tempdir().expect("temp dir");
-        for day in ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"] {
-            std::fs::write(dir.path().join(format!("carrick.log.{day}")), "old\n")
-                .expect("seed old log");
+        // Seeded with an age each, oldest first. The pruner orders the files
+        // it may delete by modified time, not by the date in the name, and
+        // four files written in one loop share an mtime to the filesystem's
+        // resolution: which two of them it deletes is then arbitrary, and the
+        // assertion on the oldest failed on whichever runner was quick enough
+        // (carrick#1462).
+        let a_day = std::time::Duration::from_secs(24 * 60 * 60);
+        for (age, day) in ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+            .into_iter()
+            .rev()
+            .enumerate()
+        {
+            let path = dir.path().join(format!("carrick.log.{day}"));
+            std::fs::write(&path, "old\n").expect("seed old log");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open the seeded log")
+                .set_modified(std::time::SystemTime::now() - a_day * (age as u32 + 1))
+                .expect("age the seeded log");
         }
 
         let mut appender = rolling::Builder::new()
