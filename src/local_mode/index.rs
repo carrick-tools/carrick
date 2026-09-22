@@ -109,6 +109,21 @@ impl Pass {
     pub fn measures_the_tree(&self) -> bool {
         matches!(self, Pass::Infer)
     }
+
+    /// What this pass may say about where its wall clock went.
+    ///
+    /// A pass that asks no model spent none of it on one, and closing a
+    /// `refresh` on `model analysis 0.0s` states a measurement of nothing —
+    /// worse, it invites a reader to compare a free pass's seconds with the
+    /// paid scan the line was written for (David's ruling, carrick#1452). The
+    /// split is for the run that has all three parts.
+    pub fn measured_wait(&self, split: crate::scan_timing::Split) -> crate::scan_timing::Split {
+        if self.infers() {
+            split
+        } else {
+            crate::scan_timing::Split::default()
+        }
+    }
 }
 
 /// What a build produced: an index, or a set of jobs somebody will collect.
@@ -466,7 +481,7 @@ fn run_generation(
         hosted_download: hosted.download_line(),
         not_dispatched,
         pending,
-        timing,
+        timing: pass.measured_wait(timing),
     })))
 }
 
@@ -1626,6 +1641,30 @@ mod tests {
         assert!(!Pass::Facts.measures_the_tree());
         assert!(!Pass::Dispatch.measures_the_tree());
         assert!(!Pass::Resume(BTreeMap::new()).measures_the_tree());
+    }
+
+    /// `refresh` asks no model, so it states no split: a closing line reading
+    /// `model analysis 0.0s` is a measurement of nothing (carrick#1452).
+    /// Every pass that does ask states what it took.
+    #[test]
+    fn a_pass_that_asks_no_model_states_no_split() {
+        let measured = crate::scan_timing::Split {
+            files: 1204,
+            services: 5,
+            local_secs: 133.0,
+            model_secs: 0.0,
+            upload_secs: 0.0,
+        };
+        let refreshed = Pass::Facts.measured_wait(measured);
+        assert!(
+            !refreshed.measured(),
+            "a free pass hands the renderer nothing to draw, got {refreshed:?}"
+        );
+        assert_eq!(Pass::Infer.measured_wait(measured), measured);
+        assert_eq!(
+            Pass::Resume(BTreeMap::new()).measured_wait(measured),
+            measured
+        );
     }
 
     /// carrick#1379: only SIGTERM is passed on, and the reason is what the
