@@ -1717,6 +1717,56 @@ mod tests {
         assert_eq!(lifted.spend, Some(spend));
         assert_eq!(lifted.dispatched, None);
         assert_eq!(lifted.not_dispatched, None);
+        assert_eq!(lifted.timing, None, "this scan stated no split");
+    }
+
+    /// The same lift, for where a scan's wall clock went (carrick#1452).
+    ///
+    /// Without this branch the marker falls into the failure tail nobody
+    /// reads, the build sums nothing, and the next `carrick index` opens with
+    /// "first read of this tree" for ever.
+    #[test]
+    fn the_indexer_lifts_out_where_the_scan_spent_its_wall_clock() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let split = crate::scan_timing::Split {
+            files: 1204,
+            services: 5,
+            local_secs: 133.0,
+            model_secs: 200.0,
+            upload_secs: 12.0,
+        };
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo 'analysing' >&2; echo '@carrick-timing {}' >&2",
+            serde_json::to_string(&split).unwrap()
+        ));
+
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .unwrap();
+        assert_eq!(lifted.timing, Some(split));
+
+        // And that is what the build adds up. Two repos of the same size are
+        // the tree the next run reads, not one of them.
+        let mut total = crate::scan_timing::Split::default();
+        total.add(&lifted.timing.unwrap());
+        total.add(&split);
+        assert_eq!(
+            crate::scan_timing::tree_line(Some(&crate::scan_timing::LastRead {
+                updated_at: String::new(),
+                split: total,
+            })),
+            "Reading the tree: 2408 files across 10 services; last time 4m26s."
+        );
     }
 
     /// The same lift, for the scan that was asked to dispatch and did not.
