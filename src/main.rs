@@ -48,6 +48,7 @@ mod new_url_target;
 mod oidc;
 mod operation;
 mod packages;
+mod panic_report;
 mod parser;
 mod phase_timing;
 mod preflight;
@@ -200,6 +201,12 @@ async fn main() {
     // than the day's shared one (carrick#1133).
     logging::init(args.verbose, logging::LogSink::Run);
     let repo_path = args.repo_path.clone();
+
+    // A panic used to be the one death that said nothing: exit 101, a log that
+    // stops mid-sentence, and a slot the cloud holds until its TTL. Installed
+    // here because this is the first point at which there is a log to write
+    // the panic to (carrick#1470).
+    panic_report::install(repo_path.clone());
 
     // A signal ends the run where it stands. The analysis future is dropped
     // with everything it owns — the sidecar's `Drop` stops its process — and

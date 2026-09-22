@@ -48,6 +48,7 @@ pub mod new_url_target;
 pub mod oidc;
 pub mod operation;
 pub mod packages;
+pub mod panic_report;
 pub mod parser;
 pub mod phase_timing;
 pub mod preflight;
