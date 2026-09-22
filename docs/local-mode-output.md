@@ -73,7 +73,8 @@ Hosted-only repositories participate in the existing matching and compiler
 checks. They contribute counterparts with `repo: null` and `remote: owner/repo`,
 and never contribute local file items or navigation paths.
 
-Only `index` and `refresh` make hosted network requests. On a failed read, a cached
+Only `index`, `refresh` and `resume` make hosted network requests, and `status`
+when a job is recorded. On a failed read, a cached
 hosted snapshot can be used for the same credential and authenticated workspace;
 the boundary states its date and the failure. A credential or account change
 cannot reuse another workspace's snapshot. Read-only commands check the current
@@ -228,7 +229,7 @@ than silently overwritten.
 | `path` | string | route path, GraphQL field, socket event, or pub/sub topic |
 | `line` | int \| null | 1-based line, when the index recorded one |
 | `col` | int \| null | 1-based column, when the index recorded one |
-| `source` | `"fact"` \| `"candidate"` | `fact` = a deterministic pass stated it; `candidate` = a replayed hosted model answer. Local facts remain authoritative when a model answer contradicts them. |
+| `source` | `"fact"` \| `"candidate"` | `fact` = a deterministic pass stated it; `candidate` = a model answer from the scan that built the index, or a replayed hosted one. Local facts remain authoritative when a model answer contradicts them. |
 | `resolution_source` | string \| null | the wire value from the index blob: `file_based_route`, `imported_member`, `model`, … `null` = this row does not state it |
 | `evidence` | string \| null | one line naming what the row was read off |
 | `counterparts` | array | the other side of the contract, across every repo in the workspace |
@@ -378,7 +379,7 @@ unclassified in this service.
 | path | what |
 |---|---|
 | `.carrick/.gitignore` | `*` — the directory ignores itself, so no user file has to change |
-| `.carrick/repos/*.json` | local per-service blobs, including eligible replayed hosted model answers |
+| `.carrick/repos/*.json` | local per-service blobs, including this scan's model answers and eligible replayed hosted ones |
 | `.carrick/hosted/snapshot.json` | authenticated hosted data, metadata and credential fingerprint; no bearer token |
 | `.carrick/index.json` | the joined read model `touch` and `check` answer from: every repo's absolute path, its services with their commits and boundaries, and per file the rows with their counterparts and verdicts |
 | `.carrick/build-*/` | transient per-run blobs and join result, removed when the build finishes |
