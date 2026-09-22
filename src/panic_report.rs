@@ -17,7 +17,10 @@
 //! What this cannot cover: an abort. A stack overflow raises SIGSEGV and the
 //! runtime aborts on it, and `panic = "abort"` would skip every hook; neither
 //! runs this. The cloud's slot TTL is what covers those, as it covers a
-//! SIGKILL.
+//! SIGKILL. Nor a panic raised while this thread already holds the log file's
+//! own lock, where the line below would wait on itself: the file layer answers
+//! a write error rather than panicking on one (`log_internal_errors(false)`,
+//! carrick#1386), so there is no such panic to raise today.
 
 use crate::cloud_storage::AwsStorage;
 use crate::shutdown::INTERRUPTION_REPORT_BUDGET;
