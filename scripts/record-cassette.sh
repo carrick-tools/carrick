@@ -5,9 +5,22 @@
 #   cargo build --release
 #   scripts/record-cassette.sh tests/fixtures/<fixture>
 #
-# The first scan makes real model calls (paid, owner-approved spend) and
-# uploads nothing: CARRICK_OUTPUT_JSON keeps the index off the cloud. It needs
-# a signed-in CLI. The second scan is fully mocked and free.
+# The first scan makes real model calls (paid, owner-approved spend). It needs
+# a signed-in CLI. It records the fixture on its own:
+#
+# - `start-scan` still opens a scan slot, because a CLI credential's model
+#   calls are refused without one;
+# - the cross-repo read comes from an empty, isolated local directory, so no
+#   sibling repo is downloaded and no project has to be named
+#   (TeeStorage::download_all_repo_data reads only its local half);
+# - nothing is uploaded. `CARRICK_OUTPUT_JSON` makes `should_upload_data`
+#   return false and ends the run at the JSON projection, before any upload,
+#   type-file or run-log step (src/engine/mod.rs). `CARRICK_SKIP_UPLOAD`
+#   also stops TeeStorage's cloud write if the upload were ever reached.
+#   TeeStorage writes its local copy BEFORE the cloud one, so an attempted
+#   upload leaves a file in the local directory, and the script fails on it.
+#
+# The second scan is fully mocked and free.
 #
 # A cassette is keyed by the analysed file's stem, so two files with one stem
 # cannot share a fixture; the script refuses rather than overwrite one answer
@@ -27,13 +40,24 @@ if [ -e "$fixture/__llm__" ]; then
 fi
 
 dump="$(mktemp -d)"
-trap 'rm -rf "$dump"' EXIT
+store="$(mktemp -d)"
+trap 'rm -rf "$dump" "$store"' EXIT
 
 # --- 1. one real run, capturing every analyzer answer -------------------------
 # A direct, synchronous scan: the dump is written where the analyzer answers,
 # so a dispatched job (answers arriving in a bundle later) would record nothing.
 env -u CARRICK_DISPATCH -u CARRICK_ANSWERS -u CARRICK_MOCK_ALL \
-  CARRICK_EVAL_DUMP_DIR="$dump" CARRICK_OUTPUT_JSON=1 "$bin" --no-cache "$fixture" >/dev/null
+  CARRICK_LAPTOP_SCAN=1 \
+  CARRICK_LOCAL_STORAGE_DIR="$store" CARRICK_LOCAL_STORAGE_ISOLATE=1 \
+  CARRICK_SKIP_UPLOAD=1 CARRICK_OUTPUT_JSON=1 \
+  CARRICK_EVAL_DUMP_DIR="$dump" \
+  "$bin" --no-cache "$fixture" >/dev/null
+
+# The upload tripwire: every upload path writes this directory first.
+if [ -n "$(ls -A "$store")" ]; then
+  echo "the recording run wrote an index ($(ls "$store")); it must upload nothing" >&2
+  exit 1
+fi
 
 shopt -s nullglob
 answers=("$dump"/*.json)

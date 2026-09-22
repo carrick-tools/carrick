@@ -118,3 +118,62 @@ fn cassette_hard_gate_file_route() {
          frozen, so the drift is a scanner change."
     );
 }
+
+/// Scan the fixture with the storage settings `scripts/record-cassette.sh`
+/// records under, the analyzer mocked, and return what landed in the storage
+/// directory. Every upload path writes that directory (TeeStorage writes its
+/// local copy before the cloud one), so an empty directory is a run that
+/// uploaded nothing.
+fn storage_after_scan(output_json: bool) -> Vec<String> {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let store = tempfile::tempdir().expect("temp dir");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    command
+        .arg(Path::new(repo).join("tests/fixtures/file-route-cassette"))
+        .arg("--no-cache")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", store.path())
+        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_SKIP_UPLOAD", "1")
+        .env_remove("CARRICK_OUTPUT_JSON");
+    if output_json {
+        command.env("CARRICK_OUTPUT_JSON", "1");
+    }
+    let output = command.output().expect("failed to spawn carrick binary");
+    assert!(
+        output.status.success(),
+        "scanner exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut written: Vec<String> = std::fs::read_dir(store.path())
+        .expect("read the storage dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    written.sort();
+    written
+}
+
+/// The recording run must upload nothing: `CARRICK_OUTPUT_JSON` ends the run
+/// at the JSON projection, before any upload.
+#[test]
+fn the_recording_settings_upload_nothing() {
+    let written = storage_after_scan(true);
+    assert!(written.is_empty(), "the recording run wrote {written:?}");
+}
+
+/// The control that makes the assertion above mean something: without
+/// `CARRICK_OUTPUT_JSON` the same run writes its index into the directory.
+#[test]
+fn the_upload_tripwire_sees_an_upload() {
+    let written = storage_after_scan(false);
+    assert!(
+        written.iter().any(|name| name.ends_with(".json")),
+        "a run that uploads must leave its index in the storage dir, got {written:?}"
+    );
+}
