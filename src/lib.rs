@@ -58,6 +58,7 @@ pub mod retry_budget;
 pub mod scan_health;
 pub mod scan_spend;
 pub mod scan_stage;
+pub mod scan_timing;
 pub mod sdk_edges;
 pub mod sdk_surface;
 pub mod service_derivation;

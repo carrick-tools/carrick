@@ -64,11 +64,28 @@ export type ServiceSummary = {
   routes_without_response_type: number;
 };
 
+/**
+ * Mirrors `scan_timing::Split`: where a build's wall clock went.
+ *
+ * The same three figures the next run's opening line is read from, so the
+ * reader is told at the end what they will be quoted at the start
+ * (carrick#1452). Time only — what a run costs us is never rendered.
+ */
+export type Timing = {
+  files: number;
+  services: number;
+  local_secs: number;
+  model_secs: number;
+  upload_secs: number;
+};
+
 /** Mirrors `progress::Summary`: what a finished build amounts to. */
 export type Summary = {
   services: ServiceSummary[];
   elapsed_secs: number;
   next?: string[];
+  /** Absent on a build that measured nothing, and from one older than #1452. */
+  timing?: Timing;
 };
 
 /** One line of a build's output, once it has been read. */
@@ -188,6 +205,22 @@ export function summaryLine(summary: Summary): string {
   parts.push(plural(total((service) => service.calls), "external call"));
   if (untyped > 0) parts.push(`${plural(untyped, "route")} without a response type`);
   return parts.join(" · ");
+}
+
+/**
+ * What the wait was made of, said once the build is over.
+ *
+ * The one thing a user could not tell while they waited is which part of a
+ * scan was the model and which was their own machine (carrick#1452). It is a
+ * line of its own rather than more clauses on the counts: the counts are what
+ * was built, and this is what it took.
+ */
+export function timingLine(timing: Timing): string {
+  return [
+    `local read ${elapsed(timing.local_secs)}`,
+    `model analysis ${elapsed(timing.model_secs)}`,
+    `upload ${elapsed(timing.upload_secs)}`,
+  ].join(" · ");
 }
 
 /** What a rendered run closes on: the next step, and nothing about cost. */
@@ -392,6 +425,11 @@ export class ScanRender {
     } else {
       this.close();
     }
+    // After the phase is closed, so nothing is written under a spinner that
+    // still owns the line: what the wait was made of is its own line between
+    // the counts and the next step (carrick#1452).
+    const timing = summary.timing;
+    if (timing) this.schedule(() => this.output.say(timingLine(timing)));
     this.schedule(() => this.output.outro(outroLine(summary)));
   }
 

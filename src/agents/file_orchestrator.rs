@@ -1458,6 +1458,10 @@ impl FileOrchestrator {
         // with no model in it, and the only one that can state how far through
         // it is; it ticks for a parent that renders a line (carrick#955).
         let mut reading = crate::progress::Ticker::new(crate::progress::Phase::Files, files.len());
+        // And how big this service turned out to be, for the record the next
+        // build opens with: "N files across M services" is this count, summed
+        // (carrick#1452).
+        crate::scan_timing::files_read(files.len());
         for file_path in files {
             // The one place a long CPU-bound pass can hear a signal: nothing
             // in the loop below awaits, so on a large repo this is minutes in
@@ -2536,6 +2540,20 @@ impl FileOrchestrator {
         stats.files_model_reused = reused.len() + collected.len();
         stats.files_model_dispatched = to_dispatch.len();
         stats.files_model_not_asked = not_asked.len();
+        // What the cache check just decided, before the first request goes
+        // out: a user cannot otherwise tell a warm rescan from a cold one, and
+        // a five-minute wait reads as "this could be an hour" (carrick#1452).
+        //
+        // Said from here because this partition IS the decision — the same two
+        // numbers the stats above carry — and only on a pass that is about to
+        // ask: a run with no model stage has nothing to say about how much of
+        // it is already answered.
+        if !crate::local_mode::no_model() && !self.model_deferred {
+            crate::progress::announce(&crate::scan_timing::model_line(
+                stats.files_model_reused,
+                stats.files_model_dispatched,
+            ));
+        }
         if !reused.is_empty() {
             debug!(
                 "Replaying {} cached model answer(s); dispatching {}",

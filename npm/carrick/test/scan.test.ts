@@ -20,6 +20,7 @@ import {
   renderScan,
   ScanRender,
   summaryLine,
+  timingLine,
 } from "../src/scan.ts";
 
 const fakeScan = fileURLToPath(new URL("./fake-scan.mjs", import.meta.url));
@@ -34,8 +35,11 @@ const BUILD = [
   '@carrick-phase {"label":"indexed api","state":"done"}',
   '@carrick-phase {"label":"joining the workspace","state":"started"}',
   '@carrick-phase {"label":"joined the workspace","state":"done"}',
-  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4}',
+  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4,"timing":{"files":1204,"services":5,"local_secs":61,"model_secs":96.4,"upload_secs":12}}',
 ];
+
+/** What the build says before it starts, read from the last one (carrick#1452). */
+const TREE_LINE = "Reading the tree: 1204 files across 5 services; last time 2m13s.";
 
 /**
  * The interactive rendering as a reader sees it: colour and cursor control
@@ -58,12 +62,16 @@ function captured(): { stream: PassThrough; text: () => string } {
 test("a build renders as an intro, one step per phase and the counts", async () => {
   const { stream, text } = captured();
   const render = new ScanRender(interactiveOutput(stream), "0.3.81");
+  // Said before the first phase, which is what makes it the line a reader
+  // meets before the wait rather than one more thing after it.
+  render.stdout(TREE_LINE);
   for (const line of BUILD) render.stderr(line);
   assert.equal(await render.finish(false), true);
 
   const drawn = text();
   // The block, in the shape the ticket accepts: an intro carrying the
-  // version, one step per phase, the counts, and the one next step.
+  // version, what the wait is expected to be, one step per phase, the counts,
+  // what the wait was, and the one next step.
   assert.deepEqual(
     drawn
       .split("\n")
@@ -71,8 +79,12 @@ test("a build renders as an intro, one step per phase and the counts", async () 
       .filter((line) => line.length > 0 && line !== "│"),
     [
       "┌  carrick 0.3.81",
+      // A line with no state of its own, which is what both of these are:
+      // neither is a step that succeeded or failed.
+      `│  ${TREE_LINE}`,
       `◇  indexing api  95 files, ${elapsed(0)}`,
       "◇  111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type",
+      "│  local read 1m1s · model analysis 1m36s · upload 12.0s",
       "└  Your agents can query it now. `carrick index --verbose` shows the full report.",
     ],
   );
@@ -248,6 +260,12 @@ test("counts and durations read the way the line says them", () => {
     }),
     "4 routes · 2 external calls",
   );
+  // What the wait was made of, in the same three parts the next run's opening
+  // line quotes (carrick#1452). Time only: what a run costs is never here.
+  assert.equal(
+    timingLine({ files: 1204, services: 5, local_secs: 61, model_secs: 96.4, upload_secs: 12 }),
+    "local read 1m1s · model analysis 1m36s · upload 12.0s",
+  );
 });
 
 test("the whole stream, end to end, through the spawned binary", async (t) => {
@@ -263,6 +281,10 @@ test("the whole stream, end to end, through the spawned binary", async (t) => {
   const drawn = written.join("");
   assert.match(drawn, /◇ indexing api {2}95 files/);
   assert.match(drawn, /◇ 111 routes · 363 functions · 175 types · 10 external calls/);
+  // The two lines the wait is bracketed by, both through the spawned binary:
+  // what the last read took, and what this one took (carrick#1452).
+  assert.ok(drawn.indexOf(TREE_LINE) < drawn.indexOf("indexing api"), drawn);
+  assert.match(drawn, /local read 1m1s · model analysis 1m36s · upload 12\.0s/);
   assert.ok(!drawn.includes("Carrick run starting"), drawn);
   assert.ok(!drawn.includes("boundary ("), drawn);
   assert.ok(!drawn.includes("SDK call(s) that produced no edge"), drawn);

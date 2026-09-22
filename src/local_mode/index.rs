@@ -49,6 +49,10 @@ pub struct IndexOutcome {
     /// What the scans left for a later run, in their own sentences. Empty on
     /// a build that finished everything it started (carrick#1315).
     pub pending: Vec<String>,
+    /// Where this build's wall clock went, summed over every repo it scanned
+    /// and the join over them. Printed, and kept so the next build's opening
+    /// line is a measurement rather than a guess (carrick#1452).
+    pub timing: crate::scan_timing::Split,
 }
 
 /// What one repo's scan is doing on a resume: where its collected answers are,
@@ -91,6 +95,35 @@ impl Pass {
     /// Whether this pass asks the model anything at all.
     pub fn infers(&self) -> bool {
         !matches!(self, Pass::Facts)
+    }
+
+    /// Whether what this pass takes is what the next `carrick index` should be
+    /// told to expect (carrick#1452).
+    ///
+    /// Only the inferred full-workspace pass. `refresh` asks no model, so its
+    /// wait is a fraction of the one being estimated; `--dispatch` writes no
+    /// index and does none of the model's work here; and a `resume` scans the
+    /// repos whose answers came back and leaves the rest alone, so its counts
+    /// cover part of the tree. Each of those would leave the next run quoting
+    /// a time for work it is not about to do.
+    pub fn measures_the_tree(&self) -> bool {
+        matches!(self, Pass::Infer)
+    }
+
+    /// What this pass may say about where its wall clock went.
+    ///
+    /// A pass that asks no model spent none of it on one, and closing a
+    /// `refresh` on `model analysis 0.0s` states a measurement of nothing —
+    /// worse, it invites a reader to compare its seconds with those of the
+    /// inferred scan the line was written for, which does several times the
+    /// work (David's ruling, carrick#1452). The split is for the run that has
+    /// all three parts.
+    pub fn measured_wait(&self, split: crate::scan_timing::Split) -> crate::scan_timing::Split {
+        if self.infers() {
+            split
+        } else {
+            crate::scan_timing::Split::default()
+        }
     }
 }
 
@@ -235,6 +268,10 @@ fn run_generation(
     // And what they left behind, so the build's closing line can say it
     // (carrick#1315).
     let mut pending: Vec<String> = Vec::new();
+    // Where this build's wall clock went, summed as each scan reports its own
+    // (carrick#1452). The reader waited on all of them, so the record the next
+    // build quotes is the whole build and not one repo of it.
+    let mut timing = crate::scan_timing::Split::default();
     // How many services this build is about, and how many are behind it, so
     // the one line a reader is watching counts the workspace rather than
     // restarting at each repo (carrick#1365). Best effort: the same resolution
@@ -270,6 +307,9 @@ fn run_generation(
             workspace_position,
         )?;
         pending.extend(report.pending.iter().cloned());
+        if let Some(split) = &report.timing {
+            timing.add(split);
+        }
         // A repo that handed its prompts over wrote no blob. One that was
         // asked to and found nothing for the model says nothing here: it
         // indexed itself, in the seconds it takes to state facts nobody has to
@@ -363,7 +403,11 @@ fn run_generation(
         .repos
         .first()
         .ok_or_else(|| "the workspace resolved to no repos".to_string())?;
+    // The join reads every blob back and asks nobody anything, so its wait is
+    // part of the local read the next build's opening line quotes.
+    let join_started = Instant::now();
     let join = join(&exe, join_target, blobs, &generation.join("join.json"))?;
+    timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
     index.hosted_checked_at = hosted.checked_at();
@@ -438,6 +482,7 @@ fn run_generation(
         hosted_download: hosted.download_line(),
         not_dispatched,
         pending,
+        timing: pass.measured_wait(timing),
     })))
 }
 
@@ -657,6 +702,9 @@ pub(super) struct ScanReport {
     /// can end on it: a run that landed six services and deferred a seventh
     /// has a next step, and it is not the ordinary one (carrick#1315).
     pub pending: Vec<String>,
+    /// Where this scan's wall clock went. `None` from a scan that did not
+    /// finish, or one that measured nothing (carrick#1452).
+    pub timing: Option<crate::scan_timing::Split>,
 }
 
 /// What one phase of a build calls itself while it runs and once it is done.
@@ -715,6 +763,8 @@ fn run_scan(
     // the scan's output, so a figure it does not lift out is a figure nobody
     // ever sees (carrick#995).
     let mut spend = None;
+    // And where its wall clock went, on the same channel (carrick#1452).
+    let mut timing = None;
     // Whether this scan handed its prompts to Carrick Cloud rather than
     // answering them here (carrick#1229). It crosses on the same channel as
     // the spend, and for the same reason: this process swallows the scan's
@@ -793,6 +843,14 @@ fn run_scan(
             spend = Some(reported);
             continue;
         }
+        // Where this scan's wall clock went. It crosses on the same channel as
+        // the spend, and for the same reason: this process swallows the scan's
+        // output, so a figure it does not lift out is a figure the next build
+        // cannot state (carrick#1452).
+        if let Some(reported) = crate::scan_timing::parse(&line) {
+            timing = Some(reported);
+            continue;
+        }
         if let Some(reported) = crate::progress::parse_dispatched(&line) {
             dispatched = Some(reported);
             continue;
@@ -852,6 +910,7 @@ fn run_scan(
             dispatched,
             not_dispatched,
             pending,
+            timing,
         });
     }
     bar.finish_and_clear();
@@ -1573,6 +1632,42 @@ fn timestamp() -> String {
 mod tests {
     use super::*;
 
+    /// Exactly one pass measures the tree the way the next `carrick index`
+    /// will read it. A pass added to this set that does less work would make
+    /// the opening line quote a time for work that is not about to happen
+    /// (carrick#1452).
+    #[test]
+    fn only_the_inferred_full_pass_leaves_a_time_for_the_next_run() {
+        assert!(Pass::Infer.measures_the_tree());
+        assert!(!Pass::Facts.measures_the_tree());
+        assert!(!Pass::Dispatch.measures_the_tree());
+        assert!(!Pass::Resume(BTreeMap::new()).measures_the_tree());
+    }
+
+    /// `refresh` asks no model, so it states no split: a closing line reading
+    /// `model analysis 0.0s` is a measurement of nothing (carrick#1452).
+    /// Every pass that does ask states what it took.
+    #[test]
+    fn a_pass_that_asks_no_model_states_no_split() {
+        let measured = crate::scan_timing::Split {
+            files: 1204,
+            services: 5,
+            local_secs: 133.0,
+            model_secs: 0.0,
+            upload_secs: 0.0,
+        };
+        let refreshed = Pass::Facts.measured_wait(measured);
+        assert!(
+            !refreshed.measured(),
+            "a free pass hands the renderer nothing to draw, got {refreshed:?}"
+        );
+        assert_eq!(Pass::Infer.measured_wait(measured), measured);
+        assert_eq!(
+            Pass::Resume(BTreeMap::new()).measured_wait(measured),
+            measured
+        );
+    }
+
     /// carrick#1379: only SIGTERM is passed on, and the reason is what the
     /// kernel has already done rather than what the signals mean.
     ///
@@ -1662,6 +1757,56 @@ mod tests {
         assert_eq!(lifted.spend, Some(spend));
         assert_eq!(lifted.dispatched, None);
         assert_eq!(lifted.not_dispatched, None);
+        assert_eq!(lifted.timing, None, "this scan stated no split");
+    }
+
+    /// The same lift, for where a scan's wall clock went (carrick#1452).
+    ///
+    /// Without this branch the marker falls into the failure tail nobody
+    /// reads, the build sums nothing, and the next `carrick index` opens with
+    /// "first read of this tree" for ever.
+    #[test]
+    fn the_indexer_lifts_out_where_the_scan_spent_its_wall_clock() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let split = crate::scan_timing::Split {
+            files: 1204,
+            services: 5,
+            local_secs: 133.0,
+            model_secs: 200.0,
+            upload_secs: 12.0,
+        };
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo 'analysing' >&2; echo '@carrick-timing {}' >&2",
+            serde_json::to_string(&split).unwrap()
+        ));
+
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .unwrap();
+        assert_eq!(lifted.timing, Some(split));
+
+        // And that is what the build adds up. Two repos of the same size are
+        // the tree the next run reads, not one of them.
+        let mut total = crate::scan_timing::Split::default();
+        total.add(&lifted.timing.unwrap());
+        total.add(&split);
+        assert_eq!(
+            crate::scan_timing::tree_line(Some(&crate::scan_timing::LastRead {
+                updated_at: String::new(),
+                split: total,
+            })),
+            "Reading the tree: 2408 files across 10 services; last time 4m26s."
+        );
     }
 
     /// The same lift, for the scan that was asked to dispatch and did not.

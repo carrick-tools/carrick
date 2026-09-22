@@ -58,6 +58,7 @@ mod retry_budget;
 mod scan_health;
 mod scan_spend;
 mod scan_stage;
+mod scan_timing;
 mod sdk_edges;
 mod sdk_surface;
 mod service_derivation;

@@ -82,6 +82,16 @@ impl Phase {
         Phase::Other,
     ];
 
+    /// Whether this stage is time spent waiting on the model.
+    ///
+    /// The two stages that ask it, and no others: the file-analyzer calls and
+    /// the function intents. Everything else is work this machine does, which
+    /// is the split the build states before and after the wait
+    /// (carrick#1452).
+    fn is_model(self) -> bool {
+        matches!(self, Phase::Model | Phase::Intents)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Phase::Discover => "discover",
@@ -139,25 +149,59 @@ pub fn mark(phase: Phase) {
     recorder.last = now;
 }
 
-/// The breakdown as the per-service line prints it, and the end of recording.
+/// What this service spent per stage, and the end of recording.
 ///
 /// Returns `None` when nothing was recorded (a path that never called
-/// [`start_service`]), so the caller prints its line unchanged rather than an
+/// [`start_service`]), so a caller states its line unchanged rather than an
 /// all-zero breakdown that would read as a measurement.
-pub fn take_line() -> Option<String> {
+pub fn take() -> Option<Totals> {
     let mut guard = recorder().lock().unwrap();
     let recorder = guard.take()?;
-    let parts: Vec<String> = Phase::ORDER
-        .iter()
-        .map(|phase| {
-            format!(
-                "{} {:.1}s",
-                phase.label(),
-                recorder.totals.get(phase).copied().unwrap_or(0.0)
-            )
-        })
-        .collect();
-    Some(parts.join(", "))
+    Some(Totals {
+        per_phase: recorder.totals,
+    })
+}
+
+/// One service's recorded stages, read two ways: the line the log states, and
+/// the two figures the build's own split is built from.
+#[derive(Debug, Clone, Default)]
+pub struct Totals {
+    per_phase: BTreeMap<Phase, f64>,
+}
+
+impl Totals {
+    /// The breakdown as the per-service line prints it.
+    pub fn line(&self) -> String {
+        let parts: Vec<String> = Phase::ORDER
+            .iter()
+            .map(|phase| {
+                format!(
+                    "{} {:.1}s",
+                    phase.label(),
+                    self.per_phase.get(phase).copied().unwrap_or(0.0)
+                )
+            })
+            .collect();
+        parts.join(", ")
+    }
+
+    /// Seconds spent waiting on the model.
+    pub fn model_secs(&self) -> f64 {
+        self.sum(true)
+    }
+
+    /// Seconds spent on work this machine did.
+    pub fn local_secs(&self) -> f64 {
+        self.sum(false)
+    }
+
+    fn sum(&self, model: bool) -> f64 {
+        self.per_phase
+            .iter()
+            .filter(|(phase, _)| phase.is_model() == model)
+            .map(|(_, secs)| secs)
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -175,7 +219,8 @@ mod tests {
     fn line_states_every_phase_in_order_and_only_after_a_start() {
         start_service();
         mark(Phase::Discover);
-        let line = take_line().expect("a started service renders a line");
+        let totals = take().expect("a started service renders a line");
+        let line = totals.line();
         for phase in Phase::ORDER {
             assert!(line.contains(phase.label()), "{line} is missing {phase:?}");
         }
@@ -183,6 +228,23 @@ mod tests {
         let other = line.find("other").expect("other present");
         assert!(discover < other, "phases print in ORDER: {line}");
 
-        assert!(take_line().is_none(), "a taken recording is finished");
+        // And the same marks, read as the split the build states: a discover
+        // mark is this machine's work, and nothing was spent on the model.
+        assert!(totals.local_secs() > 0.0, "discover is local work");
+        assert_eq!(totals.model_secs(), 0.0);
+
+        assert!(take().is_none(), "a taken recording is finished");
+    }
+
+    /// Exactly the two stages that ask the model are model time. A stage
+    /// sorted into the wrong half would make the build's split say the wait
+    /// was somewhere it was not (carrick#1452).
+    #[test]
+    fn only_the_stages_that_ask_the_model_are_model_time() {
+        let model: Vec<Phase> = Phase::ORDER
+            .into_iter()
+            .filter(|phase| phase.is_model())
+            .collect();
+        assert_eq!(model, vec![Phase::Model, Phase::Intents]);
     }
 }
