@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.89](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.88...carrick-v0.3.89) (2026-09-22)
+
+
+### Features
+
+* **cli:** say what the wait will be before it starts ([#1461](https://github.com/carrick-tools/carrick/issues/1461)) ([fbae9f7](https://github.com/carrick-tools/carrick/commit/fbae9f7dbcdb81b539f2fea2ec1a86402ee396b7))
+* **scan:** report a panic to the run log and to the cloud before it unwinds ([#1476](https://github.com/carrick-tools/carrick/issues/1476)) ([945caa7](https://github.com/carrick-tools/carrick/commit/945caa74835217e898086c4ff0b3c09b7d870b69))
+
+
+### Bug Fixes
+
+* **cloud:** print a refusal the cloud stated without a connection error in front of it ([#1474](https://github.com/carrick-tools/carrick/issues/1474)) ([b0eb627](https://github.com/carrick-tools/carrick/commit/b0eb6271bc3b198093e071e334a6e31e7fe49e91)), closes [#1471](https://github.com/carrick-tools/carrick/issues/1471)
+* **cloud:** send an end-of-run marker twice, and say so when both attempts fail ([#1477](https://github.com/carrick-tools/carrick/issues/1477)) ([5ea5196](https://github.com/carrick-tools/carrick/commit/5ea51962a38d9eb3e40e9d1f0d5543623d1be8c7))
+* **scan:** ship an interrupted run's log with the marker that says it stopped ([#1478](https://github.com/carrick-tools/carrick/issues/1478)) ([be3c3d4](https://github.com/carrick-tools/carrick/commit/be3c3d4b7bbaa2ed1744b60389dfab1b15ff3711))
+* **sidecar:** let a signal reach the wait on a capture frame ([#1475](https://github.com/carrick-tools/carrick/issues/1475)) ([9ec59a7](https://github.com/carrick-tools/carrick/commit/9ec59a72754ed72bb8a3f5cc5966e5b8d1b4cc6f)), closes [#1387](https://github.com/carrick-tools/carrick/issues/1387)
+
+
+### Documentation
+
+* **local-mode:** a candidate can be this scan's own model answer, and status reads once per job ([#1480](https://github.com/carrick-tools/carrick/issues/1480)) ([31b7148](https://github.com/carrick-tools/carrick/commit/31b71489e0a509bd272d7a92426408e1bcdc049a)), closes [#1469](https://github.com/carrick-tools/carrick/issues/1469)
+* **local-mode:** name resume and status as network readers, and this scan's model answers as candidates ([#1468](https://github.com/carrick-tools/carrick/issues/1468)) ([cc7b8cf](https://github.com/carrick-tools/carrick/commit/cc7b8cf220b2f5c9a0522066062620873aa0a4f1)), closes [#1467](https://github.com/carrick-tools/carrick/issues/1467)
+* **local-mode:** say what carrick index sends to the cloud ([#1466](https://github.com/carrick-tools/carrick/issues/1466)) ([40bd12e](https://github.com/carrick-tools/carrick/commit/40bd12e608679c621f79fc20cc25ae92d8db4264)), closes [#1465](https://github.com/carrick-tools/carrick/issues/1465)
+
 ## [0.3.88](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.87...carrick-v0.3.88) (2026-09-22)
 
 
