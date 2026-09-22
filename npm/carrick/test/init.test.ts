@@ -2114,15 +2114,25 @@ test("a clean tree already indexed needs no re-read, and each way of not being o
 
   // A scan is writing this index right now: a second pass over the same tree
   // is two scans contending, and the one that is running is the answer.
-  const scan = (state: RunningScan["status"]): RunningScan => ({
+  const scan = (state: RunningScan["status"], pid = process.pid): RunningScan => ({
     scan_id: "s1",
-    pid: 4242,
+    pid,
     status: state,
     started_at: "2026-09-22T00:00:00Z",
   });
   assert.deepEqual(
     localIndexState(statusAnswer({ services: [], running_scans: [scan("running")] }), ["/code/api"]),
     { kind: "scanning" },
+  );
+  // A `running` row whose process is gone. The record outlives the scan — it
+  // is cleared by the next build, not by the scan ending — so an interrupted
+  // `carrick index` would otherwise leave init skipping the re-read for ever.
+  assert.deepEqual(
+    localIndexState(
+      statusAnswer({ services: [statusService("api", "/code/api", { changed_since_index: 3 })], running_scans: [scan("running", 2_147_483_646)] }),
+      ["/code/api"],
+    ),
+    { kind: "reread", reason: "3 file(s) changed since it was built" },
   );
   // And the rows that sit in the same list without holding anything: the scan
   // that finished is cleared by the next build, not by finishing

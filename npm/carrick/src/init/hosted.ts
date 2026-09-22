@@ -29,7 +29,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { StatusRepo, StatusResult } from "../contract.ts";
+import type { RunningScan, StatusRepo, StatusResult } from "../contract.ts";
 import { parseStatusResult } from "../contract.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { elapsed, parseMarker } from "../scan.ts";
@@ -118,12 +118,8 @@ export function localIndexState(status: StatusResult | null, repos: string[]): L
   if (status === null) return { kind: "reread", reason: "there is no index here yet" };
   // Before the index is read at all: a detached `carrick index` writes this
   // one, and a second pass over the same tree would be two scans contending
-  // (carrick#992). `running` only — the list also carries the scans that
-  // finished, failed or handed their prompts to Carrick Cloud, and none of
-  // those is holding anything.
-  if ((status.running_scans ?? []).some((scan) => scan.status === "running")) {
-    return { kind: "scanning" };
-  }
+  // (carrick#992).
+  if ((status.running_scans ?? []).some(stillScanning)) return { kind: "scanning" };
   if (status.error !== undefined || status.services.length === 0) {
     return { kind: "reread", reason: "there is no index here yet" };
   }
@@ -142,6 +138,33 @@ export function localIndexState(status: StatusResult | null, repos: string[]): L
   );
   if (unasked) return { kind: "reread", reason: "it holds no hosted rows yet" };
   return { kind: "current" };
+}
+
+/**
+ * Whether a scan row is a process that still holds this workspace.
+ *
+ * Two things have to be true, and the recorded status is only the first of
+ * them. The list also carries the scans that finished, failed or handed their
+ * prompts to Carrick Cloud, and none of those is holding anything — and a
+ * `running` row OUTLIVES its process: `forget_superseded` clears it on the
+ * next build, not when the scan ends, so a scan somebody interrupted leaves
+ * one behind. The scanner answers this with `kill(pid, 0)` everywhere it
+ * matters (`ScanState::is_running` in `src/local_mode/scan_state.rs`) and
+ * serialises the raw status, so this asks the same question of the same pid.
+ * A row with no readable pid is not a scan this can prove is alive, and the
+ * cost of being wrong that way is one re-read rather than an init that never
+ * re-reads again.
+ */
+function stillScanning(scan: RunningScan): boolean {
+  if (scan.status !== "running" || typeof scan.pid !== "number") return false;
+  try {
+    // Signal 0 performs no action; it only reports whether the pid can be
+    // signalled. EPERM is a live process this user does not own.
+    process.kill(scan.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /** A path as the filesystem resolves it, for comparing two sides' spelling of one repo. */
