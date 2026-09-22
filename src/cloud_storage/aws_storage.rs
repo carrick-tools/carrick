@@ -843,6 +843,22 @@ impl AwsStorage {
         self.scan_id.get().cloned()
     }
 
+    /// Take the slot this process holds, for a storage that did not open it.
+    ///
+    /// An interrupted run has no storage left to ask: the signal dropped the
+    /// engine and everything it owned, so `main` builds a fresh one to report
+    /// with. Without the slot, that storage marks nothing
+    /// ([`CloudStorage::report_scan_failed`] reads it) and ships no log
+    /// ([`CloudStorage::uploads_run_logs`] is false for a Bearer credential
+    /// with no scan to store one against, carrick#1370). The id comes from
+    /// [`crate::credentials::scan_id`], which `start-scan` set.
+    ///
+    /// First write wins, as it does for the storage that opened the scan: one
+    /// process is one scan.
+    pub fn adopt_scan_id(&self, scan_id: &str) {
+        let _ = self.scan_id.set(scan_id.to_string());
+    }
+
     /// The pending list for a write action: the engine's list on the final
     /// write when it is non-empty, `None` everywhere else. The engine only
     /// sets one after [`CloudStorage::name_pending_on_final_write`] said this
@@ -1345,10 +1361,8 @@ impl AwsStorage {
     /// `scan-failed` for the scan `scan_id` names, whether or not this
     /// instance opened it.
     ///
-    /// The trait method reads the id this storage's own `start-scan` set. An
-    /// interrupted run has no storage left to ask — the signal dropped the
-    /// engine with it — so `main` builds a fresh one and passes the id the
-    /// process-global slot kept ([`crate::credentials::scan_id`]).
+    /// The trait method reads the id this storage's own `start-scan` set, or
+    /// the one [`Self::adopt_scan_id`] gave it.
     pub async fn report_scan_failed_for(&self, scan_id: &str, stage: &str, reason: &str) {
         let CloudAuth::Bearer(token) = &self.auth else {
             return;
@@ -3669,6 +3683,25 @@ mod tests {
 
         let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
         assert!(ci.uploads_run_logs());
+    }
+
+    /// The storage an interrupted run reports with opened no scan of its own,
+    /// and without the slot it would mark nothing and ship nothing
+    /// (carrick#1473).
+    #[test]
+    fn a_storage_that_adopted_this_run_s_slot_reports_for_it() {
+        let fresh =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        assert!(fresh.scan_id().is_none());
+        assert!(!fresh.uploads_run_logs());
+
+        fresh.adopt_scan_id("scan_01J");
+        assert_eq!(fresh.scan_id().as_deref(), Some("scan_01J"));
+        assert!(fresh.uploads_run_logs());
+
+        // One process is one scan: the first slot written is the one it keeps.
+        fresh.adopt_scan_id("scan_02K");
+        assert_eq!(fresh.scan_id().as_deref(), Some("scan_01J"));
     }
 
     /// `start-scan` keys on the full `owner/repo`, and a clone with no GitHub
