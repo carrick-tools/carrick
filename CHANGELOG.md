@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.88](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.87...carrick-v0.3.88) (2026-09-22)
+
+
+### Bug Fixes
+
+* **boundary:** one definition for "routes without a response type" ([#1457](https://github.com/carrick-tools/carrick/issues/1457)) ([044c2ec](https://github.com/carrick-tools/carrick/commit/044c2ecc577bdea80272c6213decbc73714e8b79)), closes [#1449](https://github.com/carrick-tools/carrick/issues/1449)
+* **init:** read status before re-reading the workspace ([#1459](https://github.com/carrick-tools/carrick/issues/1459)) ([d33aa35](https://github.com/carrick-tools/carrick/commit/d33aa3566a32fe0d260f090dbca5fc7209f1cebe))
+* **join:** keep a route nothing states at its own line, not the call it borrowed ([#1451](https://github.com/carrick-tools/carrick/issues/1451)) ([0f50725](https://github.com/carrick-tools/carrick/commit/0f507254584dea571812ffb031a66192d5b5dcf2))
+
+
+### CI/CD
+
+* run the CLI end to end on every release pull request ([#1456](https://github.com/carrick-tools/carrick/issues/1456)) ([6e37fe3](https://github.com/carrick-tools/carrick/commit/6e37fe38840251898649e7450de34ca8273e876c))
+
 ## [0.3.87](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.86...carrick-v0.3.87) (2026-09-21)
 
 
