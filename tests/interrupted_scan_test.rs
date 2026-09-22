@@ -146,6 +146,102 @@ fn a_signal_during_the_wait_on_the_sidecar_ends_the_run() {
     assert_eq!(code, TERMINATED);
 }
 
+/// And for the wait on a sidecar FRAME, which is where a ready sidecar keeps
+/// the scan: `capture_v2` and `check_v2` read their answer there, for up to
+/// fifteen minutes per frame, on the thread the analysis is on (carrick#1387).
+///
+/// The sidecar here becomes ready, answers everything the run asks before the
+/// capture, and then goes silent on the capture itself. A run that can only
+/// notice the signal when that frame arrives fails this by outliving the
+/// deadline, which is an eighth of the budget it would be serving.
+#[test]
+fn a_signal_during_the_wait_on_a_sidecar_frame_ends_the_run() {
+    let home = tempfile::tempdir().expect("a home for the run");
+    let sidecar = home.path().join("sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    // Marker rather than a sleep: the run has to have ASKED for the capture
+    // before the signal means anything, and how long it takes to get there is
+    // the machine's business.
+    let asked = home.path().join("capture-asked");
+    std::fs::write(
+        sidecar.join("index.js"),
+        format!(
+            r#"const fs = require("fs");
+let buffered = "";
+process.stdin.on("data", (chunk) => {{
+  buffered += chunk;
+  let end;
+  while ((end = buffered.indexOf("\n")) >= 0) {{
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    if (!line.trim()) continue;
+    let request;
+    try {{ request = JSON.parse(line); }} catch (e) {{ continue; }}
+    const answer = (fields) =>
+      process.stdout.write(
+        JSON.stringify(Object.assign({{ request_id: request.request_id }}, fields)) + "\n"
+      );
+    switch (request.action) {{
+      case "init":
+        answer({{ status: "ready", init_time_ms: 1 }});
+        break;
+      case "bundle":
+        answer({{ status: "success", dts_content: "", manifest: [], symbol_failures: [] }});
+        break;
+      case "infer":
+        answer({{ status: "success", inferred_types: [] }});
+        break;
+      case "resolve_definitions":
+        answer({{ status: "success", definitions: [] }});
+        break;
+      case "capture_v2":
+        // Asked, and never answered: this is the wait under test.
+        fs.writeFileSync({asked:?}, "asked");
+        break;
+      default:
+        answer({{ status: "success" }});
+    }}
+  }}
+}});
+process.stdin.resume();
+setInterval(() => {{}}, 60000);
+"#,
+            asked = asked.to_string_lossy()
+        ),
+    )
+    .expect("write the sidecar that answers everything but the capture");
+
+    let mut child = scan(&repo_root().join("examples/express-single"), home.path())
+        .env("CARRICK_SIDECAR_DIR", home.path().join("sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start a scan");
+
+    let start = Instant::now();
+    while !asked.exists() {
+        if start.elapsed() > DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the scan never asked the sidecar for a capture");
+        }
+        assert!(
+            child.try_wait().expect("poll the scan").is_none(),
+            "the scan was over before it could be signalled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    send(&child, libc::SIGTERM);
+
+    let code = code_within(
+        &mut child,
+        DEADLINE,
+        "the scan was still waiting on the capture frame",
+    );
+    assert_eq!(code, TERMINATED);
+}
+
 /// A run whose terminal goes away finishes instead of panicking on its next
 /// print (carrick#1386).
 ///

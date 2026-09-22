@@ -1707,6 +1707,14 @@ impl TypeSidecar {
     /// alive while a dead sidecar still trips the deadline. Frames for other
     /// request ids are skipped defensively (strict ordering makes them
     /// unexpected, but a stale line must not be parsed as our result).
+    ///
+    /// Waited in slices, with the signal flag read at the top of each one, for
+    /// the reason [`Self::read_response_with_timeout`] is: this is the wait
+    /// `capture_v2` and `check_v2` sit in, it blocks the thread the analysis is
+    /// on, and it is fifteen minutes long. A signal arriving inside it used to
+    /// be acted on only when the sidecar answered (carrick#1387). The slice is
+    /// not the frame's budget: only [`Instant::elapsed`] draws that down, so a
+    /// slice expiring is a trip back to the check and nothing more.
     fn read_result_value(
         &self,
         request_id: &str,
@@ -1720,9 +1728,12 @@ impl TypeSidecar {
             if remaining.is_zero() {
                 return Err(SidecarError::Timeout);
             }
-            let line = match responses.recv_timeout(remaining) {
+            crate::shutdown::check().map_err(SidecarError::Interrupted)?;
+            let line = match responses.recv_timeout(remaining.min(INTERRUPT_CHECK)) {
                 Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => return Err(SidecarError::Timeout),
+                // The slice ran out, not the frame's budget: back round to the
+                // checks, where the budget itself is read.
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return Err(SidecarError::ProcessDied),
             };
             let trimmed = line.trim();
