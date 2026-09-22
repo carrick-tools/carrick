@@ -114,9 +114,10 @@ impl Pass {
     ///
     /// A pass that asks no model spent none of it on one, and closing a
     /// `refresh` on `model analysis 0.0s` states a measurement of nothing —
-    /// worse, it invites a reader to compare a free pass's seconds with the
-    /// paid scan the line was written for (David's ruling, carrick#1452). The
-    /// split is for the run that has all three parts.
+    /// worse, it invites a reader to compare its seconds with those of the
+    /// inferred scan the line was written for, which does several times the
+    /// work (David's ruling, carrick#1452). The split is for the run that has
+    /// all three parts.
     pub fn measured_wait(&self, split: crate::scan_timing::Split) -> crate::scan_timing::Split {
         if self.infers() {
             split
