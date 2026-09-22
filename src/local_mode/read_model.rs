@@ -40,8 +40,8 @@ impl ItemKind {
     }
 }
 
-/// Which layer states a row: a local deterministic pass or a hosted model
-/// answer replayed for an unchanged file.
+/// Which layer states a row: a local deterministic pass, or a model answer
+/// from the scan that built the index or replayed for an unchanged file.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
