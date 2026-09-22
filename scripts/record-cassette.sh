@@ -30,7 +30,10 @@ dump="$(mktemp -d)"
 trap 'rm -rf "$dump"' EXIT
 
 # --- 1. one real run, capturing every analyzer answer -------------------------
-CARRICK_EVAL_DUMP_DIR="$dump" CARRICK_OUTPUT_JSON=1 "$bin" --no-cache "$fixture" >/dev/null
+# A direct, synchronous scan: the dump is written where the analyzer answers,
+# so a dispatched job (answers arriving in a bundle later) would record nothing.
+env -u CARRICK_DISPATCH -u CARRICK_ANSWERS -u CARRICK_MOCK_ALL \
+  CARRICK_EVAL_DUMP_DIR="$dump" CARRICK_OUTPUT_JSON=1 "$bin" --no-cache "$fixture" >/dev/null
 
 shopt -s nullglob
 answers=("$dump"/*.json)
