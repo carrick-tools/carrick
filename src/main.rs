@@ -958,7 +958,12 @@ mod tests {
     }
 
     /// A run stopped before `start-scan` answered says so through the other
-    /// event, and still sends what it wrote.
+    /// event, and the log is offered on that path too.
+    ///
+    /// Offered, not sent: whether it leaves is the storage's own gate, and a
+    /// Bearer credential with no scan to store a log against answers no
+    /// (carrick#1370). The mock has no such gate, so what this pins is that
+    /// the path asks.
     #[tokio::test]
     async fn a_run_interrupted_before_its_scan_opened_reports_the_other_event() {
         let log = tempfile::NamedTempFile::new().expect("a log for the run");
