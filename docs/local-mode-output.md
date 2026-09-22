@@ -26,7 +26,7 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
 | `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index — unless there was nothing to hand over, in which case it indexes here and says so (carrick#1251) | returns when the prompts are built, minutes on a large repo |
 | `carrick resume` | `.carrick/jobs.json`, Carrick Cloud, local source | `<dir>/.carrick/` | minutes; the analysis is already done |
-| `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read while a job is in flight |
+| `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read for each job recorded, in turn |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> --recheck` | the same, plus this repo's working tree and the blobs already on disk | nothing outside a temp directory it deletes | 10 s budget |
