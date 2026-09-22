@@ -276,12 +276,18 @@ const SCANNER_VERSION_HEADER: &str = "X-Carrick-Scanner-Version";
 
 /// How long one attempt at an end-of-run marker waits.
 ///
-/// Sized by what an interrupted run has for the whole report
-/// ([`crate::shutdown::INTERRUPTION_REPORT_BUDGET`], five seconds): both
-/// attempts and everything around them have to fit inside it, or the second
-/// one is spent on a process that is already being abandoned. A run that is
-/// already over must not hold a terminal open on the way out either.
-const MARKER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_400);
+/// The whole of what an interrupted run has for its report
+/// ([`crate::shutdown::INTERRUPTION_REPORT_BUDGET`]), because that budget is
+/// the bound on the signal path and it is applied from outside: `main` races
+/// the report against it and abandons whatever is still in flight. So the
+/// attempts do not have to be divided up to fit. On that path the first
+/// attempt gets the budget, and the second is reached only when the first
+/// failed fast, which is what a dropped connection or a prompt 5xx does.
+///
+/// On every other path this is the bound a run that is already over holds its
+/// terminal for, and it is deliberately not shorter: a cold Lambda start is
+/// seconds, and a shorter attempt would lose markers that land today.
+const MARKER_ATTEMPT_TIMEOUT: std::time::Duration = crate::shutdown::INTERRUPTION_REPORT_BUDGET;
 
 /// How many attempts an end-of-run marker gets.
 ///
@@ -1432,12 +1438,14 @@ impl AwsStorage {
     /// `scan_not_authorized`), and after a deploy those two want opposite
     /// things done about them.
     ///
-    /// Both attempts together fit inside [`crate::shutdown::INTERRUPTION_REPORT_BUDGET`],
-    /// which is what an interrupted run has for the whole report: two attempts
-    /// of [`MARKER_ATTEMPT_TIMEOUT`] with nothing between them. That is shorter
-    /// per attempt than the single ten-second try it replaces, which is the
-    /// trade: a cloud that takes more than a cold start to answer now loses the
-    /// marker on a path where the interruption budget was abandoning it anyway.
+    /// Nothing here divides a budget up. The signal path is cut from outside:
+    /// `main` races the whole report against
+    /// [`crate::shutdown::INTERRUPTION_REPORT_BUDGET`] and abandons what is
+    /// still in flight, so the second attempt is reached there only when the
+    /// first failed fast, which is what a dropped connection or a prompt 5xx
+    /// does. Shortening the attempt to make two of them fit would have cost
+    /// markers on every other path, where a cold Lambda start is seconds and
+    /// nothing is cutting the wait.
     async fn post_run_marker<B: Serialize + ?Sized>(&self, token: &str, action: &str, body: &B) {
         let mut last: Option<String> = None;
         for attempt in 0..MARKER_ATTEMPTS {
@@ -3552,14 +3560,15 @@ mod tests {
         }
     }
 
-    /// Both attempts fit inside what an interrupted run has for the whole of
-    /// its report, or the second one is spent on a process that is already
-    /// being abandoned (carrick#1235).
+    /// One attempt never outlives what an interrupted run has for its whole
+    /// report (carrick#1235): the budget is applied from outside, so an
+    /// attempt longer than it could only ever be abandoned mid-request, and
+    /// the retry behind it would never be reached on that path at all.
     #[test]
-    fn two_marker_attempts_fit_the_interruption_budget() {
+    fn one_marker_attempt_fits_the_interruption_budget() {
         assert!(
-            MARKER_ATTEMPT_TIMEOUT * MARKER_ATTEMPTS < crate::shutdown::INTERRUPTION_REPORT_BUDGET,
-            "{MARKER_ATTEMPTS} attempts of {MARKER_ATTEMPT_TIMEOUT:?} do not fit in {:?}",
+            MARKER_ATTEMPT_TIMEOUT <= crate::shutdown::INTERRUPTION_REPORT_BUDGET,
+            "an attempt of {MARKER_ATTEMPT_TIMEOUT:?} outlives the {:?} a report gets",
             crate::shutdown::INTERRUPTION_REPORT_BUDGET
         );
     }
