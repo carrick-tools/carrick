@@ -1373,6 +1373,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         return Err(unconfirmed_upload_error(&unconfirmed_uploads).into());
     }
 
+    // What this scan spent its wall clock on, for the build that started it.
+    // Only a run that got this far: a scan that failed measured a wait nobody
+    // should be told to expect again (carrick#1452).
+    crate::scan_timing::report();
     Ok(())
 }
 
@@ -1459,7 +1463,21 @@ impl ServiceScan<'_> {
         // it (carrick#767). The breakdown after the colon adds up to it, and
         // the request counts say how many round trips this service made —
         // which is what distinguishes work that grew from waiting that grew.
-        let phases = crate::phase_timing::take_line().unwrap_or_else(|| "not recorded".to_string());
+        let totals = crate::phase_timing::take();
+        // The same marks, folded into the split the build states before and
+        // after the wait (carrick#1452). The two stages that ask the model are
+        // the wait on the model; everything else in this loop, including the
+        // packages read and the sidecar scoped above it, is this machine's.
+        if let Some(totals) = &totals {
+            crate::scan_timing::service_analysed(
+                totals.local_secs() + packages_took.as_secs_f64() + sidecar_took.as_secs_f64(),
+                totals.model_secs(),
+            );
+        }
+        let phases = totals
+            .as_ref()
+            .map(crate::phase_timing::Totals::line)
+            .unwrap_or_else(|| "not recorded".to_string());
         let requests = crate::agent_service::requests_between(
             &requests_before,
             &crate::agent_service::request_counts(),
@@ -2061,6 +2079,10 @@ async fn upload_service_payloads<T: CloudStorage>(
     boundary: &upload_boundary::UploadBoundary,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
+    // The third of the three waits a build states: this one is neither the
+    // local read nor the model, and on a multi-service repo it is minutes
+    // (carrick#1452).
+    let upload_started = Instant::now();
     // Before the first write, because every write action reads it: a run that
     // sent even one file to the analyzer computed something the stored
     // generation does not hold, and the cloud's freshness guard — which sees
@@ -2144,6 +2166,7 @@ async fn upload_service_payloads<T: CloudStorage>(
     } else {
         logging::finish_spinner(&sp, upload_finish_message(&outcomes));
     }
+    crate::scan_timing::uploaded(upload_started.elapsed().as_secs_f64());
     unconfirmed
 }
 

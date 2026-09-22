@@ -1097,6 +1097,16 @@ fn build_workspace(
             "carrick: this scan asks Carrick Cloud to classify what the deterministic passes \
              could not, and uploads the result. It runs the analysis; later scans read it."
         );
+        // The last thing said before the wait: how big this tree is and how
+        // long the last read of it took (carrick#1452). On stdout, because a
+        // build's stderr is kept for a failure and shown for nothing else —
+        // this is the line the renderer says at the top of the run.
+        crate::outln!(
+            "{}",
+            crate::scan_timing::tree_line(
+                crate::scan_timing::LastRead::read(&workspace.last_read_file()).as_ref()
+            )
+        );
     }
     let outcome = match super::index::run(workspace, service, pass)? {
         super::index::Built::Indexed(outcome) => outcome,
@@ -1131,6 +1141,14 @@ fn build_workspace(
     // tells a skipped download apart from a failed one (carrick#1012 item 2).
     if let Some(line) = &outcome.hosted_download {
         crate::errln!("carrick: {line}");
+    }
+    // What the wait was made of, kept where the next build reads it. Only the
+    // inferred full-workspace pass: a refresh asks no model, and a resume
+    // scans the repos whose answers came back and not the rest, so either
+    // would leave the next `carrick index` quoting a time for work it is not
+    // about to do (carrick#1452).
+    if pass.measures_the_tree() && outcome.timing.measured() {
+        crate::scan_timing::LastRead::write(&outcome.timing, &workspace.last_read_file());
     }
     // What this build amounts to, for a parent that renders it: the counts and
     // the next step, without the map's per-service diagnostics (carrick#1315).
@@ -1173,6 +1191,10 @@ fn summary(outcome: &super::index::IndexOutcome) -> crate::progress::Summary {
         services,
         elapsed_secs: outcome.elapsed_secs,
         next: outcome.pending.clone(),
+        // The same three figures the next build's opening line is read from,
+        // so what a reader is told at the end is what they are quoted at the
+        // start (carrick#1452).
+        timing: outcome.timing.measured().then_some(outcome.timing),
     }
 }
 
@@ -1192,6 +1214,8 @@ fn report_dispatch_summary(
         services: Vec::new(),
         elapsed_secs: 0.0,
         next,
+        // Nothing was indexed here, so there is no wait to attribute.
+        timing: None,
     });
 }
 
@@ -1448,6 +1472,12 @@ fn print_map(outcome: &super::index::IndexOutcome) {
         outcome.elapsed_secs,
         index.indexed_at
     );
+    // And what that time was made of, for the raw stream and `--verbose`. The
+    // rendered run reads the same three figures off the summary marker
+    // (carrick#1452).
+    if outcome.timing.measured() {
+        crate::outln!("  {}", crate::scan_timing::split_line(&outcome.timing));
+    }
     for repo in &index.repos {
         for service in &repo.services {
             // `0 route(s) 0 call(s)` is the same table cell for a service with

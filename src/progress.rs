@@ -368,6 +368,12 @@ pub struct Summary {
     /// Empty on the ordinary run, whose next step is the renderer's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<String>,
+    /// Where the wait went: the local read, the model, the upload
+    /// (carrick#1452). Absent from a build that measured nothing — a dispatch
+    /// that handed everything over, a run whose scans are older than this
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::scan_timing::Split>,
 }
 
 /// State, for the parent, what this build indexed.
@@ -663,6 +669,13 @@ mod tests {
             ],
             elapsed_secs: 169.4,
             next: vec!["Carrick Cloud is analysing acme/api (95 file(s)).".to_string()],
+            timing: Some(crate::scan_timing::Split {
+                files: 1204,
+                services: 2,
+                local_secs: 61.0,
+                model_secs: 96.4,
+                upload_secs: 12.0,
+            }),
         };
         let line = format!(
             "{SUMMARY_MARKER}{}",

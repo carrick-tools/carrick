@@ -35,6 +35,9 @@ err("carrick: indexing 1 repos (carrick.json): /code/api");
 err(
   "carrick: this scan asks Carrick Cloud to classify what the deterministic passes could not.",
 );
+// The last thing said before the wait, on stdout because a build's stderr is
+// kept for a failure and shown for nothing else (carrick#1452).
+out("Reading the tree: 1204 files across 5 services; last time 2m13s.");
 
 if (mode === "dispatch") {
   err('@carrick-phase {"label":"indexing api","state":"started"}');
@@ -58,11 +61,12 @@ err('@carrick-phase {"label":"joining the workspace","state":"started"}');
 err("✓ joined the workspace");
 err('@carrick-phase {"label":"joined the workspace","state":"done"}');
 err(
-  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4}',
+  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4,"timing":{"files":1204,"services":5,"local_secs":61,"model_secs":96.4,"upload_secs":12}}',
 );
 
 out("");
 out("indexed 1 repo(s) in 169.4s at 2026-09-17T13:31:59Z");
+out("  local read 1m1s · model analysis 1m36s · upload 12.0s");
 out("  pan-api                       111 route(s)    10 call(s)  1bf3de5");
 out("  0 counterpart link(s) across the workspace");
 out("");

@@ -245,6 +245,23 @@ impl Workspace {
     pub fn last_scan_file(&self) -> PathBuf {
         last_scan_file(&self.index_dir())
     }
+
+    /// Where the last completed build's wall time split is kept
+    /// (carrick#1452).
+    ///
+    /// Beside the index for the same reason the spend receipt is, and separate
+    /// from it because it is the opposite kind of fact: what a run cost is
+    /// ours and is never rendered, and how long it took is the first thing the
+    /// next run says.
+    pub fn last_read_file(&self) -> PathBuf {
+        last_read_file(&self.index_dir())
+    }
+}
+
+/// The same path, for a reader that has the `.carrick` directory and no
+/// loaded workspace.
+pub fn last_read_file(index_dir: &Path) -> PathBuf {
+    index_dir.join("last-read.json")
 }
 
 /// The same path, for a reader that has the `.carrick` directory and no
@@ -517,6 +534,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(WORKSPACE_FILE), repos).unwrap();
         dir
+    }
+
+    /// A build writes its split through the workspace and the next one opens
+    /// with it, so the two halves have to name one file. Both are asked here
+    /// the way each asks in production: the writer through the loaded
+    /// workspace, the reader through the bare index directory
+    /// (carrick#1452).
+    #[test]
+    fn the_wall_time_split_is_written_and_read_back_from_one_file() {
+        let dir = workspace_with(r#"{"repos": ["./api"]}"#);
+        std::fs::create_dir(dir.path().join("api")).unwrap();
+        let workspace = Workspace::load(dir.path()).unwrap();
+        std::fs::create_dir_all(workspace.index_dir()).unwrap();
+        assert_eq!(
+            crate::scan_timing::tree_line(None),
+            "Reading the tree: first read of this tree.",
+            "and a workspace with no record is exactly that case"
+        );
+
+        let split = crate::scan_timing::Split {
+            files: 1204,
+            services: 5,
+            local_secs: 133.0,
+            model_secs: 200.0,
+            upload_secs: 12.0,
+        };
+        crate::scan_timing::LastRead::write(&split, &workspace.last_read_file());
+
+        let read = crate::scan_timing::LastRead::read(&last_read_file(&workspace.index_dir()))
+            .expect("the next build finds what this one wrote");
+        assert_eq!(read.split, split);
+        assert_eq!(
+            crate::scan_timing::tree_line(Some(&read)),
+            "Reading the tree: 1204 files across 5 services; last time 2m13s."
+        );
     }
 
     #[test]
