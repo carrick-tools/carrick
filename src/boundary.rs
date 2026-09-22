@@ -147,9 +147,25 @@ pub struct ServiceBoundary {
     /// different thing about the same row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
-    /// Indexed routes with no resolved response type, so nothing on the
-    /// producer side of a compatibility check. Routes counted in
+    /// Indexed routes the index can serve no response shape for, so nothing on
+    /// the producer side of a compatibility check. Routes counted in
     /// `routes_without_body` are not in this count.
+    ///
+    /// One definition, stated here because two were being read off one number
+    /// (carrick#1449): a route is counted when no producer-response manifest
+    /// entry for its operation carries a `resolved_definition` and no alias of
+    /// one is declared in the bundled `.d.ts` with a body worth reading — the
+    /// question [`untyped_operations`] asks, and the question
+    /// `get_endpoint_types` answers.
+    ///
+    /// It is NOT the count of manifest rows whose `type_state` is `unknown`,
+    /// and the two are not interchangeable in either direction. A row can be
+    /// `unknown` and still have a shape in the bundle, which this count calls
+    /// typed (carrick#1321); a row can state no response body at all, which
+    /// moves to `routes_without_body` (carrick#1159); and this counts every
+    /// indexed operation of every protocol, where a manifest read is usually
+    /// cut to the HTTP rows. On one service the two numbers were 53 and 29 of
+    /// the same scan.
     pub routes_without_response_type: Counted,
     /// Indexed routes the analysis states send no response body at all (a
     /// redirect, a 204, a stream handed to the transport, a throw), and which
@@ -466,6 +482,26 @@ fn routes_without_a_type(
 /// 111-route service that was 46 routes reported as having no response type
 /// while the index served a full definition for 45 of them (carrick#1321). A
 /// count that contradicts what the same index serves is worse than no count.
+///
+/// The manifest is joined at the operation's own site, and for a PRODUCER an
+/// operation the manifest anchors nowhere near falls back to the operation
+/// itself. Both halves are needed, for different reasons. The site join is
+/// what keeps two rows of one path in two files from typing each other. The
+/// fallback is what stops the count contradicting the index a second way: a
+/// GraphQL field's manifest row is anchored at the schema that declares it,
+/// while the field's own row moves to the resolver the analysis located
+/// (carrick#1256), so the site join misses for exactly the fields whose types
+/// the scan DID resolve — 25 of one service's 41 fields, every one of them
+/// served by `get_endpoint_types`, which looks an operation up by key and
+/// never by file (carrick#1449). The fallback applies only where the manifest
+/// holds no row at the site at all: a row that IS there decides, so an untyped
+/// site is never typed by a sibling row.
+///
+/// Consumers get no fallback. What the index serves for a producer belongs to
+/// the operation — one response shape per operation is what a reader asks for
+/// and what a consumer is checked against — but the expected type of a call is
+/// a property of that call site, and another site's type is no evidence about
+/// it.
 fn untyped_operations(
     data: &CloudRepoData,
     role: ManifestRole,
@@ -476,23 +512,38 @@ fn untyped_operations(
     };
     let manifest = data.type_manifest.as_deref().unwrap_or_default();
     let bundle = data.bundled_types.as_deref().unwrap_or_default();
-    let typed: HashSet<(String, String)> = manifest
+    let entries = manifest
         .iter()
         .filter(|entry| entry.role == role)
-        .filter(|entry| matches!(entry.type_kind, ManifestTypeKind::Response))
-        .filter(|entry| {
-            entry.resolved_definition.is_some()
-                || crate::type_manifest::dts_alias_serves_a_shape(bundle, &entry.type_alias)
-        })
-        .map(|entry| (entry.key.canonical(), entry.file_path.clone()))
-        .collect();
+        .filter(|entry| matches!(entry.type_kind, ManifestTypeKind::Response));
+    let mut anchored: HashSet<(String, String)> = HashSet::new();
+    let mut typed: HashSet<(String, String)> = HashSet::new();
+    let mut typed_operations: HashSet<String> = HashSet::new();
+    for entry in entries {
+        let key = entry.key.canonical();
+        anchored.insert((key.clone(), entry.file_path.clone()));
+        let serves = entry.resolved_definition.is_some()
+            || crate::type_manifest::dts_alias_serves_a_shape(bundle, &entry.type_alias);
+        if serves {
+            typed.insert((key.clone(), entry.file_path.clone()));
+            typed_operations.insert(key);
+        }
+    }
     operations.iter().filter_map(move |operation| {
         let location = operation.file_path.to_string_lossy();
         let (file, line) = match location.rsplit_once(':') {
             Some((file, line)) => (file, line.parse::<u32>().ok()),
             None => (location.as_ref(), None),
         };
-        if typed.contains(&(operation.key.canonical(), file.to_string())) {
+        let key = operation.key.canonical();
+        let site = (key.clone(), file.to_string());
+        if typed.contains(&site) {
+            return None;
+        }
+        if role == ManifestRole::Producer
+            && !anchored.contains(&site)
+            && typed_operations.contains(&key)
+        {
             return None;
         }
         let reason = format!(
@@ -666,6 +717,186 @@ mod tests {
         assert!(
             counted.contains("/b") && counted.contains("/c"),
             "{counted}"
+        );
+    }
+
+    /// `routes_without_response_type` is one definition, and it is not the
+    /// manifest's `type_state` (carrick#1449).
+    ///
+    /// Two numbers were being read off one scan as if they were the same
+    /// number — this count, and a count of manifest rows whose `type_state` is
+    /// `unknown`. They answer different questions, so this blob is built to
+    /// make every way they come apart visible at once, and asserts both
+    /// numbers side by side. If a change makes either definition drift into
+    /// the other, one of these assertions moves:
+    ///
+    /// * an `unknown` row whose alias the bundle serves is NOT counted, and an
+    ///   `explicit` row whose alias is only the bundler's placeholder IS —
+    ///   neither direction follows `type_state` (carrick#1321);
+    /// * a GraphQL field anchored in the manifest at the schema that declares
+    ///   it, while its own row sits at the resolver the analysis located, is
+    ///   not counted: `get_endpoint_types` serves it (carrick#1256);
+    /// * a second row of one path in another file is still counted when the
+    ///   manifest has a row at ITS site saying nothing — the operation-level
+    ///   fallback never overrides a row that is actually there;
+    /// * an operation the manifest never mentions is counted, and appears in
+    ///   no `type_state` tally at all, because it has no row to carry one.
+    #[test]
+    fn the_untyped_route_count_is_not_the_manifest_type_state_count() {
+        use crate::cloud_storage::{CloudRepoData, ManifestTypeState};
+        use crate::type_manifest::MISSING_ALIAS_MARKER;
+
+        let route = |path: &str, file: &str, line: u32| {
+            serde_json::json!({
+                "owner": { "App": "app" },
+                "key": { "protocol": "http", "method": "GET", "path": path },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": format!("{file}:{line}"),
+                "provenance": "route",
+                "resolution_source": "decorator_route"
+            })
+        };
+        let field = |name: &str, file: &str, line: u32| {
+            serde_json::json!({
+                "owner": { "App": "app" },
+                "key": { "protocol": "graphql", "kind": "mutation", "field": name },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": format!("{file}:{line}"),
+                "provenance": "route",
+                "resolution_source": null
+            })
+        };
+        let http_entry = |path: &str, file: &str, line: u32, alias: &str, state: &str| {
+            serde_json::json!({
+                "protocol": "http", "method": "GET", "path": path,
+                "role": "producer", "type_kind": "response",
+                "type_alias": alias, "file_path": file, "line_number": line,
+                "is_explicit": state == "explicit", "type_state": state,
+                "evidence": {
+                    "file_path": file, "span_start": null, "span_end": null,
+                    "line_number": line, "infer_kind": "response_body",
+                    "is_explicit": state == "explicit", "type_state": state
+                }
+            })
+        };
+        let field_entry = |name: &str, file: &str, line: u32, alias: &str, state: &str| {
+            serde_json::json!({
+                "protocol": "graphql", "kind": "mutation", "field": name,
+                "role": "producer", "type_kind": "response",
+                "type_alias": alias, "file_path": file, "line_number": line,
+                "is_explicit": false, "type_state": state,
+                "evidence": {
+                    "file_path": file, "span_start": null, "span_end": null,
+                    "line_number": line, "infer_kind": "response_body",
+                    "is_explicit": false, "type_state": state
+                }
+            })
+        };
+
+        let bundle = format!(
+            "export type Served = {{ id: string }};\n\
+             export type FieldServed = {{ id: string }};\n\
+             export type TwinServed = {{ id: string }};\n\
+             export type NeverArrived = unknown; {MISSING_ALIAS_MARKER}\n\
+             export type FieldNeverArrived = unknown; {MISSING_ALIAS_MARKER}\n\
+             export type TwinNeverArrived = unknown; {MISSING_ALIAS_MARKER}\n"
+        );
+        let blob = serde_json::json!({
+            "repo_name": "acme/app",
+            "endpoints": [
+                // A shape the bundle serves, whose row still says `unknown`.
+                route("/served", "src/a.ts", 10),
+                // The bundler's placeholder, whose row says `explicit`.
+                route("/placeholder", "src/a.ts", 20),
+                // Two rows of one path in two files: one typed, one not.
+                route("/twin", "src/twin-a.ts", 30),
+                route("/twin", "src/twin-b.ts", 40),
+                // Indexed, and the manifest never mentions it.
+                route("/unmentioned", "src/a.ts", 50),
+                // Located at its resolver; typed under the schema's anchor.
+                field("createOrder", "src/resolvers.ts", 60),
+                // Never located, so its row and its anchor are both the schema.
+                field("archiveOrder", "src/schema.graphql", 70),
+            ],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc1234",
+            "bundled_types": bundle,
+            "type_manifest": [
+                http_entry("/served", "src/a.ts", 10, "Served", "unknown"),
+                http_entry("/placeholder", "src/a.ts", 20, "NeverArrived", "explicit"),
+                http_entry("/twin", "src/twin-a.ts", 30, "TwinServed", "unknown"),
+                http_entry("/twin", "src/twin-b.ts", 40, "TwinNeverArrived", "implicit"),
+                field_entry("createOrder", "src/schema.graphql", 65, "FieldServed", "implicit"),
+                field_entry(
+                    "archiveOrder",
+                    "src/schema.graphql",
+                    70,
+                    "FieldNeverArrived",
+                    "unknown",
+                ),
+            ]
+        });
+        let data: CloudRepoData = serde_json::from_value(blob).expect("the blob reads");
+        let boundary =
+            ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
+        let counted = boundary.routes_without_response_type.reasons.join(" ");
+
+        assert_eq!(
+            boundary.routes_without_response_type.total, 4,
+            "the placeholder, the untyped twin, the unmentioned route and the \
+             unlocated field: {counted}"
+        );
+        for shortfall in [
+            "/placeholder",
+            "src/twin-b.ts",
+            "/unmentioned",
+            "archiveOrder",
+        ] {
+            assert!(
+                counted.contains(shortfall),
+                "{shortfall} is missing: {counted}"
+            );
+        }
+        for served in ["/served", "src/twin-a.ts", "createOrder"] {
+            assert!(
+                !counted.contains(served),
+                "{served} is served by the index and must not be counted: {counted}"
+            );
+        }
+
+        let unknown_state_rows = data
+            .type_manifest
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.type_state == ManifestTypeState::Unknown)
+            .count();
+        assert_eq!(
+            unknown_state_rows, 3,
+            "the manifest's own state answers a different question on the same blob"
+        );
+        assert_ne!(
+            unknown_state_rows, boundary.routes_without_response_type.total,
+            "the two numbers are not interchangeable and this blob proves it \
+             (carrick#1449); if they have converged, one definition has moved"
         );
     }
 
