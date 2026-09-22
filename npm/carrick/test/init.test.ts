@@ -50,7 +50,17 @@ import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
 import { TEMPLATE_PATHS } from "../src/templates.ts";
-import { BEAT_MS, DOWNLOAD_LABEL, downloadProgress, hostedReport } from "../src/init/hosted.ts";
+import {
+  BEAT_MS,
+  downloadHostedIndex,
+  downloadProgress,
+  hostedReport,
+  localIndexState,
+  REREADING,
+  STEP_LABEL,
+} from "../src/init/hosted.ts";
+import type { NativeRun } from "../src/init/hosted.ts";
+import type { RunningScan, StatusResult, StatusService } from "../src/contract.ts";
 import {
   chosenNumbers,
   DOCS,
@@ -126,11 +136,17 @@ function executableInitFixture(
   // fixture binary answers, because that is the branch that reads the hosted
   // index onto this machine (carrick#1020): `hostedState` is what the status
   // it writes reports, and `refreshFails` is the scanner refusing the read.
+  //
+  // `localIndex` is what `.carrick/` holds on this machine BEFORE the run,
+  // which is what decides whether the local pass runs at all (carrick#1373).
+  // It defaults to `absent`, the second-developer case: a fresh clone whose
+  // `status` refuses until a pass has written an index.
   workspace: {
     indexed?: boolean;
     alsoInProject?: string[];
     hostedState?: string;
     refreshFails?: boolean;
+    localIndex?: "absent" | "stale" | "current";
   } = {},
 ): {
   root: string;
@@ -138,6 +154,8 @@ function executableInitFixture(
   env: NodeJS.ProcessEnv;
   /** The actions this fixture's server was asked for, in order. */
   requests: () => string[];
+  /** The scanner subcommands this run spawned, in order (carrick#1373). */
+  commands: () => string[];
   cleanup: () => void;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-cli-"));
@@ -150,27 +168,53 @@ function executableInitFixture(
   // Anything but `derive` — and, on an indexed workspace, the free `refresh`
   // and `status` that read the hosted index onto this machine — exits 2, so a
   // run that ends 0 is a run that never asked this binary to scan.
+  //
+  // Stateful in one way: `status` answers "no index here" until a `refresh`
+  // has run, unless this fixture was built with one already on the machine.
+  // That is what makes the command log below a proof rather than a count — a
+  // run that skips the local pass and a run that spends 527 seconds on it
+  // reach the same rows, and only the log tells them apart (carrick#1373).
   fs.writeFileSync(native, `#!/usr/bin/env node
+import fs from "node:fs";
 const argv = process.argv.slice(2);
 const indexed = ${JSON.stringify(workspace.indexed === true)};
+const localIndex = ${JSON.stringify(workspace.localIndex ?? "absent")};
+const commands = ${JSON.stringify(path.join(root, "native.log"))};
+const wrote = ${JSON.stringify(path.join(root, "refreshed"))};
 const at = (flag) => argv[argv.indexOf(flag) + 1];
+fs.appendFileSync(commands, argv.join(" ") + "\\n");
 if (indexed && argv[0] === "refresh") {
   if (${JSON.stringify(workspace.refreshFails === true)}) {
     process.stderr.write("carrick refresh: api has no carrick.json\\n");
     process.exit(1);
   }
+  fs.writeFileSync(wrote, "");
   process.stdout.write("indexed 1 repo(s) in 4.0s\\n");
   process.exit(0);
 }
 if (indexed && argv[0] === "status") {
+  const here = localIndex !== "absent" || fs.existsSync(wrote);
+  if (!here) {
+    process.stdout.write(JSON.stringify({
+      schema: "carrick.status/0", error: "not_indexed",
+      message: "No index here yet. Run carrick index.", services: [],
+    }));
+    process.exit(1);
+  }
+  // Stale only until the pass has run: the drift is what the pass clears.
+  const changed = localIndex === "stale" && !fs.existsSync(wrote) ? 2 : 0;
+  // The drift sits on one of the two services, as a change to a file one
+  // service's scan reads and the other's does not.
   const service = (name, state) => ({
     service: name, repo: at("--workspace"), index_commit: "abc1234",
-    indexed_at: "2026-09-12T00:00:00Z", routes: 3, calls: 2, changed_since_index: 0,
+    indexed_at: "2026-09-12T00:00:00Z", routes: 3, calls: 2,
+    changed_since_index: name === "api" ? changed : 0,
     hosted_state: state,
   });
   const state = ${JSON.stringify(workspace.hostedState ?? "enriched")};
   process.stdout.write(JSON.stringify({
     schema: "carrick.status/0", workspace: at("--workspace"),
+    repos: [{ repo: at("--workspace"), name: "repo", changed_since_index: changed, outside_every_service: 0 }],
     services: [service("api", state), service("web", state)],
   }));
   process.exit(0);
@@ -274,6 +318,14 @@ globalThis.fetch = async (input, init) => {
     requests: () =>
       fs.existsSync(path.join(root, "requests.log"))
         ? fs.readFileSync(path.join(root, "requests.log"), "utf8").split("\n").filter((line) => line !== "")
+        : [],
+    commands: () =>
+      fs.existsSync(path.join(root, "native.log"))
+        ? fs
+          .readFileSync(path.join(root, "native.log"), "utf8")
+          .split("\n")
+          .filter((line) => line !== "")
+          .map((line) => line.split(" ")[0] ?? "")
         : [],
     env: {
       ...process.env,
@@ -1028,9 +1080,11 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // machine with no index and told the reader not to run the only command
     // that would have built one (carrick#1020).
     assert.ok(
-      result.stdout.includes("◇ Hosted index for 2 services downloaded into .carrick/"),
+      result.stdout.includes("◇ Hosted index for 2 services read into .carrick/"),
       result.stdout,
     );
+    // And the pass ran, because this clone had no index for it to skip.
+    assert.deepEqual(fixture.commands(), ["derive", "status", "refresh", "status"]);
     assert.doesNotMatch(result.stdout, /already has a hosted index\. Do not run/);
     assert.doesNotMatch(result.stdout, /There is no index yet/);
     // And nothing tells the reader to run a free pass by hand: the read above
@@ -1043,6 +1097,61 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     assert.ok(result.stdout.trimEnd().endsWith(`Docs: ${DOCS}`), result.stdout);
     assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#1373, end to end. `carrick index` writes an index for this tree, and
+// the `carrick init` that follows used to spend the whole of that pass again —
+// 527 seconds on a three-repo workspace, under a label reading "Downloading"
+// and a `--help` saying it ran no analysis.
+test("the executable CLI re-reads nothing when this machine already holds a current index", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    localIndex: "current",
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    // The proof: the scanner was asked to read, and never to scan.
+    assert.ok(!fixture.commands().includes("refresh"), fixture.commands().join(", "));
+    assert.ok(
+      result.stdout.includes("◇ .carrick/ already holds the hosted index for 2 services: nothing was re-read"),
+      result.stdout,
+    );
+    // And nothing claims a read that did not happen.
+    assert.doesNotMatch(result.stdout, /read into \.carrick/);
+    assert.doesNotMatch(result.stdout, /re-reading your code/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// The other side of the same rule: an index behind its tree is re-read, and
+// the run says so before the wait rather than after it.
+test("the executable CLI re-reads a workspace whose index is behind its tree, and says why", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    localIndex: "stale",
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(fixture.commands().includes("refresh"), fixture.commands().join(", "));
+    assert.ok(
+      result.stdout.includes("2 file(s) changed since it was built, re-reading your code"),
+      result.stdout,
+    );
+    assert.ok(result.stdout.includes("Hosted index for 2 services read into .carrick/"), result.stdout);
   } finally {
     fixture.cleanup();
   }
@@ -1834,10 +1943,10 @@ test("the interactive step stops the spinner on the marker its work earned", asy
   });
   const out = interactiveOutput(stream);
   await out.step("Reading the hosted index into .carrick/", async () => "local_only", () =>
-    hostedReport({ kind: "local_only", services: 3, state: "read_failed" }),
+    hostedReport({ kind: "local_only", services: 3, state: "read_failed", reread: true }),
   );
   await out.step("Reading the hosted index into .carrick/", async () => "downloaded", () =>
-    hostedReport({ kind: "downloaded", services: 2 }),
+    hostedReport({ kind: "downloaded", services: 2, reread: true }),
   );
   // Rendered, then read as text: the colours and the cursor are the
   // terminal's business and the markers are the contract.
@@ -1848,7 +1957,7 @@ test("the interactive step stops the spinner on the marker its work earned", asy
     .filter((line) => line.length > 0 && line !== "│");
   assert.deepEqual(lines, [
     "▲ .carrick/ holds 3 services as this machine read them; the hosted rows could not be replayed onto this checkout",
-    "◇ Hosted index for 2 services downloaded into .carrick/",
+    "◇ Hosted index for 2 services read into .carrick/",
   ]);
   // The label is the spinner's while it spins, and nothing once it stops.
   assert.doesNotMatch(plain.split("\n").filter((line) => /[◇▲■]/.test(line)).join("\n"), /Reading the hosted index/);
@@ -1859,30 +1968,44 @@ test("the interactive step stops the spinner on the marker its work earned", asy
 // that says so, and the one that produced nothing is a refusal (carrick#1020,
 // carrick#1026).
 test("every hosted outcome is one line, and only an actionable one is a warning", () => {
-  assert.deepEqual(hostedReport({ kind: "downloaded", services: 2 }), {
+  assert.deepEqual(hostedReport({ kind: "downloaded", services: 2, reread: true }), {
     kind: "done",
-    text: "Hosted index for 2 services downloaded into .carrick/",
+    text: "Hosted index for 2 services read into .carrick/",
   });
-  assert.deepEqual(hostedReport({ kind: "downloaded", services: 1 }).text, "Hosted index for 1 service downloaded into .carrick/");
+  assert.deepEqual(
+    hostedReport({ kind: "downloaded", services: 1, reread: true }).text,
+    "Hosted index for 1 service read into .carrick/",
+  );
   // With the time the step took, which is what a wait of minutes ends on.
   assert.equal(
-    hostedReport({ kind: "downloaded", services: 15 }, 184).text,
-    "Hosted index for 15 services downloaded into .carrick/ in 3m4s",
+    hostedReport({ kind: "downloaded", services: 15, reread: true }, 184).text,
+    "Hosted index for 15 services read into .carrick/ in 3m4s",
   );
-  const older = hostedReport({ kind: "version_mismatch", services: 2 });
+  // And the same rows, on a run that spent none of those minutes: the reader
+  // is told which of the two they got (carrick#1373).
+  const kept = hostedReport({ kind: "downloaded", services: 15, reread: false }, 0.4);
+  assert.equal(kept.kind, "done");
+  assert.equal(kept.text, ".carrick/ already holds the hosted index for 15 services: nothing was re-read");
+  assert.doesNotMatch(kept.text, /in 0/);
+  const older = hostedReport({ kind: "version_mismatch", services: 2, reread: true });
   assert.equal(older.kind, "warn");
   assert.match(older.text, /run `carrick index --detach` once from main/);
   // And never a downgrade: `CACHE_VERSION` moves most weeks (carrick#1012).
   assert.doesNotMatch(older.text, /npm i -g carrick@/);
-  const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing" });
+  const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing", reread: true });
   assert.equal(local.kind, "warn");
   assert.match(local.text, /\.carrick\/ holds 3 services as this machine read them; the commit/);
   // The state this run can cause itself: a repo it just connected under a name
   // the scanner cannot read back off the git remote (carrick#1056). The clause
   // has to name the remote as the reason, not the connection.
-  const unnamed = hostedReport({ kind: "local_only", services: 1, state: "remote_unnamed" });
+  const unnamed = hostedReport({ kind: "local_only", services: 1, state: "remote_unnamed", reread: true });
   assert.match(unnamed.text, /git remote here names no owner\/repo/);
   assert.doesNotMatch(unnamed.text, /not connected/);
+  // A scan of this workspace is already running, so this one left it alone.
+  const scanning = hostedReport({ kind: "scanning" });
+  assert.equal(scanning.kind, "warn");
+  assert.match(scanning.text, /nothing was re-read/);
+  assert.match(scanning.text, /carrick status/);
   const failed = hostedReport({ kind: "failed", problem: "api has no carrick.json" });
   assert.deepEqual(failed, {
     kind: "refuse",
@@ -1890,9 +2013,203 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
   });
   // No branch forbids a command: the sentence that did left the reader with no
   // index and nothing that would build one (carrick#1020).
-  for (const outcome of [older, local, failed]) {
+  for (const outcome of [older, local, failed, scanning]) {
     assert.doesNotMatch(outcome.text, /Do not run/);
   }
+});
+
+/** A status service row, with only the fields the freshness rule reads. */
+function statusService(
+  service: string,
+  repo: string,
+  extra: Partial<StatusService> = {},
+): StatusService {
+  return {
+    service,
+    repo,
+    index_commit: "abc1234",
+    routes: 3,
+    calls: 2,
+    changed_since_index: 0,
+    hosted_state: "enriched",
+    ...extra,
+  };
+}
+
+/** A whole status answer, for one repo at `/code/api` unless told otherwise. */
+function statusAnswer(extra: Partial<StatusResult> = {}): StatusResult {
+  return {
+    schema: "carrick.status/0",
+    workspace: "/code",
+    services: [statusService("api", "/code/api")],
+    repos: [{ repo: "/code/api", name: "api", changed_since_index: 0, outside_every_service: 0 }],
+    ...extra,
+  };
+}
+
+// carrick#1373. The pass behind this step re-reads every file in the
+// workspace, so the question it answers is not "is there an index" but "would
+// a re-read write a different one". Each branch below is a case where it would
+// — and the first one, a clean tree already indexed, is the case that cost 527
+// seconds on a three-repo workspace for no row.
+test("a clean tree already indexed needs no re-read, and each way of not being one does", () => {
+  assert.deepEqual(localIndexState(statusAnswer(), ["/code/api"]), { kind: "current" });
+
+  // Nothing to read at all: the refusal body, which `status` answers non-zero
+  // with, and the no-answer case.
+  const empty = statusAnswer({ services: [], repos: [], error: "not_indexed" });
+  assert.deepEqual(localIndexState(empty, ["/code/api"]), {
+    kind: "reread",
+    reason: "there is no index here yet",
+  });
+  assert.equal(localIndexState(null, ["/code/api"]).kind, "reread");
+
+  // Source that moved since the index was built. Counted from both places the
+  // scanner puts it: what a service's own scan reads, and what belongs to no
+  // service in the repo.
+  assert.deepEqual(
+    localIndexState(statusAnswer({ services: [statusService("api", "/code/api", { changed_since_index: 4 })] }), [
+      "/code/api",
+    ]),
+    { kind: "reread", reason: "4 file(s) changed since it was built" },
+  );
+  assert.deepEqual(
+    localIndexState(
+      statusAnswer({ repos: [{ repo: "/code/api", name: "api", changed_since_index: 9, outside_every_service: 2 }] }),
+      ["/code/api"],
+    ),
+    { kind: "reread", reason: "2 file(s) changed since it was built" },
+  );
+
+  // A repo this folder holds and the index does not, which no drift count can
+  // report: the index has no rows for it to be stale.
+  assert.deepEqual(localIndexState(statusAnswer(), ["/code/api", "/code/web"]), {
+    kind: "reread",
+    reason: "it covers 1 fewer repo(s) than this folder holds",
+  });
+
+  // A hosted state this run has just changed the conditions of: the index was
+  // built by a machine that was not signed in, or before these repos were
+  // connected, and `carrick init` has just done both.
+  for (const state of ["not_signed_in", "not_connected", "remote_unnamed", "no_index_yet"] as const) {
+    assert.deepEqual(
+      localIndexState(statusAnswer({ services: [statusService("api", "/code/api", { hosted_state: state })] }), [
+        "/code/api",
+      ]),
+      { kind: "reread", reason: "it holds no hosted rows yet" },
+      state,
+    );
+  }
+  // And one a second read answers exactly the same way: the hosted blob's own
+  // condition, which nothing this run does moves (carrick#1024).
+  for (const state of ["version_mismatch", "read_failed", "commit_missing"] as const) {
+    assert.deepEqual(
+      localIndexState(statusAnswer({ services: [statusService("api", "/code/api", { hosted_state: state })] }), [
+        "/code/api",
+      ]),
+      { kind: "current" },
+      state,
+    );
+  }
+
+  // A scan is writing this index right now: a second pass over the same tree
+  // is two scans contending, and the one that is running is the answer.
+  const scan = (state: RunningScan["status"], pid = process.pid): RunningScan => ({
+    scan_id: "s1",
+    pid,
+    status: state,
+    started_at: "2026-09-22T00:00:00Z",
+  });
+  assert.deepEqual(
+    localIndexState(statusAnswer({ services: [], running_scans: [scan("running")] }), ["/code/api"]),
+    { kind: "scanning" },
+  );
+  // A `running` row whose process is gone. The record outlives the scan — it
+  // is cleared by the next build, not by the scan ending — so an interrupted
+  // `carrick index` would otherwise leave init skipping the re-read for ever.
+  assert.deepEqual(
+    localIndexState(
+      statusAnswer({ services: [statusService("api", "/code/api", { changed_since_index: 3 })], running_scans: [scan("running", 2_147_483_646)] }),
+      ["/code/api"],
+    ),
+    { kind: "reread", reason: "3 file(s) changed since it was built" },
+  );
+  // And the rows that sit in the same list without holding anything: the scan
+  // that finished is cleared by the next build, not by finishing
+  // (carrick#1007 item 4).
+  for (const state of ["finished", "failed", "dispatched"] as const) {
+    assert.deepEqual(
+      localIndexState(statusAnswer({ running_scans: [scan(state)] }), ["/code/api"]),
+      { kind: "current" },
+      state,
+    );
+  }
+});
+
+/** A scanner stub that logs what it was asked to run. */
+function recordingRun(answers: Record<string, { status?: number; stdout?: string; stderr?: string }>): {
+  run: NativeRun;
+  commands: string[];
+} {
+  const commands: string[] = [];
+  return {
+    commands,
+    run: (args) => {
+      commands.push(args[0] ?? "");
+      const answer = answers[args[0] ?? ""] ?? { status: 2, stderr: "unexpected command" };
+      return Promise.resolve({
+        status: answer.status ?? 0,
+        stdout: answer.stdout ?? "",
+        stderr: answer.stderr ?? "",
+      });
+    },
+  };
+}
+
+// The measurement behind carrick#1373: `refresh` is `build(.., Pass::Facts)`,
+// a full local extraction and type-capture pass over every repo — 527 seconds
+// on a three-repo workspace, and the same minutes again for every `carrick
+// init` after a `carrick index`. The proof is the command log: no count and no
+// sentence can tell a skipped pass from a fast one.
+test("init runs no local pass when the index is already current, and still reports the hosted state", async () => {
+  const { run, commands } = recordingRun({
+    status: { stdout: JSON.stringify(statusAnswer({ services: [statusService("api", "/code/api")] })) },
+  });
+  const said: string[] = [];
+  const outcome = await downloadHostedIndex("/code", run, ["/code/api"], (line) => void said.push(line));
+  assert.deepEqual(commands, ["status"]);
+  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: false });
+  // And nothing is said about re-reading a thing that was not re-read.
+  assert.deepEqual(said, []);
+});
+
+// The other half: a workspace whose index is behind its tree still gets the
+// pass, because that is the only thing that brings the rows up to date.
+test("init runs the local pass when the index is stale, and says why before the wait", async () => {
+  const stale = statusAnswer({ services: [statusService("api", "/code/api", { changed_since_index: 6 })] });
+  const { run, commands } = recordingRun({
+    status: { stdout: JSON.stringify(stale) },
+    refresh: { stdout: "indexed 1 repo(s)" },
+  });
+  const said: string[] = [];
+  const outcome = await downloadHostedIndex("/code", run, ["/code/api"], (line) => void said.push(line));
+  // Status, then the pass, then status again: the outcome is read back from
+  // the index rather than assumed from an exit code (carrick#1012).
+  assert.deepEqual(commands, ["status", "refresh", "status"]);
+  assert.deepEqual(outcome, { kind: "downloaded", services: 1, reread: true });
+  assert.deepEqual(said, [`${STEP_LABEL}: 6 file(s) changed since it was built, ${REREADING}`]);
+});
+
+// A workspace with no index at all — the second developer on a team, which is
+// the case this step was added for (carrick#1020) — and a pass that refuses.
+test("init runs the local pass when there is no index, and a refusal is the scanner's own words", async () => {
+  const { run, commands } = recordingRun({
+    status: { status: 1, stdout: JSON.stringify({ schema: "carrick.status/0", error: "not_indexed", services: [] }) },
+    refresh: { status: 1, stderr: "carrick refresh: api has no carrick.json\n" },
+  });
+  const outcome = await downloadHostedIndex("/code", run, ["/code/api"]);
+  assert.deepEqual(commands, ["status", "refresh"]);
+  assert.deepEqual(outcome, { kind: "failed", problem: "api has no carrick.json" });
 });
 
 test("the derived line names the manifest kind only where every repo agrees", () => {
@@ -1978,7 +2295,7 @@ test("the download says how far through the workspace it is, and how long", () =
   report.read(
     '@carrick-progress {"service":"api","service_index":7,"service_total":15,"phase":"files","done":40,"total":120}',
   );
-  assert.deepEqual(said, [`${DOWNLOAD_LABEL}: 7 of 15 services, 2.5s`]);
+  assert.deepEqual(said, [`${STEP_LABEL}: ${REREADING}, 7 of 15 services, 2.5s`]);
 
   // The hosted half says its size once, as a notice, because it is two
   // requests for the whole workspace rather than a count that ticks.
@@ -1988,7 +2305,7 @@ test("the download says how far through the workspace it is, and how long", () =
   report.read(
     '@carrick-progress {"service":"web","service_index":8,"service_total":15,"phase":"files","done":5,"total":90}',
   );
-  assert.deepEqual(said.at(-1), `${DOWNLOAD_LABEL}: 8 of 15 services, 3.2 MB, 14.0s`);
+  assert.deepEqual(said.at(-1), `${STEP_LABEL}: ${REREADING}, 8 of 15 services, 3.2 MB, 14.0s`);
 
   // And never a time remaining: there is no measured rate to derive one from.
   for (const line of said) assert.doesNotMatch(line, /left|remaining|eta/i);
@@ -2007,7 +2324,7 @@ test("the download says where it is on a clock, not only when a marker arrives",
   // Nothing has moved and nothing has been said, and the beat says so anyway.
   clock = BEAT_MS;
   report.beat();
-  assert.deepEqual(said, [`${DOWNLOAD_LABEL}: reading, ${(BEAT_MS / 1000).toFixed(1)}s`]);
+  assert.deepEqual(said, [`${STEP_LABEL}: ${REREADING}, ${(BEAT_MS / 1000).toFixed(1)}s`]);
 
   // Two beats inside one interval are one line: the cadence is the promise in
   // both directions.
@@ -2031,18 +2348,18 @@ test("the plain rendering writes what a running step says, not only its report",
   const written: string[] = [];
   const out = plainOutput((text) => void written.push(text));
   await out.step(
-    "Downloading your index",
+    STEP_LABEL,
     async (progress) => {
-      progress("Downloading your index: reading, 5.0s");
-      progress("Downloading your index: 2 of 9 services, 10.0s");
+      progress(`${STEP_LABEL}: ${REREADING}, 5.0s`);
+      progress(`${STEP_LABEL}: ${REREADING}, 2 of 9 services, 10.0s`);
       return "ok";
     },
-    () => ({ kind: "done", text: "Hosted index for 9 services downloaded into .carrick/" }),
+    () => ({ kind: "done", text: "Hosted index for 9 services read into .carrick/" }),
   );
   assert.deepEqual(written, [
-    "Downloading your index: reading, 5.0s\n",
-    "Downloading your index: 2 of 9 services, 10.0s\n",
-    "◇ Hosted index for 9 services downloaded into .carrick/\n",
+    `${STEP_LABEL}: ${REREADING}, 5.0s\n`,
+    `${STEP_LABEL}: ${REREADING}, 2 of 9 services, 10.0s\n`,
+    "◇ Hosted index for 9 services read into .carrick/\n",
   ]);
 });
 

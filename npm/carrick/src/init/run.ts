@@ -25,7 +25,7 @@ import {
   type WorkspaceProposal,
 } from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
-import { DOWNLOAD_LABEL, downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
+import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./hosted.ts";
 import {
   createProject,
   listProjects,
@@ -212,10 +212,12 @@ function help(): string {
     "connection, the agent hooks, the MCP connection, and the service proposal",
     "your agent turns into carrick.json. It writes nothing into the repository but",
     "the ignored .carrick directory, the hook settings, and the four task skills",
-    "your agent loads. It runs no analysis: where Carrick already holds an index",
-    "for these repos, it reads that index into .carrick so this machine can answer",
-    "from it. Nothing is written, here or in Carrick, until you accept what it",
-    "proposes.",
+    "your agent loads. No model runs and nothing is uploaded. Where Carrick already",
+    "holds an index for these repos, it reads that index into .carrick so this",
+    "machine can answer from it. That read re-reads your source here first, which",
+    "takes minutes on a large workspace. It skips the re-read when .carrick already",
+    "holds an index current for this checkout. Nothing is written, here or in",
+    "Carrick, until you accept what it proposes.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "        --repo OWNER/REPO  A repo this install covers: repeatable, or one",
@@ -1092,10 +1094,20 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // as well as in a pipe: a spinner that stopped with its label spent a
     // second line on the same event (carrick#1032). What it says while it runs
     // is the scanner's own count of where it has got to (carrick#1365).
+    //
+    // The repo list goes in because the step decides for itself whether to
+    // re-read this tree, and a repo the index does not cover is the one way
+    // that decision cannot be read off a drift count (carrick#1373).
     const startedAt = Date.now();
     await out.step(
-      DOWNLOAD_LABEL,
-      (progress) => downloadHostedIndex(plan.workspace, nativeRunner(out.quiet, progress)),
+      STEP_LABEL,
+      (progress) =>
+        downloadHostedIndex(
+          plan.workspace,
+          nativeRunner(out.quiet, progress),
+          plan.repos.map((repo) => repo.path),
+          progress,
+        ),
       (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000),
     );
   } else {
