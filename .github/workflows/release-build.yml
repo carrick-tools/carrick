@@ -24,6 +24,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "npm/**"
+  # On demand, so this workflow can be run against a branch before the pull
+  # request that would trigger it exists. A trigger only has to exist at the
+  # ref being dispatched, not on the default branch.
+  workflow_dispatch:
 
 concurrency:
   group: release-build-${{ github.ref }}
@@ -98,3 +102,229 @@ jobs:
           mkdir -p unpacked
           tar -xzf release/carrick-action-linux.tar.gz -C unpacked
           ./unpacked/carrick --help > /dev/null
+
+      # The four commands a person runs, end to end, on the release this pull
+      # request would cut (carrick#1450).
+      #
+      # Every other install leg — the matrix, the global install and the
+      # upgrade in `plugin.yml` — stops at `--version`. The hand smoke of a
+      # release on 2026-09-22 found `carrick init` re-running the whole local
+      # scan (carrick#1373) and a summary line that disagreed with the
+      # manifest, and `--version` can see neither. So: the binary built above,
+      # the CLI packed from this commit, installed the way a person installs
+      # it, and a wall-clock budget per command — the budget is what catches
+      # the next re-scan.
+      #
+      # `--omit=optional` installs no platform package: on a release pull
+      # request the pinned version is not published yet, so there is nothing to
+      # resolve. That is why `CARRICK_BIN` names the binary below. The type
+      # sidecar is the one `npm pack` bundled, and the CLI resolves it from the
+      # install itself (`npm/carrick/src/native.ts`), not from a platform
+      # package.
+      - name: Pack the CLI and install it into a temp prefix
+        run: |
+          set -euo pipefail
+          # `npm install`, not `npm ci`, for the reason plugin.yml's `pack` job
+          # gives. `npm pack` runs prepack, which builds the emit and bundles
+          # the sidecar built above.
+          (cd npm/carrick && npm install --ignore-scripts --no-audit --no-fund)
+          mkdir -p pack
+          (cd npm/carrick && npm pack --pack-destination "$GITHUB_WORKSPACE/pack")
+          # `./`, because npm reads a bare `pack/carrick-0.0.0.tgz` as a git
+          # spec and tries to ssh to github.com/pack/carrick-0.0.0.tgz.git.
+          mkdir -p "$RUNNER_TEMP/cli/lib" "$RUNNER_TEMP/cli/bin"
+          npm install -g --prefix "$RUNNER_TEMP/cli" --ignore-scripts \
+            --omit=optional "./$(ls pack/carrick-*.tgz)"
+          "$RUNNER_TEMP/cli/bin/carrick" --version
+          echo "$RUNNER_TEMP/cli/bin" >> "$GITHUB_PATH"
+
+      # A workspace shaped like a checkout somebody scans: two repos, a commit
+      # in each, a config the scan reads, and a release-age policy in the
+      # `.npmrc` — the setting a repository carries that decides what any npm
+      # this run spawns is allowed to resolve.
+      #
+      # Written here rather than into the fixture: `local-mode-workspace` is
+      # `tests/local_mode_test.rs`'s answer key, and a `carrick.json` or an
+      # `.npmrc` added to that tree would change what that test scans.
+      - name: A fixture workspace, with a release-age policy in its .npmrc
+        run: |
+          set -euo pipefail
+          WS="$RUNNER_TEMP/smoke"
+          mkdir -p "$WS"
+          for repo in catalog-web inventory-svc; do
+            cp -R "tests/fixtures/local-mode-workspace/$repo" "$WS/$repo"
+            printf 'min-release-age=7\n' > "$WS/$repo/.npmrc"
+            printf '{ "serviceName": "%s" }\n' "$repo" > "$WS/$repo/carrick.json"
+            git -C "$WS/$repo" init -q .
+            git -C "$WS/$repo" add -A
+            git -C "$WS/$repo" -c user.email=fixture@carrick.test \
+              -c user.name=fixture commit -qm fixture
+          done
+          printf '{ "repos": ["./catalog-web", "./inventory-svc"] }\n' \
+            > "$WS/carrick-workspace.json"
+
+      - name: The CLI answers index, doctor and check inside a budget
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          CARRICK_MOCK_ALL: "true"
+          CARRICK_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/carrick
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+          # Which half of `--recheck` runs is decided here rather than by how
+          # loaded the runner is; the wall clock below is the cap that counts.
+          CARRICK_RECHECK_BUDGET_MS: "600000"
+        run: |
+          set -euo pipefail
+
+          # Which carrick answered, before anything asks it a question: a
+          # global left on the runner image, or a shim that resolved somewhere
+          # else, would answer every assertion below about a build nobody here
+          # made.
+          ON_PATH=$(command -v carrick)
+          echo "carrick on PATH: $ON_PATH ($(carrick --version)), binary $CARRICK_BIN"
+          case "$ON_PATH" in
+            "$RUNNER_TEMP/cli/bin/carrick") ;;
+            *)
+              echo "::error::the carrick on PATH is $ON_PATH, not the one installed from this commit"
+              exit 1
+              ;;
+          esac
+
+          # One command, one budget. `timeout` ends a command that runs past
+          # it, and 124 is how that is told apart from the command failing.
+          # Measured on the same fixture: index 4s, doctor 2s, check 3s. The
+          # budgets are several times that, so what they catch is a command
+          # that started doing something else — a re-scan, a fetch nobody
+          # bounded — and not a slow runner.
+          budget() {
+            local seconds="$1" label="$2" expect="$3"
+            shift 3
+            local started=$SECONDS code=0
+            timeout "$seconds" "$@" \
+              > "$RUNNER_TEMP/$label.out" 2> "$RUNNER_TEMP/$label.err" || code=$?
+            local elapsed=$((SECONDS - started))
+            echo "$label: exit $code in ${elapsed}s (budget ${seconds}s)"
+            sed 's/^/  | /' "$RUNNER_TEMP/$label.err"
+            if [ "$code" = "124" ]; then
+              echo "::error::carrick $label ran past its ${seconds}s budget"
+              exit 1
+            fi
+            if [ "$expect" = "zero" ] && [ "$code" != "0" ]; then
+              echo "::error::carrick $label exited $code"
+              cat "$RUNNER_TEMP/$label.out"
+              exit 1
+            fi
+          }
+
+          budget 240 index zero carrick index --workspace .
+          cat "$RUNNER_TEMP/index.out"
+
+          budget 120 status zero carrick status --json
+          # The hosted half of what `doctor` reports, read from the same place
+          # `doctor` reads it. Asserted on the services rather than on the
+          # absence of a word, so an index holding nothing cannot pass this by
+          # having nothing to fail.
+          node -e '
+            const status = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const services = status.services ?? [];
+            if (services.length === 0) {
+              console.log("::error::the index names no service, so there is no hosted state to assert on");
+              process.exit(1);
+            }
+            console.log(services.map((s) => `${s.service}=${s.hosted_state}`).join(", "));
+            const failed = services.filter((s) => s.hosted_state === "read_failed");
+            if (failed.length > 0) {
+              console.log(`::error::${failed.length} of ${services.length} service(s) read the hosted index as read_failed`);
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/status.out"
+
+          # `doctor` exits non-zero while any finding stands, and a fixture
+          # workspace has findings by construction: no hook settings, no
+          # workflow, no agent client on the runner. What is asserted is the
+          # hosted half — that it got an answer, and that the answer is not
+          # `read_failed`.
+          budget 120 doctor any carrick doctor
+          cat "$RUNNER_TEMP/doctor.out"
+          if grep -q "read_failed" "$RUNNER_TEMP/doctor.out"; then
+            echo "::error::carrick doctor read the hosted index as read_failed"
+            exit 1
+          fi
+          if ! grep -Eq "hosted index answers for all|\(hosted state: " "$RUNNER_TEMP/doctor.out"; then
+            echo "::error::carrick doctor said nothing about the hosted index, so the line above read nothing"
+            cat "$RUNNER_TEMP/doctor.out"
+            exit 1
+          fi
+
+          # The producer side of the fixture's one contract. An answer with no
+          # item means the index was built and holds nothing, which every
+          # assertion above would still pass.
+          budget 120 check-producer zero \
+            carrick check 'catalog-web/app/routes/api.v1.widgets.$widgetId.ts' --json
+          node -e '
+            const answer = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const items = answer.items ?? [];
+            console.log(`check named ${items.length} item(s) for the route module`);
+            if (items.length === 0) {
+              console.log("::error::carrick check named no item for the producer, so the index holds no contract");
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/check-producer.out"
+
+          # A re-check with something to do. Edited first: on a file the index
+          # already matches, `recheck` answers `ran: none`, and a job asserting
+          # only that the object exists would never run the half it is about.
+          printf '\n// a byte the index has not seen\n' >> inventory-svc/src/client.ts
+          budget 240 check-recheck zero \
+            carrick check inventory-svc/src/client.ts --recheck --json
+          node -e '
+            const answer = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const recheck = answer.recheck;
+            console.log(`recheck: ${JSON.stringify(recheck)}`);
+            if (!recheck || typeof recheck.ran !== "string") {
+              console.log("::error::carrick check --recheck --json carried no recheck object");
+              process.exit(1);
+            }
+            if (recheck.ran === "none") {
+              console.log(`::error::the file was edited and the re-check still ran nothing: ${recheck.reason ?? "no reason given"}`);
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/check-recheck.out"
+
+      # The fourth command carrick#1450 asks for, run but not asserted on.
+      #
+      # `init` signs in and then reads the workspace from Carrick before it
+      # writes anything, and this job can reach no such host: `CARRICK_MOCK_ALL`
+      # is the Rust side's in-process storage and the CLI's own reads never see
+      # it, and `readCredential` refuses a credential naming any api_base but
+      # the built-in one — a pin that exists so an environment variable cannot
+      # choose where a token is posted. Without a credential it exits 1 before
+      # writing anything; with one that is not real it prints `▲` lines and
+      # exits 1. Both are the endpoint, not the defect this smoke is for.
+      #
+      # So it runs inside the 30 s budget the ticket names and the outcome is
+      # recorded. The budget is the measurement carrick#1373 is about: init
+      # re-running the whole local scan is what it would catch.
+      #
+      # TODO(carrick#1454): assert exit 0 and no `▲` or `■` line here. That
+      # needs a hosted endpoint this job can reach, and carrick#1454 is where
+      # the three routes to one are written down.
+      - name: carrick init runs, and is not asserted on yet (carrick#1454)
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          CARRICK_MOCK_ALL: "true"
+          CARRICK_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/carrick
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+        run: |
+          set -uo pipefail
+          started=$SECONDS
+          code=0
+          timeout 30 carrick init --yes < /dev/null \
+            > "$RUNNER_TEMP/init.out" 2> "$RUNNER_TEMP/init.err" || code=$?
+          elapsed=$((SECONDS - started))
+          echo "init: exit $code in ${elapsed}s (budget 30s)"
+          cat "$RUNNER_TEMP/init.out" "$RUNNER_TEMP/init.err"
+          markers=$(grep -c '▲\|■' "$RUNNER_TEMP/init.out" || true)
+          echo "init printed $markers warning or refusal line(s)"
+          if [ "$code" = "0" ] && [ "$markers" = "0" ]; then
+            echo "::warning::carrick init exits 0 here with no ▲ or ■ line: the TODO in this step can become an assertion"
+          fi
