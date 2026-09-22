@@ -222,6 +222,10 @@ pub struct ProcessingStats {
     /// (carrick#1395). A route registered by the file's own location states no
     /// call for the model to echo, so this is the normal path for one.
     pub model_rows_reconciled: usize,
+    /// Model endpoint rows that named a call their own handler makes, on a
+    /// route nothing else states. Each is kept at the model's line with no
+    /// span, rather than taking that call's span (carrick#1448).
+    pub model_routes_kept_without_a_site: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -2847,6 +2851,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model rows folded onto the route a deterministic source states: {}",
             stats.model_rows_reconciled
+        );
+        debug!(
+            "  - Model routes kept at their own line with no site: {}",
+            stats.model_routes_kept_without_a_site
         );
         debug!(
             "  - Model statements discarded as contradictions: {}",
@@ -6542,8 +6550,8 @@ impl FileOrchestrator {
         for mut endpoint in endpoints {
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
-            // call that states a path or a method, or — for a route whose
-            // registration states neither, which is every file-based one — the
+            // call that states a route path, or — for a route whose
+            // registration states none, which is every file-based one — the
             // site the model itself answered at. Any OTHER listed site is a
             // call the handler MAKES, and anchoring a route to one moves the
             // row off its registration (carrick#1395).
@@ -6552,7 +6560,7 @@ impl FileOrchestrator {
                 Self::candidate_can_register_a_route(candidate, endpoint.line_number)
             });
             let candidate = match site {
-                Some(candidate) => candidate,
+                Some(candidate) => Some(candidate),
                 None => {
                     // (a) The route may already be stated deterministically —
                     // by the file layout, by route data, by a decorator. That
@@ -6583,10 +6591,13 @@ impl FileOrchestrator {
                         continue;
                     }
                     match listed {
-                        // Nothing states this route, so the site the model
-                        // named is the only anchor there is. Wrong as it may
-                        // be, it is better than no row at all.
-                        Some(candidate) => candidate,
+                        // Nothing states this route, and the site the model
+                        // named is a call the handler makes. Its span would
+                        // steer the type layer to that call and withdraw any
+                        // data call at it (carrick#1448). So the row is kept
+                        // at the model's own line with no span, the way an
+                        // unjoinable data call is kept.
+                        Some(_) => None,
                         None => {
                             dropped.push(format!(
                                 "{} {} (candidate_id '{}')",
@@ -6597,26 +6608,28 @@ impl FileOrchestrator {
                     }
                 }
             };
-            endpoint.line_number = candidate.line_number as i32;
-            endpoint.call_expression_span_start = Some(candidate.span_start);
-            endpoint.call_expression_span_end = Some(candidate.span_end);
             endpoint.resolution_source = Some(ResolutionSource::Model);
-            match Self::inline_literal_path(&endpoint.path, candidate) {
-                RegistrationLiteral::Agrees => {}
-                RegistrationLiteral::Contradicts(literal) => {
-                    warn!(
-                        "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
-                        endpoint.path, literal, file_path, candidate.line_number
-                    );
-                    endpoint.path = literal;
-                    endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
-                    stats.model_contradictions_discarded += 1;
+            match candidate {
+                Some(candidate) => {
+                    endpoint.line_number = candidate.line_number as i32;
+                    endpoint.call_expression_span_start = Some(candidate.span_start);
+                    endpoint.call_expression_span_end = Some(candidate.span_end);
+                    Self::settle_registration_literal(&mut endpoint, candidate, file_path, stats);
                 }
-                // Whether the prefix is the router's own or a copy of the
-                // segment it is mounted under is the mount chain's question
-                // (carrick#1145): keep the path, hand the literal on.
-                RegistrationLiteral::ExtendsWithPrefix(literal) => {
-                    endpoint.registration_literal = Some(literal);
+                None => {
+                    debug!(
+                        "Keeping the model's {} {} in {} at its own line {} with no span: \
+                         the id it echoed ('{}') names a call the handler makes, and nothing \
+                         else states this route",
+                        endpoint.method,
+                        endpoint.path,
+                        file_path,
+                        endpoint.line_number,
+                        endpoint.candidate_id
+                    );
+                    endpoint.call_expression_span_start = None;
+                    endpoint.call_expression_span_end = None;
+                    stats.model_routes_kept_without_a_site += 1;
                 }
             }
             // One registration, stated twice by the model, is one row. The
@@ -7095,6 +7108,34 @@ impl FileOrchestrator {
             }
             (Some(ours), _) => row.method = Some(ours.to_string()),
             (None, _) => row.method = model_method,
+        }
+    }
+
+    /// Settle the model's path for a row joined to its registration against
+    /// the literal that registration states (#332, carrick#1145).
+    fn settle_registration_literal(
+        endpoint: &mut EndpointResult,
+        candidate: &CandidateTarget,
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        match Self::inline_literal_path(&endpoint.path, candidate) {
+            RegistrationLiteral::Agrees => {}
+            RegistrationLiteral::Contradicts(literal) => {
+                warn!(
+                    "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
+                    endpoint.path, literal, file_path, candidate.line_number
+                );
+                endpoint.path = literal;
+                endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
+                stats.model_contradictions_discarded += 1;
+            }
+            // Whether the prefix is the router's own or a copy of the
+            // segment it is mounted under is the mount chain's question
+            // (carrick#1145): keep the path, hand the literal on.
+            RegistrationLiteral::ExtendsWithPrefix(literal) => {
+                endpoint.registration_literal = Some(literal);
+            }
         }
     }
 
@@ -19002,5 +19043,125 @@ export async function POST(request: Request): Promise<Response> {
 
         assert_eq!(result.endpoints.len(), 1, "one route, one row");
         assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    // --- carrick#1448: a route nothing states keeps no borrowed span ----------
+
+    /// A handler exported from a module no routing convention claims, which
+    /// reads a form body and posts an audit event. Nothing structural states
+    /// its route, so the model's row is the only one there is.
+    const UNSTATED_ROUTE_SOURCE: &str = r#"import type { Thing } from "./types";
+
+export async function POST(request: Request): Promise<Response> {
+  const body = await request.formData();
+  await fetch("https://audit.example.com/events", { method: "POST", body });
+  const thing: Thing = { id: String(body) };
+  return Response.json(thing);
+}
+"#;
+
+    /// The HTTP candidates the prompt would offer for `source`, with no route
+    /// derived for it: the module sits outside every routing convention.
+    fn unstated_route_candidates(source: &str) -> HashMap<String, CandidateTarget> {
+        SwcScanner::new()
+            .scan_content(Path::new("src/handlers/things.ts"), source, &[], &[])
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .map(|candidate| (candidate.candidate_id.clone(), candidate))
+            .collect()
+    }
+
+    /// The model answers the route at its export (line 3) but echoes the id of
+    /// the body read on line 4. Nothing else states the route, so the row is
+    /// kept where the model placed it and claims no span. With the body read's
+    /// span the type layer would read `FormData` as the route's type.
+    #[test]
+    fn a_route_nothing_states_keeps_its_own_line_and_no_borrowed_span() {
+        let candidates = unstated_route_candidates(UNSTATED_ROUTE_SOURCE);
+        let body_read = body_read_id(&candidates);
+        assert_eq!(
+            candidates[&body_read].line_number, 4,
+            "the body read is inside the handler"
+        );
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row(&body_read, "POST", 3)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/handlers/things.ts",
+            false,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "the route is kept, not dropped");
+        let row = &result.endpoints[0];
+        assert_eq!(row.line_number, 3, "the model's line, not the body read's");
+        assert_eq!(
+            row.call_expression_span_start, None,
+            "no span borrowed from a call the handler makes"
+        );
+        assert_eq!(row.call_expression_span_end, None);
+        assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
+        assert_eq!(row.primary_type_symbol.as_deref(), Some("Thing"));
+        assert_eq!(stats.model_routes_kept_without_a_site, 1);
+    }
+
+    /// The same row borrowing the id of the outbound call instead. A route row
+    /// at that span used to withdraw the call's own deterministic row, so the
+    /// file lost a real data call as well as placing its route wrongly.
+    #[test]
+    fn a_route_that_borrows_an_outbound_call_leaves_that_call_in_place() {
+        let candidates = unstated_route_candidates(UNSTATED_ROUTE_SOURCE);
+        let outbound = candidates
+            .values()
+            .find(|candidate| candidate.callee_object == "fetch")
+            .expect("the outbound call is a candidate");
+        let (outbound_id, outbound_span) = (outbound.candidate_id.clone(), outbound.span_start);
+        assert_eq!(
+            outbound.line_number, 5,
+            "the outbound call is inside the handler"
+        );
+
+        let mut call = data_call_with(
+            &outbound_id,
+            "https://audit.example.com/events",
+            Some("POST"),
+        );
+        call.line_number = 5;
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row(&outbound_id, "POST", 3)],
+                data_calls: vec![call],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/handlers/things.ts",
+            false,
+        );
+
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].line_number, 3);
+        assert_eq!(result.endpoints[0].call_expression_span_start, None);
+        assert!(
+            result
+                .data_calls
+                .iter()
+                .any(|call| call.call_expression_span_start == Some(outbound_span)),
+            "the outbound call keeps its row: {:?}",
+            result.data_calls
+        );
+        assert_eq!(stats.model_routes_kept_without_a_site, 1);
     }
 }
