@@ -962,6 +962,15 @@ pub struct UncertainWrite {
 #[derive(Debug)]
 pub enum StorageError {
     ConnectionError(String),
+    /// A refusal the cloud stated in its own words: the JSON envelope, with a
+    /// code the reader can act on (carrick#1471).
+    ///
+    /// Separate from [`StorageError::ConnectionError`] because of what the
+    /// reader does with it. A held repo, a daily limit and a credential that
+    /// needs renewing are decisions about the request, each carrying the one
+    /// sentence that says what to do next, and printing them behind "Connection
+    /// error" says the network failed and that the sentence is noise.
+    Refused(String),
     SerializationError(String),
     #[allow(dead_code)]
     NotFound(String),
@@ -986,6 +995,10 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
+            // Nothing in front of it: the cloud's sentence names what happened
+            // and what to do about it, and a prefix of ours would only argue
+            // with it.
+            StorageError::Refused(msg) => write!(f, "{}", msg),
             StorageError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             StorageError::NotFound(msg) => write!(f, "Not found: {}", msg),
             StorageError::DatabaseError(msg) => write!(f, "Database error: {}", msg),

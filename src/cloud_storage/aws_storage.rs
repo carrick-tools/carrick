@@ -176,6 +176,21 @@ fn refusal_message(status: reqwest::StatusCode, body: &str) -> String {
     message
 }
 
+/// `message` as the error a run reports, reading `body` for which kind of
+/// failure this was (carrick#1471).
+///
+/// A body that parses as the refusal envelope and names a code is the cloud
+/// deciding something about this request, and it says so in a sentence the
+/// reader can act on. Anything else (an HTML gateway page, an empty body, a
+/// text the client could not read) is the transport as far as anyone here can
+/// tell, and keeps the wording that says so.
+fn stated_refusal_or_connection(body: &str, message: String) -> StorageError {
+    match RefusalBody::of(body).code {
+        Some(_) => StorageError::Refused(message),
+        None => StorageError::ConnectionError(message),
+    }
+}
+
 /// The machine code a refusal names, for a log line rather than a message.
 ///
 /// The end-of-run markers read this because their status alone is ambiguous:
@@ -952,10 +967,10 @@ impl AwsStorage {
                             // is already right (§2.1). Only a 401, or the
                             // kind gate itself, is a re-login.
                             if is_credential_rejection(status, &response_text) {
-                                return Err(StorageError::ConnectionError(relogin_message(
-                                    status,
+                                return Err(stated_refusal_or_connection(
                                     &response_text,
-                                )));
+                                    relogin_message(status, &response_text),
+                                ));
                             }
                             if !is_transient_status(status) {
                                 let refusal = refusal_message(status, &response_text);
@@ -969,7 +984,7 @@ impl AwsStorage {
                                 return Err(if lost_an_attempt && is_write_action(action) {
                                     uncertain_write(action, refusal, may_still_run)
                                 } else {
-                                    StorageError::ConnectionError(refusal)
+                                    stated_refusal_or_connection(&response_text, refusal)
                                 });
                             }
                             (refusal_message(status, &response_text), Some(status))
@@ -1597,17 +1612,26 @@ impl AwsStorage {
 /// sentence beside its own words. The user's move is to look at the job that
 /// exists, not to send a second one, and "the scan failed" reads as an
 /// instruction to try again.
+///
+/// The sentence grows; the kind of failure does not. A refusal the cloud
+/// stated stays one, so the line the user reads still starts with the cloud's
+/// own words (carrick#1471).
 fn already_running(error: StorageError) -> StorageError {
-    let StorageError::ConnectionError(message) = &error else {
-        return error;
+    let message = match &error {
+        StorageError::Refused(message) | StorageError::ConnectionError(message) => message,
+        _ => return error,
     };
     if !message.contains("analysis_job_in_flight") {
         return error;
     }
-    StorageError::ConnectionError(format!(
+    let restated = format!(
         "{message}. Nothing new was sent; `carrick status` says how far the one that is \
          running has got."
-    ))
+    );
+    match error {
+        StorageError::Refused(_) => StorageError::Refused(restated),
+        _ => StorageError::ConnectionError(restated),
+    }
 }
 
 /// `submit-analysis-job`, sent twice: once to open the job and take the URL
@@ -2368,18 +2392,15 @@ mod tests {
     /// move is to look at the job that exists rather than send another.
     #[test]
     fn the_in_flight_refusal_is_restated_rather_than_read_as_a_failure() {
-        let refused = refusal_message(
-            StatusCode::CONFLICT,
-            &serde_json::json!({
-                "error": "owner/api already has an analysis running. Run carrick status to see how far along it is.",
-                "code": "analysis_job_in_flight",
-                "job_id": "job_1",
-            })
-            .to_string(),
-        );
-        let StorageError::ConnectionError(said) =
-            already_running(StorageError::ConnectionError(refused))
-        else {
+        let body = serde_json::json!({
+            "error": "owner/api already has an analysis running. Run carrick status to see how far along it is.",
+            "code": "analysis_job_in_flight",
+            "job_id": "job_1",
+        })
+        .to_string();
+        let refused =
+            stated_refusal_or_connection(&body, refusal_message(StatusCode::CONFLICT, &body));
+        let StorageError::Refused(said) = already_running(refused) else {
             panic!("the error keeps its kind");
         };
         assert!(said.contains("already has an analysis running"), "{said}");
@@ -2938,6 +2959,63 @@ mod tests {
             1,
             "a gate refusal must not be retried"
         );
+    }
+
+    /// A refusal the cloud stated reaches the user as the cloud wrote it, with
+    /// nothing in front of it about a connection (carrick#1471).
+    ///
+    /// The line the caller prints is `Carrick Cloud did not open this scan:
+    /// {error}`, so whatever this renders is the whole of what a held repo
+    /// tells its user. "Connection error" in front of it said the network had
+    /// failed and left the reader distrusting the one sentence that names the
+    /// time to try again.
+    #[tokio::test]
+    async fn a_refusal_the_cloud_stated_reads_as_the_cloud_wrote_it() {
+        let (storage, server) = bearer_storage(vec![(
+            409,
+            serde_json::json!({
+                "error": "A scan of example/api you started is still running, so the repo \
+                          is held. If it has stopped, try again after 14:42 UTC.",
+                "code": "laptop_scan_in_flight"
+            })
+            .to_string(),
+        )]);
+
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !message.to_lowercase().contains("connection"),
+            "a refusal the cloud stated names no connection: {message}"
+        );
+        assert!(
+            message.starts_with("A scan of example/api you started is still running"),
+            "{message}"
+        );
+        assert!(
+            message.contains("try again after 14:42 UTC. (laptop_scan_in_flight, HTTP 409)"),
+            "{message}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// And the wording that says a connection failed is kept for the failures
+    /// that are one: a body this client could not read is a transport as far
+    /// as anyone here can tell, whatever status came with it.
+    #[tokio::test]
+    async fn a_body_that_is_not_the_envelope_still_reads_as_a_connection_failure() {
+        let (storage, server) =
+            bearer_storage(vec![(409, "<html>409 Conflict</html>".to_string())]);
+
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.starts_with("Connection error:"), "{message}");
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     /// 409 is the status every laptop gate must use, precisely because this
