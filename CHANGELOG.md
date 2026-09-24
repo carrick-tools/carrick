@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.90](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.89...carrick-v0.3.90) (2026-09-24)
+
+
+### Bug Fixes
+
+* **cli:** point docs links at the page that holds each topic ([#1483](https://github.com/carrick-tools/carrick/issues/1483)) ([e063d7c](https://github.com/carrick-tools/carrick/commit/e063d7c6c21f705524e7479aed03f4f11e3ea33a))
+* **scan:** a limit the cloud enforces never stops a scan ([#1486](https://github.com/carrick-tools/carrick/issues/1486)) ([66aa168](https://github.com/carrick-tools/carrick/commit/66aa168437733fa754210bc4f9dd821fcbe7d925))
+
 ## [0.3.89](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.88...carrick-v0.3.89) (2026-09-22)
 
 
