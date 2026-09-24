@@ -1,0 +1,14 @@
+{
+  "about": "Every limit a Carrick Cloud prompt lambda enforces, as the status and details.reason it answers with (carrick-cloud#401). Each answers code llm_disabled, retriable false. The scanner never reads the reason; these rows exist so a test runs one scan per limit the cloud has today.",
+  "refusals": [
+    { "status": 503, "reason": "llm_kill_switch" },
+    { "status": 503, "reason": "daily_cap" },
+    { "status": 503, "reason": "daily_limit" },
+    { "status": 503, "reason": "free_tier_allowance" },
+    { "status": 503, "reason": "first_index_ceiling" },
+    { "status": 503, "reason": "first_index_pool" },
+    { "status": 503, "reason": "laptop_first_index_ceiling" },
+    { "status": 503, "reason": "laptop_monthly_allowance" },
+    { "status": 403, "reason": "waitlisted" }
+  ]
+}

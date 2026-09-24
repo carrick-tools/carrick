@@ -10,7 +10,7 @@
 //! definitions so that source code is not uploaded to AWS. The intent
 //! serves as the index; GitHub is the source of truth for code.
 
-use crate::agent_service::{AgentCallError, AgentService, rate_limit_tripped};
+use crate::agent_service::{AgentCallError, AgentService};
 use crate::visitor::FunctionDefinition;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -370,9 +370,9 @@ impl BatchState {
 /// missing or repeated, a null intent) sends that function again on its own,
 /// so a mismatch costs a call and never an intent. A batch the lambda refused
 /// as unsupported sends every function on its own and stops batching for the
-/// rest of the pass. Any other failure (a spent retry chain, a budget refusal,
-/// the quota breaker) is that failure for every function in the batch, exactly
-/// as it would have been for each single call.
+/// rest of the pass. Any other failure (a spent retry chain, a budget refusal)
+/// is that failure for every function in the batch, exactly as it would have
+/// been for each single call.
 async fn describe_unit<S, SFut>(
     unit: Vec<Pending>,
     state: &BatchState,
@@ -764,7 +764,6 @@ async fn describe_functions<S, SFut>(
 
         let mut succeeded = 0usize;
         let mut failed = 0usize;
-        let mut aborted = 0usize;
 
         for (pending, result) in outcomes {
             describing.item();
@@ -799,60 +798,36 @@ async fn describe_functions<S, SFut>(
                     // asks exactly these and replays the rest from cache.
                     undescribed.insert(name.clone());
                     failed_calls.insert(name.clone());
-                    if e.is_quota_abort() {
-                        aborted += 1;
-                    } else {
-                        warn!("Failed to generate intent for {}: {}", name, e);
-                        failed += 1;
-                    }
+                    warn!("Failed to generate intent for {}: {}", name, e);
+                    failed += 1;
                 }
             }
         }
 
         // One line per level that actually called out, so a degraded scan is
         // visible as a number rather than as N scattered warnings.
-        // Aborts are named only when they happened, but they must be named:
-        // without them `attempted` would not equal succeeded + failed and the
-        // line would read as unexplained loss.
         let summary = format!(
-            "Intent level {}/{}: attempted {}, succeeded {}, failed after retry {}{}",
+            "Intent level {}/{}: attempted {}, succeeded {}, failed after retry {}",
             level_idx + 1,
             levels.len(),
             attempted,
             succeeded,
             failed,
-            if aborted > 0 {
-                format!(", aborted on backend quota {}", aborted)
-            } else {
-                String::new()
-            }
         );
         // Counted against the service being analysed, so the engine can give
         // it one more try before the run ends.
         crate::scan_health::record_intents_failed(failed);
-        if failed > 0 || aborted > 0 {
+        if failed > 0 {
             warn!("{}", summary);
         } else {
             debug!("{}", summary);
         }
-
-        // The quota breaker is process-global and does not clear inside a
-        // scan: every remaining call would fail instantly without reaching the
-        // model, so stop here rather than logging a level's worth of aborts.
-        if rate_limit_tripped() {
-            warn!(
-                "Backend LLM quota exhausted; stopping intent generation ({} call(s) in this level aborted unattempted)",
-                aborted
-            );
-            break;
-        }
     }
 
     // Every eligible function that is not described and whose own call did not
-    // fail was deferred: behind a failed callee, or unreached because the quota
-    // breaker stopped the pass. It keeps what the previous scan gave it, with
-    // the hash that produced it, so the next scan reuses it only if its inputs
-    // come out the same once its callees are described.
+    // fail was deferred, behind a failed callee. It keeps what the previous
+    // scan gave it, with the hash that produced it, so the next scan reuses it
+    // only if its inputs come out the same once its callees are described.
     let mut kept = 0usize;
     for name in &eligible {
         if intents.contains_key(name) || failed_calls.contains(name) {
@@ -1882,15 +1857,11 @@ mod tests {
     }
 
     /// A batch that failed the way a single call fails (retry chain spent,
-    /// budget refusal, quota breaker) fails every function in it, and is not
+    /// budget refusal) fails every function in it, and is not
     /// re-sent as singles that would meet the same wall.
     #[tokio::test]
     async fn a_failed_batch_fails_its_functions_without_single_calls() {
-        for (code, retriable) in [
-            ("model_error", true),
-            ("llm_disabled", false),
-            (crate::agent_service::QUOTA_ABORT_CODE, false),
-        ] {
+        for (code, retriable) in [("model_error", true), ("llm_disabled", false)] {
             let transport = Transport::new();
             let state = BatchState::new();
             let out = describe_unit(vec![pending("a"), pending("b")], &state, |payload| {
@@ -2050,10 +2021,8 @@ mod tests {
         assert!(outcomes[0].1.is_ok());
         assert_eq!(outcomes[1].0.name, "boom");
         let err = outcomes[1].1.as_ref().unwrap_err();
-        // Transient class, so the summary counts it as failed-after-retry
-        // rather than as a doomed-from-the-start quota abort.
+        // Transient class, so the summary counts it as failed-after-retry.
         assert!(err.retriable);
-        assert!(!err.is_quota_abort());
         assert!(outcomes[2].1.is_ok());
     }
 

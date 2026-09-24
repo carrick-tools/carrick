@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -13,59 +13,6 @@ use tracing::{debug, warn};
 
 mod limiter;
 use limiter::{RatePacer, RouteLimits};
-
-/// Process-global circuit breaker for backend LLM quota exhaustion.
-///
-/// A scan runs as a single process, and every lambda call it makes draws on
-/// the same backend LLM quota. A quota / rate-limit error therefore does not
-/// clear within a scan, and — because the cloud counts each attempt before
-/// it calls the model — every retry only burns more of the exhausted budget.
-///
-/// The dominant failure mode without this breaker: ~20 concurrent workers
-/// each independently walk the full 2→64s backoff chain against a wall that
-/// will never lift, so a scan can sit dead for 20+ minutes making no progress
-/// while still consuming quota. The breaker collapses that: the first worker
-/// to see a quota error trips it, and every other in-flight or queued call —
-/// across all phases and all `AgentService` instances — aborts immediately.
-///
-/// This is deliberately a process-global (like [`crate::oidc::OidcProvider`]'s
-/// `global()`): there are several independently-constructed `AgentService`
-/// instances across a single scan, and a quota wall hit by any of them means
-/// the backend is exhausted for all of them.
-static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the quota circuit breaker has tripped this process. Public so the
-/// engine can abort before uploading a quota-degraded (partial) index.
-pub fn rate_limit_tripped() -> bool {
-    RATE_LIMITED.load(Ordering::Relaxed)
-}
-
-/// Trip the quota circuit breaker. Idempotent.
-fn trip_rate_limit() {
-    RATE_LIMITED.store(true, Ordering::Relaxed);
-}
-
-/// Close the breaker again, for the one moment a scan deliberately gives the
-/// backend another chance: the engine's single retry of the work a run still
-/// owes, which starts only after it has waited (see `engine::durability`). A
-/// quota that has not refilled trips it again on the first call, and every
-/// other call fails fast as before.
-pub fn reset_rate_limit() {
-    RATE_LIMITED.store(false, Ordering::Relaxed);
-}
-
-/// Calls this process failed fast because the breaker was open, or that
-/// tripped it.
-///
-/// A file or an intent that ends this way is not counted as lost (it was
-/// never attempted), so the count is what tells the engine that a service
-/// analysed while the breaker was open has model work it did not do.
-static QUOTA_ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many calls have failed on the quota breaker so far this process.
-pub fn quota_abort_count() -> usize {
-    QUOTA_ABORTS.load(Ordering::Relaxed)
-}
 
 /// How many HTTP attempts this process has retried, across every call.
 static RETRIES: AtomicU64 = AtomicU64::new(0);
@@ -163,20 +110,6 @@ pub fn requests_between(
     }
 }
 
-/// Whether a cloud error envelope signals backend quota / rate-limit
-/// exhaustion (which backoff cannot clear within a scan), as opposed to a
-/// transient overload (which it can). The cloud maps both its own per-user
-/// daily cap and upstream provider quota errors to the `rate_limited` code.
-fn is_quota_error(err: &AgentError) -> bool {
-    err.code == "rate_limited"
-}
-
-/// Pseudo-code for the call-level failure raised once the quota breaker is
-/// open. Not a cloud code: the cloud never sends it, the scanner synthesises it
-/// so callers can tell "the backend is out of quota, everything downstream is
-/// doomed" apart from a genuine per-call failure.
-pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
-
 /// The cloud's code for "the model was not asked, on purpose": an operator
 /// kill switch, the daily bucket on an OIDC caller, a service-wide daily
 /// limit, or a spend allowance. `details.reason` says which, and no code that
@@ -190,10 +123,17 @@ pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 /// cloud writes to suit the reason it refused for. The scan quotes it once,
 /// on its own line ([`crate::scan_health::refusal_sentence`]).
 ///
-/// Distinct from [`QUOTA_ABORT_CODE`] and from `rate_limited`: this call
-/// failed because a budget refused it, not because the backend is exhausted,
-/// so the breaker must not trip and the run must not fail (carrick#555, and
-/// C1 of carrick-cloud `docs/internal/reference/laptop-scan-seam.md`).
+/// Every limit of the cloud's answers with this code, the waitlist included,
+/// and none of them stops the scan: the call fails on its own, the run does
+/// not fail, and the scan finishes facts-only (carrick#555, carrick-cloud#401,
+/// and C1 of carrick-cloud `docs/internal/reference/laptop-scan-seam.md`).
+///
+/// There is no other refusal code. `rate_limited` was one until
+/// carrick-cloud#401: a scanner read it as a quota wall and stopped every later
+/// call of the scan on a process-global breaker. The cloud no longer sends it,
+/// and a cloud deployed before that sent it for a model error whose message
+/// happened to say "quota" or "limit", so it is read here as what its envelope
+/// says, `retriable: true`, and nothing more.
 pub const LLM_DISABLED_CODE: &str = "llm_disabled";
 
 /// The cloud's answer to a re-sent file whose first request is still running
@@ -217,20 +157,24 @@ fn is_analysis_in_flight(err: &AgentError) -> bool {
     err.code == ANALYSIS_IN_FLIGHT_CODE || err.reason() == Some(ANALYSIS_IN_FLIGHT_CODE)
 }
 
-/// The error returned for an individual call once the breaker is open. Scoped
-/// to what's true at the call level (this call fails fast); the engine holds
-/// back every service a failed-fast call belonged to (see
-/// [`quota_abort_count`]) and lands the rest.
-fn rate_limit_abort_error() -> AgentCallError {
-    QUOTA_ABORTS.fetch_add(1, Ordering::Relaxed);
+/// The error a failed envelope makes of the call that received it: the cloud's
+/// code, its sentence and its own transient verdict, with the lease wait named
+/// by its own code whichever wire shape carried it, so a call that runs out
+/// says what it waited on (carrick#1131).
+///
+/// What an answer means stops at the call it answered. A scanner used to trip a
+/// process-global breaker on `rate_limited` and fail every later call of the
+/// scan fast; hitting a limit never stops a scan (carrick-cloud#401).
+fn call_error_from_envelope(err: AgentError) -> AgentCallError {
+    let code = if is_analysis_in_flight(&err) {
+        ANALYSIS_IN_FLIGHT_CODE.to_string()
+    } else {
+        err.code
+    };
     AgentCallError {
-        code: QUOTA_ABORT_CODE.to_string(),
-        message: "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
-                  limit on the analysis backend, not a problem with the scanned code. The \
-                  services this reaches are held back and named at the end of the scan; \
-                  re-run after the quota resets."
-            .to_string(),
-        retriable: false,
+        code,
+        message: err.message,
+        retriable: err.retriable,
     }
 }
 
@@ -246,7 +190,7 @@ fn rate_limit_abort_error() -> AgentCallError {
 /// which is what lets a caller report failed-after-retry honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCallError {
-    /// Cloud error code (`model_error`, `rate_limited`, `internal_error`), or a
+    /// Cloud error code (`model_error`, `llm_disabled`, `internal_error`), or a
     /// scanner-side pseudo-code for a failure that never reached the envelope.
     pub code: String,
     pub message: String,
@@ -271,13 +215,6 @@ impl AgentCallError {
             message,
             retriable: true,
         }
-    }
-
-    /// Whether this call failed because the process-global quota breaker is
-    /// open rather than on its own merits. Such a call was never attempted, so
-    /// counting it as a retry failure overstates the loss.
-    pub fn is_quota_abort(&self) -> bool {
-        self.code == QUOTA_ABORT_CODE
     }
 
     /// Whether the model was deliberately not asked, rather than asked and
@@ -395,11 +332,9 @@ impl RetryPolicy {
 ///
 /// The cloud's `retriable` flag is the single source of truth for the
 /// transient class — the scanner does not re-derive it from status codes or
-/// message text. A quota abort is excluded even though quota errors are
-/// nominally transient: quota does not clear inside one scan, and the breaker
-/// has already decided that every remaining call fails fast.
+/// message text.
 fn should_retry(err: &AgentCallError, attempt: u32, max_retries: u32) -> bool {
-    err.retriable && !err.is_quota_abort() && attempt < max_retries
+    err.retriable && attempt < max_retries
 }
 
 /// Equal-jitter exponential backoff: half the exponential delay, plus a random
@@ -588,7 +523,7 @@ fn concurrency_limit() -> usize {
 
 /// The one semaphore every `AgentService` draws its permits from.
 ///
-/// Process-global for the same reason as [`RATE_LIMITED`]: a scan constructs
+/// Process-global because a scan constructs
 /// several `AgentService` instances (detection, file analysis, intents), and
 /// with a semaphore per instance two stages running side by side would put
 /// the SUM of their limits on the wire. The limit is read once, on first use.
@@ -626,10 +561,10 @@ fn global_pacer() -> Arc<RatePacer> {
 /// Whether a retriable error ENVELOPE says the route's model is out of
 /// capacity. The lambda answers 503 `model_error` with a `Retry-After` when
 /// the model's own retries ran out, and that is per model, so it cuts the
-/// route's concurrency. A 429 envelope never reaches here (`rate_limited`
-/// trips the breaker first), and anything else retriable says nothing about
-/// capacity. Neither does a lease wait, whatever its status and headers, so
-/// callers rule [`is_analysis_in_flight`] out first (carrick#1131).
+/// route's concurrency, as does any other retriable answer carrying a
+/// `Retry-After`; anything else retriable says nothing about capacity. Neither
+/// does a lease wait, whatever its status and headers, so callers rule
+/// [`is_analysis_in_flight`] out first (carrick#1131).
 fn is_model_busy(status: u16, retry_after: Option<Duration>) -> bool {
     status == 503 || retry_after.is_some()
 }
@@ -816,13 +751,6 @@ impl AgentService {
         let mut attempt: u32 = 0;
         while attempt < max_retries {
             attempt += 1;
-            // A sibling call (any phase, any `AgentService`) may have already
-            // hit the backend quota wall. Re-checked each attempt so a worker
-            // mid-backoff aborts after its current sleep instead of firing a
-            // doomed request that burns more quota.
-            if rate_limit_tripped() {
-                return Err(rate_limit_abort_error());
-            }
 
             // Read the token per attempt, not once per call. A scan of a
             // large repo outlives a token, and the provider mints a fresh one
@@ -1107,34 +1035,10 @@ impl AgentService {
                         }
                     };
 
-                    // A quota / rate-limit error will not clear within a single
-                    // scan, and each retry consumes more of the exhausted
-                    // budget. Trip the process-global breaker so sibling
-                    // workers abort fast instead of each grinding the full
-                    // backoff chain, and fail this call now.
-                    if is_quota_error(&err) {
-                        trip_rate_limit();
-                        warn!(
-                            "Backend LLM quota exhausted ({}); tripping circuit breaker — remaining calls fail fast, and the services they belong to are held back and retried once before the scan ends",
-                            err.message
-                        );
-                        return Err(rate_limit_abort_error());
-                    }
-
-                    // The lease wait (carrick#1131): an earlier request for
-                    // this prompt is still being analysed. Named by its own
-                    // code whichever wire shape carried it, so a call that
-                    // does run out says what it waited on.
-                    let in_flight = is_analysis_in_flight(&err);
-                    let call_err = AgentCallError {
-                        code: if in_flight {
-                            ANALYSIS_IN_FLIGHT_CODE.to_string()
-                        } else {
-                            err.code
-                        },
-                        message: err.message,
-                        retriable: err.retriable,
-                    };
+                    // What this answer means for this call, and for no other:
+                    // no code stops a sibling call (carrick-cloud#401).
+                    let call_err = call_error_from_envelope(err);
+                    let in_flight = call_err.code == ANALYSIS_IN_FLIGHT_CODE;
 
                     // Sat out as a pure wait: both slots released with no
                     // verdict, as a gateway timeout releases them, the
@@ -1260,17 +1164,23 @@ struct MockFailure {
     task_path: String,
     body_contains: String,
     remaining: usize,
-    /// `model_error` (transient) or `llm_disabled` (a budget refusal).
-    code: &'static str,
-    /// The refusal's `error.message`, for a refusal. The cloud writes it to
-    /// suit whichever budget refused, so a test that pins what the run prints
-    /// supplies its own.
-    message: String,
+    /// What the call returns: the error the retry loop hands back once it has
+    /// finished with the answer.
+    error: AgentCallError,
 }
 
 fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
     static FAILURES: OnceLock<Mutex<Vec<MockFailure>>> = OnceLock::new();
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn push_mock_failure(task_path: &str, body_contains: &str, times: usize, error: AgentCallError) {
+    mock_failures().lock().unwrap().push(MockFailure {
+        task_path: task_path.to_string(),
+        body_contains: body_contains.to_string(),
+        remaining: times,
+        error,
+    });
 }
 
 /// Make the next `times` offline calls to `task_path` whose serialized body
@@ -1283,19 +1193,41 @@ fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
 /// retry loop is not run: the error is what that loop returns once it is spent.
 #[allow(dead_code)] // Called by tests/ through the library, never by the binary.
 pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
-    mock_failures().lock().unwrap().push(MockFailure {
-        task_path: task_path.to_string(),
-        body_contains: body_contains.to_string(),
-        remaining: times,
-        code: "model_error",
-        message: "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
-    });
+    push_mock_failure(
+        task_path,
+        body_contains,
+        times,
+        AgentCallError::transient(
+            "model_error",
+            "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
+        ),
+    );
 }
 
-/// The same, answered the way a budget refuses: [`LLM_DISABLED_CODE`],
-/// `retriable: false`, carrying `message` as the cloud's own `error.message`.
-/// For the tests that pin what a refused service does to the scan
-/// (carrick-cloud#892) and what the run prints about it (carrick#1413).
+/// The same, answered with `envelope`: an error body exactly as a prompt
+/// lambda sends it, read by the parser and the conversion a real answer goes
+/// through ([`call_error_from_envelope`]). For the tests that pin what each
+/// refusal the cloud sends does to the scan (carrick-cloud#401).
+///
+/// Panics on a body that is not a failed envelope: it is a test's fixture.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_envelope(task_path: &str, body_contains: &str, times: usize, envelope: &str) {
+    let parsed: AgentResponse =
+        serde_json::from_str(envelope).expect("an injected envelope parses");
+    assert!(!parsed.success, "an injected envelope is a failed one");
+    let error = parsed.error.expect("an injected envelope carries an error");
+    push_mock_failure(
+        task_path,
+        body_contains,
+        times,
+        call_error_from_envelope(error),
+    );
+}
+
+/// A refusal: [`LLM_DISABLED_CODE`], `retriable: false`, carrying `message` as
+/// the cloud's own `error.message`. For the tests that pin what a refused
+/// service does to the scan (carrick-cloud#892) and what the run prints about
+/// it (carrick#1413).
 #[allow(dead_code)] // Called by tests/ through the library, never by the binary.
 pub fn inject_mock_budget_refusal(
     task_path: &str,
@@ -1303,13 +1235,11 @@ pub fn inject_mock_budget_refusal(
     times: usize,
     message: &str,
 ) {
-    mock_failures().lock().unwrap().push(MockFailure {
-        task_path: task_path.to_string(),
-        body_contains: body_contains.to_string(),
-        remaining: times,
-        code: LLM_DISABLED_CODE,
-        message: message.to_string(),
+    let envelope = serde_json::json!({
+        "success": false,
+        "error": { "code": LLM_DISABLED_CODE, "message": message, "retriable": false },
     });
+    inject_mock_envelope(task_path, body_contains, times, &envelope.to_string());
 }
 
 fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<AgentCallError> {
@@ -1322,16 +1252,7 @@ fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option
         f.remaining > 0 && f.task_path == task_path && serialized.contains(&f.body_contains)
     })?;
     failure.remaining -= 1;
-    if failure.code == LLM_DISABLED_CODE {
-        return Some(AgentCallError::permanent(
-            LLM_DISABLED_CODE,
-            failure.message.clone(),
-        ));
-    }
-    Some(AgentCallError::transient(
-        "model_error",
-        failure.message.clone(),
-    ))
+    Some(failure.error.clone())
 }
 
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
@@ -2560,6 +2481,7 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
 pub(crate) mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::atomic::AtomicBool;
 
     /// The terminal hears about retries on the first one and then once per
     /// gap, however many attempts happen in between (carrick#1103).
@@ -2599,14 +2521,9 @@ pub(crate) mod tests {
             r#"{"success":false,"error":{"code":"llm_disabled","message":"Refused with no reason at all.","retriable":false}}"#,
         ] {
             let err = envelope_error(body);
-            let call = AgentCallError {
-                code: err.code.clone(),
-                message: err.message.clone(),
-                retriable: err.retriable,
-            };
+            let call = call_error_from_envelope(err.clone());
             assert!(call.is_budget_refusal(), "{body}");
             assert!(!call.retriable, "a refusal is never retried: {body}");
-            assert!(!is_quota_error(&err), "a refusal must not trip the breaker");
             assert!(
                 !is_analysis_in_flight(&err),
                 "a refusal is not a lease wait"
@@ -2623,6 +2540,43 @@ pub(crate) mod tests {
     const IN_FLIGHT_409: &str = r#"{"success":false,"error":{"code":"analysis_in_flight","message":"still being analysed","retriable":true,"details":{"requestId":"r1","reason":"analysis_in_flight"}}}"#;
     /// The lease wait as a cloud deployed before carrick#1131 sends it.
     const IN_FLIGHT_503: &str = r#"{"success":false,"error":{"code":"model_error","message":"still being analysed","retriable":true,"details":{"requestId":"r1","reason":"analysis_in_flight"}}}"#;
+    /// Every limit a prompt lambda enforces, as `(status, details.reason)`
+    /// (carrick-cloud#401). Shared with `tests/scan_durability_test.rs`.
+    const CLOUD_LIMITS_JSON: &str =
+        include_str!("../tests/fixtures/cloud-limit-refusals/refusals.json");
+
+    fn cloud_limits() -> Vec<(u16, String)> {
+        let fixture: serde_json::Value = serde_json::from_str(CLOUD_LIMITS_JSON).unwrap();
+        fixture["refusals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["status"].as_u64().unwrap() as u16,
+                    row["reason"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// A refusal envelope in the shape every prompt lambda sends one.
+    fn refusal_envelope(reason: &str) -> String {
+        serde_json::json!({
+            "success": false,
+            "error": {
+                "code": LLM_DISABLED_CODE,
+                "message": format!("Refused: {reason}."),
+                "retriable": false,
+                "details": { "reason": reason, "requestId": "r" },
+            },
+        })
+        .to_string()
+    }
+
+    /// What a cloud deployed before carrick-cloud#401 answered a model error
+    /// whose message said "quota" or "limit".
+    const RATE_LIMITED_429: &str = r#"{"success":false,"error":{"code":"rate_limited","message":"Gemini quota exceeded","retriable":true,"details":{"requestId":"r3"}}}"#;
     /// A real capacity refusal: the model's own retries ran out.
     const MODEL_BUSY_503: &str = r#"{"success":false,"error":{"code":"model_error","message":"model busy","retriable":true,"details":{"requestId":"r2"}}}"#;
 
@@ -2888,37 +2842,18 @@ pub(crate) mod tests {
         assert_eq!(null.guidance_key, None);
     }
 
+    /// `rate_limited` is read as its envelope says and as nothing more: a
+    /// cloud deployed before carrick-cloud#401 sent it, `retriable: true`, for
+    /// a model error whose message said "quota" or "limit", and this build
+    /// retries it like any transient answer. It is not a refusal, and it is
+    /// not a wall: nothing about it reaches another call.
     #[test]
-    fn quota_error_classified_by_code() {
-        // Only the `rate_limited` code trips the breaker; transient overloads
-        // keep their normal backoff path.
-        assert!(is_quota_error(&err_with_code("rate_limited")));
-        assert!(!is_quota_error(&err_with_code("overloaded")));
-        assert!(!is_quota_error(&err_with_code("model_error")));
-    }
-
-    #[test]
-    #[serial]
-    fn breaker_trips_and_is_idempotent() {
-        // Process-global state — reset around the assertions so neither this
-        // run nor a sibling test leaks a tripped breaker.
-        RATE_LIMITED.store(false, Ordering::Relaxed);
-        assert!(!rate_limit_tripped());
-
-        trip_rate_limit();
-        assert!(rate_limit_tripped());
-        trip_rate_limit();
-        assert!(rate_limit_tripped());
-
-        RATE_LIMITED.store(false, Ordering::Relaxed);
-        assert!(!rate_limit_tripped());
-    }
-
-    #[test]
-    fn abort_error_names_the_quota() {
-        // The message must read as a backend capacity limit, not a code fault.
-        let msg = rate_limit_abort_error().to_string().to_lowercase();
-        assert!(msg.contains("quota"));
+    fn rate_limited_is_an_ordinary_retriable_answer() {
+        let call = call_error_from_envelope(envelope_error(RATE_LIMITED_429));
+        assert_eq!(call.code, "rate_limited");
+        assert!(call.retriable);
+        assert!(!call.is_budget_refusal());
+        assert!(should_retry(&call, 1, MAX_RETRIES));
     }
 
     #[test]
@@ -2936,12 +2871,6 @@ pub(crate) mod tests {
         // A permanent failure is never retried, at any attempt.
         let permanent = AgentCallError::permanent("internal_error", "boom".to_string());
         assert!(!should_retry(&permanent, 1, MAX_RETRIES));
-
-        // A quota abort is not a per-call failure: the breaker is open, so
-        // retrying only burns more of an exhausted budget.
-        assert!(rate_limit_abort_error().is_quota_abort());
-        assert!(!should_retry(&rate_limit_abort_error(), 1, MAX_RETRIES));
-        assert!(!transient.is_quota_abort());
     }
 
     #[test]
@@ -3510,6 +3439,63 @@ pub(crate) mod tests {
                 header_of(request, "x-carrick-attempt").as_deref(),
                 Some("1")
             );
+        }
+    }
+
+    /// carrick-cloud#401: a `rate_limited` answer is retried on its own
+    /// `retriable`, and a call that meets one stops nothing else. The breaker
+    /// this build no longer has failed every later call of the scan fast on
+    /// that code: here the first call is refused twice and then answered, and
+    /// a second call made after it still goes out and is answered.
+    #[tokio::test]
+    async fn a_rate_limited_answer_is_retried_and_stops_no_other_call() {
+        let (api_base, server) = stub_server(vec![
+            (429, RATE_LIMITED_429.to_string()),
+            (429, RATE_LIMITED_429.to_string()),
+            (200, r#"{"success":true,"text":"first"}"#.to_string()),
+            (200, r#"{"success":true,"text":"second"}"#.to_string()),
+        ]);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(3));
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let first = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &serde_json::json!({}))
+            .await;
+        assert_eq!(first.unwrap().text, "first");
+        let second = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &serde_json::json!({}))
+            .await;
+        assert_eq!(
+            second.expect("a later call is sent, not failed fast").text,
+            "second"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// Every limit the cloud enforces, as each prompt lambda sends it
+    /// (carrick-cloud#401): one request each, never retried, read as a
+    /// refusal whatever the reason and whatever the status, and the refusal's
+    /// own sentence kept for the run to print.
+    #[tokio::test]
+    async fn every_limit_the_cloud_sends_is_one_request_and_a_refusal() {
+        let limits = cloud_limits();
+        assert!(limits.len() >= 9, "the fixture lists every limit");
+        for (status, reason) in &limits {
+            let body = refusal_envelope(reason);
+            let (api_base, server) = stub_server(vec![(*status, body)]);
+            let service = service_with(4, 4).with_retry_policy(quick_policy(3));
+            let error = service
+                .post_with_retry(
+                    &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                    &api_base,
+                    "/analyze-file",
+                    &serde_json::json!({}),
+                )
+                .await
+                .expect_err("a refusal is a failed call");
+            assert!(error.is_budget_refusal(), "{reason}: {error}");
+            assert!(!error.retriable, "{reason}");
+            assert_eq!(error.message, format!("Refused: {reason}."), "{reason}");
+            assert_eq!(server.join().unwrap().len(), 1, "{reason} was retried");
         }
     }
 

@@ -669,7 +669,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // 4b. The work the run still owes gets one more try before it ends: a
     // deferred service's detection, the files and intents the model did not
-    // answer for, the calls the quota breaker stopped. After minutes, not
+    // answer for. After minutes, not
     // seconds, because what usually causes all of them is a shared model
     // quota that refills on that scale.
     let retrying: Vec<usize> = runs
@@ -713,10 +713,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
         })
         .await;
-        // The breaker never re-closes on its own inside a scan. After a wait
-        // this long it is worth one more call to find out; a quota that has
-        // not refilled trips it again at once.
-        crate::agent_service::reset_rate_limit();
         for index in retrying {
             let service = &services[index];
             // Whatever this service lost is recorded again if it is lost again.
@@ -796,7 +792,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // A service that owes model work and already has an index is held back,
     // so the index stays stale rather than becoming thinner (#461): this used
     // to be one run-wide gate that aborted every service's upload for one
-    // service's lost file, and a run-wide abort on a tripped quota breaker.
+    // service's lost file.
     // A service with no index yet lands whatever it holds — there is nothing
     // to protect, and on the laptop path the cloud's partial rule decides
     // with the service's own unanalysed-file list. The lost files are absent
@@ -1358,10 +1354,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // a stale service can show, as it was when one lost file failed the
         // whole run; now the rest of the run has landed first. The partial
         // opt-in keeps such a run green, as it always did.
-        if !laptop && !allow_partial {
+        //
+        // A service whose only debt is what a limit refused does not fail it:
+        // hitting a limit never fails a scan (carrick-cloud#401). It is named
+        // in the pending summary above, and held back when it has an index.
+        let failing: Vec<String> = owed
+            .iter()
+            .filter(|(_, work)| work.thins_the_index() && !work.only_refused())
+            .map(|(service, work)| format!("{service} ({})", work.describe()))
+            .collect();
+        if !laptop && !allow_partial && !failing.is_empty() {
             return Err(format!(
-                "{}. The other services were uploaded.",
-                reason[..1].to_uppercase() + &reason[1..]
+                "Pending model analysis: {}. The other services were uploaded.",
+                failing.join(", ")
             )
             .into());
         }
@@ -1433,7 +1438,6 @@ impl ServiceScan<'_> {
         // the analysis below and end with it, so that the cross-repo phase,
         // the upload and a service that failed mid-loop name nobody.
         let _service_scope = crate::current_service::enter(service.service_name.as_deref());
-        let quota_aborts_before = crate::agent_service::quota_abort_count();
         let service_started = Instant::now();
 
         let packages = load_packages_for_service(self.repo_path, service)?;
@@ -1510,7 +1514,6 @@ impl ServiceScan<'_> {
         let owed = durability::OwedWork {
             deferred: analysis.deferred,
             losses: crate::scan_health::service_losses(service.service_name.as_deref()),
-            quota_aborts: crate::agent_service::quota_abort_count() - quota_aborts_before,
             retry_error: None,
         };
         Ok(ServiceRun {
@@ -7086,14 +7089,14 @@ mod tests {
         crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
 
         let error: Box<dyn std::error::Error> =
-            "Carrick Cloud LLM quota was exhausted mid-scan".into();
+            "Failed to download cross-repo data: connection reset".into();
         super::report_scan_failure(&storage, ".", error.as_ref()).await;
 
         assert_eq!(
             storage.scan_failures(),
             vec![(
                 "file_analysis".to_string(),
-                "Carrick Cloud LLM quota was exhausted mid-scan".to_string()
+                "Failed to download cross-repo data: connection reset".to_string()
             )]
         );
         crate::scan_stage::enter(crate::scan_stage::Stage::Unknown);

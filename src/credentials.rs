@@ -241,8 +241,7 @@ pub fn relogin_hint() -> Option<String> {
 
 /// The scan slot the cloud minted for this run, from `start-scan`.
 ///
-/// A process-global for the same reason the quota breaker is: one scan is one
-/// process, and the four prompt-lambda clients are built far from the storage
+/// A process-global because one scan is one process, and the four prompt-lambda clients are built far from the storage
 /// client that opened the run, with no handle on it. Every prompt call of a
 /// laptop run carries it as `X-Carrick-Scan-Id`, and the money gates key on
 /// what the cloud stored under it — never on anything the client asserts (C4).

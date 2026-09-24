@@ -9,9 +9,9 @@
 //! most of a service's endpoints (#461).
 //!
 //! This module is where those losses are counted, so the end of the run can
-//! state them and refuse to call itself a success. It is a process-global for
-//! the same reason [`crate::agent_service::rate_limit_tripped`] is: a scan is
-//! one process, several independently-constructed services analyse inside it,
+//! state them and refuse to call itself a success. It is a process-global
+//! because a scan is one process, several independently-constructed services
+//! analyse inside it,
 //! and the question "did this run lose anything" is about the run, not about
 //! any one of them.
 //!
@@ -373,21 +373,17 @@ pub fn record_candidates_not_refreshed(path: &str, sentence: Option<&str>) {
 /// Whether a failed analyzer call is a file this run LOST, as opposed to one
 /// it was told not to ask about.
 ///
-/// Two codes are not losses, for different reasons:
-///
-/// - [`crate::agent_service::QUOTA_ABORT_CODE`]: the process-global breaker is
-///   open, so this call was never attempted. The breaker fails the run on its
-///   own terms.
-/// - [`crate::agent_service::LLM_DISABLED_CODE`]: a budget refused the call,
-///   whatever `details.reason` says. The ruling is that the scan completes
-///   facts-only and never fails, so counting these would abort the run before
-///   the upload and leave the organisation with no index (carrick#555).
+/// One code is not a loss: [`crate::agent_service::LLM_DISABLED_CODE`], a
+/// limit of the cloud's refused the call, whatever `details.reason` says. The
+/// ruling is that hitting a limit never stops a scan: it completes facts-only
+/// and never fails, so counting these would hold the service back and leave
+/// the organisation with no fresh index (carrick#555, carrick-cloud#401).
 ///
 /// Everything else — the model was asked and did not answer — is a loss.
 pub fn counts_as_lost_file(error: &(dyn std::error::Error + 'static)) -> bool {
     error
         .downcast_ref::<crate::agent_service::AgentCallError>()
-        .is_none_or(|e| !e.is_quota_abort() && !e.is_budget_refusal())
+        .is_none_or(|e| !e.is_budget_refusal())
 }
 
 /// Whether a failed analyzer call means a budget refused it.
@@ -717,17 +713,18 @@ mod tests {
         assert!(registry.summary_line().unwrap().contains("model_error"));
     }
 
-    /// A call the quota breaker aborted was never attempted, and the breaker
-    /// fails the run on its own terms. It is neither category.
+    /// A `rate_limited` answer whose retries ran out is a loss like any other
+    /// spent transient answer: the model was asked and did not answer. It is
+    /// not a refusal, whatever the word sounds like (carrick-cloud#401).
     #[test]
-    fn a_quota_abort_is_neither_a_loss_nor_a_budget_refusal() {
-        let aborted = AgentCallError {
-            code: crate::agent_service::QUOTA_ABORT_CODE.to_string(),
-            message: "breaker open".to_string(),
-            retriable: false,
+    fn a_spent_rate_limited_answer_is_a_loss_not_a_refusal() {
+        let spent = AgentCallError {
+            code: "rate_limited".to_string(),
+            message: "Gemini quota exceeded".to_string(),
+            retriable: true,
         };
-        assert!(!counts_as_lost_file(&aborted));
-        assert!(!is_budget_refusal(&aborted));
+        assert!(counts_as_lost_file(&spent));
+        assert!(!is_budget_refusal(&spent));
     }
 
     /// A failure that never produced an envelope is a loss: the scanner cannot

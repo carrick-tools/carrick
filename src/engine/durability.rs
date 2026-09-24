@@ -12,9 +12,10 @@
 //!    model did not answer, the run carries on. A detection that answered is
 //!    kept when only its guidance failed ([`ModelSetup::guidance_deferred`]).
 //! 2. Once every service has been through, the work still owed — a deferred
-//!    service, files the analyzer never answered for, intents that failed, calls
-//!    the quota breaker stopped — gets ONE more try in the same run, after a
-//!    wait of minutes ([`retry_delay`]).
+//!    service, files the analyzer never answered for, intents that failed —
+//!    gets ONE more try in the same run, after a wait of minutes
+//!    ([`retry_delay`]). What a limit refused is not retried: it would be
+//!    refused again.
 //!
 //!    Both kinds of waiting, the patient retries inside detection and guidance
 //!    and this wait, draw on one run-wide budget ([`crate::retry_budget`],
@@ -23,7 +24,9 @@
 //!    that refuses the whole run cannot hold it for hours (carrick#1126).
 //! 3. What is still owed after that is PENDING. A pending service that already
 //!    has an index is held back, so a thinner index cannot replace it (#461);
-//!    every other service lands.
+//!    every other service lands. On CI a pending service fails the run, unless
+//!    all it owes is what a limit refused: hitting a limit never fails a scan
+//!    (carrick-cloud#401).
 //! 4. A laptop run with pending work still closes its scan with the last write
 //!    (`scan_final`), and that write names the pending services
 //!    (`pending_services`), so the cloud releases the slot, writes the receipt
@@ -169,38 +172,43 @@ pub struct OwedWork {
     pub deferred: Option<String>,
     /// Files and intents the model did not answer for.
     pub losses: ServiceLosses,
-    /// Calls the quota breaker failed fast while it was being analysed.
-    pub quota_aborts: usize,
     /// The retry of this service ended in an error of its own (the error).
     pub retry_error: Option<String>,
 }
 
 impl OwedWork {
     pub fn is_empty(&self) -> bool {
-        self.deferred.is_none()
-            && self.losses.is_empty()
-            && self.quota_aborts == 0
-            && self.retry_error.is_none()
+        self.deferred.is_none() && self.losses.is_empty() && self.retry_error.is_none()
     }
 
     /// Whether what is owed makes the service's index thinner than a complete
     /// one. Intents are the exception: a function with no intent was never a
     /// reason to hold an index back, and still is not.
     pub fn thins_the_index(&self) -> bool {
-        self.deferred.is_some()
-            || self.losses.files > 0
-            || self.quota_aborts > 0
-            || self.retry_error.is_some()
+        self.deferred.is_some() || self.losses.files > 0 || self.retry_error.is_some()
+    }
+
+    /// Whether its model stages were deferred because a limit of the cloud's
+    /// refused them (`llm_disabled`), rather than because the model did not
+    /// answer.
+    fn deferred_by_refusal(&self) -> bool {
+        self.deferred
+            .as_deref()
+            .is_some_and(|reason| reason.ends_with(crate::agent_service::LLM_DISABLED_CODE))
+    }
+
+    /// Whether everything that thins this service's index is what a limit
+    /// refused. Such a service is still pending, and still held back when it
+    /// has an index, but it does not fail a CI run: hitting a limit never
+    /// fails a scan (carrick-cloud#401).
+    pub fn only_refused(&self) -> bool {
+        self.deferred_by_refusal() && self.losses.files == 0 && self.retry_error.is_none()
     }
 
     /// Whether another try in this run could change anything. A budget that
     /// refused the model will refuse it again a few minutes later.
     pub fn worth_retrying(&self) -> bool {
-        !self.is_empty()
-            && !self
-                .deferred
-                .as_deref()
-                .is_some_and(|reason| reason.ends_with(crate::agent_service::LLM_DISABLED_CODE))
+        !self.is_empty() && !self.deferred_by_refusal()
     }
 
     /// The parenthesis the summary puts after the service's name.
@@ -211,12 +219,6 @@ impl OwedWork {
         }
         if self.losses.files > 0 {
             parts.push(format!("{} file(s) not analysed", self.losses.files));
-        }
-        if self.quota_aborts > 0 {
-            parts.push(format!(
-                "{} call(s) stopped by the LLM quota",
-                self.quota_aborts
-            ));
         }
         if self.losses.intents > 0 {
             parts.push(format!(
@@ -236,9 +238,9 @@ impl OwedWork {
 /// - Nothing owed that thins the index: it lands.
 /// - Its retry failed for a reason of its own: held back, because what the
 ///   run holds for it is from before a failure nobody classified.
-/// - Deferred, or stopped by the quota breaker: its files were never sent, so
-///   no unanalysed-file list describes the gap. It lands only when there is
-///   no index to thin (`has_index` false).
+/// - Deferred: its files were never sent, so no unanalysed-file list describes
+///   the gap. It lands only when there is no index to thin (`has_index`
+///   false).
 /// - Files the analyzer did not answer for: it lands when the cloud decides
 ///   with the service's own list (a laptop first index of the service,
 ///   `laptop && !has_index`). CI never sends the list, so CI holds it back.
@@ -252,7 +254,7 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
     if allow_partial {
         return false;
     }
-    if owed.deferred.is_some() || owed.quota_aborts > 0 {
+    if owed.deferred.is_some() {
         return has_index;
     }
     owed.losses.files > 0 && (has_index || !laptop)
@@ -421,6 +423,24 @@ mod tests {
         };
         assert!(owed.thins_the_index());
         assert!(!owed.worth_retrying());
+        // Pending, and it fails no run.
+        assert!(owed.only_refused());
+        // A deferral the model did not answer is not a refusal, and a refused
+        // service that also lost a file owes a loss as well.
+        let unanswered = OwedWork {
+            deferred: Some("framework detection: model_error".to_string()),
+            ..OwedWork::default()
+        };
+        assert!(!unanswered.only_refused());
+        let refused_and_lost = OwedWork {
+            losses: ServiceLosses {
+                files: 1,
+                intents: 0,
+            },
+            ..owed.clone()
+        };
+        assert!(!refused_and_lost.only_refused());
+        assert!(!OwedWork::default().only_refused());
     }
 
     #[test]
