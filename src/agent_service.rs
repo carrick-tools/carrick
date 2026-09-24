@@ -190,7 +190,7 @@ fn call_error_from_envelope(err: AgentError) -> AgentCallError {
 /// which is what lets a caller report failed-after-retry honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCallError {
-    /// Cloud error code (`model_error`, `rate_limited`, `internal_error`), or a
+    /// Cloud error code (`model_error`, `llm_disabled`, `internal_error`), or a
     /// scanner-side pseudo-code for a failure that never reached the envelope.
     pub code: String,
     pub message: String,
