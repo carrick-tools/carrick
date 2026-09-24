@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/checkout",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post<{ x: number }>(\"/checkout\")",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "/checkout",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(\"/checkout\")",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/checkout",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(\"/checkout\")",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

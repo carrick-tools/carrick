@@ -56,6 +56,7 @@ export { DenoProject, findDenoConfig } from './deno-project.js';
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
 export type { CheckProgress } from './check.js';
+export { jsonWireDeclarations } from './check-probe.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';
 

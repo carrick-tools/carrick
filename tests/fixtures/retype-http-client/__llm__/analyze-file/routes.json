@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/checkout",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "reply.json(result)",
+      "response_expression_line": 11,
+      "primary_type_symbol": "CheckoutResult",
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

@@ -19,7 +19,8 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
-import { captureStub, runCheck } from './capture/index.js';
+import { captureStub, jsonWireDeclarations, runCheck } from './capture/index.js';
+import { Retyper } from './retype.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -32,6 +33,7 @@ import type {
   BuildWorkspaceResponse,
   CheckCompatibilityResponse,
   ResolveDefinitionsResponse,
+  RetypeCheckResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -55,6 +57,7 @@ interface ProjectComponents {
   surfaceEmitter: SurfaceEmitter;
   typeInferrer: TypeInferrer;
   definitionResolver: DefinitionResolver;
+  retyper: Retyper;
 }
 
 let components: ProjectComponents | null = null;
@@ -76,18 +79,22 @@ function projectComponents(): ProjectComponents {
     const loader = projectLoader;
     const project = loader.getProject();
     const repoRoot = loader.getRepoRoot();
+    // The module graph, where the project resolved through one, is the only
+    // thing that can name the package a file belongs to: a Deno service
+    // resolves nothing under `node_modules` (carrick#1260).
+    const typeInferrer = new TypeInferrer({
+      project,
+      repoRoot,
+      packageOf: (filePath) => loader.packageOf(filePath),
+    });
     components = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
-      // The module graph, where the project resolved through one, is the only
-      // thing that can name the package a file belongs to: a Deno service
-      // resolves nothing under `node_modules` (carrick#1260).
-      typeInferrer: new TypeInferrer({
-        project,
-        repoRoot,
-        packageOf: (filePath) => loader.packageOf(filePath),
-      }),
+      typeInferrer,
       definitionResolver: new DefinitionResolver({ project }),
+      // Locates calls exactly as `infer` does, so it rewrites the node the
+      // consumer's published type came from (carrick#1491).
+      retyper: new Retyper(project, typeInferrer, jsonWireDeclarations),
     };
   }
   return components;
@@ -350,6 +357,33 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
 }
 
 /**
+ * How long one retype_check request may spend before the items it has not
+ * reached abstain: well inside the scanner's 900s read deadline.
+ */
+const RETYPE_BUDGET_MS = 600_000;
+
+/**
+ * Handle the 'retype_check' action - judge untyped consumer calls by retyping
+ * them with the producer's response type (carrick#1491)
+ */
+function handleRetypeCheck(
+  request: SidecarRequest & { action: 'retype_check' }
+): RetypeCheckResponse {
+  try {
+    log(`Retyping ${request.items.length} consumer call(s)`);
+    const outcomes = projectComponents().retyper.run(
+      request.items,
+      request.budget_ms ?? RETYPE_BUDGET_MS
+    );
+    return { request_id: request.request_id, status: 'success', outcomes };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Retype check failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'build_workspace' action - build synthetic monorepo workspace
  */
 function handleBuildWorkspace(request: SidecarRequest & { action: 'build_workspace' }): BuildWorkspaceResponse {
@@ -524,6 +558,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleCheckCompatibility(request);
     case 'resolve_definitions':
       return handleResolveDefinitions(request);
+    case 'retype_check':
+      return handleRetypeCheck(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

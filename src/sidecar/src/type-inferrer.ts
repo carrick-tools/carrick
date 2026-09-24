@@ -18,6 +18,7 @@
  * function's return type.
  */
 
+import * as path from 'node:path';
 import {
   Project,
   SourceFile,
@@ -533,6 +534,22 @@ export class TypeInferrer {
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
     }
+  }
+
+  /**
+   * The call a `call_result` locator names, located exactly as `infer` locates
+   * it (span, else expression text near a line). The retype check
+   * (carrick#1491) rewrites this node, so it must be the node the consumer's
+   * published type came from, not a guess at the line.
+   */
+  locateCall(request: InferRequestItem): { sourceFile: SourceFile; call: CallExpression } | undefined {
+    const filePath = path.isAbsolute(request.file_path)
+      ? request.file_path
+      : path.join(this.repoRoot, request.file_path);
+    const sourceFile = this.getSourceFile(filePath);
+    if (!sourceFile) return undefined;
+    const call = this.resolveTargetCallExpression(sourceFile, request);
+    return call ? { sourceFile, call } : undefined;
   }
 
   /**
@@ -1514,6 +1531,21 @@ export class TypeInferrer {
     // LLM's `primary_type_symbol` schema contract extracts, and the Rust
     // depth-copy's symbol-agreement guard makes a mismatched fallback inert.
     // Multi-generic calls are ambiguous and anchor nothing here.
+    //
+    // carrick#1491: why a typed call like `client.post<{ x: number }>(url)`
+    // publishes no comparable type. Two facts, both pinned by
+    // test/infer-inline-call-generic.test.ts:
+    //  - when the client resolves and no wrapper rule unwrapped its envelope,
+    //    the anchor above is the ENVELOPE's own symbol, so this fallback never
+    //    runs and the text stays the whole envelope
+    //    (`ClientResponse<{ x: number; }, any>`), whose defaulted request-data
+    //    parameter is `any`;
+    //  - when the client does not resolve, this fallback runs, and it anchors
+    //    a NAMED generic only: an inline literal has no symbol, so
+    //    `primaryTypeSymbol` returns nothing and no anchor is taken.
+    // Either way the text carries `any`, cannot anchor a literal capture, and
+    // the pair is left unverified; the check phase's retype of the consumer
+    // call is what judges such a call today.
     if (!anchor || !this.primaryTypeSymbol(anchor.element)) {
       const typeArgs = callExpr.getTypeArguments();
       if (typeArgs.length === 1) {

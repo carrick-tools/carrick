@@ -427,6 +427,15 @@ export interface CheckVerdict {
   /** Why `resolved` is false. Absent exactly when `resolved` is true. */
   unresolved_reason?: string;
   /**
+   * WHICH side's type left the verdict unresolved, when one side did: a gate,
+   * a missing export, poison or a deep finding on that side. Absent when
+   * nothing about either side is to blame (the check did not run, a probe
+   * diagnostic that is not a mismatch) and whenever `resolved` is true. The
+   * scanner retypes an unresolved CONSUMER call with the producer's response
+   * (carrick#1491), so it reads this rather than parsing the reason.
+   */
+  unresolved_side?: 'producer' | 'consumer';
+  /**
    * Statements about THIS comparison that are neither the verdict nor an
    * unresolution (carrick#1341).
    *
