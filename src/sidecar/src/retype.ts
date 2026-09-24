@@ -52,8 +52,9 @@ interface Diag {
 type Origin = { kind: 'original'; pos: number } | { kind: 'inserted' };
 
 interface Rewrite {
-  form: 'type_argument' | 'cast';
   edits: Edit[];
+  /** The wire transform is stated, so its declarations are appended. */
+  wire: boolean;
   /** Start/end of the rewritten call in the NEW text, for re-locating it. */
   callStart: number;
   callEnd: number;
@@ -116,6 +117,12 @@ export class Retyper {
       // "agrees" here would be a verdict about no comparison at all.
       return abstain(item, 'the consumer never reads the response');
     }
+    const escape = resultEscapes(call);
+    if (escape) {
+      // Only this file's diagnostics are compared, so reads made where the
+      // value escapes to are invisible and an "agrees" would claim them.
+      return abstain(item, escape);
+    }
 
     const plan = this.plan(call, producer, item.wire);
     if (typeof plan === 'string') return abstain(item, plan);
@@ -127,12 +134,11 @@ export class Retyper {
       before.set(sourceFile, pre);
     }
     const decisive = this.check(sourceFile, original, plan(true), pre);
-    if (decisive.kind === 'abstain') return abstain(item, decisive.reason, decisive.form);
+    if (decisive.kind === 'abstain') return abstain(item, decisive.reason);
     if (decisive.added.length === 0) {
       return {
         item_id: item.item_id,
         outcome: 'agrees',
-        form: decisive.form,
         diagnostics: [],
       };
     }
@@ -151,7 +157,6 @@ export class Retyper {
     return {
       item_id: item.item_id,
       outcome: 'mismatch',
-      form: decisive.form,
       diagnostics: decisive.added.map(
         (d): RetypeDiagnostic => ({
           line: lineOf(d.start),
@@ -188,8 +193,8 @@ export class Retyper {
         const text = stated(useWire);
         const delta = text.length - (argEnd - argStart);
         return {
-          form: 'type_argument',
           edits: [{ start: argStart, end: argEnd, text }],
+          wire: useWire && wire,
           callStart,
           callEnd: callEnd + delta,
         };
@@ -203,47 +208,25 @@ export class Retyper {
       return (useWire) => {
         const text = `<${stated(useWire)}>`;
         return {
-          form: 'type_argument',
           edits: [{ start: at, end: at, text }],
+          wire: useWire && wire,
           callStart,
           callEnd: callEnd + text.length,
         };
       };
     }
 
-    // No type parameter to state. A call to a function the program declares
-    // whose result it types as `any` (an untyped helper) can still be asked to
-    // return the producer's type with a cast; a call that returns a typed
-    // value (a `Response` whose body is read later) cannot, and is left alone.
-    //
-    // A callee that is itself `any` is neither: it is a client the program
-    // could not resolve (a checkout without its dependencies), and what it
-    // returns may be an envelope around the payload, so casting it to the
-    // payload would report the envelope's own members as missing.
+    // No type parameter to state. A cast of the call's result is not
+    // offered: an untyped helper declared `Promise<any>` may return a whole
+    // client envelope, and casting that to the payload would report every
+    // `.data` read as a break (ruling on PR #1492).
     if (!resolvedDeclaration(call)) {
       return 'the consumer call does not resolve in its program (is the client installed?)';
     }
-    const result = call.getType();
-    const promised = promiseArgument(result);
-    if (!result.isAny() && !(promised && promised.isAny())) {
-      return (
-        `the consumer call takes no type argument and returns ` +
-        `'${result.getText(call)}', so it cannot be retyped`
-      );
-    }
-    return (useWire) => {
-      const inner = stated(useWire);
-      const target = promised ? `Promise<${inner}>` : inner;
-      return {
-        form: 'cast',
-        edits: [
-          { start: callStart, end: callStart, text: '(' },
-          { start: callEnd, end: callEnd, text: ` as ${target})` },
-        ],
-        callStart: callStart + 1,
-        callEnd: callEnd + 1,
-      };
-    };
+    return (
+      `the consumer call takes no type argument and returns ` +
+      `'${call.getType().getText(call)}', so it cannot be retyped`
+    );
   }
 
   /**
@@ -256,15 +239,19 @@ export class Retyper {
     rewrite: Rewrite,
     pre: Diag[]
   ):
-    | { kind: 'checked'; form: Rewrite['form']; added: Diag[] }
-    | { kind: 'abstain'; form: Rewrite['form']; reason: string } {
-    const appendix =
-      '\n' +
-      [
-        ...this.jsonWire(PREFIX),
-        `type ${WIRE}<P> = ${PREFIX}JsonWireSame<${PREFIX}JsonWire<P>, P> extends true ? P : ${PREFIX}JsonWire<P>;`,
-      ].join('\n') +
-      '\n';
+    | { kind: 'checked'; added: Diag[] }
+    | { kind: 'abstain'; reason: string } {
+    // Appended only when the rewrite names them: an alias nothing references
+    // is a TS6196 under `noUnusedLocals`, which would read as the producer's
+    // type failing to resolve.
+    const appendix = rewrite.wire
+      ? '\n' +
+        [
+          ...this.jsonWire(PREFIX),
+          `type ${WIRE}<P> = ${PREFIX}JsonWireSame<${PREFIX}JsonWire<P>, P> extends true ? P : ${PREFIX}JsonWire<P>;`,
+        ].join('\n') +
+        '\n'
+      : '';
     const rewritten = applyEdits(original, rewrite.edits) + appendix;
     const bodyEnd = rewritten.length - appendix.length;
     const originOf = (pos: number): Origin =>
@@ -272,11 +259,9 @@ export class Retyper {
 
     sourceFile.replaceWithText(rewritten);
     try {
-      if (rewrite.form === 'type_argument') {
-        const reached = this.typeArgumentReachesResult(sourceFile, rewrite);
-        if (reached !== true) {
-          return { kind: 'abstain', form: rewrite.form, reason: reached };
-        }
+      const reached = this.typeArgumentReachesResult(sourceFile, rewrite);
+      if (reached !== true) {
+        return { kind: 'abstain', reason: reached };
       }
 
       const post = fileDiagnostics(sourceFile);
@@ -284,7 +269,6 @@ export class Retyper {
       if (inserted.length > 0) {
         return {
           kind: 'abstain',
-          form: rewrite.form,
           reason:
             "the producer's response type does not resolve in the consumer's program: " +
             `TS${inserted[0].code}: ${inserted[0].message}`,
@@ -306,7 +290,7 @@ export class Retyper {
         added.push(mapped);
       }
       added.sort((a, b) => a.start - b.start || a.code - b.code);
-      return { kind: 'checked', form: rewrite.form, added };
+      return { kind: 'checked', added };
     } finally {
       sourceFile.replaceWithText(original);
     }
@@ -353,12 +337,8 @@ export class Retyper {
   }
 }
 
-function abstain(
-  item: RetypeItem,
-  reason: string,
-  form?: RetypeOutcome['form']
-): RetypeOutcome {
-  return { item_id: item.item_id, outcome: 'abstain', form, diagnostics: [], reason };
+function abstain(item: RetypeItem, reason: string): RetypeOutcome {
+  return { item_id: item.item_id, outcome: 'abstain', diagnostics: [], reason };
 }
 
 function asLocator(item: RetypeItem): InferRequestItem {
@@ -403,14 +383,82 @@ function resolvedDeclaration(call: CallExpression): ts.SignatureDeclaration | un
   return signature?.getDeclaration() as ts.SignatureDeclaration | undefined;
 }
 
-function declaresTypeParameters(call: CallExpression): boolean {
-  return (resolvedDeclaration(call)?.typeParameters?.length ?? 0) > 0;
+/**
+ * Why the call's result leaves what this file's type-check can see, or
+ * `undefined` when every use of it stays in view.
+ *
+ * The retype diffs one file's diagnostics. A value returned from a function
+ * whose return type is inferred carries the producer's type to the callers,
+ * wherever they are, and one bound to an exported name carries it out of the
+ * file. A function that DECLARES its return type is the opposite: the return
+ * is checked against the declaration right here, which is how a typed wrapper
+ * is judged. A callback handed to a call returns into that call, which is
+ * also in view.
+ */
+function resultEscapes(call: CallExpression): string | undefined {
+  let top: Node = call;
+  while (
+    Node.isAwaitExpression(top.getParentOrThrow()) ||
+    Node.isParenthesizedExpression(top.getParentOrThrow())
+  ) {
+    top = top.getParentOrThrow();
+  }
+  if (returnsUndeclared(top)) {
+    return 'the response is returned from a function with no declared return type, so its readers are elsewhere';
+  }
+  const parent = top.getParent();
+  if (!parent || !Node.isVariableDeclaration(parent) || parent.getInitializer() !== top) {
+    return undefined;
+  }
+  if (parent.getVariableStatement()?.isExported()) {
+    return 'the response is bound to an exported name, so its readers are elsewhere';
+  }
+  const names = Node.isIdentifier(parent.getNameNode())
+    ? [parent.getNameNode()]
+    : parent.getNameNode().getDescendantsOfKind(SyntaxKind.Identifier);
+  for (const name of names) {
+    if (!Node.isIdentifier(name)) continue;
+    for (const ref of name.findReferencesAsNodes()) {
+      if (returnsUndeclared(ref)) {
+        return 'the response is returned from a function with no declared return type, so its readers are elsewhere';
+      }
+    }
+  }
+  return undefined;
 }
 
-function promiseArgument(type: Type): Type | undefined {
-  const symbol = type.getSymbol() ?? type.getAliasSymbol();
-  if (symbol?.getName() !== 'Promise') return undefined;
-  return type.getTypeArguments()[0];
+/** `node` is (part of) what a function with an inferred return type returns. */
+function returnsUndeclared(node: Node): boolean {
+  for (let at: Node | undefined = node; at; at = at.getParent()) {
+    const parent = at.getParent();
+    if (!parent) return false;
+    const returned =
+      Node.isReturnStatement(parent) ||
+      (Node.isArrowFunction(parent) && parent.getBody() === at);
+    if (returned) {
+      const fn = Node.isReturnStatement(parent)
+        ? parent.getFirstAncestor(
+            (n) =>
+              Node.isFunctionDeclaration(n) ||
+              Node.isFunctionExpression(n) ||
+              Node.isArrowFunction(n) ||
+              Node.isMethodDeclaration(n)
+          )
+        : parent;
+      if (!fn || !('getReturnTypeNode' in fn)) return false;
+      const declared = (fn as unknown as { getReturnTypeNode(): Node | undefined }).getReturnTypeNode();
+      if (declared) return false;
+      // A callback returns into the call it is handed to, which is in view.
+      return !Node.isCallExpression(fn.getParent());
+    }
+    // A statement inside a block is not what the block's function returns.
+    if (Node.isBlock(parent)) return false;
+  }
+  return false;
+}
+
+function declaresTypeParameters(call: CallExpression): boolean {
+  return (resolvedDeclaration(call)?.typeParameters?.length ?? 0) > 0;
 }
 
 function fileDiagnostics(sourceFile: SourceFile): Diag[] {

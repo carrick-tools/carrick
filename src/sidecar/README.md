@@ -313,7 +313,7 @@ A verdict that is not a fact (`resolved: false`) says which side is to blame in 
 
 A consumer call with no type argument (`await api.post('/orders')`) returns `any`, so check_v2 has nothing to compare. `retype_check` rewrites the call in memory to state the producer's response type, type-checks the consumer file before and after, and reports every diagnostic the rewrite added. Each one is a place the consumer uses something the producer does not return. It runs in the init'd project, because the consumer's file only type-checks there, and it restores the file before it answers.
 
-The call is located the way `infer` locates a `call_result`: by span, else by `expression_text` near `expression_line`. A call that already states a type argument has it replaced. A call to a generic gets one inserted. A call whose result is already `any` (an untyped helper) is cast. `wire: true` compares the form JSON puts on the wire, as check_v2 does for `http`.
+The call is located the way `infer` locates a `call_result`: by span, else by `expression_text` near `expression_line`. A call that already states a type argument has it replaced. A call to a generic gets one inserted. A call with no type parameter is not retyped. `wire: true` compares the form JSON puts on the wire, as check_v2 does for `http`.
 
 ```json
 {
@@ -342,7 +342,6 @@ Response:
     {
       "item_id": "web/Endpoint_9f8e_Response",
       "outcome": "mismatch",
-      "form": "type_argument",
       "diagnostics": [
         { "line": 13, "code": 2339, "message": "Property 'totalMinutes' does not exist on type '{ id: string; total: number; }'." }
       ]
@@ -351,7 +350,7 @@ Response:
 }
 ```
 
-`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, the type parameter it would fill does not carry the response, the call returns a typed value with no type parameter, or the producer's type names something the consumer's program cannot resolve. Diagnostics the file had before the rewrite never count.
+`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, or the producer's type names something the consumer's program cannot resolve. Diagnostics the file had before the rewrite never count.
 
 #### `infer` - Resolve the type at a locator
 

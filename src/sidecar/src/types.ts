@@ -619,8 +619,6 @@ export interface RetypeDiagnostic {
 export interface RetypeOutcome {
   item_id: string;
   outcome: 'mismatch' | 'agrees' | 'abstain';
-  /** How the type was stated: a type argument, or a cast of an `any` result. */
-  form?: 'type_argument' | 'cast';
   diagnostics: RetypeDiagnostic[];
   reason?: string;
 }

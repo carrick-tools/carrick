@@ -867,6 +867,9 @@ pub(crate) struct BuiltPair {
     /// (`expanded_definition`). The retype check states it at the consumer's
     /// call (carrick#1491).
     pub producer_expanded: Option<String>,
+    /// The consumer's published type for the same kind. With the producer's,
+    /// it says whether either side states a request body at all.
+    pub consumer_expanded: Option<String>,
 }
 
 struct ServiceEntry<'a> {
@@ -1070,6 +1073,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         pre_verdict,
         pre_verdict_side,
         producer_expanded: producer.entry.expanded_definition.clone(),
+        consumer_expanded: consumer.entry.expanded_definition.clone(),
     })
 }
 
@@ -1255,7 +1259,7 @@ pub(crate) fn run_check(
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
-    log_unresolved_pairs(&outcomes);
+    log_unresolved_pairs(&outcomes, &pairs, local_consumers);
     outcomes
 }
 
@@ -1343,8 +1347,12 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
 /// Whether the CONSUMER's type is what left this verdict unresolved, in a way
 /// a retype of its call could settle. A consumer that states no contract at
 /// all (it reads no body, or sends a form body) has nothing to compare.
+///
+/// A proven mismatch is never a candidate: the retype may only lift a verdict
+/// that compared nothing, never downgrade one that found a break.
 fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> bool {
-    verdict.unresolved_side == Some(VerdictSide::Consumer)
+    verdict.bucket != VerdictBucket::Incompatible
+        && verdict.unresolved_side == Some(VerdictSide::Consumer)
         && !verdict
             .gate
             .as_deref()
@@ -1469,8 +1477,13 @@ fn scope_to(
     sidecar.wait_ready(crate::services::type_sidecar::ready_budget())
 }
 
-/// Write one retype answer onto its pair's outcome.
+/// Write one retype answer onto its pair's outcome. An outcome check_v2
+/// already found incompatible keeps its verdict whatever the answer: the
+/// retype only lifts what compared nothing.
 fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
+    if outcome.bucket == VerdictBucket::Incompatible {
+        return;
+    }
     match answer.outcome {
         RetypeVerdict::Mismatch => {
             let places: Vec<String> = answer
@@ -1510,11 +1523,38 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
 
 /// One log line per pair the check could not establish as a fact, with the
 /// reason, so a CI run says why a pair is unverified without a second tool
-/// (carrick#1491).
-fn log_unresolved_pairs(outcomes: &[PairCheckOutcome]) {
-    for line in outcomes.iter().filter_map(unresolved_pair_line) {
+/// (carrick#1491). Only the pairs this run is answerable for are logged.
+fn log_unresolved_pairs(
+    outcomes: &[PairCheckOutcome],
+    pairs: &[BuiltPair],
+    local_consumers: &LocalConsumers,
+) {
+    let worth: HashSet<&str> = pairs
+        .iter()
+        .filter(|pair| worth_logging(pair, local_consumers))
+        .map(|pair| pair.spec.pair_key.as_str())
+        .collect();
+    for line in outcomes
+        .iter()
+        .filter(|o| worth.contains(o.pair_key.as_str()))
+        .filter_map(unresolved_pair_line)
+    {
         info!("{line}");
     }
+}
+
+/// Whether an unverified pair belongs in this run's log: it involves a
+/// service scanned in this run (a pair between two peers is theirs to
+/// report), and it is not the request half of an operation where neither side
+/// publishes a request type, which states no body to compare rather than a
+/// body nobody could read.
+fn worth_logging(pair: &BuiltPair, local_consumers: &LocalConsumers) -> bool {
+    let local = local_consumers.contains_key(&pair.producer_service)
+        || local_consumers.contains_key(&pair.consumer_service);
+    let no_body = pair.type_kind == ManifestTypeKind::Request
+        && pair.producer_expanded.is_none()
+        && pair.consumer_expanded.is_none();
+    local && !no_body
 }
 
 /// The log line for one pair, or `None` when its verdict is a fact.
@@ -2068,6 +2108,66 @@ mod tests {
                  it: the consumer never reads the response"
             )
         );
+    }
+
+    #[test]
+    fn only_pairs_this_run_answers_for_are_logged() {
+        let local = web_consumer();
+        let response = retype_pair(ManifestTypeKind::Response, Some("{ id: string; }"));
+        assert!(worth_logging(&response, &local));
+        // Two peers: nothing this run scanned.
+        assert!(!worth_logging(&response, &LocalConsumers::new()));
+        // A request half where neither side publishes a body type.
+        let bodiless = retype_pair(ManifestTypeKind::Request, None);
+        assert!(!worth_logging(&bodiless, &local));
+        // One side does state a body: that half is worth a line.
+        let with_body = retype_pair(ManifestTypeKind::Request, Some("{ id: string; }"));
+        assert!(worth_logging(&with_body, &local));
+    }
+
+    #[test]
+    fn a_retype_never_downgrades_a_proven_mismatch() {
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ y: number; }"));
+        let verdict = crate::services::type_sidecar::CheckVerdict {
+            pair_id: "id".to_string(),
+            pair_key: pair.spec.pair_key.clone(),
+            bucket: VerdictBucket::Incompatible,
+            gate: None,
+            diagnostic: Some("Property 'y' is missing".to_string()),
+            codes: vec![2741],
+            resolved: false,
+            unresolved_reason: Some("the consumer type carries 'any' at 'meta'".to_string()),
+            unresolved_side: Some(VerdictSide::Consumer),
+            notes: Vec::new(),
+        };
+        assert!(
+            !consumer_to_blame(&verdict),
+            "a check_v2 mismatch with a consumer deep-any is not a retype candidate"
+        );
+        let mut outcome = outcome_for(
+            &pair,
+            verdict.bucket,
+            verdict.gate.clone(),
+            verdict.diagnostic.clone(),
+            verdict.resolved,
+            verdict.unresolved_reason.clone(),
+            Vec::new(),
+        );
+        apply_retype(
+            &mut outcome,
+            &RetypeOutcome {
+                item_id: pair.spec.pair_key.clone(),
+                outcome: RetypeVerdict::Agrees,
+                diagnostics: Vec::new(),
+                reason: None,
+            },
+        );
+        assert_eq!(outcome.bucket, VerdictBucket::Incompatible);
+        assert_eq!(
+            outcome.diagnostic.as_deref(),
+            Some("Property 'y' is missing")
+        );
+        assert!(!outcome.resolved);
     }
 
     /// The CI log states each unverified pair and why (carrick#1491): the

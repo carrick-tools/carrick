@@ -98,15 +98,17 @@ fn a_read_of_a_field_the_producer_does_not_return_is_flagged() {
     let (projection, log) = scan(&fixture_dir());
 
     let matches = checkout_matches(&projection);
-    assert_eq!(matches.len(), 2, "both calls match the route: {matches:#?}");
+    assert_eq!(
+        matches.len(),
+        3,
+        "all three calls match the route: {matches:#?}"
+    );
     let mut reasons: Vec<&str> = matches
         .iter()
-        .map(|m| {
-            assert_eq!(m["type_compatible"], false, "{m:#}");
-            m["mismatch_reason"].as_str().unwrap_or_default()
-        })
+        .filter_map(|m| m["mismatch_reason"].as_str())
         .collect();
     reasons.sort();
+    assert_eq!(reasons.len(), 2, "the two reads are flagged: {matches:#?}");
     // The typed call reads at line 7, the untyped one at line 12.
     for (reason, line) in reasons.iter().zip([12, 7]) {
         assert!(
@@ -116,17 +118,21 @@ fn a_read_of_a_field_the_producer_does_not_return_is_flagged() {
         );
     }
 
-    // The request half of each pair compared nothing (the route reads no
-    // body), and the log says so per pair, with the reason.
-    for line in [6, 11] {
-        assert!(
-            log.contains(&format!(
-                "Types not verified: POST /checkout request (web/src/checkout.ts:{line} in web \
-                 against api):"
-            )),
-            "no reason line for the call at line {line}:\n{log}"
-        );
-    }
+    // The discarded response is the one pair left unverified, and the log
+    // says why. The request halves state no body on either side and are not
+    // logged: a passing scan's log carries only what is worth reading.
+    let unverified: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("Types not verified:"))
+        .collect();
+    assert_eq!(unverified.len(), 1, "{unverified:#?}");
+    assert!(
+        unverified[0]
+            .contains("POST /checkout response (web/src/checkout.ts:16 in web against api):")
+            && unverified[0].contains("the consumer never reads the response"),
+        "{}",
+        unverified[0]
+    );
 }
 
 #[test]
@@ -148,13 +154,15 @@ fn a_read_of_a_field_the_producer_returns_is_not_flagged() {
 
     let (projection, log) = scan(&root);
     let matches = checkout_matches(&projection);
-    assert_eq!(matches.len(), 2, "{matches:#?}");
+    assert_eq!(matches.len(), 3, "{matches:#?}");
     for m in matches {
         assert_ne!(m["type_compatible"], false, "nothing to flag: {m:#}");
         assert!(m["mismatch_reason"].is_null(), "{m:#}");
     }
-    assert!(
-        !log.contains("Types not verified: POST /checkout response"),
-        "the response half of both pairs is now a fact:\n{log}"
-    );
+    for line in [6, 11] {
+        assert!(
+            !log.contains(&format!("(web/src/checkout.ts:{line} in web")),
+            "the reads at line {line} are now a fact:\n{log}"
+        );
+    }
 }

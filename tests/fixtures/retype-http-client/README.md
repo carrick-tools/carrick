@@ -9,7 +9,8 @@ which is the shape that leaves both calls without a comparable type.
 
 - `api/src/routes.ts` answers `POST /checkout` with a `CheckoutResult { y }`.
 - `web/src/checkout.ts` reads `response.data.x` after a typed call (line 6) and
-  after an untyped one (line 11).
+  after an untyped one (line 11), and discards the response of a third call
+  (line 16), which the retype cannot judge and the scan logs with its reason.
 - `__llm__/` holds the mocked model answers for a `CARRICK_MOCK_ALL` scan.
 
 Used by `tests/retype_consumer_test.rs` (the whole scanner) and by

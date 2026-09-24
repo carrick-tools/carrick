@@ -15,7 +15,8 @@
  * returning `{ y }` both must be flagged at the read; against one returning
  * `{ x }` neither may be. The rest pin the edges: a typed wrapper whose
  * declared return is the sink, a call whose result goes nowhere, an untyped
- * helper retyped by a cast, and a producer type the consumer cannot resolve.
+ * helper with no type parameter, results that escape the file's own
+ * type-check, and a producer type the consumer cannot resolve.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -123,6 +124,29 @@ export async function streamed(): Promise<void> {
   const stream = await watch('/p');
   stream.subscribe((value) => console.log(value.x));
 }
+
+export async function returnedCall() {
+  return api.post('/p');
+}
+
+export async function returnedBinding() {
+  const response = await api.post('/p');
+  return response.data;
+}
+
+export const exportedArrow = () => api.post('/p');
+
+export const exportedBinding = api.post('/p');
+
+export async function readInCallback(): Promise<number[]> {
+  const response = await api.post('/p');
+  return [1].map(() => response.data.x);
+}
+
+export const logsIt = async () => {
+  const response = await api.post('/p');
+  console.log(response.data.x);
+};
 `;
 
 const CASES = {
@@ -137,12 +161,17 @@ const CASES = {
   unresolvedUntyped: { line: 61, text: "missing.post('/p')" },
   bareEnvelope: { line: 68, text: "getBare('/p')", read: 69 },
   streamed: { line: 78, text: "watch('/p')", read: 79 },
+  returnedCall: { line: 83, text: "api.post('/p')" },
+  returnedBinding: { line: 87, text: "api.post('/p')" },
+  exportedArrow: { line: 91, text: "api.post('/p')" },
+  exportedBinding: { line: 93, text: "api.post('/p')" },
+  readInCallback: { line: 96, text: "api.post('/p')", read: 97 },
+  logsIt: { line: 101, text: "api.post('/p')", read: 102 },
 } as const;
 
 interface Outcome {
   item_id: string;
   outcome: 'mismatch' | 'agrees' | 'abstain';
-  form?: string;
   diagnostics: Array<{ line: number; code: number; message: string }>;
   reason?: string;
 }
@@ -213,7 +242,6 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     it(`(${name}) flags the read of a field the producer does not return`, async () => {
       const out = await retype(name, '{ y: number; }');
       assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
-      assert.strictEqual(out.form, 'type_argument');
       assert.strictEqual(out.diagnostics.length, 1, JSON.stringify(out.diagnostics));
       const [d] = out.diagnostics;
       assert.strictEqual(d.line, CASES[name].read);
@@ -285,12 +313,27 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     assert.match(out.reason ?? '', /never reads the response/);
   });
 
-  it('retypes an untyped helper with a cast of its any result', async () => {
+  it('does not cast an untyped helper: its any may be a whole envelope', async () => {
     const out = await retype('helper', '{ y: number; }');
-    assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
-    assert.strictEqual(out.form, 'cast');
-    assert.strictEqual(out.diagnostics[0].line, CASES.helper.read);
-    assert.strictEqual(out.diagnostics[0].code, 2339);
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.match(out.reason ?? '', /takes no type argument/);
+  });
+
+  it('keeps a read that stays in view: in a callback, or in a statement of an arrow', async () => {
+    for (const name of ['readInCallback', 'logsIt'] as const) {
+      const out = await retype(name, '{ y: number; }');
+      assert.strictEqual(out.outcome, 'mismatch', `${name}: ${JSON.stringify(out)}`);
+      assert.strictEqual(out.diagnostics[0].line, CASES[name].read);
+    }
+  });
+
+  it('abstains when the response escapes the file or the function', async () => {
+    // Only this file's diagnostics are compared; readers elsewhere are not.
+    for (const name of ['returnedCall', 'returnedBinding', 'exportedArrow', 'exportedBinding'] as const) {
+      const out = await retype(name, '{ y: number; }');
+      assert.strictEqual(out.outcome, 'abstain', `${name}: ${JSON.stringify(out)}`);
+      assert.match(out.reason ?? '', /readers are elsewhere/, name);
+    }
   });
 
   it('does not count a diagnostic the file already had', async () => {
@@ -364,4 +407,70 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     });
     assert.match(res.inferred_types?.[0]?.type_string ?? '', /\{ x: number; \}/);
   });
+});
+
+describe('carrick#1491: the retype under noUnusedLocals', () => {
+  let client: SidecarClient;
+  let repoDir: string;
+  let consumerPath: string;
+
+  before(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1491-unused-'));
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          noUnusedLocals: true,
+          module: 'esnext',
+          moduleResolution: 'bundler',
+          target: 'es2022',
+          lib: ['es2022', 'dom'],
+          skipLibCheck: true,
+        },
+        include: ['src'],
+      })
+    );
+    fs.writeFileSync(path.join(repoDir, 'src', 'http-client.d.ts'), CLIENT_DECL);
+    consumerPath = path.join(repoDir, 'src', 'client.ts');
+    fs.writeFileSync(consumerPath, CONSUMER);
+    client = new SidecarClient();
+    await client.start();
+    await client.send({ action: 'init', request_id: 'init', repo_root: repoDir });
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  // The declared form must not append the wire transform: an alias nothing
+  // references is a TS6196 here, which read as the producer's type failing
+  // to resolve and made every declared-form item abstain.
+  for (const wire of [false, true]) {
+    it(`judges the declared and the wire form alike (wire: ${wire})`, async () => {
+      const send = (producerType: string) =>
+        client.send<{ status: string; outcomes?: Outcome[] }>({
+          action: 'retype_check',
+          request_id: `unused-${wire}-${producerType}`,
+          items: [
+            {
+              item_id: 'untyped',
+              file_path: consumerPath,
+              line_number: CASES.untyped.line,
+              expression_text: CASES.untyped.text,
+              expression_line: CASES.untyped.line,
+              producer_type: producerType,
+              wire,
+            },
+          ],
+        });
+      const flagged = (await send('{ y: number; }')).outcomes![0];
+      assert.strictEqual(flagged.outcome, 'mismatch', JSON.stringify(flagged));
+      assert.match(flagged.diagnostics[0].message, /on type '\{ y: number; \}'/);
+      const agreed = (await send('{ x: number; }')).outcomes![0];
+      assert.strictEqual(agreed.outcome, 'agrees', JSON.stringify(agreed));
+    });
+  }
 });

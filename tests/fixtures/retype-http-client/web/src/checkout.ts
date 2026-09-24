@@ -11,3 +11,7 @@ export async function untypedCheckout(): Promise<number> {
   const response = await api.post("/checkout");
   return response.data.x;
 }
+
+export async function fireAndForget(): Promise<void> {
+  await api.post("/checkout");
+}
