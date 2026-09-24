@@ -290,6 +290,13 @@ type SchemaDirection = 'input' | 'output';
  * recorded (a coerced request member, carrick#1101). Provenance is absent, not
  * empty, when there is nothing to say.
  */
+/**
+ * carrick-cloud#1366: the parameter and config-member names a client takes a
+ * request body under. A generic slot is read as the body only under one of
+ * these names; a type parameter alone also types response modes and fallbacks.
+ */
+const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
+
 interface DeclaredContract {
   text: string;
   provenance?: TypeProvenance[];
@@ -1789,9 +1796,79 @@ export class TypeInferrer {
       located = parent.getInitializer() ?? located;
     }
 
+    // carrick-cloud#1366: the locator named a handler parameter that a keyed
+    // parameter decorator binds to ONE field of the body (`@Body('key') x: T`).
+    // The parameter's type is that field's, so publishing it states the whole
+    // body is a `T`. The body the handler reads is an object with one member
+    // per keyed parameter the same decorator binds.
+    const keyedBody = this.keyedBodyParamContract(located);
+    if (keyedBody) {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names a parameter bound ` +
+          'to one body field by a keyed decorator; publishing the body those fields make up'
+      );
+      return this.declaredRequestInferredType(
+        request,
+        keyedBody,
+        this.getNodeLocation(located)
+      );
+    }
+
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
     // expression's type (not the surrounding `Promise<any>`) is read.
-    const unwrapped = this.unwrapExpressionNode(located);
+    let unwrapped = this.unwrapExpressionNode(located);
+
+    // carrick-cloud#1366: the locator landed on the request CALL, or on the
+    // request CONFIG the call takes, rather than on the body. The call's type
+    // is its response, and a config's type is the config, so either one read
+    // as the body publishes the wrong contract. Follow the call's signature to
+    // the argument it sends as the body.
+    const inCall = this.requestBodyInCall(unwrapped);
+    if (inCall.kind === 'body') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
+          'reading the body argument its signature declares'
+      );
+      unwrapped = this.unwrapExpressionNode(inCall.node);
+    } else if (inCall.kind === 'body_type') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
+          "reading the body off the config variable's type"
+      );
+      return this.createInferredType(
+        request,
+        this.expandResolvedTypeStructural(inCall.type, typeText(inCall.type, inCall.at)),
+        false,
+        this.getNodeLocation(inCall.at)
+      );
+    } else if (inCall.kind === 'abstain') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number}: ${inCall.why}; leaving unresolved`
+      );
+      return null;
+    } else if (inCall.kind === 'no_body') {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} is a request config ` +
+          'that carries no body member; the call sends no request body'
+      );
+      const abstain = this.createInferredType(
+        request,
+        'unknown',
+        false,
+        this.getNodeLocation(unwrapped)
+      );
+      abstain.any_provenance = [
+        {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            `the located argument is the call's request config, and it sets no '${inCall.member}' ` +
+            'member, which is where the call takes its body, so the call sends no request body',
+        },
+      ];
+      return abstain;
+    }
 
     // A `fetch` body is almost always `JSON.stringify(payload)`, whose own type
     // is the useless `string`. Drill to the serialized argument so the consumer
@@ -4919,6 +4996,313 @@ export class TypeInferrer {
     }
     const read = this.inferRequestReadFromHandler(handler);
     return read ? { text: read } : null;
+  }
+
+  /**
+   * carrick-cloud#1366, shape 1: the request contract of a parameter a KEYED
+   * parameter decorator binds to one field of the body (`@Body('key') x: T`).
+   *
+   * The decorator is recognised by shape, not by name: a call decorator whose
+   * first argument is a string literal. Every parameter of the same handler
+   * that the SAME decorator binds by key contributes one member, so two keyed
+   * reads of one body publish one object. A sibling the same decorator binds
+   * WITHOUT a key (no argument, or a non-string one such as a pipe) receives
+   * the whole body, so the contract is that sibling's type intersected with
+   * the keyed members.
+   *
+   * Returns null when the located node is not a keyed parameter, so every
+   * other request path is untouched.
+   */
+  private keyedBodyParamContract(located: Node): DeclaredContract | null {
+    const param = this.parameterNamedBy(located);
+    if (!param) return null;
+    const binding = this.callDecoratorBindings(param).find((b) => b.key !== undefined);
+    if (!binding) return null;
+
+    const func = param.getParent();
+    if (!func || !('getParameters' in func)) return null;
+    const siblings = (func as FunctionLike).getParameters();
+
+    const members: string[] = [];
+    const seen = new Set<string>();
+    let wholeBody: ParameterDeclaration | undefined;
+    for (const sibling of siblings) {
+      const same = this.callDecoratorBindings(sibling).filter((b) => b.name === binding.name);
+      if (same.length === 0) continue;
+      const keyed = same.find((b) => b.key !== undefined);
+      if (!keyed || keyed.key === undefined) {
+        wholeBody ??= sibling;
+        continue;
+      }
+      if (seen.has(keyed.key)) continue;
+      seen.add(keyed.key);
+      const optional = sibling.hasQuestionToken() || sibling.hasInitializer();
+      let type = sibling.getType();
+      if (optional) type = type.getNonNullableType();
+      const text = this.expandResolvedTypeStructural(type, typeText(type, sibling));
+      const key = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(keyed.key)
+        ? keyed.key
+        : JSON.stringify(keyed.key);
+      members.push(`${key}${optional ? '?' : ''}: ${text};`);
+    }
+    if (members.length === 0) return null;
+    const keyedText = `{ ${members.join(' ')} }`;
+    if (!wholeBody) return { text: keyedText };
+    const wholeType = wholeBody.getType();
+    const wholeText = this.expandResolvedTypeStructural(wholeType, typeText(wholeType, wholeBody));
+    const operand = /^\{[\s\S]*\}$/.test(wholeText) ? wholeText : `(${wholeText})`;
+    return { text: `${operand} & ${keyedText}` };
+  }
+
+  /**
+   * The handler parameter a request locator names: the parameter itself, its
+   * name, a decorator on it, or an identifier whose declaration is one. A
+   * member read of a parameter (`x.length`) is not the parameter and is left
+   * to the expression path.
+   */
+  private parameterNamedBy(located: Node): ParameterDeclaration | undefined {
+    if (Node.isParameterDeclaration(located)) return located;
+    const decoratedParam = located.getFirstAncestor(
+      (n): n is ParameterDeclaration =>
+        Node.isParameterDeclaration(n) &&
+        n.getDecorators().some((d) => d === located || d.containsRange(located.getPos(), located.getEnd()))
+    );
+    if (decoratedParam) return decoratedParam;
+    if (!Node.isIdentifier(located)) return undefined;
+    const parent = located.getParent();
+    if (Node.isParameterDeclaration(parent) && parent.getNameNode() === located) {
+      return parent;
+    }
+    for (const def of located.getDefinitionNodes()) {
+      if (Node.isParameterDeclaration(def)) return def;
+    }
+    return undefined;
+  }
+
+  /**
+   * Every call decorator on the parameter, with the string key its first
+   * argument names (`@Body('key')` -> `{ name: 'Body', key: 'key' }`). A call
+   * decorator with no argument, or a first argument that is not a string (a
+   * pipe instance), binds without a key.
+   */
+  private callDecoratorBindings(
+    param: ParameterDeclaration
+  ): Array<{ name: string; key?: string }> {
+    const bindings: Array<{ name: string; key?: string }> = [];
+    for (const decorator of param.getDecorators()) {
+      const call = decorator.getCallExpression();
+      if (!call) continue;
+      const first = call.getArguments()[0];
+      if (first && (Node.isStringLiteral(first) || Node.isNoSubstitutionTemplateLiteral(first))) {
+        bindings.push({ name: decorator.getName(), key: first.getLiteralValue() });
+      } else {
+        bindings.push({ name: decorator.getName() });
+      }
+    }
+    return bindings;
+  }
+
+  /**
+   * carrick-cloud#1366, shapes 2 and 3: a request locator that names the
+   * request CALL, or a request CONFIG argument, instead of the body.
+   *
+   * The body is found from the callee's DECLARED signature:
+   *
+   *  - a body slot is a parameter named as a body (`data`, `body`, `json`)
+   *    and typed by one of the signature's own type parameters (`data?: D`);
+   *  - a config slot is a parameter typed by a generic config type whose
+   *    body-named member is typed by the config's own type parameter
+   *    (`config?: Config<D>` with `data?: D`). A generic config with no such
+   *    member (its type parameter types something else, a response mode say)
+   *    is opaque: nothing can be said about its body.
+   *
+   * A located CALL is taken as the request call only when its first argument
+   * is string-typed (the URL) and one argument supplies a body through a slot;
+   * anything else is left alone, so an awaited payload builder keeps its own
+   * type. A located argument in a config slot yields the payload member: from
+   * an object literal directly, from a variable through its type. A literal
+   * that does not set the member means the call sends no body; a variable
+   * whose type does not resolve the member, or an opaque config, abstains.
+   */
+  private requestBodyInCall(
+    node: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body'; node: Node; from: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string }
+    | { kind: 'no_body'; member: string } {
+    if (Node.isCallExpression(node)) {
+      const args = node.getArguments();
+      if (args.length < 2) return { kind: 'none' };
+      const first = args[0].getType();
+      const stringLike =
+        first.isString() ||
+        first.isStringLiteral() ||
+        first.isTemplateLiteral() ||
+        (first.isUnion() && first.getUnionTypes().every((t) => t.isString() || t.isStringLiteral()));
+      if (!stringLike) return { kind: 'none' };
+      const slots = this.requestBodySlots(node);
+      for (let i = 1; i < args.length; i++) {
+        const slot = slots[i];
+        if (!slot || slot.kind === 'opaque_config') continue;
+        if (slot.kind === 'body') {
+          return { kind: 'body', node: args[i], from: 'the request call' };
+        }
+        const fromConfig = this.configArgumentBody(args[i], slot.member, 'the request call');
+        if (fromConfig.kind === 'body' || fromConfig.kind === 'body_type') return fromConfig;
+      }
+      return { kind: 'none' };
+    }
+
+    if (Node.isObjectLiteralExpression(node) || Node.isIdentifier(node)) {
+      const call = node.getParent();
+      if (!call || !Node.isCallExpression(call)) return { kind: 'none' };
+      const index = call.getArguments().indexOf(node);
+      if (index < 1) return { kind: 'none' };
+      const slot = this.requestBodySlots(call)[index];
+      if (!slot || slot.kind === 'body') return { kind: 'none' };
+      if (slot.kind === 'opaque_config') {
+        return {
+          kind: 'abstain',
+          why: "the located argument is a request config whose declared type names no body member",
+        };
+      }
+      return this.configArgumentBody(node, slot.member, "the call's request config");
+    }
+
+    return { kind: 'none' };
+  }
+
+  /**
+   * The body a config-slot argument supplies through `member`: an object
+   * literal's own member, or a variable's member read off its type.
+   */
+  private configArgumentBody(
+    arg: Node,
+    member: string,
+    from: string
+  ):
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body'; node: Node; from: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string }
+    | { kind: 'no_body'; member: string } {
+    const unwrapped = this.unwrapExpressionNode(arg);
+    if (Node.isObjectLiteralExpression(unwrapped)) {
+      const value = this.objectLiteralMemberValue(unwrapped, member);
+      if (value) return { kind: 'body', node: value, from };
+      return { kind: 'no_body', member };
+    }
+    const property = unwrapped.getType().getProperty(member);
+    if (property) {
+      const type = property.getTypeAtLocation(unwrapped);
+      // Top types first: the non-nullable form of `unknown` is `{}`.
+      const bare = type.isAny() || type.isUnknown() ? type : type.getNonNullableType();
+      if (!bare.isAny() && !bare.isUnknown() && !bare.isTypeParameter()) {
+        return { kind: 'body_type', type: bare, at: unwrapped, from };
+      }
+    }
+    return {
+      kind: 'abstain',
+      why: `the located request config's type does not resolve its '${member}' member`,
+    };
+  }
+
+  /**
+   * Per parameter position of the call's resolved declaration: a body slot, a
+   * config slot (with the member that carries the body), an opaque generic
+   * config, or neither (undefined). Empty when the callee has no declaration.
+   */
+  private requestBodySlots(
+    call: CallExpression
+  ): Array<
+    { kind: 'body' } | { kind: 'config'; member: string } | { kind: 'opaque_config' } | undefined
+  > {
+    const checker = this.project.getTypeChecker().compilerObject;
+    let declaration: ts.SignatureDeclaration | undefined;
+    try {
+      declaration = checker.getResolvedSignature(call.compilerNode)?.getDeclaration();
+    } catch {
+      return [];
+    }
+    if (!declaration || !('parameters' in declaration)) return [];
+    const ownTypeParams = new Set(
+      (declaration.typeParameters ?? []).map((tp) => tp.name.text)
+    );
+    return declaration.parameters.map((param) => {
+      if (param.dotDotDotToken) return undefined;
+      const typeNode = param.type;
+      if (!typeNode || !ts.isTypeReferenceNode(typeNode)) return undefined;
+      if (
+        ts.isIdentifier(typeNode.typeName) &&
+        !typeNode.typeArguments &&
+        ownTypeParams.has(typeNode.typeName.text)
+      ) {
+        return ts.isIdentifier(param.name) && BODY_MEMBER_NAMES.has(param.name.text)
+          ? { kind: 'body' as const }
+          : undefined;
+      }
+      return this.configSlot(checker, typeNode);
+    });
+  }
+
+  /**
+   * A generic config type's slot: `config` with the body-named member typed by
+   * the config's own type parameter (`interface Config<D> { data?: D }`), or
+   * `opaque_config` when the config is generic but no body-named member is
+   * (`interface Options<R> { responseType?: R }`). Undefined for a type that
+   * is not a generic config, and for two candidate members (ambiguous).
+   */
+  private configSlot(
+    checker: ts.TypeChecker,
+    typeNode: ts.TypeReferenceNode
+  ): { kind: 'config'; member: string } | { kind: 'opaque_config' } | undefined {
+    let symbol = checker.getSymbolAtLocation(typeNode.typeName);
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
+      symbol = checker.getAliasedSymbol(symbol);
+    }
+    let generic = false;
+    const found = new Set<string>();
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (!ts.isInterfaceDeclaration(decl) && !ts.isTypeAliasDeclaration(decl)) continue;
+      const own = new Set((decl.typeParameters ?? []).map((tp) => tp.name.text));
+      if (own.size === 0) continue;
+      const members = ts.isInterfaceDeclaration(decl)
+        ? decl.members
+        : ts.isTypeLiteralNode(decl.type)
+          ? decl.type.members
+          : undefined;
+      if (!members) continue;
+      generic = true;
+      for (const member of members) {
+        if (!ts.isPropertySignature(member) || !member.type || !member.name) continue;
+        if (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) continue;
+        if (!BODY_MEMBER_NAMES.has(member.name.text)) continue;
+        const t = member.type;
+        if (
+          ts.isTypeReferenceNode(t) &&
+          ts.isIdentifier(t.typeName) &&
+          !t.typeArguments &&
+          own.has(t.typeName.text)
+        ) {
+          found.add(member.name.text);
+        }
+      }
+    }
+    if (found.size === 1) return { kind: 'config', member: [...found][0] };
+    return generic && found.size === 0 ? { kind: 'opaque_config' } : undefined;
+  }
+
+  /** The value an object literal gives `name`: an assignment's initializer or a shorthand's identifier. */
+  private objectLiteralMemberValue(
+    literal: ObjectLiteralExpression,
+    name: string
+  ): Node | undefined {
+    const property = literal.getProperty(name);
+    if (!property) return undefined;
+    if (Node.isPropertyAssignment(property)) return property.getInitializer();
+    if (Node.isShorthandPropertyAssignment(property)) return property.getNameNode();
+    return undefined;
   }
 
   /**

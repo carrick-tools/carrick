@@ -179,7 +179,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    rather than an error body or a redirect location (carrick#1161).
  *  - `no_request_body`: the located request read is a validated part the
  *    route's validator binds that is not a body (a path parameter, a query), so
- *    the route states no request body contract there (carrick#1166).
+ *    the route states no request body contract there (carrick#1166); or the
+ *    located argument is a call's request config and does not set the member
+ *    the call takes its body from, so the call sends no body
+ *    (carrick-cloud#1366).
  *  - `projected_value_only`: every read of a call's result takes a member out
  *    of it and none reads the value itself, so the site states a part of a
  *    payload rather than the payload a caller receives (carrick#1375).
