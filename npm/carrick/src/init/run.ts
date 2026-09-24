@@ -3,8 +3,8 @@
 // What this prints is one line per thing that happened (carrick#1026). The
 // reasoning behind each step — how the hooks deliver, which editor extension
 // to install, why the scan is left to CI, what a hand-written carrick.json
-// looks like — is the quickstart's, at `output.ts`'s `DOCS`, and this command
-// links to it rather than repeating it. The record of the run stays here,
+// looks like — is in the docs, at the `DOCS*` links in `output.ts`, and this
+// command links to them rather than repeating them. The record of the run stays here,
 // because nothing else can state it: this login, this project, these repos,
 // this many packages, this index.
 
@@ -45,7 +45,7 @@ import { findCarrick, offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
 import { excludedRepos, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
-import { createOutput, DOCS, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
+import { createOutput, DOCS, DOCS_EDITOR, DOCS_INDEX, DOCS_INIT_FILES, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 
 /**
@@ -239,7 +239,9 @@ function help(): string {
     "                         so the agent hooks can run it by name after this run",
     "                         ends. A terminal is asked instead; --yes is not this",
     "",
-    `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
+    `What init installs, the hooks included: ${DOCS_INIT_FILES}`,
+    `CI and a carrick.json written by hand: ${DOCS_INDEX}`,
+    `The editor extension: ${DOCS_EDITOR}`,
   ].join("\n");
 }
 

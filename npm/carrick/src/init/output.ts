@@ -46,6 +46,10 @@ export const WARN = "▲";
 export const REFUSE = "■";
 
 export const DOCS = "https://docs.carrick.tools/quickstart";
+/** What `init` writes on this machine, file by file: the page `doctor` and `remove` point at. */
+export const DOCS_INIT_FILES = "https://docs.carrick.tools/cli#workspace-initialisation";
+export const DOCS_INDEX = "https://docs.carrick.tools/building-the-index";
+export const DOCS_EDITOR = "https://docs.carrick.tools/editor";
 
 /**
  * A question the user ended rather than answered: Ctrl-C, Escape, or an input
