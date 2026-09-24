@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::repo_relative;
 use crate::analyzer::PairCheckOutcome;
@@ -30,7 +30,7 @@ use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CheckPairEndpoint, CheckPairSpec,
     CheckStubInput, InferKind, InferRequestItem, ManifestEntry, ProbeProtocol, ProbeTypeKind,
-    SymbolRequest, VerdictBucket,
+    RetypeItem, RetypeOutcome, RetypeVerdict, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -861,6 +861,12 @@ pub(crate) struct BuiltPair {
     /// manifest `type_state` is NOT a pre-verdict trigger — check_v2 reads the
     /// real surface and judges resolved-ness itself.
     pub pre_verdict: Option<(VerdictBucket, String)>,
+    /// Which side has no surface, when `pre_verdict` is set.
+    pub pre_verdict_side: Option<VerdictSide>,
+    /// The producer's response type, fully inlined, as the index publishes it
+    /// (`expanded_definition`). The retype check states it at the consumer's
+    /// call (carrick#1491).
+    pub producer_expanded: Option<String>,
 }
 
 struct ServiceEntry<'a> {
@@ -1011,6 +1017,13 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
     // unverifiable) and can never read compatible. Gating on the stale
     // `type_state` instead dropped real, resolvable, mutually-compatible edges
     // to "not compared" (the order→notification verdict gap).
+    let pre_verdict_side = if !producer.has_surface {
+        Some(VerdictSide::Producer)
+    } else if !consumer.has_surface {
+        Some(VerdictSide::Consumer)
+    } else {
+        None
+    };
     let pre_verdict = if !producer.has_surface {
         Some((
             VerdictBucket::Unverifiable,
@@ -1055,6 +1068,8 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         producer_service: producer.service_id.to_string(),
         consumer_service: consumer.service_id.to_string(),
         pre_verdict,
+        pre_verdict_side,
+        producer_expanded: producer.entry.expanded_definition.clone(),
     })
 }
 
@@ -1112,6 +1127,7 @@ pub(crate) fn materialize_stubs(
 pub(crate) fn run_check(
     sidecar: &TypeSidecar,
     all_repo_data: &[CloudRepoData],
+    local_consumers: &LocalConsumers,
 ) -> Vec<PairCheckOutcome> {
     let pairs = build_check_pairs(all_repo_data);
     if pairs.is_empty() {
@@ -1119,8 +1135,14 @@ pub(crate) fn run_check(
     }
 
     let mut outcomes: Vec<PairCheckOutcome> = Vec::new();
+    // Pairs whose CONSUMER side left the verdict unresolved: the ones the
+    // retype check can judge from the consumer's own code (carrick#1491).
+    let mut consumer_blamed: HashSet<String> = HashSet::new();
     let mut probing: Vec<&BuiltPair> = Vec::new();
     for pair in &pairs {
+        if pair.pre_verdict_side == Some(VerdictSide::Consumer) {
+            consumer_blamed.insert(pair.spec.pair_key.clone());
+        }
         if let Some((bucket, reason)) = &pair.pre_verdict {
             // A pre-verdicted pair never reached a probe, so nothing about it
             // was compared: not a fact, and the pre-verdict reason is why.
@@ -1168,15 +1190,20 @@ pub(crate) fn run_check(
                     .collect();
                 for pair in &probing {
                     match by_key.get(pair.spec.pair_key.as_str()) {
-                        Some(verdict) => outcomes.push(outcome_for(
-                            pair,
-                            verdict.bucket,
-                            verdict.gate.clone(),
-                            verdict.diagnostic.clone(),
-                            verdict.resolved,
-                            verdict.unresolved_reason.clone(),
-                            verdict.notes.clone(),
-                        )),
+                        Some(verdict) => {
+                            if consumer_to_blame(verdict) {
+                                consumer_blamed.insert(pair.spec.pair_key.clone());
+                            }
+                            outcomes.push(outcome_for(
+                                pair,
+                                verdict.bucket,
+                                verdict.gate.clone(),
+                                verdict.diagnostic.clone(),
+                                verdict.resolved,
+                                verdict.unresolved_reason.clone(),
+                                verdict.notes.clone(),
+                            ))
+                        }
                         None => outcomes.push(outcome_for(
                             pair,
                             VerdictBucket::Unverifiable,
@@ -1218,9 +1245,302 @@ pub(crate) fn run_check(
         let _ = std::fs::remove_dir_all(&workspace_parent);
     }
 
+    retype_consumer_calls(
+        sidecar,
+        &pairs,
+        &consumer_blamed,
+        local_consumers,
+        &mut outcomes,
+    );
+
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+    log_unresolved_pairs(&outcomes);
     outcomes
+}
+
+// ===========================================================================
+// Check time: retype an unresolved consumer call (carrick#1491)
+// ===========================================================================
+
+/// The locator a consumer's `call_result` inference used for one response
+/// alias. Carried from the scan to the check so the retype rewrites the call
+/// the consumer's published type came from, not a guess at its line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallLocator {
+    /// Absolute path.
+    pub file_path: String,
+    pub line_number: u32,
+    pub span_start: Option<u32>,
+    pub span_end: Option<u32>,
+    pub expression_text: Option<String>,
+    pub expression_line: Option<u32>,
+}
+
+/// A service scanned in THIS run, whose sources are on disk: the only kind of
+/// consumer whose file can be type-checked. A peer's blob carries no sources.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocalConsumer {
+    /// The root the sidecar is initialised at for this service.
+    pub root: PathBuf,
+    pub tsconfig: Option<String>,
+    /// Consumer response alias -> the call its type was inferred from.
+    pub calls: HashMap<String, CallLocator>,
+}
+
+/// Local consumers by service id (`service_name ?? repo_name`).
+pub(crate) type LocalConsumers = HashMap<String, LocalConsumer>;
+
+/// Filled while each local service is captured and read once, at the check.
+/// The capture is the only place that holds the call locators, and it runs
+/// several stack frames and one retry loop away from the check, so the run
+/// hands them over here rather than through every frame in between.
+static LOCAL_CONSUMERS: std::sync::Mutex<Option<LocalConsumers>> = std::sync::Mutex::new(None);
+
+/// Record a local service's consumer calls for the retype check.
+pub(crate) fn record_local_consumer(service_id: &str, consumer: LocalConsumer) {
+    LOCAL_CONSUMERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(service_id.to_string(), consumer);
+}
+
+/// Take every recorded local consumer, leaving none.
+pub(crate) fn take_local_consumers() -> LocalConsumers {
+    LOCAL_CONSUMERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
+/// The consumer response locators among a service's inference requests.
+pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<String, CallLocator> {
+    let mut calls = HashMap::new();
+    for request in infer {
+        if request.infer_kind != InferKind::CallResult {
+            continue;
+        }
+        let Some(alias) = request.alias.as_deref() else {
+            continue;
+        };
+        // First locator wins, as the inference join does.
+        calls
+            .entry(alias.to_string())
+            .or_insert_with(|| CallLocator {
+                file_path: request.file_path.clone(),
+                line_number: request.line_number,
+                span_start: request.span_start,
+                span_end: request.span_end,
+                expression_text: request.expression_text.clone(),
+                expression_line: request.expression_line,
+            });
+    }
+    calls
+}
+
+/// Whether the CONSUMER's type is what left this verdict unresolved, in a way
+/// a retype of its call could settle. A consumer that states no contract at
+/// all (it reads no body, or sends a form body) has nothing to compare.
+fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> bool {
+    verdict.unresolved_side == Some(VerdictSide::Consumer)
+        && !verdict
+            .gate
+            .as_deref()
+            .is_some_and(|gate| gate.ends_with(":void") || gate.ends_with(":form"))
+}
+
+/// Said on every pair the retype decided.
+const RETYPE_NOTE: &str = "judged by retyping the consumer's call with the producer's response \
+     type and type-checking the consumer's own code";
+
+/// The retype items to send, grouped by consumer service so each service's
+/// program is built once. A pair qualifies when it is an HTTP response pair,
+/// its CONSUMER left the verdict unresolved, the consumer was scanned in this
+/// run (its file is on disk), and the producer published a response type with
+/// no `any`/`unknown` in it.
+fn retype_items<'a>(
+    pairs: &'a [BuiltPair],
+    consumer_blamed: &HashSet<String>,
+    local_consumers: &LocalConsumers,
+) -> BTreeMap<&'a str, Vec<RetypeItem>> {
+    let mut by_service: BTreeMap<&str, Vec<RetypeItem>> = BTreeMap::new();
+    for pair in pairs {
+        if !consumer_blamed.contains(&pair.spec.pair_key)
+            || pair.spec.protocol != ProbeProtocol::Http
+            || pair.type_kind != ManifestTypeKind::Response
+        {
+            continue;
+        }
+        let Some(consumer) = local_consumers.get(&pair.consumer_service) else {
+            continue;
+        };
+        let Some(call) = consumer.calls.get(&pair.consumer_alias) else {
+            continue;
+        };
+        let Some(producer_type) = pair
+            .producer_expanded
+            .as_deref()
+            .filter(|text| !contains_disqualifying_top_type(text) && !text.trim().is_empty())
+        else {
+            continue;
+        };
+        by_service
+            .entry(pair.consumer_service.as_str())
+            .or_default()
+            .push(RetypeItem {
+                item_id: pair.spec.pair_key.clone(),
+                file_path: call.file_path.clone(),
+                line_number: call.line_number,
+                span_start: call.span_start,
+                span_end: call.span_end,
+                expression_text: call.expression_text.clone(),
+                expression_line: call.expression_line,
+                producer_type: producer_type.to_string(),
+                wire: true,
+            });
+    }
+
+    by_service
+}
+
+/// Judge every HTTP response pair whose CONSUMER left the verdict unresolved
+/// by retyping the consumer's call with the producer's response type and
+/// reading the consumer file's own type-check (carrick#1491).
+///
+/// Only a consumer scanned in this run can be judged (its file is on disk),
+/// and only against a producer whose published type has no `any`/`unknown`
+/// in it. A pair the retype decides becomes a fact either way: a mismatch
+/// names each place the consumer uses what the producer does not return, and
+/// an agreement is compatible. A pair it cannot decide keeps its verdict,
+/// with the retype's reason added to why it is unresolved.
+fn retype_consumer_calls(
+    sidecar: &TypeSidecar,
+    pairs: &[BuiltPair],
+    consumer_blamed: &HashSet<String>,
+    local_consumers: &LocalConsumers,
+    outcomes: &mut [PairCheckOutcome],
+) {
+    let by_service = retype_items(pairs, consumer_blamed, local_consumers);
+    for (service, items) in by_service {
+        let consumer = &local_consumers[service];
+        let answers = scope_to(sidecar, consumer).and_then(|()| sidecar.retype_check(&items));
+        let answers: HashMap<String, RetypeOutcome> = match answers {
+            Ok(answers) => answers
+                .into_iter()
+                .map(|answer| (answer.item_id.clone(), answer))
+                .collect(),
+            Err(e) => {
+                warn!("Retyping {service}'s consumer calls failed: {e}");
+                items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.item_id.clone(),
+                            RetypeOutcome {
+                                item_id: item.item_id.clone(),
+                                outcome: RetypeVerdict::Abstain,
+                                diagnostics: Vec::new(),
+                                reason: Some(format!("the retype check did not run: {e}")),
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        };
+        for outcome in outcomes.iter_mut() {
+            if let Some(answer) = answers.get(&outcome.pair_key) {
+                apply_retype(outcome, answer);
+            }
+        }
+    }
+}
+
+/// Point the sidecar's project at the consumer service, unless it already is.
+fn scope_to(
+    sidecar: &TypeSidecar,
+    consumer: &LocalConsumer,
+) -> Result<(), crate::services::type_sidecar::SidecarError> {
+    if sidecar.is_scoped_to(&consumer.root, consumer.tsconfig.as_deref()) {
+        return Ok(());
+    }
+    sidecar.start_init(&consumer.root, consumer.tsconfig.as_deref());
+    sidecar.wait_ready(crate::services::type_sidecar::ready_budget())
+}
+
+/// Write one retype answer onto its pair's outcome.
+fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
+    match answer.outcome {
+        RetypeVerdict::Mismatch => {
+            let places: Vec<String> = answer
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}:{}: {}", outcome.consumer_file, d.line, d.message))
+                .collect();
+            outcome.bucket = VerdictBucket::Incompatible;
+            outcome.gate = Some("retype:consumer".to_string());
+            outcome.diagnostic = Some(format!(
+                "the consumer uses what the producer's response does not provide: {}",
+                places.join("; ")
+            ));
+            outcome.resolved = true;
+            outcome.unresolved_reason = None;
+            outcome.notes.push(RETYPE_NOTE.to_string());
+        }
+        RetypeVerdict::Agrees => {
+            outcome.bucket = VerdictBucket::Compatible;
+            outcome.gate = None;
+            outcome.diagnostic = None;
+            outcome.resolved = true;
+            outcome.unresolved_reason = None;
+            outcome.notes.push(RETYPE_NOTE.to_string());
+        }
+        RetypeVerdict::Abstain => {
+            let why = answer.reason.as_deref().unwrap_or("no reason given");
+            outcome.unresolved_reason = Some(match outcome.unresolved_reason.take() {
+                Some(reason) => {
+                    format!("{reason}; retyping the consumer's call did not decide it: {why}")
+                }
+                None => format!("retyping the consumer's call did not decide it: {why}"),
+            });
+        }
+    }
+}
+
+/// One log line per pair the check could not establish as a fact, with the
+/// reason, so a CI run says why a pair is unverified without a second tool
+/// (carrick#1491).
+fn log_unresolved_pairs(outcomes: &[PairCheckOutcome]) {
+    for line in outcomes.iter().filter_map(unresolved_pair_line) {
+        info!("{line}");
+    }
+}
+
+/// The log line for one pair, or `None` when its verdict is a fact.
+fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
+    if outcome.resolved {
+        return None;
+    }
+    let kind = match outcome.type_kind {
+        ManifestTypeKind::Request => "request",
+        ManifestTypeKind::Response => "response",
+    };
+    Some(format!(
+        "Types not verified: {} {} {} ({}:{} in {} against {}): {}",
+        outcome.pseudo_method,
+        outcome.identity,
+        kind,
+        outcome.consumer_file,
+        outcome.consumer_line,
+        outcome.consumer_service,
+        outcome.producer_service,
+        outcome
+            .unresolved_reason
+            .as_deref()
+            .or(outcome.diagnostic.as_deref())
+            .unwrap_or("no reason recorded")
+    ))
 }
 
 fn outcome_for(
@@ -1511,6 +1831,299 @@ mod tests {
             bare_checkout: true,
             files: BTreeMap::new(),
         }
+    }
+
+    // ---- retype check (carrick#1491) ---------------------------------------
+
+    /// One producer/consumer HTTP pair on `POST /p`, both with a surface, the
+    /// producer publishing `expanded` as its response.
+    fn retype_pair(kind: ManifestTypeKind, expanded: Option<&str>) -> BuiltPair {
+        let key = OperationKey::http("POST", "/p");
+        let mut producer = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            kind,
+            "P",
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Explicit,
+        );
+        producer.expanded_definition = expanded.map(str::to_string);
+        let consumer = entry(
+            key,
+            ManifestRole::Consumer,
+            kind,
+            "C",
+            "src/client.ts",
+            8,
+            ManifestTypeState::Unknown,
+        );
+        let mut pairs = build_check_pairs(&[
+            repo("api", None, vec![producer], Some(fake_artifact())),
+            repo("web", None, vec![consumer], Some(fake_artifact())),
+        ]);
+        assert_eq!(pairs.len(), 1);
+        pairs.remove(0)
+    }
+
+    fn web_consumer() -> LocalConsumers {
+        LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: PathBuf::from("/repo/web"),
+                tsconfig: None,
+                calls: HashMap::from([(
+                    "C".to_string(),
+                    CallLocator {
+                        file_path: "/repo/web/src/client.ts".to_string(),
+                        line_number: 8,
+                        span_start: None,
+                        span_end: None,
+                        expression_text: Some("api.post('/p')".to_string()),
+                        expression_line: Some(8),
+                    },
+                )]),
+            },
+        )])
+    }
+
+    #[test]
+    fn retype_items_take_only_what_the_consumer_left_unresolved() {
+        let local = web_consumer();
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ id: string; }"));
+        let blamed = HashSet::from([pair.spec.pair_key.clone()]);
+
+        let pairs = [pair];
+        let items = retype_items(&pairs, &blamed, &local);
+        let web = &items["web"];
+        assert_eq!(web.len(), 1);
+        assert_eq!(web[0].item_id, pairs[0].spec.pair_key);
+        assert_eq!(web[0].file_path, "/repo/web/src/client.ts");
+        assert_eq!(web[0].expression_text.as_deref(), Some("api.post('/p')"));
+        assert_eq!(web[0].producer_type, "{ id: string; }");
+        assert!(web[0].wire, "an http response is judged in its wire form");
+
+        // The producer, not the consumer, left it unresolved.
+        assert!(retype_items(&pairs, &HashSet::new(), &local).is_empty());
+        // The consumer is a peer: its file is not on this machine.
+        assert!(retype_items(&pairs, &blamed, &LocalConsumers::new()).is_empty());
+
+        // A producer type with a top type in it would let any read agree.
+        let loose = [retype_pair(
+            ManifestTypeKind::Response,
+            Some("{ id: string; meta: any; }"),
+        )];
+        let blamed_loose = HashSet::from([loose[0].spec.pair_key.clone()]);
+        assert!(retype_items(&loose, &blamed_loose, &local).is_empty());
+        // No published producer type at all.
+        let absent = [retype_pair(ManifestTypeKind::Response, None)];
+        let blamed_absent = HashSet::from([absent[0].spec.pair_key.clone()]);
+        assert!(retype_items(&absent, &blamed_absent, &local).is_empty());
+
+        // A request body is what the consumer SENDS; retyping its call says
+        // nothing about it.
+        let request = [retype_pair(
+            ManifestTypeKind::Request,
+            Some("{ id: string; }"),
+        )];
+        let blamed_request = HashSet::from([request[0].spec.pair_key.clone()]);
+        assert!(retype_items(&request, &blamed_request, &local).is_empty());
+    }
+
+    #[test]
+    fn a_consumer_is_to_blame_only_for_a_type_a_retype_can_settle() {
+        let verdict = |side: Option<VerdictSide>, gate: Option<&str>| {
+            crate::services::type_sidecar::CheckVerdict {
+                pair_id: "id".to_string(),
+                pair_key: "key".to_string(),
+                bucket: VerdictBucket::Unverifiable,
+                gate: gate.map(str::to_string),
+                diagnostic: None,
+                codes: Vec::new(),
+                resolved: false,
+                unresolved_reason: Some("why".to_string()),
+                unresolved_side: side,
+                notes: Vec::new(),
+            }
+        };
+        let consumer = Some(VerdictSide::Consumer);
+        assert!(consumer_to_blame(&verdict(
+            consumer,
+            Some("consumer:unknown")
+        )));
+        assert!(consumer_to_blame(&verdict(
+            consumer,
+            Some("capture:consumer:any")
+        )));
+        // A deep finding on a compared pair carries no gate.
+        assert!(consumer_to_blame(&verdict(consumer, None)));
+        assert!(!consumer_to_blame(&verdict(
+            Some(VerdictSide::Producer),
+            Some("producer:any")
+        )));
+        assert!(!consumer_to_blame(&verdict(None, Some("assignment:other"))));
+        // It reads no body: there is no use of a response to judge.
+        assert!(!consumer_to_blame(&verdict(
+            consumer,
+            Some("consumer:void")
+        )));
+        assert!(!consumer_to_blame(&verdict(
+            consumer,
+            Some("consumer:form")
+        )));
+    }
+
+    #[test]
+    fn a_consumer_without_a_surface_is_the_side_to_blame() {
+        let key = OperationKey::http("POST", "/p");
+        let producer = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            "P",
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Explicit,
+        );
+        let consumer = entry(
+            key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "C",
+            "src/client.ts",
+            8,
+            ManifestTypeState::Unknown,
+        );
+        let pairs = build_check_pairs(&[
+            repo("api", None, vec![producer.clone()], Some(fake_artifact())),
+            repo("web", None, vec![consumer.clone()], None),
+        ]);
+        assert_eq!(pairs[0].pre_verdict_side, Some(VerdictSide::Consumer));
+        let pairs = build_check_pairs(&[
+            repo("api", None, vec![producer], None),
+            repo("web", None, vec![consumer], Some(fake_artifact())),
+        ]);
+        assert_eq!(pairs[0].pre_verdict_side, Some(VerdictSide::Producer));
+    }
+
+    #[test]
+    fn a_retype_answer_lands_on_the_outcome() {
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ y: number; }"));
+        let unresolved = || {
+            outcome_for(
+                &pair,
+                VerdictBucket::Unverifiable,
+                Some("consumer:unknown".to_string()),
+                Some("the consumer type resolved to 'unknown'".to_string()),
+                false,
+                Some("the consumer type is 'unknown'".to_string()),
+                Vec::new(),
+            )
+        };
+        let answer = |outcome: RetypeVerdict, reason: Option<&str>| RetypeOutcome {
+            item_id: pair.spec.pair_key.clone(),
+            outcome,
+            diagnostics: vec![crate::services::type_sidecar::RetypeDiagnostic {
+                line: 9,
+                code: 2339,
+                message: "Property 'x' does not exist on type '{ y: number; }'.".to_string(),
+            }],
+            reason: reason.map(str::to_string),
+        };
+
+        let mut mismatch = unresolved();
+        apply_retype(&mut mismatch, &answer(RetypeVerdict::Mismatch, None));
+        assert_eq!(mismatch.bucket, VerdictBucket::Incompatible);
+        assert!(mismatch.resolved);
+        assert_eq!(mismatch.unresolved_reason, None);
+        assert_eq!(
+            mismatch.diagnostic.as_deref(),
+            Some(
+                "the consumer uses what the producer's response does not provide: \
+                 src/client.ts:9: Property 'x' does not exist on type '{ y: number; }'."
+            )
+        );
+        assert_eq!(mismatch.notes, vec![RETYPE_NOTE.to_string()]);
+
+        let mut agrees = unresolved();
+        apply_retype(&mut agrees, &answer(RetypeVerdict::Agrees, None));
+        assert_eq!(agrees.bucket, VerdictBucket::Compatible);
+        assert!(agrees.resolved);
+        assert_eq!((agrees.gate, agrees.diagnostic), (None, None));
+
+        let mut abstain = unresolved();
+        apply_retype(
+            &mut abstain,
+            &answer(
+                RetypeVerdict::Abstain,
+                Some("the consumer never reads the response"),
+            ),
+        );
+        assert_eq!(abstain.bucket, VerdictBucket::Unverifiable);
+        assert!(!abstain.resolved);
+        assert_eq!(
+            abstain.unresolved_reason.as_deref(),
+            Some(
+                "the consumer type is 'unknown'; retyping the consumer's call did not decide \
+                 it: the consumer never reads the response"
+            )
+        );
+    }
+
+    /// The CI log states each unverified pair and why (carrick#1491): the
+    /// smoke run listed a pair as not verifiable and printed no reason.
+    #[test]
+    fn an_unverified_pair_is_logged_with_its_reason() {
+        let pair = retype_pair(ManifestTypeKind::Response, None);
+        let outcome = outcome_for(
+            &pair,
+            VerdictBucket::GateCaughtBakedAny,
+            Some("capture:consumer:any".to_string()),
+            None,
+            false,
+            Some("the consumer type carries 'any' at '<1>'".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(
+            unresolved_pair_line(&outcome).as_deref(),
+            Some(
+                "Types not verified: POST /p response (src/client.ts:8 in web against api): \
+                 the consumer type carries 'any' at '<1>'"
+            )
+        );
+        let fact = outcome_for(
+            &pair,
+            VerdictBucket::Compatible,
+            None,
+            None,
+            true,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(unresolved_pair_line(&fact), None);
+    }
+
+    #[test]
+    fn consumer_call_locators_keep_the_first_call_result_per_alias() {
+        let item = |kind: InferKind, alias: &str, line: u32| InferRequestItem {
+            file_path: "/repo/web/src/client.ts".to_string(),
+            line_number: line,
+            span_start: Some(line * 10),
+            span_end: Some(line * 10 + 5),
+            expression_text: None,
+            expression_line: None,
+            infer_kind: kind,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let calls = consumer_call_locators(&[
+            item(InferKind::RequestBody, "Req", 3),
+            item(InferKind::CallResult, "C", 8),
+            item(InferKind::CallResult, "C", 12),
+        ]);
+        assert_eq!(calls.len(), 1, "only call results are retyped: {calls:?}");
+        assert_eq!(calls["C"].line_number, 8);
+        assert_eq!(calls["C"].span_start, Some(80));
     }
 
     // ---- derive_capture_anchors -------------------------------------------
@@ -2798,7 +3411,7 @@ mod tests {
             ),
         ];
 
-        let outcomes = run_check(&sidecar, &all_repo_data);
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         let outcome = &outcomes[0];
         assert_eq!(
@@ -2839,7 +3452,7 @@ mod tests {
 
         // Determinism: a second independent check run yields the same
         // outcomes (pair keys, buckets, diagnostics).
-        let outcomes_again = run_check(&sidecar, &all_repo_data);
+        let outcomes_again = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
         let flat = |v: &[PairCheckOutcome]| {
             v.iter()
                 .map(|o| {
@@ -2857,6 +3470,247 @@ mod tests {
             flat(&outcomes_again),
             "check outcomes must be byte-stable across runs"
         );
+    }
+
+    /// carrick#1491, the two-case fixture the ticket requires, end to end
+    /// against the real sidecar ($0, no model): a consumer reads
+    /// `response.data.x` after (a) a typed call and (b) the same call with no
+    /// type argument, on a synthetic client whose envelope carries an `any`
+    /// beside its payload.
+    ///
+    /// Without the retype both pairs stay unverified, which is what a real
+    /// scan reported. With it, both are flagged at the read against a
+    /// producer returning `{ y }`, and neither against one returning `{ x }`.
+    /// The sidecar is scoped to the PRODUCER service when the check runs, as
+    /// it is after a monorepo scans its services in turn, so the pass has to
+    /// re-scope it to the consumer.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn untyped_consumer_call_is_judged_by_retyping_it() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let fixture = manifest_dir.join("tests/fixtures/retype-http-client");
+        let api_root = fixture.join("api").canonicalize().expect("api fixture");
+        let web_root = fixture.join("web").canonicalize().expect("web fixture");
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&web_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let key = OperationKey::http("POST", "/checkout");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let consumer_alias = |line: u32| {
+            let site = crate::type_manifest::build_site_id(
+                "src/checkout.ts",
+                line,
+                &key,
+                web_root.to_str().unwrap(),
+            );
+            build_manifest_type_alias_with_site_id(
+                &key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                Some(&site),
+            )
+        };
+        let (typed_alias, untyped_alias) = (consumer_alias(6), consumer_alias(11));
+
+        // The consumer's inference requests as a scan builds them: the call's
+        // text and line, as the model reports them.
+        let file = web_root
+            .join("src/checkout.ts")
+            .to_string_lossy()
+            .into_owned();
+        let call = |line: u32, text: &str, alias: &str| InferRequestItem {
+            file_path: file.clone(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: Some(text.to_string()),
+            expression_line: Some(line),
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let infer = vec![
+            call(6, "api.post<{ x: number }>(\"/checkout\")", &typed_alias),
+            call(11, "api.post(\"/checkout\")", &untyped_alias),
+        ];
+        let inferred = sidecar
+            .infer_types(&infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let consumer_anchors = derive_capture_anchors(
+            &[],
+            &infer,
+            &[],
+            &inferred,
+            &[typed_alias.clone(), untyped_alias.clone()],
+            web_root.to_str().unwrap(),
+        );
+        let (web_stub, web_artifact) = run_capture(
+            &sidecar,
+            web_root.to_str().unwrap(),
+            "web",
+            &consumer_anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("web capture");
+        let _ = std::fs::remove_dir_all(&web_stub);
+
+        // The producer's response, published the way a scan publishes it: the
+        // capture's expanded definition.
+        let producer = |type_text: &str| {
+            let (dir, artifact) = run_capture(
+                &sidecar,
+                api_root.to_str().unwrap(),
+                "api",
+                &[CaptureAnchor::Literal {
+                    alias: producer_alias.clone(),
+                    type_text: type_text.to_string(),
+                    anchor_origin: AnchorOrigin::LlmSymbol,
+                    source_file: None,
+                }],
+                &HashMap::new(),
+                None,
+            )
+            .expect("api capture");
+            let expanded = sidecar
+                .resolve_definitions(dir.to_str().unwrap(), std::slice::from_ref(&producer_alias))
+                .expect("definitions")
+                .remove(0)
+                .expanded;
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut entry = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                &producer_alias,
+                "src/checkout.ts",
+                1,
+                ManifestTypeState::Explicit,
+            );
+            entry.expanded_definition = Some(expanded);
+            vec![
+                repo("api", None, vec![entry], Some(artifact)),
+                repo(
+                    "web",
+                    None,
+                    vec![
+                        entry_for(&key, &typed_alias, 6),
+                        entry_for(&key, &untyped_alias, 11),
+                    ],
+                    Some(web_artifact.clone()),
+                ),
+            ]
+        };
+        fn entry_for(key: &OperationKey, alias: &str, line: u32) -> TypeManifestEntry {
+            entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                alias,
+                "src/checkout.ts",
+                line,
+                ManifestTypeState::Unknown,
+            )
+        }
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: web_root.clone(),
+                tsconfig: None,
+                calls: consumer_call_locators(&infer),
+            },
+        )]);
+        let by_line = |outcomes: &[PairCheckOutcome]| -> BTreeMap<u32, PairCheckOutcome> {
+            outcomes
+                .iter()
+                .map(|o| (o.consumer_line, o.clone()))
+                .collect()
+        };
+
+        let returns_y = producer("{ y: number }");
+
+        // Control: no retype. Neither pair is established, which is the miss.
+        let control = by_line(&run_check(&sidecar, &returns_y, &LocalConsumers::new()));
+        assert_eq!(control.len(), 2, "{control:#?}");
+        for (line, outcome) in &control {
+            assert!(
+                !outcome.resolved && outcome.bucket != VerdictBucket::Incompatible,
+                "line {line} is unverified without the retype: {outcome:#?}"
+            );
+        }
+        // Why the TYPED call was unverified too: with no wrapper rule, its
+        // inferred type is the client's whole envelope, whose request-data
+        // parameter defaults to `any`, so it cannot anchor a literal and the
+        // capture re-reads the envelope. An installed client stops at the
+        // capture pre-gate on that member; this fixture's ambient client
+        // decays whole. Either way it is the consumer's `any`.
+        let typed_gate = control[&6].gate.as_deref().unwrap_or_default();
+        assert!(typed_gate.ends_with("consumer:any"), "{:#?}", control[&6]);
+        // The untyped call only ever reads members off its result, so the
+        // inferrer abstains (carrick#1375) and the consumer is `unknown`.
+        assert_eq!(control[&11].gate.as_deref(), Some("consumer:unknown"));
+
+        // A monorepo scans its services in turn; the sidecar is left on the
+        // last one, not on the consumer.
+        sidecar.start_init(&api_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("re-init");
+
+        let flagged = by_line(&run_check(&sidecar, &returns_y, &local));
+        for line in [6, 11] {
+            let outcome = &flagged[&line];
+            assert_eq!(outcome.bucket, VerdictBucket::Incompatible, "{outcome:#?}");
+            assert!(
+                outcome.resolved,
+                "a retyped verdict is a fact: {outcome:#?}"
+            );
+            assert_eq!(outcome.unresolved_reason, None);
+            assert_eq!(outcome.gate.as_deref(), Some("retype:consumer"));
+            let diagnostic = outcome.diagnostic.as_deref().unwrap_or_default();
+            assert!(
+                diagnostic.contains(&format!("src/checkout.ts:{}:", line + 1))
+                    && diagnostic.contains("Property 'x' does not exist"),
+                "the read of the missing field is named at its line: {diagnostic}"
+            );
+            assert!(outcome.notes.iter().any(|n| n == RETYPE_NOTE));
+        }
+
+        // A consumer whose own capture degraded has no surface at all, so the
+        // pair never reaches a probe. Its file is still on disk, and the
+        // retype still reads it.
+        let mut no_surface = returns_y.clone();
+        no_surface[1].capture_stub = None;
+        let degraded = by_line(&run_check(&sidecar, &no_surface, &local));
+        for line in [6, 11] {
+            assert_eq!(
+                degraded[&line].bucket,
+                VerdictBucket::Incompatible,
+                "{:#?}",
+                degraded[&line]
+            );
+        }
+
+        let returns_x = producer("{ x: number }");
+        let agreed = by_line(&run_check(&sidecar, &returns_x, &local));
+        for line in [6, 11] {
+            let outcome = &agreed[&line];
+            assert_eq!(outcome.bucket, VerdictBucket::Compatible, "{outcome:#?}");
+            assert!(outcome.resolved, "{outcome:#?}");
+            assert_eq!(outcome.diagnostic, None);
+        }
     }
 
     #[test]
@@ -3093,6 +3947,7 @@ mod tests {
                 ),
                 consumer_repo_data.clone(),
             ],
+            &LocalConsumers::new(),
         );
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         assert_eq!(
@@ -3115,6 +3970,7 @@ mod tests {
                 ),
                 consumer_repo_data,
             ],
+            &LocalConsumers::new(),
         );
         assert_eq!(control_outcomes.len(), 1);
         assert_eq!(
@@ -3272,6 +4128,7 @@ mod tests {
                     Some(dash_artifact),
                 ),
             ],
+            &LocalConsumers::new(),
         );
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         assert_eq!(

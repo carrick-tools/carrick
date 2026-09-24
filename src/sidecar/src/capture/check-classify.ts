@@ -136,7 +136,11 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   // Every branch below this point except the last two returns a verdict about
   // a type nobody could read; each states that in one place rather than
   // repeating the reasoning.
-  const notAFact = (reason: string) => ({ resolved: false as const, unresolved_reason: reason });
+  const notAFact = (reason: string, side?: Side) => ({
+    resolved: false as const,
+    unresolved_reason: reason,
+    ...(side ? { unresolved_side: side } : {}),
+  });
 
   // 1. Poison: a diagnostic in this pair's own alias closure (either side)
   //    makes the pair unverifiable, never "no probe error -> compatible". A
@@ -150,7 +154,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         bucket: 'unverifiable',
         gate: `poison:${side}`,
         diagnostic: `the type stub for service '${endpoint.service_name}' does not typecheck (its own declarations carry diagnostics); compatibility cannot be verified.`,
-        ...notAFact(`the ${side} stub does not typecheck`),
+        ...notAFact(`the ${side} stub does not typecheck`, side),
       };
     }
   }
@@ -165,7 +169,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'unverifiable',
       gate: `import:${side}`,
       diagnostic: `surface export '${alias}' for the ${side} is missing or renamed; compatibility cannot be verified.`,
-      ...notAFact(`the ${side} surface export is missing or renamed`),
+      ...notAFact(`the ${side} surface export is missing or renamed`, side),
     };
   }
 
@@ -183,7 +187,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'gate_caught_baked_any',
       gate: `${side}:any`,
       diagnostic: `the ${side} type resolved to 'any' at check time; compatibility cannot be verified (a type inferred through a missing library bakes to any).`,
-      ...notAFact(`the ${side} type is 'any'`),
+      ...notAFact(`the ${side} type is 'any'`, side),
     };
   }
   const decayGate = gateDiags
@@ -196,7 +200,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'unverifiable',
       gate: `${side}:${kind}`,
       diagnostic: `the ${side} type resolved to '${kind}' at check time; compatibility cannot be verified.`,
-      ...notAFact(`the ${side} type is '${kind}'`),
+      ...notAFact(`the ${side} type is '${kind}'`, side),
     };
   }
 
@@ -215,7 +219,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         bucket: 'unverifiable',
         gate: `${side}:void`,
         diagnostic: `the ${side} type is 'void' (it reads no body), so there is no contract to verify.`,
-        ...notAFact(`the ${side} type is 'void'`),
+        ...notAFact(`the ${side} type is 'void'`, side),
       };
     }
     return {
@@ -223,7 +227,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'unverifiable',
       gate: `${side}:form`,
       diagnostic: `the ${side} sends a form-encoded body, whose fields are appended at runtime and cannot be compared with a declared shape.`,
-      ...notAFact(`the ${side} sends a form-encoded body`),
+      ...notAFact(`the ${side} sends a form-encoded body`, side),
     };
   }
 
@@ -370,6 +374,7 @@ function namedFields(input: ClassifyInput, scrubCtx: ScrubContext): string {
 function factness(input: ClassifyInput): {
   resolved: boolean;
   unresolved_reason?: string;
+  unresolved_side?: Side;
 } {
   const findings = input.deepFindings;
   if (!findings) {
@@ -386,6 +391,7 @@ function factness(input: ClassifyInput): {
     const where = first.path === '' ? 'its root' : `'${first.path}'`;
     return {
       resolved: false,
+      unresolved_side: label,
       unresolved_reason:
         first.kind === 'budget_exhausted'
           ? `the ${label} type is too deep or wide to verify at ${where}`

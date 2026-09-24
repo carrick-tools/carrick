@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
@@ -486,6 +486,11 @@ pub struct CheckVerdict {
     /// Why `resolved` is false. Absent exactly when it is true.
     #[serde(default)]
     pub unresolved_reason: Option<String>,
+    /// Which side's type left the verdict unresolved, when one side did
+    /// (carrick#1491). The retype check reads this to find the pairs whose
+    /// CONSUMER call it can judge, instead of parsing `unresolved_reason`.
+    #[serde(default)]
+    pub unresolved_side: Option<VerdictSide>,
     /// Statements about this comparison that are neither the verdict nor an
     /// unresolution (carrick#1341): an optionality gap that is legal and still
     /// a drift, and the note that the comparison was made against the JSON
@@ -496,6 +501,68 @@ pub struct CheckVerdict {
     /// check — the same terms every other additive field here is read on.
     #[serde(default)]
     pub notes: Vec<String>,
+}
+
+/// One side of a checked pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerdictSide {
+    Producer,
+    Consumer,
+}
+
+/// One consumer call to retype with the producer's response type
+/// (carrick#1491). The locator is the one the consumer's `call_result`
+/// inference used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetypeItem {
+    pub item_id: String,
+    pub file_path: String,
+    pub line_number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_end: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression_line: Option<u32>,
+    /// The producer's response type as TypeScript text, fully inlined.
+    pub producer_type: String,
+    /// Judge the form JSON puts on the wire (an `http` response).
+    pub wire: bool,
+}
+
+/// What the consumer file's type-check said once the call stated the
+/// producer's response type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetypeVerdict {
+    /// The rewrite added diagnostics: the consumer uses something the producer
+    /// does not return.
+    Mismatch,
+    /// It added none.
+    Agrees,
+    /// The check could not be made; `reason` says why.
+    Abstain,
+}
+
+/// A diagnostic the retype ADDED to the consumer file, at its original line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetypeDiagnostic {
+    pub line: u32,
+    pub code: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetypeOutcome {
+    pub item_id: String,
+    pub outcome: RetypeVerdict,
+    #[serde(default)]
+    pub diagnostics: Vec<RetypeDiagnostic>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).
@@ -575,6 +642,11 @@ enum SidecarRequest {
         request_id: String,
         stub_dir: String,
         aliases: Vec<String>,
+    },
+    #[serde(rename = "retype_check")]
+    RetypeCheck {
+        request_id: String,
+        items: Vec<RetypeItem>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -711,6 +783,9 @@ pub struct SidecarResponse {
     /// Resolved definitions (for resolve_definitions)
     #[serde(default)]
     pub definitions: Option<Vec<ResolvedDefinitionResult>>,
+    /// Retype outcomes (for retype_check)
+    #[serde(default)]
+    pub outcomes: Option<Vec<RetypeOutcome>>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
@@ -981,6 +1056,10 @@ pub struct TypeSidecar {
     spawn_time: Instant,
     /// Request ID counter
     request_counter: Mutex<u64>,
+    /// The root and tsconfig the last `init` scoped the sidecar to. A request
+    /// that reads the init'd project for one service checks this before
+    /// re-initialising, because a re-init drops the built program.
+    scope: Mutex<Option<(PathBuf, Option<String>)>>,
 }
 
 impl TypeSidecar {
@@ -1072,6 +1151,7 @@ impl TypeSidecar {
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
             spawn_time,
             request_counter: Mutex::new(0),
+            scope: Mutex::new(None),
         })
     }
 
@@ -1095,6 +1175,7 @@ impl TypeSidecar {
         }
 
         debug!("[type_sidecar] Starting init for repo: {}", repo_root_str);
+        *self.scope.lock().unwrap() = Some((repo_root.to_path_buf(), tsconfig.clone()));
 
         // Send init request
         let request = SidecarRequest::Init {
@@ -1269,6 +1350,7 @@ impl TypeSidecar {
                 symbol_failures: None,
                 inferred_types: None,
                 definitions: None,
+                outcomes: None,
                 errors: None,
             });
         }
@@ -1307,6 +1389,7 @@ impl TypeSidecar {
                 symbol_failures: None,
                 inferred_types: Some(vec![]),
                 definitions: None,
+                outcomes: None,
                 errors: None,
             });
         }
@@ -1357,6 +1440,41 @@ impl TypeSidecar {
         }
 
         Ok(response.definitions.unwrap_or_default())
+    }
+
+    /// Whether the last `init` scoped the sidecar to exactly this root and
+    /// tsconfig, so a request that reads the init'd project can skip a re-init
+    /// (which would drop the program already built for it).
+    pub fn is_scoped_to(&self, repo_root: &Path, tsconfig_path: Option<&str>) -> bool {
+        self.scope
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(root, tsconfig)| {
+                root == repo_root && tsconfig.as_deref() == tsconfig_path
+            })
+    }
+
+    /// Retype consumer calls with the producer's response type and report what
+    /// the consumer file's own type-check says (carrick#1491). Reads the
+    /// init'd project: the caller scopes the sidecar to the consumer service
+    /// first.
+    pub fn retype_check(&self, items: &[RetypeItem]) -> Result<Vec<RetypeOutcome>, SidecarError> {
+        self.ensure_ready()?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = SidecarRequest::RetypeCheck {
+            request_id: self.next_request_id(),
+            items: items.to_vec(),
+        };
+        self.send_request(&request)?;
+        let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::CheckFailed(errors.join("; ")));
+        }
+        Ok(response.outcomes.unwrap_or_default())
     }
 
     /// Run the v2 "tsc as serializer" capture for one service, producing a

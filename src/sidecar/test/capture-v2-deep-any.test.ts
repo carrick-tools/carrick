@@ -800,10 +800,13 @@ describe('check phase: a budget-exhausted deep any is unverifiable, within-budge
     const d17 = byKey.get('d17')!;
     assert.strictEqual(d17.bucket, 'unverifiable', JSON.stringify(d17));
     assert.strictEqual(d17.gate, 'capture:producer:budget_exhausted');
+    assert.strictEqual(d17.unresolved_side, 'producer');
     // Symmetric on the consumer side (deepDecayOf loops both sides).
     const d17c = byKey.get('d17-consumer')!;
     assert.strictEqual(d17c.bucket, 'unverifiable', JSON.stringify(d17c));
     assert.strictEqual(d17c.gate, 'capture:consumer:budget_exhausted');
+    // carrick#1491: the pre-gate names the side it caught, as a field.
+    assert.strictEqual(d17c.unresolved_side, 'consumer');
     // A clean type within budget still verifies — no over-demotion.
     assert.strictEqual(byKey.get('d16-clean')!.bucket, 'compatible', JSON.stringify(byKey.get('d16-clean')));
   });

@@ -350,9 +350,43 @@ export interface ResolveDefinitionsRequest extends BaseRequest {
 }
 
 /**
+ * One consumer call to retype with the producer's response type (carrick#1491).
+ * The locator is the one the consumer's `call_result` inference used: a span,
+ * or expression text near a line.
+ */
+export interface RetypeItem {
+  /** Caller key, echoed on the outcome. */
+  item_id: string;
+  /** Absolute path, or relative to the init'd root. */
+  file_path: string;
+  line_number: number;
+  span_start?: number;
+  span_end?: number;
+  expression_text?: string;
+  expression_line?: number;
+  /** The producer's response type as TypeScript text, fully inlined. */
+  producer_type: string;
+  /** Judge the form JSON puts on the wire (an `http` response). */
+  wire: boolean;
+}
+
+/**
+ * Retype consumer calls with the producer's response type and report what the
+ * consumer file's own type-check says about it. Needs `init`: it runs in the
+ * consumer's real program.
+ */
+export interface RetypeCheckRequest extends BaseRequest {
+  action: 'retype_check';
+  items: RetypeItem[];
+  /** Time the request may spend; items it does not reach abstain. */
+  budget_ms?: number;
+}
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
+  | RetypeCheckRequest
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
@@ -566,10 +600,41 @@ export interface ErrorResponse extends BaseResponse {
   errors: string[];
 }
 
+/** A diagnostic the retype ADDED to the consumer file, at its original line. */
+export interface RetypeDiagnostic {
+  line: number;
+  code: number;
+  message: string;
+}
+
+/**
+ * What the consumer file's type-check said once the call stated the
+ * producer's response type.
+ *
+ * - `mismatch`: the rewrite added diagnostics; each is a place the consumer
+ *   uses something the producer's response does not provide.
+ * - `agrees`: it added none.
+ * - `abstain`: the check could not be made; `reason` says why.
+ */
+export interface RetypeOutcome {
+  item_id: string;
+  outcome: 'mismatch' | 'agrees' | 'abstain';
+  /** How the type was stated: a type argument, or a cast of an `any` result. */
+  form?: 'type_argument' | 'cast';
+  diagnostics: RetypeDiagnostic[];
+  reason?: string;
+}
+
+export interface RetypeCheckResponse extends BaseResponse {
+  outcomes?: RetypeOutcome[];
+  errors?: string[];
+}
+
 /**
  * Union type for all possible sidecar responses
  */
 export type SidecarResponse =
+  | RetypeCheckResponse
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse

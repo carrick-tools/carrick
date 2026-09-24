@@ -135,6 +135,26 @@ export interface ProbePlan {
 }
 
 /** The assignment line whose diagnostic decides the bucket. */
+/**
+ * The JSON wire transform as TypeScript declarations: `JsonWire<T>` is the
+ * form `JSON.stringify` puts `T` on the wire in (a value with `toJSON()`
+ * travels as what it returns), and `JsonWireSame<A, B>` says two forms are
+ * mutually assignable. `prefix` namespaces the three names so the same
+ * transform can be appended to a file that is not ours (the retype check,
+ * carrick#1491) without colliding with anything the file declares. The probe
+ * uses no prefix, so its text is unchanged.
+ */
+export function jsonWireDeclarations(prefix: string): string[] {
+  const depth = `${prefix}JsonWireDepth`;
+  const wire = `${prefix}JsonWire`;
+  const same = `${prefix}JsonWireSame`;
+  return [
+    `type ${depth} = [never, 0, 1, 2, 3, 4, 5, 6];`,
+    `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], ${depth}[D]> } : T;`,
+    `type ${same}<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`,
+  ];
+}
+
 export function decisiveAssignmentLine(plan: ProbePlan): number {
   return plan.wireAssignmentLine ?? plan.assignmentLine;
 }
@@ -281,16 +301,12 @@ export function buildProbe(
   // disagreeing one). tsc stays the judge of both forms.
   let wireAssignmentLine: number | undefined;
   if (spec.protocol === 'http') {
-    push(`type JsonWireDepth = [never, 0, 1, 2, 3, 4, 5, 6];`);
-    push(
-      `type JsonWire<T, D extends number = 6> = [D] extends [never] ? T : T extends { toJSON: (...args: any[]) => infer R } ? JsonWire<R, JsonWireDepth[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: JsonWire<T[K], JsonWireDepth[D]> } : T;`
-    );
     // Keep the DECLARED type whenever serialising changes nothing observable,
     // so the compiler's headline still names the real surface alias (the probe
     // prints `Sent`, which the scrub rewrites) instead of expanding a mapped
     // type structurally. Only a pair whose payload really is transformed loses
     // that name — and there the declared name no longer describes what travels.
-    push(`type JsonWireSame<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`);
+    for (const line of jsonWireDeclarations('')) push(line);
     push(
       `type WireSent = [Sent] extends [Expected] ? Sent : (JsonWireSame<JsonWire<Sent>, Sent> extends true ? Sent : JsonWire<Sent>);`
     );

@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A synthetic server and a synthetic HTTP client, both declared in the fixture."
+}

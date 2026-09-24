@@ -242,6 +242,7 @@ export async function runCheck(
             `type would let an arbitrary shape read compatible).`,
       codes: [],
       resolved: false,
+      unresolved_side: hit.side,
       unresolved_reason:
         hit.kind === 'budget_exhausted'
           ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`

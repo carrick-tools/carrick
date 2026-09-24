@@ -218,6 +218,61 @@ describe('four-bucket classifier precedence', () => {
       assert.match(v.unresolved_reason!, /not established as a fact/);
     });
 
+    // carrick#1491: the scanner retypes an unresolved CONSUMER call with the
+    // producer's response, so which side left the verdict unresolved is a
+    // field, not a phrase to parse out of the reason.
+    it('names the side that left the verdict unresolved', () => {
+      const deep = classifyPair({
+        plan,
+        probeDiags: [],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: { sent: [], expected: [{ path: '<0>', kind: 'any', reason: 'declared' }] },
+      });
+      assert.strictEqual(deep.unresolved_side, 'consumer');
+
+      const expectedAny = [...plan.gateLines].find(([, n]) => n === 'expected:any')![0];
+      const gated = classifyPair({
+        plan,
+        probeDiags: [diag(expectedAny, 2344)],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(gated.unresolved_side, 'consumer');
+
+      const sentUnknown = [...plan.gateLines].find(([, n]) => n === 'sent:unknown')![0];
+      const producer = classifyPair({
+        plan,
+        probeDiags: [diag(sentUnknown, 2344)],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(producer.unresolved_side, 'producer');
+
+      const importLine = classifyPair({
+        plan,
+        probeDiags: [diag(plan.importLines[1], 2305)],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(importLine.unresolved_side, 'consumer');
+
+      // Blame on neither side: the walk did not run, or the pair is a fact.
+      const unwalked = classifyPair({ plan, probeDiags: [], poisonReason: noPoison, scrubCtx });
+      assert.strictEqual(unwalked.unresolved_side, undefined);
+      const fact = classifyPair({
+        plan,
+        probeDiags: [],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(fact.unresolved_side, undefined);
+    });
+
     it('a gated verdict was never a fact and says why', () => {
       const anyLine = [...plan.gateLines].find(([, n]) => n === 'sent:any')![0];
       const v = classifyPair({

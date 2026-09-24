@@ -66,7 +66,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer` and `resolve_definitions` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions` and `retype_check` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
 `capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -78,6 +78,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `capture_v2` | no | Emit a per-service declaration stub package |
 | `check_v2` | no | Typecheck matched pairs across captured stubs |
 | `infer` | yes | Resolve the type at a set of locators |
+| `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
 | `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
@@ -305,6 +306,52 @@ Terminal frame (`result` is a `CheckResult`, abbreviated):
 A verdict's `diagnostic` (present on a mismatch) is the compiler's own text, followed by the fields that differ: which side does not send a field the other requires, which field is sent under a name the other does not declare, which are optional on one side and always present on the other, and where two member types disagree. The list is capped and says how many it did not name. It is walked over the same two types the judge compared, with the compiler's own assignability relation, so it never names a field the verdict does not rest on and never changes a verdict.
 
 An `http` pair is judged on the form JSON puts on the wire. A value with a `toJSON()` method travels as what it serialises to, so a producer returning `Date` where the consumer reads `string` is not a drift, and a consumer that sends a `Date` in a request body satisfies a producer declaring `string`. The transform applies to the SENDING side in each direction, which is where serialisation happens: a consumer declaring `Date` for a response is still a mismatch, because no `Date` ever arrives. `bigint` is left alone — `JSON.stringify` throws on one, so it is a real problem, not a wire difference.
+
+A verdict that is not a fact (`resolved: false`) says which side is to blame in `unresolved_side` (`producer` or `consumer`) when one is: a gate, a missing export, poison or a deep `any`/`unknown` on that side. It is absent when neither side is to blame.
+
+#### `retype_check` - Judge an untyped consumer call
+
+A consumer call with no type argument (`await api.post('/orders')`) returns `any`, so check_v2 has nothing to compare. `retype_check` rewrites the call in memory to state the producer's response type, type-checks the consumer file before and after, and reports every diagnostic the rewrite added. Each one is a place the consumer uses something the producer does not return. It runs in the init'd project, because the consumer's file only type-checks there, and it restores the file before it answers.
+
+The call is located the way `infer` locates a `call_result`: by span, else by `expression_text` near `expression_line`. A call that already states a type argument has it replaced. A call to a generic gets one inserted. A call whose result is already `any` (an untyped helper) is cast. `wire: true` compares the form JSON puts on the wire, as check_v2 does for `http`.
+
+```json
+{
+  "request_id": "5",
+  "action": "retype_check",
+  "items": [
+    {
+      "item_id": "web/Endpoint_9f8e_Response",
+      "file_path": "/abs/web/src/orders.ts",
+      "line_number": 12,
+      "expression_text": "api.post('/orders')",
+      "expression_line": 12,
+      "producer_type": "{ id: string; total: number; }",
+      "wire": true
+    }
+  ]
+}
+```
+
+Response:
+```json
+{
+  "request_id": "5",
+  "status": "success",
+  "outcomes": [
+    {
+      "item_id": "web/Endpoint_9f8e_Response",
+      "outcome": "mismatch",
+      "form": "type_argument",
+      "diagnostics": [
+        { "line": 13, "code": 2339, "message": "Property 'totalMinutes' does not exist on type '{ id: string; total: number; }'." }
+      ]
+    }
+  ]
+}
+```
+
+`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, the type parameter it would fill does not carry the response, the call returns a typed value with no type parameter, or the producer's type names something the consumer's program cannot resolve. Diagnostics the file had before the rewrite never count.
 
 #### `infer` - Resolve the type at a locator
 

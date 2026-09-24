@@ -333,6 +333,24 @@ export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
 });
 
+const RetypeItemSchema = z.object({
+  item_id: z.string().min(1),
+  file_path: z.string().min(1),
+  line_number: z.number().int().positive(),
+  span_start: z.number().int().nonnegative().optional(),
+  span_end: z.number().int().nonnegative().optional(),
+  expression_text: z.string().optional(),
+  expression_line: z.number().int().positive().optional(),
+  producer_type: z.string().min(1),
+  wire: z.boolean(),
+});
+
+export const RetypeCheckRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('retype_check'),
+  items: z.array(RetypeItemSchema).min(1, 'At least one item is required'),
+  budget_ms: z.number().int().nonnegative().optional(),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -350,6 +368,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   BuildWorkspaceRequestSchema,
   CheckCompatibilityRequestSchema,
   ResolveDefinitionsRequestSchema,
+  RetypeCheckRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

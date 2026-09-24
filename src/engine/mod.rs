@@ -5072,6 +5072,25 @@ fn run_capture_for_service(
                 .into_owned();
         }
     }
+    // The consumer calls the check may retype with a producer's response
+    // (carrick#1491), under the root `scope_sidecar_to_service` initialises
+    // this service at, so the check re-uses the program when it is still
+    // scoped here.
+    let service_id = cloud_data
+        .service_name
+        .clone()
+        .unwrap_or_else(|| cloud_data.repo_name.clone());
+    type_compat_v2::record_local_consumer(
+        &service_id,
+        type_compat_v2::LocalConsumer {
+            root: match &config.directory {
+                Some(dir) => absolute_repo.join(dir),
+                None => absolute_repo.clone(),
+            },
+            tsconfig: config.tsconfig.clone(),
+            calls: type_compat_v2::consumer_call_locators(&infer),
+        },
+    );
     // Every alias the check phase will import from this service's surface. The
     // manifest is already on `cloud_data` by the time capture runs.
     let manifest_aliases: Vec<String> = cloud_data
@@ -5096,10 +5115,6 @@ fn run_capture_for_service(
         return None;
     }
 
-    let service_id = cloud_data
-        .service_name
-        .clone()
-        .unwrap_or_else(|| cloud_data.repo_name.clone());
     // Literal texts for the last-resort backfill re-anchor: when capture
     // demotes an alias (e.g. its file's declaration emit was skipped), the
     // scanner's own v1 resolution text for the same alias — when it carries a
@@ -6589,7 +6604,8 @@ async fn build_cross_repo_analyzer(
     //    unset and every edge keeps `type_compatible: None` — the harness
     //    greps for this exact "Skipping type checking" trap (§7).
     if let Some(sidecar) = sidecar {
-        let outcomes = type_compat_v2::run_check(sidecar, &all_repo_data);
+        let local_consumers = type_compat_v2::take_local_consumers();
+        let outcomes = type_compat_v2::run_check(sidecar, &all_repo_data, &local_consumers);
         analyzer.set_pair_outcomes(outcomes);
     } else {
         warn!(
