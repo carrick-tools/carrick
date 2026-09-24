@@ -228,7 +228,8 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
 /// no contract, as opposed to failing to see one. `no_success_payload`: every
 /// response the route's handler sends is an error or a redirect (carrick#1161).
 /// `no_request_body`: the located request read is a validated non-body part
-/// (carrick#1166). `projected_value_only`: every read of the call's result
+/// (carrick#1166), or a request config that sets no body member
+/// (carrick-cloud#1366). `projected_value_only`: every read of the call's result
 /// takes a member out of it, so the site states a part of a payload and not a
 /// payload (carrick#1375).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
