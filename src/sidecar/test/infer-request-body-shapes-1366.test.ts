@@ -81,6 +81,34 @@ describe('request-body shapes (carrick-cloud#1366)', () => {
     };
   }
 
+  /** Like `infer`, but a locator that abstains returns no row instead of failing. */
+  async function inferMaybe(
+    alias: string,
+    file: string,
+    expressionText: string,
+    anchor: string
+  ): Promise<{ type_string: string; reasons: string[] } | undefined> {
+    const line = lineOf(file, anchor);
+    const response = await client.send<InferResponseShape>({
+      action: 'infer',
+      request_id: `shapes-1366-${alias}`,
+      requests: [
+        {
+          file_path: file,
+          line_number: line,
+          expression_text: expressionText,
+          expression_line: line,
+          infer_kind: 'request_body',
+          alias,
+        },
+      ],
+    });
+    const row = response.inferred_types?.find((t) => t.alias === alias);
+    return row
+      ? { type_string: row.type_string, reasons: (row.any_provenance ?? []).map((p) => p.reason) }
+      : undefined;
+  }
+
   before(async () => {
     client = new SidecarClient();
     await client.start();
@@ -113,13 +141,35 @@ describe('request-body shapes (carrick-cloud#1366)', () => {
     });
 
     it('control: an unkeyed body parameter keeps its own type', async () => {
-      const got = await infer('WholeBody', PRODUCER, 'dto', '@Body() dto');
+      const got = await infer('WholeBody', PRODUCER, 'dto', 'create(@Body() dto');
       assert.strictEqual(got.type_string, '{ name: string; size: number; }');
     });
 
     it('control: a member read of the parameter is not the parameter', async () => {
       const got = await infer('MemberRead', PRODUCER, 'masterKey.length', 'masterKey.length');
       assert.strictEqual(got.type_string, 'number');
+    });
+  });
+
+  describe('1b. keyed body parameter beside a whole-body parameter, pipes, other decorators', () => {
+    it('a whole-body sibling and a keyed one publish their intersection', async () => {
+      const got = await infer('DtoAndKeyed', PRODUCER, 'force', "@Body('force')");
+      assert.strictEqual(got.type_string, '{ name: string; size: number; } & { force: boolean; }');
+    });
+
+    it('a pipe as the first argument is the whole-body form', async () => {
+      const got = await infer('PipeWhole', PRODUCER, 'checked', '@Body(new CheckPipe()) checked');
+      assert.strictEqual(got.type_string, '{ name: string; size: number; }');
+    });
+
+    it('a piped whole body and a keyed field publish their intersection', async () => {
+      const got = await infer('PipeAndKeyed', PRODUCER, 'dryRun', "@Body('dryRun')");
+      assert.strictEqual(got.type_string, '{ name: string; size: number; } & { dryRun: boolean; }');
+    });
+
+    it('another decorator before the keyed one does not hide the key', async () => {
+      const got = await infer('LeadingDecorator', PRODUCER, 'label', "@Body('label')");
+      assert.strictEqual(got.type_string, '{ label: string; }');
     });
   });
 
@@ -142,7 +192,7 @@ describe('request-body shapes (carrick-cloud#1366)', () => {
 
   describe('3. request config located instead of the body', () => {
     it('publishes the config payload member', async () => {
-      const got = await infer('DeleteConfig', CONSUMER, '{ data: { reason } }', 'data: { reason }');
+      const got = await infer('DeleteConfig', CONSUMER, '{ data: { reason } }', '`/accounts/${id}`, { data: { reason } }');
       assert.strictEqual(got.type_string, '{ reason: string; }');
     });
 
@@ -158,6 +208,74 @@ describe('request-body shapes (carrick-cloud#1366)', () => {
     });
   });
 
+  describe('3b. config variables, a static client, and option shapes that carry no generic body', () => {
+    it('a config variable publishes its payload member, located on the variable', async () => {
+      const got = await infer('BuiltConfigVar', CONSUMER, 'removal', '`/accounts/${id}`, removal');
+      assert.strictEqual(got.type_string, '{ reason: string; }');
+    });
+
+    it('a config variable publishes its payload member, located on the call', async () => {
+      const got = await infer(
+        'BuiltConfigCall',
+        CONSUMER,
+        'api.delete(`/accounts/${id}`, removal)',
+        '`/accounts/${id}`, removal'
+      );
+      assert.strictEqual(got.type_string, '{ reason: string; }');
+    });
+
+    it('a config variable whose type does not resolve the member abstains', async () => {
+      const got = await inferMaybe('TypedConfigVar', CONSUMER, 'opaque', '`/accounts/${id}`, opaque');
+      assert.strictEqual(got, undefined, JSON.stringify(got));
+    });
+
+    it('a client called through its static default reads the config the same way', async () => {
+      const got = await infer(
+        'StaticClient',
+        CONSUMER,
+        "{ data: { reason, via: 'static' } }",
+        "via: 'static'"
+      );
+      assert.strictEqual(got.type_string, '{ reason: string; via: string; }');
+    });
+
+    it('options generic over a response mode: the mode is never the body, and no body is not decided', async () => {
+      for (const [alias, text, anchor] of [
+        ['ModeOptions', "{ body: note, responseType: 'json' }", "{ body: note, responseType: 'json' }"],
+        ['MethodOptions', "{ method: 'POST', body: note }", "{ method: 'POST', body: note }"],
+      ]) {
+        const got = await inferMaybe(alias, CONSUMER, text, anchor);
+        assert.strictEqual(got, undefined, `${alias}: ${JSON.stringify(got)}`);
+      }
+    });
+
+    it('options generic over a response mode: a located call is unchanged', async () => {
+      const got = await infer(
+        'ModeCall',
+        CONSUMER,
+        "fetchData('/notes/raw', { method: 'POST', body: note })",
+        "{ method: 'POST', body: note }"
+      );
+      assert.strictEqual(got.type_string, 'unknown');
+      assert.deepStrictEqual(got.reasons, []);
+    });
+
+    it('non-generic json options are unchanged', async () => {
+      const got = await infer('ShortClient', CONSUMER, '{ json: note }', '{ json: note }');
+      assert.strictEqual(got.type_string, '{ json: { text: string; }; }');
+    });
+
+    it('non-generic json options with a response mode are unchanged', async () => {
+      const got = await infer(
+        'StreamClient',
+        CONSUMER,
+        "{ json: note, responseType: 'json' }",
+        "{ json: note, responseType: 'json' }"
+      );
+      assert.strictEqual(got.type_string, '{ json: { text: string; }; responseType: "json"; }');
+    });
+  });
+
   describe('the judge over the inferred texts', () => {
     let verdicts: Map<string, CheckVerdict>;
     let root: string;
@@ -170,7 +288,7 @@ describe('request-body shapes (carrick-cloud#1366)', () => {
       await infer('P_Query', PRODUCER, 'sql', "@Body('sql')");
       await infer('C_Auth', CONSUMER, '{ masterKey }', '{ masterKey }');
       await infer('C_AuthPin', CONSUMER, '{ masterKey: pin }', '{ masterKey: pin }');
-      await infer('C_Remove', CONSUMER, '{ data: { reason } }', 'data: { reason }');
+      await infer('C_Remove', CONSUMER, '{ data: { reason } }', '`/accounts/${id}`, { data: { reason } }');
       await infer(
         'C_RemoveCode',
         CONSUMER,

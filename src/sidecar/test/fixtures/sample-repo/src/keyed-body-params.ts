@@ -12,6 +12,15 @@ function Body(_field?: string): ParamDecorator {
 function Param(_field?: string): ParamDecorator {
   return () => undefined;
 }
+function Trim(): ParamDecorator {
+  return () => undefined;
+}
+class CheckPipe {
+  readonly strict = true;
+}
+function Put(_path?: string): MethodDecorator {
+  return () => undefined;
+}
 function Post(_path?: string): MethodDecorator {
   return () => undefined;
 }
@@ -52,6 +61,29 @@ export class OpsController {
   @Post('query')
   runQuery(@Body('sql') sql: string): { rowCount: number } {
     return { rowCount: sql.length };
+  }
+
+  @Put('widgets/:id')
+  replaceWidget(@Body() dto: CreateWidgetDto, @Body('force') force: boolean): { id: string } {
+    return { id: `${dto.name}:${force}` };
+  }
+
+  @Post('widgets/validated')
+  createValidated(@Body(new CheckPipe()) checked: CreateWidgetDto): { id: string } {
+    return { id: checked.name };
+  }
+
+  @Patch('widgets/validated')
+  patchValidated(
+    @Body(new CheckPipe()) patch: CreateWidgetDto,
+    @Body('dryRun') dryRun: boolean
+  ): { id: string } {
+    return { id: `${patch.name}:${dryRun}` };
+  }
+
+  @Post('labels')
+  addLabel(@Trim() @Body('label') label: string): { id: string } {
+    return { id: label };
   }
 
   @Post('widgets')

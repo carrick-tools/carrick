@@ -66,3 +66,63 @@ export async function runQueryMisnamed(sql: string): Promise<QueryResultData> {
   const response = await api.post<QueryResultData>('/ops/query', { query: sql });
   return response.data;
 }
+
+// Review follow-ups: a config held in a variable, a client called through its
+// static default, and three option shapes whose generic member is not a body.
+
+export async function removeWithBuiltConfig(id: string, reason: string): Promise<void> {
+  const removal = { data: { reason } };
+  await api.delete(`/accounts/${id}`, removal);
+}
+
+export async function removeWithTypedConfig(id: string, opaque: RequestConfig): Promise<void> {
+  await api.delete(`/accounts/${id}`, opaque);
+}
+
+export interface HttpStatic extends HttpClient {
+  <T = unknown>(config: RequestConfig): Promise<ClientResponse<T>>;
+  create(config?: RequestConfig): HttpClient;
+}
+
+declare const httpDefault: HttpStatic;
+
+export async function removeThroughStatic(id: string, reason: string): Promise<void> {
+  await httpDefault.delete(`/accounts/${id}`, { data: { reason, via: 'static' } });
+}
+
+export type ResponseMode = 'json' | 'text' | 'blob';
+
+export interface FetchOptions<R extends ResponseMode = 'json'> {
+  method?: string;
+  body?: Record<string, unknown> | string;
+  headers?: Record<string, string>;
+  responseType?: R;
+}
+
+declare function fetchData<T = unknown, R extends ResponseMode = 'json'>(
+  url: string,
+  options?: FetchOptions<R>
+): Promise<T>;
+
+export async function saveNote(note: { text: string }): Promise<void> {
+  await fetchData('/notes', { body: note, responseType: 'json' });
+  await fetchData('/notes/raw', { method: 'POST', body: note });
+}
+
+export interface JsonOptions {
+  json?: unknown;
+  searchParams?: Record<string, string>;
+}
+
+declare const shortClient: { post(url: string, options?: JsonOptions): Promise<unknown> };
+declare const streamClient: {
+  post(url: string, options?: JsonOptions & { responseType?: 'json' }): Promise<unknown>;
+};
+
+export async function saveViaShort(note: { text: string }): Promise<void> {
+  await shortClient.post('/notes/short', { json: note });
+}
+
+export async function saveViaStream(note: { text: string }): Promise<void> {
+  await streamClient.post('/notes/stream', { json: note, responseType: 'json' });
+}
