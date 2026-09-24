@@ -2589,11 +2589,9 @@ impl FileOrchestrator {
                     .map_err(|e| {
                         // Recorded here, where the error is still typed: this
                         // file has no analysis in the index, and the run must
-                        // not call itself a success. Two classes are excluded
-                        // and they are excluded for different reasons, which
-                        // `counts_as_lost_file` states: a call the quota
-                        // breaker aborted was never attempted, and a call a
-                        // budget refused was never asked (carrick#555).
+                        // not call itself a success. A call a limit refused
+                        // is excluded, because the model was never asked
+                        // (carrick#555, `counts_as_lost_file`).
                         if crate::scan_health::counts_as_lost_file(e.as_ref()) {
                             crate::scan_health::record_unanalysed_file(
                                 &pf.path_str,

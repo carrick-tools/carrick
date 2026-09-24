@@ -641,6 +641,148 @@ async fn a_refused_file_is_asked_about_again_on_the_next_scan() {
     assert!(rescan.scan_failed.lock().unwrap().is_empty());
 }
 
+/// Every limit a Carrick Cloud prompt lambda enforces, by `details.reason`
+/// (carrick-cloud#401). The same file `agent_service`'s wire test reads.
+fn cloud_limits() -> Vec<String> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/cloud-limit-refusals/refusals.json")).unwrap();
+    let reasons: Vec<String> = fixture["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["reason"].as_str().unwrap().to_string())
+        .collect();
+    assert!(reasons.len() >= 9, "the fixture lists every limit");
+    reasons
+}
+
+/// A refusal as every prompt lambda sends one: `llm_disabled`, not retriable,
+/// the limit named in `details.reason`, the sentence in `message`.
+///
+/// Every limit carries [`REFUSAL_SENTENCE`]: the run keeps the first refusal
+/// sentence it meets in a process-global, and the other tests in this binary
+/// read that line.
+fn refusal_envelope(reason: &str) -> String {
+    serde_json::json!({
+        "success": false,
+        "error": {
+            "code": "llm_disabled",
+            "message": REFUSAL_SENTENCE,
+            "retriable": false,
+            "details": { "reason": reason, "requestId": "r" },
+        },
+    })
+    .to_string()
+}
+
+/// Service names in the uploads after the first `from`, sorted.
+fn landed_since(storage: &StubStorage, from: usize) -> Vec<String> {
+    let mut landed: Vec<String> = storage.uploads()[from..]
+        .iter()
+        .filter_map(|u| u.data.service_name.clone())
+        .collect();
+    landed.sort();
+    landed
+}
+
+/// Hitting a limit never stops a scan (carrick-cloud#401). For every limit
+/// the cloud enforces, a CI scan of a repo that already has an index, whose
+/// one file of beta the limit refuses, lands all three services, beta
+/// included, and exits 0. It is the strictest case: had the refusal counted
+/// as a lost file, beta would be held back and the run would fail.
+#[tokio::test]
+#[serial]
+async fn on_ci_every_limit_on_a_file_still_uploads_every_service() {
+    for reason in cloud_limits() {
+        offline_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = three_service_repo(tmp.path());
+        let storage = StubStorage::default();
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+            .await
+            .expect("a clean CI scan");
+        let first = storage.uploads().len();
+
+        carrick::agent_service::inject_mock_envelope(
+            "/analyze-file",
+            BETA_ONLY_ROUTE,
+            1,
+            &refusal_envelope(&reason),
+        );
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, true)
+            .await
+            .unwrap_or_else(|e| panic!("{reason}: a limit failed the CI run: {e}"));
+
+        assert_eq!(
+            landed_since(&storage, first),
+            ["alpha", "beta", "gamma"],
+            "{reason}: every service lands"
+        );
+        // The refusal reached the file, and was read as a refusal: beta's own
+        // upload says its file was not sent, which a lost file does not.
+        let beta = storage.latest("beta").unwrap();
+        let files_lost = &beta.boundary.as_ref().unwrap().files_lost;
+        assert!(
+            files_lost
+                .reasons
+                .iter()
+                .any(|r| r.contains("server.ts") && r.contains("not sent to the model")),
+            "{reason}: {files_lost:?}"
+        );
+    }
+}
+
+/// The same for a limit that refuses a service's framework detection, which
+/// defers the whole service to facts-only. On CI it fails no run: a first
+/// index lands every service, beta facts-only; once beta has an index, beta
+/// is held back so its index stays whole rather than thinner, the other two
+/// land, and the run still exits 0.
+#[tokio::test]
+#[serial]
+async fn on_ci_a_limit_on_detection_fails_no_run() {
+    for reason in cloud_limits() {
+        offline_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = three_service_repo(tmp.path());
+        let storage = StubStorage::default();
+
+        carrick::agent_service::inject_mock_envelope(
+            "/framework-detect",
+            BETA_ONLY_DEPENDENCY,
+            1,
+            &refusal_envelope(&reason),
+        );
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+            .await
+            .unwrap_or_else(|e| panic!("{reason}: a limit failed a first index: {e}"));
+        assert_eq!(
+            storage.uploaded_services(),
+            ["alpha", "beta", "gamma"],
+            "{reason}"
+        );
+        assert!(
+            storage.latest("beta").unwrap().cached_detection.is_none(),
+            "{reason}: the refused service is analysed facts-only"
+        );
+
+        let first = storage.uploads().len();
+        carrick::agent_service::inject_mock_envelope(
+            "/framework-detect",
+            BETA_ONLY_DEPENDENCY,
+            1,
+            &refusal_envelope(&reason),
+        );
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, true)
+            .await
+            .unwrap_or_else(|e| panic!("{reason}: a limit failed a CI rescan: {e}"));
+        assert_eq!(
+            landed_since(&storage, first),
+            ["alpha", "gamma"],
+            "{reason}: beta's index is kept, not thinned"
+        );
+    }
+}
+
 /// On CI the same failure lands services 1 and 3 and ends non-zero naming
 /// service 2, because the exit code is the only place CI can show it. A
 /// service that already has an index is held back rather than thinned.
