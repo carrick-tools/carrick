@@ -46,7 +46,7 @@ import { CODEX_HOOKS_FILE, uninstallCodexHooks } from "./codex.ts";
 import { removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
 import { removeNotice } from "./outdated.ts";
 import { removeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
-import { createOutput, DOCS, type InitOutput } from "./output.ts";
+import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 
 export type RemoveOptions = {
   workspace: string;
@@ -99,7 +99,7 @@ function help(): string {
     "    -w, --workspace DIR  The folder init was run in (default: this one)",
     "        --keep-login     Leave the saved credential; remove everything else",
     "",
-    `What each of those things is, and what it does: ${DOCS}`,
+    `What each of those things is, and what it does: ${DOCS_INIT_FILES}`,
   ].join("\n");
 }
 

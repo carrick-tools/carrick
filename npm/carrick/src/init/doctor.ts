@@ -37,7 +37,7 @@ import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { DEFAULTS, renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
-import { createOutput, DOCS, type InitOutput } from "./output.ts";
+import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 import {
   currentVersion,
   fetchLatest,
@@ -101,7 +101,7 @@ function help(): string {
     "",
     "    -w, --workspace DIR  The folder init was run in (default: this one)",
     "",
-    `What each of those things is, and what it does: ${DOCS}`,
+    `What each of those things is, and what it does: ${DOCS_INIT_FILES}`,
   ].join("\n");
 }
 

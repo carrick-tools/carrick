@@ -34,9 +34,11 @@ and continues, so a workflow decides its own version — and
 
 `init` prints one line per thing it did — `◇` done, `▲` a warning with what to
 do about it, `■` something it could not do and why — and ends on the sentence
-to paste to your agent. Everything else, including the editor extension, how
-the hooks deliver, the CI check and a `carrick.json` written by hand, is in the
-[quickstart](https://docs.carrick.tools/quickstart). Without a terminal — CI, an
+to paste to your agent. What it installs, the hooks included, is in the
+[CLI reference](https://docs.carrick.tools/cli#workspace-initialisation). The CI
+check and a `carrick.json` written by hand are in
+[Building the index](https://docs.carrick.tools/building-the-index), and the
+editor extension is in [In your editor](https://docs.carrick.tools/editor). Without a terminal — CI, an
 agent's shell, a pipe — the same lines are written as plain text, with no colour
 and no spinner.
 
