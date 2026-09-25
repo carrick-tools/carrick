@@ -323,9 +323,9 @@ fn declared_location(
 /// The advisory for every handler that switches on a request field and has no
 /// `operations` block declaring what it serves (carrick#831).
 ///
-/// One finding per (service, location, field): several tables on one field
-/// are one question with one `operations` block, so their values are merged in
-/// the order the tables state them. It carries the material a reader needs to
+/// One finding per (service, handler, location, field): several tables one
+/// handler states for one field are one question with one `operations`
+/// block, so their values are merged in the order the tables state them. It carries the material a reader needs to
 /// accept the model's reading rather than author it: the values, the route
 /// consumers name (when any do), and the call sites already stating a value.
 /// A field that IS declared produces nothing — the question it asks has been
@@ -348,9 +348,11 @@ pub fn dispatch_operation_findings(
             .unwrap_or_else(|| repo.repo_name.clone());
         let declared = declared_fields(repo);
 
-        // One group per (location, field), in the order the tables first
-        // name it, each carrying the union of the values its kept tables
-        // state and the consumers that name one of them.
+        // One group per handler and field, in the order the tables first name
+        // it, each carrying the union of the values its kept tables state and
+        // the consumers that name one of them. Two handlers switching on the
+        // same field are two dispatchers (two lambdas behind two routes), so
+        // they keep separate blocks.
         let mut groups: Vec<FieldGroup> = Vec::new();
         for table in tables {
             if declared.contains(&(table.location, table.field.clone())) {
@@ -360,13 +362,14 @@ pub fn dispatch_operation_findings(
             if !selects_the_operation(repo, table, !consumers.is_empty()) {
                 continue;
             }
-            let group = match groups
-                .iter_mut()
-                .position(|g| g.location == table.location && g.field == table.field)
-            {
+            let handler = handler_identity(table);
+            let group = match groups.iter_mut().position(|g| {
+                g.handler == handler && g.location == table.location && g.field == table.field
+            }) {
                 Some(index) => &mut groups[index],
                 None => {
                     groups.push(FieldGroup {
+                        handler,
                         location: table.location,
                         field: table.field.clone(),
                         values: Vec::new(),
@@ -415,13 +418,30 @@ pub fn dispatch_operation_findings(
     findings
 }
 
-/// The tables of one service that switch on one (location, field).
+/// The tables of one handler that switch on one (location, field).
 struct FieldGroup {
+    /// `(file, member name)` of the handler, from [`handler_identity`].
+    handler: (String, String),
     location: DispatchLocation,
     field: String,
     values: Vec<String>,
     /// `(call site, "METHOD path")` for each consumer call naming a value.
     consumers: Vec<(String, Option<String>)>,
+}
+
+/// Which handler a table is about: its file and the member name of the
+/// function it names, so `NoticesService.create` and `create` in one file are
+/// one handler. A table with no handler name is keyed by its file alone.
+fn handler_identity(table: &DispatchTable) -> (String, String) {
+    (
+        table.file_path.trim_start_matches("./").to_string(),
+        table
+            .handler_name
+            .as_deref()
+            .map(member_name)
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 /// Every call in ANOTHER service that states a value of this table for this
@@ -498,15 +518,21 @@ fn selects_the_operation(
     let Some(handler) = table.handler_name.as_deref() else {
         return true;
     };
-    let routed = repo.endpoints.iter().any(|endpoint| {
-        endpoint
-            .handler_name
-            .as_deref()
-            .is_some_and(|name| member_name(name) == member_name(handler))
-            && same_file(&location_file(&endpoint.file_path), &table.file_path)
-    });
-    if routed {
-        return repo.endpoints.iter().any(|endpoint| {
+    // This handler's OWN route rows. A dispatch on the same field on some
+    // other route of the service says nothing about this handler.
+    let own_routes: Vec<&crate::analyzer::ApiEndpointDetails> = repo
+        .endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint
+                .handler_name
+                .as_deref()
+                .is_some_and(|name| member_name(name) == member_name(handler))
+                && same_file(&location_file(&endpoint.file_path), &table.file_path)
+        })
+        .collect();
+    if !own_routes.is_empty() {
+        return own_routes.iter().any(|endpoint| {
             endpoint
                 .dispatch
                 .as_ref()
@@ -520,12 +546,16 @@ fn selects_the_operation(
     !handlers.iter().any(|key| {
         let definition = &repo.function_definitions[key];
         let file = definition.file_path.to_string_lossy();
-        repo.function_definitions.values().any(|caller| {
-            caller
-                .calls
-                .iter()
-                .any(|edge| edge.line_number == definition.line_number && edge.file_path == file)
-        })
+        repo.function_definitions
+            .iter()
+            // A function calling itself is recursion, not a caller: a
+            // recursive entry point is still where the request arrives.
+            .filter(|(caller_key, _)| *caller_key != key)
+            .any(|(_, caller)| {
+                caller.calls.iter().any(|edge| {
+                    edge.line_number == definition.line_number && edge.file_path == file
+                })
+            })
     })
 }
 
@@ -1133,11 +1163,51 @@ mod tests {
         assert_eq!(route, &None, "no consumer names a route");
     }
 
-    /// Several tables on one field are one question with one block: the
-    /// advisory is one per (service, location, field), values merged in the
-    /// order the tables state them.
+    fn values_of(finding: &crate::findings::Finding) -> Vec<String> {
+        let crate::findings::Finding::DispatchOperations { values, .. } = finding else {
+            panic!("expected a dispatch_operations finding: {finding:?}");
+        };
+        values.clone()
+    }
+
+    /// Several tables one handler states for one field are one question with
+    /// one block, values merged in the order the tables state them. The
+    /// member name and the index's `Class.member` name are one handler.
     #[test]
-    fn tables_on_one_field_are_one_block() {
+    fn one_handlers_tables_on_one_field_are_one_block() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![
+                switch_on(
+                    "action",
+                    &["archive", "publish"],
+                    "run",
+                    "/repo/src/a.ts",
+                    5,
+                ),
+                switch_on(
+                    "action",
+                    &["publish", "retire"],
+                    "Jobs.run",
+                    "/repo/src/a.ts",
+                    5,
+                ),
+            ]),
+        );
+        repo.function_definitions = std::collections::HashMap::from([(
+            "Jobs.run".to_string(),
+            function("Jobs.run", "/repo/src/a.ts", 5),
+        )]);
+
+        let findings = dispatch_operation_findings(&[repo]);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(values_of(&findings[0]), ["archive", "publish", "retire"]);
+    }
+
+    /// Two routeless lambdas switching on `action` are two dispatchers behind
+    /// two routes: two blocks, each with its own values.
+    #[test]
+    fn two_handlers_on_one_field_keep_separate_blocks() {
         let mut repo = blob(
             "jobs",
             Some(vec![
@@ -1163,11 +1233,56 @@ mod tests {
         ]);
 
         let findings = dispatch_operation_findings(&[repo]);
-        assert_eq!(findings.len(), 1, "{findings:#?}");
-        let crate::findings::Finding::DispatchOperations { values, .. } = &findings[0] else {
-            panic!("expected a dispatch_operations finding: {:?}", findings[0]);
-        };
-        assert_eq!(values, &["archive", "publish", "retire"]);
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert_eq!(values_of(&findings[0]), ["archive", "publish"]);
+        assert_eq!(values_of(&findings[1]), ["publish", "retire"]);
+    }
+
+    /// A recursive entry point calls itself; that is not a caller, and it is
+    /// still where the request arrives.
+    #[test]
+    fn a_recursive_entry_point_is_still_an_entry_point() {
+        let plain = function("handler", "/repo/src/a.ts", 5);
+        let recursive = calling(plain.clone(), &plain);
+        let mut repo = blob(
+            "jobs",
+            Some(vec![switch_on(
+                "action",
+                &["archive", "publish"],
+                "handler",
+                "/repo/src/a.ts",
+                5,
+            )]),
+        );
+        repo.function_definitions =
+            std::collections::HashMap::from([("handler".to_string(), recursive)]);
+
+        assert_eq!(dispatch_operation_findings(&[repo]).len(), 1);
+    }
+
+    /// A routed handler with plain rows is not made a dispatcher by a
+    /// dispatch on the same field on ANOTHER route of the service.
+    #[test]
+    fn another_routes_dispatch_does_not_admit_a_routed_handler() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![switch_on(
+                "action",
+                &["archive", "publish"],
+                "create",
+                "/repo/src/notices.ts",
+                3,
+            )]),
+        );
+        repo.endpoints
+            .push(route("create", "/repo/src/notices.ts:3", None));
+        repo.endpoints.push(route(
+            "run",
+            "/repo/src/jobs.ts:9",
+            Some(body("action", "archive")),
+        ));
+
+        assert!(dispatch_operation_findings(&[repo]).is_empty());
     }
 
     /// A routed handler whose rows extraction marked with the dispatch is the
