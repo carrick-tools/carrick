@@ -46,7 +46,9 @@ dependencies it does not list. No package is installed: the scan only needs
 | `streaming.service.ts:13` | `queueNote` calls through a namespace import of a package |
 | `streaming.service.ts:14` | `SnapshotPublisher` constructs a package object with arguments in its body, beside a push onto its own list |
 
-With the detection lists empty, every row above except `billing.service.ts:18`
-and the `inventory.reserved` pair still stays: the listener file raises no
-candidate then, and `billing.service.ts:18` is the no-argument transport that
-only detection can name.
+With the detection lists empty, the `inventory.reserved` pair, the
+`streaming.service.ts` rows and `billing.service.ts:18` are the only rows
+above that go. The listener file and `streaming.service.ts` raise no candidate
+then, so the model is not asked about them and there is no row, and
+`billing.service.ts:18` is the no-argument transport that only detection can
+name. Every other kept row stays.

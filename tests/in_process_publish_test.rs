@@ -176,13 +176,6 @@ fn kept_whatever_detection_says() -> Vec<Row> {
         // In-process, but an emitter in the service listens for the topic.
         call("invoice.refunded", &format!("{BILLING}:23")),
         endpoint("invoice.refunded", &format!("{REFUNDS}:5")),
-        // A method the wrapper inherits from a package class.
-        call("invoice.streamed", &format!("{STREAMING}:12")),
-        // A call through a namespace import of a package.
-        call("invoice.noted", &format!("{STREAMING}:13")),
-        // A package object constructed with arguments inside the body, beside
-        // a push onto the class's own list.
-        call("invoice.snapshotted", &format!("{STREAMING}:14")),
     ]
 }
 
@@ -190,6 +183,17 @@ fn kept_whatever_detection_says() -> Vec<Row> {
 fn kept() -> Vec<Row> {
     let mut rows = kept_whatever_detection_says();
     rows.extend([
+        // Kept by rules that read the code too. Their file raises no candidate
+        // when the detection lists are empty, so the model is not asked about
+        // it then and there is no row to keep.
+        //
+        // A method the wrapper inherits from a package class.
+        call("invoice.streamed", &format!("{STREAMING}:12")),
+        // A call through a namespace import of a package.
+        call("invoice.noted", &format!("{STREAMING}:13")),
+        // A package object constructed with arguments inside the body, beside
+        // a push onto the class's own list.
+        call("invoice.snapshotted", &format!("{STREAMING}:14")),
         // A package detection lists as a messaging client, constructed with
         // no arguments.
         call("invoice.charged", &format!("{BILLING}:18")),
