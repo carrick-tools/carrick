@@ -109,6 +109,7 @@ function monorepoProposal(workspace: string): Record<string, unknown> {
           })),
         },
         warnings: [],
+        not_installed: [],
       },
     ],
   };
@@ -225,7 +226,7 @@ const monorepo = ${JSON.stringify(derived === "monorepo")};
 const proposal = monorepo ? ${JSON.stringify(monorepoProposal("WORKSPACE"))} : {
   schema: "carrick.derive/0", workspace, repos_detected_by: "single repository",
   repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
-  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: null }], config: null, warnings: [] }],
+  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: null }], config: null, warnings: [], not_installed: [] }],
 };
 process.stdout.write(JSON.stringify(proposal).replaceAll("WORKSPACE", workspace));
 `);
@@ -711,6 +712,27 @@ test("a failed derive reaches the caller whole, with the scanner's own prefix re
   }
 });
 
+// carrick#1489 review: `not_installed` ships with the binary that fills it,
+// so a document without it is a mismatched install, refused as one rather
+// than read as "nothing to install".
+test("a derive document without not_installed is refused as a mismatched install", posixNativeFixture, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-derive-"));
+  const restoreEnv = withEnv({ CARRICK_BIN: path.join(dir, "native.mjs") });
+  try {
+    const document = {
+      schema: "carrick.derive/0", workspace: dir, repos_detected_by: "single repository",
+      repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
+      repos: [{ path: dir, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [] }],
+    };
+    fs.writeFileSync(path.join(dir, "native.mjs"), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(document))});\n`);
+    fs.chmodSync(path.join(dir, "native.mjs"), 0o755);
+    assert.throws(() => deriveWorkspace(dir), /unsupported workspace proposal/);
+  } finally {
+    restoreEnv();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // carrick#993 row 8. An unverified `--project` used to exit 1 before the hooks
 // and the proposal were written, so the documented command needed two runs:
 // one to be told to open a browser, another to get the setup it came for. It
@@ -833,8 +855,8 @@ process.stdout.write(JSON.stringify({
   schema: "carrick.derive/0", workspace, repos_detected_by: "sibling repositories",
   repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
   repos: [
-    { path: ${JSON.stringify(made["api"])}, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [] },
-    { path: ${JSON.stringify(made["web"])}, reason: "npm workspaces", services: [{ serviceName: "web" }, { serviceName: "admin" }], config: null, warnings: [] },
+    { path: ${JSON.stringify(made["api"])}, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [], not_installed: [] },
+    { path: ${JSON.stringify(made["web"])}, reason: "npm workspaces", services: [{ serviceName: "web" }, { serviceName: "admin" }], config: null, warnings: [], not_installed: [] },
   ],
 }));
 `);
@@ -1075,7 +1097,8 @@ test("the executable CLI creates the named project and puts the repos in it", po
     assert.match(result.stdout, /^ {2}Default \(default\) {2}1 repo$/m);
     assert.match(result.stdout, /^◇ Created project payments$/m);
     assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
-    // The move is made, and not announced (carrick#1489 part 3.3).
+    // The move is made. The repo was in a project somebody chose, so it is
+    // said, once (carrick#1489 review).
     assert.deepEqual(fixture.requests().filter((request) => request !== "list-projects"), [
       "resolve-repos acme/api",
       "create-project",
@@ -1084,7 +1107,11 @@ test("the executable CLI creates the named project and puts the repos in it", po
       "assign-repos acme/api",
       "resolve-repos acme/api",
     ]);
-    assert.doesNotMatch(result.stdout, /Moved acme\/api/);
+    assert.equal(
+      result.stdout.split("\n").filter((line) => line === "Moved acme/api from Acme Default (default-project) into payments.").length,
+      1,
+      result.stdout,
+    );
     // The move is named in the summary, with the project it comes out of, and
     // it is named BEFORE the request that performs it.
     const proposed = result.stdout.indexOf("acme/api  moves from Acme Default (default-project)");
@@ -1888,7 +1915,7 @@ const workspace = argv[argv.indexOf("--workspace") + 1];
 process.stdout.write(JSON.stringify({
   schema: "carrick.derive/0", workspace, repos_detected_by: "single repository",
   repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
-  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [] }],
+  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [], not_installed: [] }],
 }));
 `);
   fs.chmodSync(native, 0o755);
@@ -2004,7 +2031,7 @@ test("--yes leaves one question, and it is the move", async () => {
  * repos the new project took, the cloud before it says nothing, and there the
  * App grant put the repo in a default project that init then moves it out of.
  */
-function firstRunRepo(claims: "adopts" | "before-1359"): {
+function firstRunRepo(claims: "adopts" | "before-1359" | "read-fails"): {
   repo: string;
   asked: string[];
   restore: () => void;
@@ -2041,7 +2068,7 @@ process.stdout.write(JSON.stringify({
   // is accepted the App has connected it.
   let where: "unconnected" | "staged" | "default" | "acme" = "unconnected";
   const installed = (): void => {
-    if (where === "unconnected") where = claims === "adopts" ? "staged" : "default";
+    if (where === "unconnected") where = claims === "before-1359" ? "default" : "staged";
   };
   let reads = 0;
   globalThis.fetch = (async (_input: string, init: { body: string }) => {
@@ -2051,6 +2078,8 @@ process.stdout.write(JSON.stringify({
     // being answered.
     if (body.action !== "resolve-repos" || reads > 0) installed();
     if (body.action === "resolve-repos") {
+      // The network goes away after the questions are answered.
+      if (claims === "read-fails" && reads > 0) throw new TypeError("fetch failed");
       reads += 1;
       const connected = where === "default" || where === "acme";
       return Response.json({
@@ -2071,7 +2100,7 @@ process.stdout.write(JSON.stringify({
       if (took > 0) where = "acme";
       return Response.json({
         schema: "carrick.create-project/0",
-        project: claims === "adopts"
+        project: claims !== "before-1359"
           ? { slug: body.slug, name: body.name, archived: false, repo_count: took }
           : { slug: body.slug, name: body.name, archived: false },
       });
@@ -2173,6 +2202,33 @@ for (const claims of ["adopts", "before-1359"] as const) {
     }
   });
 }
+
+// carrick#1489 review: the read after the yes used to run before anything was
+// written, so a network error there exited 1 with no proposal and no hooks.
+// The local files come first now, and a failed read is one line saying what
+// is left.
+test("a workspace read that fails after the yes leaves the setup written and exits 0", async () => {
+  const fixture = firstRunRepo("read-fails");
+  try {
+    const out = recordingOutput({
+      pick: async (_question, options) => options.find((option) => option.label === "New project")!.value,
+      ask: async () => "Acme",
+      confirm: async (question) => !question.startsWith("Install carrick"),
+    });
+    assert.equal(await initWith([fixture.repo], out, true), 0, out.lines.join("\n"));
+    assert.ok(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)));
+    assert.ok(fs.existsSync(path.join(fixture.repo, CODEX_HOOKS_FILE)));
+    assert.ok(
+      out.lines.includes(
+        "▲ Could not reach Carrick to verify the workspace. Check the connection and retry. The files here are written; run carrick init again to verify the connection and the project.",
+      ),
+      out.lines.join("\n"),
+    );
+    assert.equal(out.lines.at(-1)?.startsWith("Next: paste this to your agent"), true, out.lines.join("\n"));
+  } finally {
+    fixture.restore();
+  }
+});
 
 test("the plain rendering is one line per thing, with no colour and no box", () => {
   const written: string[] = [];

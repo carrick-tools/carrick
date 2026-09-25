@@ -731,6 +731,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   let decision: ProjectChoice;
   // The repos this run has permission to take out of another project.
   const movable = new Set<string>();
+  // The ones among them that sit in a project somebody chose, at the read the
+  // proposal was built from. Their move is said; a repo the App grant has
+  // just put in the default project is not (carrick#1489).
+  const announced = new Set<string>();
   // The directory names this run leaves out, for the workspace file below.
   let deselected: string[] = [];
   // The editors outside this workspace the answer covers, settled before it.
@@ -980,6 +984,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       }
     }
     for (const name of [...moving, ...joining]) movable.add(name.toLowerCase());
+    for (const name of moving) announced.add(name.toLowerCase());
   } catch (error) {
     // A question the reader ended stops the run where it stands. Nothing above
     // this line writes, so there is nothing to undo (carrick#1338).
@@ -1003,9 +1008,9 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // What the reader still has to do, said once at the end rather than between
   // the steps (carrick#1489).
   const todo: string[] = [];
-  let workspaceSlug: string;
+  let workspaceSlug = initial.workspace.slug;
+  let projectExists = decision.exists;
   try {
-    let projectExists = decision.exists;
     if (decision.create && project !== null) {
       const outcome = await createProject(credential.token, project, decision.name ?? project);
       if (outcome.kind === "created") {
@@ -1020,46 +1025,6 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
         out.warn(`Carrick did not create ${label(project)}: ${outcome.message}`);
       }
     }
-    // Read again, now. The read the questions were answered from can be
-    // minutes old — the App is often installed in another tab while init
-    // waits at a prompt — and a first project may have just taken the repos.
-    // The connection lines used to come from the old read, and sent a reader
-    // to the grant page for repos that were already connected (carrick#1489).
-    const current = await resolveRepos(credential.token, names);
-    const identity = await connectRepos(credential.token, names, current, {
-      interactive,
-      project: project ?? undefined,
-      projectExists,
-      movable,
-      label,
-      say: out.say,
-      track: (text, work, report) => out.step(text, work, report),
-    });
-    workspaceSlug = identity.workspace.slug;
-    if (project !== null && !reposAreInProject(identity, names, project)) {
-      // An unverified project does not end the run, whether it was named on
-      // the command line or picked here. Stopping cost someone their hooks and
-      // their proposal for a browser step they could only take afterwards, and
-      // the documented command then needed two runs (carrick#993 row 8).
-      todo.push(
-        `Finish the browser steps above to put these repos in ${label(project)}, then run carrick init --project ${project} again to verify.`,
-      );
-    }
-    // After a wait that was stopped, the grant is still the thing to do, and
-    // the line that said so is above the wait.
-    const unconnected = unconnectedRepos(identity, names);
-    if (interactive && unconnected.length > 0) {
-      todo.push(connectLine(unconnected, names.length, workspaceUrls(identity.workspace.slug).connect));
-    }
-    if (identity.allowance_sentence) out.say(identity.allowance_sentence);
-    for (const repo of identity.repos) {
-      if (repo.connected && repo.services.length > 0) hostedIndex.push(repo.full_name);
-    }
-    // The rest of the project, which this machine does not hold. Carrick
-    // answers across every repo in a project, so a folder holding half of one
-    // is a partial index and nothing here would otherwise say so
-    // (carrick#993 row 18).
-    todo.push(...absentRepos(identity, names, project, label));
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
@@ -1081,7 +1046,6 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
   }
-
   // The agent hooks, merged by command: this file may already hold a user's
   // own hooks, or the hook pack the hosted index installs. And the MCP
   // connection, for work that crosses repos this machine does not hold,
@@ -1181,6 +1145,59 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // written for two of them (carrick#1489).
   if (!mcp.some((outcome) => outcome.client === "Claude Code")) {
     todo.push(`No claude command on this machine, so Claude Code has no Carrick MCP server. Once it is installed: ${mcpLine()}`);
+  }
+
+  // The connection, last of the steps that talk to Carrick, so a read that
+  // fails costs nothing already decided: the files above are written
+  // (carrick#1489 review).
+  //
+  // Read again, now. The read the questions were answered from can be minutes
+  // old — the App is often installed in another tab while init waits at a
+  // prompt — and a first project may have just taken the repos. The
+  // connection lines used to come from the old read, and sent a reader to the
+  // grant page for repos that were already connected (carrick#1489).
+  try {
+    const current = await resolveRepos(credential.token, names);
+    const identity = await connectRepos(credential.token, names, current, {
+      interactive,
+      project: project ?? undefined,
+      projectExists,
+      movable,
+      announce: announced,
+      label,
+      say: out.say,
+      track: (text, work, report) => out.step(text, work, report),
+    });
+    workspaceSlug = identity.workspace.slug;
+    if (project !== null && !reposAreInProject(identity, names, project)) {
+      // An unverified project does not end the run, whether it was named on
+      // the command line or picked here. Stopping cost someone their hooks and
+      // their proposal for a browser step they could only take afterwards, and
+      // the documented command then needed two runs (carrick#993 row 8).
+      todo.push(
+        `Finish the browser steps above to put these repos in ${label(project)}, then run carrick init --project ${project} again to verify.`,
+      );
+    }
+    // After a wait that was stopped, the grant is still the thing to do, and
+    // the line that said so is above the wait.
+    const unconnected = unconnectedRepos(identity, names);
+    if (interactive && unconnected.length > 0) {
+      todo.push(connectLine(unconnected, names.length, workspaceUrls(identity.workspace.slug).connect));
+    }
+    if (identity.allowance_sentence) out.say(identity.allowance_sentence);
+    for (const repo of identity.repos) {
+      if (repo.connected && repo.services.length > 0) hostedIndex.push(repo.full_name);
+    }
+    // The rest of the project, which this machine does not hold. Carrick
+    // answers across every repo in a project, so a folder holding half of one
+    // is a partial index and nothing here would otherwise say so
+    // (carrick#993 row 18).
+    todo.push(...absentRepos(identity, names, project, label));
+  } catch (error) {
+    // The server's own sentence says what failed; this one says what is left.
+    todo.push(
+      `${(error as Error).message} The files here are written; run carrick init again to verify the connection and the project.`,
+    );
   }
 
   // What is set up, in one line; then the index; then what is left to do;

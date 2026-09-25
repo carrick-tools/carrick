@@ -200,8 +200,8 @@ test("the requested repos are placed from here, and the claim still comes from t
 
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
-  // A move the reader allowed is not announced: the first one is the App
-  // grant's default project handing the repo over (carrick#1489 part 3.3).
+  // A move out of a project nobody chose (the App grant's default) is not
+  // announced (carrick#1489 part 3.3).
   assert.deepEqual(lines, []);
   // The browser step this replaces is not printed at all.
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
@@ -325,6 +325,48 @@ test("assignment happens when the poll sees the repo, not before", async () => {
   assert.equal(lines.at(-1), "1 repo connected, in payments");
   assert.doesNotMatch(lines.join("\n"), /Moved|currently in project/);
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
+});
+
+// carrick#1489 review: the silence is for a move out of an untouched default.
+// A repo the reader moved out of a project somebody chose gets its one line,
+// naming both projects.
+test("a consented move out of a chosen project is said, once", async () => {
+  const lines: string[] = [];
+  await connectRepos("token", ["acme/api"], assignedToDefault, {
+    interactive: false,
+    project: "payments",
+    projectExists: true,
+    movable: new Set(["acme/api"]),
+    announce: new Set(["acme/api"]),
+    label: (slug) => (slug === "payments" ? "Payments (payments)" : `Acme Default (${slug})`),
+    say: (line) => lines.push(line),
+    assign: async (repos) => moved(repos, "payments"),
+    poll: async () => assignedToPayments,
+  });
+  assert.deepEqual(lines, ["Moved acme/api from Acme Default (default-project) into Payments (payments)."]);
+});
+
+// carrick#1489 review: the owner-or-admin sentence is about a browser step,
+// so a wait on placements this run makes itself does not print it.
+test("a wait with no browser step does not say who can finish one", async () => {
+  const lines: string[] = [];
+  const opened: string[] = [];
+  const controller = new AbortController();
+  await connectRepos("token", ["acme/api"], assignedToDefault, {
+    interactive: true,
+    project: "payments",
+    projectExists: true,
+    movable: new Set(["acme/api"]),
+    signal: controller.signal,
+    say: (line) => lines.push(line),
+    open: async (url) => { opened.push(url); return true; },
+    // Placed, but the read has not caught up yet.
+    assign: async (repos) => moved(repos, "payments"),
+    poll: async () => assignedToDefault,
+    wait: async () => { controller.abort(); },
+  });
+  assert.ok(!lines.includes(ADMIN_WAIT), lines.join("\n"));
+  assert.deepEqual(opened, []);
 });
 
 // carrick#1489 part 3.1. The grant page re-asks GitHub for the whole repo

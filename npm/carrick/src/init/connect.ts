@@ -34,6 +34,12 @@ type ConnectOptions = {
    * the grant finishing rather than a move out of a project anyone chose.
    */
   movable?: Set<string>;
+  /**
+   * The movable repos whose move is said, lowercased: the ones in a project
+   * somebody chose. A repo the App grant has just put in the default project
+   * moves silently, because nobody chose where it was (carrick#1489).
+   */
+  announce?: Set<string>;
   /** How a project is printed: display name beside slug, where one is known. */
   label?: (slug: string) => string;
   open?: (url: string) => Promise<boolean>;
@@ -189,6 +195,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   const project = options.project;
   const label = options.label ?? ((slug: string) => slug);
   const movable = options.movable ?? new Set<string>();
+  const announce = options.announce ?? new Set<string>();
   const track = options.track ?? plainTrack(options.say);
   const assign =
     options.assign ??
@@ -232,8 +239,18 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
     }
     let moved = false;
     for (const repo of outcome.repos) {
-      if (repo.assigned) moved = moved || repo.moved;
-      else report(`${repo.full_name} was not moved: ${repo.reason ?? "Carrick gave no reason."}`);
+      if (!repo.assigned) {
+        report(`${repo.full_name} was not moved: ${repo.reason ?? "Carrick gave no reason."}`);
+        continue;
+      }
+      moved = moved || repo.moved;
+      const row = identity.repos.find(
+        (candidate) => candidate.full_name.toLowerCase() === repo.full_name.toLowerCase(),
+      );
+      const from = row?.connected === true ? row.project_slug : null;
+      if (repo.moved && from && announce.has(repo.full_name.toLowerCase())) {
+        report(`Moved ${repo.full_name} from ${label(from)} into ${label(project)}.`);
+      }
     }
     return moved;
   };
@@ -289,8 +306,6 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
     }
     return latest;
   }
-  options.say(ADMIN_WAIT);
-
   // Where the browser is pointed: at the project it must create, else at the
   // grant — only where a repo really is unconnected — else, only where this
   // run cannot place them itself, at the page that moves them.
@@ -302,7 +317,12 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
         : byHand(latest)
           ? urls.repos
           : null;
-  if (target !== null) void (options.open ?? openBrowser)(target).catch(() => false);
+  // Who can finish a browser step, said only where there is one: a wait on
+  // placements this run makes itself has nothing for an owner to do.
+  if (target !== null) {
+    options.say(ADMIN_WAIT);
+    void (options.open ?? openBrowser)(target).catch(() => false);
+  }
 
   /** Where the wait stands, as one line. */
   const status = (identity: ResolvedRepos): string => {
