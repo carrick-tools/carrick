@@ -135,6 +135,7 @@ const LISTENER: &str = "src/inventory/inventory.listener.ts";
 const SHIPPING: &str = "src/shipping/shipping.service.ts";
 const BILLING: &str = "src/billing/billing.service.ts";
 const REFUNDS: &str = "src/billing/refunds.listener.ts";
+const STREAMING: &str = "src/billing/streaming.service.ts";
 
 /// Rows that stay whatever framework detection lists: each is kept by a rule
 /// that reads the code, not the detection step.
@@ -175,6 +176,13 @@ fn kept_whatever_detection_says() -> Vec<Row> {
         // In-process, but an emitter in the service listens for the topic.
         call("invoice.refunded", &format!("{BILLING}:23")),
         endpoint("invoice.refunded", &format!("{REFUNDS}:5")),
+        // A method the wrapper inherits from a package class.
+        call("invoice.streamed", &format!("{STREAMING}:12")),
+        // A call through a namespace import of a package.
+        call("invoice.noted", &format!("{STREAMING}:13")),
+        // A package object constructed with arguments inside the body, beside
+        // a push onto the class's own list.
+        call("invoice.snapshotted", &format!("{STREAMING}:14")),
     ]
 }
 

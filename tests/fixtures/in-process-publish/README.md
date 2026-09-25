@@ -42,6 +42,9 @@ dependencies it does not list. No package is installed: the scan only needs
 | `billing.service.ts:22` | `LedgerFeed` is in-memory, but `RemoteLedgerFeed` implements it with a network call |
 | `billing.service.ts:23`, `refunds.listener.ts:5` | in-process, but an emitter in the service listens for the topic |
 | `billing.service.ts:24` (`invoice.scheduled`) | the model placed line 20's row on line 24, whose call publishes a different topic |
+| `streaming.service.ts:12` | `StreamBus` calls a method it inherits from a package class |
+| `streaming.service.ts:13` | `queueNote` calls through a namespace import of a package |
+| `streaming.service.ts:14` | `SnapshotPublisher` constructs a package object with arguments in its body, beside a push onto its own list |
 
 With the detection lists empty, every row above except `billing.service.ts:18`
 and the `inventory.reserved` pair still stays: the listener file raises no
