@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
 import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE, SCOPE } from "../src/auth/credentials.ts";
-import { authorize, type OAuthOptions } from "../src/auth/oauth.ts";
+import { authorize, callbackPage, type OAuthOptions } from "../src/auth/oauth.ts";
 import { resolveRepos } from "../src/auth/read.ts";
 
 test("credentials are private, replaced atomically, overridden only by CARRICK_TOKEN and removed locally", () => {
@@ -59,6 +59,8 @@ test("resolve rejects an old 200 schema, reauth on 401, and does not echo server
   }), payload);
 });
 
+const RESOLVED = { schema: "carrick.resolve-repos/0", workspace: { slug: "acme", billing_tier: "free", installed: true }, allowance_sentence: null, repos: [], project_repos: [] };
+
 test("loopback login binds state, S256, resource and redirect to the token exchange", async () => {
   let authorization: URL;
   let redirect = "";
@@ -67,6 +69,7 @@ test("loopback login binds state, S256, resource and redirect to the token excha
     timeoutMs: 3000,
     say: () => {},
     fetch: async (input, options) => {
+      if (String(input).endsWith("/types/check-or-upload")) return Response.json(RESOLVED);
       if (String(input).endsWith("/oauth/register")) {
         const body = JSON.parse(options?.body as string);
         assert.equal(body.client_name, "Carrick CLI");
@@ -107,6 +110,121 @@ test("loopback login binds state, S256, resource and redirect to the token excha
   assert.equal(token, "issued");
   assert.equal(exchanges, 1);
   await assert.rejects(fetch(redirect));
+});
+
+/**
+ * Drive one browser round trip against `authorize` and keep the page the
+ * browser was shown. `callback` builds the query from the state and redirect.
+ */
+async function roundTrip(
+  callback: (state: string) => string,
+  reply: (url: string, events: string[], signal?: AbortSignal | null) => Response | Promise<Response>,
+  extra: Partial<OAuthOptions> = {},
+): Promise<{ outcome: PromiseSettledResult<string>; status: number; type: string | null; html: string; events: string[] }> {
+  const events: string[] = [];
+  let redirect = "";
+  let page: Promise<Response> | undefined;
+  const outcome = (await Promise.allSettled([authorize({
+    timeoutMs: 3000, say: () => {}, ...extra,
+    fetch: async (input, options) => {
+      const url = String(input);
+      if (url.endsWith("/oauth/register")) {
+        redirect = JSON.parse(options?.body as string).redirect_uris[0];
+        return Response.json({ client_id: "client" });
+      }
+      // A slow server: a page sent before the exchange would arrive first.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      events.push(url.endsWith("/oauth/token") ? "exchange" : "lookup");
+      return reply(url, events, options?.signal);
+    },
+    open: async (value) => {
+      page = fetch(`${redirect}?${callback(new URL(value).searchParams.get("state")!)}`)
+        .then((response) => { events.push("page"); return response; });
+      return true;
+    },
+  })]))[0]!;
+  const response = await page!;
+  const html = await response.text();
+  return { outcome, status: response.status, type: response.headers.get("content-type"), html, events };
+}
+
+const issued = (url: string): Response => url.endsWith("/oauth/token")
+  ? Response.json({ access_token: "issued", token_type: "Bearer", scope: SCOPE })
+  : Response.json(RESOLVED);
+
+test("the callback page answers after the exchange and names the workspace", async () => {
+  const run = await roundTrip((state) => `code=accepted&state=${state}`, issued);
+  assert.equal(run.outcome.status, "fulfilled");
+  assert.equal(run.status, 200);
+  assert.match(run.type ?? "", /^text\/html/);
+  assert.deepEqual(run.events, ["exchange", "lookup", "page"]);
+  assert.match(run.html, /<h1>Signed in to acme<\/h1>/);
+  assert.match(run.html, /You can close this tab\. Next, run <code>carrick init<\/code> in the folder that holds your repos\./);
+  assert.doesNotMatch(run.html, /<link|<script|<img|src=|href=/);
+});
+
+test("a failed workspace lookup keeps the token and still says signed in", async () => {
+  const run = await roundTrip((state) => `code=accepted&state=${state}`, (url) => url.endsWith("/oauth/token") ? issued(url) : new Response("{}", { status: 503 }));
+  assert.equal(run.outcome.status === "fulfilled" && run.outcome.value, "issued");
+  assert.match(run.html, /<h1>Signed in to Carrick<\/h1>/);
+});
+
+test("a hung workspace lookup is bounded and the page goes out without the name", async () => {
+  const started = Date.now();
+  const run = await roundTrip((state) => `code=accepted&state=${state}`, (url, _events, signal) => url.endsWith("/oauth/token")
+    ? issued(url)
+    // Never answers; only the caller's signal ends it.
+    : new Promise<Response>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  { lookupTimeoutMs: 100 });
+  assert.equal(run.outcome.status === "fulfilled" && run.outcome.value, "issued");
+  assert.match(run.html, /<h1>Signed in to Carrick<\/h1>/);
+  assert.ok(Date.now() - started < 2000, "the lookup bound, not the login timeout, released the page");
+});
+
+test("a failed exchange shows the failure and the retry on the page", async () => {
+  const run = await roundTrip((state) => `code=accepted&state=${state}`, () => new Response("secret", { status: 500 }));
+  assert.equal(run.outcome.status, "rejected");
+  assert.equal(run.status, 400);
+  assert.match(run.html, /<h1>Sign-in failed<\/h1>/);
+  assert.match(run.html, /Carrick token exchange failed \(HTTP 500\)\. Run <code>carrick login<\/code> again\./);
+  assert.doesNotMatch(run.html, /secret|accepted/);
+});
+
+test("declined, invalid and missing-code callbacks get the same page with their own message", async () => {
+  const declined = await roundTrip((state) => `error=access_denied&state=${state}`, issued);
+  assert.equal(declined.outcome.status, "rejected");
+  assert.deepEqual(declined.events, ["page"]);
+  assert.match(declined.type ?? "", /^text\/html/);
+  assert.match(declined.html, /<h1>Sign-in declined<\/h1>[\s\S]*Carrick authorization was declined\. Run <code>carrick login<\/code> again\./);
+
+  let redirect = "";
+  const pages: string[] = [];
+  await assert.rejects(authorize({
+    timeoutMs: 300, say: () => {},
+    fetch: async (_url, options) => {
+      redirect = JSON.parse(options?.body as string).redirect_uris[0];
+      return Response.json({ client_id: "client" });
+    },
+    open: async (value) => {
+      const state = new URL(value).searchParams.get("state");
+      for (const query of ["code=x&state=wrong", `state=${state}`]) {
+        const response = await fetch(`${redirect}?${query}`);
+        assert.equal(response.status, 400);
+        assert.match(response.headers.get("content-type") ?? "", /^text\/html/);
+        pages.push(await response.text());
+      }
+      return true;
+    },
+  }), /timed out/);
+  assert.match(pages[0]!, /<h1>Sign-in failed<\/h1>[\s\S]*not a valid sign-in link/);
+  assert.match(pages[1]!, /<h1>Sign-in failed<\/h1>[\s\S]*no authorization code/);
+});
+
+test("the callback page escapes what it interpolates", () => {
+  const html = callbackPage(`Signed in to <script>"x"</script>`, "a & 'b' `<i>`");
+  assert.doesNotMatch(html, /<script>|<i>/);
+  assert.match(html, /&lt;script&gt;&quot;x&quot;&lt;\/script&gt;/);
+  assert.match(html, /a &amp; &#39;b&#39; <code>&lt;i&gt;<\/code>/);
 });
 
 test("login asks for the cli scope, records it, and refuses a token minted under another", async () => {

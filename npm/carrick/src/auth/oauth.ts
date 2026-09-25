@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { APP_BASE, API_BASE, SCOPE } from "./credentials.ts";
+import { resolveRepos } from "./read.ts";
 
 /** Launch a URL as an argument, never through a shell. */
 export async function openBrowser(url: string): Promise<boolean> {
@@ -19,8 +20,48 @@ export type OAuthOptions = {
   open?: (url: string) => Promise<boolean>;
   say?: (message: string) => void;
   timeoutMs?: number;
+  /** Bound on the workspace lookup that names the page. Default 3 s. */
+  lookupTimeoutMs?: number;
   signal?: AbortSignal;
 };
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/**
+ * The page the browser lands on after the loopback redirect (carrick#1488).
+ * Self-contained: inline CSS, no external assets. Kept deliberately plain:
+ * the word "carrick", one heading, one line. Every argument is escaped here.
+ */
+export function callbackPage(heading: string, line: string): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carrick</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0d10;color:#e6e8eb;font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:32rem;padding:2rem}
+.brand{font-weight:600;letter-spacing:.02em;color:#9aa3ad;margin:0 0 1.5rem}
+h1{font-size:1.5rem;font-weight:600;margin:0 0 .5rem}
+p{margin:0;color:#b8c0c8}
+code{font:.95em ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e8eb}
+</style></head>
+<body><main><p class="brand">carrick</p><h1>${escapeHtml(heading)}</h1><p>${escapeHtml(line).replace(/`([^`]+)`/g, "<code>$1</code>")}</p></main></body></html>
+`;
+}
+
+/** Send the page; resolves once it has been flushed or the browser went away. */
+function answer(res: http.ServerResponse, status: number, heading: string, line: string): Promise<void> {
+  if (res.writableEnded) return Promise.resolve();
+  const done = new Promise<void>((resolve) => {
+    res.once("finish", resolve);
+    res.once("close", resolve);
+  });
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPage(heading, line));
+  return done;
+}
+
+const TRY_AGAIN = "Run `carrick login` again.";
 
 /** RFC 8252 loopback + S256 PKCE against Carrick's existing public OAuth client flow. */
 export async function authorize(options: OAuthOptions = {}): Promise<string> {
@@ -32,33 +73,36 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
   let settle: (value: string | Error) => void;
   const received = new Promise<string | Error>((resolve) => { settle = resolve; });
   let consumed = false;
+  // The browser that delivered the code waits on this response until the
+  // exchange has finished, so the page states the real outcome.
+  let pending: http.ServerResponse | null = null;
+  let delivered: Promise<void> = Promise.resolve();
   const server = http.createServer((req, res) => {
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
     let url: URL;
     try { url = new URL(req.url ?? "/", "http://127.0.0.1"); }
-    catch { res.writeHead(400).end("Invalid authorization callback."); return; }
+    catch { answer(res, 400, "Sign-in failed", `This is not a valid sign-in link. ${TRY_AGAIN}`); return; }
     const supplied = url.searchParams.get("state") ?? "";
     if (consumed || req.method !== "GET" || url.pathname !== "/callback" ||
         url.searchParams.getAll("state").length !== 1 ||
         Buffer.byteLength(supplied) !== Buffer.byteLength(state) ||
         !timingSafeEqual(Buffer.from(supplied), Buffer.from(state))) {
-      res.writeHead(400).end("Invalid authorization callback.");
+      answer(res, 400, "Sign-in failed", `This is not a valid sign-in link. ${TRY_AGAIN}`);
       return;
     }
     if (url.searchParams.has("error")) {
       consumed = true;
-      res.writeHead(400).end("Carrick authorization was declined. Return to your terminal.");
+      answer(res, 400, "Sign-in declined", `Carrick authorization was declined. ${TRY_AGAIN}`);
       settle(new Error("Carrick authorization was declined. Run carrick login to try again."));
       return;
     }
     const code = url.searchParams.get("code");
     if (!code || url.searchParams.getAll("code").length !== 1) {
-      res.writeHead(400).end("Missing authorization code.");
+      answer(res, 400, "Sign-in failed", `The sign-in link carried no authorization code. ${TRY_AGAIN}`);
       return;
     }
     consumed = true;
-    res.end("Authorization received. Return to your terminal to finish Carrick login.");
+    pending = res;
     settle(code);
   });
   server.requestTimeout = 10_000;
@@ -103,14 +147,32 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
         typeof body.token_type !== "string" || body.token_type.toLowerCase() !== "bearer" || body.scope !== SCOPE) {
       throw new Error("Carrick returned an invalid OAuth token response.");
     }
+    if (pending) {
+      // The workspace name is for the page only. A failed lookup must not
+      // lose an issued token: the caller saves it and reports the lookup.
+      // Bounded: a hung lookup must not hold the token back from the caller.
+      const lookup = AbortSignal.any([signal, AbortSignal.timeout(options.lookupTimeoutMs ?? 3_000)]);
+      const workspace = await resolveRepos(body.access_token, [], request, lookup).then((r) => r.workspace.slug, () => null);
+      delivered = answer(pending, 200, workspace ? `Signed in to ${workspace}` : "Signed in to Carrick",
+        "You can close this tab. Next, run `carrick init` in the folder that holds your repos.");
+    }
     return body.access_token;
   } catch (error) {
-    if (signal.aborted) throw new Error("Carrick login was cancelled or timed out. Run carrick login to try again.");
     // Never include a remote body, token, verifier or callback URL in an error.
-    if (error instanceof Error && error.message.startsWith("Carrick")) throw error;
-    throw new Error("Carrick login could not complete. Check the connection and loopback listener, then run carrick login.");
+    const failure = signal.aborted
+      ? new Error("Carrick login was cancelled or timed out. Run carrick login to try again.")
+      : error instanceof Error && error.message.startsWith("Carrick")
+        ? error
+        : new Error("Carrick login could not complete. Check the connection and loopback listener, then run carrick login.");
+    if (pending) {
+      const said = failure.message.replace(/ Run carrick login.*$/, "").replace(/, then run carrick login\.$/, ".");
+      delivered = answer(pending, 400, "Sign-in failed", `${said} ${TRY_AGAIN}`);
+    }
+    throw failure;
   } finally {
     signal.removeEventListener("abort", cancel);
+    // Let the page finish writing before connections are torn down.
+    await delivered;
     server.closeAllConnections();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
   }
