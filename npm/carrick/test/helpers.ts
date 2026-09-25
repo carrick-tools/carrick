@@ -118,11 +118,12 @@ export type HookRun = { stdout: string; stderr: string; code: number | null; ms:
 /** Run one of the hook scripts the way Claude Code runs it: payload on stdin. */
 export function runHook(
   script: string,
-  options: { payload?: unknown; env?: NodeJS.ProcessEnv; cwd?: string },
+  options: { payload?: unknown; env?: NodeJS.ProcessEnv; cwd?: string; nodeArgs?: string[] },
 ): Promise<HookRun> {
   const started = Date.now();
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(pluginDir, "src", "hook", script)], {
+    const args = [...(options.nodeArgs ?? []), path.join(pluginDir, "src", "hook", script)];
+    const child = spawn(process.execPath, args, {
       env: options.env ?? fakeEnv(),
       cwd: options.cwd ?? pluginDir,
       stdio: ["pipe", "pipe", "pipe"],
