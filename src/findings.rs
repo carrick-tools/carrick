@@ -143,17 +143,21 @@ pub enum VerdictState {
 pub enum OnMainUnknown {
     /// This repo has no index on main to compare with.
     NoMainIndex,
-    /// Main's index is not of this PR's base: it was scanned at another
-    /// commit (main's own scan may still be running), from a working tree
-    /// with uncommitted changes, or by another scanner version.
+    /// Main's index is not of this PR's base: it was scanned at a commit this
+    /// clone shows differs from the base (main's own scan may still be
+    /// running), or from a working tree with uncommitted changes.
     MainIndexStale,
+    /// Another scanner version wrote main's index. Its extraction or type
+    /// check may differ from this run's, so a finding it lacks may not be the
+    /// PR's. Separate from [`OnMainUnknown::MainIndexStale`] so the cloud can
+    /// treat it differently without a scanner release.
+    MainIndexOtherScanner,
     /// Main's side of the comparison failed, panicked or ran out of time.
     MainSideFailed,
     /// Main's index holds no type verdict this run can compare this pairing
     /// with. A verdict the PR run reached by reading the consumer's own source
     /// cannot be reached again from main's stored index, so main's stored
-    /// verdict is the only answer; it is missing, or was judged against a
-    /// producer that has been re-indexed since.
+    /// verdict is the only answer, and it is missing or unresolved.
     MainTypesUnjudged,
 }
 
@@ -1064,6 +1068,7 @@ mod tests {
         for (reason, spelled) in [
             (NoMainIndex, "no_main_index"),
             (MainIndexStale, "main_index_stale"),
+            (MainIndexOtherScanner, "main_index_other_scanner"),
             (MainSideFailed, "main_side_failed"),
             (MainTypesUnjudged, "main_types_unjudged"),
         ] {

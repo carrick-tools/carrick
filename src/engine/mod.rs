@@ -297,6 +297,12 @@ fn main_copy_against_base(
              finding it lacks is posted as not compared",
             scanned.join(", ")
         ),
+        crate::pr_baseline::MainCopy::OtherScanner => info!(
+            "Main's index ({}) was written by another Carrick version than this run's ({}), \
+             so a finding it lacks is posted as not compared",
+            scanned.join(", "),
+            env!("CARGO_PKG_VERSION")
+        ),
         crate::pr_baseline::MainCopy::Current
             if main_self
                 .iter()
@@ -6819,13 +6825,11 @@ async fn main_side_findings(
     );
     let mut findings = main_results.findings;
     findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
-    let types_judged = type_check == crate::local_mode::JoinTypeCheck::Ran || !stored.is_empty();
-    let mut type_sites = analyzer.type_sites();
-    type_sites.extend(stored);
     Ok(crate::pr_baseline::MainSide {
         findings,
-        type_sites,
-        types_judged,
+        recomputed: analyzer.type_sites(),
+        stored,
+        types_judged: type_check == crate::local_mode::JoinTypeCheck::Ran,
     })
 }
 

@@ -71,6 +71,11 @@ impl CloudStorage for Store {
     async fn health_check(&self) -> Result<(), StorageError> {
         Ok(())
     }
+    // The index keys each service of a repo apart, as the cloud does, so the
+    // two-service fixture uploads both.
+    fn supports_multi_service(&self) -> bool {
+        true
+    }
     async fn upload_logs(&self, _repo: &str, _log_content: &str) -> Result<(), StorageError> {
         Ok(())
     }
@@ -438,74 +443,141 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
 
-/// carrick-cloud#1408. Main's stored verdicts are main's own answers, from the
-/// scan that had main's sources on disk, and they count on main's side. The
-/// PR run's retype of a consumer call (carrick#1491) is the case that needs
-/// them, because the recomputation from main's stored copy has no sources;
-/// here main's stored row is set to what such a retype answered, and the
-/// recomputation, which judges the pair compatible, is overruled by it.
+/// The two-service repo whose consumer reads a response field off calls that
+/// publish no comparable type, so only the retype check (carrick#1491) can
+/// judge them: `web/src/checkout.ts` reads `response.data.x` after the calls
+/// on lines 6 and 11, and `api` answers with `{ y }`. Returned with its mocked
+/// model answers.
+fn retype_repo(root: &Path) -> (PathBuf, PathBuf) {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retype-http-client");
+    let repo = root.join("retype-http-client");
+    copy_dir(&fixture, &repo);
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    (repo, fixture.join("__llm__"))
+}
+
+/// Answer the model from `cassettes` until the returned guard drops.
+struct Cassettes;
+
+impl Cassettes {
+    fn from(cassettes: &Path) -> Self {
+        // SAFETY: the tests in this binary run one at a time (SERIAL).
+        unsafe {
+            std::env::set_var(
+                "CARRICK_MOCK_FIXTURE_DIR",
+                format!("{}/", cassettes.display()),
+            )
+        };
+        Cassettes
+    }
+}
+
+impl Drop for Cassettes {
+    fn drop(&mut self) {
+        // SAFETY: the tests in this binary run one at a time (SERIAL).
+        unsafe { std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR") };
+    }
+}
+
+/// The finding at the call on `line` of the consumer file, from a PR run's
+/// findings.
+fn call_at(findings: &[serde_json::Value], line: u32) -> serde_json::Value {
+    let site = format!("web/src/checkout.ts:{line}");
+    findings
+        .iter()
+        .find(|f| f["kind"] == "type_mismatch" && f["call_sites"][0] == site.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("no type_mismatch at {site} in {findings:#?}"))
+}
+
+/// carrick-cloud#1408, the smoke test's shape. The PR run finds the broken
+/// reads by retyping the consumer's calls, which needs the consumer's source
+/// on disk. Main's side is recomputed from main's stored copy, which has none,
+/// so the recomputation cannot judge them. Main's own scan did judge them,
+/// with main's sources, and stored the answer: that answer is main's.
+///
+/// The PR changes only a line after the calls, so the surface differs and
+/// main's side runs, while every call keeps its line.
 #[tokio::test]
-async fn mains_stored_verdict_counts_on_mains_side() {
+async fn a_break_main_stored_from_its_own_retype_is_on_main() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let (repo, cassettes) = retype_repo(tmp.path());
+    let _cassettes = Cassettes::from(&cassettes);
+
+    let store = Store::default();
+    scan_with(&store, &repo, true).await;
+    {
+        let repos = store.repos.lock().unwrap();
+        let stored: Vec<String> = repos
+            .iter()
+            .flat_map(|repo| repo.compat_verdicts.iter().flatten())
+            .flat_map(|row| row.sites.iter())
+            .filter(|site| {
+                site.response.as_ref().is_some_and(|answer| {
+                    answer.verdict == carrick::operation::TypeVerdict::Incompatible
+                })
+            })
+            .map(|site| site.consumer_location.clone())
+            .collect();
+        assert!(
+            stored.contains(&"web/src/checkout.ts:11".to_string()),
+            "main's scan stored its own retype of the untyped read: {stored:?}"
+        );
+    }
+
+    let checkout = repo.join("web/src/checkout.ts");
+    let mut source = std::fs::read_to_string(&checkout).unwrap();
+    source.push_str("\nexport const checkoutPath = \"/checkout\";\n");
+    std::fs::write(&checkout, source).unwrap();
+    commit(&repo, "pr: an export after the calls");
+
+    let runs = main_side_runs();
+    let findings = pr_scan_with(&store, &repo, true).await;
+    assert_eq!(main_side_runs(), runs + 1, "main's side ran");
+    for line in [6, 11] {
+        let finding = call_at(&findings, line);
+        assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    }
+}
+
+/// Review of carrick#1525 (F1). Main's stored mismatch was judged against the
+/// producer as it was when main's consumer last scanned. The producer has
+/// fixed the contract since, and main's recomputation, judged against the
+/// producer as it is now, resolves the call as compatible. A PR that breaks
+/// the call again introduces the break, whatever main's stored row says.
+#[tokio::test]
+async fn a_pr_that_breaks_a_call_the_producer_fixed_introduces_it() {
     let _serial = SERIAL.lock().await;
     let (_tmp, producer, consumer) = setup();
     let store = Store::default();
     scan_with(&store, &producer, true).await;
 
-    // Main agrees with the producer, and says so in its stored row.
-    set_consumer_count_type(&consumer, "number");
-    commit(&consumer, "main: number count");
-    scan_with(&store, &consumer, true).await;
-    // Main's scan found both calls compatible. Store what it would have
-    // stored had its retype found each one broken.
-    let doctored: Vec<String> = {
-        let mut repos = store.repos.lock().unwrap();
-        let main_copy = repos
-            .iter_mut()
-            .find(|repo| repo.repo_name == "inventory-svc")
-            .expect("main's copy of the consumer");
-        let mut doctored = Vec::new();
-        for site in main_copy
-            .compat_verdicts
-            .iter_mut()
-            .flatten()
-            .flat_map(|row| row.sites.iter_mut())
-        {
-            let Some(answer) = site.response.as_mut() else {
-                continue;
-            };
-            assert_eq!(
-                answer.verdict,
-                carrick::operation::TypeVerdict::Compatible,
-                "main's scan found {} compatible",
-                site.consumer_location
-            );
-            answer.verdict = carrick::operation::TypeVerdict::Incompatible;
-            answer.reason =
-                Some("the consumer uses what the producer's response does not provide".into());
-            answer.resolved = true;
-            doctored.push(site.consumer_location.clone());
-        }
-        doctored
-    };
-    assert!(!doctored.is_empty(), "main's scan stored a response answer");
-
-    // The PR reads the count as a string, which breaks the same calls.
+    // Main reads the count as a string; the producer returns a number, and
+    // main's scan stores the mismatch.
     set_consumer_count_type(&consumer, "string");
-    commit(&consumer, "pr: string count");
-    let findings = pr_scan_with(&store, &consumer, true).await;
-    let mismatches: Vec<&serde_json::Value> = findings
-        .iter()
-        .filter(|f| f["kind"] == "type_mismatch")
-        .collect();
-    assert!(!mismatches.is_empty(), "{findings:#?}");
-    for finding in mismatches {
-        let site = finding["call_sites"][0].as_str().unwrap().to_string();
-        assert!(
-            doctored.contains(&site),
-            "{site} is a stored site: {doctored:?}"
-        );
-        assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
-    }
+    commit(&consumer, "main: string count");
+    scan_with(&store, &consumer, true).await;
+
+    // The producer now returns a string, and re-indexes. Main's consumer is
+    // not rescanned, so its stored row still says incompatible.
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    let source = std::fs::read_to_string(&route).unwrap();
+    let fixed = source
+        .replace("activeCount: number;", "activeCount: string;")
+        .replace("activeCount: 3", "activeCount: \"3\"");
+    assert_ne!(source, fixed, "the producer's count type moved");
+    std::fs::write(&route, fixed).unwrap();
+    commit(&producer, "producer: string count");
+    scan_with(&store, &producer, true).await;
+
+    // The PR reads the count as a number again.
+    set_consumer_count_type(&consumer, "number");
+    commit(&consumer, "pr: number count");
+    let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
 
 /// carrick-cloud#1408. When this clone shows main's copy to be at a commit

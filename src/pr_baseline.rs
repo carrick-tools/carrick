@@ -47,6 +47,13 @@ fn site_file(site: &str) -> String {
     crate::type_manifest::parse_file_location(site).0
 }
 
+/// One call site as `file:line`, whatever form it was written in, so a site
+/// two sources report is recognised as one.
+fn site_id(site: &str) -> String {
+    let (file, line) = crate::type_manifest::parse_file_location(site);
+    format!("{file}:{line}")
+}
+
 /// The buckets one finding counts in, with the site it counts, one entry per
 /// call site. A finding with no pairing counts in none, and a finding with a
 /// pairing but no sites counts once, under an empty file.
@@ -71,7 +78,7 @@ fn groups(finding: &Finding) -> Vec<(SiteGroup, String)> {
         .map(|site| {
             (
                 (finding.kind(), pair.to_string(), site_file(site)),
-                site.clone(),
+                site_id(site),
             )
         })
         .collect()
@@ -80,8 +87,8 @@ fn groups(finding: &Finding) -> Vec<(SiteGroup, String)> {
 /// The distinct sites each group holds. Distinct, because main's side reads
 /// one site from two sources (its recomputed findings and its stored
 /// verdicts), and a site both report is still one broken call.
-fn sites_by_group<'a>(
-    entries: impl Iterator<Item = (SiteGroup, String)> + 'a,
+fn sites_by_group(
+    entries: impl Iterator<Item = (SiteGroup, String)>,
 ) -> HashMap<SiteGroup, HashSet<String>> {
     let mut sites: HashMap<SiteGroup, HashSet<String>> = HashMap::new();
     for (group, site) in entries {
@@ -117,11 +124,13 @@ pub struct MainSide {
     /// Main's findings, recomputed this run from its stored copy against the
     /// same peers.
     pub findings: Vec<Finding>,
-    /// Main's answer at each type-checked call site: every outcome of the
-    /// recomputed check, and every site of main's stored verdicts.
-    pub type_sites: Vec<MainTypeSite>,
-    /// Main has a type answer to compare with: its recomputed check ran, or
-    /// its stored copy carries verdicts.
+    /// The answer main's recomputed type check reached at each call site. It
+    /// is judged against the peers as they are now.
+    pub recomputed: Vec<MainTypeSite>,
+    /// The answer main's own scan stored at each call site. It was judged
+    /// with main's sources on disk, against the peers as they were then.
+    pub stored: Vec<MainTypeSite>,
+    /// Main's recomputed type check ran.
     pub types_judged: bool,
 }
 
@@ -132,6 +141,9 @@ pub enum MainCopy {
     Current,
     /// It is provably not: see [`OnMainUnknown::MainIndexStale`].
     Stale,
+    /// Another scanner version wrote it: see
+    /// [`OnMainUnknown::MainIndexOtherScanner`].
+    OtherScanner,
 }
 
 /// Mark each pairing-carrying finding in `pr` with whether main has it.
@@ -141,13 +153,27 @@ pub enum MainCopy {
 /// and main's side judged at least one group the PR has more sites in; else
 /// the run could not tell, and the finding carries why. A finding with no
 /// pairing is left as it is.
+///
+/// Main's sites are its recomputed findings, plus each stored mismatch at a
+/// site the recomputation reached no resolved answer for. Where the
+/// recomputation did resolve the site, its answer is judged against the peers
+/// as they are now and replaces the stored one: a producer that fixed the
+/// contract since main's last scan makes main's stored mismatch history, and a
+/// PR that breaks the call again introduces the break.
 pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
+    let fresh: HashSet<(&str, String)> = main
+        .recomputed
+        .iter()
+        .filter(|site| site.resolved)
+        .map(|site| (site.pair.as_str(), site_id(&site.site)))
+        .collect();
     let theirs = sites_by_group(
         main.findings.iter().flat_map(groups).chain(
-            main.type_sites
+            main.stored
                 .iter()
                 .filter(|site| site.incompatible)
-                .map(|site| (site.group(), site.site.clone())),
+                .filter(|site| !fresh.contains(&(site.pair.as_str(), site_id(&site.site))))
+                .map(|site| (site.group(), site_id(&site.site))),
         ),
     );
     let ours = sites_by_group(pr.iter().flat_map(groups));
@@ -167,6 +193,8 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
             finding.set_on_main(Some(true));
         } else if copy == MainCopy::Stale {
             finding.set_on_main_unknown(OnMainUnknown::MainIndexStale);
+        } else if copy == MainCopy::OtherScanner {
+            finding.set_on_main_unknown(OnMainUnknown::MainIndexOtherScanner);
         } else if short.iter().any(|group| judged(main, group)) {
             finding.set_on_main(Some(false));
         } else {
@@ -179,25 +207,30 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
 /// provably lacks at least one of them.
 ///
 /// A method mismatch is recomputed from main's copy exactly as the PR's was.
-/// A type mismatch is judged when main has a resolved answer in the group,
-/// from either source, or has no answer in it at all while it has type
-/// answers elsewhere: then the PR added the pairing. An answer that exists
-/// and is unresolved is main being unable to judge, typically a response the
-/// PR run judged by retyping the consumer's own code and main's stored copy
-/// carries no verdict for.
+/// A type mismatch group is judged when every distinct site main has in it
+/// carries at least one resolved answer, from either source, or when main has
+/// no site in it at all and its recomputed type check ran: then the PR added
+/// the pairing. One unresolved site is enough to leave the group unjudged,
+/// because the break the PR shows there may be one main has too; typically a
+/// response the PR run judged by retyping the consumer's own code, which main's
+/// recomputation cannot do.
 fn judged(main: &MainSide, group: &SiteGroup) -> bool {
     if group.0 != TYPE_MISMATCH {
         return true;
     }
-    let mut answers = main
-        .type_sites
+    let mut resolved_at: HashMap<String, bool> = HashMap::new();
+    for site in main
+        .recomputed
         .iter()
+        .chain(main.stored.iter())
         .filter(|site| site.group() == *group)
-        .peekable();
-    if answers.peek().is_none() {
+    {
+        *resolved_at.entry(site_id(&site.site)).or_default() |= site.resolved;
+    }
+    if resolved_at.is_empty() {
         return main.types_judged;
     }
-    answers.any(|site| site.resolved)
+    resolved_at.values().all(|resolved| *resolved)
 }
 
 /// Mark every pairing-carrying finding as not comparable, and why.
@@ -274,27 +307,31 @@ fn stored_site(pair: String, site: String, answer: &DirectionVerdict) -> MainTyp
 /// Whether main's copy is provably not main as this PR's base has it.
 ///
 /// Stale when a stored service was scanned from a working tree with
-/// uncommitted changes, by another scanner version (whose extraction and
-/// judge may differ from this run's, so a difference would not be the PR's),
-/// or at a commit `differs` says has changes against the base. A copy at
-/// another commit this clone cannot compare, such as the head of a
-/// squash-merged branch that a laptop index scanned, is not shown to differ
-/// and counts as current: its verdicts are still main's latest answer.
+/// uncommitted changes, or at a commit `differs` says has changes against the
+/// base. A copy at another commit this clone cannot compare, such as the head
+/// of a squash-merged branch that a laptop index scanned, is not shown to
+/// differ and counts as current: its verdicts are still main's latest answer.
+/// Otherwise, a copy another scanner version wrote is told apart, because its
+/// extraction and type check may differ from this run's.
 pub fn main_copy(
     main_self: &[CloudRepoData],
     base: Option<&str>,
     differs: impl Fn(&str, &str) -> Option<bool>,
 ) -> MainCopy {
-    let this_version = env!("CARGO_PKG_VERSION");
     let stale = main_self.iter().any(|repo| {
         repo.dirty == Some(true)
-            || repo.scanner_version.as_deref() != Some(this_version)
             || base.is_some_and(|base| {
                 repo.commit_hash != base && differs(&repo.commit_hash, base) == Some(true)
             })
     });
+    let this_version = env!("CARGO_PKG_VERSION");
+    let other_scanner = main_self
+        .iter()
+        .any(|repo| repo.scanner_version.as_deref() != Some(this_version));
     if stale {
         MainCopy::Stale
+    } else if other_scanner {
+        MainCopy::OtherScanner
     } else {
         MainCopy::Current
     }
@@ -461,8 +498,8 @@ mod tests {
     fn main_side(findings: Vec<Finding>) -> MainSide {
         MainSide {
             findings,
-            type_sites: Vec::new(),
             types_judged: true,
+            ..MainSide::default()
         }
     }
 
@@ -555,8 +592,8 @@ mod tests {
         let pair = "POST /orders/:id~PUT";
         let main = MainSide {
             findings: vec![method_mismatch(pair, &["src/a.ts:3"])],
-            type_sites: Vec::new(),
             types_judged: false,
+            ..MainSide::default()
         };
         let mut pr = vec![
             type_mismatch(ORDERS, "src/checkout.ts:40"),
@@ -626,11 +663,10 @@ mod tests {
     }
 
     fn main_with_stored(copy: &CloudRepoData, site: &str) -> MainSide {
-        let mut type_sites = vec![recomputed_unresolved(site)];
-        type_sites.extend(stored_type_sites(std::slice::from_ref(copy)));
         MainSide {
             findings: Vec::new(),
-            type_sites,
+            recomputed: vec![recomputed_unresolved(site)],
+            stored: stored_type_sites(std::slice::from_ref(copy)),
             types_judged: true,
         }
     }
@@ -650,9 +686,9 @@ mod tests {
         // Without main's stored answer the recomputation alone cannot judge
         // the pairing, and the run says so rather than blame the PR.
         let recomputed_only = MainSide {
-            findings: Vec::new(),
-            type_sites: vec![recomputed_unresolved(site)],
+            recomputed: vec![recomputed_unresolved(site)],
             types_judged: true,
+            ..MainSide::default()
         };
         let mut pr = vec![retyped(site)];
         mark_on_main(&mut pr, &recomputed_only, MainCopy::Current);
@@ -683,41 +719,104 @@ mod tests {
         assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::MainTypesUnjudged));
     }
 
+    /// Review of carrick#1525, F1: main's stored mismatch was judged against
+    /// the producer as it was then. Where main's recomputation resolves the
+    /// same site against the producer as it is now, that answer wins: the
+    /// producer fixed the contract, and a PR that breaks the call again
+    /// introduces the break.
+    #[test]
+    fn a_resolved_recomputation_overrules_a_stored_mismatch() {
+        let site = "src/screens/rules.tsx:184";
+        let mut main = main_with_stored(&main_copy_with(site, "incompatible", true), site);
+        main.recomputed[0].resolved = true;
+        let mut pr = vec![retyped(site)];
+        mark_on_main(&mut pr, &main, MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(false));
+    }
+
+    /// Review of carrick#1525, F2: a group is judged only when every site main
+    /// has in it carries a resolved answer. One site main's recomputation
+    /// could not resolve and nothing stored may be broken on main too.
+    #[test]
+    fn one_unjudged_site_leaves_the_group_unjudged() {
+        let judged = "src/screens/rules.tsx:184";
+        let unjudged = "src/screens/rules.tsx:300";
+        let mut main = main_with_stored(&main_copy_with(judged, "compatible", true), judged);
+        main.recomputed.push(recomputed_unresolved(unjudged));
+        let mut pr = vec![retyped(judged), retyped(unjudged)];
+        mark_on_main(&mut pr, &main, MainCopy::Current);
+        assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::MainTypesUnjudged));
+        assert_eq!(unknown(&pr[1]), Some(OnMainUnknown::MainTypesUnjudged));
+
+        // Main's type check did not run and it has no site in the group: the
+        // run cannot tell either, stored rows elsewhere notwithstanding.
+        let elsewhere = main_copy_with("src/screens/other.tsx:1", "compatible", true);
+        let main = MainSide {
+            stored: stored_type_sites(std::slice::from_ref(&elsewhere)),
+            types_judged: false,
+            ..MainSide::default()
+        };
+        let mut pr = vec![retyped(judged)];
+        mark_on_main(&mut pr, &main, MainCopy::Current);
+        assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::MainTypesUnjudged));
+    }
+
     /// One site both sources report is one broken call: a second broken call
     /// the PR adds in the same file still reads as introduced.
     #[test]
     fn a_site_both_sources_report_counts_once() {
         let site = "src/screens/rules.tsx:184";
+        let added = "src/screens/rules.tsx:300";
         let mut main = main_with_stored(&main_copy_with(site, "incompatible", true), site);
-        main.type_sites[0].incompatible = true;
-        main.type_sites[0].resolved = true;
-        let mut pr = vec![retyped(site), retyped("src/screens/rules.tsx:300")];
+        // The recomputation found it too, over a type it could not resolve all
+        // the way down, and judged the site of the PR's new call compatible.
+        main.findings = vec![retyped(site)];
+        main.recomputed[0].incompatible = true;
+        main.recomputed.push(MainTypeSite {
+            pair: RULES.to_string(),
+            site: added.to_string(),
+            incompatible: false,
+            resolved: true,
+        });
+        // Counted twice, main would have two sites to the PR's two.
+        let mut pr = vec![retyped(site), retyped(added)];
         mark_on_main(&mut pr, &main, MainCopy::Current);
         assert_eq!(on_main(&pr[0]), Some(false));
         assert_eq!(on_main(&pr[1]), Some(false));
+
+        // Without the added call, the one site counts once on each side.
+        let mut pr = vec![retyped(site)];
+        mark_on_main(&mut pr, &main, MainCopy::Current);
+        assert_eq!(on_main(&pr[0]), Some(true));
     }
 
-    /// A stale copy never yields `false`: what main's copy lacks may have
-    /// reached main after it. What it has is still on main.
+    /// A stale copy, or one another scanner version wrote, never yields
+    /// `false`: what main's copy lacks may have reached main after it, or may
+    /// be a difference between two scanners. What it has is still on main.
     #[test]
     fn a_stale_copy_never_calls_a_finding_introduced() {
         let site = "src/screens/rules.tsx:184";
         let main = main_with_stored(&main_copy_with(site, "incompatible", true), site);
         let other = "rules-api|GET|/rules/:param/holidays~rules-web|src/screens/other.tsx|response";
-        let mut pr = vec![
-            retyped(site),
-            retyped("src/screens/other.tsx:9").with_pair(Some(other.to_string())),
-        ];
-        mark_on_main(&mut pr, &main, MainCopy::Stale);
-        assert_eq!(on_main(&pr[0]), Some(true));
-        assert_eq!(unknown(&pr[1]), Some(OnMainUnknown::MainIndexStale));
+        for (copy, reason) in [
+            (MainCopy::Stale, OnMainUnknown::MainIndexStale),
+            (MainCopy::OtherScanner, OnMainUnknown::MainIndexOtherScanner),
+        ] {
+            let mut pr = vec![
+                retyped(site),
+                retyped("src/screens/other.tsx:9").with_pair(Some(other.to_string())),
+            ];
+            mark_on_main(&mut pr, &main, copy);
+            assert_eq!(on_main(&pr[0]), Some(true));
+            assert_eq!(unknown(&pr[1]), Some(reason));
+        }
     }
 
     /// A copy at another commit this clone cannot compare is main's latest
     /// index and is compared with: the laptop index a new project starts
     /// from scans a branch head that squash-merges to another commit. A copy
-    /// at a commit this clone shows to differ from the base, a dirty copy, and
-    /// a copy another scanner version wrote are stale.
+    /// at a commit this clone shows to differ from the base and a dirty copy
+    /// are stale; a copy another scanner version wrote is told apart.
     #[test]
     fn which_copies_are_stale() {
         let copy = main_copy_with("src/screens/rules.tsx:1", "compatible", true);
@@ -747,6 +846,14 @@ mod tests {
         other_version.scanner_version = Some("0.0.1".to_string());
         assert_eq!(
             main_copy(std::slice::from_ref(&other_version), None, cannot_compare),
+            MainCopy::OtherScanner
+        );
+        assert_eq!(
+            main_copy(
+                std::slice::from_ref(&other_version),
+                Some("bbbb2222"),
+                differs
+            ),
             MainCopy::Stale
         );
     }
