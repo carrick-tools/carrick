@@ -20,7 +20,10 @@
 //! check, never toward hiding a break.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::cloud_storage::CloudRepoData;
 use crate::findings::Finding;
 
 /// A comparison bucket: kind, pairing, and the consumer file of one site.
@@ -96,6 +99,128 @@ pub fn mark_on_main(pr: &mut [Finding], main: &[Finding], baseline: Baseline) {
         });
         finding.set_on_main(Some(on_main));
     }
+}
+
+/// Mark every pairing-carrying finding as on main, for a PR whose scanned
+/// surface is main's: the same inputs against the same peers yield the same
+/// findings, so there is nothing to run.
+pub fn mark_all_on_main(pr: &mut [Finding]) {
+    for finding in pr.iter_mut() {
+        if finding.pair().is_some() {
+            finding.set_on_main(Some(true));
+        }
+    }
+}
+
+/// Whether any finding carries a pairing to compare. Without one, the
+/// comparison could mark nothing and is not run.
+pub fn has_anything_to_mark(pr: &[Finding]) -> bool {
+    pr.iter().any(|finding| finding.pair().is_some())
+}
+
+/// The fields of a stored service that describe the run rather than the code:
+/// when it ran, at which commit, what it cached, and the cross-repo facts it
+/// attached on upload. Everything else is an input to the findings. The list
+/// errs toward keeping a field: an unlisted run fact only makes two surfaces
+/// differ, and the comparison then runs as it would have.
+fn surface(data: &CloudRepoData) -> serde_json::Value {
+    let mut data = data.clone();
+    data.last_updated = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    data.commit_hash = String::new();
+    data.dirty = None;
+    data.file_results = None;
+    data.cached_detection = None;
+    data.cached_guidance = None;
+    data.cached_extraction_config = None;
+    data.package_json_hash = None;
+    data.cache_version = None;
+    data.compat_verdicts = None;
+    data.sdk_edges = None;
+    data.sdk_unresolved = None;
+    data.boundary = None;
+    // The upload strips the parsed type nodes (`strip_ast_nodes`), so main's
+    // stored copy never has them and this run's always does.
+    for row in data.endpoints.iter_mut().chain(data.calls.iter_mut()) {
+        row.request_type = None;
+        row.response_type = None;
+    }
+    // Intents describe functions for search; no finding reads them.
+    for definition in data.function_definitions.values_mut() {
+        definition.intent = None;
+        definition.body_source = None;
+    }
+    serde_json::to_value(&data).unwrap_or(serde_json::Value::Null)
+}
+
+/// Whether this run scanned exactly what main's stored copy describes, service
+/// for service. Then main's findings are this run's, and the comparison has
+/// nothing to add.
+pub fn same_surface(current: &[CloudRepoData], main: &[CloudRepoData]) -> bool {
+    if current.len() != main.len() {
+        return false;
+    }
+    let keyed = |repos: &[CloudRepoData]| {
+        let mut rows: Vec<(Option<String>, serde_json::Value)> = repos
+            .iter()
+            .map(|repo| (repo.service_name.clone(), surface(repo)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    };
+    let ours = keyed(current);
+    ours.iter().all(|(_, value)| !value.is_null()) && ours == keyed(main)
+}
+
+/// How many times this process ran main's side of the comparison. Read by the
+/// tests that prove a skip.
+static MAIN_SIDE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn record_main_side_run() {
+    MAIN_SIDE_RUNS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn main_side_runs() -> usize {
+    MAIN_SIDE_RUNS.load(Ordering::SeqCst)
+}
+
+/// A way for main's side of the comparison to fail, injected by a test.
+#[allow(dead_code)] // Constructed by tests/ through the library, never by the binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainSideFault {
+    /// The analysis returns an error.
+    Error,
+    /// The analysis panics.
+    Panic,
+    /// The analysis never finishes.
+    Hang,
+}
+
+static FAULT: Mutex<Option<MainSideFault>> = Mutex::new(None);
+
+/// Make the next run of main's side of the comparison fail as `fault`.
+/// Honoured only under `CARRICK_MOCK_ALL`, like
+/// [`crate::agent_service::inject_mock_failure`].
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_main_side_fault(fault: MainSideFault) {
+    *FAULT.lock().unwrap_or_else(|p| p.into_inner()) = Some(fault);
+}
+
+/// The injected fault, taken once. Always `None` outside `CARRICK_MOCK_ALL`.
+pub fn take_mock_main_side_fault() -> Option<MainSideFault> {
+    if std::env::var("CARRICK_MOCK_ALL").is_err() {
+        return None;
+    }
+    FAULT.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
+/// A caught panic's message, for the one line that reports it.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
 }
 
 #[cfg(test)]

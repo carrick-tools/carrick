@@ -25,7 +25,7 @@
 use crate::cloud_storage::AwsStorage;
 use crate::shutdown::INTERRUPTION_REPORT_BUDGET;
 use std::panic::PanicHookInfo;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{debug, error};
 
 /// The word a panicking run reports, the way [`crate::shutdown`] has one.
@@ -50,9 +50,39 @@ static REPORTED: AtomicBool = AtomicBool::new(false);
 pub fn install(repo_path: String) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic the code around it catches and states itself is not the
+        // run dying, so it neither marks the scan failed nor prints Rust's
+        // own lines (carrick-cloud#1369).
+        if CAUGHT.load(Ordering::SeqCst) > 0 {
+            return;
+        }
         report(info, &repo_path);
         previous(info);
     }));
+}
+
+/// How many [`CaughtPanics`] scopes are open.
+static CAUGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// While held, a panic is one its caller catches and reports in its own line:
+/// the hook neither posts the failure marker nor prints.
+///
+/// Process-wide, because the hook cannot tell which task raised a panic. Hold
+/// it only around work the caller wraps in `catch_unwind`, and only for as
+/// long as that work runs.
+pub struct CaughtPanics(());
+
+impl CaughtPanics {
+    pub fn begin() -> Self {
+        CAUGHT.fetch_add(1, Ordering::SeqCst);
+        CaughtPanics(())
+    }
+}
+
+impl Drop for CaughtPanics {
+    fn drop(&mut self) {
+        CAUGHT.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn report(info: &PanicHookInfo<'_>, repo_path: &str) {
