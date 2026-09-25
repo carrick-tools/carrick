@@ -29,15 +29,16 @@
 //! A function is PROVEN in-process when its body reaches at least one sink and
 //! every call in it is accounted for:
 //!
-//! - Its module imports nothing from a package framework detection lists as a
-//!   messaging, socket or data-fetching client. That list is the model's
-//!   classification of the repo's own dependencies; nothing here names a
-//!   library.
 //! - A call on an instance the class or module CONSTRUCTS itself (`new X()`
 //!   as a field or module-scope initialiser, never reassigned) is a sink when
-//!   `X` comes from a declared dependency, and is followed into `X`'s method
-//!   when `X` is this repo's own class. An empty array or object literal held
-//!   the same way is a sink too: a listener list the code fills at run time.
+//!   `X` comes from a declared dependency that is not a transport, and is
+//!   followed into `X`'s method when `X` is this repo's own class. A transport
+//!   is a package framework detection lists as a messaging, socket or
+//!   data-fetching client: the model's classification of the repo's own
+//!   dependencies, so nothing here names a library. An empty array or object
+//!   literal held the same way is a sink too: a listener list the code fills
+//!   at run time. So is a call of a function imported from a non-transport
+//!   dependency (an operator applied to the stream).
 //! - A call resolved by a call-graph edge, or on the class's own method, is
 //!   followed, to a bounded depth.
 //! - A bare call of a callback handed out by such an instance
@@ -455,12 +456,6 @@ impl<'a> Classifier<'a> {
             return Verdict::NotProven;
         };
         let imports = import_table(&parsed.module);
-        if imports
-            .values()
-            .any(|import| self.is_transport_import(file, &import.source))
-        {
-            return Verdict::NotProven;
-        }
         let Some(located) = locate(&parsed.module, name, def.line_number, &parsed.cm) else {
             return Verdict::NotProven;
         };

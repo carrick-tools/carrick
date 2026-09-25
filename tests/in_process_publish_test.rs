@@ -22,6 +22,7 @@ struct Scan {
     rows: BTreeSet<Row>,
     /// Pub/sub type-manifest anchors: (role, topic, `file:line`).
     anchors: BTreeSet<Row>,
+    blob: serde_json::Value,
 }
 
 fn scan() -> Scan {
@@ -40,7 +41,8 @@ fn scan() -> Scan {
             format!("{}/", cassettes.display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        // The assertion is on which rows exist; the type layer is not under test.
+        // The row tests hold without the sidecar; the one test that needs it
+        // says so when it is missing.
         .env("CARRICK_ALLOW_MISSING_TYPES", "1");
     for var in [
         "GITHUB_REPOSITORY",
@@ -99,7 +101,19 @@ fn scan() -> Scan {
             ));
         }
     }
-    Scan { rows, anchors }
+    Scan {
+        rows,
+        anchors,
+        blob,
+    }
+}
+
+/// Every generated type alias (`Endpoint_<hash>_Response...`) written in `text`.
+fn aliases_in(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.starts_with("Endpoint_") && token.contains("_Response"))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn call(topic: &str, site: &str) -> Row {
@@ -209,4 +223,31 @@ fn a_withdrawn_row_leaves_no_type_anchor() {
         scan.anchors,
         scan.rows
     );
+}
+
+/// A withdrawn row asks the sidecar for nothing: every type the scan resolved
+/// and every declaration its stub carries belongs to a manifest entry. Needs
+/// the sidecar built (`src/sidecar`), as CI builds it before this step.
+#[test]
+fn a_withdrawn_row_resolves_no_type() {
+    let scan = scan();
+    let manifest: BTreeSet<String> = scan.blob["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["type_alias"].as_str().map(str::to_owned))
+        .collect();
+    for field in ["bundled_types", "capture_stub"] {
+        let value = &scan.blob[field];
+        assert!(
+            !value.is_null(),
+            "the blob has no {field}: the sidecar did not run, so this test checks nothing"
+        );
+        let resolved = aliases_in(&value.to_string());
+        let orphans: Vec<&String> = resolved.difference(&manifest).collect();
+        assert!(
+            orphans.is_empty(),
+            "{field} names aliases no manifest entry holds (a withdrawn row's type was resolved): {orphans:?}"
+        );
+    }
 }
