@@ -225,6 +225,44 @@ fn type_mismatch(findings: &[serde_json::Value]) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no type_mismatch in {findings:#?}"))
 }
 
+/// The findings with every `on_main_unknown` checked to be `reason` and then
+/// removed, so two runs that could not compare for different reasons can be
+/// compared byte for byte.
+fn reasons_as(findings: &[serde_json::Value], reason: &str) -> Vec<serde_json::Value> {
+    findings
+        .iter()
+        .map(|finding| {
+            let mut finding = finding.clone();
+            if let Some(object) = finding.as_object_mut()
+                && let Some(said) = object.remove("on_main_unknown")
+            {
+                assert_eq!(said, serde_json::json!(reason), "{finding:#}");
+            }
+            finding
+        })
+        .collect()
+}
+
+/// Point the run at a `pull_request` event whose base is `base`, as a runner
+/// does.
+fn event_with_base(dir: &Path, base: &str) -> PathBuf {
+    let path = dir.join("event.json");
+    let event = serde_json::json!({ "pull_request": { "base": { "sha": base } } });
+    std::fs::write(&path, event.to_string()).unwrap();
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe { std::env::set_var("GITHUB_EVENT_PATH", &path) };
+    path
+}
+
+fn head(repo: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git failed to spawn");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
     // SAFETY: the tests in this binary run one at a time (SERIAL).
     unsafe {
@@ -234,6 +272,9 @@ fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
         // The repo name comes from GITHUB_REPOSITORY before the directory, so
         // on a runner both fixtures would be one repo named for this one.
         std::env::remove_var("GITHUB_REPOSITORY");
+        // A runner's own event would name a base commit these fixtures do
+        // not have.
+        std::env::remove_var("GITHUB_EVENT_PATH");
     }
     let tmp = tempfile::tempdir().unwrap();
     let producer = fixture_repo(tmp.path(), "catalog-web");
@@ -246,8 +287,8 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     let _serial = SERIAL.lock().await;
     let (_tmp, producer, consumer) = setup();
 
-    // No prior index of the consumer: the field is absent, so the cloud
-    // keeps today's behaviour.
+    // No prior index of the consumer: the run cannot tell, and says why
+    // (carrick-cloud#1408).
     let store = Store::default();
     scan(&store, &producer).await;
     set_consumer_verb(&consumer, "PUT", 0);
@@ -255,7 +296,12 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     let finding = wrong_verb(&pr_scan(&store, &consumer).await);
     assert!(
         finding.get("on_main").is_none(),
-        "no baseline, no field: {finding:#}"
+        "no baseline, no verdict: {finding:#}"
+    );
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("no_main_index"),
+        "{finding:#}"
     );
 
     // Main calls with the right verb; the PR introduces the wrong one.
@@ -276,10 +322,10 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 }
 
-/// Main's side failing in any way costs the run nothing but the field: the
-/// findings it posts are byte for byte the ones a run with no prior index
-/// posts. (The payload's `delta` differs, as it must: a prior index is what
-/// gives the run one.)
+/// Main's side failing in any way costs the run nothing but the comparison:
+/// the findings it posts are byte for byte the ones a run with no prior index
+/// posts, apart from why neither could compare. (The payload's `delta`
+/// differs, as it must: a prior index is what gives the run one.)
 #[tokio::test]
 async fn a_failing_main_side_posts_the_findings_of_a_run_without_a_baseline() {
     let _serial = SERIAL.lock().await;
@@ -289,7 +335,11 @@ async fn a_failing_main_side_posts_the_findings_of_a_run_without_a_baseline() {
     scan(&fresh, &producer).await;
     set_consumer_verb(&consumer, "PUT", 0);
     commit(&consumer, "put");
-    let without_baseline = serde_json::to_string(&pr_scan(&fresh, &consumer).await).unwrap();
+    let without_baseline = serde_json::to_string(&reasons_as(
+        &pr_scan(&fresh, &consumer).await,
+        "no_main_index",
+    ))
+    .unwrap();
 
     // Main calls with the right verb, so the comparison has work to do.
     let store = Store::default();
@@ -309,7 +359,11 @@ async fn a_failing_main_side_posts_the_findings_of_a_run_without_a_baseline() {
     ] {
         let runs = main_side_runs();
         inject_mock_main_side_fault(fault);
-        let posted = serde_json::to_string(&pr_scan(&store, &consumer).await).unwrap();
+        let posted = serde_json::to_string(&reasons_as(
+            &pr_scan(&store, &consumer).await,
+            "main_side_failed",
+        ))
+        .unwrap();
         assert_eq!(main_side_runs(), runs + 1, "{fault:?}: main's side ran");
         assert_eq!(posted, without_baseline, "{fault:?}");
     }
@@ -381,5 +435,119 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     set_consumer_count_type(&consumer, "string");
     commit(&consumer, "pr: string count");
     let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+}
+
+/// carrick-cloud#1408. Main's stored verdicts are main's own answers, from the
+/// scan that had main's sources on disk, and they count on main's side. The
+/// PR run's retype of a consumer call (carrick#1491) is the case that needs
+/// them, because the recomputation from main's stored copy has no sources;
+/// here main's stored row is set to what such a retype answered, and the
+/// recomputation, which judges the pair compatible, is overruled by it.
+#[tokio::test]
+async fn mains_stored_verdict_counts_on_mains_side() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan_with(&store, &producer, true).await;
+
+    // Main agrees with the producer, and says so in its stored row.
+    set_consumer_count_type(&consumer, "number");
+    commit(&consumer, "main: number count");
+    scan_with(&store, &consumer, true).await;
+    // Main's scan found both calls compatible. Store what it would have
+    // stored had its retype found each one broken.
+    let doctored: Vec<String> = {
+        let mut repos = store.repos.lock().unwrap();
+        let main_copy = repos
+            .iter_mut()
+            .find(|repo| repo.repo_name == "inventory-svc")
+            .expect("main's copy of the consumer");
+        let mut doctored = Vec::new();
+        for site in main_copy
+            .compat_verdicts
+            .iter_mut()
+            .flatten()
+            .flat_map(|row| row.sites.iter_mut())
+        {
+            let Some(answer) = site.response.as_mut() else {
+                continue;
+            };
+            assert_eq!(
+                answer.verdict,
+                carrick::operation::TypeVerdict::Compatible,
+                "main's scan found {} compatible",
+                site.consumer_location
+            );
+            answer.verdict = carrick::operation::TypeVerdict::Incompatible;
+            answer.reason =
+                Some("the consumer uses what the producer's response does not provide".into());
+            answer.resolved = true;
+            doctored.push(site.consumer_location.clone());
+        }
+        doctored
+    };
+    assert!(!doctored.is_empty(), "main's scan stored a response answer");
+
+    // The PR reads the count as a string, which breaks the same calls.
+    set_consumer_count_type(&consumer, "string");
+    commit(&consumer, "pr: string count");
+    let findings = pr_scan_with(&store, &consumer, true).await;
+    let mismatches: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| f["kind"] == "type_mismatch")
+        .collect();
+    assert!(!mismatches.is_empty(), "{findings:#?}");
+    for finding in mismatches {
+        let site = finding["call_sites"][0].as_str().unwrap().to_string();
+        assert!(
+            doctored.contains(&site),
+            "{site} is a stored site: {doctored:?}"
+        );
+        assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    }
+}
+
+/// carrick-cloud#1408. When this clone shows main's copy to be at a commit
+/// that differs from the PR's base, main moved after its last index, and a
+/// finding the copy lacks may be main's: the run cannot call it introduced.
+#[tokio::test]
+async fn a_copy_behind_the_prs_base_never_calls_a_finding_introduced() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+
+    // Main's last index calls with the right verb. Main then moves on without
+    // a new index, and the PR, based on the moved main, sends the wrong verb.
+    scan(&store, &consumer).await;
+    set_consumer_verb(&consumer, "GET", 1);
+    commit(&consumer, "main: moved after its last index");
+    let base = head(&consumer);
+    set_consumer_verb(&consumer, "PUT", 1);
+    commit(&consumer, "pr: put");
+
+    event_with_base(tmp.path(), &base);
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert!(finding.get("on_main").is_none(), "{finding:#}");
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("main_index_stale"),
+        "{finding:#}"
+    );
+
+    // The same PR against a copy at its base is compared.
+    let fresh = Store::default();
+    scan(&fresh, &producer).await;
+    set_consumer_verb(&consumer, "GET", 1);
+    commit(&consumer, "main: indexed");
+    let base = head(&consumer);
+    scan(&fresh, &consumer).await;
+    set_consumer_verb(&consumer, "PUT", 1);
+    commit(&consumer, "pr: put again");
+    event_with_base(tmp.path(), &base);
+    let finding = wrong_verb(&pr_scan(&fresh, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }

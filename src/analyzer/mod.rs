@@ -1476,20 +1476,69 @@ pub struct PairCheckOutcome {
 /// direction. It leaves out the line, which a PR moves by editing the consumer
 /// file above the call, and the aliases, which hash that line.
 fn type_pair_key(outcome: &PairCheckOutcome) -> String {
-    let consumer_file = strip_ci_workspace_prefix(&outcome.consumer_file);
-    let direction = match outcome.type_kind {
+    pair_key_of(
+        &outcome.producer_service,
+        &outcome.pseudo_method,
+        &outcome.identity,
+        &outcome.consumer_service,
+        strip_ci_workspace_prefix(&outcome.consumer_file),
+        outcome.type_kind,
+    )
+}
+
+/// The one spelling of a type pairing, for a recomputed outcome and for a
+/// stored verdict alike (carrick-cloud#1408). The route's parameter names are
+/// normalised, as the verdict join normalises them, because an outcome names
+/// the producer's operation as its manifest does and a stored verdict as the
+/// edge's producer key does.
+fn pair_key_of(
+    producer_service: &str,
+    pseudo_method: &str,
+    identity: &str,
+    consumer_service: &str,
+    consumer_file: &str,
+    direction: crate::cloud_storage::ManifestTypeKind,
+) -> String {
+    let direction = match direction {
         crate::cloud_storage::ManifestTypeKind::Request => "request",
         crate::cloud_storage::ManifestTypeKind::Response => "response",
     };
     format!(
         "{}|{}|{}~{}|{}|{}",
-        outcome.producer_service,
-        outcome.pseudo_method,
-        outcome.identity,
-        outcome.consumer_service,
+        producer_service,
+        pseudo_method,
+        normalize_compat_path(identity),
+        consumer_service,
         consumer_file,
         direction
     )
+}
+
+/// The pairing a stored compat verdict's site is about, spelled as
+/// [`type_pair_key`] spells an outcome's, or `None` for a producer key the
+/// type check never pairs on.
+pub(crate) fn stored_type_pair_key(
+    producer_repo: &str,
+    producer_key: &str,
+    consumer_repo: &str,
+    consumer_file: &str,
+    direction: crate::cloud_storage::ManifestTypeKind,
+) -> Option<String> {
+    let (method, identity) = parse_producer_key(producer_key)?;
+    Some(pair_key_of(
+        producer_repo,
+        &method,
+        &identity,
+        consumer_repo,
+        consumer_file,
+        direction,
+    ))
+}
+
+/// A call site, `file:line`, with a CI runner's checkout prefix removed, as a
+/// finding's `call_sites` carry it.
+pub(crate) fn repo_relative_location(location: &str) -> String {
+    strip_ci_workspace_prefix(location).to_string()
 }
 
 impl CoreExtractor for Analyzer {}
@@ -1529,6 +1578,27 @@ impl Analyzer {
             Some(outcomes) => PairDirections::from_outcomes(outcomes),
             None => PairDirections::default(),
         }
+    }
+
+    /// Every type-check outcome of this analysis as one call site's answer,
+    /// keyed as its type mismatch would be paired (carrick-cloud#1408). Empty
+    /// when no check ran.
+    pub(crate) fn type_sites(&self) -> Vec<crate::pr_baseline::MainTypeSite> {
+        self.pair_outcomes
+            .iter()
+            .flatten()
+            .map(|outcome| crate::pr_baseline::MainTypeSite {
+                pair: type_pair_key(outcome),
+                site: strip_ci_workspace_prefix(&format!(
+                    "{}:{}",
+                    outcome.consumer_file, outcome.consumer_line
+                ))
+                .to_string(),
+                incompatible: outcome.bucket
+                    == crate::services::type_sidecar::VerdictBucket::Incompatible,
+                resolved: outcome.resolved,
+            })
+            .collect()
     }
 
     pub fn set_pair_outcomes(&mut self, outcomes: Vec<PairCheckOutcome>) {
@@ -5938,7 +6008,21 @@ mod tests {
         let key = type_pair_key(&base);
         assert_eq!(
             key,
-            "producer-svc|GET|/orders/:id~consumer-svc|src/client.ts|response"
+            "producer-svc|GET|/orders/:param~consumer-svc|src/client.ts|response"
+        );
+        // Main's stored verdict names the producer as the edge's key does,
+        // with the route's own parameter name, and pairs the same
+        // (carrick-cloud#1408).
+        assert_eq!(
+            stored_type_pair_key(
+                "producer-svc",
+                "http|GET|/orders/:orderId",
+                "consumer-svc",
+                "src/client.ts",
+                crate::cloud_storage::ManifestTypeKind::Response,
+            )
+            .as_deref(),
+            Some(key.as_str())
         );
 
         let mut moved = outcome(

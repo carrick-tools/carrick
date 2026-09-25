@@ -32,6 +32,24 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Write a mismatch's comparison with main (carrick-cloud#1369, #1408).
+///
+/// `on_main` is written when the PR run could tell, `on_main_unknown` when it
+/// could not, and neither on a run that is not a PR run, so such a payload is
+/// exactly what it was before either field existed. The cloud reads only
+/// `on_main: false` as introduced by the PR.
+fn serialize_on_main<M: SerializeMap>(
+    map: &mut M,
+    on_main: &Option<bool>,
+    on_main_unknown: &Option<OnMainUnknown>,
+) -> Result<(), M::Error> {
+    match (on_main, on_main_unknown) {
+        (Some(on_main), _) => map.serialize_entry("on_main", on_main),
+        (None, Some(reason)) => map.serialize_entry("on_main_unknown", reason),
+        (None, None) => Ok(()),
+    }
+}
+
 /// The wire view of a `call_sites` list: at most [`MAX_CALL_SITES`] entries.
 fn wire_call_sites(call_sites: &[String]) -> &[String] {
     &call_sites[..call_sites.len().min(MAX_CALL_SITES)]
@@ -112,6 +130,33 @@ pub enum VerdictState {
     NotChecked,
 }
 
+/// Why a PR run could not say whether main already had a finding
+/// (carrick-cloud#1408). Sent as `on_main_unknown` in place of `on_main`, so
+/// the cloud can say it could not tell rather than read the finding as one
+/// the PR introduced.
+///
+/// `on_main: false` is only ever sent when main's side of the comparison is
+/// main as this PR's base has it, judged the same way this run judged the PR.
+/// Every other case is one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMainUnknown {
+    /// This repo has no index on main to compare with.
+    NoMainIndex,
+    /// Main's index is not of this PR's base: it was scanned at another
+    /// commit (main's own scan may still be running), from a working tree
+    /// with uncommitted changes, or by another scanner version.
+    MainIndexStale,
+    /// Main's side of the comparison failed, panicked or ran out of time.
+    MainSideFailed,
+    /// Main's index holds no type verdict this run can compare this pairing
+    /// with. A verdict the PR run reached by reading the consumer's own source
+    /// cannot be reached again from main's stored index, so main's stored
+    /// verdict is the only answer; it is missing, or was judged against a
+    /// producer that has been re-indexed since.
+    MainTypesUnjudged,
+}
+
 /// One repo's pinned version of a conflicting package.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PackageVersionRef {
@@ -182,10 +227,13 @@ pub enum Finding {
         /// findings with main's on it. `None` when the caller cannot state it.
         pair: Option<String>,
         /// Whether main's copy of this repo, matched against the same peers,
-        /// yields this same finding (carrick-cloud#1369). Set only on a PR run
-        /// that has a prior index; `None` everywhere else, and then the field
-        /// is left off the wire, which the cloud reads as today's behaviour.
+        /// yields this same finding (carrick-cloud#1369). Set only on a PR run;
+        /// `None` when the run could not tell, and then `on_main_unknown` says
+        /// why, and on every run that is not a PR run.
         on_main: Option<bool>,
+        /// Why `on_main` is `None` on a PR run (carrick-cloud#1408). Never set
+        /// alongside `on_main`.
+        on_main_unknown: Option<OnMainUnknown>,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -211,10 +259,13 @@ pub enum Finding {
         /// findings with main's on it. `None` when the caller cannot state it.
         pair: Option<String>,
         /// Whether main's copy of this repo, matched against the same peers,
-        /// yields this same finding (carrick-cloud#1369). Set only on a PR run
-        /// that has a prior index; `None` everywhere else, and then the field
-        /// is left off the wire, which the cloud reads as today's behaviour.
+        /// yields this same finding (carrick-cloud#1369). Set only on a PR run;
+        /// `None` when the run could not tell, and then `on_main_unknown` says
+        /// why, and on every run that is not a PR run.
         on_main: Option<bool>,
+        /// Why `on_main` is `None` on a PR run (carrick-cloud#1408). Never set
+        /// alongside `on_main`.
+        on_main_unknown: Option<OnMainUnknown>,
     },
     /// A consumer call with no producer in the index.
     MissingEndpoint {
@@ -332,6 +383,7 @@ impl Finding {
             direction: None,
             pair: None,
             on_main: None,
+            on_main_unknown: None,
         }
     }
 
@@ -352,6 +404,7 @@ impl Finding {
             verdict_state: None,
             pair: None,
             on_main: None,
+            on_main_unknown: None,
         }
     }
 
@@ -458,12 +511,44 @@ impl Finding {
         }
     }
 
-    /// Whether main already had this finding (carrick-cloud#1369). No-op for
-    /// every kind that carries no pairing.
+    /// Whether main already had this finding (carrick-cloud#1369). Clears any
+    /// reason the run could not tell. No-op for every kind that carries no
+    /// pairing.
     pub fn set_on_main(&mut self, value: Option<bool>) {
         match self {
-            Finding::TypeMismatch { on_main, .. } | Finding::MethodMismatch { on_main, .. } => {
-                *on_main = value
+            Finding::TypeMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            } => {
+                *on_main = value;
+                *on_main_unknown = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The run could not tell whether main already had this finding, and why
+    /// (carrick-cloud#1408). No-op for every kind that carries no pairing.
+    pub fn set_on_main_unknown(&mut self, reason: OnMainUnknown) {
+        match self {
+            Finding::TypeMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            }
+            | Finding::MethodMismatch {
+                on_main,
+                on_main_unknown,
+                ..
+            } => {
+                *on_main = None;
+                *on_main_unknown = Some(reason);
             }
             _ => {}
         }
@@ -597,6 +682,7 @@ impl Serialize for Finding {
                 // fact a reader needs.
                 pair: _,
                 on_main,
+                on_main_unknown,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -614,11 +700,7 @@ impl Serialize for Finding {
                 if let Some(verdict_state) = verdict_state {
                     map.serialize_entry("verdict_state", verdict_state)?;
                 }
-                // Omitted without a baseline, so the payload is unchanged
-                // wherever the scan had no main to compare with.
-                if let Some(on_main) = on_main {
-                    map.serialize_entry("on_main", on_main)?;
-                }
+                serialize_on_main(&mut map, on_main, on_main_unknown)?;
             }
             Finding::MethodMismatch {
                 method,
@@ -630,6 +712,7 @@ impl Serialize for Finding {
                 verdict_state,
                 pair: _,
                 on_main,
+                on_main_unknown,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -642,9 +725,7 @@ impl Serialize for Finding {
                 if let Some(verdict_state) = verdict_state {
                     map.serialize_entry("verdict_state", verdict_state)?;
                 }
-                if let Some(on_main) = on_main {
-                    map.serialize_entry("on_main", on_main)?;
-                }
+                serialize_on_main(&mut map, on_main, on_main_unknown)?;
             }
             Finding::MissingEndpoint {
                 method,
@@ -936,10 +1017,9 @@ mod tests {
         assert!(!v.as_object().unwrap().contains_key("pair"));
     }
 
-    /// With no baseline (a first PR, no prior index, a non-PR run) the field
-    /// is absent, and the finding serializes exactly as it did before the
-    /// field existed, pairing or not. The cloud reads absent as today's
-    /// behaviour: every risk fails the check.
+    /// On a run that marks nothing (any run that is not a PR run) neither
+    /// field is written, and the finding serializes exactly as it did before
+    /// either existed, pairing or not.
     #[test]
     fn without_a_baseline_the_finding_is_unchanged_on_the_wire() {
         let before = serde_json::to_value(Finding::type_mismatch(
@@ -972,6 +1052,39 @@ mod tests {
             .with_pair(Some("POST /x~PUT".to_string()));
         assert_eq!(serde_json::to_value(&keyed).unwrap(), before);
         assert!(!before.as_object().unwrap().contains_key("on_main"));
+        assert!(!before.as_object().unwrap().contains_key("on_main_unknown"));
+    }
+
+    /// carrick-cloud#1408, the wire half. A PR run that cannot tell whether
+    /// main had a finding sends why, in snake_case, in place of `on_main`; the
+    /// two are never sent together, and a later verdict replaces the reason.
+    #[test]
+    fn a_finding_the_run_could_not_compare_says_why_on_the_wire() {
+        use OnMainUnknown::*;
+        for (reason, spelled) in [
+            (NoMainIndex, "no_main_index"),
+            (MainIndexStale, "main_index_stale"),
+            (MainSideFailed, "main_side_failed"),
+            (MainTypesUnjudged, "main_types_unjudged"),
+        ] {
+            let mut mismatch = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", "boom")
+                .with_pair(Some("api|GET|/x~web|src/a.ts|response".to_string()));
+            mismatch.set_on_main_unknown(reason);
+            let v = serde_json::to_value(&mismatch).unwrap();
+            assert_eq!(v["on_main_unknown"], json!(spelled));
+            assert!(!v.as_object().unwrap().contains_key("on_main"));
+
+            let mut wrong_verb = Finding::method_mismatch("PUT", "/x", None, vec![], "POST")
+                .with_pair(Some("POST /x~PUT".to_string()));
+            wrong_verb.set_on_main_unknown(reason);
+            let v = serde_json::to_value(&wrong_verb).unwrap();
+            assert_eq!(v["on_main_unknown"], json!(spelled));
+
+            wrong_verb.set_on_main(Some(true));
+            let v = serde_json::to_value(&wrong_verb).unwrap();
+            assert_eq!(v["on_main"], json!(true));
+            assert!(!v.as_object().unwrap().contains_key("on_main_unknown"));
+        }
     }
 
     #[test]
