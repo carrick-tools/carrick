@@ -44,7 +44,20 @@ interface Edit {
   start: number;
   end: number;
   text: string;
+  /** Where the stated producer type begins inside `text`, when it is there. */
+  statedAt?: number;
 }
+
+/**
+ * The check phase's structural any/unknown walk (`findDisqualifyingTopTypes`
+ * in the capture bundle): member paths below `root` that hold a top type.
+ */
+export type TopTypeWalk = (
+  root: ts.Type,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  location: ts.Node
+) => Array<{ kind: string; path: string }>;
 
 interface Diag {
   /** Start position in the file the diagnostic was reported on. */
@@ -58,6 +71,8 @@ type Origin = { kind: 'original'; pos: number } | { kind: 'inserted' };
 
 interface Rewrite {
   edits: Edit[];
+  /** The producer's type as the edits state it. */
+  stated: string;
   /** The wire transform is stated, so its declarations are appended. */
   wire: boolean;
   /**
@@ -71,14 +86,16 @@ interface Rewrite {
 export class Retyper {
   /**
    * `jsonWire` is the check phase's own JSON wire transform
-   * (`jsonWireDeclarations` in the capture bundle), handed in by the entry
-   * point so both judges read the wire the same way without this file
-   * crossing the bundle seam.
+   * (`jsonWireDeclarations` in the capture bundle) and `topTypes` its
+   * any/unknown walk, handed in by the entry point so both judges read the
+   * wire and a top type the same way without this file crossing the bundle
+   * seam.
    */
   constructor(
     private readonly project: Project,
     private readonly inferrer: TypeInferrer,
-    private readonly jsonWire: (prefix: string) => string[]
+    private readonly jsonWire: (prefix: string) => string[],
+    private readonly topTypes: TopTypeWalk
   ) {}
 
   /**
@@ -201,7 +218,8 @@ export class Retyper {
         const text = stated(useWire);
         const delta = text.length - (argEnd - argStart);
         return {
-          edits: [{ start: argStart, end: argEnd, text }],
+          edits: [{ start: argStart, end: argEnd, text, statedAt: 0 }],
+          stated: text,
           wire: useWire && wire,
           typeArgumentCall: { start: callStart, end: callEnd + delta },
         };
@@ -215,7 +233,8 @@ export class Retyper {
       return (useWire) => {
         const text = `<${stated(useWire)}>`;
         return {
-          edits: [{ start: at, end: at, text }],
+          edits: [{ start: at, end: at, text, statedAt: 1 }],
+          stated: stated(useWire),
           wire: useWire && wire,
           typeArgumentCall: { start: callStart, end: callEnd + text.length },
         };
@@ -241,6 +260,7 @@ export class Retyper {
         const text = stated(useWire);
         return {
           edits: edits.flatMap((edit) => edit(text)),
+          stated: text,
           wire: useWire && wire,
         };
       };
@@ -314,10 +334,78 @@ export class Retyper {
         added.push(mapped);
       }
       added.sort((a, b) => a.start - b.start || a.code - b.code);
+
+      const unresolved = this.unresolvedMembers(sourceFile, rewrite, added.length > 0);
+      if (unresolved) return { kind: 'abstain', reason: unresolved };
       return { kind: 'checked', added };
     } finally {
       sourceFile.replaceWithText(original);
     }
+  }
+
+  /**
+   * Why the stated type, as the consumer's program reads it, cannot be
+   * compared, or `undefined` when it can (carrick#1514). Read after the
+   * diagnostics diff, because the two top types fail in opposite directions.
+   *
+   * The producer's text is sent only when it holds no `any`/`unknown`, but
+   * the consumer's program is where it is read: under its compiler options,
+   * through the wire transform (a lib type whose `toJSON()` returns `any`),
+   * with its own declarations.
+   *
+   * - A member that reads as `unknown` makes reads fail that the producer's
+   *   type would pass, so any diagnostic may be ours. It is never compared.
+   * - A member that reads as `any` can hide a failure but never make one, so
+   *   the diagnostics the diff found stand; only an empty diff is not
+   *   compared, since it may be the `any` agreeing.
+   *
+   * Either way the reason names the member, as the check phase does for a
+   * published type.
+   *
+   * The walk's budget sentinel is dropped. The scanner's text screen
+   * (`contains_disqualifying_top_type`, which has no budget) found no
+   * `any`/`unknown` in the producer's text before sending it, so a walk that
+   * runs out of budget can only miss one the consumer's program made deeper
+   * than the budget allows; the compiler's diagnostics stand.
+   */
+  private unresolvedMembers(
+    sourceFile: SourceFile,
+    rewrite: Rewrite,
+    diagnosed: boolean
+  ): string | undefined {
+    let shift = 0;
+    let at: number | undefined;
+    for (const edit of [...rewrite.edits].sort((a, b) => a.start - b.start)) {
+      if (at === undefined && edit.statedAt !== undefined) {
+        at = edit.start + shift + edit.statedAt;
+      }
+      shift += edit.text.length - (edit.end - edit.start);
+    }
+    const node =
+      at === undefined
+        ? undefined
+        : sourceFile.getDescendantAtStartWithWidth(at, rewrite.stated.length);
+    // Every rewrite states the type at a recorded offset, so this is only
+    // reached through a wrong offset; it abstains rather than skip the walk.
+    if (!node) return 'the stated producer type could not be found again after the rewrite';
+
+    const type = node.getType().compilerType;
+    let found: Array<{ kind: string; path: string }>;
+    if (type.flags & ts.TypeFlags.Unknown) found = [{ kind: 'unknown', path: '' }];
+    else if (type.flags & ts.TypeFlags.Any) found = [{ kind: 'any', path: '' }];
+    else {
+      const program = this.project.getProgram().compilerObject;
+      found = this.topTypes(type, program, program.getTypeChecker(), node.compilerNode);
+    }
+    const unknowns = found.filter((finding) => finding.kind === 'unknown');
+    const anys = found.filter((finding) => finding.kind === 'any');
+    const deciding = unknowns.length > 0 ? unknowns : diagnosed ? [] : anys;
+    if (deciding.length === 0) return undefined;
+
+    const members = deciding
+      .map(({ kind, path }) => (path === '' ? `'${kind}'` : `'${kind}' at '${path}'`))
+      .join(', ');
+    return `the producer's response reads as ${members} in the consumer's program, so it was not compared`;
   }
 
   /**
@@ -838,7 +926,11 @@ function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
       const type = parent.getTypeNodeOrThrow();
       const start = type.getStart();
       const end = type.getEnd();
-      return (stated) => [{ start, end, text: awaited ? stated : `Promise<${stated}>` }];
+      return (stated) => [
+        awaited
+          ? { start, end, text: stated, statedAt: 0 }
+          : { start, end, text: `Promise<${stated}>`, statedAt: 'Promise<'.length },
+      ];
     } else if (!Node.isParenthesizedExpression(parent)) break;
     node = parent;
   }
@@ -848,7 +940,7 @@ function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
     // The compiler reports past a parenthesis, so a finding on the cast read
     // lands on `res`, an original position, never on this one.
     { start, end: start, text: '(' },
-    { start: end, end, text: ` as Promise<${stated}>)` },
+    { start: end, end, text: ` as Promise<${stated}>)`, statedAt: ' as Promise<'.length },
   ];
 }
 

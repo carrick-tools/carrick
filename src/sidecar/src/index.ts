@@ -19,8 +19,13 @@ import { TypeBundler, SurfaceEmitter } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
-import { captureStub, jsonWireDeclarations, runCheck } from './capture/index.js';
-import { Retyper } from './retype.js';
+import {
+  captureStub,
+  findDisqualifyingTopTypes,
+  jsonWireDeclarations,
+  runCheck,
+} from './capture/index.js';
+import { Retyper, type TopTypeWalk } from './retype.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -94,7 +99,18 @@ function projectComponents(): ProjectComponents {
       definitionResolver: new DefinitionResolver({ project }),
       // Locates calls exactly as `infer` does, so it rewrites the node the
       // consumer's published type came from (carrick#1491).
-      retyper: new Retyper(project, typeInferrer, jsonWireDeclarations),
+      // The walk is typed against the capture bundle's compiler copy and
+      // handed this project's: it reads only `TypeFlags` and `ObjectFlags`,
+      // which the two copies share (pinned in retype-top-types.test.ts). The
+      // pin runs against this package's lockfile; the published package
+      // (`npm/carrick/package.json`) resolves `typescript ^5.8.0` unpinned,
+      // so an install can pair ts-morph's copy with a newer 5.x.
+      retyper: new Retyper(
+        project,
+        typeInferrer,
+        jsonWireDeclarations,
+        findDisqualifyingTopTypes as unknown as TopTypeWalk
+      ),
     };
   }
   return components;
