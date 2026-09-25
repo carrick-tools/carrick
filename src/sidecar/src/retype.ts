@@ -319,9 +319,6 @@ export class Retyper {
         };
       }
 
-      const unresolved = this.unresolvedMembers(sourceFile, rewrite);
-      if (unresolved) return { kind: 'abstain', reason: unresolved };
-
       const remaining = new Map<string, number>();
       for (const d of pre) remaining.set(key(d), (remaining.get(key(d)) ?? 0) + 1);
       const added: Diag[] = [];
@@ -337,6 +334,9 @@ export class Retyper {
         added.push(mapped);
       }
       added.sort((a, b) => a.start - b.start || a.code - b.code);
+
+      const unresolved = this.unresolvedMembers(sourceFile, rewrite, added.length > 0);
+      if (unresolved) return { kind: 'abstain', reason: unresolved };
       return { kind: 'checked', added };
     } finally {
       sourceFile.replaceWithText(original);
@@ -345,20 +345,34 @@ export class Retyper {
 
   /**
    * Why the stated type, as the consumer's program reads it, cannot be
-   * compared, or `undefined` when it can (carrick#1514).
+   * compared, or `undefined` when it can (carrick#1514). Read after the
+   * diagnostics diff, because the two top types fail in opposite directions.
    *
    * The producer's text is sent only when it holds no `any`/`unknown`, but
    * the consumer's program is where it is read: under its compiler options,
-   * through the wire transform, with its own declarations. A member that
-   * reads as `unknown` there makes every read of it an error that says
-   * nothing about the producer, and one that reads as `any` makes every read
-   * of it agree. Either way that member was not compared, so the item
-   * abstains and names it, as the check phase does for a published type.
+   * through the wire transform (a lib type whose `toJSON()` returns `any`),
+   * with its own declarations.
    *
-   * A walk that runs out of budget found nothing to name; the compiler's
-   * diagnostics stand.
+   * - A member that reads as `unknown` makes reads fail that the producer's
+   *   type would pass, so any diagnostic may be ours. It is never compared.
+   * - A member that reads as `any` can hide a failure but never make one, so
+   *   the diagnostics the diff found stand; only an empty diff is not
+   *   compared, since it may be the `any` agreeing.
+   *
+   * Either way the reason names the member, as the check phase does for a
+   * published type.
+   *
+   * The walk's budget sentinel is dropped. The scanner's text screen
+   * (`contains_disqualifying_top_type`, which has no budget) found no
+   * `any`/`unknown` in the producer's text before sending it, so a walk that
+   * runs out of budget can only miss one the consumer's program made deeper
+   * than the budget allows; the compiler's diagnostics stand.
    */
-  private unresolvedMembers(sourceFile: SourceFile, rewrite: Rewrite): string | undefined {
+  private unresolvedMembers(
+    sourceFile: SourceFile,
+    rewrite: Rewrite,
+    diagnosed: boolean
+  ): string | undefined {
     let shift = 0;
     let at: number | undefined;
     for (const edit of [...rewrite.edits].sort((a, b) => a.start - b.start)) {
@@ -376,16 +390,22 @@ export class Retyper {
     if (!node) return 'the stated producer type could not be found again after the rewrite';
 
     const type = node.getType().compilerType;
-    const where = "in the consumer's program, so it was not compared";
-    if (type.flags & ts.TypeFlags.Unknown) return `the producer's response reads as 'unknown' ${where}`;
-    if (type.flags & ts.TypeFlags.Any) return `the producer's response reads as 'any' ${where}`;
-    const program = this.project.getProgram().compilerObject;
-    const found = this.topTypes(type, program, program.getTypeChecker(), node.compilerNode).filter(
-      (finding) => finding.kind === 'any' || finding.kind === 'unknown'
-    );
-    if (found.length === 0) return undefined;
-    const members = found.map((finding) => `'${finding.kind}' at '${finding.path}'`).join(', ');
-    return `the producer's response reads as ${members} ${where}`;
+    let found: Array<{ kind: string; path: string }>;
+    if (type.flags & ts.TypeFlags.Unknown) found = [{ kind: 'unknown', path: '' }];
+    else if (type.flags & ts.TypeFlags.Any) found = [{ kind: 'any', path: '' }];
+    else {
+      const program = this.project.getProgram().compilerObject;
+      found = this.topTypes(type, program, program.getTypeChecker(), node.compilerNode);
+    }
+    const unknowns = found.filter((finding) => finding.kind === 'unknown');
+    const anys = found.filter((finding) => finding.kind === 'any');
+    const deciding = unknowns.length > 0 ? unknowns : diagnosed ? [] : anys;
+    if (deciding.length === 0) return undefined;
+
+    const members = deciding
+      .map(({ kind, path }) => (path === '' ? `'${kind}'` : `'${kind}' at '${path}'`))
+      .join(', ');
+    return `the producer's response reads as ${members} in the consumer's program, so it was not compared`;
   }
 
   /**

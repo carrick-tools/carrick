@@ -101,7 +101,10 @@ function projectComponents(): ProjectComponents {
       // consumer's published type came from (carrick#1491).
       // The walk is typed against the capture bundle's compiler copy and
       // handed this project's: it reads only `TypeFlags` and `ObjectFlags`,
-      // which the two copies share (pinned in retype-top-types.test.ts).
+      // which the two copies share (pinned in retype-top-types.test.ts). The
+      // pin runs against this package's lockfile; the published package
+      // (`npm/carrick/package.json`) resolves `typescript ^5.8.0` unpinned,
+      // so an install can pair ts-morph's copy with a newer 5.x.
       retyper: new Retyper(
         project,
         typeInferrer,

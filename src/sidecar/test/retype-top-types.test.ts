@@ -4,12 +4,19 @@
  * says which one instead.
  *
  * The retype states the producer's response in the CONSUMER's own program,
- * under the consumer's compiler options. A consumer without
- * `strictNullChecks` is common (a mobile app's base config sets no `strict`),
- * and there `null` is assignable to every type, so the JSON wire transform's
- * `null extends { toJSON(): infer R }` test held and `R` came back `unknown`.
- * A producer member typed `null` in one branch of a union then read as
- * `unknown`, and a field the producer does return was flagged as missing.
+ * under the compiler options the sidecar reads for it. Without
+ * `strictNullChecks`, `null` is assignable to every type, so the JSON wire
+ * transform's `null extends { toJSON(): infer R }` test held and `R` came
+ * back `unknown`. A producer member typed `null` in one branch of a union
+ * then read as `unknown`, and a field the producer does return was flagged
+ * as missing. That is a real defect for a consumer that is genuinely
+ * non-strict.
+ *
+ * The consumer that exposed it is not one: it sets no `strict` and builds
+ * with TypeScript 6, where `strict` defaults on, while the sidecar's bundled
+ * TypeScript 5 reads the same config as non-strict (carrick#1519). Once that
+ * is fixed, its row is judged strict and returns to a mismatch of its own
+ * (`possibly 'null'`, from a discriminant published as `boolean`, #1516).
  *
  * Every other retype fixture, and the check workspace, is `strict: true`,
  * which is why none of them saw it. This one sets `strictNullChecks: false`
@@ -174,7 +181,32 @@ describe('carrick#1514: the retype in a program without strictNullChecks', () =>
     assert.match(out.reason ?? '', /'unknown' at 'session'/);
   });
 
-  it('does not compare a member that reads as any, and names it', async () => {
+  it('keeps a mismatch found beside a member that reads as any', async () => {
+    // A lib type whose `toJSON()` returns `any` reads as `any` on the wire.
+    // `any` can hide an error but never make one, so the read of a field the
+    // producer does not return is still a fact.
+    const out = await retype(
+      'absent',
+      '{ active: boolean; when: Date; rect: DOMRect; session: { id: string; pendingId: string; }; }'
+    );
+    assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
+    assert.strictEqual(out.diagnostics.length, 1, JSON.stringify(out.diagnostics));
+    assert.strictEqual(out.diagnostics[0].line, CASES.absent.read);
+    assert.strictEqual(out.diagnostics[0].code, 2339);
+  });
+
+  it('does not compare a member that reads as unknown, even when nothing fails', async () => {
+    // `unknown` makes reads fail that the producer's type would pass, so it
+    // is not compared whatever the diff says.
+    const out = await retype(
+      'pending',
+      '{ active: boolean; session: { id: string; pendingId: string; }; extra: unknown; }'
+    );
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.match(out.reason ?? '', /'unknown' at 'extra'/);
+  });
+
+  it('does not compare a member that reads as any when nothing fails, and names it', async () => {
     // `any` never errors, so without this the read would "agree" with a
     // member nobody could see.
     const out = await retype(
