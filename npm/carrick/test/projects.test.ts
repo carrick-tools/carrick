@@ -8,7 +8,17 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { listProjects, createProject, assignRepos, projectLines } from "../src/init/projects.ts";
+import {
+  listProjects,
+  createProject,
+  assignRepos,
+  projectLines,
+  projectOptions,
+  nameProblem,
+  slugFromName,
+  NEW_PROJECT,
+  DASHBOARD,
+} from "../src/init/projects.ts";
 
 const TOKEN = "test-token";
 
@@ -114,6 +124,75 @@ test("a create sends the slug it was given, and reports what came back", async (
   );
   assert.equal(created.kind, "created");
   assert.equal(created.kind === "created" ? created.project.slug : null, "payments");
+});
+
+// carrick-cloud#1359: a workspace's first project takes the repos the GitHub
+// App install staged, and the create answer says how many. A server from
+// before that answers without the field, or a hard 0; both mean none.
+test("a create reports the repos the new project already holds, and none where the server does not say", async () => {
+  const answer = (project: Record<string, unknown>) =>
+    answering(() => Response.json({ schema: "carrick.create-project/0", project }));
+  const base = { slug: "acme", name: "Acme", archived: false };
+  for (const [project, count] of [
+    [{ ...base, repo_count: 2 }, 2],
+    [{ ...base, repo_count: 0 }, 0],
+    [{ ...base, repo_count: null }, 0],
+    [base, 0],
+  ] as const) {
+    const outcome = await createProject(TOKEN, "acme", "Acme", answer(project));
+    assert.equal(outcome.kind === "created" ? outcome.project.repo_count : "not created", count, JSON.stringify(project));
+  }
+});
+
+// carrick#1489: a new project is asked for by name, and the slug is the one
+// the dashboard's form derives from the same name.
+test("the slug is derived from the name exactly as the dashboard derives it", () => {
+  for (const [name, slug] of [
+    ["Acme", "acme"],
+    ["Acme API", "acme-api"],
+    ["  Payments & Billing!  ", "payments-billing"],
+    ["--Search--", "search"],
+    ["Café Orders", "caf-orders"],
+    ["A".repeat(40), "a".repeat(32)],
+    // Cut at 32, then a trailing hyphen the cut left is dropped.
+    [`${"x".repeat(31)} y`, "x".repeat(31)],
+    ["日本", ""],
+  ] as const) {
+    assert.equal(slugFromName(name), slug, name);
+  }
+});
+
+test("a name is refused before anything is sent when the dashboard would refuse it", () => {
+  const projects = [
+    { slug: "payments", name: "Payments", archived: false, repo_count: 1 },
+    { slug: "old-search", name: "Old Search", archived: true, repo_count: 0 },
+  ];
+  assert.equal(nameProblem("Acme", projects), null);
+  assert.equal(nameProblem("ab", projects), "A project name needs at least 3 letters or digits.");
+  assert.equal(nameProblem("日本", projects), "A project name needs at least 3 letters or digits.");
+  assert.equal(nameProblem("Default", projects), '"Default" is reserved. Pick another name.');
+  assert.equal(nameProblem("payments", projects), "Project Payments (payments) already exists. Pick another name.");
+  // An archived project still holds its slug.
+  assert.equal(nameProblem("Old search", projects), "Project Old Search (old-search) already exists, archived. Pick another name.");
+  assert.match(nameProblem("n".repeat(65), projects) ?? "", /64 characters or fewer/);
+});
+
+test("the project question lists each active project, then a new one, then the dashboard", () => {
+  const options = projectOptions([
+    { slug: "zeta", name: "Zeta", archived: false, repo_count: 3 },
+    { slug: "gone", name: "Gone", archived: true, repo_count: 1 },
+    { slug: "alpha", name: "alpha", archived: false, repo_count: 1 },
+    { slug: "unknown", name: "Unknown", archived: false, repo_count: null },
+  ]);
+  assert.deepEqual(options, [
+    { value: "project:alpha", label: "alpha", hint: "1 repo" },
+    { value: "project:unknown", label: "Unknown (unknown)" },
+    { value: "project:zeta", label: "Zeta (zeta)", hint: "3 repos" },
+    { value: NEW_PROJECT, label: "New project" },
+    { value: DASHBOARD, label: "Choose on the dashboard" },
+  ]);
+  // No row is labelled with the word the old question used.
+  assert.ok(options.every((option) => !/slug/i.test(option.label)));
 });
 
 // A refusal is the server stating a rule. It is the one non-2xx that must not

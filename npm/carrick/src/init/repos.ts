@@ -9,7 +9,14 @@ const proposal = z.object({
   schema: z.literal("carrick.derive/0"), workspace: z.string(), repos_detected_by: z.string(),
   repos_added: z.array(z.string()), repos_excluded: z.array(z.string()), missing: z.array(z.string()),
   parent_proposal: z.object({ directory: z.string(), repos: z.array(z.string()) }).nullable(),
-  repos: z.array(z.object({ path: z.string(), reason: z.string(), services: z.array(service), config: z.record(z.unknown()).nullable(), warnings: z.array(z.string()) })),
+  repos: z.array(z.object({
+    path: z.string(), reason: z.string(), services: z.array(service), config: z.record(z.unknown()).nullable(), warnings: z.array(z.string()),
+    // The services whose dependencies a scan would refuse over, by the
+    // scanner's own preflight rule (carrick#1489). Required: the scanner ships
+    // in this package, so a document without it is a mismatched install and
+    // is refused as one below.
+    not_installed: z.array(z.object({ service: z.string(), directory: z.string(), command: z.string() })),
+  })),
 });
 export type WorkspaceProposal = z.infer<typeof proposal>;
 

@@ -107,10 +107,23 @@ const UNSTAMPED_GET = `carrick:
   URL: ${MCP_URL}
 `;
 
-test("a machine with no agent client is told the line, and nothing is written", () => {
-  const { env, written } = machine({ commands: ["claude"] });
+test("a machine with no claude command is told the line, and nothing is written", () => {
+  const { env, written, ran } = machine({ directories: [path.join(HOME, ".claude")] });
   assert.deepEqual(connectMcpClients(EVERY_EDITOR, env), []);
   assert.deepEqual(written, {});
+  assert.deepEqual(ran, []);
+});
+
+// carrick#1489. `claude mcp add` creates the configuration it writes to, so a
+// Claude Code that has never been run is still one this command can set up.
+// Requiring its directory made init write its hooks and then report "no agent
+// client found".
+test("Claude Code is connected by its command even before it has ever run", () => {
+  const { env, ran } = machine({ commands: ["claude"], statuses: { "claude mcp get carrick": 1 } });
+  assert.deepEqual(connectMcpClients([], env), [
+    { client: "Claude Code", state: "written", detail: "connected for this user" },
+  ]);
+  assert.deepEqual(ran, ["claude mcp get carrick", ADD_LINE]);
 });
 
 test("Claude Code is connected by its own command, once", () => {

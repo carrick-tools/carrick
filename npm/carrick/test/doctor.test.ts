@@ -685,8 +685,8 @@ test("how far the index is behind the branch CI indexes is a note with the numbe
 
 test("the whole command, on a workspace with exactly three findings", () => {
   // One repo: an include that is not there, a workflow that matches the
-  // template, hooks that run this package, the task skills never written, no
-  // agent client, and an index whose hosted half never arrived. Three
+  // template, hooks that run this package, the task skills never written, a
+  // Claude Code already connected, and an index whose hosted half never arrived. Three
   // findings, exit 1, and everything else a line that costs nothing.
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
   const entry = path.join(packageRoot, "bin", "carrick.mjs");
@@ -721,10 +721,21 @@ test("the whole command, on a workspace with exactly three findings", () => {
     }),
   );
 
+  // Claude Code is found by its command alone (carrick#1489), so the machine
+  // this runs on would decide a line: a `claude` of the test's own goes first
+  // on PATH, one that already holds the Carrick server.
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(
+    path.join(bin, "claude"),
+    `#!/bin/sh\nif [ "$1 $2 $3" = "mcp get carrick" ]; then echo "carrick:"; echo "  URL: https://api.carrick.tools/mcp"; exit 0; fi\nexit 1\n`,
+  );
+  fs.chmodSync(path.join(bin, "claude"), 0o755);
   const run = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "doctor", root], {
     encoding: "utf8",
     env: {
       ...process.env,
+      PATH: `${bin}${path.delimiter}${process.env["PATH"] ?? ""}`,
       HOME: home,
       USERPROFILE: home,
       XDG_CONFIG_HOME: path.join(home, ".config"),
@@ -746,7 +757,8 @@ test("the whole command, on a workspace with exactly three findings", () => {
     `◇ CI workflow matches the current template in 1 repo(s).`,
     `◇ Agent hooks are installed here and run this package (${entry}).`,
     "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
-    "No agent client on this machine holds an MCP configuration, so there is none to check.",
+    // Found with no ~/.claude at all: the command is the detection.
+    "◇ MCP server connected for Claude Code.",
     "▲ api: api is connected and has no hosted index yet. Run `carrick index` once to classify them. (hosted state: no_index_yet)",
     "",
     "3 finding(s) above, marked ▲ or ■. Nothing here was changed; `carrick doctor` exits non-zero while any of them stand.",
