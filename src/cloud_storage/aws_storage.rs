@@ -269,6 +269,36 @@ fn relogin_message(status: reqwest::StatusCode, body: &str) -> String {
 /// a child process inherits from the parent that drives it.
 const RUN_ID_HEADER: &str = "X-Carrick-Run-Id";
 
+/// How many repos this run will report, beside the run key (cloud#1363).
+///
+/// `carrick index` over several repos is one run, and the cloud sends one
+/// email for it when every repo has finished. The run id says which uploads
+/// belong together; this says how many to wait for. Sent only when the
+/// process driving the scans declared it through [`RUN_REPO_COUNT_ENV`], so a
+/// single `carrick` scan and every CI run send nothing, and a cloud that has
+/// never heard of the header mails each repo as it always has.
+const RUN_REPO_COUNT_HEADER: &str = "X-Carrick-Run-Repo-Count";
+
+/// Set by `carrick index` on each repo's scan subprocess: the number of repos
+/// the run covers. Internal, like [`crate::logging::RUN_ID_ENV`].
+pub const RUN_REPO_COUNT_ENV: &str = "CARRICK_RUN_REPO_COUNT";
+
+/// The declared repo count as a header, or no header at all. A value that is
+/// not a positive integer is dropped rather than sent: the cloud would read it
+/// as absent anyway, and absent is the safe reading.
+fn run_repo_count_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let declared = std::env::var(RUN_REPO_COUNT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|count| *count >= 1)
+        .map(reqwest::header::HeaderValue::from);
+    if let Some(value) = declared {
+        headers.insert(RUN_REPO_COUNT_HEADER, value);
+    }
+    headers
+}
+
 /// The release that made the request. Sent beside the run id for the same
 /// reason the prompt lambdas get it: a behaviour that appeared in one release
 /// is otherwise attributed by guessing at timestamps.
@@ -981,6 +1011,7 @@ impl AwsStorage {
                 .post(&self.lambda_url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header(RUN_ID_HEADER, crate::logging::run_id())
+                .headers(run_repo_count_headers())
                 .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
@@ -1085,6 +1116,7 @@ impl AwsStorage {
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
                 .header(RUN_ID_HEADER, crate::logging::run_id())
+                .headers(run_repo_count_headers())
                 .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
@@ -1468,6 +1500,7 @@ impl AwsStorage {
                 .post(&self.lambda_url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header(RUN_ID_HEADER, crate::logging::run_id())
+                .headers(run_repo_count_headers())
                 .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .timeout(MARKER_ATTEMPT_TIMEOUT)
                 .json(body)
@@ -3252,6 +3285,63 @@ mod tests {
         );
     }
 
+    /// A run that declared its repo count sends it beside the run key
+    /// (cloud#1363), on the wire, so the cloud can hold each repo's email for
+    /// the run's one mail.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_request_in_a_counted_run_says_how_many_repos_the_run_covers() {
+        // SAFETY: a `#[serial]` test; the variable is read per request.
+        unsafe { std::env::set_var(RUN_REPO_COUNT_ENV, "3") };
+        let (storage, server) = bearer_storage(vec![check_ok()]);
+        storage.health_check().await.unwrap();
+        unsafe { std::env::remove_var(RUN_REPO_COUNT_ENV) };
+
+        let request = &server.join().unwrap()[0];
+        assert_eq!(
+            header_of(request, RUN_REPO_COUNT_HEADER).as_deref(),
+            Some("3"),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id()),
+            "{request}"
+        );
+    }
+
+    /// The old request: no declared count, no header, which is exactly what
+    /// every release before this one sent. A value that is not a positive
+    /// count is dropped rather than sent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_request_with_no_declared_count_sends_no_count_header() {
+        for declared in [None, Some("0"), Some("two"), Some("")] {
+            // SAFETY: a `#[serial]` test; the variable is read per request.
+            unsafe {
+                match declared {
+                    Some(value) => std::env::set_var(RUN_REPO_COUNT_ENV, value),
+                    None => std::env::remove_var(RUN_REPO_COUNT_ENV),
+                }
+            }
+            let (storage, server) = bearer_storage(vec![check_ok()]);
+            storage.health_check().await.unwrap();
+            unsafe { std::env::remove_var(RUN_REPO_COUNT_ENV) };
+
+            let request = &server.join().unwrap()[0];
+            assert_eq!(
+                header_of(request, RUN_REPO_COUNT_HEADER),
+                None,
+                "{declared:?}: {request}"
+            );
+            assert_eq!(
+                header_of(request, RUN_ID_HEADER).as_deref(),
+                Some(crate::logging::run_id()),
+                "{request}"
+            );
+        }
+    }
+
     /// The same two headers on the CI branch, where the credential is the
     /// minted OIDC token rather than a bearer secret. Serialised because the
     /// provider reads the runner's variables out of the process environment
@@ -3331,6 +3421,33 @@ mod tests {
         assert_eq!(body["reason"], "the sidecar stopped answering");
         assert!(
             has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    /// A repo that dies inside a counted run reports its death with the count
+    /// too (cloud#1363): the fail marker is one of the finishes the run's one
+    /// email waits for, and it goes out through its own request builder.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fail_marker_in_a_counted_run_carries_the_count() {
+        // SAFETY: a `#[serial]` test; the variable is read per request.
+        unsafe { std::env::set_var(RUN_REPO_COUNT_ENV, "2") };
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(200, serde_json::json!({ "ok": true }).to_string())],
+            "scan_01J",
+        );
+        storage
+            .report_scan_failed("upload", "connection reset")
+            .await;
+        unsafe { std::env::remove_var(RUN_REPO_COUNT_ENV) };
+
+        let requests = server.join().unwrap();
+        assert_eq!(body_of(&requests[0])["action"], "scan-failed");
+        assert_eq!(
+            header_of(&requests[0], RUN_REPO_COUNT_HEADER).as_deref(),
+            Some("2"),
             "{}",
             requests[0]
         );

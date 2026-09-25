@@ -326,6 +326,7 @@ fn run_generation(
             &name,
             pass,
             workspace_position,
+            targets.len(),
         )?;
         pending.extend(report.pending.iter().cloned());
         if let Some(split) = &report.timing {
@@ -577,8 +578,10 @@ fn scan_repo(
     label: &str,
     pass: &Pass,
     workspace_position: Option<(usize, usize)>,
+    run_repos: usize,
 ) -> Result<ScanReport, String> {
     let mut command = scan_command(exe, repo, blobs, previous, Some(peers), pass);
+    declare_run_repos(&mut command, pass, run_repos);
     if let Some((offset, total)) = workspace_position {
         command
             .env(crate::progress::OFFSET_ENV, offset.to_string())
@@ -593,6 +596,26 @@ fn scan_repo(
         },
         HEARTBEAT,
     )
+}
+
+/// Tell each repo's scan how many repos this run covers (cloud#1363).
+///
+/// The cloud sends one email for a `carrick index` run, when every repo in it
+/// has finished, and this count is how it knows how many finishes to wait for.
+/// Only the plain inferred pass declares one: it is the run that scans every
+/// target and uploads each of them. `refresh` uploads nothing, `--dispatch`
+/// hands its repos to cloud jobs that mail on their own, and a `resume` is a
+/// subset the user typed and is watching. Removed on those, so an inherited
+/// variable cannot hold their mail for repos that will never report.
+pub(super) fn declare_run_repos(command: &mut Command, pass: &Pass, run_repos: usize) {
+    if matches!(pass, Pass::Infer) && run_repos > 0 {
+        command.env(
+            crate::cloud_storage::RUN_REPO_COUNT_ENV,
+            run_repos.to_string(),
+        );
+    } else {
+        command.env_remove(crate::cloud_storage::RUN_REPO_COUNT_ENV);
+    }
 }
 
 /// The subprocess one repo's phase-1 scan runs as.
@@ -2319,6 +2342,33 @@ mod tests {
             env.get(crate::logging::RUN_PHASE_ENV),
             Some(&Some("workspace join".into()))
         );
+    }
+
+    /// One email per `carrick index` run (cloud#1363): the inferred pass tells
+    /// every repo's scan how many repos the run covers, and every other pass
+    /// removes the count, so an inherited one cannot hold a mail for repos
+    /// that will never report.
+    #[test]
+    fn only_the_inferred_pass_declares_how_many_repos_the_run_covers() {
+        let key = crate::cloud_storage::RUN_REPO_COUNT_ENV;
+        let declared = |pass: &Pass, repos: usize| {
+            let mut command = scan_command(
+                Path::new("/bin/carrick"),
+                Path::new("/repos/api"),
+                Path::new("/build/repos"),
+                Path::new("/build/previous.json"),
+                Some(Path::new("/build/peers")),
+                pass,
+            );
+            command.env(key, "9");
+            declare_run_repos(&mut command, pass, repos);
+            env_of(&command).get(key).cloned()
+        };
+        assert_eq!(declared(&Pass::Infer, 3), Some(Some("3".into())));
+        assert_eq!(declared(&Pass::Infer, 1), Some(Some("1".into())));
+        for pass in [Pass::Facts, Pass::Dispatch, Pass::Resume(BTreeMap::new())] {
+            assert_eq!(declared(&pass, 3), Some(None), "{pass:?}");
+        }
     }
 
     /// A scan that panics keeps logging on the way down, so the last twelve
