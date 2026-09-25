@@ -276,7 +276,9 @@ const RUN_ID_HEADER: &str = "X-Carrick-Run-Id";
 /// belong together; this says how many to wait for. Sent only when the
 /// process driving the scans declared it through [`RUN_REPO_COUNT_ENV`], so a
 /// single `carrick` scan and every CI run send nothing, and a cloud that has
-/// never heard of the header mails each repo as it always has.
+/// never heard of the header mails each repo as it always has. Laptop
+/// requests only: the OIDC path is CI, which never runs under `carrick index`,
+/// so it does not send the header at all.
 const RUN_REPO_COUNT_HEADER: &str = "X-Carrick-Run-Repo-Count";
 
 /// Set by `carrick index` on each repo's scan subprocess: the number of repos
@@ -1116,7 +1118,6 @@ impl AwsStorage {
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
                 .header(RUN_ID_HEADER, crate::logging::run_id())
-                .headers(run_repo_count_headers())
                 .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
@@ -3359,10 +3360,12 @@ mod tests {
         let (token_url, token_server) =
             crate::agent_service::tests::stub_token_endpoint(vec![issued.clone()]);
         // SAFETY: a `#[serial]` test, and the provider is read once per
-        // process — nothing else in this binary asks for it.
+        // process — nothing else in this binary asks for it. The run count is
+        // set too, to show the CI path does not send it (cloud#1363).
         unsafe {
             std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_URL", &token_url);
             std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-secret");
+            std::env::set_var(RUN_REPO_COUNT_ENV, "3");
         }
 
         let (base, server) = crate::agent_service::tests::stub_server(vec![check_ok()]);
@@ -3372,10 +3375,12 @@ mod tests {
             false,
         );
         storage.health_check().await.unwrap();
+        unsafe { std::env::remove_var(RUN_REPO_COUNT_ENV) };
 
         let request = &server.join().unwrap()[0];
         token_server.join().unwrap();
         assert!(has_header(request, "x-carrick-oidc", &issued), "{request}");
+        assert_eq!(header_of(request, RUN_REPO_COUNT_HEADER), None, "{request}");
         assert_eq!(
             header_of(request, RUN_ID_HEADER).as_deref(),
             Some(crate::logging::run_id()),
