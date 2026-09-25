@@ -928,6 +928,15 @@ struct Resolved {
     /// model returns: the path a `new URL` gives a call whose verb is
     /// unreadable has no verb to be indexed under.
     emits: bool,
+    /// The target a model row must report for this statement to apply to it.
+    /// `None`, the rule, means it applies to whatever row sits at its span.
+    ///
+    /// Set only where the span belongs to a call that is not the request the
+    /// statement is about: the verb of the one request a non-request call
+    /// wraps (carrick-cloud#1365). A model row at that span may describe a
+    /// different call inside it, so the verb applies only to a row that
+    /// reports the wrapped request's own URL text.
+    only_for_target: Option<String>,
     row: ResolvedRow,
 }
 
@@ -5687,6 +5696,7 @@ impl FileOrchestrator {
                 line: endpoint.line_number,
                 source: ResolutionSource::ClassController,
                 emits: true,
+                only_for_target: None,
                 row: ResolvedRow::Endpoint(Box::new(endpoint)),
             };
             let _ = Self::emit_resolved_rows(result, vec![resolved], emitted);
@@ -5919,6 +5929,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::WholeUrlEnv,
                     emits: true,
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -5958,6 +5969,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::EnvBasePath,
                     emits: true,
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6001,6 +6013,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::LiteralBasePath,
                     emits: true,
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6024,6 +6037,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::ImportedMember,
                     emits: true,
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6050,6 +6064,7 @@ impl FileOrchestrator {
                     // producer's route descriptor, so it stays the model's to
                     // classify and only overrules what the model returns.
                     emits: spec.method_from_callee,
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6079,6 +6094,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::NewUrl,
                     emits: method.is_some(),
+                    only_for_target: None,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6122,6 +6138,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::ReceiverType,
                     emits: true,
+                    only_for_target: None,
                     row,
                 });
             }
@@ -6137,8 +6154,12 @@ impl FileOrchestrator {
             // still the site's own, so it is stated without a target and
             // overrules only the method of the row the model returns here.
             // Lowest precedence: any source that reads the target as well
-            // states the verb with it and wins the span.
-            if let Some(method) = Self::verb_the_call_states(candidate, &candidates) {
+            // states the verb with it and wins the span. A call that only
+            // wraps the request states its verb for a row reporting that
+            // request's URL, and for no other row.
+            if let Some((method, only_for_target)) =
+                Self::verb_the_call_states(candidate, &candidates)
+            {
                 claim(Resolved {
                     method: Some(method.clone()),
                     url: String::new(),
@@ -6146,6 +6167,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::InlineLiteral,
                     emits: false,
+                    only_for_target,
                     row: ResolvedRow::Call(Box::new(Self::deterministic_call(
                         candidate,
                         line,
@@ -6171,6 +6193,7 @@ impl FileOrchestrator {
                 line,
                 source: ResolutionSource::SameFileWrapper,
                 emits: true,
+                only_for_target: None,
                 row: ResolvedRow::Call(Box::new(DataCallResult {
                     candidate_id: format!("span:{}-{}", call.span_start, call.span_end),
                     line_number: line,
@@ -6224,6 +6247,7 @@ impl FileOrchestrator {
                     line: endpoint.line_number,
                     source,
                     emits: true,
+                    only_for_target: None,
                     row: ResolvedRow::Endpoint(Box::new(endpoint)),
                 });
             }
@@ -6231,43 +6255,99 @@ impl FileOrchestrator {
         resolved
     }
 
-    /// The HTTP verb a call site states for itself, if it states exactly one
-    /// (carrick-cloud#1365).
+    /// The HTTP verb a call site states, and the target a model row must
+    /// report for it to apply (carrick-cloud#1365).
     ///
     /// A request's own reading comes first: the verb it is spelled with, or the
     /// literal `method` in its options bag, which is what its `request_shape`
-    /// holds. A call whose method is a parameter states none.
+    /// holds. It applies to any row at the site. A call whose method is a
+    /// parameter states none.
     ///
-    /// A candidate that is not a request itself can still wrap one: the
+    /// A candidate that is not request-shaped can still wrap a request: the
     /// `Promise.all(xs.map((x) => client.post(url)))` a model may answer at
-    /// its outer call, or a promise chain's outer link. It states the verb of
-    /// the request inside its span when there is exactly one. Two requests
-    /// inside, or one whose method is unreadable, leave which of them the row
-    /// describes unknown, so nothing is stated.
+    /// its outer call. `NotARequest` only says the call carries no verb and no
+    /// options bag, not that it sends nothing, and a verb-named member is
+    /// raised whatever its receiver is (`headers.get`, a `Map`'s `delete`). So
+    /// the inner verb is stated only when the wrapper holds exactly one call
+    /// that could be a request, that call names its verb and writes its URL
+    /// as a literal, and the model's row reports that URL. Anything else in
+    /// the span that could be a request makes it two: another request-shaped
+    /// call, or a request head such as the `fetch(url)` a promise chain starts
+    /// from, which shares the wrapper's span start.
+    ///
+    /// `candidates` is sorted by `(span_start, span_end)`, so the calls inside
+    /// a span are read off the slice from its start rather than by a scan of
+    /// every candidate.
     fn verb_the_call_states(
         candidate: &CandidateTarget,
         candidates: &[&CandidateTarget],
-    ) -> Option<String> {
+    ) -> Option<(String, Option<String>)> {
         match &candidate.request_shape {
-            RequestShapeSignal::Known(shape) => Some(shape.method.clone()),
+            RequestShapeSignal::Known(shape) => Some((shape.method.clone(), None)),
             RequestShapeSignal::Unreadable => None,
             RequestShapeSignal::NotARequest => {
-                let mut inside = candidates.iter().filter(|other| {
-                    (other.span_start, other.span_end) != (candidate.span_start, candidate.span_end)
-                        && candidate.span_start <= other.span_start
-                        && other.span_end <= candidate.span_end
-                        && !matches!(other.request_shape, RequestShapeSignal::NotARequest)
-                });
+                let first =
+                    candidates.partition_point(|other| other.span_start < candidate.span_start);
+                let mut inside = candidates[first..]
+                    .iter()
+                    .take_while(|other| other.span_start < candidate.span_end)
+                    .filter(|other| {
+                        other.span_end <= candidate.span_end
+                            && (other.span_start, other.span_end)
+                                != (candidate.span_start, candidate.span_end)
+                            && Self::could_be_a_request(other)
+                    });
                 let only = inside.next()?;
                 if inside.next().is_some() {
                     return None;
                 }
-                match &only.request_shape {
-                    RequestShapeSignal::Known(shape) => Some(shape.method.clone()),
-                    _ => None,
-                }
+                let RequestShapeSignal::Known(shape) = &only.request_shape else {
+                    return None;
+                };
+                let url = Self::literal_url_text(only.path_snippet.as_deref())?;
+                Some((shape.method.clone(), Some(url.to_string())))
             }
         }
+    }
+
+    /// Whether a candidate inside a wrapper could be the request a model row
+    /// at the wrapper describes: it is request-shaped, or it is a bare call or
+    /// a call whose first argument is a literal URL, the way a `fetch(url)`
+    /// head is written.
+    fn could_be_a_request(candidate: &CandidateTarget) -> bool {
+        match candidate.request_shape {
+            RequestShapeSignal::Known(_) | RequestShapeSignal::Unreadable => true,
+            RequestShapeSignal::NotARequest => {
+                candidate.callee_property.is_none()
+                    || Self::literal_url_text(candidate.path_snippet.as_deref()).is_some()
+            }
+        }
+    }
+
+    /// The text of a first argument written as one whole string or template
+    /// literal that reads as a URL: a path, an absolute URL, or a base
+    /// interpolation followed by the rest. `None` for anything else, including
+    /// a snippet cut off at the end of its line, and a word such as the
+    /// `"etag"` a header read is passed.
+    fn literal_url_text(snippet: Option<&str>) -> Option<&str> {
+        let s = snippet?.trim();
+        let quote = s.chars().next()?;
+        if !matches!(quote, '"' | '\'' | '`') || s.len() < 2 || !s.ends_with(quote) {
+            return None;
+        }
+        let inner = &s[1..s.len() - 1];
+        if inner.contains(quote) || inner.contains('\\') {
+            return None;
+        }
+        (inner.starts_with('/') || inner.starts_with("${") || inner.contains("://"))
+            .then_some(inner)
+    }
+
+    /// Whether a model row's target reports `url`: the same text, or the text
+    /// behind a base the model put in front of a path.
+    fn target_reports_url(target: &str, url: &str) -> bool {
+        let target = target.trim();
+        target == url || (url.starts_with('/') && target.ends_with(url))
     }
 
     /// The row shape every candidate-backed deterministic call shares.
@@ -6984,7 +7064,15 @@ impl FileOrchestrator {
                         .iter()
                         .find(|entry| entry.span.map(|(start, _)| start) == span)
                     {
-                        Self::overrule_model_call(&mut call, overrule, file_path, stats);
+                        match overrule.only_for_target.as_deref() {
+                            Some(url) if !Self::target_reports_url(&call.target, url) => debug!(
+                                "Not applying the {} of the request inside the call at {file_path}:{}: the model's row reports {:?}, the request {url:?}",
+                                overrule.method.as_deref().unwrap_or("<unstated>"),
+                                call.line_number,
+                                call.target
+                            ),
+                            _ => Self::overrule_model_call(&mut call, overrule, file_path, stats),
+                        }
                     }
                     call.resolution_source = Some(ResolutionSource::Model);
                     result.data_calls.push(call);
@@ -16165,38 +16253,87 @@ export { routes };
         assert_eq!(stats.model_contradictions_discarded, 1);
     }
 
+    /// A bare call whose first argument is a literal URL and which names no
+    /// verb: the `fetch(url)` a promise chain starts from.
+    fn request_head(id: &str, span: (u32, u32), url: &str) -> CandidateTarget {
+        CandidateTarget {
+            callee_object: "fetch".to_string(),
+            callee_property: None,
+            path_snippet: Some(format!("`{url}`")),
+            code_snippet: format!("fetch(`{url}`)"),
+            receiver_ident: Some("fetch".to_string()),
+            ..verb_named_call(id, span, RequestShapeSignal::NotARequest)
+        }
+    }
+
+    /// A verb-named member whose argument is a word, not a URL: a header read,
+    /// a form field, a map key.
+    fn verb_named_read(id: &str, span: (u32, u32), verb: &str, arg: &str) -> CandidateTarget {
+        CandidateTarget {
+            callee_object: "res".to_string(),
+            callee_property: Some(verb.to_lowercase()),
+            path_snippet: Some(format!("\"{arg}\"")),
+            code_snippet: format!("res.headers.{}(\"{arg}\")", verb.to_lowercase()),
+            receiver_ident: None,
+            ..verb_named_call(id, span, known(verb))
+        }
+    }
+
+    fn methods_of(result: &FileAnalysisResult) -> Vec<Option<&str>> {
+        result
+            .data_calls
+            .iter()
+            .map(|call| call.method.as_deref())
+            .collect()
+    }
+
     /// The outer call of `Promise.all(xs.map((x) => client.post(url)))` is not
     /// a request, but a model may answer at it. It wraps one request, and that
-    /// request's verb is the row's.
+    /// request's verb is the row's when the row reports that request's URL,
+    /// with or without a base in front. A row at the same wrapper that reports
+    /// another URL describes another call and keeps the model's method.
     #[test]
     fn a_call_wrapping_one_request_states_that_requests_verb() {
         let result = FileAnalysisResult {
-            data_calls: vec![data_call_with("outer", "/teams/${teamId}", None)],
+            data_calls: vec![
+                data_call_with("outer", "/teams/${teamId}", None),
+                data_call_with("based", "${API_URL}/teams/${teamId}", None),
+                data_call_with("other", "/teams/${teamId}/archive", Some("PATCH")),
+            ],
             ..Default::default()
         };
         let candidate_map: HashMap<String, CandidateTarget> = [
-            (
-                "outer".to_string(),
-                verb_named_call("outer", (100, 200), RequestShapeSignal::NotARequest),
-            ),
-            (
-                "inner".to_string(),
-                verb_named_call("inner", (140, 190), known("POST")),
-            ),
+            verb_named_call("outer", (100, 200), RequestShapeSignal::NotARequest),
+            verb_named_call("inner", (140, 190), known("POST")),
+            verb_named_call("based", (300, 400), RequestShapeSignal::NotARequest),
+            verb_named_call("based-inner", (340, 390), known("DELETE")),
+            verb_named_call("other", (500, 600), RequestShapeSignal::NotARequest),
+            verb_named_call("other-inner", (540, 590), known("POST")),
         ]
         .into_iter()
+        .map(|candidate| (candidate.candidate_id.clone(), candidate))
         .collect();
 
         let (result, _) = emit_and_join(result, &candidate_map, "src/team.ts");
 
-        assert_eq!(result.data_calls[0].method.as_deref(), Some("POST"));
+        assert_eq!(
+            methods_of(&result),
+            vec![Some("POST"), Some("DELETE"), Some("PATCH")]
+        );
     }
 
-    /// Nothing is stated where the verb is not the call's to give: an outer
-    /// call wrapping two requests with different verbs, or wrapping a request
-    /// whose method is a parameter beside one that names its verb; and a
-    /// request whose own method is a parameter. Each row keeps what the model
-    /// said.
+    /// Nothing is stated where the verb is not the wrapper's to give, and each
+    /// row keeps what the model said:
+    ///
+    /// - two requests with different verbs inside one wrapper;
+    /// - a request whose method is a parameter beside one that names its verb;
+    /// - a request whose own method is a parameter;
+    /// - a chain `fetch(url).then(() => client.delete(url))`: the head is a
+    ///   request that names no verb and shares the chain's span start, so the
+    ///   chain holds two requests, not one;
+    /// - `callApi("PATCH", url, { name: form.get("name") })`: the only
+    ///   verb-named call inside reads a form field, and its argument is not
+    ///   the URL the row reports.
     #[test]
     fn a_call_states_no_verb_it_cannot_read_as_its_own() {
         let result = FileAnalysisResult {
@@ -16204,6 +16341,8 @@ export { routes };
                 data_call_with("two", "/teams/${teamId}", None),
                 data_call_with("unreadable-inside", "/teams/${teamId}", None),
                 data_call_with("unreadable", "/teams/${teamId}", Some("PUT")),
+                data_call_with("head", "/teams/${teamId}", Some("GET")),
+                data_call_with("form", "/teams/${teamId}", Some("PATCH")),
             ],
             ..Default::default()
         };
@@ -16219,6 +16358,16 @@ export { routes };
             verb_named_call("inside-a", (420, 480), RequestShapeSignal::Unreadable),
             verb_named_call("inside-b", (500, 560), known("POST")),
             verb_named_call("unreadable", (700, 760), RequestShapeSignal::Unreadable),
+            request_head("head", (800, 830), "/teams/${teamId}"),
+            verb_named_call("chain", (800, 900), RequestShapeSignal::NotARequest),
+            verb_named_call("chain-delete", (850, 890), known("DELETE")),
+            CandidateTarget {
+                callee_object: "callApi".to_string(),
+                callee_property: None,
+                path_snippet: Some("\"PATCH\"".to_string()),
+                ..verb_named_call("form", (1000, 1100), RequestShapeSignal::NotARequest)
+            },
+            verb_named_read("form-field", (1050, 1090), "GET", "name"),
         ]
         .into_iter()
         .map(|candidate| (candidate.candidate_id.clone(), candidate))
@@ -16226,12 +16375,10 @@ export { routes };
 
         let (result, stats) = emit_and_join(result, &candidate_map, "src/team.ts");
 
-        let methods: Vec<Option<&str>> = result
-            .data_calls
-            .iter()
-            .map(|call| call.method.as_deref())
-            .collect();
-        assert_eq!(methods, vec![None, None, Some("PUT")]);
+        assert_eq!(
+            methods_of(&result),
+            vec![None, None, Some("PUT"), Some("GET"), Some("PATCH")]
+        );
         assert_eq!(stats.model_methods_supplied, 0);
     }
 

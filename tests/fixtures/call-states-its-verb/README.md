@@ -18,13 +18,25 @@ stand-in for an HTTP client package, and it is not installed, so no
 deterministic source states a row at any of these sites: every row is the
 model's.
 
+`src/lib/items.ts` is the negative side: requests whose method the model
+states correctly, next to or around verb-named calls that are not the request.
+A chain whose `finally` deletes from a `Map` (line 6), a chain whose `then`
+reads a header (line 12), a form field read inside a wrapper call's arguments
+(line 18), a query parameter read inside the request's URL argument (line 24),
+a `Map` read beside a request (line 28), and a `fetch` chain whose `then`
+issues a DELETE to the same URL (line 32).
+
 ## The cassettes
 
-Every row states `"method": null`, and every `candidate_id` is a real candidate
-id (`span:<start>-<end>`, read off the fixture's own prompt), so each row joins
-the site it names. `LabelPicker.tsx:4` names the outer `Promise.all` candidate,
-which is not a request; line 8 names the request inside. Before the fix, every
-row was indexed as a GET, the default for a missing method.
+Every `candidate_id` is a real candidate id (`span:<start>-<end>`, read off
+the fixture's own prompt), so each row joins the site it names.
+
+- The screens' rows state `"method": null`. `LabelPicker.tsx:4` names the
+  outer `Promise.all` call, which is not a request; line 8 names the request
+  inside. Before the fix, every screen row was indexed as a GET, the default
+  for a missing method.
+- The rows in `items.ts` state the method the code sends, except the DELETE on
+  line 32, which states none.
 
 The ids are byte offsets into the source files. Editing a source file moves
 them, and the cassette has to be re-read from a `CARRICK_EVAL_DUMP_DIR` run.
@@ -39,3 +51,10 @@ them, and the cassette has to be re-read from a `CARRICK_EVAL_DUMP_DIR` run.
 | `src/screens/InviteCard.tsx` | 10 | PATCH |
 | `src/screens/MemberToggle.tsx` | 4 | DELETE |
 | `src/screens/MemberToggle.tsx` | 4 | POST |
+| `src/lib/items.ts` | 6 | GET |
+| `src/lib/items.ts` | 12 | PUT |
+| `src/lib/items.ts` | 18 | PATCH |
+| `src/lib/items.ts` | 24 | DELETE |
+| `src/lib/items.ts` | 28 | POST |
+| `src/lib/items.ts` | 32 | GET |
+| `src/lib/items.ts` | 32 | DELETE |
