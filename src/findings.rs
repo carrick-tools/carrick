@@ -173,6 +173,19 @@ pub enum Finding {
         /// one. Adding it there is a seam change, made on purpose or not at
         /// all.
         direction: Option<crate::cloud_storage::ManifestTypeKind>,
+        /// The pairing this finding is about, as the scanner keys it
+        /// (carrick-cloud#1369): producer service and operation, consumer
+        /// service and file, and the direction. No line, because a PR that
+        /// edits the consumer file above a call moves the line without
+        /// changing the pairing. Scan-local: never written to the wire. The
+        /// only reader is [`crate::pr_baseline`], which compares a PR run's
+        /// findings with main's on it. `None` when the caller cannot state it.
+        pair: Option<String>,
+        /// Whether main's copy of this repo, matched against the same peers,
+        /// yields this same finding (carrick-cloud#1369). Set only on a PR run
+        /// that has a prior index; `None` everywhere else, and then the field
+        /// is left off the wire, which the cloud reads as today's behaviour.
+        on_main: Option<bool>,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -189,6 +202,19 @@ pub enum Finding {
         /// declared route is a fact about routing, and no type verdict bears
         /// on it (cloud#599).
         verdict_state: Option<VerdictState>,
+        /// The pairing this finding is about, as the scanner keys it
+        /// (carrick-cloud#1369): producer service and operation, consumer
+        /// service and file, and the direction. No line, because a PR that
+        /// edits the consumer file above a call moves the line without
+        /// changing the pairing. Scan-local: never written to the wire. The
+        /// only reader is [`crate::pr_baseline`], which compares a PR run's
+        /// findings with main's on it. `None` when the caller cannot state it.
+        pair: Option<String>,
+        /// Whether main's copy of this repo, matched against the same peers,
+        /// yields this same finding (carrick-cloud#1369). Set only on a PR run
+        /// that has a prior index; `None` everywhere else, and then the field
+        /// is left off the wire, which the cloud reads as today's behaviour.
+        on_main: Option<bool>,
     },
     /// A consumer call with no producer in the index.
     MissingEndpoint {
@@ -304,6 +330,8 @@ impl Finding {
             // and by nobody else: a finding whose two type strings are side
             // labels must not read as a request or a response.
             direction: None,
+            pair: None,
+            on_main: None,
         }
     }
 
@@ -322,6 +350,8 @@ impl Finding {
             expected_method: expected_method.into(),
             edge_source: None,
             verdict_state: None,
+            pair: None,
+            on_main: None,
         }
     }
 
@@ -403,6 +433,40 @@ impl Finding {
             *direction = kind;
         }
         self
+    }
+
+    /// State the pairing a mismatch is about (carrick-cloud#1369), the key a
+    /// PR run's finding is compared with main's on. No-op for every other
+    /// kind.
+    pub fn with_pair(mut self, key: Option<String>) -> Self {
+        match &mut self {
+            Finding::TypeMismatch { pair, .. } | Finding::MethodMismatch { pair, .. } => {
+                *pair = key
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The pairing a mismatch is about, when its emitter stated one.
+    pub fn pair(&self) -> Option<&str> {
+        match self {
+            Finding::TypeMismatch { pair, .. } | Finding::MethodMismatch { pair, .. } => {
+                pair.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether main already had this finding (carrick-cloud#1369). No-op for
+    /// every kind that carries no pairing.
+    pub fn set_on_main(&mut self, value: Option<bool>) {
+        match self {
+            Finding::TypeMismatch { on_main, .. } | Finding::MethodMismatch { on_main, .. } => {
+                *on_main = value
+            }
+            _ => {}
+        }
     }
 
     /// Mark an orphaned endpoint as served by a module that also renders a
@@ -529,6 +593,10 @@ impl Serialize for Finding {
                 // in-process finding, and this payload's shape is the cloud's
                 // as well, so it is not written here.
                 direction: _,
+                // Scan-local (carrick-cloud#1369): the comparison key, not a
+                // fact a reader needs.
+                pair: _,
+                on_main,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -546,6 +614,11 @@ impl Serialize for Finding {
                 if let Some(verdict_state) = verdict_state {
                     map.serialize_entry("verdict_state", verdict_state)?;
                 }
+                // Omitted without a baseline, so the payload is unchanged
+                // wherever the scan had no main to compare with.
+                if let Some(on_main) = on_main {
+                    map.serialize_entry("on_main", on_main)?;
+                }
             }
             Finding::MethodMismatch {
                 method,
@@ -555,6 +628,8 @@ impl Serialize for Finding {
                 expected_method,
                 edge_source,
                 verdict_state,
+                pair: _,
+                on_main,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -566,6 +641,9 @@ impl Serialize for Finding {
                 }
                 if let Some(verdict_state) = verdict_state {
                     map.serialize_entry("verdict_state", verdict_state)?;
+                }
+                if let Some(on_main) = on_main {
+                    map.serialize_entry("on_main", on_main)?;
                 }
             }
             Finding::MissingEndpoint {
@@ -835,6 +913,65 @@ mod tests {
             missing,
             Finding::missing_endpoint("GET", "/x", None, vec![])
         );
+    }
+
+    /// carrick-cloud#1369, the wire half. `on_main` is written on both
+    /// mismatch kinds when the PR run compared with main, as a boolean the
+    /// renderer reads with `=== true`. The pairing it was compared on never
+    /// reaches the wire.
+    #[test]
+    fn on_main_is_on_the_wire_and_the_pairing_is_not() {
+        let mut mismatch = Finding::type_mismatch("GET", "/x", None, vec![], "A", "B", "boom")
+            .with_pair(Some("api|GET|/x~web|src/a.ts|response".to_string()));
+        mismatch.set_on_main(Some(true));
+        let v = serde_json::to_value(&mismatch).unwrap();
+        assert_eq!(v["on_main"], json!(true));
+        assert!(!v.as_object().unwrap().contains_key("pair"));
+
+        let mut wrong_verb = Finding::method_mismatch("PUT", "/x", None, vec![], "POST")
+            .with_pair(Some("POST /x~PUT".to_string()));
+        wrong_verb.set_on_main(Some(false));
+        let v = serde_json::to_value(&wrong_verb).unwrap();
+        assert_eq!(v["on_main"], json!(false));
+        assert!(!v.as_object().unwrap().contains_key("pair"));
+    }
+
+    /// With no baseline (a first PR, no prior index, a non-PR run) the field
+    /// is absent, and the finding serializes exactly as it did before the
+    /// field existed, pairing or not. The cloud reads absent as today's
+    /// behaviour: every risk fails the check.
+    #[test]
+    fn without_a_baseline_the_finding_is_unchanged_on_the_wire() {
+        let before = serde_json::to_value(Finding::type_mismatch(
+            "GET",
+            "/x",
+            None,
+            vec!["src/a.ts:3".into()],
+            "A",
+            "B",
+            "boom",
+        ))
+        .unwrap();
+        let keyed = Finding::type_mismatch(
+            "GET",
+            "/x",
+            None,
+            vec!["src/a.ts:3".into()],
+            "A",
+            "B",
+            "boom",
+        )
+        .with_pair(Some("api|GET|/x~web|src/a.ts|response".to_string()));
+        assert_eq!(serde_json::to_value(&keyed).unwrap(), before);
+        assert!(!before.as_object().unwrap().contains_key("on_main"));
+
+        let before =
+            serde_json::to_value(Finding::method_mismatch("PUT", "/x", None, vec![], "POST"))
+                .unwrap();
+        let keyed = Finding::method_mismatch("PUT", "/x", None, vec![], "POST")
+            .with_pair(Some("POST /x~PUT".to_string()));
+        assert_eq!(serde_json::to_value(&keyed).unwrap(), before);
+        assert!(!before.as_object().unwrap().contains_key("on_main"));
     }
 
     #[test]

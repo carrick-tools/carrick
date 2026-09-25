@@ -478,7 +478,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // 2. Download all repos (moved earlier for incremental cache lookup)
     let sp = logging::spinner("Downloading cross-repo data...");
-    let (mut all_repo_data, _repo_s3_urls) = storage
+    let (all_repo_data, _repo_s3_urls) = storage
         .download_all_repo_data()
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
@@ -961,7 +961,39 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // 6. Cross-repo analysis (reuse already-downloaded data).
     // Remove this repo's downloaded copies so the freshly-analyzed services
     // are the ones used.
-    all_repo_data.retain(|repo| repo.repo_name != repo_name);
+    //
+    // On a PR run with a prior index, main's copy is kept aside instead of
+    // dropped: the PR comment fails only on findings the PR introduced, and
+    // matching main's copy against the same peers is how the run tells which
+    // those are (carrick-cloud#1369).
+    let (main_self_data, peers): (Vec<CloudRepoData>, Vec<CloudRepoData>) = all_repo_data
+        .into_iter()
+        .partition(|repo| repo.repo_name == repo_name);
+    let all_repo_data = peers;
+    let main_baseline_input =
+        (is_pr_run && had_prior_index && !main_self_data.is_empty()).then(|| {
+            // Main's copy passed the upload boundary, which replaces machine
+            // paths with placeholders; this run's services are compared in
+            // the same form.
+            let as_uploaded: Vec<CloudRepoData> = current_services_data
+                .iter()
+                .map(|data| {
+                    let id = data.service_name.as_deref().unwrap_or(&data.repo_name);
+                    boundary.scrub(data, id).unwrap_or_else(|| data.clone())
+                })
+                .collect();
+            let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
+            MainBaselineInput {
+                // The peers are only needed when there is something to run.
+                peers: if surface_unchanged {
+                    Vec::new()
+                } else {
+                    all_repo_data.clone()
+                },
+                main_self: main_self_data,
+                surface_unchanged,
+            }
+        });
 
     // Peer repos and local service count describe the project topology, which
     // the formatter uses to frame findings (single repo / monorepo / poly-repo)
@@ -1253,6 +1285,15 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         enter_stage(crate::scan_stage::Stage::Upload)?;
         unconfirmed_uploads =
             upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
+    }
+
+    // Which of this PR's findings main already had (carrick-cloud#1369). Run
+    // after this run's own analysis, which has taken the local consumers the
+    // type check retypes: main's sources are not on disk, so its copy is
+    // checked from its stored surface alone. The input exists only on a PR
+    // run with a prior index.
+    if let Some(input) = main_baseline_input {
+        mark_findings_on_main(&mut results.findings, input, sidecar).await;
     }
 
     let topology = crate::findings::Topology {
@@ -6563,6 +6604,125 @@ async fn analyze_current_repo(
         data: cloud_data,
         deferred: setup.deferred,
     })
+}
+
+/// Main's copy of this repo and the peers it is matched against, kept aside
+/// on a PR run with a prior index (carrick-cloud#1369).
+struct MainBaselineInput {
+    peers: Vec<CloudRepoData>,
+    main_self: Vec<CloudRepoData>,
+    /// This run scanned exactly what main's copy describes.
+    surface_unchanged: bool,
+}
+
+/// How long main's side of the comparison may take before the run gives up on
+/// it and posts every finding without the field. Overridable for tests.
+const MAIN_SIDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAIN_SIDE_TIMEOUT_ENV: &str = "CARRICK_MAIN_SIDE_TIMEOUT_SECS";
+
+fn main_side_timeout() -> std::time::Duration {
+    std::env::var(MAIN_SIDE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|secs| secs.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(MAIN_SIDE_TIMEOUT)
+}
+
+/// Mark each of the PR run's findings with whether main's copy of this repo,
+/// matched against the same peers, yields it too (carrick-cloud#1369).
+///
+/// Skipped when no finding carries a pairing to mark. When this run scanned
+/// exactly what main's copy describes, every finding is main's and is marked
+/// so without running anything. Otherwise main's side runs under a timeout
+/// and a panic guard: whatever goes wrong there is stated in one line and
+/// leaves every finding without the field, which the cloud reads as today's
+/// behaviour. It never costs the run its PR result.
+async fn mark_findings_on_main(
+    findings: &mut [crate::findings::Finding],
+    input: MainBaselineInput,
+    sidecar: Option<&TypeSidecar>,
+) {
+    if !crate::pr_baseline::has_anything_to_mark(findings) {
+        debug!("No mismatch to compare with main");
+        return;
+    }
+    if input.surface_unchanged {
+        info!("This PR leaves every scanned service as main has it: its findings are main's");
+        crate::pr_baseline::mark_all_on_main(findings);
+        return;
+    }
+
+    let sp = logging::spinner("Comparing findings with main...");
+    let timeout = main_side_timeout();
+    let outcome = {
+        let _caught = crate::panic_report::CaughtPanics::begin();
+        tokio::time::timeout(
+            timeout,
+            futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(main_side_findings(
+                input, sidecar,
+            ))),
+        )
+        .await
+    };
+    let failure = match outcome {
+        Ok(Ok(Ok((main_findings, types_compared)))) => {
+            crate::pr_baseline::mark_on_main(
+                findings,
+                &main_findings,
+                crate::pr_baseline::Baseline { types_compared },
+            );
+            logging::finish_spinner(&sp, "Compared findings with main");
+            return;
+        }
+        Ok(Ok(Err(e))) => format!("main's analysis failed: {e}"),
+        Ok(Err(panic)) => format!(
+            "main's analysis panicked: {}",
+            crate::pr_baseline::panic_message(panic.as_ref())
+        ),
+        Err(_) => format!("main's analysis took longer than {}s", timeout.as_secs()),
+    };
+    logging::finish_spinner_warn(&sp, "Could not compare findings with main");
+    warn!("Findings are posted without the on-main mark: {failure}");
+}
+
+/// Main's side of the comparison: the same analysis this run's findings came
+/// from, over main's stored copy and the same peers. Returns main's findings
+/// and whether its type check ran.
+async fn main_side_findings(
+    input: MainBaselineInput,
+    sidecar: Option<&TypeSidecar>,
+) -> Result<(Vec<crate::findings::Finding>, bool), Box<dyn std::error::Error>> {
+    crate::pr_baseline::record_main_side_run();
+    match crate::pr_baseline::take_mock_main_side_fault() {
+        Some(crate::pr_baseline::MainSideFault::Error) => {
+            return Err("injected main-side failure".into());
+        }
+        Some(crate::pr_baseline::MainSideFault::Panic) => panic!("injected main-side panic"),
+        Some(crate::pr_baseline::MainSideFault::Hang) => {
+            std::future::pending::<()>().await;
+        }
+        None => {}
+    }
+    let MainBaselineInput {
+        peers, main_self, ..
+    } = input;
+    let sdk_input = crate::sdk_edges::SdkJoinInput::collect(
+        peers.iter().chain(main_self.iter()),
+        main_self.iter(),
+    );
+    let (analyzer, type_check) = build_cross_repo_analyzer(peers, main_self, sidecar).await?;
+    let main_results = analyzer.get_results();
+    let sdk_join = crate::sdk_edges::join(
+        &sdk_input,
+        &main_results.cross_repo_matches,
+        &analyzer.pair_directions(),
+    );
+    let mut main_findings = main_results.findings;
+    main_findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
+    Ok((
+        main_findings,
+        type_check == crate::local_mode::JoinTypeCheck::Ran,
+    ))
 }
 
 async fn build_cross_repo_analyzer(

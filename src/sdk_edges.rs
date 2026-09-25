@@ -568,18 +568,38 @@ pub fn type_mismatch_findings(edges: &[SdkEdge]) -> Vec<Finding> {
                 .as_deref()
                 .filter(|reason| !reason.is_empty())
                 .unwrap_or("producer and consumer types are incompatible");
-            Some(Finding::type_mismatch(
-                method,
-                path,
-                None,
-                vec![edge.consumer_location.clone()],
-                edge.producer_repo.clone(),
-                format!("{} ({})", edge.package, edge.sdk_member),
-                &format!(
-                    "reached through `{}` (`{}` at {}:{}): the {} types are incompatible: {}",
-                    edge.package, edge.sdk_member, edge.sdk_repo, edge.sdk_location, side, reason
-                ),
-            ))
+            Some(
+                Finding::type_mismatch(
+                    method,
+                    path,
+                    None,
+                    vec![edge.consumer_location.clone()],
+                    edge.producer_repo.clone(),
+                    format!("{} ({})", edge.package, edge.sdk_member),
+                    &format!(
+                        "reached through `{}` (`{}` at {}:{}): the {} types are incompatible: {}",
+                        edge.package,
+                        edge.sdk_member,
+                        edge.sdk_repo,
+                        edge.sdk_location,
+                        side,
+                        reason
+                    ),
+                )
+                // The pairing, for the PR run's comparison with main
+                // (carrick-cloud#1369): the stored edge's own keys, with the
+                // consumer's file but not its line.
+                .with_pair(Some(format!(
+                    "sdk|{}|{}~{}|{}|{}.{}|{}",
+                    edge.producer_repo,
+                    edge.producer_key,
+                    edge.consumer_repo,
+                    crate::type_manifest::parse_file_location(&edge.consumer_location).0,
+                    edge.package,
+                    edge.sdk_member,
+                    side
+                ))),
+            )
         })
         .collect()
 }
@@ -1817,6 +1837,15 @@ mod tests {
             }
             other => panic!("expected a type mismatch, got {other:?}"),
         }
+        // The pairing a PR run compares with main's on (carrick-cloud#1369):
+        // the edge's own keys and the consumer's file, never its line.
+        assert_eq!(
+            findings[0].pair(),
+            Some(
+                "sdk|payments-api|http|POST|/v1/payments~checkout|src/checkout.ts\
+                 |@fixture/ledger-sdk.payments.create|request"
+            )
+        );
     }
 
     /// A break on the RESPONSE half is a break too, and names itself as one.

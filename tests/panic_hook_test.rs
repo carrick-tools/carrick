@@ -38,6 +38,21 @@ fn a_panic_is_written_to_this_run_s_log_by_the_hook_the_scan_installs() {
 
     carrick::panic_report::install(repo_root().to_string_lossy().to_string());
 
+    // A panic the code around it catches and states itself is not the run
+    // dying: under `CaughtPanics` the hook neither logs it nor marks the scan
+    // failed (carrick-cloud#1369). First, because the hook reports one panic
+    // per process.
+    {
+        let _caught = carrick::panic_report::CaughtPanics::begin();
+        let caught = std::panic::catch_unwind(|| panic!("a comparison that gave up"));
+        assert!(caught.is_err(), "the caught panic was raised");
+    }
+    let written = std::fs::read_to_string(&log).expect("read this run's log");
+    assert!(
+        !written.contains("a comparison that gave up"),
+        "a caught panic is not the run's: {written}"
+    );
+
     let panicked = std::panic::catch_unwind(|| panic!("a scan that could not go on"));
     assert!(panicked.is_err(), "the panic was raised");
 
