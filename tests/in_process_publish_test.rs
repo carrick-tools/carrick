@@ -286,11 +286,25 @@ fn broker_rows_stay_when_detection_lists_nothing() {
         let entry = entry.expect("answer file");
         std::fs::copy(entry.path(), analyze.join(entry.file_name())).expect("copy answer");
     }
+    // The recorded detection answer with every list emptied.
+    let recorded = fixture_dir().join("__llm__/framework-detect/framework-detect.json");
+    let mut detection: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&recorded).expect("read detection"))
+            .expect("parse detection");
+    for value in detection
+        .as_object_mut()
+        .expect("detection is an object")
+        .values_mut()
+    {
+        if value.is_array() {
+            *value = serde_json::Value::Array(Vec::new());
+        }
+    }
     let detect = cassettes.path().join("framework-detect");
     std::fs::create_dir_all(&detect).expect("framework-detect dir");
     std::fs::write(
         detect.join("framework-detect.json"),
-        r#"{"frameworks":[],"data_fetchers":[],"messaging_clients":[],"socket_clients":[],"notes":"none"}"#,
+        serde_json::to_vec(&detection).expect("serialize detection"),
     )
     .expect("write detection");
 
