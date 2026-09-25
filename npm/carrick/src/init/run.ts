@@ -19,7 +19,11 @@ import {
   deriveWorkspace,
   selectedProposal,
   selectRepos,
+  siblingRepos,
   writeProposal,
+  realPath,
+  repoRoots,
+  MAX_SIBLINGS,
   PROPOSAL_FILE,
   repoIdentity,
   type DerivedWorkspace,
@@ -41,11 +45,13 @@ import {
   planProject,
   projectLabel,
   projectStep,
+  reposPhrase,
   SLUG,
   type Project,
   type ProjectChoice,
   type ProjectPrompts,
 } from "./projects.ts";
+import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
@@ -97,6 +103,17 @@ export function scaffoldSentence(repos: RepoIdentity[]): string {
   }
   const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
   return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
+}
+
+/** The title of the block a run closes on when there is scaffolding left to do. */
+export const NEXT_TITLE = "Next: paste this into a new agent session";
+
+/**
+ * The line that tells the agent where the proposal is, for a run that set up
+ * the folder above the one it started in (carrick#1512).
+ */
+export function initFolderSentence(workspace: string): string {
+  return `The init folder is ${tilde(workspace)}.`;
 }
 
 /** What a run with nothing left to set up closes on: what this machine can do now. */
@@ -269,7 +286,7 @@ function carrickOnPath(): boolean {
 }
 
 /**
- * The repos a project holds that this folder does not, one line per project.
+ * The repos a project holds that this machine does not, one line per project.
  *
  * Carrick answers across every repo in a project, so a machine holding half of
  * one gets half the answers, and the connection line above names only what is
@@ -277,14 +294,18 @@ function carrickOnPath(): boolean {
  * membership of every project the requested repos are in (carrick#993 row 18).
  * Capped and counted like the identity lines, because a project can hold two
  * hundred.
+ *
+ * `onMachine` is every GitHub repo found on this machine, not only the ones
+ * this run set up: a repo in the folder beside this one is on the machine, and
+ * saying otherwise was the false line in carrick#1512.
  */
 export function absentRepos(
   identity: ResolvedRepos,
-  names: string[],
+  onMachine: string[],
   project: string | null,
   label: (slug: string) => string = (slug) => slug,
 ): string[] {
-  const onDisk = new Set(names.map((name) => name.toLowerCase()));
+  const onDisk = new Set(onMachine.map((name) => name.toLowerCase()));
   const sole = identity.project_repos.length === 1;
   const lines: string[] = [];
   for (const entry of identity.project_repos) {
@@ -377,85 +398,132 @@ export function installSentence(commands: string[], to: "agent" | "reader"): str
     : `Dependencies are not installed. Run ${listed(commands, 5)} before the next scan.`;
 }
 
-/**
- * One block per project: the repos in it, each once, with what is about to
- * happen to it (carrick#1489).
- *
- * This replaced a listing that named every repo twice and restated the project
- * the reader had just confirmed. The block header is the project, and a repo
- * row says only what differs from the header: a package count above one, or
- * the project it moves out of.
- */
-export function summaryBlocks(input: {
-  plan: WorkspaceProposal;
-  selected: RepoIdentity[];
-  /** The project these repos go to, or null when none was settled. */
-  project: string | null;
-  /** The header for a project this run creates, or null when it exists. */
-  created: string | null;
-  label: (slug: string) => string;
-  /** Where each repo is now, by owner/repo; null for one not connected. */
-  assigned: Map<string, string | null>;
-  moving: string[];
-}): string[] {
-  const groups = new Map<string, RepoIdentity[]>();
-  const header = (repo: RepoIdentity): string => {
-    if (input.project !== null) {
-      return input.created !== null ? `New project ${input.created}` : `Project ${input.label(input.project)}`;
-    }
-    const current = repo.name === null ? null : (input.assigned.get(repo.name) ?? null);
-    return current === null ? "No project" : `Project ${input.label(current)}`;
-  };
-  for (const repo of input.selected) {
-    const key = header(repo);
-    groups.set(key, [...(groups.get(key) ?? []), repo]);
-  }
-  const moving = new Set(input.moving.map((name) => name.toLowerCase()));
-  const lines: string[] = [];
-  for (const [title, repos] of groups) {
-    lines.push(`  ${title}`);
-    const width = Math.max(...repos.map((repo) => path.basename(repo.path).length));
-    for (const repo of repos.slice(0, 10)) {
-      const found = input.plan.repos.find((entry) => entry.path === repo.path);
-      const packages = found?.services.length ?? 0;
-      const from = repo.name === null ? null : (input.assigned.get(repo.name) ?? null);
-      const notes = [
-        repo.name ?? "no GitHub repo",
-        ...(packages > 1 ? [`${packages} packages`] : []),
-        ...(repo.name !== null && moving.has(repo.name.toLowerCase()) && from !== null
-          ? [`moves from ${input.label(from)}`]
-          : []),
-      ];
-      lines.push(`    ${path.basename(repo.path).padEnd(width)}  ${notes.join("  ")}`);
-    }
-    if (repos.length > 10) lines.push(`    and ${repos.length - 10} more`);
-  }
-  return lines;
+/** A path as a reader types it, with the home directory as `~`. */
+export function tilde(target: string, home: string = os.homedir()): string {
+  if (target === home) return "~";
+  return target.startsWith(`${home}${path.sep}`) ? `~${target.slice(home.length)}` : target;
 }
 
 /**
- * The files the write step creates, by path, for the question that asks to
- * write them (carrick#1489).
+ * The files the write step creates, as one line of the list "Go ahead?" is
+ * asked about (carrick#1489, carrick#1512).
  *
  * Directories inside the workspace, because each holds several files and the
  * list has to fit one line; every file outside it by its own path, because
  * those belong to somebody's editor. Claude Code's server list is written by
- * its own command, so it is named rather than given a path.
+ * its own command, so it is named rather than given a path. It says "add",
+ * because that is what happens: every writer here merges, and a line that
+ * listed folders read as though it replaced them (carrick#1512).
  */
 export function writesLine(options: { workspaceFile: boolean; editorFiles: string[]; claudeCode: boolean; home?: string }): string {
-  const home = options.home ?? os.homedir();
-  const outside = options.editorFiles.map((file) =>
-    file.startsWith(`${home}${path.sep}`) ? `~${file.slice(home.length)}` : file,
+  const mcp = [
+    ...(options.claudeCode ? ["Claude Code"] : []),
+    ...options.editorFiles.map((file) => tilde(file, options.home)),
+  ];
+  const parts = [
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/",
+    options.workspaceFile ? `create .carrick/ and ${WORKSPACE_FILE}` : "create .carrick/",
+    ...(mcp.length > 0 ? [`add Carrick's MCP server to ${listed(mcp, 5)}`] : []),
+  ];
+  return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
+}
+
+/**
+ * The GitHub App line of that list: which repos still need the App.
+ *
+ * With a terminal, init opens the page itself once the reader says yes, so the
+ * line says that and no address. Without one it cannot, and the line carries
+ * the address instead: it is the only place a run with no terminal says it.
+ */
+export function connectItem(unconnected: string[], total: number, interactive: boolean, url: string): string {
+  const which =
+    unconnected.length === total && total === 2
+      ? "both repos"
+      : unconnected.length === total && total > 2
+        ? `all ${total} repos`
+        : reposPhrase(unconnected);
+  return interactive
+    ? `Open GitHub to install Carrick on ${which}`
+    : `Install the Carrick GitHub App on ${which}: ${url}`;
+}
+
+/**
+ * Everything the run will do, one line each, for the one question that covers
+ * it (carrick#1512).
+ *
+ * A project used to be created at its own question, before the reader had seen
+ * which repos went into it, and the GitHub App line was printed twice around
+ * the files question. Now the project, the App and the files are three lines
+ * under "Next:", and "Go ahead?" is asked once, about all of them. A move out
+ * of another project is a line here too, and still its own question after this
+ * one, because `--yes` never grants it (carrick#1338).
+ */
+export function nextLines(input: {
+  /** The name of a project this run creates, or null. */
+  create: string | null;
+  /** The project the repos go to, as printed, or null when none was settled. */
+  project: string | null;
+  /** The repos this run covers, as the reader knows them. */
+  repos: string[];
+  /** Repos that go into an existing project once the App is on them. */
+  joining: string[];
+  moving: Array<{ repo: string; from: string }>;
+  /** The GitHub App line, or null when every repo is connected. */
+  connect: string | null;
+  writes: string;
+}): string[] {
+  const lines: string[] = [];
+  if (input.create !== null) lines.push(`Create project ${input.create} with ${reposPhrase(input.repos)}`);
+  else if (input.project !== null && input.joining.length > 0) {
+    lines.push(`Add ${reposPhrase(input.joining)} to project ${input.project}`);
+  }
+  if (input.project !== null) {
+    const sources = [...new Set(input.moving.map((entry) => entry.from))];
+    for (const from of sources) {
+      const repos = input.moving.filter((entry) => entry.from === from).map((entry) => entry.repo);
+      lines.push(`Move ${reposPhrase(repos)} from ${from} into ${input.create ?? input.project}`);
+    }
+  }
+  if (input.connect !== null) lines.push(input.connect);
+  lines.push(input.writes);
+  return lines;
+}
+
+/**
+ * The line a run inside one repo prints about the others beside it, where it
+ * does not ask about them: too many to list, or no terminal to ask in.
+ */
+export function thisRepoOnly(repo: string): string {
+  return `Setting up ${repo} only. To set up several repos as one system, run carrick init in the folder that holds them.`;
+}
+
+/**
+ * Which of the repos beside this one belong to the same system, asked in the
+ * run itself (carrick#1512).
+ *
+ * The run used to name the folder above and tell the reader to start again
+ * there. This repo starts ticked and the others do not: a sibling folder is
+ * not a claim that the repos in it call each other. Each row names the GitHub
+ * repo its remote points at, which is what the reader recognises when two
+ * folders are called something else.
+ */
+export async function chooseSiblings(
+  current: RepoIdentity,
+  siblings: RepoIdentity[],
+  directory: string,
+  out: InitOutput,
+): Promise<string[]> {
+  const rows: Choice[] = [current, ...siblings].map((repo) => ({
+    value: repo.path,
+    label: repo === current ? `${path.basename(repo.path)} (this repo)` : path.basename(repo.path),
+    hint: repo.name ?? "no GitHub remote",
+  }));
+  return out.choose(
+    `${tilde(directory)} holds other repos. Which belong to the same system as ${path.basename(current.path)}?`,
+    "a repo",
+    rows,
+    { initial: [current.path], required: true },
   );
-  return `Writes: ${[
-    ".carrick/",
-    ".claude/",
-    ".agents/",
-    ".codex/",
-    ...(options.workspaceFile ? [WORKSPACE_FILE] : []),
-    ...outside,
-    ...(options.claudeCode ? ["Claude Code's MCP servers"] : []),
-  ].join(", ")}`;
 }
 
 /**
@@ -703,7 +771,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     process.stdout.write(`${parsed}\n`);
     return parsed.startsWith("carrick init") ? 0 : 2;
   }
-  const { workspace } = parsed;
+  // Where the run was started, and where it sets up: the folder above, once
+  // the reader has said a repo beside this one belongs with it (carrick#1512).
+  const startedIn = parsed.workspace;
+  let workspace = parsed.workspace;
 
   if (!fs.existsSync(workspace)) {
     process.stderr.write(`carrick init: ${workspace} is not a directory on this machine\n`);
@@ -762,7 +833,48 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // The derivation and the identities are local reads: they name the choice,
     // and a run nobody has chosen in yet must not have signed anything in.
     derived = deriveWorkspace(workspace);
-    const candidates = derived.plan.repos.map((repo) => repoIdentity(repo.path));
+    let candidates = derived.plan.repos.map((repo) => repoIdentity(repo.path));
+    // The repos beside this one, asked about here rather than named with an
+    // instruction to start again in the folder above (carrick#1512). A yes to
+    // any of them carries on as if the run had started there: the same
+    // derivation, the same proposal, and the repos left unticked written to
+    // the same exclude list a folder run writes.
+    let ticked: RepoIdentity[] | null = null;
+    const parent = derived.plan.parent_proposal;
+    if (parent !== null && candidates.length === 1) {
+      const current = candidates[0]!;
+      const siblings = siblingRepos(derived.plan, excludedRepos(parent.directory));
+      const asking =
+        siblings.length > 0 &&
+        siblings.length <= MAX_SIBLINGS &&
+        interactive &&
+        !parsed.assumeYes &&
+        parsed.repos.length === 0;
+      if (asking) {
+        const picked = new Set(
+          (await chooseSiblings(current, siblings.map((repo) => repoIdentity(repo)), parent.directory, out)).map(realPath),
+        );
+        if (picked.size > 1 || !picked.has(realPath(current.path))) {
+          workspace = parent.directory;
+          derived = deriveWorkspace(workspace);
+          candidates = derived.plan.repos.map((repo) => repoIdentity(repo.path));
+          const chosen = candidates.filter((repo) => picked.has(realPath(repo.path)));
+          // This repo first, where the reader kept it: it is the one they
+          // started in, and every sentence below names it first.
+          ticked = [
+            ...chosen.filter((repo) => realPath(repo.path) === realPath(current.path)),
+            ...chosen.filter((repo) => realPath(repo.path) !== realPath(current.path)),
+          ];
+        }
+      } else if (siblings.length > 0) {
+        out.say(thisRepoOnly(path.basename(current.path)));
+      } else if (parent.repos.some((repo) => realPath(repo) === realPath(parent.directory))) {
+        // Not a folder of repos but a repository this directory sits inside,
+        // which is where a scan of it belongs: the one case where "run it in
+        // the folder above" is still the answer.
+        out.warn(`The parent folder ${parent.directory} is itself a repo. Run carrick init .. to initialise that workspace.`);
+      }
+    }
     // What Carrick already knows about this folder, before the picker draws
     // its defaults. A read, not a write: the credential has to exist already,
     // so a machine nobody has signed in on still chooses first and signs in
@@ -776,10 +888,12 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     const knownNames = [...new Set(candidates.map((repo) => repo.name).filter((name): name is string => name !== null))];
     // Only where a picker is actually going to draw. Every other path has its
     // answer already — `--repo` names it, `--yes` takes the list as derived, a
-    // single repo is not a choice — and asking about a repo whose name the
-    // reader never offered is a request that buys nothing (carrick#1338's
-    // test pins it: a repo left out is named in no request at all).
-    const picking = parsed.repos.length === 0 && !parsed.assumeYes && interactive && candidates.length > 1;
+    // single repo is not a choice, the question about the repos beside this
+    // one was the choice — and asking about a repo whose name the reader never
+    // offered is a request that buys nothing (carrick#1338's test pins it: a
+    // repo left out is named in no request at all).
+    const picking =
+      ticked === null && parsed.repos.length === 0 && !parsed.assumeYes && interactive && candidates.length > 1;
     if (picking && saved !== null && knownNames.length > 0) {
       try {
         known = await resolveRepos(saved.token, knownNames);
@@ -789,18 +903,20 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
         projects = null;
       }
     }
-    const selected = await chooseRepos(
-      derived.plan,
-      candidates,
-      {
-        repos: parsed.repos,
-        assumeYes: parsed.assumeYes,
-        interactive,
-        identity: known,
-        label: (slug) => projectLabel(slug, projects),
-      },
-      out,
-    );
+    const selected =
+      ticked ??
+      (await chooseRepos(
+        derived.plan,
+        candidates,
+        {
+          repos: parsed.repos,
+          assumeYes: parsed.assumeYes,
+          interactive,
+          identity: known,
+          label: (slug) => projectLabel(slug, projects),
+        },
+        out,
+      ));
     if (selected.length === 0) throw new Stop(0);
     selectedRepos = selected;
     derived = selectedProposal(derived, selected.map((repo) => repo.path));
@@ -809,7 +925,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       .filter((repo) => !kept.has(repo.path))
       .map((repo) => path.basename(repo.path));
     const dropped = candidates.length - selected.length;
-    if (dropped > 0) {
+    // Not after the question about the repos beside this one: its rows were
+    // the whole answer, and a folder repo that had no row there (one with no
+    // JavaScript or TypeScript in it) is not news.
+    if (dropped > 0 && ticked === null) {
       out.done(
         `${selected.length} of ${candidates.length} repos covered; ${dropped} left out of the proposal, the project and the connection`,
       );
@@ -878,7 +997,15 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // --project the step reads the assignment the repos already have and
     // offers the list, rather than doing nothing at all (carrick#987).
     const dashboard = workspaceUrls(initial.workspace.slug).projects;
+    // The repos by the folder names the reader has on disk, in the order the
+    // questions name them.
+    const shown = selected.map((repo) => path.basename(repo.path));
+    const shortName = (fullName: string): string => {
+      const repo = selected.find((entry) => entry.name?.toLowerCase() === fullName.toLowerCase());
+      return repo === undefined ? fullName : path.basename(repo.path);
+    };
     const prompts: ProjectPrompts = {
+      repos: shown,
       say: out.say,
       ask: out.ask,
       confirm: out.confirm,
@@ -911,12 +1038,6 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // scanner said about it. Everything above is a read; everything below the
     // confirm is a write.
     const plan = derived.plan;
-    if (plan.parent_proposal) {
-      const parent = plan.parent_proposal;
-      const folders = parent.repos.map((repo) => path.basename(repo));
-      const shown = folders.length > 3 ? `${folders.slice(0, 3).join(", ")} and ${folders.length - 3} more` : folders.join(", ");
-      out.warn(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
-    }
     // The scanner's own warnings about what it proposed. Capped: the proposal
     // file carries every one of them, and it is named on the line above.
     const warnings = plan.repos.flatMap((repo) => repo.warnings);
@@ -930,27 +1051,34 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // and one this machine has no command for is offered unticked.
     const offered = offeredFileClients();
     editors = await chooseEditors(offered, { editors: parsed.editors, assumeYes: parsed.assumeYes, interactive }, out);
-    // The summary the yes is given to: one block per project, each repo once,
-    // the one browser step on its own line with its link, and the files by
-    // path (carrick#1489).
-    const created =
-      decision.create && project !== null
-        ? decision.name !== undefined && decision.name !== project
-          ? `${decision.name} (${project})`
-          : project
-        : null;
-    for (const line of summaryBlocks({ plan, selected, project, created, label, assigned, moving })) out.say(line);
+    // What the yes is given to: every thing this run will do, one line each —
+    // the project, the GitHub App, the files — and nothing created before it
+    // (carrick#1512). The files are named, editor files included, because a
+    // question that does not name a file is not consent to write it
+    // (carrick#1365, carrick#1489).
     const unconnected = unconnectedRepos(initial, names);
-    if (unconnected.length > 0) {
-      out.warn(connectLine(unconnected, names.length, workspaceUrls(initial.workspace.slug).connect));
-    }
-    out.say(
-      writesLine({
+    const next = nextLines({
+      create: decision.create && project !== null ? (decision.name ?? project) : null,
+      project: project === null ? null : label(project),
+      repos: shown,
+      joining: joining.map(shortName),
+      moving: moving.map((name) => ({ repo: shortName(name), from: label(assigned.get(name) ?? "") })),
+      connect:
+        unconnected.length === 0
+          ? null
+          : connectItem(
+              unconnected.map(shortName),
+              names.length,
+              interactive,
+              workspaceUrls(initial.workspace.slug).connect,
+            ),
+      writes: writesLine({
         workspaceFile: deselected.length > 0,
         editorFiles: offered.filter((client) => editors.includes(client.name)).map((client) => client.file),
         claudeCode: claudeCodeFound(),
       }),
-    );
+    });
+    out.say(["Next:", ...next.map((line) => `  ${line}`)].join("\n"));
     if (!parsed.assumeYes) {
       if (!interactive) {
         throw new Stop(
@@ -958,10 +1086,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
           `use --yes to accept this proposal without a terminal${moving.length > 0 && !parsed.allowMove ? ", and --allow-move to accept the move above" : ""}.`,
         );
       }
-      // The files are named on the line above it, editor files included,
-      // because a question that does not name a file is not consent to write
-      // it (carrick#1365, carrick#1489).
-      if (!(await out.confirm("Write these files?"))) {
+      if (!(await out.confirm("Go ahead?"))) {
         out.refuse(NOTHING_WRITTEN);
         throw new Stop(0);
       }
@@ -1131,13 +1256,26 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     out.refuse(`Could not write the task skills: ${(error as Error).message}`);
   }
 
+  // The same hooks and skills inside each repo of a folder, because an agent
+  // started inside one of them reads neither host's files from the folder
+  // above (carrick#1512, option A as ruled). Kept out of git through each
+  // repo's own exclude file; a repo that is the workspace already has them.
+  for (const repo of selectedRepos) {
+    if (realPath(repo.path) === realPath(workspace)) continue;
+    try {
+      writeRepoCopy(repo.path, command.command, { slug: projectSlug });
+    } catch (error) {
+      out.refuse(`Could not add Carrick's hooks and skills to ${path.basename(repo.path)}: ${(error as Error).message}.`);
+    }
+  }
+
+  // Nothing here about restarting Claude Code: the instruction this run closes
+  // on is pasted into a new agent session, which loads the MCP server it has
+  // just been given (carrick#1512).
   const mcp = connectMcpClients(editors);
   // Nothing here about `carrick` not being on PATH: the offer above said it, in
   // front of the decision it changes, and with the command for this machine's
   // package manager rather than a guess at npm (carrick#1372).
-  if (mcp.some((outcome) => outcome.client === "Claude Code" && outcome.state === "written")) {
-    todo.push("Restart Claude Code to load the Carrick MCP server.");
-  }
   for (const outcome of mcp.filter((entry) => entry.state === "failed")) {
     todo.push(`MCP not configured for ${outcome.client}: ${outcome.detail}`);
   }
@@ -1158,6 +1296,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // grant page for repos that were already connected (carrick#1489).
   try {
     const current = await resolveRepos(credential.token, names);
+    const role = current.workspace.role;
     const identity = await connectRepos(credential.token, names, current, {
       interactive,
       project: project ?? undefined,
@@ -1165,6 +1304,8 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       movable,
       announce: announced,
       label,
+      // A role the read does not state is unknown, not a member's.
+      member: role !== undefined && role !== "owner" && role !== "admin",
       say: out.say,
       track: (text, work, report) => out.step(text, work, report),
     });
@@ -1191,8 +1332,21 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // The rest of the project, which this machine does not hold. Carrick
     // answers across every repo in a project, so a folder holding half of one
     // is a partial index and nothing here would otherwise say so
-    // (carrick#993 row 18).
-    todo.push(...absentRepos(identity, names, project, label));
+    // (carrick#993 row 18). "This machine" is every repo in the folder that
+    // holds this run's repos, set up here or not: a repo in the folder beside
+    // this one is not missing (carrick#1512). Only read where the run's own
+    // repos leave something unaccounted for, because each is a git call.
+    let absent = absentRepos(identity, names, project, label);
+    if (absent.length > 0) {
+      const folder = selectedRepos.some((repo) => realPath(repo.path) === realPath(workspace))
+        ? path.dirname(workspace)
+        : workspace;
+      const here = repoRoots(folder)
+        .map((root) => repoIdentity(root).name)
+        .filter((name): name is string => name !== null);
+      absent = absentRepos(identity, [...names, ...here], project, label);
+    }
+    todo.push(...absent);
   } catch (error) {
     // The server's own sentence says what failed; this one says what is left.
     todo.push(
@@ -1252,9 +1406,14 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   const unscaffolded = reposToScaffold(selectedRepos);
   if (unscaffolded.length > 0) {
     const install = installSentence(installs, "agent");
-    out.note("Next: paste this to your agent", [
+    // A new session, because that is the one that loads the MCP server this
+    // run has just added (carrick#1512).
+    out.note(NEXT_TITLE, [
       ...(install === null ? [] : [install]),
       scaffoldSentence(unscaffolded),
+      // The scaffold tool reads the proposal from the folder init ran in, and
+      // a run that moved to the folder above did not run where it started.
+      ...(realPath(workspace) === realPath(startedIn) ? [] : [initFolderSentence(workspace)]),
     ]);
   } else {
     const install = installSentence(installs, "reader");

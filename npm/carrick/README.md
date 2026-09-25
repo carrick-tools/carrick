@@ -288,7 +288,8 @@ npm uninstall -g carrick
 
 `carrick remove` reverses `carrick init` on this machine, one line per thing it
 removed: the Carrick hook entries in this folder's `.claude` settings, the
-`carrick` MCP server in each agent client's configuration, the `.carrick`
+hooks and skills it copied into each repo here with their `.git/info/exclude`
+lines, the `carrick` MCP server in each agent client's configuration, the `.carrick`
 directory, and the saved credential. Other hooks, other MCP servers and the
 settings files themselves stay; an MCP server called `carrick` that points at
 anything other than `api.carrick.tools` is left alone and reported. Pass

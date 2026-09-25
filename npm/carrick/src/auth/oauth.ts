@@ -63,6 +63,15 @@ function answer(res: http.ServerResponse, status: number, heading: string, line:
 
 const TRY_AGAIN = "Run `carrick login` again.";
 
+/**
+ * What the page says once sign-in worked, and nothing more (carrick#1511).
+ *
+ * The page cannot know what the reader does next: `carrick init` opens it and
+ * carries on by itself, and a `carrick login` on a machine that is already set
+ * up has no next step. The terminal knows, so it says the next step.
+ */
+export const SIGNED_IN_LINE = "You can close this tab and go back to your terminal.";
+
 /** RFC 8252 loopback + S256 PKCE against Carrick's existing public OAuth client flow. */
 export async function authorize(options: OAuthOptions = {}): Promise<string> {
   const request = options.fetch ?? fetch;
@@ -153,8 +162,7 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
       // Bounded: a hung lookup must not hold the token back from the caller.
       const lookup = AbortSignal.any([signal, AbortSignal.timeout(options.lookupTimeoutMs ?? 3_000)]);
       const workspace = await resolveRepos(body.access_token, [], request, lookup).then((r) => r.workspace.slug, () => null);
-      delivered = answer(pending, 200, workspace ? `Signed in to ${workspace}` : "Signed in to Carrick",
-        "You can close this tab. Next, run `carrick init` in the folder that holds your repos.");
+      delivered = answer(pending, 200, workspace ? `Signed in to ${workspace}` : "Signed in to Carrick", SIGNED_IN_LINE);
     }
     return body.access_token;
   } catch (error) {

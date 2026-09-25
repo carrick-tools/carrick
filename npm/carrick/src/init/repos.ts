@@ -144,6 +144,52 @@ export function repoRoots(workspace: string): string[] {
 }
 
 /**
+ * The files that make a folder a JavaScript or TypeScript project, which is
+ * what Carrick indexes. `carrick.json` is here because a folder holding one has
+ * already been set up for Carrick.
+ */
+const JS_MANIFESTS = ["package.json", "deno.json", "deno.jsonc", "pnpm-workspace.yaml", "carrick.json"];
+
+/** The most sibling repos `carrick init` lists to choose from (carrick#1512). */
+export const MAX_SIBLINGS = 15;
+
+/**
+ * The other repos in the folder above this one, where there are any.
+ *
+ * The scanner states the folder above a single repository and what it holds
+ * (`parent_proposal`), by the same markers every scan uses, which count a
+ * folder holding only `.git`. The question these feed is which repos belong to
+ * the same system as this one, so a sibling is kept only where it holds a
+ * JavaScript or TypeScript manifest, and not where the folder's own
+ * `carrick-workspace.json` already leaves it out (carrick#1512).
+ */
+export function siblingRepos(
+  plan: WorkspaceProposal,
+  excluded: string[] = [],
+  exists: (target: string) => boolean = fs.existsSync,
+): string[] {
+  const parent = plan.parent_proposal;
+  if (parent === null) return [];
+  const here = realPath(plan.workspace);
+  return parent.repos.filter(
+    (repo) =>
+      path.dirname(repo) === parent.directory &&
+      realPath(repo) !== here &&
+      !excluded.includes(path.basename(repo)) &&
+      JS_MANIFESTS.some((manifest) => exists(path.join(repo, manifest))),
+  );
+}
+
+/** A path with its symlinks resolved, or as given where it cannot be. */
+export function realPath(target: string): string {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+/**
  * What one repository on disk says it is on GitHub, and why it said nothing.
  *
  * `problem` is a clause, so a caller can put it after the path it read: it is

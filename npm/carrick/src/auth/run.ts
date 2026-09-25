@@ -1,6 +1,7 @@
 import { API_BASE, APP_BASE, readCredential, saveCredential, removeCredential, type Credential } from "./credentials.ts";
 import { authorize } from "./oauth.ts";
 import { resolveRepos } from "./read.ts";
+import { readInstallId } from "../init/install-id.ts";
 
 /**
  * Sign in through the browser and leave a saved credential behind.
@@ -32,6 +33,19 @@ export async function signIn(
   );
 }
 
+/**
+ * What a `carrick login` says to do next, or null when there is nothing.
+ *
+ * The browser page used to say "Next, run carrick init" to everyone, which was
+ * wrong under init itself and on every login after the first (carrick#1511).
+ * The terminal knows which it is: `carrick init` writes this machine's install
+ * id and `carrick remove` deletes it, so a machine without one has never been
+ * set up, and that is the only login with a step left.
+ */
+export function loginNextStep(installId: string | null = readInstallId()): string | null {
+  return installId === null ? "Next: run carrick init in the folder that holds your repos." : null;
+}
+
 export async function login(argv: string[]): Promise<number> {
   if (argv.length) {
     process.stdout.write("carrick login\n\nSign in through your browser. CARRICK_TOKEN overrides the saved credential.\n");
@@ -42,6 +56,8 @@ export async function login(argv: string[]): Promise<number> {
   process.once("SIGINT", cancel);
   try {
     await signIn(undefined, controller.signal);
+    const next = loginNextStep();
+    if (next !== null) process.stdout.write(`${next}\n`);
     return 0;
   } catch (error) {
     process.stderr.write(`${(error as Error).message}\n`);

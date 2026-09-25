@@ -1,10 +1,13 @@
 // Undoing `carrick init`, on this machine.
 //
 // An install that can state its own undo is the courtesy that makes people
-// willing to try it (carrick#1034), and init now writes in ten places: the
+// willing to try it (carrick#1034), and init now writes in eleven places: the
 // hook entries in a workspace's `.claude` settings, the Codex ones in
 // `.codex/hooks.json`, the task skills under `.claude/skills` and
-// `.agents/skills`, the repo selection in `carrick-workspace.json`, an MCP
+// `.agents/skills`, a copy of those hooks and skills inside each repo of a
+// folder with the `.git/info/exclude` lines that keep it out of git
+// (`writeRepoCopy` / `removeRepoCopy` in `repo-copies.ts`), the repo
+// selection in `carrick-workspace.json`, an MCP
 // server entry in each agent client's own configuration, the `.carrick`
 // directory, the install id in `~/.carrick`, and the credential in the user's
 // configuration directory.
@@ -46,6 +49,7 @@ import { CODEX_HOOKS_FILE, uninstallCodexHooks } from "./codex.ts";
 import { removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
 import { removeNotice } from "./outdated.ts";
 import { removeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
+import { removeRepoCopy } from "./repo-copies.ts";
 import { createOutput, DOCS_INIT_FILES, type InitOutput } from "./output.ts";
 
 export type RemoveOptions = {
@@ -86,9 +90,10 @@ function help(): string {
     "carrick remove [DIRECTORY] [--keep-login]",
     "",
     "Undo what carrick init wrote on this machine: the Carrick hook entries in",
-    "this folder's .claude settings and in .codex/hooks.json, the carrick MCP",
-    "server in each agent client's configuration, the .carrick directory, this",
-    "machine's install id, and the saved credential.",
+    "this folder's .claude settings and in .codex/hooks.json, the hooks and",
+    "skills it copied into each repo here with their .git/info/exclude lines,",
+    "the carrick MCP server in each agent client's configuration, the .carrick",
+    "directory, this machine's install id, and the saved credential.",
     "Other hooks, other MCP servers and the settings files themselves are left",
     "as they are, and so is anything in carrick-workspace.json that init did",
     "not put there. The task skills it wrote are removed where they still match",
@@ -298,6 +303,21 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
         ? `${row.path} has been edited since Carrick wrote it, so it was left in place. Delete it by hand to finish removing it.`
         : `${row.path} was not written by Carrick, so it was left in place.`,
     );
+  }
+
+  // The copies init put inside each repo of a folder (carrick#1512): exactly
+  // the files its lines in that repo's `.git/info/exclude` name, and then the
+  // lines. A repo with no such lines is one init never copied into.
+  for (const repo of repoRoots(workspace)) {
+    const name = path.relative(workspace, repo) || path.basename(repo);
+    try {
+      if (removeRepoCopy(repo) !== null) {
+        out.done(`Carrick's hooks and skills removed from ${name}, with its .git/info/exclude lines`);
+        removed += 1;
+      }
+    } catch (error) {
+      out.refuse(`Could not remove Carrick's hooks and skills from ${name}: ${(error as Error).message}`);
+    }
   }
 
   // The repo selection, which is the one thing init writes into a file a user

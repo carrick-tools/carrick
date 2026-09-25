@@ -15,6 +15,7 @@ import {
   deriveWorkspace,
   repoIdentity,
   selectedProposal,
+  siblingRepos,
   writeProposal,
   PROPOSAL_FILE,
   type WorkspaceProposal,
@@ -25,13 +26,14 @@ import {
   mergeCarrickHooks,
   ownEntryPoint,
 } from "../src/init/settings.ts";
-import { PROJECT_RULE, projectStep, type Project, type ProjectPrompts } from "../src/init/projects.ts";
+import { PROJECT_RULE, planProject, projectStep, reposPhrase, type Project, type ProjectPrompts } from "../src/init/projects.ts";
 import {
   absentRepos,
   installCommands,
   installSentence,
   setupLine,
-  summaryBlocks,
+  nextLines,
+  connectItem,
   writesLine,
   parseArgs,
   init,
@@ -67,8 +69,10 @@ import {
   interactiveOutput,
   plainOutput,
   PromptCancelled,
+  type Choice,
   type InitOutput,
 } from "../src/init/output.ts";
+import { ADMIN_WAIT } from "../src/init/connect.ts";
 import { PassThrough, Writable } from "node:stream";
 import type { ResolvedRepos } from "../src/auth/read.ts";
 
@@ -746,7 +750,7 @@ test("the executable CLI finishes setup when the named project is not verified",
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /acme\/api {2}moves from default-project/);
+    assert.match(result.stdout, /^ {2}Move repo from default-project into payments$/m);
     assert.match(result.stdout, /Create project "payments" if needed/);
     // This API serves no assignment action, so the browser keeps that step.
     assert.match(result.stdout, /Assign the requested repos/);
@@ -789,8 +793,12 @@ test("no assignment is issued before the proposal is answered", posixNativeFixtu
     // actions that change the server, and neither was asked for.
     assert.deepEqual(fixture.requests(), ["resolve-repos acme/api", "list-projects"]);
     // The move the run would have made, named with the project it comes out
-    // of — display name and slug, which is what the dashboard shows it under.
-    assert.match(result.stdout, /^ {2}Project payments\n {4}repo {2}acme\/api {2}moves from Acme Default \(default-project\)$/m);
+    // of — display name and slug, which is what the dashboard shows it under —
+    // in the list the one question is about, beside the create (carrick#1512).
+    assert.match(
+      result.stdout,
+      /^Next:\n {2}Create project payments with repo\n {2}Move repo from Acme Default \(default-project\) into payments$/m,
+    );
     assert.match(result.stderr, /use --yes to accept this proposal without a terminal, and --allow-move/);
     assert.equal(fs.existsSync(path.join(fixture.repo, ".carrick")), false);
     assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
@@ -968,10 +976,10 @@ test("a repo left out of the selection gets no proposal entry and no assignment"
     );
     assert.deepEqual(selection.exclude, ["web"]);
     // And recorded as ours, which is what `carrick remove` takes back. The
-    // file is named on the line above the question that writes it
-    // (carrick#1489), not on a line of its own afterwards.
+    // file is named in the list the question that writes it is about
+    // (carrick#1489, carrick#1512), not on a line of its own afterwards.
     assert.deepEqual(selection.carrick, { exclude: ["web"] });
-    assert.match(result.stdout, /^Writes: .*carrick-workspace\.json/m);
+    assert.match(result.stdout, /^ {2}Add Carrick's hooks .*create \.carrick\/ and carrick-workspace\.json/m);
     assert.doesNotMatch(result.stdout, /web excluded in/);
   } finally {
     fixture.cleanup();
@@ -1112,9 +1120,9 @@ test("the executable CLI creates the named project and puts the repos in it", po
       1,
       result.stdout,
     );
-    // The move is named in the summary, with the project it comes out of, and
+    // The move is named in the list, with the project it comes out of, and
     // it is named BEFORE the request that performs it.
-    const proposed = result.stdout.indexOf("acme/api  moves from Acme Default (default-project)");
+    const proposed = result.stdout.indexOf("  Move repo from Acme Default (default-project) into payments");
     assert.ok(proposed >= 0, result.stdout);
     assert.ok(proposed < result.stdout.indexOf("Created project"), result.stdout);
     // Claimed only because resolve-repos read it back afterwards.
@@ -1361,19 +1369,20 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     // And the run ends in three parts (carrick#1489): what is set up, in one
     // line; what is left to do, a line each; and the one sentence for the
     // agent. This workspace read reports no services, so there is no index
-    // step between them.
+    // step between them. No "Restart Claude Code" line: the block says a NEW
+    // agent session, which is the one that loads the server (carrick#1512).
     assert.equal(
-      result.stdout.trimEnd().split("\n").slice(-6).join("\n"),
+      result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
         "◇ Set up acme/api in acme · project payments: Claude Code and Codex hooks, task skills, MCP in Claude Code",
         "▲ Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.",
-        "▲ Restart Claude Code to load the Carrick MCP server.",
         "",
-        "Next: paste this to your agent",
+        "Next: paste this into a new agent session",
         `  ${scaffoldFor("acme/api")}`,
       ].join("\n"),
       result.stdout,
     );
+    assert.doesNotMatch(result.stdout, /Restart Claude Code/);
     // The quickstart carries what left the terminal, and none of it is printed.
     assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|carrick templates workflow|docs\.carrick\.tools\/carrick-json/);
   } finally {
@@ -1389,6 +1398,7 @@ function recordingPrompts(
   return {
     lines,
     asked,
+    repos: ["api", "web"],
     say: (line: string) => void lines.push(line),
     ask: async (question: string) => {
       asked.push(question);
@@ -1449,9 +1459,13 @@ test("a plain init asks nothing without a terminal, and settles nothing it would
 // carrick#1489 part 1: the question asked for a slug and hid what Enter did.
 // It is one pick list now, and a new project is asked for by its name.
 test("a plain init creates a new project from the name the terminal types", async () => {
+  const pick = picking("New project");
   const prompts = recordingPrompts({
     interactive: true,
-    pick: picking("New project"),
+    pick: async (question, options) => {
+      prompts.asked.push(question);
+      return pick(question, options);
+    },
     ask: async (question) => {
       prompts.asked.push(question);
       return "Acme Search";
@@ -1461,15 +1475,17 @@ test("a plain init creates a new project from the name the terminal types", asyn
       return true;
     },
   });
-  // Named, and asked for: the creation itself waits for the proposal, so what
-  // this step answers is what the run has permission to do (carrick#1338).
+  // Named, and not confirmed here: the create is a line in the list "Go
+  // ahead?" is asked about, which is where the reader sees which repos go
+  // into it, and nothing is created before that answer (carrick#1338,
+  // carrick#1512). The question itself names the repos.
   assert.deepEqual(await projectStep([null, "payments"], LISTED, prompts), {
     slug: "acme-search",
     exists: false,
     create: true,
     name: "Acme Search",
   });
-  assert.deepEqual(prompts.asked, ["Project name", "Create project Acme Search (acme-search)?"]);
+  assert.deepEqual(prompts.asked, ["Which project should api and web be in?", "Project name"]);
   // What a project is, said above the question rather than in the docs: a
   // project is the boundary every cross-repo answer is computed inside, and
   // splitting one system across two of them is the mistake this prevents
@@ -1494,7 +1510,7 @@ test("a plain init takes a listed project without creating anything", async () =
   });
 });
 
-test("a name that clashes is refused and asked again; a declined create goes back to the list", async () => {
+test("a name that clashes is refused and asked again; no name goes back to the list", async () => {
   const names = ["Payments", "Billing"];
   const clash = recordingPrompts({
     interactive: true,
@@ -1509,13 +1525,44 @@ test("a name that clashes is refused and asked again; a declined create goes bac
   });
   assert.ok(clash.lines.includes("Project Payments (payments) already exists. Pick another name."), clash.lines.join("\n"));
 
-  const declined = recordingPrompts({
+  const unnamed = recordingPrompts({
     interactive: true,
     pick: picking("New project", "Default (default)"),
-    ask: async () => "Search",
-    confirm: async () => false,
+    ask: async () => "",
+    confirm: async () => {
+      throw new Error("a project is not confirmed at its own question (carrick#1512)");
+    },
   });
-  assert.deepEqual(await projectStep([null], LISTED, declined), { slug: "default", exists: true, create: false });
+  assert.deepEqual(await projectStep([null], LISTED, unnamed), { slug: "default", exists: true, create: false });
+});
+
+// carrick#1512: the keep question names the repos it is about, one or many.
+test("the project questions name the repos they are about", async () => {
+  const one = recordingPrompts({ interactive: true, repos: ["shop-app"], confirm: async (question) => {
+    one.asked.push(question);
+    return true;
+  } });
+  await projectStep(["payments"], LISTED, one);
+  assert.deepEqual(one.asked, ["shop-app is in project Payments (payments). Keep it there?"]);
+  const two = recordingPrompts({ interactive: true, repos: ["shop-app", "shop-api"], confirm: async (question) => {
+    two.asked.push(question);
+    return true;
+  } });
+  await projectStep(["payments", "payments"], LISTED, two);
+  assert.deepEqual(two.asked, ["shop-app and shop-api are in project Payments (payments). Keep them there?"]);
+  assert.equal(reposPhrase(["a", "b", "c", "d", "e"]), "a, b, c and 2 more");
+});
+
+// carrick#1512: a named project that is not there is created on the one
+// "Go ahead?", not at a question of its own.
+test("--project names a new project without asking to create it", async () => {
+  const prompts = recordingPrompts({
+    interactive: true,
+    confirm: async () => {
+      throw new Error("the create is a line in the list, not a question of its own");
+    },
+  });
+  assert.deepEqual(await planProject("search", LISTED, prompts), { slug: "search", exists: false, create: true });
 });
 
 test("choosing the dashboard opens its projects page and says what that leaves undone", async () => {
@@ -1529,7 +1576,7 @@ test("choosing the dashboard opens its projects page and says what that leaves u
   });
   assert.deepEqual(await projectStep([null], LISTED, prompts), none);
   assert.deepEqual(opened, [url]);
-  assert.equal(prompts.lines.at(-1), `Add these repos to a project at ${url}. Until then they are in no project.`);
+  assert.equal(prompts.lines.at(-1), `Add api and web to a project at ${url}. Until then they are in no project.`);
 
   // An API without the actions is every workspace until the cloud half ships,
   // and there is no list to pick from.
@@ -2151,26 +2198,35 @@ for (const claims of ["adopts", "before-1359"] as const) {
         },
       });
       assert.equal(await initWith([fixture.repo], out, true), 0, out.lines.join("\n"));
-      assert.deepEqual(questions.slice(0, 4), [
-        "Which project should these repos be in? [New project | Choose on the dashboard]",
+      // The project question names the repo, and the project is not
+      // confirmed at a question of its own: the one "Go ahead?" covers the
+      // create, the App and the files (carrick#1512).
+      assert.deepEqual(questions.slice(0, 3), [
+        "Which project should acme-api be in? [New project | Choose on the dashboard]",
         "Project name",
-        "Create project Acme (acme)?",
-        "Write these files?",
+        "Go ahead?",
       ]);
       const said = out.lines.join("\n");
-      // Part 2: one block, the one browser step with its link, the files.
-      const summary = out.lines.indexOf(" " + "  New project Acme (acme)");
-      assert.ok(summary >= 0, said);
-      assert.deepEqual(out.lines.slice(summary, summary + 4), [
-        "   New project Acme (acme)",
-        "     acme-api  acme/acme-api",
-        "▲ acme/acme-api is not connected yet. Install the Carrick GitHub App on it: https://app.carrick.tools/w/acme/connect",
-        " Writes: .carrick/, .claude/, .agents/, .codex/, Claude Code's MCP servers",
-      ]);
+      // Part 2: everything the run will do, a line each, under "Next:".
+      assert.ok(
+        out.lines.includes(
+          [
+            " Next:",
+            "  Create project Acme with acme-api",
+            "  Open GitHub to install Carrick on acme-api",
+            "  Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
+          ].join("\n"),
+        ),
+        said,
+      );
+      // Nothing was created before that answer.
+      assert.ok(fixture.asked.indexOf("create-project") > fixture.asked.indexOf("list-projects"), fixture.asked.join(","));
       // Part 3: the connection is read again after the write was accepted, so
       // a repo the App connected meanwhile is not sent to the grant page
-      // again, and nothing waits.
-      assert.equal(out.lines.filter((line) => line.includes("/connect")).length, 1, said);
+      // again, and nothing waits. The App line was said once, in the list,
+      // and a terminal opens the page rather than printing its address.
+      assert.equal(out.lines.filter((line) => line.includes("/connect")).length, 0, said);
+      assert.equal(out.lines.filter((line) => /install Carrick on|Install the Carrick GitHub App/.test(line)).length, 1, said);
       assert.doesNotMatch(said, /Waiting|currently in project|Moved acme|A workspace owner/);
       if (claims === "adopts") {
         // The first project took the staged repo, so there is nothing to move.
@@ -2191,12 +2247,12 @@ for (const claims of ["adopts", "before-1359"] as const) {
       assert.equal(
         out.lines.at(-1),
         [
-          "Next: paste this to your agent",
+          "Next: paste this into a new agent session",
           "First install dependencies: run `npm install`.",
           scaffoldFor("acme/acme-api"),
         ].join("\n"),
       );
-      assert.doesNotMatch(said, /slug|No agent client|Docs:/);
+      assert.doesNotMatch(said, /slug|No agent client|Docs:|Restart Claude Code/);
     } finally {
       fixture.restore();
     }
@@ -2224,7 +2280,7 @@ test("a workspace read that fails after the yes leaves the setup written and exi
       ),
       out.lines.join("\n"),
     );
-    assert.equal(out.lines.at(-1)?.startsWith("Next: paste this to your agent"), true, out.lines.join("\n"));
+    assert.equal(out.lines.at(-1)?.startsWith("Next: paste this into a new agent session"), true, out.lines.join("\n"));
   } finally {
     fixture.restore();
   }
@@ -2845,60 +2901,428 @@ test("an editor file is written only for an editor somebody named", async () => 
   assert.deepEqual(asked, [{ initial: ["Cursor"], required: false }]);
   assert.deepEqual(await chooseEditors([], { ...none, interactive: true }, out), []);
 
-  // The files an answer covers are named by path on the line above the
-  // question (carrick#1489), the home directory as ~.
+  // The files an answer covers are named by path in the list the question is
+  // about (carrick#1489), the home directory as ~, and as what happens to
+  // them: every writer merges, and a list of folders read as though it
+  // replaced them (carrick#1512).
   assert.equal(
-    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, home: "/home/dev" }),
-    "Writes: .carrick/, .claude/, .agents/, .codex/, ~/.cursor/mcp.json",
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: true, home: "/home/dev" }),
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code",
   );
   assert.equal(
-    writesLine({ workspaceFile: true, editorFiles: [], claudeCode: true, home: "/home/dev" }),
-    `Writes: .carrick/, .claude/, .agents/, .codex/, ${WORKSPACE_FILE}, Claude Code's MCP servers`,
+    writesLine({ workspaceFile: false, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: false, home: "/home/dev" }),
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to ~/.cursor/mcp.json",
+  );
+  assert.equal(
+    writesLine({ workspaceFile: true, editorFiles: ["/home/dev/.cursor/mcp.json"], claudeCode: true, home: "/home/dev" }),
+    `Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/ and ${WORKSPACE_FILE}, and add Carrick's MCP server to Claude Code and ~/.cursor/mcp.json`,
+  );
+  assert.equal(
+    writesLine({ workspaceFile: false, editorFiles: [], claudeCode: false, home: "/home/dev" }),
+    "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, and create .carrick/",
   );
 });
 
 // carrick#1489 part 2: the summary named each repo twice, restated the
 // project the reader had just confirmed, and hid the one browser step behind
 // "once the browser connects them". One block per project, each repo once.
-test("the summary is one block per project, each repo once", () => {
-  const plan: WorkspaceProposal = {
-    schema: "carrick.derive/0", workspace: "/code", repos_detected_by: "test", repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
-    repos: [
-      { path: "/code/acme-api", reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [], not_installed: [] },
-      { path: "/code/acme-app", reason: "npm workspaces", services: [{ serviceName: "web" }, { serviceName: "admin" }, { serviceName: "docs" }], config: null, warnings: [], not_installed: [] },
+test("the list Go ahead is asked about names the project, the App and the files, once each", () => {
+  const writes = "Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/, and add Carrick's MCP server to Claude Code";
+  const url = "https://app.carrick.tools/w/acme/connect";
+  // The first run of the smoke case: a new project, neither repo connected.
+  assert.deepEqual(
+    nextLines({
+      create: "Shop",
+      project: "shop",
+      repos: ["shop-app", "shop-api"],
+      joining: ["shop-app", "shop-api"],
+      moving: [],
+      connect: connectItem(["shop-app", "shop-api"], 2, true, url),
+      writes,
+    }),
+    [
+      "Create project Shop with shop-app and shop-api",
+      "Open GitHub to install Carrick on both repos",
+      writes,
     ],
+  );
+  // An existing project: the repos that join it, and a move from where one is
+  // now, which is still asked about on its own afterwards (carrick#1338).
+  assert.deepEqual(
+    nextLines({
+      create: null,
+      project: "Shop (shop)",
+      repos: ["shop-app", "shop-api"],
+      joining: ["shop-app"],
+      moving: [{ repo: "shop-api", from: "Default (default)" }],
+      connect: connectItem(["shop-app"], 2, true, url),
+      writes,
+    }),
+    [
+      "Add shop-app to project Shop (shop)",
+      "Move shop-api from Default (default) into Shop (shop)",
+      "Open GitHub to install Carrick on shop-app",
+      writes,
+    ],
+  );
+  // Nothing to create, connect or move: only the files.
+  assert.deepEqual(
+    nextLines({ create: null, project: "Shop (shop)", repos: ["shop-app"], joining: [], moving: [], connect: null, writes }),
+    [writes],
+  );
+  // Without a terminal nothing can open the page, so the line carries it.
+  assert.equal(connectItem(["shop-app"], 1, false, url), `Install the Carrick GitHub App on shop-app: ${url}`);
+  assert.equal(connectItem(["a", "b", "c"], 3, true, url), "Open GitHub to install Carrick on all 3 repos");
+});
+
+/**
+ * A folder of repos the way the smoke run held them (carrick#1512): two
+ * JavaScript repos side by side, a third holding nothing but `.git`, and a
+ * derive that answers the way the scanner does — from inside a repo, that
+ * repo and the folder above it; from the folder, its repos.
+ */
+function siblingFolder(options: {
+  /** Extra JavaScript repos beside the two, for the long-list case. */
+  extra?: number;
+  /** What the workspace read says the signed-in user is. */
+  role?: string;
+  /** Whether the App lands on the repos while the questions are answered. */
+  connects?: boolean;
+  /** Repos the project holds beyond the ones this run asks about. */
+  alsoInProject?: string[];
+}): { folder: string; api: string; app: string; asked: string[]; opened: () => string[]; restore: () => void } {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-siblings-")));
+  const folder = path.join(root, "shop");
+  const repo = (name: string, manifest: boolean): string => {
+    const dir = path.join(folder, name);
+    fs.mkdirSync(dir, { recursive: true });
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "remote", "add", "origin", `https://github.com/example-org/${name}.git`]);
+    if (manifest) fs.writeFileSync(path.join(dir, "package.json"), "{}\n");
+    return dir;
   };
-  const selected = [
-    { path: "/code/acme-api", name: "acme/acme-api", remote: null, problem: null },
-    { path: "/code/acme-app", name: "acme/acme-app", remote: null, problem: null },
-  ];
-  const label = (slug: string): string => (slug === "default" ? "Default (default)" : slug);
+  const api = repo("shop-api", true);
+  const app = repo("shop-app", true);
+  repo("tools-py", false);
+  for (let index = 0; index < (options.extra ?? 0); index += 1) repo(`lib-${String(index).padStart(2, "0")}`, true);
+  const native = path.join(root, "native.mjs");
+  fs.writeFileSync(native, `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+const argv = process.argv.slice(2);
+if (argv[0] !== "derive") process.exit(2);
+const workspace = fs.realpathSync(argv[argv.indexOf("--workspace") + 1]);
+const markers = [".git", "package.json", "carrick.json", "deno.json", "deno.jsonc", "pnpm-workspace.yaml"];
+const marked = (dir) => markers.some((name) => fs.existsSync(path.join(dir, name)));
+const children = (dir) => fs.readdirSync(dir, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+  .map((entry) => path.join(dir, entry.name)).filter(marked).sort();
+let exclude = [];
+try { exclude = JSON.parse(fs.readFileSync(path.join(workspace, "carrick-workspace.json"), "utf8")).exclude ?? []; } catch {}
+const entry = (repo) => ({ path: repo, reason: "test", services: [{ serviceName: path.basename(repo) }], config: null, warnings: [], not_installed: [] });
+const base = { schema: "carrick.derive/0", workspace, repos_added: [], repos_excluded: exclude, missing: [] };
+const inside = children(workspace);
+const doc = inside.length > 0
+  ? { ...base, repos_detected_by: "sibling repositories", parent_proposal: null,
+      repos: inside.filter((repo) => !exclude.includes(path.basename(repo))).map(entry) }
+  : { ...base, repos_detected_by: "single repository",
+      parent_proposal: { directory: path.dirname(workspace), repos: children(path.dirname(workspace)) },
+      repos: [entry(workspace)] };
+process.stdout.write(JSON.stringify(doc));
+`);
+  fs.chmodSync(native, 0o755);
+  const bin = fakeClaude(root);
+  // The browser, so a wait never opens a real one: `open` on macOS, xdg-open
+  // elsewhere, each logging the address it was handed.
+  for (const name of ["open", "xdg-open"]) {
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\necho "$1" >> ${JSON.stringify(path.join(root, "opened.log"))}\nexit 0\n`);
+    fs.chmodSync(path.join(bin, name), 0o755);
+  }
+  const restoreEnv = withEnv({
+    CARRICK_BIN: native,
+    CARRICK_TOKEN: "test-token",
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    HOME: path.join(root, "home"),
+    PATH: `${bin}${path.delimiter}${process.env["PATH"] ?? ""}`,
+  });
+  const fetchBefore = globalThis.fetch;
+  const asked: string[] = [];
+  let reads = 0;
+  let placed: string | null = null;
+  const created: string[] = [];
+  globalThis.fetch = (async (_input: string, init: { body: string }) => {
+    const body = JSON.parse(String(init.body));
+    asked.push(`${body.action}${Array.isArray(body.repos) ? ` ${body.repos.join(",")}` : ""}`);
+    if (body.action === "resolve-repos") {
+      const connected = options.connects !== false && reads > 0 && placed !== null;
+      reads += 1;
+      return Response.json({
+        schema: "carrick.resolve-repos/0",
+        workspace: {
+          slug: "example-org",
+          billing_tier: "free",
+          installed: connected,
+          ...(options.role === undefined ? {} : { role: options.role }),
+        },
+        allowance_sentence: null,
+        repos: body.repos.map((name: string) =>
+          connected
+            ? { full_name: name, connected: true, project_id: "p1", project_slug: placed, services: [] }
+            : { full_name: name, connected: false }),
+        project_repos: connected ? [{ project_slug: placed, repos: [...body.repos, ...(options.alsoInProject ?? [])] }] : [],
+      });
+    }
+    if (body.action === "list-projects") {
+      return Response.json({
+        schema: "carrick.list-projects/0",
+        projects: created.map((slug) => ({ slug, name: slug, archived: false, repo_count: 0 })),
+      });
+    }
+    if (body.action === "create-project") {
+      created.push(body.slug);
+      placed = body.slug;
+      return Response.json({
+        schema: "carrick.create-project/0",
+        project: { slug: body.slug, name: body.name, archived: false, repo_count: 0 },
+      });
+    }
+    if (body.action === "assign-repos") {
+      placed = body.project;
+      return Response.json({
+        schema: "carrick.assign-repos/0", project_slug: body.project,
+        repos: body.repos.map((name: string) => ({ full_name: name, assigned: true, moved: false, project_slug: body.project, reason: null })),
+      });
+    }
+    throw new Error(`unexpected action ${body.action}`);
+  }) as unknown as typeof fetch;
+  return {
+    folder,
+    api,
+    app,
+    asked,
+    opened: () =>
+      fs.existsSync(path.join(root, "opened.log"))
+        ? fs.readFileSync(path.join(root, "opened.log"), "utf8").split("\n").filter((line) => line !== "")
+        : [],
+    restore: () => {
+      restoreEnv();
+      globalThis.fetch = fetchBefore;
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+/** A terminal that ticks these rows, names a new project, and says yes. */
+function siblingTerminal(tick: (rows: Choice[]) => string[]): InitOutput & {
+  lines: string[];
+  questions: Array<{ question: string; rows?: Choice[]; initial?: string[] }>;
+} {
+  const questions: Array<{ question: string; rows?: Choice[]; initial?: string[] }> = [];
+  const out = recordingOutput({
+    choose: async (question, _noun, rows, config) => {
+      questions.push({ question, rows, initial: config.initial });
+      return tick(rows);
+    },
+    pick: async (question, options) => {
+      questions.push({ question });
+      return options.find((option) => option.label === "New project")!.value;
+    },
+    ask: async (question) => {
+      questions.push({ question });
+      return "Shop";
+    },
+    confirm: async (question) => {
+      questions.push({ question });
+      return !question.startsWith("Install carrick");
+    },
+  });
+  return Object.assign(out, { questions });
+}
+
+function gitStatus(dir: string): string {
+  return execFileSync("git", ["-C", dir, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" });
+}
+
+// carrick#1512. Run inside one repo of a folder, init named the folder above
+// and told the reader to start again there. It asks instead: this repo
+// ticked, the JavaScript repos beside it unticked and named by their GitHub
+// repo, and a yes to any of them carries on as the folder run would.
+test("inside one repo, init asks which repos beside it belong with it, and a yes sets up the folder", posixNativeFixture, async () => {
+  const fixture = siblingFolder({});
+  try {
+    const out = siblingTerminal((rows) => rows.map((row) => row.value));
+    assert.equal(await initWith([fixture.app], out, true), 0, out.lines.join("\n"));
+    const said = out.lines.join("\n");
+    const first = out.questions[0]!;
+    assert.equal(first.question, `${fixture.folder} holds other repos. Which belong to the same system as shop-app?`);
+    // This repo first and ticked; the others unticked; a folder holding only
+    // `.git` is not a candidate for "the same system".
+    assert.deepEqual(first.rows, [
+      { value: fixture.app, label: "shop-app (this repo)", hint: "example-org/shop-app" },
+      { value: fixture.api, label: "shop-api", hint: "example-org/shop-api" },
+    ]);
+    assert.deepEqual(first.initial, [fixture.app]);
+    // The project question names both repos, this one first, and nothing is
+    // asked to be confirmed before the one "Go ahead?".
+    assert.deepEqual(out.questions.slice(1).map((entry) => entry.question), [
+      "Which project should shop-app and shop-api be in?",
+      "Project name",
+      "Go ahead?",
+    ]);
+    assert.ok(
+      out.lines.includes(
+        [
+          " Next:",
+          "  Create project Shop with shop-app and shop-api",
+          "  Open GitHub to install Carrick on both repos",
+          "  Add Carrick's hooks and skills to .claude/, .agents/ and .codex/, create .carrick/ and carrick-workspace.json, and add Carrick's MCP server to Claude Code",
+        ].join("\n"),
+      ),
+      said,
+    );
+    // Not told to run it again anywhere.
+    assert.doesNotMatch(said, /Run carrick init \.\.|parent folder/);
+    // Nothing was created before the answer: the create is the first write.
+    assert.equal(fixture.asked.findIndex((line) => line.startsWith("create-project")) > 0, true, fixture.asked.join("\n"));
+    // Set up as the folder: the proposal and the selection in the folder, the
+    // repo nobody offered left out of it.
+    assert.ok(fs.existsSync(path.join(fixture.folder, PROPOSAL_FILE)));
+    assert.equal(fs.existsSync(path.join(fixture.app, ".carrick")), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(fixture.folder, WORKSPACE_FILE), "utf8")).exclude, ["tools-py"]);
+    // Option A: each repo holds its own hooks and skills, and git sees none
+    // of them.
+    for (const repo of [fixture.api, fixture.app]) {
+      assert.ok(fs.existsSync(path.join(repo, ".claude", "settings.local.json")), repo);
+      assert.ok(fs.existsSync(path.join(repo, CODEX_HOOKS_FILE)), repo);
+      for (const skill of taskSkillPaths()) assert.ok(fs.existsSync(path.join(repo, skill)), skill);
+      assert.equal(gitStatus(repo), "?? package.json\n", repo);
+    }
+    // The agent is told where the proposal is, because it is not where the
+    // reader started.
+    assert.equal(
+      out.lines.at(-1),
+      [
+        "Next: paste this into a new agent session",
+        scaffoldSentence([
+          { path: fixture.app, name: "example-org/shop-app", remote: null, problem: null },
+          { path: fixture.api, name: "example-org/shop-api", remote: null, problem: null },
+        ]),
+        `The init folder is ${fixture.folder}.`,
+      ].join("\n"),
+    );
+    assert.doesNotMatch(said, /Restart Claude Code|not on this machine/);
+  } finally {
+    fixture.restore();
+  }
+});
+
+// carrick#1512: left unticked, the repo beside this one is named nowhere, and
+// a project that also holds it (every repo the App was granted, until
+// carrick-cloud#1403) does not call it missing from this machine.
+test("with only this repo ticked, every line names it alone and a sibling is never 'not on this machine'", posixNativeFixture, async () => {
+  const fixture = siblingFolder({ alsoInProject: ["example-org/shop-api", "example-org/billing"] });
+  try {
+    const out = siblingTerminal((rows) => [rows[0]!.value]);
+    assert.equal(await initWith([fixture.app], out, true), 0, out.lines.join("\n"));
+    const said = out.lines.join("\n");
+    assert.deepEqual(out.questions.slice(1).map((entry) => entry.question), [
+      "Which project should shop-app be in?",
+      "Project name",
+      "Go ahead?",
+    ]);
+    assert.ok(said.includes("  Create project Shop with shop-app\n  Open GitHub to install Carrick on shop-app\n"), said);
+    // The repo that really is elsewhere is still named; the one beside this
+    // one is not.
+    assert.ok(out.lines.includes("▲ Also in this project, not on this machine: example-org/billing."), said);
+    assert.doesNotMatch(said, /shop-api/);
+    // Set up where it started, as a single repo, with no copy anywhere else.
+    assert.ok(fs.existsSync(path.join(fixture.app, PROPOSAL_FILE)));
+    assert.equal(fs.existsSync(path.join(fixture.folder, ".carrick")), false);
+    assert.equal(fs.existsSync(path.join(fixture.api, ".claude")), false);
+    assert.doesNotMatch(said, /The init folder is/);
+  } finally {
+    fixture.restore();
+  }
+});
+
+// carrick#1512: more than fifteen repos beside this one is not a list to tick
+// through, and a run with no terminal cannot ask. Both say one line and set
+// up this repo.
+test("too many repos beside this one, or no terminal, is one line and this repo alone", posixNativeFixture, async () => {
+  const line = "Setting up shop-app only. To set up several repos as one system, run carrick init in the folder that holds them.";
+  const many = siblingFolder({ extra: 15 });
+  try {
+    const out = siblingTerminal(() => {
+      throw new Error("no list above fifteen repos");
+    });
+    assert.equal(await initWith([many.app], out, true), 0, out.lines.join("\n"));
+    assert.ok(out.lines.includes(` ${line}`), out.lines.join("\n"));
+    assert.equal(out.questions[0]!.question, "Which project should shop-app be in?");
+  } finally {
+    many.restore();
+  }
+  const few = siblingFolder({});
+  try {
+    const out = siblingTerminal(() => {
+      throw new Error("no terminal to ask in");
+    });
+    assert.equal(await initWith(["--yes", few.app], out, false), 0, out.lines.join("\n"));
+    assert.ok(out.lines.includes(` ${line}`), out.lines.join("\n"));
+    assert.equal(fs.existsSync(path.join(few.folder, ".carrick")), false);
+  } finally {
+    few.restore();
+  }
+});
+
+// carrick#1512 and carrick-cloud#1426: the owner-or-admin line is for a
+// member, and the GitHub App line is said once, in the list. A terminal opens
+// the page itself.
+test("the wait on the App says who can end it only to a member, and the App line is said once", posixNativeFixture, async () => {
+  for (const role of ["member", "owner", undefined]) {
+    const fixture = siblingFolder({ connects: false, ...(role === undefined ? {} : { role }) });
+    try {
+      const out = siblingTerminal((rows) => [rows[0]!.value]);
+      // The wait is stopped the way a reader stops it.
+      out.step = async (_label, work, report) => {
+        setImmediate(() => process.emit("SIGINT"));
+        const value = await work(() => {});
+        out.lines.push(report(value).text);
+        return value;
+      };
+      assert.equal(await initWith([fixture.app], out, true), 0, out.lines.join("\n"));
+      const said = out.lines.join("\n");
+      assert.equal(said.includes(ADMIN_WAIT), role === "member", `${String(role)}: ${said}`);
+      assert.deepEqual(fixture.opened(), ["https://app.carrick.tools/w/example-org/connect"]);
+      // Once in the list; and, the wait stopped with the grant still to do,
+      // once as what is left, with the page to finish it on.
+      assert.equal(out.lines.filter((entry) => entry.includes("install Carrick on shop-app")).length, 1, said);
+      assert.equal(
+        out.lines.filter((entry) => entry.includes("Install the Carrick GitHub App on it: https://app.carrick.tools/w/example-org/connect")).length,
+        1,
+        said,
+      );
+    } finally {
+      fixture.restore();
+    }
+  }
+});
+
+// carrick#1512: which repos beside this one are candidates for "the same
+// system". The scanner counts a folder holding only `.git`; the question
+// counts a folder holding a JavaScript or TypeScript manifest, one the
+// folder's own workspace file has not left out, and never this repo itself.
+test("a sibling is a JavaScript repo in the folder above, not left out and not this one", () => {
+  const files = new Set(["/code/api/package.json", "/code/web/deno.json", "/code/app/package.json", "/code/old/package.json"]);
+  const plan: WorkspaceProposal = {
+    schema: "carrick.derive/0", workspace: "/code/app", repos_detected_by: "single repository", repos_added: [], repos_excluded: [], missing: [],
+    parent_proposal: { directory: "/code", repos: ["/code/api", "/code/app", "/code/py", "/code/web", "/code/old"] },
+    repos: [],
+  };
+  assert.deepEqual(siblingRepos(plan, ["old"], (target) => files.has(target)), ["/code/api", "/code/web"]);
+  // A repository this folder sits inside is not a sibling.
   assert.deepEqual(
-    summaryBlocks({ plan, selected, project: "acme", created: "Acme (acme)", label, assigned: new Map(), moving: [] }),
-    [
-      "  New project Acme (acme)",
-      "    acme-api  acme/acme-api",
-      "    acme-app  acme/acme-app  3 packages",
-    ],
+    siblingRepos({ ...plan, parent_proposal: { directory: "/code", repos: ["/code"] } }, [], () => true),
+    [],
   );
-  // A move is on the row it is about, naming where the repo comes from.
-  const assigned = new Map<string, string | null>([["acme/acme-api", "default"], ["acme/acme-app", null]]);
-  assert.deepEqual(
-    summaryBlocks({ plan, selected, project: "acme", created: null, label, assigned, moving: ["acme/acme-api"] }),
-    [
-      "  Project acme",
-      "    acme-api  acme/acme-api  moves from Default (default)",
-      "    acme-app  acme/acme-app  3 packages",
-    ],
-  );
-  // No project settled: each repo under the project it is in now.
-  assert.deepEqual(
-    summaryBlocks({ plan, selected, project: null, created: null, label, assigned, moving: [] }),
-    [
-      "  Project Default (default)",
-      "    acme-api  acme/acme-api",
-      "  No project",
-      "    acme-app  acme/acme-app  3 packages",
-    ],
-  );
+  assert.deepEqual(siblingRepos({ ...plan, parent_proposal: null }), []);
 });
