@@ -603,9 +603,9 @@ mod tests {
             "scanner_version": env!("CARGO_PKG_VERSION"),
             "compat_verdicts": [{
                 "producer_repo": "rules-api",
-                "producer_key": "http|GET|/rules/:boothId/holidays",
+                "producer_key": "http|GET|/rules/:calendarId/holidays",
                 "consumer_repo": "rules-web",
-                "consumer_key": "http|GET|/rules/:boothId/holidays",
+                "consumer_key": "http|GET|/rules/:calendarId/holidays",
                 "response": answer,
                 "sites": [{ "consumer_location": site, "response": answer }],
                 "scanner_version": env!("CARGO_PKG_VERSION")
