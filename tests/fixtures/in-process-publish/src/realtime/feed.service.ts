@@ -1,5 +1,4 @@
 import { Subject } from "@fixture/streams";
-import { filter } from "@fixture/streams/operators";
 
 export interface FeedEvent {
   kind: string;
@@ -14,6 +13,6 @@ export class FeedService {
   }
 
   subscribe(kind: string, handler: (event: FeedEvent) => void) {
-    return this.events.pipe(filter((event: FeedEvent) => event.kind === kind)).subscribe(handler);
+    return this.events.subscribe(handler);
   }
 }

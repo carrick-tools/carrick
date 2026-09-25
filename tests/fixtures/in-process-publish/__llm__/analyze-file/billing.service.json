@@ -1,0 +1,87 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "invoice.charged",
+      "role": "publisher",
+      "line_number": 18,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 18
+    },
+    {
+      "topic": "invoice.queued",
+      "role": "publisher",
+      "line_number": 19,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 19
+    },
+    {
+      "topic": "invoice.scheduled",
+      "role": "publisher",
+      "line_number": 20,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 20
+    },
+    {
+      "topic": "invoice.settled",
+      "role": "publisher",
+      "line_number": 21,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 21
+    },
+    {
+      "topic": "invoice.recorded",
+      "role": "publisher",
+      "line_number": 22,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 22
+    },
+    {
+      "topic": "invoice.refunded",
+      "role": "publisher",
+      "line_number": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: \"invoice.refunded\", payload: { id } }",
+      "payload_expression_line": 23
+    },
+    {
+      "topic": "invoice.viewed",
+      "role": "publisher",
+      "line_number": 24,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: \"invoice.viewed\", payload: { id } }",
+      "payload_expression_line": 24
+    },
+    {
+      "topic": "invoice.scheduled",
+      "role": "publisher",
+      "line_number": 24,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 24
+    }
+  ]
+}

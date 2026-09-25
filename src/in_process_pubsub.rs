@@ -15,31 +15,42 @@
 //! resolves such a call to its same-repo definition (`crate::call_graph`), and
 //! the definition's own body states where the value goes. This pass reads it.
 //!
-//! A row is WITHDRAWN when all of these hold:
+//! The pass FAILS CLOSED. Withdrawing a real publish hides a cross-service
+//! event from every question about it, while keeping an in-process one costs
+//! one line of noise, so a row is withdrawn only on positive proof and every
+//! doubt keeps it. A row is WITHDRAWN when all of these hold:
 //!
 //! - The row's call site resolves, through the call graph's edges, to exactly
 //!   one same-repo function. A call on a client the repo imports from a package
 //!   (`client.publish("x", p)`) resolves to nothing here and is never touched.
-//! - That function is proven in-process (below).
+//! - That call names the row's topic in its own arguments, as a string or a
+//!   module-scope constant. The model's line can be off, and a row placed on
+//!   a neighbouring call must not be judged by it.
+//! - That function is proven in-process (below), and so is every function it
+//!   is followed into.
 //! - Nothing in the same service sits on the other side of the topic. An
 //!   in-process publisher with an in-process subscriber is a real contract
 //!   (the same stance `crate::event_emitter` takes for `emit`/`on`), and the
 //!   pair matches itself; only a side that can never be matched is withdrawn.
 //!
-//! A function is PROVEN in-process when its body reaches at least one sink and
-//! every call in it is accounted for:
+//! A function is PROVEN in-process when no class of this repo that extends or
+//! implements its class (at any depth) defines the same member, its body
+//! reaches at least one sink, and every call in it is accounted for:
 //!
 //! - A call on an instance the class or module CONSTRUCTS itself (`new X()`
 //!   as a field or module-scope initialiser, never reassigned) is a sink when
-//!   `X` comes from a declared dependency that is not a transport, and is
-//!   followed into `X`'s method when `X` is this repo's own class. A transport
-//!   is a package framework detection lists as a messaging, socket or
-//!   data-fetching client: the model's classification of the repo's own
-//!   dependencies, so nothing here names a library. An empty array or object
-//!   literal held the same way is a sink too: a listener list the code fills
-//!   at run time. So is a call of a function imported from a non-transport
-//!   dependency (an operator applied to the stream).
-//! - A call resolved by a call-graph edge, or on the class's own method, is
+//!   `X` comes from a declared dependency, is constructed with NO arguments,
+//!   and is not a transport. A client that connects somewhere is told where,
+//!   so an instance built with arguments proves nothing whatever detection
+//!   says. A transport is a package framework detection lists as a messaging,
+//!   socket or data-fetching client: the model's classification of the repo's
+//!   own dependencies, so nothing here names a library. Detection can only
+//!   keep a row, never supply the proof that withdraws one.
+//! - When `X` is this repo's own class, the call is followed into `X`'s
+//!   method. An empty array or object literal held the same way is a sink: a
+//!   listener list the code fills at run time.
+//! - A call resolved by a call-graph edge (an injected field whose declared
+//!   class the call graph resolves), or on the class's own method, is
 //!   followed, to a bounded depth.
 //! - A bare call of a callback handed out by such an instance
 //!   (`this.listeners.forEach((fn) => fn(event))`) runs a registered listener
@@ -48,21 +59,28 @@
 //!   `new Date().toISOString()`) can carry nothing of the caller's.
 //!
 //! Anything else leaves the function NOT proven and its callers' rows stand:
-//! an injected field (whatever it is, it was handed in, so it may be a broker
-//! connection), a parameter, a global called with arguments (`fetch`,
-//! `JSON.stringify` alike), a construction from a global (the runtime's own
-//! globals include sockets and workers), a Node builtin module (the same
-//! reason), and any import the workspace index cannot place. The pass says
-//! nothing rather than guess, so a missed in-process wrapper keeps its rows,
-//! as it did before this pass existed.
+//! a function imported from a package (it is code this scan cannot read), a
+//! method inherited from any class, an injected field the call graph cannot
+//! resolve (an interface, an untyped field), a parameter, a global called
+//! with arguments (`fetch`, `JSON.stringify` alike), a construction from a
+//! global (the runtime's own globals include sockets and workers), a Node
+//! builtin module (the same reason), and any import the workspace index
+//! cannot place. A missed in-process wrapper keeps its rows, as it did before
+//! this pass existed.
 //!
-//! Two known limits. The call graph keeps one edge per caller and callee, at
-//! the first call site; a second call to the same wrapper from the same
-//! function is joined to that edge by its callee text (`this.feed.publish`),
-//! which the first site shares. And a transport package the detection step
-//! did not list, constructed directly by the wrapper's class, would read as a
-//! sink: that is a detection miss, and every other pub/sub gate in the
-//! scanner shares it.
+//! Known limits:
+//!
+//! - The call graph keeps one edge per caller and callee, at the first call
+//!   site; a second call to the same wrapper from the same function is joined
+//!   to that edge by its callee text (`this.feed.publish`), which the first
+//!   site shares.
+//! - A transport that detection did not list and that the wrapper's class
+//!   constructs with no arguments (a client reading its host from the
+//!   environment) reads as in-process.
+//! - A broker bridge: an in-process stream that another class of the service
+//!   subscribes to and forwards to a broker. The publish into the stream is
+//!   withdrawn, because this pass reads what the wrapper sends to, not who
+//!   reads the stream afterwards (carrick#1529).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -84,6 +102,10 @@ use crate::workspace_resolver::{Resolution, WorkspaceIndex};
 /// How many same-repo hops a wrapper may be followed through. Deep enough for
 /// a facade over a service over a bus; a chain longer than this proves nothing.
 const MAX_DEPTH: usize = 4;
+
+/// How many ancestors a class's hierarchy may have before the search stops
+/// and reads as one that reaches the wrapper's class.
+const MAX_ANCESTORS: usize = 64;
 
 /// One model pub/sub row as the engine's folds key it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -117,25 +139,41 @@ impl InProcessPubsub {
         })
     }
 
-    /// `file_results` without the withdrawn rows, for a reader that builds
-    /// something from every pub/sub row (the payload type requests), so a
-    /// withdrawn row asks the sidecar for nothing. Borrowed when nothing was
-    /// withdrawn.
-    pub fn retained<'r>(
+    /// The pub/sub rows of `file_results` without the withdrawn ones, for a
+    /// reader that builds something from every pub/sub row (the payload type
+    /// requests), so a withdrawn row asks the sidecar for nothing.
+    ///
+    /// Borrowed when nothing was withdrawn. Otherwise only files with pub/sub
+    /// rows are carried, and only those rows: every other field of the copy
+    /// is empty, so this is for the pub/sub readers alone.
+    pub fn pubsub_rows_kept<'r>(
         &self,
         file_results: &'r HashMap<String, FileAnalysisResult>,
     ) -> Cow<'r, HashMap<String, FileAnalysisResult>> {
         if self.withdrawn.is_empty() {
             return Cow::Borrowed(file_results);
         }
-        let mut kept = file_results.clone();
-        for (path, result) in kept.iter_mut() {
-            result.pubsub_operations.retain(|op| {
-                op.role.is_none_or(|role| {
-                    !self.is_withdrawn(Path::new(path), op.line_number, &op.topic, role)
-                })
-            });
-        }
+        let kept = file_results
+            .iter()
+            .filter(|(_, result)| !result.pubsub_operations.is_empty())
+            .map(|(path, result)| {
+                let pubsub_operations = result
+                    .pubsub_operations
+                    .iter()
+                    .filter(|op| {
+                        op.role.is_none_or(|role| {
+                            !self.is_withdrawn(Path::new(path), op.line_number, &op.topic, role)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                let rows = FileAnalysisResult {
+                    pubsub_operations,
+                    ..FileAnalysisResult::default()
+                };
+                (path.clone(), rows)
+            })
+            .collect();
         Cow::Owned(kept)
     }
 
@@ -204,7 +242,7 @@ pub fn classify(
             // `file_results` is keyed by the path as walked (absolute during a
             // scan); definitions are repo-relative by now.
             let file = repo_relative(repo_root, &site.file);
-            let Some(target) = classifier.site_target(&file, site.line) else {
+            let Some(target) = classifier.site_target(&file, site.line, &site.topic) else {
                 continue;
             };
             if classifier.verdict(&target, 0) == Verdict::InProcess {
@@ -277,13 +315,58 @@ struct ParsedModule {
     module: Module,
     /// Every call in the module: its line, start offset and callee text.
     calls: Vec<CallText>,
+    /// Module-scope `const NAME = "literal"` bindings, for a topic passed by
+    /// name.
+    consts: HashMap<String, String>,
 }
 
-/// One call's callee as written, whitespace removed (`this.feed.publish`).
+/// One call's callee as written, whitespace removed (`this.feed.publish`),
+/// with what its arguments spell out.
 struct CallText {
     line: u32,
     lo: u32,
     text: String,
+    /// Every string written inside the call's arguments: string literals and
+    /// templates with no interpolation.
+    literals: HashSet<String>,
+    /// Every identifier read inside the call's arguments.
+    idents: HashSet<String>,
+}
+
+impl CallText {
+    /// Whether this call's arguments name `topic`: as a string written in
+    /// them, or as a module-scope constant holding it.
+    fn names(&self, topic: &str, consts: &HashMap<String, String>) -> bool {
+        self.literals.contains(topic)
+            || self
+                .idents
+                .iter()
+                .any(|ident| consts.get(ident).is_some_and(|value| value == topic))
+    }
+}
+
+/// The strings and identifiers a call's arguments contain.
+#[derive(Default)]
+struct ArgumentText {
+    literals: HashSet<String>,
+    idents: HashSet<String>,
+}
+
+impl Visit for ArgumentText {
+    fn visit_str(&mut self, value: &Str) {
+        self.literals.insert(value.value.to_string());
+    }
+    fn visit_tpl(&mut self, tpl: &Tpl) {
+        if tpl.exprs.is_empty()
+            && let Some(cooked) = tpl.quasis.first().and_then(|quasi| quasi.cooked.as_ref())
+        {
+            self.literals.insert(cooked.to_string());
+        }
+        tpl.visit_children_with(self);
+    }
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.idents.insert(ident.sym.to_string());
+    }
 }
 
 impl ParsedModule {
@@ -297,10 +380,14 @@ impl ParsedModule {
                 if let Callee::Expr(callee) = &call.callee
                     && let Ok(text) = self.cm.span_to_snippet(callee.span())
                 {
+                    let mut arguments = ArgumentText::default();
+                    call.args.visit_with(&mut arguments);
                     self.calls.push(CallText {
                         line: self.cm.lookup_char_pos(call.span.lo).line as u32,
                         lo: call.span.lo.0,
                         text: text.chars().filter(|c| !c.is_whitespace()).collect(),
+                        literals: arguments.literals,
+                        idents: arguments.idents,
                     });
                 }
                 call.visit_children_with(self);
@@ -312,20 +399,23 @@ impl ParsedModule {
         };
         module.visit_with(&mut collector);
         let calls = collector.calls;
-        Self { cm, module, calls }
+        let consts = crate::swc_scanner::collect_const_string_values(&module);
+        Self {
+            cm,
+            module,
+            calls,
+            consts,
+        }
     }
 
-    /// The callee texts of the outermost call starting on `line` and of the
-    /// chain links that start where it does.
-    fn outer_callee_texts(&self, line: u32) -> HashSet<&str> {
+    /// The outermost call starting on `line` and the chain links that start
+    /// where it does.
+    fn outer_calls(&self, line: u32) -> Vec<&CallText> {
         let on_line = || self.calls.iter().filter(move |call| call.line == line);
         let Some(first) = on_line().map(|call| call.lo).min() else {
-            return HashSet::new();
+            return Vec::new();
         };
-        on_line()
-            .filter(|call| call.lo == first)
-            .map(|call| call.text.as_str())
-            .collect()
+        on_line().filter(|call| call.lo == first).collect()
     }
 
     /// The callee texts of the calls on `line` whose last member is `member`.
@@ -404,7 +494,13 @@ impl<'a> Classifier<'a> {
     /// own site, which also joins a REPEAT call: the call graph keeps one edge
     /// per caller and callee, at the first site, and a second
     /// `this.feed.publish(...)` in the same function names the same callee.
-    fn site_target(&mut self, file: &Path, line: u32) -> Option<Target> {
+    ///
+    /// The call must also name the row's topic in its own arguments, as a
+    /// string or a module-scope constant. The model's line can be off by one,
+    /// and a row placed on the neighbouring call would otherwise be judged by
+    /// a call it does not describe. Payload text is not enough on its own:
+    /// `{ id }` is the payload of half the calls in a service.
+    fn site_target(&mut self, file: &Path, line: u32, topic: &str) -> Option<Target> {
         let owners: Vec<&'a FunctionDefinition> = self
             .defs_by_file
             .get(file)?
@@ -416,21 +512,27 @@ impl<'a> Classifier<'a> {
             return None;
         }
         let parsed = self.module(file)?;
-        let outer = parsed.outer_callee_texts(line);
-        if outer.is_empty() {
+        let outer = parsed.outer_calls(line);
+        let mut targets: HashSet<Target> = HashSet::new();
+        let mut named = false;
+        for edge in owners.iter().flat_map(|def| def.calls.iter()) {
+            let member = edge.name.rsplit('.').next().unwrap_or(&edge.name);
+            let texts: HashSet<&str> = parsed
+                .callee_texts_named(edge.call_site_line, member)
+                .collect();
+            let matched: Vec<&&CallText> = outer
+                .iter()
+                .filter(|call| texts.contains(call.text.as_str()))
+                .collect();
+            if matched.is_empty() {
+                continue;
+            }
+            named |= matched.iter().any(|call| call.names(topic, &parsed.consts));
+            targets.insert((normalize(Path::new(&edge.file_path)), edge.name.clone()));
+        }
+        if !named {
             return None;
         }
-        let targets: HashSet<Target> = owners
-            .iter()
-            .flat_map(|def| def.calls.iter())
-            .filter(|edge| {
-                let member = edge.name.rsplit('.').next().unwrap_or(&edge.name);
-                parsed
-                    .callee_texts_named(edge.call_site_line, member)
-                    .any(|text| outer.contains(text))
-            })
-            .map(|edge| (normalize(Path::new(&edge.file_path)), edge.name.clone()))
-            .collect();
         single(targets)
     }
 
@@ -452,6 +554,9 @@ impl<'a> Classifier<'a> {
         let Some(def) = self.defs.get(target).copied() else {
             return Verdict::NotProven;
         };
+        if self.overridden(target) {
+            return Verdict::NotProven;
+        }
         let Some(parsed) = self.module(file) else {
             return Verdict::NotProven;
         };
@@ -507,6 +612,124 @@ impl<'a> Classifier<'a> {
         Verdict::InProcess
     }
 
+    /// Whether the call may run code other than `target`'s body: a class of
+    /// this repo that extends or implements `target`'s class, at any depth,
+    /// defines the same member. An instance of that class can stand where the
+    /// declared one is expected (a container binds a broker-backed subclass
+    /// in place of an in-memory default), and the call then reaches its
+    /// member instead. A class whose ancestry this pass cannot follow counts
+    /// as one that does.
+    fn overridden(&mut self, target: &Target) -> bool {
+        let (file, name) = target;
+        let Some((class, member)) = name.split_once('.') else {
+            return false;
+        };
+        // A private member cannot be overridden, and a static one is not
+        // reached through an instance.
+        if member.starts_with('#') || member.starts_with("static.") {
+            return false;
+        }
+        let goal = (file.clone(), class.to_string());
+        let candidates: Vec<(PathBuf, String)> = self
+            .defs
+            .keys()
+            .filter_map(|(def_file, def_name)| {
+                let (def_class, def_member) = def_name.split_once('.')?;
+                (def_member == member && (def_file, def_class) != (file, class))
+                    .then(|| (def_file.clone(), def_class.to_string()))
+            })
+            .collect();
+        candidates
+            .into_iter()
+            .any(|candidate| self.descends_from(candidate, &goal))
+    }
+
+    /// Whether `class` extends or implements `goal`, at any depth. An
+    /// ancestor this pass cannot place answers yes.
+    fn descends_from(&mut self, class: (PathBuf, String), goal: &(PathBuf, String)) -> bool {
+        let mut frontier = vec![class];
+        let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
+        while let Some(current) = frontier.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_ANCESTORS {
+                return true;
+            }
+            for parent in self.class_parents(&current.0, &current.1) {
+                match parent {
+                    ClassRef::Repo(parent_file, parent_class) => {
+                        if parent_file == goal.0 && parent_class == goal.1 {
+                            return true;
+                        }
+                        frontier.push((parent_file, parent_class));
+                    }
+                    ClassRef::Outside => {}
+                    ClassRef::Unknown => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// What `class`, declared in `file`, extends and implements.
+    fn class_parents(&mut self, file: &Path, class: &str) -> Vec<ClassRef> {
+        let Some(parsed) = self.module(file) else {
+            return vec![ClassRef::Unknown];
+        };
+        let Some(declared) = module_classes(&parsed.module)
+            .into_iter()
+            .find(|(name, _)| name == class)
+            .map(|(_, declared)| declared)
+        else {
+            return vec![ClassRef::Unknown];
+        };
+        let imports = import_table(&parsed.module);
+        let named = |expr: &Expr| match unwrap(expr) {
+            Expr::Ident(ident) => self.class_ref(file, &parsed.module, &imports, &ident.sym),
+            _ => ClassRef::Unknown,
+        };
+        declared
+            .super_class
+            .as_deref()
+            .map(named)
+            .into_iter()
+            .chain(declared.implements.iter().map(|clause| named(&clause.expr)))
+            .collect()
+    }
+
+    /// The class a name in `file` refers to.
+    fn class_ref(
+        &self,
+        file: &Path,
+        module: &Module,
+        imports: &HashMap<String, ImportedSymbol>,
+        name: &str,
+    ) -> ClassRef {
+        if module_classes(module)
+            .iter()
+            .any(|(declared, _)| declared == name)
+        {
+            return ClassRef::Repo(file.to_path_buf(), name.to_string());
+        }
+        let Some(import) = imports.get(name) else {
+            // Neither declared nor imported here: a runtime global such as
+            // `Error`, or an interface this module declares. Neither is a
+            // class of this repo.
+            return ClassRef::Outside;
+        };
+        if import.kind != SymbolKind::Named {
+            return ClassRef::Unknown;
+        }
+        match self.workspace.resolve(file, &import.source) {
+            Resolution::External { .. } => ClassRef::Outside,
+            Resolution::Internal(path) => {
+                ClassRef::Repo(normalize(&path), import.imported_name.clone())
+            }
+            _ => ClassRef::Unknown,
+        }
+    }
+
     /// Whether `specifier`, imported by `file`, names a package detection
     /// classed as a transport. Matched as every other detection gate matches
     /// a specifier: the entry itself or a path under it.
@@ -538,6 +761,16 @@ impl<'a> Classifier<'a> {
             _ => ImportOrigin::Unproven,
         }
     }
+}
+
+/// Where a class's parent is declared.
+enum ClassRef {
+    /// A class of this repo: its file and name.
+    Repo(PathBuf, String),
+    /// A package's class or a runtime global: never one of this repo's.
+    Outside,
+    /// Something this pass cannot place.
+    Unknown,
 }
 
 enum ImportOrigin {
@@ -796,8 +1029,9 @@ impl Visit for DeclaredNames {
 /// How a held value came to be, read off its one initialiser.
 #[derive(Debug, Clone)]
 enum Origin {
-    /// `new X(...)` with `X` a plain identifier.
-    Constructed(String),
+    /// `new X(...)` with `X` a plain identifier, and whether the construction
+    /// passes anything. A client that connects somewhere is told where.
+    Constructed { ctor: String, with_args: bool },
     /// An empty array or object literal.
     EmptyContainer,
     /// Anything else, or a value that is assigned again after it is declared.
@@ -810,7 +1044,10 @@ fn origin_of(init: Option<&Expr>) -> Origin {
     };
     match unwrap(init) {
         Expr::New(new) => match unwrap(&new.callee) {
-            Expr::Ident(ident) => Origin::Constructed(ident.sym.to_string()),
+            Expr::Ident(ident) => Origin::Constructed {
+                ctor: ident.sym.to_string(),
+                with_args: new.args.as_ref().is_some_and(|args| !args.is_empty()),
+            },
             _ => Origin::Unknown,
         },
         Expr::Array(array) if array.elems.is_empty() => Origin::EmptyContainer,
@@ -834,8 +1071,6 @@ struct Scope<'a> {
     fields: HashMap<String, Origin>,
     /// The class's own method names.
     methods: HashSet<String>,
-    /// The enclosing class's superclass, when it is a plain identifier.
-    super_class: Option<String>,
 }
 
 impl<'a> Scope<'a> {
@@ -878,13 +1113,7 @@ impl<'a> Scope<'a> {
 
         let mut fields = HashMap::new();
         let mut methods = HashSet::new();
-        let mut super_class = None;
         if let Some(class) = class {
-            if let Some(parent) = class.super_class.as_deref()
-                && let Expr::Ident(ident) = unwrap(parent)
-            {
-                super_class = Some(ident.sym.to_string());
-            }
             for member in &class.body {
                 match member {
                     ClassMember::ClassProp(prop) if !prop.is_static => {
@@ -950,7 +1179,6 @@ impl<'a> Scope<'a> {
             classes,
             fields,
             methods,
-            super_class,
         }
     }
 }
@@ -1154,10 +1382,14 @@ impl BodyWalker<'_, '_> {
     fn held(&self, origin: &Origin, method: Option<&str>, span: Span) -> Need {
         match origin {
             Origin::EmptyContainer => Need::Sink,
-            Origin::Constructed(ctor) => {
+            Origin::Constructed { ctor, with_args } => {
                 if let Some(import) = self.scope.imports.get(ctor) {
                     return match self.classifier.import_origin(self.file, import) {
-                        ImportOrigin::Dependency => Need::Sink,
+                        // A package instance built with nothing to connect
+                        // to. One built with arguments may have been told a
+                        // host, whatever detection says the package is.
+                        ImportOrigin::Dependency if !with_args => Need::Sink,
+                        ImportOrigin::Dependency => Need::NotProven,
                         ImportOrigin::Repo(file, class) => match method {
                             Some(method) => Need::Follow((file, format!("{class}.{method}"))),
                             None => Need::NotProven,
@@ -1202,20 +1434,8 @@ impl BodyWalker<'_, '_> {
                 if self.scope.methods.contains(&method) {
                     return Need::Follow((self.file.to_path_buf(), format!("{class}.{method}")));
                 }
-                // A method the class inherits: what it is depends on the class
-                // it extends.
-                match self
-                    .scope
-                    .super_class
-                    .as_ref()
-                    .and_then(|parent| self.scope.imports.get(parent))
-                {
-                    Some(import) => match self.classifier.import_origin(self.file, import) {
-                        ImportOrigin::Dependency => Need::Sink,
-                        _ => Need::NotProven,
-                    },
-                    None => Need::NotProven,
-                }
+                // A method the class inherits: code this body does not show.
+                Need::NotProven
             }
             Root::Call(name) => {
                 if self.is_element(&name) {
@@ -1229,9 +1449,10 @@ impl BodyWalker<'_, '_> {
                 }
                 if let Some(import) = self.scope.imports.get(&name) {
                     return match self.classifier.import_origin(self.file, import) {
-                        ImportOrigin::Dependency => Need::Sink,
                         ImportOrigin::Repo(file, export) => Need::Follow((file, export)),
-                        ImportOrigin::Unproven => Need::NotProven,
+                        // A package function is code this scan cannot read:
+                        // it may send what it is given anywhere.
+                        ImportOrigin::Dependency | ImportOrigin::Unproven => Need::NotProven,
                     };
                 }
                 if self.scope.functions.contains(&name) {
@@ -1255,11 +1476,8 @@ impl BodyWalker<'_, '_> {
                 if let Some(target) = self.edge_at(span) {
                     return Need::Follow(target);
                 }
-                if let Some(import) = self.scope.imports.get(&name) {
-                    return match self.classifier.import_origin(self.file, import) {
-                        ImportOrigin::Dependency => Need::Sink,
-                        _ => Need::NotProven,
-                    };
+                if self.scope.imports.contains_key(&name) {
+                    return Need::NotProven;
                 }
                 if self.scope.functions.contains(&name) || self.scope.classes.contains(&name) {
                     return Need::NotProven;
@@ -1352,7 +1570,7 @@ impl Visit for BodyWalker<'_, '_> {
                 let name = ident.sym.to_string();
                 match self.scope.imports.get(&name) {
                     Some(import) => match self.classifier.import_origin(self.file, import) {
-                        ImportOrigin::Dependency => Need::Nothing,
+                        ImportOrigin::Dependency if !has_args => Need::Nothing,
                         _ => Need::NotProven,
                     },
                     None if self.scope.classes.contains(&name)

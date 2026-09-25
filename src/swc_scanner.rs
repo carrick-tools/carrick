@@ -3702,7 +3702,7 @@ fn file_imports_messaging_client(import_sources: &[String], messaging_clients: &
 /// string-literal initializer are recorded — this is a targeted recall booster,
 /// not a general constant-folder, so template literals, member exprs, and
 /// nested scopes are intentionally ignored.
-fn collect_const_string_values(module: &Module) -> HashMap<String, String> {
+pub(crate) fn collect_const_string_values(module: &Module) -> HashMap<String, String> {
     let mut bindings = HashMap::new();
     for item in &module.body {
         let var = match item {

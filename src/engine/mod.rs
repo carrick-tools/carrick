@@ -787,6 +787,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         warn!("{line}");
         logging::annotate(logging::Annotation::Warning, &line);
     }
+    // Rows left out on purpose (carrick#1513): a count, so a reader who
+    // expected them knows they were dropped rather than missed.
+    if let Some(line) = crate::scan_health::in_process_pubsub_line() {
+        crate::progress::announce(&line);
+    }
     if let Some(summary) = crate::scan_health::summary_line() {
         warn!("{summary}");
     }
@@ -2957,7 +2962,7 @@ async fn analyze_current_repo_incremental(
             // deterministic `protocol_extractions`, so their payload anchors
             // bundle through the same path (#corpus-2 resolution dim). A row
             // withdrawn as in-process has no operation to type (carrick#1513).
-            let pubsub_results = in_process_pubsub.retained(&merged_results);
+            let pubsub_results = in_process_pubsub.pubsub_rows_kept(&merged_results);
             protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
                 &pubsub_results,
                 repo_path,
@@ -3658,6 +3663,7 @@ fn classify_in_process_pubsub(
             "pub/sub rows withdrawn as in-process with no counterpart (carrick#1513)"
         );
     }
+    crate::scan_health::record_in_process_pubsub(classified.len());
     classified
 }
 
@@ -6597,7 +6603,7 @@ async fn analyze_current_repo(
     // deterministic `protocol_extractions`, so their payload anchors bundle
     // through the same path (#corpus-2 resolution dim). A row withdrawn as
     // in-process has no operation to type (carrick#1513).
-    let pubsub_results = in_process_pubsub.retained(&analysis_result.file_results);
+    let pubsub_results = in_process_pubsub.pubsub_rows_kept(&analysis_result.file_results);
     protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
         &pubsub_results,
         repo_path,

@@ -26,18 +26,16 @@ struct Scan {
     stderr: String,
 }
 
-/// One isolated first scan of the fixture.
+/// One isolated first scan of the fixture with its recorded answers.
 fn scan() -> Scan {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
-    scan_in(storage.path(), cache.path())
+    scan_in(storage.path(), cache.path(), &fixture_dir().join("__llm__"))
 }
 
 /// A scan that stores its blob in `storage` and reads the previous one back
 /// from there, so a second call takes the incremental path.
-fn scan_in(storage: &Path, cache: &Path) -> Scan {
-    let cassettes = fixture_dir().join("__llm__");
-
+fn scan_in(storage: &Path, cache: &Path, cassettes: &Path) -> Scan {
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
     cmd.arg(fixture_dir())
         .env("CARRICK_LOCAL_STORAGE_DIR", storage)
@@ -135,26 +133,20 @@ fn endpoint(topic: &str, site: &str) -> Row {
 const ORDERS: &str = "src/orders/orders.service.ts";
 const LISTENER: &str = "src/inventory/inventory.listener.ts";
 const SHIPPING: &str = "src/shipping/shipping.service.ts";
+const BILLING: &str = "src/billing/billing.service.ts";
+const REFUNDS: &str = "src/billing/refunds.listener.ts";
 
-#[test]
-fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
-    let scan = scan();
-
-    // Kept. Each stays for a different reason, so dropping every row
-    // cannot pass this test.
-    let kept = [
-        // The wrapper's module imports the package detection lists as the
-        // messaging client.
+/// Rows that stay whatever framework detection lists: each is kept by a rule
+/// that reads the code, not the detection step.
+fn kept_whatever_detection_says() -> Vec<Row> {
+    vec![
+        // A broker client constructed with arguments.
         call("order.placed", &format!("{ORDERS}:24")),
         // The wrapper sends through a transport it was handed, which proves
         // nothing about where it goes.
         call("order.cancelled", &format!("{ORDERS}:31")),
         // A call on the package client itself resolves to no repo function.
         call("order.archived", &format!("{ORDERS}:32")),
-        // In-process, but the service subscribes to the same topic: the pair
-        // is a contract, as an emitter's `emit`/`on` pair is.
-        call("inventory.reserved", &format!("{ORDERS}:26")),
-        endpoint("inventory.reserved", &format!("{LISTENER}:9")),
         // A field constructed from a runtime global: the globals include
         // sockets.
         call("shipment.sent", &format!("{SHIPPING}:15")),
@@ -167,18 +159,44 @@ fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
         // No call at all, only a write to a handed-in object: nothing shows
         // the value staying here.
         call("shipment.sent", &format!("{SHIPPING}:18")),
-    ];
-    for row in &kept {
-        assert!(
-            scan.rows.contains(row),
-            "expected {row:?} to stay a pub/sub row; rows: {:#?}",
-            scan.rows
-        );
-    }
+        // A package instance constructed with arguments, from a package
+        // detection does not list.
+        call("invoice.queued", &format!("{BILLING}:19")),
+        // A function imported from a package: code this scan cannot read.
+        call("invoice.scheduled", &format!("{BILLING}:20")),
+        // An in-memory class two levels below a subclass that overrides the
+        // member with a broker publish.
+        call("invoice.settled", &format!("{BILLING}:21")),
+        // An in-memory class another class implements with a network call.
+        call("invoice.recorded", &format!("{BILLING}:22")),
+        // The model's row for line 20 placed on line 24, whose call publishes
+        // a different topic: judged by its own call or not at all.
+        call("invoice.scheduled", &format!("{BILLING}:24")),
+        // In-process, but an emitter in the service listens for the topic.
+        call("invoice.refunded", &format!("{BILLING}:23")),
+        endpoint("invoice.refunded", &format!("{REFUNDS}:5")),
+    ]
+}
 
-    // Withdrawn: in-process with nothing on the other side of the topic.
-    let withdrawn = [
-        // A field constructed from a declared dependency.
+/// Rows the recorded detection keeps.
+fn kept() -> Vec<Row> {
+    let mut rows = kept_whatever_detection_says();
+    rows.extend([
+        // A package detection lists as a messaging client, constructed with
+        // no arguments.
+        call("invoice.charged", &format!("{BILLING}:18")),
+        // In-process, but the service subscribes to the same topic: the pair
+        // is a contract, as an emitter's `emit`/`on` pair is.
+        call("inventory.reserved", &format!("{ORDERS}:26")),
+        endpoint("inventory.reserved", &format!("{LISTENER}:9")),
+    ]);
+    rows
+}
+
+/// Rows withdrawn: in-process with nothing on the other side of the topic.
+fn withdrawn() -> Vec<Row> {
+    vec![
+        // A field constructed, with no arguments, from a declared dependency.
         call("order.placed", &format!("{ORDERS}:23")),
         // A second call to the same wrapper from the same function: the call
         // graph keeps the first site only.
@@ -190,15 +208,29 @@ fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
         // The subscribing side, on a line where a callback is its own
         // definition.
         endpoint("stock.checked", &format!("{LISTENER}:10")),
-    ];
-    for row in &withdrawn {
+        // The same in-process wrapper from a second caller file.
+        call("invoice.viewed", &format!("{BILLING}:24")),
+    ]
+}
+
+#[test]
+fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
+    let scan = scan();
+    let kept = kept();
+    for row in &kept {
+        assert!(
+            scan.rows.contains(row),
+            "expected {row:?} to stay a pub/sub row; rows: {:#?}",
+            scan.rows
+        );
+    }
+    for row in &withdrawn() {
         assert!(
             !scan.rows.contains(row),
             "expected {row:?} to be withdrawn as an in-process call; rows: {:#?}",
             scan.rows
         );
     }
-
     assert_eq!(
         scan.rows.len(),
         kept.len(),
@@ -207,30 +239,77 @@ fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
     );
 }
 
+/// The count a reader sees says how many rows were left out.
+#[test]
+fn the_run_says_how_many_rows_it_left_out() {
+    let scan = scan();
+    let line = format!(
+        "{} pub/sub call(s) left out of the index: their events stay inside the service.",
+        withdrawn().len()
+    );
+    assert!(
+        scan.stderr.contains(&line),
+        "expected the line {line:?} in the scan's output:\n{}",
+        scan.stderr
+    );
+}
+
+/// With nothing in the detection lists, a broker the detection step missed
+/// still keeps its rows. Detection only adds rows to keep, never proof.
+#[test]
+fn broker_rows_stay_when_detection_lists_nothing() {
+    let cassettes = tempfile::tempdir().expect("temp cassette dir");
+    let analyze = cassettes.path().join("analyze-file");
+    std::fs::create_dir_all(&analyze).expect("analyze-file dir");
+    for entry in std::fs::read_dir(fixture_dir().join("__llm__/analyze-file")).expect("answers") {
+        let entry = entry.expect("answer file");
+        std::fs::copy(entry.path(), analyze.join(entry.file_name())).expect("copy answer");
+    }
+    let detect = cassettes.path().join("framework-detect");
+    std::fs::create_dir_all(&detect).expect("framework-detect dir");
+    std::fs::write(
+        detect.join("framework-detect.json"),
+        r#"{"frameworks":[],"data_fetchers":[],"messaging_clients":[],"socket_clients":[],"notes":"none"}"#,
+    )
+    .expect("write detection");
+
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let scan = scan_in(storage.path(), cache.path(), cassettes.path());
+    for row in &kept_whatever_detection_says() {
+        assert!(
+            scan.rows.contains(row),
+            "with an empty detection, expected {row:?} to stay a pub/sub row; rows: {:#?}",
+            scan.rows
+        );
+    }
+}
+
 #[test]
 fn a_withdrawn_row_leaves_no_type_anchor() {
     let scan = scan();
-    let sites: BTreeSet<&str> = scan
+    let sites: BTreeSet<(&str, &str)> = scan
         .anchors
         .iter()
-        .map(|(_, _, site)| site.as_str())
+        .map(|(_, topic, site)| (topic.as_str(), site.as_str()))
         .collect();
-    for site in [
-        format!("{ORDERS}:23"),
-        format!("{ORDERS}:25"),
-        format!("{ORDERS}:30"),
-        format!("{ORDERS}:33"),
-        format!("{LISTENER}:10"),
-    ] {
+    for (_, topic, site) in &withdrawn() {
         assert!(
-            !sites.contains(site.as_str()),
+            !sites.contains(&(topic.as_str(), site.as_str())),
             "a withdrawn row kept its manifest anchor at {site}: {:#?}",
             scan.anchors
         );
     }
+    // Every kept model row has one anchor. The emitter row the event-bus pass
+    // adds carries none (carrick#688), so it is left out of the count.
+    let model_rows = scan
+        .rows
+        .iter()
+        .filter(|row| **row != endpoint("invoice.refunded", &format!("{REFUNDS}:5")))
+        .count();
     assert_eq!(
         scan.anchors.len(),
-        scan.rows.len(),
+        model_rows,
         "every kept row has one anchor: anchors {:#?}, rows {:#?}",
         scan.anchors,
         scan.rows
@@ -270,8 +349,9 @@ fn a_withdrawn_row_resolves_no_type() {
 fn a_rescan_withdraws_the_same_rows() {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
-    let first = scan_in(storage.path(), cache.path());
-    let second = scan_in(storage.path(), cache.path());
+    let cassettes = fixture_dir().join("__llm__");
+    let first = scan_in(storage.path(), cache.path(), &cassettes);
+    let second = scan_in(storage.path(), cache.path(), &cassettes);
     assert!(
         second.stderr.contains("already analysed"),
         "the second scan did not reuse the cached answers, so it did not take the incremental path:\n{}",
