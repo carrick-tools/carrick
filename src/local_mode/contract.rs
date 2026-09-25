@@ -593,6 +593,11 @@ pub struct StatusOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub analysing: Vec<String>,
     pub services: Vec<StatusService>,
+    /// What the last build's type check did: whether it ran, what it judged,
+    /// and which verdicts are not in Carrick Cloud (carrick#1490). Absent
+    /// for an index that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_check: Option<super::read_model::TypeCheckSummary>,
 }
 
 impl StatusOutput {
@@ -669,6 +674,9 @@ impl StatusOutput {
                     repo.outside_every_service - repo.stale_files.len()
                 ));
             }
+        }
+        for line in self.type_check.iter().flat_map(|check| check.lines()) {
+            out.push_str(&format!("  {line}\n"));
         }
         out.push('\n');
         for service in &self.services {
@@ -1031,6 +1039,7 @@ mod hosted_wire_tests {
             scanner_version: "test".to_string(),
             running_scans: Vec::new(),
             last_scan: None,
+            type_check: None,
             repos: vec![StatusRepo {
                 repo: "/repos/monorepo".to_string(),
                 name: "monorepo".to_string(),

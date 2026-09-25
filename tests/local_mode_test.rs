@@ -2122,3 +2122,107 @@ fn a_dispatch_with_nothing_to_hand_over_says_so() {
         "nothing is waiting to be collected:\n{said}"
     );
 }
+
+/// The stored blob a laptop `carrick index` wrote for one repo: the copy of
+/// exactly what it uploaded, which is what the cloud's compatibility answer is
+/// read from.
+fn stored_blob(root: &Path, repo: &str) -> serde_json::Value {
+    let dir = root.join(".carrick/repos");
+    std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .map(|path| {
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(&path).expect("read a stored blob"),
+            )
+            .expect("a stored blob is JSON")
+        })
+        .find(|blob| blob["repo_name"] == serde_json::json!(repo))
+        .unwrap_or_else(|| panic!("no stored blob for {repo} in {}", dir.display()))
+}
+
+/// The fixture's two repos indexed with `carrick index`, the consumer in a
+/// folder named `consumer`.
+///
+/// Sibling repos are scanned in name order, so the name is what decides
+/// whether the consumer is scanned before or after `catalog-web`, its
+/// producer.
+fn laptop_index(consumer: &str) -> (tempfile::TempDir, String) {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    if consumer != "inventory-svc" {
+        std::fs::rename(root.join("inventory-svc"), root.join(consumer)).expect("rename");
+        std::fs::write(
+            root.join("carrick-workspace.json"),
+            format!("{{ \"repos\": [\"./catalog-web\", \"./{consumer}\"] }}\n"),
+        )
+        .expect("rewrite the workspace file");
+    }
+    for repo in ["catalog-web", consumer] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+    let (stdout, stderr) = run_mocked_output(root, &["index", "--workspace", "."]);
+    (workspace, format!("{stdout}\n{stderr}"))
+}
+
+/// carrick#1490: the consumer's upload carries the type verdict for its pair
+/// when its producer was indexed earlier in the same build, the way a CI run
+/// of the consumer carries it after downloading the producer's index. Before
+/// the fix every laptop scan read no sibling at all, so the consumer stored
+/// no verdict whatever the order.
+#[test]
+#[serial]
+fn a_laptop_index_stores_the_consumers_type_verdict() {
+    let (workspace, said) = laptop_index("inventory-svc");
+    let consumer = stored_blob(workspace.path(), "inventory-svc");
+    let verdicts = consumer["compat_verdicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the consumer stored no verdict:\n{said}"));
+    assert!(
+        verdicts
+            .iter()
+            .any(|row| row["producer_repo"] == "catalog-web"
+                && row["producer_key"]
+                    .as_str()
+                    .is_some_and(|key| key.contains("/api/v1/widgets/"))),
+        "the verdict is for the widget pair: {verdicts:#?}"
+    );
+    assert!(
+        said.contains("type check: 1 of 1 pair(s) judged"),
+        "the build says the check ran and what it judged:\n{said}"
+    );
+    assert!(
+        !said.contains("not in Carrick Cloud"),
+        "nothing judged here is missing from the upload:\n{said}"
+    );
+}
+
+/// carrick#1490: a consumer indexed before its producer had nothing to pair
+/// with when it uploaded, and the build says so by name rather than leaving
+/// the cloud to report the pair as never compared. `carrick status` says it
+/// too, because a detached build's output is a log nobody may read.
+#[test]
+#[serial]
+fn a_verdict_the_upload_missed_is_named_by_the_build_and_by_status() {
+    let (workspace, said) = laptop_index("basket-svc");
+    let root = workspace.path();
+    assert!(
+        stored_blob(root, "basket-svc")["compat_verdicts"].is_null(),
+        "indexed first, the consumer had no producer to pair with:\n{said}"
+    );
+    let line = "1 verdict(s) for basket-svc are not in Carrick Cloud: it was indexed before \
+                catalog-web.";
+    assert!(said.contains(line), "the build names the gap:\n{said}");
+    assert!(
+        line.split_whitespace().count() <= 20,
+        "a scanner line carries the count, the thing and what is missing, nothing more"
+    );
+    let status = run(root, &["status"]);
+    assert!(status.contains(line), "status names it too:\n{status}");
+    let json: serde_json::Value =
+        serde_json::from_str(&run(root, &["status", "--json"])).expect("status --json");
+    assert_eq!(
+        json["type_check"]["not_stored"][0]["consumer"], "basket-svc",
+        "{json:#}"
+    );
+}

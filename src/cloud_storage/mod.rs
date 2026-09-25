@@ -26,7 +26,7 @@ pub use aws_storage::AwsStorage;
 pub(crate) use aws_storage::{INLINE_PAYLOAD_LIMIT_BYTES, indexed_service_slug};
 mod local_dir_storage;
 mod tee_storage;
-pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage};
+pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};
 pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]

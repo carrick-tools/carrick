@@ -1536,6 +1536,11 @@ fn print_map(outcome: &super::index::IndexOutcome) {
         .map(|item| item.counterparts.len())
         .sum();
     crate::outln!("  {counterparts} counterpart link(s) across the workspace");
+    // Never silent: a skipped check and a verdict the upload missed are what
+    // a first index otherwise leaves unexplained (carrick#1490).
+    for line in index.type_check.iter().flat_map(|check| check.lines()) {
+        crate::outln!("  {line}");
+    }
     crate::outln!();
     for repo in &index.repos {
         for service in &repo.services {

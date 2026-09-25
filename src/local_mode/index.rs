@@ -3,10 +3,12 @@
 //! Two phases, the same two the offline cross-repo harness uses, driven as
 //! subprocesses of this binary:
 //!
-//! 1. **Per repo, isolated.** Each repo is scanned on its own with the
-//!    cross-repo download forced empty, so no sibling's data reaches a repo's
-//!    own scan. Hosted answers are handed in only as previous_data. This is
-//!    the slow phase, and it is where `refresh` does its work for one service.
+//! 1. **Per repo.** Each repo is scanned on its own. A pass that uploads
+//!    downloads the siblings this build has already indexed, so its upload
+//!    carries the type verdicts for those pairs (carrick#1490); the free
+//!    `refresh` pass has its cross-repo download forced empty. Hosted answers
+//!    are handed in only as previous_data. This is the slow phase, and it is
+//!    where `refresh` does its work for one service.
 //! 2. **Join.** One more run reads every blob back, builds the analyzer over
 //!    all of them, runs the type check, and writes what it found to
 //!    a temporary join file inside the current build directory.
@@ -245,6 +247,24 @@ fn run_generation(
         )
         .map_err(|e| e.to_string())?;
     }
+    // What a repo's own scan can pair with (carrick#1490): the repos retained
+    // from the last build, the hosted-only siblings, and every repo scanned
+    // before it, which is what a CI run of the same repo would download. Its
+    // own directory, so the join input below stays exactly what it was.
+    let peers = generation.join("peers");
+    std::fs::create_dir_all(&peers).map_err(|e| format!("{}: {e}", peers.display()))?;
+    let hosted_siblings = hosted.remote_blobs().into_iter().map(|(_, blob)| blob);
+    for (position, blob) in read_blobs(blobs)?
+        .into_iter()
+        .chain(hosted_siblings)
+        .enumerate()
+    {
+        write_blob(&peers.join(format!("sibling-{position}.json")), &blob)?;
+    }
+    // The scan position of every service this build scans, and the blobs it
+    // uploaded, which is what the type-check summary compares the join with.
+    let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut uploaded_blobs: Vec<UploadedBlob> = Vec::new();
     let mut scanned = Vec::new();
     // The repos this run scanned WITH the model and uploaded. A laptop scan
     // that returns here has written its blob to the cloud — the tee propagates
@@ -302,6 +322,7 @@ fn run_generation(
             repo,
             &scan_dir,
             &previous,
+            &peers,
             &name,
             pass,
             workspace_position,
@@ -339,11 +360,22 @@ fn run_generation(
             super::scan_state::spent(&spend);
         }
         for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
-            std::fs::write(
-                blobs.join(format!("local-{position}-{service}.json")),
-                serde_json::to_vec(&blob).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            let file = format!("local-{position}-{service}.json");
+            write_blob(&blobs.join(&file), &blob)?;
+            write_blob(&peers.join(&file), &blob)?;
+            positions.insert(service_id(&blob), position);
+            if uploaded.contains(repo) {
+                uploaded_blobs.push(UploadedBlob {
+                    position,
+                    blob,
+                    check_skipped: match &report.type_check {
+                        Some(super::join::JoinTypeCheck::Skipped { reason }) => {
+                            Some(reason.clone())
+                        }
+                        _ => None,
+                    },
+                });
+            }
         }
         scanned.push(name);
     }
@@ -410,6 +442,7 @@ fn run_generation(
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
+    index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();
     index.hosted_source_key = hosted.source_key();
     (index.hosted_identity, index.hosted_workspace) = hosted.identity();
@@ -534,16 +567,18 @@ fn workspace_service_counts(repos: &[PathBuf]) -> Option<Vec<usize>> {
 }
 
 /// Phase 1 for one repo, and what its scan cost when it was a paid one.
+#[allow(clippy::too_many_arguments)]
 fn scan_repo(
     exe: &Path,
     repo: &Path,
     blobs: &Path,
     previous: &Path,
+    peers: &Path,
     label: &str,
     pass: &Pass,
     workspace_position: Option<(usize, usize)>,
 ) -> Result<ScanReport, String> {
-    let mut command = scan_command(exe, repo, blobs, previous, pass);
+    let mut command = scan_command(exe, repo, blobs, previous, Some(peers), pass);
     if let Some((offset, total)) = workspace_position {
         command
             .env(crate::progress::OFFSET_ENV, offset.to_string())
@@ -566,11 +601,19 @@ fn scan_repo(
 /// asks for and what a facts-only one does: the difference between them is
 /// entirely in this environment, and it is the difference between a free pass
 /// and a paid one.
+///
+/// `peers` is the directory of sibling blobs this build has already written.
+/// A pass that uploads reads them, so its upload carries the type verdicts for
+/// the pairs they complete, the way a CI run's does after it downloads its
+/// siblings' index (carrick#1490). A facts-only pass uploads nothing and stays
+/// isolated: it runs from a session-start hook, and the join below judges
+/// every pair for the local read model anyway.
 pub(super) fn scan_command(
     exe: &Path,
     repo: &Path,
     blobs: &Path,
     previous: &Path,
+    peers: Option<&Path>,
     pass: &Pass,
 ) -> Command {
     let mut command = Command::new(exe);
@@ -582,7 +625,6 @@ pub(super) fn scan_command(
             format!("scan of {}", repo_label(repo)),
         )
         .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
-        .env(crate::cloud_storage::ISOLATE_ENV, "1")
         .env(super::hosted::PREVIOUS_ENV, previous)
         // The scan is a subprocess whose output this indexer swallows, so it
         // is asked for the one thing worth showing: how far through each
@@ -625,6 +667,18 @@ pub(super) fn scan_command(
             }
         }
         Pass::Facts | Pass::Infer => {}
+    }
+    match peers.filter(|_| pass.infers()) {
+        Some(peers) => {
+            command
+                .env(crate::cloud_storage::PEERS_ENV, peers)
+                .env_remove(crate::cloud_storage::ISOLATE_ENV);
+        }
+        None => {
+            command
+                .env(crate::cloud_storage::ISOLATE_ENV, "1")
+                .env_remove(crate::cloud_storage::PEERS_ENV);
+        }
     }
     // The build has already checked every repo for a tree it cannot type, so
     // a scan it starts must not check again and reach a different answer: the
@@ -677,6 +731,7 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
         .env(crate::progress::PROGRESS_ENV, "1")
         .env(super::JOIN_OUT_ENV, out)
         .env_remove(crate::cloud_storage::ISOLATE_ENV)
+        .env_remove(crate::cloud_storage::PEERS_ENV)
         .env_remove(super::hosted::PREVIOUS_ENV)
         // Never a laptop scan: this phase analyses nothing and uploads
         // nothing, it reads blobs back and joins them.
@@ -705,6 +760,9 @@ pub(super) struct ScanReport {
     /// Where this scan's wall clock went. `None` from a scan that did not
     /// finish, or one that measured nothing (carrick#1452).
     pub timing: Option<crate::scan_timing::Split>,
+    /// What the scan's own cross-repo type check did. `None` from a scan that
+    /// never reached one (carrick#1490).
+    pub type_check: Option<super::join::JoinTypeCheck>,
 }
 
 /// What one phase of a build calls itself while it runs and once it is done.
@@ -783,6 +841,7 @@ fn run_scan(
     // (`carrick status`, the SessionStart hook) shows that sentence rather
     // than the first line of the scan's log (carrick#1103).
     let mut failure: Option<crate::progress::Failure> = None;
+    let mut type_check: Option<super::join::JoinTypeCheck> = None;
     // The last count and the last notice, so either one arriving redraws the
     // bar with both.
     let mut last_update: Option<crate::progress::Update> = None;
@@ -863,6 +922,10 @@ fn run_scan(
             pending.push(statement);
             continue;
         }
+        if let Some(stated) = crate::progress::parse_type_check(&line) {
+            type_check = Some(stated);
+            continue;
+        }
         if let Some(stated) = crate::progress::parse_failure(&line) {
             failure = Some(stated);
             continue;
@@ -911,6 +974,7 @@ fn run_scan(
             not_dispatched,
             pending,
             timing,
+            type_check,
         });
     }
     bar.finish_and_clear();
@@ -1227,6 +1291,99 @@ pub(super) fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
     Ok(blobs)
 }
 
+fn write_blob(path: &Path, blob: &CloudRepoData) -> Result<(), String> {
+    std::fs::write(path, serde_json::to_vec(blob).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// One blob this build uploaded: the position its repo was scanned at, and
+/// why that scan's own type check did not run, when it did not.
+pub(super) struct UploadedBlob {
+    pub position: usize,
+    pub blob: CloudRepoData,
+    pub check_skipped: Option<String>,
+}
+
+/// What the build's type check did, and which of its verdicts the uploads
+/// missed (carrick#1490).
+///
+/// A pair is `(producer, producer key, consumer, consumer key)`, the identity
+/// a stored verdict is keyed on, so several call sites on one pair count once.
+/// `positions` is the scan position of every service scanned.
+pub(super) fn type_check_summary(
+    join: &LocalJoin,
+    uploaded: &[UploadedBlob],
+    positions: &BTreeMap<String, usize>,
+) -> super::read_model::TypeCheckSummary {
+    type Pair<'a> = (&'a str, &'a str, &'a str, &'a str);
+    fn pair(m: &JoinedMatch) -> Pair<'_> {
+        (
+            &m.producer_service,
+            &m.producer_key,
+            &m.consumer_service,
+            &m.consumer_key,
+        )
+    }
+    let edges = join
+        .matches
+        .iter()
+        .filter(|m| m.relationship == "producer_consumer");
+    let pairs: std::collections::BTreeSet<Pair> = edges.clone().map(pair).collect();
+    let judged: std::collections::BTreeSet<Pair> = edges
+        .filter(|m| m.type_verdict.is_some())
+        .map(pair)
+        .collect();
+
+    let mut missing: BTreeMap<(String, String), super::read_model::UnstoredVerdicts> =
+        BTreeMap::new();
+    for upload in uploaded {
+        let consumer = service_id(&upload.blob);
+        let stored: std::collections::BTreeSet<Pair> = upload
+            .blob
+            .compat_verdicts
+            .iter()
+            .flatten()
+            .map(|v| {
+                (
+                    v.producer_repo.as_str(),
+                    v.producer_key.as_str(),
+                    v.consumer_repo.as_str(),
+                    v.consumer_key.as_str(),
+                )
+            })
+            .collect();
+        for judged_pair in judged.iter().filter(|p| p.2 == consumer) {
+            if stored.contains(judged_pair) {
+                continue;
+            }
+            let producer = judged_pair.0.to_string();
+            let before = positions
+                .get(&producer)
+                .is_some_and(|p| *p > upload.position);
+            missing
+                .entry((consumer.clone(), producer.clone()))
+                .or_insert_with(|| super::read_model::UnstoredVerdicts {
+                    consumer: consumer.clone(),
+                    producer,
+                    verdicts: 0,
+                    indexed_before_producer: before,
+                    check_skipped: upload.check_skipped.clone(),
+                })
+                .verdicts += 1;
+        }
+    }
+
+    super::read_model::TypeCheckSummary {
+        skipped: match &join.type_check {
+            super::join::JoinTypeCheck::Ran => None,
+            super::join::JoinTypeCheck::Skipped { reason } => Some(reason.clone()),
+        },
+        pairs: pairs.len(),
+        judged: judged.len(),
+        not_stored: missing.into_values().collect(),
+    }
+}
+
 /// Fold the blobs and the join into the read model.
 pub(super) fn build(
     workspace: &Workspace,
@@ -1365,6 +1522,8 @@ pub(super) fn build(
         scanner_version: join.scanner_version.clone(),
         indexed_at: now,
         repos,
+        // Stated by the caller, which alone knows what each repo uploaded.
+        type_check: None,
     })
 }
 
@@ -1718,6 +1877,7 @@ mod tests {
             Path::new("/repos/api"),
             Path::new("/build/repos"),
             Path::new("/build/previous.json"),
+            Some(Path::new("/build/peers")),
             pass,
         ))
     }
@@ -1994,9 +2154,9 @@ mod tests {
     }
 
     /// The cache directory and the previous generation are handed over the
-    /// same way either way: a laptop scan's cross-repo download is the
-    /// isolated local one, so this file is its only previous generation and
-    /// without it every laptop rescan would be a cold, paid one.
+    /// same way either way: a laptop scan's cross-repo download holds only
+    /// its siblings, so this file is its only previous generation and without
+    /// it every laptop rescan would be a cold, paid one.
     #[test]
     fn both_variants_carry_the_cache_dir_and_the_previous_generation() {
         for pass in [Pass::Facts, Pass::Infer] {
@@ -2006,14 +2166,131 @@ mod tests {
                 Some(&Some("/build/repos".into()))
             );
             assert_eq!(
-                env.get(crate::cloud_storage::ISOLATE_ENV),
-                Some(&Some("1".into()))
-            );
-            assert_eq!(
                 env.get(super::super::hosted::PREVIOUS_ENV),
                 Some(&Some("/build/previous.json".into()))
             );
         }
+    }
+
+    fn joined_pair(consumer: &str, verdict: Option<crate::operation::TypeVerdict>) -> JoinedMatch {
+        JoinedMatch {
+            producer_service: "api".to_string(),
+            producer_key: "http|GET|/orders/:id".to_string(),
+            consumer_service: consumer.to_string(),
+            consumer_key: "http|GET|/orders/:id".to_string(),
+            consumer_file: Some("src/client.ts".to_string()),
+            consumer_line: Some(4),
+            relationship: "producer_consumer".to_string(),
+            type_verdict: verdict,
+            mismatch_reason: None,
+        }
+    }
+
+    fn consumer_blob(repo: &str) -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": repo,
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-25T00:00:00Z",
+            "commit_hash": "4f2a1c9"
+        }))
+        .unwrap()
+    }
+
+    /// carrick#1490: a skipped check says why and that nothing has a verdict,
+    /// and a verdict missing for a producer this build did not scan after the
+    /// consumer is still named, without claiming an order that did not
+    /// happen.
+    #[test]
+    fn the_type_check_summary_states_a_skip_and_every_missing_verdict() {
+        let join = LocalJoin {
+            scanner_version: "test".to_string(),
+            operations: Vec::new(),
+            matches: vec![joined_pair("web", None)],
+            findings: Vec::new(),
+            type_check: super::super::JoinTypeCheck::Skipped {
+                reason: "sidecar not found".to_string(),
+            },
+        };
+        let skipped = type_check_summary(&join, &[], &BTreeMap::new());
+        assert_eq!(
+            skipped.lines(),
+            ["type check skipped: sidecar not found. No pair in this index has a type verdict."]
+        );
+
+        let join = LocalJoin {
+            matches: vec![
+                joined_pair("web", Some(crate::operation::TypeVerdict::Compatible)),
+                joined_pair("mobile", None),
+            ],
+            type_check: super::super::JoinTypeCheck::Ran,
+            ..join
+        };
+        // The producer is hosted, so it has no scan position in this build.
+        let positions = BTreeMap::from([("web".to_string(), 0)]);
+        let uploaded = |check_skipped: Option<&str>| UploadedBlob {
+            position: 0,
+            blob: consumer_blob("web"),
+            check_skipped: check_skipped.map(str::to_string),
+        };
+        let summary = type_check_summary(&join, &[uploaded(None)], &positions);
+        assert_eq!(
+            summary.lines(),
+            [
+                "type check: 1 of 2 pair(s) judged",
+                "1 verdict(s) for web against api are not in Carrick Cloud.",
+            ]
+        );
+
+        // The consumer's own scan skipped its check: that reason, which the
+        // indexer would otherwise swallow, is the one stated.
+        let summary = type_check_summary(&join, &[uploaded(Some("sidecar not found"))], &positions);
+        assert_eq!(
+            summary.lines()[1],
+            "1 verdict(s) for web are not in Carrick Cloud: its type check was skipped: \
+             sidecar not found."
+        );
+    }
+
+    /// carrick#1490: what a scan's type check did crosses the swallowed
+    /// stderr on its own marker, whole.
+    #[test]
+    fn a_scans_type_check_state_crosses_the_marker_channel() {
+        let skipped = super::super::JoinTypeCheck::Skipped {
+            reason: "sidecar not found".to_string(),
+        };
+        let line = format!(
+            "@carrick-type-check {}",
+            serde_json::to_string(&skipped).unwrap()
+        );
+        assert_eq!(crate::progress::parse_type_check(&line), Some(skipped));
+        assert_eq!(
+            crate::progress::parse_type_check("@carrick-pending x"),
+            None
+        );
+    }
+
+    /// carrick#1490: a pass that uploads reads the siblings already indexed,
+    /// so its upload carries their verdicts; the free pass stays isolated.
+    /// Each clears the other's variable, so an inherited one cannot change
+    /// what a scan reads.
+    #[test]
+    fn an_uploading_pass_reads_its_peers_and_the_free_pass_stays_isolated() {
+        for pass in [Pass::Infer, Pass::Dispatch] {
+            let env = scan_env(&pass);
+            assert_eq!(
+                env.get(crate::cloud_storage::PEERS_ENV),
+                Some(&Some("/build/peers".into())),
+                "{pass:?}"
+            );
+            assert_eq!(env.get(crate::cloud_storage::ISOLATE_ENV), Some(&None));
+        }
+        let facts = scan_env(&Pass::Facts);
+        assert_eq!(
+            facts.get(crate::cloud_storage::ISOLATE_ENV),
+            Some(&Some("1".into()))
+        );
+        assert_eq!(facts.get(crate::cloud_storage::PEERS_ENV), Some(&None));
     }
 
     /// One build, one run id. Every subprocess is handed this process's id and

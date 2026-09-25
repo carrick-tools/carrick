@@ -12,6 +12,13 @@
 //!   `download_all_repo_data` reads back *all* the cached repos. The engine's
 //!   `build_cross_repo_analyzer` then joins them exactly as the cloud path would.
 //!
+//! A third read source serves the laptop `carrick index` (carrick#1490): with
+//! `CARRICK_LOCAL_STORAGE_PEERS=<dir>`, `download_all_repo_data` reads the
+//! blobs in `<dir>` — the siblings the build has already indexed — so the
+//! repo's own scan joins against them and its upload carries the type
+//! verdicts for those pairs, as a CI run's upload does after downloading its
+//! siblings' index.
+//!
 //! The backend is chosen at binary startup purely by the presence of the
 //! `CARRICK_LOCAL_STORAGE_DIR` env var (see `main.rs`). The engine never learns
 //! it is in eval mode — same contract as `MockStorage`.
@@ -29,30 +36,58 @@ use tracing::debug;
 pub const CACHE_DIR_ENV: &str = "CARRICK_LOCAL_STORAGE_DIR";
 /// When set to `1`, `download_all_repo_data` returns empty (Phase A isolation).
 pub const ISOLATE_ENV: &str = "CARRICK_LOCAL_STORAGE_ISOLATE";
+/// A directory of sibling blobs for `download_all_repo_data` to read instead
+/// of the cache dir. Ignored when [`ISOLATE_ENV`] is set: isolation is the
+/// eval harness's guarantee and nothing may widen it.
+pub const PEERS_ENV: &str = "CARRICK_LOCAL_STORAGE_PEERS";
+
+/// Where `download_all_repo_data` reads the cross-repo set from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrossRepoReads {
+    /// Nothing: the eval harness's Phase A, and the free `carrick refresh`.
+    Isolated,
+    /// Every blob in the cache dir: the join.
+    CacheDir,
+    /// Every blob in this directory: a laptop scan reading the siblings its
+    /// build has already indexed (carrick#1490).
+    Peers(PathBuf),
+}
+
+impl CrossRepoReads {
+    fn from_env() -> Self {
+        if std::env::var(ISOLATE_ENV).as_deref() == Ok("1") {
+            return Self::Isolated;
+        }
+        match std::env::var_os(PEERS_ENV) {
+            Some(dir) if !dir.is_empty() => Self::Peers(PathBuf::from(dir)),
+            _ => Self::CacheDir,
+        }
+    }
+}
 
 pub struct LocalDirStorage {
     cache_dir: PathBuf,
-    isolate: bool,
+    reads: CrossRepoReads,
 }
 
 impl LocalDirStorage {
     /// Construct from the `CARRICK_LOCAL_STORAGE_DIR` / `CARRICK_LOCAL_STORAGE_ISOLATE`
-    /// env vars. Creates the cache dir if it does not exist.
+    /// / `CARRICK_LOCAL_STORAGE_PEERS` env vars. Creates the cache dir if it
+    /// does not exist.
     pub fn from_env() -> Result<Self, StorageError> {
         let cache_dir = std::env::var(CACHE_DIR_ENV)
             .map_err(|_| StorageError::ConnectionError(format!("{CACHE_DIR_ENV} is not set")))?;
-        let isolate = std::env::var(ISOLATE_ENV).as_deref() == Ok("1");
-        Self::new(PathBuf::from(cache_dir), isolate)
+        Self::new(PathBuf::from(cache_dir), CrossRepoReads::from_env())
     }
 
-    pub fn new(cache_dir: PathBuf, isolate: bool) -> Result<Self, StorageError> {
+    pub fn new(cache_dir: PathBuf, reads: CrossRepoReads) -> Result<Self, StorageError> {
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             StorageError::ConnectionError(format!(
                 "Failed to create local storage dir {}: {e}",
                 cache_dir.display()
             ))
         })?;
-        Ok(Self { cache_dir, isolate })
+        Ok(Self { cache_dir, reads })
     }
 
     /// Sanitize a `(repo, service)` pair into a single-segment file stem. The
@@ -176,16 +211,20 @@ impl CloudStorage for LocalDirStorage {
         // Phase A: upload-only. Returning empty is the load-bearing isolation —
         // without it the real cloud (or a sibling corpus repo) would inject data
         // into the per-repo scan and break Tier-A fidelity.
-        if self.isolate {
-            debug!("LOCAL: isolate mode — returning empty cross-repo set");
-            return Ok((Vec::new(), HashMap::new()));
-        }
+        let dir = match &self.reads {
+            CrossRepoReads::Isolated => {
+                debug!("LOCAL: isolate mode — returning empty cross-repo set");
+                return Ok((Vec::new(), HashMap::new()));
+            }
+            CrossRepoReads::CacheDir => &self.cache_dir,
+            CrossRepoReads::Peers(dir) => dir,
+        };
 
         let mut repos = Vec::new();
-        let entries = std::fs::read_dir(&self.cache_dir).map_err(|e| {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
             StorageError::ConnectionError(format!(
                 "Failed to read local storage dir {}: {e}",
-                self.cache_dir.display()
+                dir.display()
             ))
         })?;
         // Collect + sort paths so the joined order is deterministic across runs.
@@ -266,7 +305,8 @@ mod tests {
     #[test]
     fn multi_service_cache_paths_do_not_clobber() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalDirStorage::new(dir.path().to_path_buf(), false).unwrap();
+        let store =
+            LocalDirStorage::new(dir.path().to_path_buf(), CrossRepoReads::CacheDir).unwrap();
 
         // Two services in the SAME repo must land in distinct files (the bug:
         // keying by repo_name alone clobbered orders-pkg with gateway).
@@ -293,7 +333,50 @@ mod tests {
     #[test]
     fn local_storage_does_not_claim_to_ship_run_logs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalDirStorage::new(dir.path().to_path_buf(), false).unwrap();
+        let store =
+            LocalDirStorage::new(dir.path().to_path_buf(), CrossRepoReads::CacheDir).unwrap();
         assert!(!store.uploads_run_logs());
+    }
+
+    /// carrick#1490: a laptop scan reads its siblings from the peers directory
+    /// and never from its own cache dir, which holds only what it wrote.
+    #[tokio::test]
+    async fn peers_reads_the_peers_directory_and_not_the_cache_dir() {
+        let cache = tempfile::tempdir().unwrap();
+        let peers = tempfile::tempdir().unwrap();
+        let sibling = serde_json::json!({
+            "repo_name": "producer",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-25T00:00:00Z",
+            "commit_hash": "4f2a1c9"
+        });
+        std::fs::write(peers.path().join("local-0-0.json"), sibling.to_string()).unwrap();
+        std::fs::write(cache.path().join("own.json"), "{ not json }").unwrap();
+
+        let store = LocalDirStorage::new(
+            cache.path().to_path_buf(),
+            CrossRepoReads::Peers(peers.path().to_path_buf()),
+        )
+        .unwrap();
+        let (repos, _) = store.download_all_repo_data().await.unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.repo_name.as_str())
+                .collect::<Vec<_>>(),
+            ["producer"]
+        );
+
+        let isolated =
+            LocalDirStorage::new(cache.path().to_path_buf(), CrossRepoReads::Isolated).unwrap();
+        assert!(
+            isolated
+                .download_all_repo_data()
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 }
