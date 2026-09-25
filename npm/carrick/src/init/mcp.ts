@@ -286,15 +286,22 @@ export function mergeServerEntry(
 }
 
 /**
- * Claude Code, through the command it ships.
+ * Whether Claude Code is on this machine: its command, and nothing else.
  *
- * Detected the same way as the others — its own data directory — and not by
- * the command alone: a machine where `claude` resolves but nothing has ever
- * run it has no user configuration to add a server to, and the detection rule
- * stays one rule.
+ * Not its data directory, unlike the editors below. `claude mcp add` is the
+ * writer, and it creates the user configuration it writes to, so a machine
+ * where `claude` resolves but has never been run is one this command can set
+ * up. Requiring the directory made init write the Claude Code hooks and then
+ * say it found no agent client (carrick#1489). The writer, the remover and
+ * the reader all ask this, so the three agree about what is here.
  */
+export function claudeCodeFound(env: McpEnvironment = realEnvironment()): boolean {
+  return env.onPath("claude");
+}
+
+/** Claude Code, through the command it ships. */
 function configureClaudeCode(env: McpEnvironment): McpOutcome | null {
-  if (!env.onPath("claude") || !env.exists(path.join(env.home, ".claude"))) return null;
+  if (!claudeCodeFound(env)) return null;
   const installId = env.installId();
   // `claude mcp add` refuses a name it already holds, so the read comes first.
   // It is read rather than tested because it also prints the headers on the
@@ -486,7 +493,7 @@ export function removeServerEntry(existing: string | null): {
  * scope and a failure prints the line that removes whatever is left.
  */
 function disconnectClaudeCode(env: McpEnvironment): McpRemoval | null {
-  if (!env.onPath("claude") || !env.exists(path.join(env.home, ".claude"))) return null;
+  if (!claudeCodeFound(env)) return null;
   const read = env.capture("claude", ["mcp", "get", MCP_NAME]);
   if (read.status !== 0) return { client: "Claude Code", state: "absent", detail: "no carrick server" };
   if (!read.stdout.includes(MCP_HOST)) {
@@ -562,7 +569,7 @@ export type McpInspection = {
  */
 export function inspectMcpClients(env: McpEnvironment = realEnvironment()): McpInspection[] {
   const found: McpInspection[] = [];
-  if (env.onPath("claude") && env.exists(path.join(env.home, ".claude"))) {
+  if (claudeCodeFound(env)) {
     const read = env.capture("claude", ["mcp", "get", MCP_NAME]);
     if (read.status === null) {
       found.push({ client: "Claude Code", state: "unreadable", detail: "`claude mcp get carrick` did not answer" });

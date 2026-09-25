@@ -165,6 +165,8 @@ export type InitOutput = {
    * sentence that says what the keys do.
    */
   choose(question: string, noun: string, options: Choice[], config: ChoiceSet): Promise<string[]>;
+  /** Exactly one of these, answered with its `value` (carrick#1489). */
+  pick(question: string, options: Choice[]): Promise<string>;
   /** Dim a fragment, where this rendering has colour to dim it with. */
   accent(text: string): string;
   /** Whether the work under `step` may write to the terminal itself. */
@@ -317,6 +319,21 @@ export function plainOutput(
       }
       throw new PromptCancelled();
     },
+    // The same numbered list, and one number. There is no marked set, so an
+    // empty answer is not one.
+    pick: async (question, options) => {
+      write(`${question}\n`);
+      options.forEach((option, index) => {
+        write(`  ${index + 1}. ${option.label}${option.hint === undefined ? "" : `  (${option.hint})`}\n`);
+      });
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const answer = (await askOnce(input, echo, "Number\n> ")).trim();
+        const index = /^\d+$/.test(answer) ? Number(answer) - 1 : -1;
+        if (index >= 0 && index < options.length) return options[index]!.value;
+        write(`${REFUSE} Not a number between 1 and ${options.length}: "${answer}"\n`);
+      }
+      throw new PromptCancelled();
+    },
     quiet: false,
   };
 }
@@ -398,7 +415,12 @@ export function interactiveOutput(output: Writable = process.stdout, keys: Reada
     // hosted read two lines, and stopping with the outcome text alone put
     // warnings and refusals under a done marker (carrick#1032).
     step: async (label, work, report) => {
-      const spinner = clack.spinner({ output });
+      // clack's spinner answers SIGINT itself, by stopping. Work that treats
+      // Ctrl-C as "stop waiting" then still returns, and its report would go
+      // to a spinner that no longer prints: it is logged instead
+      // (carrick#1489, the connect wait).
+      let interrupted = false;
+      const spinner = clack.spinner({ output, onCancel: () => { interrupted = true; } });
       spinner.start(label);
       let value: Awaited<ReturnType<typeof work>>;
       try {
@@ -409,7 +431,10 @@ export function interactiveOutput(output: Writable = process.stdout, keys: Reada
         throw error;
       }
       const outcome = report(value);
-      if (outcome.kind === "done") spinner.stop(outcome.text);
+      if (interrupted) {
+        const log = outcome.kind === "done" ? clack.log.step : outcome.kind === "warn" ? clack.log.warn : clack.log.error;
+        log(outcome.text, { output });
+      } else if (outcome.kind === "done") spinner.stop(outcome.text);
       else if (outcome.kind === "warn") spinner.error(outcome.text);
       else spinner.cancel(outcome.text);
       return value;
@@ -431,6 +456,11 @@ export function interactiveOutput(output: Writable = process.stdout, keys: Reada
     choose: async (question, noun, options, config) => {
       const answer = await pickMany(question, noun, options, config, output, keys);
       if (clack.isCancel(answer) || !Array.isArray(answer)) throw new PromptCancelled();
+      return answer;
+    },
+    pick: async (question, options) => {
+      const answer = await clack.select({ message: question, options, output, input: keys });
+      if (clack.isCancel(answer)) throw new PromptCancelled();
       return answer;
     },
     accent: (text) => pc.dim(text),

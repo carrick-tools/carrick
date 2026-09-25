@@ -3,6 +3,19 @@ import { APP_BASE } from "../auth/credentials.ts";
 import { openBrowser } from "../auth/oauth.ts";
 import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";
 import { assignRepos, type AssignOutcome } from "./projects.ts";
+import type { StepProgress, StepReport } from "./output.ts";
+
+/**
+ * Show a status that updates in place while `work` runs, then its report.
+ *
+ * `InitOutput.step` in a run: a spinner on a terminal, one line per change on
+ * a pipe. The default is the pipe's behaviour, for a caller with no output.
+ */
+export type Track = <T>(
+  label: string,
+  work: (progress: StepProgress) => Promise<T>,
+  report: (value: T) => StepReport,
+) => Promise<T>;
 
 type ConnectOptions = {
   interactive: boolean;
@@ -28,6 +41,8 @@ type ConnectOptions = {
   /** Placing repos in the project, injected so tests state the server (carrick#999). */
   assign?: (repos: string[], signal?: AbortSignal) => Promise<AssignOutcome>;
   wait?: (signal: AbortSignal) => Promise<void>;
+  /** The live status line the wait is shown on (carrick#1489). */
+  track?: Track;
   signal?: AbortSignal;
 };
 
@@ -42,6 +57,12 @@ type ConnectOptions = {
 export const ADMIN_WAIT =
   "A workspace owner or admin must do this; Ctrl-C and run init again once they have.";
 
+/** The dashboard pages init sends a reader to, for one workspace. */
+export function workspaceUrls(slug: string): { connect: string; projects: string; repos: string } {
+  const workspace = `${APP_BASE}/w/${encodeURIComponent(slug)}`;
+  return { connect: `${workspace}/connect`, projects: `${workspace}/projects`, repos: `${workspace}/repos` };
+}
+
 /** Every requested repo must be present, connected, and assigned to this project. */
 export function reposAreInProject(
   identity: ResolvedRepos,
@@ -55,13 +76,6 @@ export function reposAreInProject(
     );
     return repo?.connected === true && repo.project_slug === project;
   });
-}
-
-function assignment(identity: ResolvedRepos, name: string): string {
-  const repo = identity.repos.find(
-    (candidate) => candidate.full_name.toLowerCase() === name.toLowerCase(),
-  );
-  return repo?.connected === true ? repo.project_slug : "not connected";
 }
 
 /**
@@ -83,27 +97,39 @@ export function projectAssignments(
   });
 }
 
-function reportAssignments(
-  identity: ResolvedRepos,
-  repos: string[],
-  previous: Map<string, string>,
-  say: (message: string) => void,
-  label: (slug: string) => string,
-): void {
-  for (const name of repos) {
-    const current = assignment(identity, name);
-    if (previous.get(name.toLowerCase()) === current) continue;
-    const repo = identity.repos.find(
-      (candidate) => candidate.full_name.toLowerCase() === name.toLowerCase(),
-    );
-    const actualName = repo?.full_name ?? name;
-    say(
-      current === "not connected"
-        ? `${actualName} is not connected to this workspace.`
-        : `${actualName} is currently in project ${label(current)}.`,
-    );
-    previous.set(name.toLowerCase(), current);
-  }
+/** The requested repos this read says are not connected, as the server spells them. */
+export function unconnectedRepos(identity: ResolvedRepos, repos: string[]): string[] {
+  return repos
+    .map((name) => ({
+      name,
+      row: identity.repos.find((candidate) => candidate.full_name.toLowerCase() === name.toLowerCase()),
+    }))
+    .filter(({ row }) => !identity.workspace.installed || row?.connected !== true)
+    .map(({ name, row }) => row?.full_name ?? name);
+}
+
+/**
+ * The one line that sends a reader to the GitHub App, naming the repos it is
+ * for. Printed only for repos a read taken just now says are unconnected: the
+ * grant page re-asks GitHub for the whole repo list, which is wasted on a repo
+ * that is already connected (carrick#1489).
+ */
+export function connectLine(unconnected: string[], total: number, url: string): string {
+  const which =
+    unconnected.length === 1
+      ? `${unconnected[0]} is not connected yet`
+      : unconnected.length === total && total === 2
+        ? "Neither repo is connected yet"
+        : unconnected.length === total
+          ? `None of the ${total} repos is connected yet`
+          : `${unconnected.length} of ${total} repos are not connected yet`;
+  const on = unconnected.length === 1 ? "it" : total === 2 && unconnected.length === 2 ? "both" : "them";
+  return `${which}. Install the Carrick GitHub App on ${on}: ${url}`;
+}
+
+/** "1 repo", "2 repos". */
+function repoCount(count: number): string {
+  return `${count} repo${count === 1 ? "" : "s"}`;
 }
 
 /**
@@ -130,35 +156,40 @@ function misplaced(
   });
 }
 
+/** The pipe's rendering of a tracked wait: each distinct status once, then the report. */
+function plainTrack(say: (line: string) => void): Track {
+  return async (_label, work, report) => {
+    const value = await work((text) => say(text));
+    say(report(value).text);
+    return value;
+  };
+}
+
 /**
  * The GitHub App grant is the only browser step; the CLI places the repos.
  *
  * Assignment is a server action on this credential (carrick#999), tried for
  * every connected repo the moment the poll sees it, so nobody has to open the
- * Repos page and move it by hand. An API that does not serve the action yet —
- * which is every API until the deploy lands — answers an absence, and the
- * browser instruction this command printed before is what it falls back to.
+ * Repos page and move it by hand. An API that does not serve the action yet
+ * answers an absence, and the browser instruction is what it falls back to.
  * Ctrl-C stops verification.
+ *
+ * What it prints is the state and the next step, not the traffic
+ * (carrick#1489): the wait is one status line that updates in place, a move
+ * the run was allowed to make is not announced (the first one out of an
+ * untouched default project is the App grant finishing, not a decision), and
+ * a repo gets a line of its own only when something about it failed.
+ *
+ * `initial` must be a read taken just before this call: it decides which
+ * repos are sent to the grant page and whether there is anything to wait for.
  */
 export async function connectRepos(token: string, repos: string[], initial: ResolvedRepos, options: ConnectOptions): Promise<ResolvedRepos> {
-  const workspaceUrl = `${APP_BASE}/w/${encodeURIComponent(initial.workspace.slug)}`;
-  const connectUrl = `${workspaceUrl}/connect`;
-  const projectUrl = `${workspaceUrl}/projects`;
-  const reposUrl = `${workspaceUrl}/repos`;
-  const assignments = new Map<string, string>();
+  const urls = workspaceUrls(initial.workspace.slug);
   const poll = options.poll ?? ((signal?: AbortSignal) => resolveRepos(token, repos, fetch, signal));
   const project = options.project;
   const label = options.label ?? ((slug: string) => slug);
   const movable = options.movable ?? new Set<string>();
-  // A repo that is already where it was asked to be is not news: the run states
-  // the project once, on the line naming the login (carrick#1026). Seeding the
-  // map with those repos leaves this reporting only what CHANGED or what is
-  // somewhere else, which is what a reader can act on.
-  if (project !== undefined) {
-    for (const name of repos) {
-      if (assignment(initial, name) === project) assignments.set(name.toLowerCase(), project);
-    }
-  }
+  const track = options.track ?? plainTrack(options.say);
   const assign =
     options.assign ??
     ((names: string[], signal?: AbortSignal) => assignRepos(token, project ?? "", names, fetch, signal));
@@ -166,21 +197,22 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   // there is nothing to place repos into and the browser owns both steps.
   let placeable = project !== undefined && options.projectExists === true;
   let saidBrowserAssign = false;
-  // One line per distinct thing the server said, so a write that keeps failing
-  // does not print the same sentence every five seconds.
+  // What happened to a repo that failed, said once each. During the wait the
+  // status line owns the terminal, so these are held until it ends.
   const said = new Set<string>();
-
-  const sayOnce = (line: string): void => {
+  let held: string[] | null = null;
+  const report = (line: string): void => {
     if (said.has(line)) return;
     said.add(line);
-    options.say(line);
+    if (held !== null) held.push(line);
+    else options.say(line);
   };
 
   const browserAssign = (): void => {
     if (saidBrowserAssign) return;
     saidBrowserAssign = true;
-    options.say(`Assign the requested repos: ${reposUrl}`);
-    options.say(`  Select ${repos.join(", ")}, choose the target project in "Move selected to", then choose "Move selected".`);
+    report(`Assign the requested repos: ${urls.repos}`);
+    report(`  Select ${repos.join(", ")}, choose the target project in "Move selected to", then choose "Move selected".`);
   };
 
   /** Place what can be placed; true when something moved and is worth re-reading. */
@@ -191,22 +223,17 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
     const outcome = await assign(pending, signal);
     if (outcome.kind !== "placed") {
       // Neither a refusal nor an absence is worth retrying every five seconds,
-      // and both leave the assignment to the browser. The instruction itself
-      // is printed by the caller, after the steps that come before it.
+      // and both leave the assignment to the browser.
       placeable = false;
       if (outcome.kind === "refused") {
-        options.say(`Carrick did not assign the requested repos to ${label(project)}: ${outcome.message}`);
+        report(`Carrick did not assign the requested repos to ${label(project)}: ${outcome.message}`);
       }
       return false;
     }
     let moved = false;
     for (const repo of outcome.repos) {
-      if (repo.assigned) {
-        moved = moved || repo.moved;
-        if (repo.moved) sayOnce(`Moved ${repo.full_name} into project ${label(project)}.`);
-      } else {
-        sayOnce(`${repo.full_name} was not moved: ${repo.reason ?? "Carrick gave no reason."}`);
-      }
+      if (repo.assigned) moved = moved || repo.moved;
+      else report(`${repo.full_name} was not moved: ${repo.reason ?? "Carrick gave no reason."}`);
     }
     return moved;
   };
@@ -214,37 +241,48 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   /** Place, then read the assignment back: a claim is only made on the read. */
   const settle = async (identity: ResolvedRepos, signal?: AbortSignal): Promise<ResolvedRepos> => {
     if (!(await place(identity, signal))) return identity;
-    const latest = await poll(signal);
-    reportAssignments(latest, repos, assignments, options.say, label);
-    return latest;
+    return poll(signal);
   };
+
+  /**
+   * Whether a person has to move a repo on the Repos page: this run cannot
+   * place repos at all, or a connected repo sits in another project and
+   * nobody consented to moving it (carrick#1338).
+   */
+  const byHand = (identity: ResolvedRepos): boolean =>
+    project !== undefined &&
+    (!placeable ||
+      identity.repos.some(
+        (repo) =>
+          repo.connected &&
+          repo.project_slug !== project &&
+          repos.some((name) => name.toLowerCase() === repo.full_name.toLowerCase()) &&
+          !movable.has(repo.full_name.toLowerCase()),
+      ));
+
+  const settled = (identity: ResolvedRepos): boolean =>
+    project !== undefined
+      ? reposAreInProject(identity, repos, project)
+      : identity.workspace.installed && identity.repos.every((repo) => repo.connected);
 
   let latest = initial;
   if (project !== undefined) {
-    reportAssignments(latest, repos, assignments, options.say, label);
-    if (reposAreInProject(latest, repos, project)) {
-      return latest;
-    }
+    if (settled(latest)) return latest;
     latest = await settle(latest, options.signal);
-    if (reposAreInProject(latest, repos, project)) {
-      return latest;
-    }
+    if (settled(latest)) return latest;
     // The create step is skipped only when this run has just seen the project
     // in the workspace or created it.
     if (!options.projectExists) {
-      options.say(`Create project "${project}" if needed: ${projectUrl}`);
+      options.say(`Create project "${project}" if needed: ${urls.projects}`);
       options.say(`  Choose Create project, enter a name, and set the slug to "${project}".`);
     }
-    if (!latest.workspace.installed || latest.repos.some((repo) => !repo.connected)) {
-      options.say(`Connect any missing repos: ${connectUrl}`);
-    }
-    // Only where this run cannot do the placing itself. With repos still to
-    // connect it does not know yet, and says so when the poll finds out.
-    if (!placeable) browserAssign();
-  } else {
-    if (latest.workspace.installed && latest.repos.every((repo) => repo.connected)) return latest;
-    options.say(`Connect repositories in your browser: ${connectUrl}`);
+  } else if (settled(latest)) {
+    return latest;
   }
+  const unconnected = unconnectedRepos(latest, repos);
+  if (unconnected.length > 0) options.say(connectLine(unconnected, repos.length, urls.connect));
+  // Only where this run cannot do the placing itself.
+  if (byHand(latest)) browserAssign();
   if (!options.interactive) {
     if (project !== undefined) {
       options.say(`Project ${label(project)} is not verified for every requested repo.`);
@@ -252,56 +290,86 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
     return latest;
   }
   options.say(ADMIN_WAIT);
-  options.say(
-    project !== undefined
-      ? `Waiting for every requested repo to reach project ${label(project)}. Press Ctrl-C to stop.`
-      : "Waiting for repository connections. Press Ctrl-C to continue setup without waiting.",
-  );
+
+  // Where the browser is pointed: at the project it must create, else at the
+  // grant — only where a repo really is unconnected — else, only where this
+  // run cannot place them itself, at the page that moves them.
+  const target =
+    project !== undefined && !options.projectExists
+      ? urls.projects
+      : unconnected.length > 0
+        ? urls.connect
+        : byHand(latest)
+          ? urls.repos
+          : null;
+  if (target !== null) void (options.open ?? openBrowser)(target).catch(() => false);
+
+  /** Where the wait stands, as one line. */
+  const status = (identity: ResolvedRepos): string => {
+    const missing = unconnectedRepos(identity, repos).length;
+    if (missing > 0) {
+      return `Waiting for GitHub: ${repos.length - missing} of ${repoCount(repos.length)} connected`;
+    }
+    if (project === undefined) return `Waiting for GitHub: ${repoCount(repos.length)} connected`;
+    // The move instruction is held with the other lines while this shows, so
+    // the page it names is on the status line itself.
+    return `Waiting for ${repoCount(repos.length)} to reach ${label(project)}${byHand(identity) ? `: move them at ${urls.repos}` : ""}`;
+  };
+
   const controller = new AbortController();
   const cancel = (): void => controller.abort();
   process.once("SIGINT", cancel);
   const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30 * 60_000), ...(options.signal ? [options.signal] : [])]);
-  const seen = new Set(latest.repos.filter((repo) => repo.connected).map((repo) => repo.full_name));
+  held = [];
+  let done = false;
   try {
-    // Where the browser is pointed: at the project it must create, else at the
-    // grant that connects the repos, else — only where this run cannot place
-    // them itself — at the page that moves them.
-    const target =
-      project === undefined
-        ? connectUrl
-        : !options.projectExists
-          ? projectUrl
-          : !latest.workspace.installed || latest.repos.some((repo) => !repo.connected)
-            ? connectUrl
-            : reposUrl;
-    void (options.open ?? openBrowser)(target).catch(() => false);
-    while (!signal.aborted) {
-      await (options.wait ?? (async (signal) => { await setTimeout(5000, undefined, { signal }); }))(signal);
-      signal.throwIfAborted();
-      latest = await poll(signal);
-      if (project !== undefined) {
-        reportAssignments(latest, repos, assignments, options.say, label);
-        latest = await settle(latest, signal);
-        if (reposAreInProject(latest, repos, project)) {
-          return latest;
-        }
-        if (!placeable) browserAssign();
-      } else {
-        for (const repo of latest.repos) {
-          if (repo.connected && !seen.has(repo.full_name)) {
-            options.say(`Connected ${repo.full_name}.`);
-            seen.add(repo.full_name);
+    await track(
+      status(latest),
+      async (progress) => {
+        let shown = status(latest);
+        progress(`${shown}. Press Ctrl-C to stop.`);
+        try {
+          while (!signal.aborted) {
+            await (options.wait ?? (async (signal) => { await setTimeout(5000, undefined, { signal }); }))(signal);
+            signal.throwIfAborted();
+            latest = await settle(await poll(signal), signal);
+            if (settled(latest)) {
+              done = true;
+              return;
+            }
+            if (byHand(latest)) browserAssign();
+            const now = status(latest);
+            if (now !== shown) {
+              shown = now;
+              progress(`${now}. Press Ctrl-C to stop.`);
+            }
           }
+        } catch (error) {
+          if (!signal.aborted) throw error;
         }
-        if (latest.workspace.installed && latest.repos.every((repo) => repo.connected)) return latest;
-      }
-    }
-  } catch (error) { if (!signal.aborted) throw error; }
-  finally { process.removeListener("SIGINT", cancel); }
-  options.say(
-    project !== undefined
-      ? `Stopped waiting; project ${label(project)} is not verified for every requested repo.`
-      : "Stopped waiting for repository connections; continuing local setup.",
-  );
+      },
+      () =>
+        done
+          ? {
+              kind: "done",
+              text:
+                project === undefined
+                  ? `${repoCount(repos.length)} connected`
+                  : `${repoCount(repos.length)} connected, in ${label(project)}`,
+            }
+          : {
+              kind: "warn",
+              text:
+                project !== undefined
+                  ? `Stopped waiting; project ${label(project)} is not verified for every requested repo.`
+                  : "Stopped waiting for repository connections; continuing local setup.",
+            },
+    );
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    const lines = held;
+    held = null;
+    for (const line of lines) options.say(line);
+  }
   return latest;
 }

@@ -25,6 +25,7 @@
 
 import { z } from "zod";
 import { API_BASE } from "../auth/credentials.ts";
+import type { Choice } from "./output.ts";
 
 const project = z.object({
   slug: z.string(),
@@ -43,7 +44,13 @@ const listResponse = z.object({
 
 const createResponse = z.object({
   schema: z.literal("carrick.create-project/0"),
-  project,
+  // `repo_count` is the repos the new project already holds: a workspace's
+  // first project takes the repos the GitHub App install staged
+  // (carrick-cloud#1359). A server from before that answers without the
+  // field, or with a hard 0, and both mean "none".
+  project: project.extend({
+    repo_count: z.number().int().nonnegative().nullable().optional().transform((count) => count ?? 0),
+  }),
 });
 
 /** What one repo's assignment did, as the server reports it (carrick#999). */
@@ -67,9 +74,12 @@ const assignResponse = z.object({
   repos: z.array(placement),
 });
 
+/** A project this run created: `repo_count` is the repos it already holds. */
+export type CreatedProject = Project & { repo_count: number };
+
 /** What a create attempt did. `absent` is "this server has no such action". */
 export type CreateOutcome =
-  | { kind: "created"; project: Project }
+  | { kind: "created"; project: CreatedProject }
   | { kind: "refused"; message: string }
   | { kind: "absent" };
 
@@ -226,6 +236,29 @@ export async function assignRepos(
 /** The slug shape the dashboard enforces, applied before anything is sent. */
 export const SLUG = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,31}$/;
 
+/** The slug both create paths refuse (carrick-cloud `create_project.js`). */
+export const RESERVED_SLUG = "default";
+
+/** The longest display name the server accepts (carrick-cloud `create_project.js`). */
+export const MAX_NAME_LENGTH = 64;
+
+/**
+ * The slug the dashboard derives from a project name.
+ *
+ * A copy of the new-project form's `slugify`, character for character
+ * (carrick-cloud `app/src/pages/w/[slug]/projects/index.astro`), so a name
+ * typed here and the same name typed in the dashboard make the same project
+ * (carrick#1489). Change both or neither.
+ */
+export function slugFromName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+}
+
 /** What a project is, said once, above the picker that asks for one. */
 export const PROJECT_RULE =
   "One project per interconnected system: repos that call each other belong together.";
@@ -236,6 +269,13 @@ export type ProjectPrompts = {
   /** A free-text answer, already trimmed. Empty means "skip this". */
   ask: (question: string) => Promise<string>;
   confirm: (question: string) => Promise<boolean>;
+  /** One of these rows, answered with its `value`. */
+  pick: (question: string, options: Choice[]) => Promise<string>;
+  /**
+   * The workspace's projects page, and how to open it, for the row that
+   * leaves the choice to the dashboard. Absent where no workspace was read.
+   */
+  dashboard?: { url: string; open: (url: string) => void };
   interactive: boolean;
   assumeYes: boolean;
 };
@@ -271,6 +311,8 @@ export type ProjectChoice = {
   exists: boolean;
   /** The terminal asked for this project to be created, and it is not there yet. */
   create: boolean;
+  /** The display name typed for a project to create. Absent means the slug. */
+  name?: string;
 };
 
 /**
@@ -307,10 +349,13 @@ export async function planProject(
  *
  * Without the flag this used to do nothing at all, so a first run never saw
  * the workspace's projects and the repo silently stayed wherever the browser
- * had put it. The order is: the assignment the repos already have, then the
- * list, then a name the user types, which may be one that does not exist yet.
- * Nothing is created here — the answer is carried into the proposal and acted
- * on only if that is accepted (carrick#1338).
+ * had put it. The order is: the assignment the repos already have, then one
+ * pick list — each active project, a new one, or the dashboard. A new project
+ * is asked for by NAME and its slug derived the way the dashboard derives it:
+ * the free-text slug question named neither what a slug was nor that Enter
+ * left the repos in no project (carrick#1489). Nothing is created here — the
+ * answer is carried into the proposal and acted on only if that is accepted
+ * (carrick#1338).
  *
  * `current` is one entry per SELECTED repo: the project it is in, or null when
  * it is not connected to this workspace at all.
@@ -343,24 +388,95 @@ export async function projectStep(
   // is computed inside, so repos split across two of them see nothing of each
   // other (carrick#993).
   prompts.say(PROJECT_RULE);
-  prompts.say(
-    projects.length === 0 ? "This workspace has no projects yet." : "Projects in this workspace:",
-  );
-  for (const line of projectLines(projects)) prompts.say(line);
-  const answer = await prompts.ask(
-    "Which project should these repos be in? Enter a slug, or press Enter to leave it to the browser.",
-  );
-  if (answer === "") return none;
-  if (!SLUG.test(answer)) {
-    prompts.say(
-      `"${answer}" is not a project slug: use 3-32 lowercase letters, digits, and single hyphens. Leaving the project step to the browser.`,
-    );
-    return none;
+  const options = projectOptions(projects);
+  // Bounded, because a declined create goes back to the list: a reader who
+  // keeps declining has not chosen a project, and the dashboard is where one
+  // is chosen instead.
+  for (let round = 0; round < 3; round += 1) {
+    const picked = await prompts.pick("Which project should these repos be in?", options);
+    if (picked === DASHBOARD) break;
+    if (picked === NEW_PROJECT) {
+      const created = await newProject(projects, prompts);
+      if (created !== null) return created;
+      continue;
+    }
+    return { slug: picked.slice(PICKED.length), exists: true, create: false };
   }
-  if (projects.some((project) => project.slug === answer && !project.archived)) {
-    return { slug: answer, exists: true, create: false };
+  if (prompts.dashboard !== undefined) {
+    prompts.say(`Add these repos to a project at ${prompts.dashboard.url}. Until then they are in no project.`);
+    prompts.dashboard.open(prompts.dashboard.url);
   }
-  return { slug: answer, exists: false, create: await prompts.confirm(`Create project "${answer}"?`) };
+  return none;
+}
+
+/** The pick list's two rows that are not projects. */
+export const NEW_PROJECT = "new";
+export const DASHBOARD = "dashboard";
+const PICKED = "project:";
+
+/**
+ * The rows of the project question: every active project, then a new one,
+ * then the dashboard.
+ *
+ * An archived project is not a place to put repos, so it is not a row. The
+ * values carry a prefix so that no slug can be read as one of the other two.
+ */
+export function projectOptions(projects: Project[]): Choice[] {
+  const active = projects
+    .filter((project) => !project.archived)
+    .sort((left, right) => left.slug.localeCompare(right.slug));
+  return [
+    ...active.map((project) => ({
+      value: `${PICKED}${project.slug}`,
+      label: projectLabel(project.slug, [project]),
+      ...(project.repo_count === null
+        ? {}
+        : { hint: `${project.repo_count} repo${project.repo_count === 1 ? "" : "s"}` }),
+    })),
+    { value: NEW_PROJECT, label: "New project" },
+    { value: DASHBOARD, label: "Choose on the dashboard" },
+  ];
+}
+
+/**
+ * Why a typed project name cannot be created, or null when it can.
+ *
+ * The same refusals the dashboard's form makes before it sends anything, in
+ * the same order, so the server's own refusal is the rare case.
+ */
+export function nameProblem(name: string, projects: Project[]): string | null {
+  if (name.length > MAX_NAME_LENGTH) return `A project name is ${MAX_NAME_LENGTH} characters or fewer.`;
+  const slug = slugFromName(name);
+  if (!SLUG.test(slug)) return "A project name needs at least 3 letters or digits.";
+  if (slug === RESERVED_SLUG) return `"${name}" is reserved. Pick another name.`;
+  const taken = projects.find((project) => project.slug === slug);
+  if (taken !== undefined) {
+    return `Project ${projectLabel(slug, projects)} already exists${taken.archived ? ", archived" : ""}. Pick another name.`;
+  }
+  return null;
+}
+
+/**
+ * A project to create, by the name the reader types.
+ *
+ * Null when the reader gave no name, declined the create, or gave three names
+ * that cannot be used: the caller then asks the list again.
+ */
+async function newProject(projects: Project[], prompts: ProjectPrompts): Promise<ProjectChoice | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const name = await prompts.ask("Project name");
+    if (name === "") return null;
+    const problem = nameProblem(name, projects);
+    if (problem !== null) {
+      prompts.say(problem);
+      continue;
+    }
+    const slug = slugFromName(name);
+    const shown = name === slug ? slug : `${name} (${slug})`;
+    if (!(await prompts.confirm(`Create project ${shown}?`))) return null;
+    return { slug, exists: false, create: true, name };
+  }
+  return null;
 }
 
 /** The list as init prints it: one line per project, active ones first. */

@@ -390,11 +390,39 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
         // `warnings` is what this derivation found and a caller prints;
         // `notes` is the standing advice about a proposal of this shape, which
         // rides in this document and nowhere else (carrick#1032).
-        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings, "notes": derived.notes }));
+        // `not_installed` is the preflight's own dependency rule, asked before
+        // the handoff rather than by a refused scan: `carrick init` puts the
+        // install in the agent's instruction (carrick#1489, carrick#1254).
+        let not_installed = not_installed(repo, &derived.services);
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings, "notes": derived.notes, "not_installed": not_installed }));
     }
     Ok(
         serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),
     )
+}
+
+/// The services in one repo whose dependencies a scan would refuse over, each
+/// with the directory the install runs in and the command that runs it.
+///
+/// Only the dependency half of [`crate::preflight::unprepared`]: a mapping to
+/// a missing generated directory names no command anyone can be told to run.
+fn not_installed(repo: &Path, services: &[crate::config::Config]) -> Vec<serde_json::Value> {
+    crate::preflight::unprepared(repo, services)
+        .into_iter()
+        .filter_map(|row| match row {
+            crate::preflight::Unprepared::Dependencies {
+                service,
+                install_root,
+                command,
+                ..
+            } => Some(serde_json::json!({
+                "service": service,
+                "directory": if install_root.is_empty() { ".".to_string() } else { install_root },
+                "command": command,
+            })),
+            crate::preflight::Unprepared::Mapping { .. } => None,
+        })
+        .collect()
 }
 
 /// `status`: the workspace, with no file in the question.
@@ -2125,6 +2153,45 @@ mod tests {
         // nothing else: there is no rehearsal pass in the flow (cloud#832).
         assert!(refusal.contains("carrick login"), "{refusal}");
         assert!(!refusal.contains("carrick refresh"), "{refusal}");
+    }
+
+    /// `derive` states the install a scan would refuse over, so `carrick init`
+    /// can hand it to the agent before the first scan is refused for it
+    /// (carrick#1489). The rule is the preflight's; this pins that it reaches
+    /// the document, and that an installed tree reports nothing.
+    #[test]
+    fn derive_names_the_install_a_scan_would_refuse_over() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"api","dependencies":{"express":"4"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}").unwrap();
+
+        let bare = derive(Some(root)).unwrap();
+        let rows = bare["repos"][0]["not_installed"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(rows.len(), 1, "{bare}");
+        assert_eq!(rows[0]["directory"], ".");
+        assert_eq!(rows[0]["command"], "npm install");
+        assert!(
+            rows[0]["service"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
+        );
+
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        let installed = derive(Some(root)).unwrap();
+        assert_eq!(
+            installed["repos"][0]["not_installed"],
+            serde_json::json!([]),
+            "{installed}"
+        );
     }
 
     /// A long list of unconfigured repos is a folder someone pointed at, not a
