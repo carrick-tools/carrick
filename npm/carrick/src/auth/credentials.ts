@@ -104,7 +104,7 @@ export function saveCredential(token: string, workspace: string | null, env: Nod
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 }
 
-/** Removes the local credential only; dashboard revocation is a separate action. */
+/** Removes the local credential only; `carrick logout` revokes the key first (`auth/run.ts`, `revokeKey`). */
 export function removeCredential(env: NodeJS.ProcessEnv = process.env): boolean {
   try { fs.unlinkSync(credentialPath(env)); return true; }
   catch (error) {

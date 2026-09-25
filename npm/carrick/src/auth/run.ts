@@ -1,4 +1,4 @@
-import { API_BASE, readCredential, saveCredential, removeCredential, type Credential } from "./credentials.ts";
+import { API_BASE, APP_BASE, readCredential, saveCredential, removeCredential, type Credential } from "./credentials.ts";
 import { authorize } from "./oauth.ts";
 import { resolveRepos } from "./read.ts";
 
@@ -49,16 +49,56 @@ export async function login(argv: string[]): Promise<number> {
   } finally { process.removeListener("SIGINT", cancel); }
 }
 
-export function logout(argv: string[]): number {
+/**
+ * Ask Carrick to revoke the key that makes the request (carrick#1487).
+ *
+ * The key is its own authority: `POST <app>/oauth/revoke` hashes the bearer
+ * and revokes that one row, so the user's other machines and editor keys
+ * survive. Only a 204 means the key is no longer live (an unknown or
+ * already-revoked key is a 204 too). Every other outcome is "not revoked":
+ * a 200, which the endpoint never sends; the 404 an older cloud gives for a
+ * route it does not have; and a network failure. The caller signs out
+ * locally either way.
+ */
+export async function revokeKey(token: string, request: typeof fetch = fetch): Promise<boolean> {
+  try {
+    const result = await request(`${APP_BASE}/oauth/revoke`, {
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(10_000),
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return result.status === 204;
+  } catch { return false; }
+}
+
+export type LogoutOptions = {
+  env?: NodeJS.ProcessEnv;
+  fetch?: typeof fetch;
+  out?: (text: string) => void;
+  err?: (text: string) => void;
+};
+
+export async function logout(argv: string[], options: LogoutOptions = {}): Promise<number> {
+  const out = options.out ?? ((text: string) => process.stdout.write(text));
+  const err = options.err ?? ((text: string) => process.stderr.write(text));
   if (argv.length) {
-    process.stdout.write("carrick logout\n\nRemove the saved local credential. Revoke the key at https://app.carrick.tools/account.\n");
+    out("carrick logout\n\nSign this machine out: revoke its Carrick key on the server and remove the saved credential.\n");
     return argv.length === 1 && ["--help", "-h"].includes(argv[0]!) ? 0 : 2;
   }
+  const env = options.env ?? process.env;
+  // The saved credential, never CARRICK_TOKEN: logout signs this machine's
+  // login out, and an override is a key the user manages somewhere else.
+  const { CARRICK_TOKEN: _override, ...fileEnv } = env;
+  let saved: Credential | null = null;
+  // An unreadable file still gets removed below; there is just no key to revoke.
+  try { saved = readCredential(fileEnv); } catch { saved = null; }
   try {
-    const removed = removeCredential();
-    process.stdout.write(removed ? "Removed the saved Carrick credential.\n" : "No saved Carrick credential.\n");
-    if (process.env["CARRICK_TOKEN"] !== undefined) process.stdout.write("CARRICK_TOKEN still overrides login; unset it in your shell to sign out.\n");
-    process.stdout.write("To revoke the key on the server, visit https://app.carrick.tools/account.\n");
+    const revoked = saved ? await revokeKey(saved.token, options.fetch) : false;
+    const removed = removeCredential(env);
+    const where = saved?.workspace_slug ?? "Carrick";
+    if (!removed) out("No saved Carrick credential.\n");
+    else if (revoked) out(`Signed out of ${where}.\n`);
+    else out(`Signed out of ${where} on this machine, but Carrick could not revoke the key on the server. Revoke it at ${APP_BASE}/account.\n`);
+    if (env["CARRICK_TOKEN"] !== undefined) out("CARRICK_TOKEN still overrides login; unset it in your shell to sign out.\n");
     return 0;
-  } catch (error) { process.stderr.write(`${(error as Error).message}\n`); return 1; }
+  } catch (error) { err(`${(error as Error).message}\n`); return 1; }
 }
