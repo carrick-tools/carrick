@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "span:244-309",
+      "line_number": 6,
+      "target": "/accounts/${account.id}/invite",
+      "method": null,
+      "pattern_matched": "client.post(",
+      "call_expression_text": "client.post(`/accounts/${account.id}/invite`, { note: \"resent\" })",
+      "call_expression_line": 6,
+      "payload_expression_text": "{ note: \"resent\" }",
+      "payload_expression_line": 6,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:555-604",
+      "line_number": 10,
+      "target": "/accounts/${account.id}",
+      "method": null,
+      "pattern_matched": "client.patch(",
+      "call_expression_text": "client.patch(`/accounts/${account.id}`, { name })",
+      "call_expression_line": 10,
+      "payload_expression_text": "{ name }",
+      "payload_expression_line": 10,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -266,6 +266,9 @@ pub enum ResolutionSource {
     /// that states no row of its own: a bare `x.verb("/lit", arg)` carries no
     /// role, so whether it registers a route or requests one is the model's to
     /// decide. It overrules the path of the row the model does return (#332).
+    /// The verb a call is spelled with is read the same way: no row of its
+    /// own, only the method of the model's row at that site
+    /// (carrick-cloud#1365).
     InlineLiteral,
     /// The row is the model's, with no deterministic twin at its span.
     Model,

@@ -229,6 +229,10 @@ pub struct ProcessingStats {
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
+    /// Model data-call rows that stated no method, given the one the source
+    /// states at the same span (carrick-cloud#1365). Without it the row would
+    /// have been indexed as a GET, the default for a missing method.
+    pub model_methods_supplied: usize,
     /// Model endpoint rows discarded because they joined no convention row in
     /// a file a routing convention CLAIMED (carrick#703). In such a file the
     /// route set is the module's exported handlers, so a row the model states
@@ -909,7 +913,9 @@ struct Resolved {
     /// The HTTP verb the source states, upper-cased. `None` where the
     /// source resolves the URL and not the verb.
     method: Option<String>,
-    /// The target the source states, in the spelling the row persists.
+    /// The target the source states, in the spelling the row persists. Empty
+    /// for a source that states the verb and no target (the verb a call is
+    /// spelled with, carrick-cloud#1365): the model's target is kept.
     url: String,
     /// The call expression's span. `None` for a route the source declares
     /// with no call site of its own (a file-based route, a route
@@ -2876,6 +2882,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model statements discarded as contradictions: {}",
             stats.model_contradictions_discarded
+        );
+        debug!(
+            "  - Model calls given the method the source states: {}",
+            stats.model_methods_supplied
         );
         debug!(
             "  - Model endpoints discarded in convention-claimed modules: {}",
@@ -6115,6 +6125,48 @@ impl FileOrchestrator {
                     row,
                 });
             }
+
+            // The verb the call is spelled with, on its own (carrick-cloud#1365).
+            // Every source above that states a verb also states a target, and
+            // needs one it can read: a whole-URL binding, a base binding, a
+            // member, a request spec, a `new URL`, a plain string literal. A
+            // verb-named call on a template literal (`client.post(`/x/${id}`)`)
+            // matches none of them, so the model's row was the only statement
+            // of the site, and a row whose method the model left out was
+            // indexed as the GET a missing method defaults to. The verb is
+            // still the site's own, so it is stated without a target and
+            // overrules only the method of the row the model returns here.
+            // Lowest precedence: any source that reads the target as well
+            // states the verb with it and wins the span.
+            //
+            // Only the call's OWN shape states a verb. A call that is not
+            // request-shaped states none, even when it wraps a request
+            // (`Promise.all(xs.map((x) => client.post(url)))`): `NotARequest`
+            // means it names no verb and carries no options bag, not that it
+            // sends nothing, verb-named members raise candidates whatever
+            // their receiver is (`headers.get`, a `Map`'s `delete`), and a
+            // chain's links share its head's span start. Reading the verb of
+            // a request inside it reached rows describing other calls.
+            // A call whose method is a parameter (`Unreadable`) states none.
+            if let RequestShapeSignal::Known(shape) = &candidate.request_shape {
+                let method = shape.method.clone();
+                claim(Resolved {
+                    method: Some(method.clone()),
+                    url: String::new(),
+                    span,
+                    line,
+                    source: ResolutionSource::InlineLiteral,
+                    emits: false,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        String::new(),
+                        Some(method),
+                        ResolutionSource::InlineLiteral,
+                        None,
+                    ))),
+                });
+            }
         }
 
         // A request wrapper declared in the SAME file, called with the path as
@@ -7123,7 +7175,16 @@ impl FileOrchestrator {
                 stats.model_contradictions_discarded += 1;
                 row.method = Some(ours.to_string());
             }
-            (Some(ours), _) => row.method = Some(ours.to_string()),
+            (Some(ours), theirs) => {
+                if theirs.is_none_or(|theirs| theirs.trim().is_empty()) {
+                    debug!(
+                        "Taking the method a {source:?} states for the call at {file_path}:{}: {ours:?} (the model stated none)",
+                        row.line_number
+                    );
+                    stats.model_methods_supplied += 1;
+                }
+                row.method = Some(ours.to_string());
+            }
             (None, _) => row.method = model_method,
         }
     }
@@ -16007,6 +16068,121 @@ export { routes };
 
         assert_eq!(result.data_calls[0].target, "${API_URL}/things");
         assert_eq!(result.data_calls[0].method.as_deref(), Some("GET"));
+    }
+
+    /// A client call at `span` whose request shape is `shape`, with a
+    /// template-literal URL that no target-reading source can read
+    /// (carrick-cloud#1365).
+    fn verb_named_call(id: &str, span: (u32, u32), shape: RequestShapeSignal) -> CandidateTarget {
+        CandidateTarget {
+            span_start: span.0,
+            span_end: span.1,
+            callee_object: "client".to_string(),
+            callee_property: Some("post".to_string()),
+            path_snippet: Some("`/teams/${teamId}`".to_string()),
+            code_snippet: "client.post(`/teams/${teamId}`)".to_string(),
+            request_shape: shape,
+            receiver_ident: Some("client".to_string()),
+            ..candidate_with_snippet(id, None)
+        }
+    }
+
+    fn known(method: &str) -> RequestShapeSignal {
+        RequestShapeSignal::Known(WrapperRequestShape {
+            method: method.to_string(),
+            has_body: None,
+        })
+    }
+
+    /// carrick-cloud#1365: a verb-named call on a template literal is stated
+    /// by no source that reads a target, so the model's row is the only one at
+    /// its span. The verb the call is spelled with still settles that row's
+    /// method: supplied where the model stated none, corrected where it stated
+    /// another. The model's target is kept, because nothing here reads one.
+    #[test]
+    fn a_call_spelled_with_its_verb_gives_the_models_row_that_verb() {
+        let result = FileAnalysisResult {
+            data_calls: vec![
+                data_call_with("c1", "/teams/${teamId}", None),
+                data_call_with("c2", "/teams/${teamId}", Some("GET")),
+                data_call_with("c3", "/teams/${teamId}", Some(" ")),
+            ],
+            ..Default::default()
+        };
+        let candidate_map: HashMap<String, CandidateTarget> = [
+            ("c1", (100, 140), "POST"),
+            ("c2", (200, 240), "DELETE"),
+            ("c3", (300, 340), "PATCH"),
+        ]
+        .into_iter()
+        .map(|(id, span, verb)| (id.to_string(), verb_named_call(id, span, known(verb))))
+        .collect();
+
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/team.ts");
+
+        let rows: Vec<(&str, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.target.as_str(), call.method.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("/teams/${teamId}", Some("POST")),
+                ("/teams/${teamId}", Some("DELETE")),
+                ("/teams/${teamId}", Some("PATCH")),
+            ]
+        );
+        assert_eq!(stats.model_methods_supplied, 2);
+        assert_eq!(stats.model_contradictions_discarded, 1);
+    }
+
+    /// Only a call's own shape states a verb, and each row here keeps what the
+    /// model said:
+    ///
+    /// - the outer call of `Promise.all(xs.map((x) => client.post(url)))`,
+    ///   which is not request-shaped, even though it wraps exactly one request
+    ///   (a model row joined there is the deferred case);
+    /// - the `fetch(url)` head of `fetch(url).then(() => client.delete(url))`,
+    ///   which shares its span start with the chain around it;
+    /// - a request whose method is a parameter.
+    #[test]
+    fn a_call_states_no_verb_it_does_not_name_itself() {
+        let result = FileAnalysisResult {
+            data_calls: vec![
+                data_call_with("outer", "/teams/${teamId}", None),
+                data_call_with("head", "/teams/${teamId}", Some("GET")),
+                data_call_with("unreadable", "/teams/${teamId}", Some("PUT")),
+            ],
+            ..Default::default()
+        };
+        let candidate_map: HashMap<String, CandidateTarget> = [
+            verb_named_call("outer", (100, 200), RequestShapeSignal::NotARequest),
+            verb_named_call("inner", (140, 190), known("POST")),
+            CandidateTarget {
+                callee_object: "fetch".to_string(),
+                callee_property: None,
+                receiver_ident: Some("fetch".to_string()),
+                ..verb_named_call("head", (300, 330), RequestShapeSignal::NotARequest)
+            },
+            verb_named_call("chain", (300, 400), RequestShapeSignal::NotARequest),
+            verb_named_call("chain-delete", (350, 390), known("DELETE")),
+            verb_named_call("unreadable", (500, 560), RequestShapeSignal::Unreadable),
+        ]
+        .into_iter()
+        .map(|candidate| (candidate.candidate_id.clone(), candidate))
+        .collect();
+
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/team.ts");
+
+        let methods: Vec<Option<&str>> = result
+            .data_calls
+            .iter()
+            .map(|call| call.method.as_deref())
+            .collect();
+        assert_eq!(methods, vec![None, Some("GET"), Some("PUT")]);
+        assert_eq!(stats.model_methods_supplied, 0);
+        assert_eq!(stats.model_contradictions_discarded, 0);
     }
 
     /// #529: a generated OpenAPI client is hundreds of near-identical

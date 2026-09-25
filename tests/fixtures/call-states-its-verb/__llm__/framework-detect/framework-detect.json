@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": ["@example/http"],
+  "messaging_clients": [],
+  "notes": "A React client. @example/http is the HTTP client package."
+}

@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "span:161-214",
+      "line_number": 4,
+      "target": "/teams/${teamId}/members/${memberId}",
+      "method": null,
+      "pattern_matched": "client.delete(",
+      "call_expression_text": "client.delete(`/teams/${teamId}/members/${memberId}`)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:227-278",
+      "line_number": 4,
+      "target": "/teams/${teamId}/members/${memberId}",
+      "method": null,
+      "pattern_matched": "client.post(",
+      "call_expression_text": "client.post(`/teams/${teamId}/members/${memberId}`)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
