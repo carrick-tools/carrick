@@ -8,7 +8,7 @@
 //! The fixture's README lists the sites and why each one goes or stays.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture_dir() -> PathBuf {
@@ -23,18 +23,25 @@ struct Scan {
     /// Pub/sub type-manifest anchors: (role, topic, `file:line`).
     anchors: BTreeSet<Row>,
     blob: serde_json::Value,
+    stderr: String,
 }
 
+/// One isolated first scan of the fixture.
 fn scan() -> Scan {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
+    scan_in(storage.path(), cache.path())
+}
+
+/// A scan that stores its blob in `storage` and reads the previous one back
+/// from there, so a second call takes the incremental path.
+fn scan_in(storage: &Path, cache: &Path) -> Scan {
     let cassettes = fixture_dir().join("__llm__");
 
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
     cmd.arg(fixture_dir())
-        .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
-        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
-        .env("CARRICK_CACHE_DIR", cache.path())
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage)
+        .env("CARRICK_CACHE_DIR", cache)
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
@@ -59,13 +66,13 @@ fn scan() -> Scan {
         cmd.env_remove(var);
     }
     let output = cmd.output().expect("failed to spawn carrick");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(
         output.status.success(),
         "fixture scan exited non-zero:\n{stderr}"
     );
 
-    let mut blobs = std::fs::read_dir(storage.path())
+    let mut blobs = std::fs::read_dir(storage)
         .expect("storage dir")
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
@@ -105,6 +112,7 @@ fn scan() -> Scan {
         rows,
         anchors,
         blob,
+        stderr,
     }
 }
 
@@ -254,4 +262,28 @@ fn a_withdrawn_row_resolves_no_type() {
             "{field} names aliases no manifest entry holds (a withdrawn row's type was resolved): {orphans:?}"
         );
     }
+}
+
+/// The second scan of an unchanged tree reuses the model's cached answers and
+/// builds its rows on the incremental path, which withdraws the same rows.
+#[test]
+fn a_rescan_withdraws_the_same_rows() {
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let first = scan_in(storage.path(), cache.path());
+    let second = scan_in(storage.path(), cache.path());
+    assert!(
+        second.stderr.contains("already analysed"),
+        "the second scan did not reuse the cached answers, so it did not take the incremental path:\n{}",
+        second.stderr
+    );
+    assert!(
+        !second
+            .rows
+            .contains(&call("order.placed", &format!("{ORDERS}:23"))),
+        "the incremental path kept an in-process row: {:#?}",
+        second.rows
+    );
+    assert_eq!(first.rows, second.rows);
+    assert_eq!(first.anchors, second.anchors);
 }
