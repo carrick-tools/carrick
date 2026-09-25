@@ -173,6 +173,9 @@ async fn a_pr_run_marks_each_finding_with_whether_main_had_it() {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
         std::env::remove_var("GITHUB_REF");
         std::env::remove_var("GITHUB_EVENT_NAME");
+        // The repo name comes from GITHUB_REPOSITORY before the directory, so
+        // on a runner both fixtures would be one repo named for this one.
+        std::env::remove_var("GITHUB_REPOSITORY");
     }
     let tmp = tempfile::tempdir().unwrap();
     let producer = fixture_repo(tmp.path(), "catalog-web");
