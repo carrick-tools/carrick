@@ -5,7 +5,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { editPayload, fakeEnv, firstCall, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
+import {
+  editPayload,
+  fakeEnv,
+  firstCall,
+  fixturePath,
+  makeWorkspace,
+  runHook,
+  testDir,
+} from "./helpers.ts";
 
 test("an edit gets the verdicts as additionalContext", async (t) => {
   const workspace = makeWorkspace();
@@ -145,14 +153,21 @@ test("the hook's own work fits the 300 ms budget", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
+  // CPU time on the hook's main thread, which excludes the CLI it spawns. Wall
+  // time on a shared runner measured the concurrent test files too
+  // (carrick#1498); cpu-usage.mjs gives the margin. Waiting on the CLI is
+  // covered by the slow-CLI test above.
   const run = await runHook("post-edit.ts", {
     payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_LOG_QUIET: "0" }),
+    nodeArgs: [`--import=${path.join(testDir, "cpu-usage.mjs")}`],
   });
-  const cliMs = Number(/in (\d+)ms/.exec(run.stderr)?.[1] ?? "0");
-  const ours = run.ms - cliMs;
-  assert.ok(cliMs >= 0);
-  assert.ok(ours < 300, `hook overhead was ${ours}ms (total ${run.ms}ms, CLI ${cliMs}ms)`);
+  assert.equal(run.code, 0);
+  assert.match(run.stdout, /additionalContext/);
+  const cpu = /carrick-test-cpu-ms=(\d+)/.exec(run.stderr);
+  assert.ok(cpu, `the hook reported no CPU time: ${run.stderr}`);
+  const ours = Number(cpu[1]);
+  t.diagnostic(`hook CPU ${ours}ms, wall ${run.ms}ms`);
+  assert.ok(ours < 300, `hook used ${ours}ms of CPU (wall ${run.ms}ms)`);
 });
 
 test("the hook stays quiet when the LSP owns delivery", async (t) => {
