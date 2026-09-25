@@ -106,6 +106,7 @@ jobs:
           --test new_url_target_test
           --test object_export_surface_test
           --test output_contract_test
+          --test pr_on_main_test
           --test prompt_determinism_test
           --test receiver_type_classification_test
           --test retype_consumer_test
