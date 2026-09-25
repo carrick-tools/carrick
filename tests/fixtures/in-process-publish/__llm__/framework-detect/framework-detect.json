@@ -1,0 +1,9 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [
+    "@fixture/broker"
+  ],
+  "socket_clients": [],
+  "notes": "An in-house message broker client is the only transport dependency."
+}

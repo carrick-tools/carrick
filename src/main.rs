@@ -37,6 +37,7 @@ mod handler_span;
 mod help;
 mod import_bindings;
 mod imported_request_member;
+mod in_process_pubsub;
 mod intent_generator;
 mod local_http_wrapper;
 mod local_mode;

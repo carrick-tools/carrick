@@ -2864,10 +2864,19 @@ async fn analyze_current_repo_incremental(
                 packages,
                 function_definitions,
             );
+            let in_process_pubsub = classify_in_process_pubsub(
+                repo_path,
+                &merged_results,
+                &cloud_data,
+                &service_modules,
+                &setup.detection,
+                &protocol_extractions.event_bus,
+            );
             append_deterministic_protocol_operations(
                 &mut cloud_data,
                 &protocol_extractions,
                 &merged_results,
+                &in_process_pubsub,
             );
             attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
             attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -2924,6 +2933,7 @@ async fn analyze_current_repo_incremental(
                 &mut manifest_entries,
                 &merged_results,
                 &protocol_extractions.sockets,
+                &in_process_pubsub,
                 repo_path,
             );
             if !manifest_entries.is_empty() {
@@ -2945,9 +2955,11 @@ async fn analyze_current_repo_incremental(
             ));
             // Pub/sub ops are LLM-sourced in `merged_results`, not in the
             // deterministic `protocol_extractions`, so their payload anchors
-            // bundle through the same path (#corpus-2 resolution dim).
+            // bundle through the same path (#corpus-2 resolution dim). A row
+            // withdrawn as in-process has no operation to type (carrick#1513).
+            let pubsub_results = in_process_pubsub.retained(&merged_results);
             protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
-                &merged_results,
+                &pubsub_results,
                 repo_path,
                 &service_modules,
             ));
@@ -2965,7 +2977,7 @@ async fn analyze_current_repo_incremental(
             // handles) resolve via the LLM-located payload expression through
             // the same infer path.
             protocol_infer.extend(
-                file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path),
+                file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path),
             );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
@@ -3495,6 +3507,7 @@ fn append_deterministic_protocol_operations(
     cloud_data: &mut CloudRepoData,
     extractions: &ProtocolExtractions,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    in_process: &crate::in_process_pubsub::InProcessPubsub,
 ) {
     // Same "{file}:{line}" convention the mount-graph conversions use
     let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
@@ -3585,7 +3598,67 @@ fn append_deterministic_protocol_operations(
         file_results,
         &to_details,
     );
-    append_pubsub_operations(cloud_data, file_results, &extractions.sockets, &to_details);
+    append_pubsub_operations(
+        cloud_data,
+        file_results,
+        &extractions.sockets,
+        in_process,
+        &to_details,
+    );
+}
+
+/// The model's pub/sub rows that are calls into an in-process wrapper with
+/// nothing on the other side of the topic in this service (carrick#1513),
+/// read by [`append_pubsub_operations`] and [`append_pubsub_manifest_entries`]
+/// so a withdrawn row leaves neither an operation nor an anchor. The rule is
+/// [`crate::in_process_pubsub`]'s.
+///
+/// A transport is whatever framework detection classed as a messaging,
+/// socket or data-fetching client. The in-process event-bus pass's rows count
+/// as the other side of a topic exactly as the model's own do.
+fn classify_in_process_pubsub(
+    repo_path: &str,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    cloud_data: &CloudRepoData,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
+    detection: &DetectionResult,
+    event_bus: &crate::event_emitter::BusExtraction,
+) -> crate::in_process_pubsub::InProcessPubsub {
+    use crate::operation::PubsubRole;
+
+    let transports: Vec<String> = detection
+        .messaging_clients
+        .iter()
+        .chain(&detection.socket_clients)
+        .chain(&detection.data_fetchers)
+        .cloned()
+        .collect();
+    let other_sides: Vec<(String, PubsubRole)> = event_bus
+        .subscribers
+        .iter()
+        .map(|op| (op.event.clone(), PubsubRole::Subscriber))
+        .chain(
+            event_bus
+                .publishers
+                .iter()
+                .map(|op| (op.event.clone(), PubsubRole::Publisher)),
+        )
+        .collect();
+    let classified = crate::in_process_pubsub::classify(
+        Path::new(repo_path),
+        file_results,
+        &cloud_data.function_definitions,
+        modules,
+        &transports,
+        &other_sides,
+    );
+    if !classified.is_empty() {
+        debug!(
+            withdrawn = classified.len(),
+            "pub/sub rows withdrawn as in-process with no counterpart (carrick#1513)"
+        );
+    }
+    classified
 }
 
 /// Fold the deterministic in-process event-bus scan into `cloud_data`
@@ -3756,10 +3829,15 @@ fn has_socket_twin(
 /// An op whose `role` is `None` (model omitted it or emitted an off-enum value,
 /// absorbed leniently) can't be placed on either side and is dropped with a debug
 /// log. Only literal topics are extracted today (env-template collapse is deferred).
+///
+/// An op `in_process` withdrew is a call into this repo's own in-process
+/// wrapper with no counterpart in the service (carrick#1513): it is not a
+/// cross-service event, so it is counted and not indexed.
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
+    in_process: &crate::in_process_pubsub::InProcessPubsub,
     to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
     use crate::operation::PubsubRole;
@@ -3769,6 +3847,7 @@ fn append_pubsub_operations(
     let mut publishers = 0usize;
     let mut dropped = 0usize;
     let mut folded = 0usize;
+    let mut withdrawn = 0usize;
     // Deterministic order: HashMap iteration is unordered, so sort by path
     // before pushing endpoints/calls (keeps scanner output stable).
     let mut paths: Vec<&String> = file_results.keys().collect();
@@ -3787,6 +3866,12 @@ fn append_pubsub_operations(
                     "pub/sub op folded into same-file socket twin"
                 );
                 folded += 1;
+                continue;
+            }
+            if let Some(role) = op.role
+                && in_process.is_withdrawn(Path::new(path), op.line_number, &op.topic, role)
+            {
+                withdrawn += 1;
                 continue;
             }
             let line = u32::try_from(op.line_number).unwrap_or(0);
@@ -3812,10 +3897,14 @@ fn append_pubsub_operations(
             }
         }
     }
-    if subscribers + publishers + dropped + folded > 0 {
+    if subscribers + publishers + dropped + folded + withdrawn > 0 {
         debug!(
             subscribers,
-            publishers, dropped, folded, "Indexing pub/sub operations"
+            publishers,
+            dropped,
+            folded,
+            withdrawn_in_process = withdrawn,
+            "Indexing pub/sub operations"
         );
     }
 }
@@ -3851,11 +3940,13 @@ fn append_pubsub_operations(
 /// `socket_event_twins`) is also skipped here: it was dropped from `cloud_data`
 /// by `append_pubsub_operations`, so leaving a manifest anchor for it would
 /// orphan the anchor. The `sockets` extraction feeds the same fold set both
-/// places.
+/// places, and so does `in_process` (carrick#1513): a row it withdrew has no
+/// operation to anchor.
 fn append_pubsub_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
+    in_process: &crate::in_process_pubsub::InProcessPubsub,
     repo_root: &str,
 ) {
     use crate::operation::PubsubRole;
@@ -3871,6 +3962,11 @@ fn append_pubsub_manifest_entries(
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
             if has_socket_twin(&twins, &file_norm, &op.topic) {
+                continue;
+            }
+            if let Some(pubsub_role) = op.role
+                && in_process.is_withdrawn(Path::new(path), op.line_number, &op.topic, pubsub_role)
+            {
                 continue;
             }
             let role = match op.role {
@@ -6437,10 +6533,19 @@ async fn analyze_current_repo(
         Some(packages.clone()),
         function_definitions,
     );
+    let in_process_pubsub = classify_in_process_pubsub(
+        repo_path,
+        &analysis_result.file_results,
+        &cloud_data,
+        &service_modules,
+        &setup.detection,
+        &protocol_extractions.event_bus,
+    );
     append_deterministic_protocol_operations(
         &mut cloud_data,
         &protocol_extractions,
         &analysis_result.file_results,
+        &in_process_pubsub,
     );
     attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
     attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -6462,6 +6567,7 @@ async fn analyze_current_repo(
         &mut manifest_entries,
         &analysis_result.file_results,
         &protocol_extractions.sockets,
+        &in_process_pubsub,
         repo_path,
     );
     if !manifest_entries.is_empty() {
@@ -6489,9 +6595,11 @@ async fn analyze_current_repo(
     ));
     // Pub/sub ops are LLM-sourced in `analysis_result.file_results`, not in the
     // deterministic `protocol_extractions`, so their payload anchors bundle
-    // through the same path (#corpus-2 resolution dim).
+    // through the same path (#corpus-2 resolution dim). A row withdrawn as
+    // in-process has no operation to type (carrick#1513).
+    let pubsub_results = in_process_pubsub.retained(&analysis_result.file_results);
     protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
-        &analysis_result.file_results,
+        &pubsub_results,
         repo_path,
         &service_modules,
     ));
@@ -6507,9 +6615,8 @@ async fn analyze_current_repo(
     // Pub/sub payloads with no named symbol (wrapper patterns: topic-map
     // emitters, schema-catalog workers, generic channel handles) resolve via
     // the LLM-located payload expression through the same infer path.
-    protocol_infer.extend(
-        file_orchestrator.collect_pubsub_infer_requests(&analysis_result.file_results, repo_path),
-    );
+    protocol_infer
+        .extend(file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path));
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -12591,6 +12698,7 @@ mod tests {
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             ".",
         );
         let manifest_alias = entries
@@ -12673,6 +12781,7 @@ mod tests {
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             ".",
         );
         let manifest_aliases: HashSet<String> = entries
@@ -12786,6 +12895,7 @@ mod tests {
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             ".",
         );
         let manifest_aliases: HashMap<ManifestRole, String> = entries
@@ -12956,6 +13066,7 @@ mod tests {
             &mut cloud_data,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             &to_details,
         );
         assert_eq!(
@@ -12983,6 +13094,7 @@ mod tests {
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             ".",
         );
 
@@ -13081,7 +13193,12 @@ mod tests {
         );
 
         let mut cloud_data = repo_with_bundle("payments-svc", None, "");
-        append_deterministic_protocol_operations(&mut cloud_data, &extractions, &file_results);
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+        );
 
         // The socket emit is indexed exactly once, as the socket op.
         assert_eq!(
@@ -13117,7 +13234,13 @@ mod tests {
         // Manifest side folds identically: no orphan anchor for the folded op,
         // the real pub/sub op still anchors.
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets, ".");
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &extractions.sockets,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+        );
         assert_eq!(
             entries
                 .iter()
@@ -13194,7 +13317,12 @@ mod tests {
         );
 
         let mut cloud_data = repo_with_bundle("notify-monorepo", None, "");
-        append_deterministic_protocol_operations(&mut cloud_data, &extractions, &file_results);
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+        );
 
         // The subscription is the gap #676 was filed for: nothing else reports
         // it, so the deterministic row is the only one, at the AST's own line.
@@ -13239,7 +13367,13 @@ mod tests {
         // The kept model row still anchors its manifest entry, so deferring to
         // it loses no type resolution.
         let mut entries = Vec::new();
-        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets, ".");
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &extractions.sockets,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+        );
         assert_eq!(
             entries
                 .iter()
@@ -13284,6 +13418,7 @@ mod tests {
             &mut entries,
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
             ".",
         );
 
