@@ -162,6 +162,7 @@ jobs:
         run: >-
           cargo test --verbose
           --test deterministic_emission_test
+          --test dispatch_dto_enum_test
           --test env_var_whole_url_test
           --test hosted_enrichment_test
           --test imported_request_member_test

@@ -1,0 +1,7 @@
+{
+  "name": "dispatch-dto-enum",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: a request DTO enum field a service method branches on, beside a real dispatcher (carrick-cloud#1366)",
+  "main": "src/jobs.handler.ts"
+}

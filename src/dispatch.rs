@@ -323,11 +323,14 @@ fn declared_location(
 /// The advisory for every handler that switches on a request field and has no
 /// `operations` block declaring what it serves (carrick#831).
 ///
-/// One finding per (service, location, field). It carries the material a
-/// reader needs to accept the model's reading rather than author it: the
-/// values, the route consumers name (when any do), and the call sites already
-/// stating a value. A table whose field IS declared produces nothing — the
-/// question it asks has been answered.
+/// One finding per (service, handler, location, field): several tables one
+/// handler states for one field are one question with one `operations`
+/// block, so their values are merged in the order the tables state them. It carries the material a reader needs to
+/// accept the model's reading rather than author it: the values, the route
+/// consumers name (when any do), and the call sites already stating a value.
+/// A field that IS declared produces nothing — the question it asks has been
+/// answered. A table whose handler is not where a request arrives produces
+/// nothing either: see [`selects_the_operation`].
 ///
 /// Never a failure and never a claim that anything is wrong: the handler
 /// works. What is missing is in the index, not in the code.
@@ -344,60 +347,287 @@ pub fn dispatch_operation_findings(
             .clone()
             .unwrap_or_else(|| repo.repo_name.clone());
         let declared = declared_fields(repo);
+
+        // One group per handler and field, in the order the tables first name
+        // it, each carrying the union of the values its kept tables state and
+        // the consumers that name one of them. Two handlers switching on the
+        // same field are two dispatchers (two lambdas behind two routes), so
+        // they keep separate blocks.
+        let mut groups: Vec<FieldGroup> = Vec::new();
         for table in tables {
             if declared.contains(&(table.location, table.field.clone())) {
                 continue;
             }
-            // The route and the call sites come from the CONSUMERS, because
-            // the case this exists for is the handler whose route is not in
-            // the source at all. A call counts when it states a value for
-            // this field that this handler answers — that, and not the path,
-            // is what ties it to this table.
-            let mut routes: std::collections::BTreeMap<String, usize> = Default::default();
-            let mut call_sites: Vec<String> = Vec::new();
-            for other in repos {
-                let other_service = other
-                    .service_name
-                    .clone()
-                    .unwrap_or_else(|| other.repo_name.clone());
-                if other_service == service {
-                    continue;
+            let consumers = consumers_naming(repos, &service, table);
+            if !selects_the_operation(repo, table, !consumers.is_empty()) {
+                continue;
+            }
+            let handler = handler_identity(table);
+            let group = match groups.iter_mut().position(|g| {
+                g.handler == handler && g.location == table.location && g.field == table.field
+            }) {
+                Some(index) => &mut groups[index],
+                None => {
+                    groups.push(FieldGroup {
+                        handler,
+                        location: table.location,
+                        field: table.field.clone(),
+                        values: Vec::new(),
+                        consumers: Vec::new(),
+                    });
+                    groups.last_mut().expect("just pushed")
                 }
-                for call in &other.calls {
-                    let Some(dispatch) = call.dispatch.as_ref() else {
-                        continue;
-                    };
-                    if dispatch.location != table.location || dispatch.field != table.field {
-                        continue;
-                    }
-                    if !table.values.contains(&dispatch.value) {
-                        continue;
-                    }
-                    if let Some((method, path)) = call.key.as_http() {
-                        *routes.entry(format!("{method} {path}")).or_default() += 1;
-                    }
-                    call_sites.push(call.file_path.to_string_lossy().into_owned());
+            };
+            for value in &table.values {
+                if !group.values.contains(value) {
+                    group.values.push(value.clone());
                 }
             }
+            group.consumers.extend(consumers);
+        }
+
+        for group in groups {
             // The route the most consumers name. A tie is broken by the route
-            // text so two scans of one tree suggest the same block.
+            // text so two scans of one tree suggest the same block. A call is
+            // counted once however many tables of the field it named.
+            let mut consumers = group.consumers;
+            consumers.sort();
+            consumers.dedup();
+            let mut routes: std::collections::BTreeMap<String, usize> = Default::default();
+            for (_, route) in &consumers {
+                if let Some(route) = route {
+                    *routes.entry(route.clone()).or_default() += 1;
+                }
+            }
             let route = routes
                 .into_iter()
                 .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
                 .map(|(route, _)| route);
-            call_sites.sort();
+            let mut call_sites: Vec<String> = consumers.into_iter().map(|(site, _)| site).collect();
             call_sites.dedup();
             findings.push(crate::findings::Finding::DispatchOperations {
                 service: service.clone(),
                 route,
-                dispatch_location: table.location.as_str().to_string(),
-                dispatch_field: table.field.clone(),
-                values: table.values.clone(),
+                dispatch_location: group.location.as_str().to_string(),
+                dispatch_field: group.field,
+                values: group.values,
                 call_sites,
             });
         }
     }
     findings
+}
+
+/// The tables of one handler that switch on one (location, field).
+struct FieldGroup {
+    /// `(file, member name)` of the handler, from [`handler_identity`].
+    handler: (String, String),
+    location: DispatchLocation,
+    field: String,
+    values: Vec<String>,
+    /// `(call site, "METHOD path")` for each consumer call naming a value.
+    consumers: Vec<(String, Option<String>)>,
+}
+
+/// Which handler a table is about: its file and the member name of the
+/// function it names, so `NoticesService.create` and `create` in one file are
+/// one handler. A table with no handler name is keyed by its file alone.
+fn handler_identity(table: &DispatchTable) -> (String, String) {
+    (
+        table.file_path.trim_start_matches("./").to_string(),
+        table
+            .handler_name
+            .as_deref()
+            .map(member_name)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Every call in ANOTHER service that states a value of this table for this
+/// field, as `(call site, "METHOD path")`.
+///
+/// The route and the call sites come from the CONSUMERS, because the case the
+/// advisory exists for is the handler whose route is not in the source at all.
+/// A call counts when it states a value for this field that this handler
+/// answers — that, and not the path, is what ties it to this table.
+fn consumers_naming(
+    repos: &[crate::cloud_storage::CloudRepoData],
+    service: &str,
+    table: &DispatchTable,
+) -> Vec<(String, Option<String>)> {
+    let mut consumers = Vec::new();
+    for other in repos {
+        let other_service = other
+            .service_name
+            .clone()
+            .unwrap_or_else(|| other.repo_name.clone());
+        if other_service == service {
+            continue;
+        }
+        for call in &other.calls {
+            let Some(dispatch) = call.dispatch.as_ref() else {
+                continue;
+            };
+            if dispatch.location != table.location
+                || dispatch.field != table.field
+                || !table.values.contains(&dispatch.value)
+            {
+                continue;
+            }
+            let route = call
+                .key
+                .as_http()
+                .map(|(method, path)| format!("{method} {path}"));
+            consumers.push((call.file_path.to_string_lossy().into_owned(), route));
+        }
+    }
+    consumers
+}
+
+/// Whether this table's handler is where a request's operation is SELECTED,
+/// rather than a function further in that branches on a field of data it was
+/// handed (carrick-cloud#1366).
+///
+/// A request DTO with an enum field, and a service method that does one thing
+/// for `scope: "all"` and another for `scope: "specific"`, reads to the model
+/// exactly like a dispatcher. What tells them apart is structural: where the
+/// handler sits in the service, not what its body says.
+///
+/// - A consumer that already sends one of the values for this field settles it
+///   (`corroborated`).
+/// - A handler bound to a route in this service selects an operation only if
+///   extraction marked that route's rows with a dispatch on this field. A
+///   routed handler branching on a body field with plain rows is a route that
+///   validates or varies its data.
+/// - A handler bound to no route is an entry point only if nothing in the
+///   service calls it: that is the handler infrastructure invokes (an
+///   API-gateway lambda). One the service calls is handed its input by its
+///   caller, which is where a request's operation, if any, was chosen.
+/// - A handler the function index cannot place is kept: nothing structural
+///   contradicts the table, and dropping it would lose the routeless case the
+///   advisory exists for.
+fn selects_the_operation(
+    repo: &crate::cloud_storage::CloudRepoData,
+    table: &DispatchTable,
+    corroborated: bool,
+) -> bool {
+    if corroborated {
+        return true;
+    }
+    let Some(handler) = table.handler_name.as_deref() else {
+        return true;
+    };
+    // This handler's OWN route rows. A dispatch on the same field on some
+    // other route of the service says nothing about this handler.
+    let own_routes: Vec<&crate::analyzer::ApiEndpointDetails> = repo
+        .endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint
+                .handler_name
+                .as_deref()
+                .is_some_and(|name| member_name(name) == member_name(handler))
+                && same_file(&location_file(&endpoint.file_path), &table.file_path)
+        })
+        .collect();
+    if !own_routes.is_empty() {
+        return own_routes.iter().any(|endpoint| {
+            endpoint
+                .dispatch
+                .as_ref()
+                .is_some_and(|d| d.location == table.location && d.field == table.field)
+        });
+    }
+    let handlers = handler_rows(&repo.function_definitions, table);
+    if handlers.is_empty() {
+        return true;
+    }
+    !handlers.iter().any(|key| {
+        let definition = &repo.function_definitions[key];
+        let file = definition.file_path.to_string_lossy();
+        repo.function_definitions
+            .iter()
+            // A function calling itself is recursion, not a caller: a
+            // recursive entry point is still where the request arrives.
+            .filter(|(caller_key, _)| *caller_key != key)
+            .any(|(_, caller)| {
+                caller.calls.iter().any(|edge| {
+                    edge.line_number == definition.line_number && edge.file_path == file
+                })
+            })
+    })
+}
+
+/// The last segment of a dotted handler name: `NoticesService.create` and
+/// `create` name the same method, the first as the function index keys a
+/// class member and the second as extraction usually writes it.
+fn member_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The file part of a `file:line` location.
+fn location_file(location: &std::path::Path) -> String {
+    let text = location.to_string_lossy();
+    match text.rsplit_once(':') {
+        Some((file, line)) if line.chars().all(|c| c.is_ascii_digit()) => file.to_string(),
+        _ => text.into_owned(),
+    }
+}
+
+/// Whether two paths name one file when one may be repo-relative and the
+/// other as the scan held it.
+fn same_file(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim_start_matches("./"), b.trim_start_matches("./"));
+    // Whole path segments only: `src/b.ts` is not `src/ab.ts`.
+    let tail = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+    };
+    !a.is_empty() && !b.is_empty() && (tail(a, b) || tail(b, a))
+}
+
+/// The function rows a table's handler names: same file, the same name or the
+/// same member name, and the declaration line deciding between several.
+///
+/// When the line matches none of them a SOLE candidate still takes it: the
+/// line is the model's reading of where a declaration opens and is worth a few
+/// lines of slack, while the name and the file together already identify the
+/// function. Several candidates and no line agreement is no row.
+fn handler_rows(
+    function_definitions: &std::collections::HashMap<String, crate::visitor::FunctionDefinition>,
+    table: &DispatchTable,
+) -> Vec<String> {
+    let Some(handler_name) = table.handler_name.as_deref() else {
+        return Vec::new();
+    };
+    // Same name AND same file. One repo declares `handler` in a dozen files,
+    // so the name alone would pick every one of them. A dotted name the model
+    // wrote must match exactly; a bare one matches a class member of that name.
+    let mut candidates: Vec<String> = function_definitions
+        .iter()
+        .filter(|(_, definition)| {
+            definition.name == handler_name
+                || (!handler_name.contains('.') && member_name(&definition.name) == handler_name)
+        })
+        .filter(|(_, definition)| {
+            same_file(&definition.file_path.to_string_lossy(), &table.file_path)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    candidates.sort();
+    let by_line: Vec<String> = candidates
+        .iter()
+        .filter(|key| Some(function_definitions[*key].line_number) == table.line_number)
+        .cloned()
+        .collect();
+    if !by_line.is_empty() {
+        by_line
+    } else if candidates.len() == 1 {
+        candidates
+    } else {
+        Vec::new()
+    }
 }
 
 /// The `(location, field)` pairs this repo's `carrick.json` already declares
@@ -434,44 +664,8 @@ pub fn stamp_dispatch_tables_on_functions(
 ) -> usize {
     let mut stamped = 0usize;
     for table in tables {
-        let Some(handler_name) = table.handler_name.as_deref() else {
-            continue;
-        };
-        // Same name AND same file. One repo declares `handler` in a dozen
-        // files, so the name alone would stamp the fact onto every one of
-        // them.
-        let candidates: Vec<String> = function_definitions
-            .iter()
-            .filter(|(_, definition)| definition.name == handler_name)
-            .filter(|(_, definition)| {
-                definition
-                    .file_path
-                    .to_string_lossy()
-                    .ends_with(table.file_path.trim_start_matches("./"))
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        // The line extraction stated for the declaration decides between
-        // several same-named functions in one file. When it matches none of
-        // them, a SOLE candidate still takes it: the line is the model's
-        // reading of where a declaration opens and is worth a few lines of
-        // slack, while the name and the file together already identify the
-        // function. Several candidates and no line agreement stamps nothing
-        // — the array is the record either way.
-        let by_line: Vec<&String> = candidates
-            .iter()
-            .filter(|key| Some(function_definitions[*key].line_number) == table.line_number)
-            .collect();
-        let chosen: Vec<String> = if !by_line.is_empty() {
-            by_line.into_iter().cloned().collect()
-        } else if candidates.len() == 1 {
-            candidates
-        } else {
-            Vec::new()
-        };
-
-        for key in chosen {
+        // No row stamps nothing — the array is the record either way.
+        for key in handler_rows(function_definitions, table) {
             if let Some(definition) = function_definitions.get_mut(&key) {
                 definition.dispatch_table = Some(table.clone());
                 stamped += 1;
@@ -780,6 +974,344 @@ mod tests {
         );
     }
 
+    fn function(name: &str, file: &str, line: u32) -> crate::visitor::FunctionDefinition {
+        crate::visitor::FunctionDefinition {
+            name: name.to_string(),
+            file_path: std::path::PathBuf::from(file),
+            node_type: crate::visitor::FunctionNodeType::Placeholder,
+            arguments: vec![],
+            body_source: None,
+            is_exported: true,
+            line_number: line,
+            end_line: line + 10,
+            intent: None,
+            calls: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            tokens: vec![],
+            intent_input_hash: None,
+            dispatch_table: None,
+        }
+    }
+
+    fn calling(
+        mut caller: crate::visitor::FunctionDefinition,
+        callee: &crate::visitor::FunctionDefinition,
+    ) -> crate::visitor::FunctionDefinition {
+        caller.calls.push(crate::visitor::FunctionCallRef {
+            name: callee.name.clone(),
+            file_path: callee.file_path.to_string_lossy().into_owned(),
+            line_number: callee.line_number,
+            call_site_line: caller.line_number + 1,
+            call_count: 1,
+        });
+        caller
+    }
+
+    fn route(
+        handler: &str,
+        file: &str,
+        dispatch: Option<Dispatch>,
+    ) -> crate::analyzer::ApiEndpointDetails {
+        crate::analyzer::ApiEndpointDetails {
+            owner: None,
+            key: crate::operation::OperationKey::http("POST", "/notices"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: Some(handler.to_string()),
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from(file),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            view_module: false,
+            dispatch,
+            schema_binding: None,
+            handler_span: None,
+        }
+    }
+
+    fn switch_on(
+        field: &str,
+        values: &[&str],
+        handler: &str,
+        file: &str,
+        line: u32,
+    ) -> DispatchTable {
+        DispatchTable {
+            location: DispatchLocation::Body,
+            field: field.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            handler_name: Some(handler.to_string()),
+            file_path: file.to_string(),
+            line_number: Some(line),
+            service_name: None,
+            repo_name: None,
+        }
+    }
+
+    /// carrick-cloud#1366: a request DTO with an enum field, a routed
+    /// controller method that hands it to a service, and the service method
+    /// branching on it. The model read both branches as dispatch tables; the
+    /// route's rows carry no dispatch and the service method is called by the
+    /// controller, so neither selects an operation and nothing is advised.
+    #[test]
+    fn a_dto_enum_branch_is_not_an_operation_to_declare() {
+        let service_create = function("NoticesService.create", "/repo/src/notices.service.ts", 8);
+        let controller_create = calling(
+            function(
+                "NoticesController.create",
+                "/repo/src/notices.controller.ts",
+                12,
+            ),
+            &service_create,
+        );
+        let mut repo = blob(
+            "notices",
+            Some(vec![
+                // The service method, as extraction names a class member.
+                switch_on(
+                    "scope",
+                    &["all", "specific"],
+                    "create",
+                    "/repo/src/notices.service.ts",
+                    8,
+                ),
+                // The routed controller method, branching on the same field.
+                switch_on(
+                    "scope",
+                    &["all", "specific"],
+                    "create",
+                    "/repo/src/notices.controller.ts",
+                    12,
+                ),
+            ]),
+        );
+        repo.endpoints
+            .push(route("create", "/repo/src/notices.controller.ts:12", None));
+        repo.function_definitions = std::collections::HashMap::from([
+            ("NoticesService.create".to_string(), service_create),
+            ("NoticesController.create".to_string(), controller_create),
+        ]);
+
+        let findings = dispatch_operation_findings(&[repo]);
+        assert!(
+            findings.is_empty(),
+            "no operation is selected here: {findings:#?}"
+        );
+    }
+
+    /// The same service, with a real dispatcher beside it: an entry point no
+    /// function in the service calls, switching on `action`. That one is
+    /// advised, once.
+    #[test]
+    fn a_real_dispatch_table_beside_a_dto_enum_is_advised_once() {
+        let service_create = function("NoticesService.create", "/repo/src/notices.service.ts", 8);
+        let controller_create = calling(
+            function(
+                "NoticesController.create",
+                "/repo/src/notices.controller.ts",
+                12,
+            ),
+            &service_create,
+        );
+        let lambda = function("handler", "/repo/src/jobs.handler.ts", 5);
+        let mut repo = blob(
+            "notices",
+            Some(vec![
+                switch_on(
+                    "scope",
+                    &["all", "specific"],
+                    "create",
+                    "/repo/src/notices.service.ts",
+                    8,
+                ),
+                switch_on(
+                    "action",
+                    &["archive", "publish"],
+                    "handler",
+                    "/repo/src/jobs.handler.ts",
+                    5,
+                ),
+            ]),
+        );
+        repo.endpoints
+            .push(route("create", "/repo/src/notices.controller.ts:12", None));
+        repo.function_definitions = std::collections::HashMap::from([
+            ("NoticesService.create".to_string(), service_create),
+            ("NoticesController.create".to_string(), controller_create),
+            ("handler".to_string(), lambda),
+        ]);
+
+        let findings = dispatch_operation_findings(&[repo]);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let crate::findings::Finding::DispatchOperations {
+            dispatch_field,
+            values,
+            route,
+            ..
+        } = &findings[0]
+        else {
+            panic!("expected a dispatch_operations finding: {:?}", findings[0]);
+        };
+        assert_eq!(dispatch_field, "action");
+        assert_eq!(values, &["archive", "publish"]);
+        assert_eq!(route, &None, "no consumer names a route");
+    }
+
+    fn values_of(finding: &crate::findings::Finding) -> Vec<String> {
+        let crate::findings::Finding::DispatchOperations { values, .. } = finding else {
+            panic!("expected a dispatch_operations finding: {finding:?}");
+        };
+        values.clone()
+    }
+
+    /// Several tables one handler states for one field are one question with
+    /// one block, values merged in the order the tables state them. The
+    /// member name and the index's `Class.member` name are one handler.
+    #[test]
+    fn one_handlers_tables_on_one_field_are_one_block() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![
+                switch_on(
+                    "action",
+                    &["archive", "publish"],
+                    "run",
+                    "/repo/src/a.ts",
+                    5,
+                ),
+                switch_on(
+                    "action",
+                    &["publish", "retire"],
+                    "Jobs.run",
+                    "/repo/src/a.ts",
+                    5,
+                ),
+            ]),
+        );
+        repo.function_definitions = std::collections::HashMap::from([(
+            "Jobs.run".to_string(),
+            function("Jobs.run", "/repo/src/a.ts", 5),
+        )]);
+
+        let findings = dispatch_operation_findings(&[repo]);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(values_of(&findings[0]), ["archive", "publish", "retire"]);
+    }
+
+    /// Two routeless lambdas switching on `action` are two dispatchers behind
+    /// two routes: two blocks, each with its own values.
+    #[test]
+    fn two_handlers_on_one_field_keep_separate_blocks() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![
+                switch_on(
+                    "action",
+                    &["archive", "publish"],
+                    "handler",
+                    "/repo/src/a.ts",
+                    5,
+                ),
+                switch_on(
+                    "action",
+                    &["publish", "retire"],
+                    "handler",
+                    "/repo/src/b.ts",
+                    5,
+                ),
+            ]),
+        );
+        repo.function_definitions = std::collections::HashMap::from([
+            ("a".to_string(), function("handler", "/repo/src/a.ts", 5)),
+            ("b".to_string(), function("handler", "/repo/src/b.ts", 5)),
+        ]);
+
+        let findings = dispatch_operation_findings(&[repo]);
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert_eq!(values_of(&findings[0]), ["archive", "publish"]);
+        assert_eq!(values_of(&findings[1]), ["publish", "retire"]);
+    }
+
+    /// A recursive entry point calls itself; that is not a caller, and it is
+    /// still where the request arrives.
+    #[test]
+    fn a_recursive_entry_point_is_still_an_entry_point() {
+        let plain = function("handler", "/repo/src/a.ts", 5);
+        let recursive = calling(plain.clone(), &plain);
+        let mut repo = blob(
+            "jobs",
+            Some(vec![switch_on(
+                "action",
+                &["archive", "publish"],
+                "handler",
+                "/repo/src/a.ts",
+                5,
+            )]),
+        );
+        repo.function_definitions =
+            std::collections::HashMap::from([("handler".to_string(), recursive)]);
+
+        assert_eq!(dispatch_operation_findings(&[repo]).len(), 1);
+    }
+
+    /// A routed handler with plain rows is not made a dispatcher by a
+    /// dispatch on the same field on ANOTHER route of the service.
+    #[test]
+    fn another_routes_dispatch_does_not_admit_a_routed_handler() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![switch_on(
+                "action",
+                &["archive", "publish"],
+                "create",
+                "/repo/src/notices.ts",
+                3,
+            )]),
+        );
+        repo.endpoints
+            .push(route("create", "/repo/src/notices.ts:3", None));
+        repo.endpoints.push(route(
+            "run",
+            "/repo/src/jobs.ts:9",
+            Some(body("action", "archive")),
+        ));
+
+        assert!(dispatch_operation_findings(&[repo]).is_empty());
+    }
+
+    /// A routed handler whose rows extraction marked with the dispatch is the
+    /// dispatcher the prompt describes: advised.
+    #[test]
+    fn a_routed_handler_with_dispatch_rows_is_advised() {
+        let mut repo = blob(
+            "jobs",
+            Some(vec![switch_on(
+                "action",
+                &["archive", "publish"],
+                "run",
+                "/repo/src/jobs.ts",
+                3,
+            )]),
+        );
+        repo.endpoints.push(route(
+            "run",
+            "/repo/src/jobs.ts:3",
+            Some(body("action", "archive")),
+        ));
+        repo.function_definitions = std::collections::HashMap::from([(
+            "run".to_string(),
+            function("run", "/repo/src/jobs.ts", 3),
+        )]);
+
+        assert_eq!(dispatch_operation_findings(&[repo]).len(), 1);
+    }
+
     /// A table whose field the repo already declares asks nothing, so it says
     /// nothing.
     #[test]
@@ -813,26 +1345,7 @@ mod tests {
     /// array, which is the record.
     #[test]
     fn a_table_is_stamped_onto_its_handlers_function_row() {
-        use crate::visitor::{FunctionDefinition, FunctionNodeType};
-
-        let definition = |name: &str, file: &str, line: u32| FunctionDefinition {
-            name: name.to_string(),
-            file_path: std::path::PathBuf::from(file),
-            node_type: FunctionNodeType::Placeholder,
-            arguments: vec![],
-            body_source: None,
-            is_exported: true,
-            line_number: line,
-            end_line: line + 10,
-            intent: None,
-            calls: vec![],
-            return_type: None,
-            return_is_explicit: false,
-            signature: None,
-            tokens: vec![],
-            intent_input_hash: None,
-            dispatch_table: None,
-        };
+        let definition = function;
         let mut functions = std::collections::HashMap::from([
             (
                 "handler".to_string(),
