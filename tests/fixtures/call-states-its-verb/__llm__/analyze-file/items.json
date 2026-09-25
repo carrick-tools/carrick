@@ -92,6 +92,45 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "span:1480-1539",
+      "line_number": 39,
+      "target": "/items/draft",
+      "method": "POST",
+      "pattern_matched": "api.request(",
+      "call_expression_text": "api.request(config)",
+      "call_expression_line": 39,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:1635-1654",
+      "line_number": 43,
+      "target": "/items/${id}/draft",
+      "method": "GET",
+      "pattern_matched": "api.fetch(",
+      "call_expression_text": "api.fetch(draftUrl)",
+      "call_expression_line": 43,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:1779-1848",
+      "line_number": 47,
+      "target": "/items/${id}",
+      "method": "POST",
+      "pattern_matched": "send(",
+      "call_expression_text": "send(`/items/${id}`, { onDone: () => client.delete(`/items/${id}`) })",
+      "call_expression_line": 47,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

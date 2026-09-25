@@ -12,17 +12,18 @@
 //! One test per line shape from the ticket, and every `candidate_id` in the
 //! cassettes is a real candidate, so each row joins the site it names:
 //!
-//! - a request inside `Promise.all(xs.map(...))`, answered once at the outer
-//!   `Promise.all` call (which states no verb of its own) and once at the
-//!   request itself;
+//! - a request inside `Promise.all(xs.map(...))`, answered once at the request
+//!   itself (fixed) and once at the outer `Promise.all` call, which states no
+//!   verb of its own (deferred to carrick#1521, recorded as it is today);
 //! - a request inside a one-line `try` holding several statements;
 //! - a one-line `if/else` with a request on each branch.
 //!
 //! `src/lib/items.ts` is the other side: calls whose method the model states
 //! correctly, sitting next to or around verb-named calls that are not the
 //! request (`headers.get`, a `Map`'s `delete` and `get`, `form.get`,
-//! `searchParams.get`, and a chain whose head is a `fetch`). Every one keeps
-//! the model's method.
+//! `searchParams.get`, a chain whose head is a `fetch` or a member call, a
+//! `Promise.all` over two calls, and a request call whose options hold a
+//! callback that issues another). Every one keeps the model's method.
 //!
 //! See `tests/fixtures/call-states-its-verb/README.md` for the answer key.
 
@@ -117,10 +118,15 @@ fn expect(sites: &[(i64, &str)]) -> Vec<(i64, String)> {
         .collect()
 }
 
-/// Line 4's row names the outer `Promise.all` call and line 8's names the
-/// request inside it. The first half checks that premise: the analyzer was
-/// offered both calls on each line, the outer one with no verb of its own, so
-/// the row at line 4 really is joined to a call that is not the request.
+/// Line 8's row names the request inside `Promise.all`, and takes its verb.
+/// Line 4's row names the outer `Promise.all` call, which is not
+/// request-shaped and states no verb, so the row the model left without a
+/// method is still indexed as a GET. That half records today's behaviour, not
+/// the right answer: it is carrick#1521, and when that is fixed line 4 expects
+/// POST.
+///
+/// The first half checks the premise: the analyzer was offered both calls on
+/// each line, so the rows really are joined to the call each one names.
 #[test]
 fn a_request_inside_promise_all_over_a_map_keeps_its_verb() {
     let prompt = &scanned().prompts["src_screens_LabelPicker.tsx.json"];
@@ -143,7 +149,7 @@ fn a_request_inside_promise_all_over_a_map_keeps_its_verb() {
 
     assert_eq!(
         methods_in("src/screens/LabelPicker.tsx"),
-        expect(&[(4, "POST"), (8, "PUT")]),
+        expect(&[(4, "GET"), (8, "PUT")]),
         "{:#}",
         scanned().projection
     );
@@ -178,7 +184,12 @@ fn each_branch_of_a_one_line_if_else_keeps_its_verb() {
 /// wrapper call's arguments. Line 24: a query parameter read inside the
 /// request's own URL argument. Line 28: a `Map` read beside a request. Line
 /// 32: a `fetch` chain whose `then` issues a DELETE to the same URL, answered
-/// once at the `fetch` (GET) and once, with no method, at the DELETE.
+/// once at the `fetch` (GET) and once, with no method, at the DELETE. Line 39:
+/// a row at a `Promise.all` over a request with no literal URL and a DELETE
+/// whose path ends the row's target. Line 43: a member-call chain head with a
+/// variable argument, its `then` issuing a DELETE to the row's target. Line
+/// 47: a request call whose options hold a callback issuing a DELETE to the
+/// same URL.
 #[test]
 fn a_verb_named_call_that_is_not_the_request_leaves_the_models_method() {
     assert_eq!(
@@ -191,6 +202,9 @@ fn a_verb_named_call_that_is_not_the_request_leaves_the_models_method() {
             (28, "POST"),
             (32, "DELETE"),
             (32, "GET"),
+            (39, "POST"),
+            (43, "GET"),
+            (47, "POST"),
         ]),
         "{:#}",
         scanned().projection

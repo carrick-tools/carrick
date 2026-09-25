@@ -31,3 +31,18 @@ export async function refreshItem(id: string, init: RequestInit): Promise<Respon
 export async function reloadThenDrop(id: string): Promise<void> {
   await fetch(`/items/${id}/draft`).then(() => client.delete(`/items/${id}/draft`));
 }
+
+declare const api: { request(config: unknown): Promise<unknown>; fetch(url: string): Promise<unknown> };
+declare function send(path: string, options: { onDone: () => unknown }): Promise<unknown>;
+
+export async function publishDraft(config: unknown): Promise<void> {
+  await Promise.all([api.request(config), client.delete("/draft")]);
+}
+
+export async function fetchThenDrop(draftUrl: string, id: string): Promise<void> {
+  await api.fetch(draftUrl).then(() => client.delete(`/items/${id}/draft`));
+}
+
+export async function sendThenDrop(id: string): Promise<void> {
+  await send(`/items/${id}`, { onDone: () => client.delete(`/items/${id}`) });
+}
