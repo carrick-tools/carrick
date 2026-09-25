@@ -12,6 +12,11 @@
  * consumer uses something the producer does not return. No rule of ours
  * decides anything: the compiler reads the consumer's own code.
  *
+ * A call that takes no type argument but returns a typed transport response
+ * (`const res = await fetch(u)`) is judged at its body read instead: the
+ * `res.json()` on that call's result is the payload, so that read is cast to
+ * the producer's type (carrick#1493).
+ *
  * Runs in the consumer's REAL program (the init'd project), because that is
  * the only place its file can type-check: the check workspace holds
  * declaration stubs, not consumer sources, and none of the consumer's imports.
@@ -55,9 +60,12 @@ interface Rewrite {
   edits: Edit[];
   /** The wire transform is stated, so its declarations are appended. */
   wire: boolean;
-  /** Start/end of the rewritten call in the NEW text, for re-locating it. */
-  callStart: number;
-  callEnd: number;
+  /**
+   * Start/end of the rewritten call in the NEW text, for re-locating it, when
+   * a type argument was stated there. A body-read cast states the type
+   * directly, so there is nothing to follow into a result.
+   */
+  typeArgumentCall?: { start: number; end: number };
 }
 
 export class Retyper {
@@ -195,8 +203,7 @@ export class Retyper {
         return {
           edits: [{ start: argStart, end: argEnd, text }],
           wire: useWire && wire,
-          callStart,
-          callEnd: callEnd + delta,
+          typeArgumentCall: { start: callStart, end: callEnd + delta },
         };
       };
     }
@@ -210,8 +217,7 @@ export class Retyper {
         return {
           edits: [{ start: at, end: at, text }],
           wire: useWire && wire,
-          callStart,
-          callEnd: callEnd + text.length,
+          typeArgumentCall: { start: callStart, end: callEnd + text.length },
         };
       };
     }
@@ -222,6 +228,22 @@ export class Retyper {
     // `.data` read as a break (ruling on PR #1492).
     if (!resolvedDeclaration(call)) {
       return 'the consumer call does not resolve in its program (is the client installed?)';
+    }
+    // A typed transport response (`fetch`) whose body the source reads with
+    // `.json()`: the payload is that read, so the cast goes there
+    // (carrick#1493). The call's own result is not the payload and is not
+    // touched.
+    const reads = bodyReadsOf(call);
+    if (typeof reads === 'string') return reads;
+    if (reads.length > 0) {
+      const edits = reads.map(bodyReadEdit);
+      return (useWire) => {
+        const text = stated(useWire);
+        return {
+          edits: edits.flatMap((edit) => edit(text)),
+          wire: useWire && wire,
+        };
+      };
     }
     return (
       `the consumer call takes no type argument and returns ` +
@@ -259,9 +281,11 @@ export class Retyper {
 
     sourceFile.replaceWithText(rewritten);
     try {
-      const reached = this.typeArgumentReachesResult(sourceFile, rewrite);
-      if (reached !== true) {
-        return { kind: 'abstain', reason: reached };
+      if (rewrite.typeArgumentCall) {
+        const reached = this.typeArgumentReachesResult(sourceFile, rewrite.typeArgumentCall);
+        if (reached !== true) {
+          return { kind: 'abstain', reason: reached };
+        }
       }
 
       const post = fileDiagnostics(sourceFile);
@@ -305,11 +329,11 @@ export class Retyper {
    */
   private typeArgumentReachesResult(
     sourceFile: SourceFile,
-    rewrite: Rewrite
+    at: { start: number; end: number }
   ): true | string {
     const call = sourceFile
       .getDescendantsOfKind(SyntaxKind.CallExpression)
-      .find((c) => c.getStart() === rewrite.callStart && c.getEnd() === rewrite.callEnd);
+      .find((c) => c.getStart() === at.start && c.getEnd() === at.end);
     if (!call) return 'the retyped call could not be found again after the rewrite';
     const stated = call.getTypeArguments()[0]?.getType();
     if (!stated) return 'the retyped call carries no type argument';
@@ -395,11 +419,12 @@ function resolvedDeclaration(call: CallExpression): ts.SignatureDeclaration | un
  * is judged. A callback handed to a call returns into that call, which is
  * also in view.
  */
-function resultEscapes(call: CallExpression): string | undefined {
+function resultEscapes(call: CallExpression, throughCasts = false): string | undefined {
   let top: Node = call;
   while (
     Node.isAwaitExpression(top.getParentOrThrow()) ||
-    Node.isParenthesizedExpression(top.getParentOrThrow())
+    Node.isParenthesizedExpression(top.getParentOrThrow()) ||
+    (throughCasts && Node.isAsExpression(top.getParentOrThrow()))
   ) {
     top = top.getParentOrThrow();
   }
@@ -455,6 +480,158 @@ function returnsUndeclared(node: Node): boolean {
     if (Node.isBlock(parent)) return false;
   }
   return false;
+}
+
+/**
+ * The `.json()` body reads that carry this call's payload, or why the ones
+ * the source makes cannot be judged (carrick#1493). An empty list means the
+ * source reads no JSON body off the result.
+ *
+ * The located call may be the body read itself (`res.json()`), or the call
+ * whose result the source reads it from: `(await fetch(u)).json()`, or
+ * `const res = await fetch(u)` followed by `res.json()` on that binding.
+ *
+ * A read counts only when it is on THIS call's result: the binding is a
+ * plain name that is never reassigned, and every other use of it is a member
+ * read (`res.ok`, `res.status`). A response handed whole to anything else
+ * may have its body read out of view, so an agreement here would claim reads
+ * the diff cannot see.
+ */
+function bodyReadsOf(call: CallExpression): CallExpression[] | string {
+  if (isBodyRead(call)) return checkedBodyReads([call]);
+
+  let top: Node = call;
+  while (
+    Node.isAwaitExpression(top.getParentOrThrow()) ||
+    Node.isParenthesizedExpression(top.getParentOrThrow())
+  ) {
+    top = top.getParentOrThrow();
+  }
+  const chained = bodyReadOn(top);
+  if (chained) return checkedBodyReads([chained]);
+
+  const declaration = top.getParent();
+  if (
+    !declaration ||
+    !Node.isVariableDeclaration(declaration) ||
+    declaration.getInitializer() !== top
+  ) {
+    return [];
+  }
+  const name = declaration.getNameNode();
+  if (!Node.isIdentifier(name)) return [];
+
+  const reads: CallExpression[] = [];
+  let handedOn = false;
+  for (const ref of name.findReferencesAsNodes()) {
+    const read = bodyReadOn(ref);
+    if (read) {
+      reads.push(read);
+      continue;
+    }
+    const parent = ref.getParent();
+    if (
+      parent &&
+      Node.isBinaryExpression(parent) &&
+      parent.getLeft() === ref &&
+      isAssignmentOperator(parent.getOperatorToken().getKind())
+    ) {
+      return 'the response binding is reassigned, so its body may not be this call\'s payload';
+    }
+    if (!parent || !Node.isPropertyAccessExpression(parent) || parent.getExpression() !== ref) {
+      handedOn = true;
+    }
+  }
+  if (reads.length === 0) return [];
+  if (handedOn) {
+    return 'the response object is handed on, so its body may be read elsewhere';
+  }
+  return checkedBodyReads(reads);
+}
+
+/** Why these body reads cannot be retyped, or the reads themselves. */
+function checkedBodyReads(reads: CallExpression[]): CallExpression[] | string {
+  const checker = reads[0].getProject().getTypeChecker().compilerObject;
+  for (const read of reads) {
+    const returned = read.getType().compilerType;
+    const body = checker.getAwaitedType(returned) ?? returned;
+    if (!(body.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown))) {
+      // The source's own client states what the body is; that is the
+      // consumer's contract, and it is compared as one, not retyped.
+      return (
+        `the consumer's body read already states a type ` +
+        `('${checker.typeToString(body)}'), so it is not retyped`
+      );
+    }
+  }
+  if (reads.every((read) => resultIsDiscarded(read))) {
+    return 'the consumer never reads the response body';
+  }
+  for (const read of reads) {
+    const escape = resultEscapes(read, true);
+    if (escape) return escape.replace('the response', 'the response body');
+  }
+  return reads;
+}
+
+/** `node.json()` with no arguments, where `node` is the receiver. */
+function bodyReadOn(node: Node): CallExpression | undefined {
+  const access = node.getParent();
+  if (
+    !access ||
+    !Node.isPropertyAccessExpression(access) ||
+    access.getExpression() !== node ||
+    access.getName() !== 'json'
+  ) {
+    return undefined;
+  }
+  const read = access.getParent();
+  return read && Node.isCallExpression(read) && read.getExpression() === access && isBodyRead(read)
+    ? read
+    : undefined;
+}
+
+function isBodyRead(call: CallExpression): boolean {
+  const callee = call.getExpression();
+  return (
+    Node.isPropertyAccessExpression(callee) &&
+    callee.getName() === 'json' &&
+    call.getArguments().length === 0
+  );
+}
+
+function isAssignmentOperator(kind: SyntaxKind): boolean {
+  return kind >= SyntaxKind.FirstAssignment && kind <= SyntaxKind.LastAssignment;
+}
+
+/**
+ * The edits that state `P` at one body read. A cast the source wrote around
+ * the parsed body (`(await res.json()) as Order`) is REPLACED, as a type
+ * argument the source wrote is: what is judged is how the source uses the
+ * body, not what it claimed the body was. Otherwise the read itself is cast:
+ * `(res.json() as Promise<P>)`.
+ */
+function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
+  let node: Node = read;
+  let awaited = false;
+  for (let parent = node.getParent(); parent; parent = node.getParent()) {
+    if (Node.isAwaitExpression(parent)) awaited = true;
+    else if (Node.isAsExpression(parent)) {
+      const type = parent.getTypeNodeOrThrow();
+      const start = type.getStart();
+      const end = type.getEnd();
+      return (stated) => [{ start, end, text: awaited ? stated : `Promise<${stated}>` }];
+    } else if (!Node.isParenthesizedExpression(parent)) break;
+    node = parent;
+  }
+  const start = read.getStart();
+  const end = read.getEnd();
+  return (stated) => [
+    // The compiler reports past a parenthesis, so a finding on the cast read
+    // lands on `res`, an original position, never on this one.
+    { start, end: start, text: '(' },
+    { start: end, end, text: ` as Promise<${stated}>)` },
+  ];
 }
 
 function declaresTypeParameters(call: CallExpression): boolean {

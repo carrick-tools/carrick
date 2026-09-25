@@ -3814,6 +3814,195 @@ mod tests {
         }
     }
 
+    /// carrick#1493: a consumer that calls `fetch` and reads the body with
+    /// `res.json()` is judged through capture, check_v2 and the retype, end to
+    /// end against the real sidecar ($0, no model).
+    ///
+    /// `fetch` takes no type argument and returns a typed `Response`, so the
+    /// retype used to abstain on the call. The payload is the body read on
+    /// its binding, and that read is what now carries the producer's type:
+    /// a read of a field the producer does not return is flagged at its
+    /// line, and one it does return is compatible.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn fetch_body_read_is_judged_by_retyping_it() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let api_root = manifest_dir
+            .join("tests/fixtures/retype-http-client/api")
+            .canonicalize()
+            .expect("api fixture");
+        let web_dir = tempfile::tempdir().unwrap();
+        let web_root = web_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(web_root.join("src")).unwrap();
+        std::fs::write(
+            web_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","lib":["es2022","dom"],"skipLibCheck":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        // Line numbers are read off this text; keep the two in step.
+        std::fs::write(
+            web_root.join("src/checkout.ts"),
+            "export async function loadCheckout(): Promise<number> {\n  \
+             const res = await fetch(\"/checkout\");\n  \
+             const body = await res.json();\n  \
+             return body.x;\n\
+             }\n",
+        )
+        .unwrap();
+        let (call_line, read_line) = (2, 4);
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&web_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let key = OperationKey::http("POST", "/checkout");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let site = crate::type_manifest::build_site_id(
+            "src/checkout.ts",
+            call_line,
+            &key,
+            web_root.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_site_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&site),
+        );
+        let infer = vec![InferRequestItem {
+            file_path: web_root
+                .join("src/checkout.ts")
+                .to_string_lossy()
+                .into_owned(),
+            line_number: call_line,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("fetch(\"/checkout\")".to_string()),
+            expression_line: Some(call_line),
+            infer_kind: InferKind::CallResult,
+            alias: Some(consumer_alias.clone()),
+            param_name: None,
+        }];
+        let inferred = sidecar
+            .infer_types(&infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let consumer_anchors = derive_capture_anchors(
+            &[],
+            &infer,
+            &[],
+            &inferred,
+            std::slice::from_ref(&consumer_alias),
+            web_root.to_str().unwrap(),
+        );
+        let (web_stub, web_artifact) = run_capture(
+            &sidecar,
+            web_root.to_str().unwrap(),
+            "web",
+            &consumer_anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("web capture");
+        let _ = std::fs::remove_dir_all(&web_stub);
+
+        let producer = |type_text: &str| {
+            let (dir, artifact) = run_capture(
+                &sidecar,
+                api_root.to_str().unwrap(),
+                "api",
+                &[CaptureAnchor::Literal {
+                    alias: producer_alias.clone(),
+                    type_text: type_text.to_string(),
+                    anchor_origin: AnchorOrigin::LlmSymbol,
+                    source_file: None,
+                }],
+                &HashMap::new(),
+                None,
+            )
+            .expect("api capture");
+            let expanded = sidecar
+                .resolve_definitions(dir.to_str().unwrap(), std::slice::from_ref(&producer_alias))
+                .expect("definitions")
+                .remove(0)
+                .expanded;
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut producer_entry = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                &producer_alias,
+                "src/checkout.ts",
+                1,
+                ManifestTypeState::Explicit,
+            );
+            producer_entry.expanded_definition = Some(expanded);
+            vec![
+                repo("api", None, vec![producer_entry], Some(artifact)),
+                repo(
+                    "web",
+                    None,
+                    vec![entry(
+                        key.clone(),
+                        ManifestRole::Consumer,
+                        ManifestTypeKind::Response,
+                        &consumer_alias,
+                        "src/checkout.ts",
+                        call_line,
+                        ManifestTypeState::Unknown,
+                    )],
+                    Some(web_artifact.clone()),
+                ),
+            ]
+        };
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: web_root.clone(),
+                tsconfig: None,
+                calls: consumer_call_locators(&infer),
+            },
+        )]);
+        let only = |outcomes: Vec<PairCheckOutcome>| -> PairCheckOutcome {
+            assert_eq!(outcomes.len(), 1, "{outcomes:#?}");
+            outcomes.into_iter().next().unwrap()
+        };
+
+        let returns_y = producer("{ y: number }");
+
+        // Control: no retype. The body read is `any`, so nothing is compared.
+        let control = only(run_check(&sidecar, &returns_y, &LocalConsumers::new()));
+        assert!(
+            !control.resolved && control.bucket != VerdictBucket::Incompatible,
+            "unverified without the retype: {control:#?}"
+        );
+
+        let flagged = only(run_check(&sidecar, &returns_y, &local));
+        assert_eq!(flagged.bucket, VerdictBucket::Incompatible, "{flagged:#?}");
+        assert!(flagged.resolved, "{flagged:#?}");
+        assert_eq!(flagged.gate.as_deref(), Some("retype:consumer"));
+        let diagnostic = flagged.diagnostic.as_deref().unwrap_or_default();
+        assert!(
+            diagnostic.contains(&format!("src/checkout.ts:{read_line}:"))
+                && diagnostic.contains("Property 'x' does not exist"),
+            "the read of the missing field is named at its line: {diagnostic}"
+        );
+
+        let agreed = only(run_check(&sidecar, &producer("{ x: number }"), &local));
+        assert_eq!(agreed.bucket, VerdictBucket::Compatible, "{agreed:#?}");
+        assert!(agreed.resolved, "{agreed:#?}");
+        assert_eq!(agreed.diagnostic, None);
+    }
+
     #[test]
     #[serial(v2_capture_sidecar)]
     fn explicit_config_survives_initial_capture_and_backfill() {
