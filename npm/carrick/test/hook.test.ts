@@ -155,10 +155,10 @@ test("the hook's own work fits the 300 ms budget", async (t) => {
 
   // CPU time on the hook's main thread, which excludes the CLI it spawns. Wall
   // time on a shared runner measured the concurrent test files too
-  // (carrick#1498); cpu-usage.mjs gives the margin. Waiting on the CLI is
-  // covered by the slow-CLI test above.
+  // (carrick#1498); cpu-usage.mjs gives the margin.
   const run = await runHook("post-edit.ts", {
     payload: editPayload(workspace),
+    env: fakeEnv({ CARRICK_LOG_QUIET: "0" }),
     nodeArgs: [`--import=${path.join(testDir, "cpu-usage.mjs")}`],
   });
   assert.equal(run.code, 0);
@@ -166,8 +166,16 @@ test("the hook's own work fits the 300 ms budget", async (t) => {
   const cpu = /carrick-test-cpu-ms=(\d+)/.exec(run.stderr);
   assert.ok(cpu, `the hook reported no CPU time: ${run.stderr}`);
   const ours = Number(cpu[1]);
-  t.diagnostic(`hook CPU ${ours}ms, wall ${run.ms}ms`);
+  const cli = /in (\d+)ms/.exec(run.stderr);
+  assert.ok(cli, `the hook logged no CLI time: ${run.stderr}`);
+  const waited = run.ms - Number(cli[1]);
+  t.diagnostic(`hook CPU ${ours}ms, wall ${run.ms}ms, wall less CLI ${waited}ms`);
   assert.ok(ours < 300, `hook used ${ours}ms of CPU (wall ${run.ms}ms)`);
+  // CPU time does not count waiting, so a hook that blocks on the network or
+  // a timer passes the bound above. This catches it. 2 s is far above the
+  // 322 ms a loaded shared runner has measured, so contention does not trip
+  // it, and far below the seconds a network wait takes.
+  assert.ok(waited < 2000, `hook spent ${waited}ms of wall time outside the CLI`);
 });
 
 test("the hook stays quiet when the LSP owns delivery", async (t) => {
