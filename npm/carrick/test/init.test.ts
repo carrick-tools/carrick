@@ -3164,7 +3164,9 @@ test("inside one repo, init asks which repos beside it belong with it, and a yes
     assert.deepEqual(first.initial, [fixture.app]);
     // The project question names both repos, this one first, and nothing is
     // asked to be confirmed before the one "Go ahead?".
-    assert.deepEqual(out.questions.slice(1).map((entry) => entry.question), [
+    // The first three after it: a machine with no global carrick is then
+    // offered one, which is a question about the machine, not this setup.
+    assert.deepEqual(out.questions.slice(1, 4).map((entry) => entry.question), [
       "Which project should shop-app and shop-api be in?",
       "Project name",
       "Go ahead?",
@@ -3225,7 +3227,7 @@ test("with only this repo ticked, every line names it alone and a sibling is nev
     const out = siblingTerminal((rows) => [rows[0]!.value]);
     assert.equal(await initWith([fixture.app], out, true), 0, out.lines.join("\n"));
     const said = out.lines.join("\n");
-    assert.deepEqual(out.questions.slice(1).map((entry) => entry.question), [
+    assert.deepEqual(out.questions.slice(1, 4).map((entry) => entry.question), [
       "Which project should shop-app be in?",
       "Project name",
       "Go ahead?",
@@ -3325,4 +3327,31 @@ test("a sibling is a JavaScript repo in the folder above, not left out and not t
     [],
   );
   assert.deepEqual(siblingRepos({ ...plan, parent_proposal: null }), []);
+});
+
+// carrick#1512: nothing is created, connected or written before the one
+// "Go ahead?". A no to it, after a sibling was ticked and a new project named,
+// leaves the folder, both repos and Carrick as they were.
+test("a no to Go ahead creates no project and writes nothing, in the folder or the repos", posixNativeFixture, async () => {
+  const fixture = siblingFolder({});
+  try {
+    const out = siblingTerminal((rows) => rows.map((row) => row.value));
+    out.confirm = async (question) => {
+      out.questions.push({ question });
+      return false;
+    };
+    assert.equal(await initWith([fixture.app], out, true), 0, out.lines.join("\n"));
+    assert.equal(out.questions.at(-1)?.question, "Go ahead?");
+    assert.ok(out.lines.includes(`■ ${NOTHING_WRITTEN}`), out.lines.join("\n"));
+    assert.deepEqual(
+      fixture.asked.filter((line) => !line.startsWith("resolve-repos") && line !== "list-projects"),
+      [],
+    );
+    assert.deepEqual(fs.readdirSync(fixture.folder).sort(), ["shop-api", "shop-app", "tools-py"]);
+    for (const repo of [fixture.api, fixture.app]) {
+      assert.deepEqual(fs.readdirSync(repo).sort(), [".git", "package.json"], repo);
+    }
+  } finally {
+    fixture.restore();
+  }
 });
