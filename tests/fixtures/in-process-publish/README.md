@@ -22,6 +22,8 @@ dependencies it does not list. No package is installed: the scan only needs
 | `orders.service.ts:33` | `notify` | a plain function sending to a module-scope instance |
 | `inventory.listener.ts:10` | `FeedService.subscribe` | the subscribing side, on a line where the callback is a definition of its own |
 | `billing.service.ts:24` (`invoice.viewed`) | `FeedService.publish` | the same wrapper from a second caller file |
+| `audit.service.ts:14` | `FeedService.publish` | the same, with the topic passed as a module-scope constant |
+| `audit.service.ts:15` | `FeedService.publish` | the same, with the topic in a template literal |
 
 ## Kept
 
@@ -45,6 +47,13 @@ dependencies it does not list. No package is installed: the scan only needs
 | `streaming.service.ts:12` | `StreamBus` calls a method it inherits from a package class |
 | `streaming.service.ts:13` | `queueNote` calls through a namespace import of a package |
 | `streaming.service.ts:14` | `SnapshotPublisher` constructs a package object with arguments in its body, beside a push onto its own list |
+| `audit.service.ts:13` | `AuditTrail` is in-memory, but `RetryingAuditTrail` defines the same member and extends a mixin call, an ancestry this pass cannot follow |
+
+`audit.service.ts` also makes an unrelated `fetch` so the file raises a
+candidate and the model is asked about it. `AuditTrail`'s member is `record`,
+not `publish`, on purpose: a class whose ancestry cannot be followed keeps
+every row whose wrapper member shares its name, so a `publish` there would
+keep all of the `publish` rows above.
 
 With the detection lists empty, the `inventory.reserved` pair, the
 `streaming.service.ts` rows and `billing.service.ts:18` are the only rows

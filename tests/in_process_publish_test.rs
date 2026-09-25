@@ -136,6 +136,7 @@ const SHIPPING: &str = "src/shipping/shipping.service.ts";
 const BILLING: &str = "src/billing/billing.service.ts";
 const REFUNDS: &str = "src/billing/refunds.listener.ts";
 const STREAMING: &str = "src/billing/streaming.service.ts";
+const AUDIT: &str = "src/billing/audit.service.ts";
 
 /// Rows that stay whatever framework detection lists: each is kept by a rule
 /// that reads the code, not the detection step.
@@ -176,6 +177,10 @@ fn kept_whatever_detection_says() -> Vec<Row> {
         // In-process, but an emitter in the service listens for the topic.
         call("invoice.refunded", &format!("{BILLING}:23")),
         endpoint("invoice.refunded", &format!("{REFUNDS}:5")),
+        // An in-memory class, and a class whose ancestry runs through a
+        // function call (a mixin) defines the same member: this pass cannot
+        // say which class that one extends, so it counts as an override.
+        call("order.traced", &format!("{AUDIT}:13")),
     ]
 }
 
@@ -222,6 +227,10 @@ fn withdrawn() -> Vec<Row> {
         endpoint("stock.checked", &format!("{LISTENER}:10")),
         // The same in-process wrapper from a second caller file.
         call("invoice.viewed", &format!("{BILLING}:24")),
+        // The call names its topic through a module-scope constant.
+        call("order.audited", &format!("{AUDIT}:14")),
+        // The call names its topic in a template literal.
+        call("order.tagged", &format!("{AUDIT}:15")),
     ]
 }
 
