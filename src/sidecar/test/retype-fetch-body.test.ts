@@ -128,6 +128,162 @@ export async function passedRead(): Promise<number> {
   const res = await fetch('/p');
   return settle(res.json());
 }
+
+declare function parseBody(value: unknown): any;
+
+export async function errorBranch(): Promise<number> {
+  const res = await fetch('/p');
+  if (!res.ok) {
+    const e = await res.json();
+    throw new Error(e.message);
+  }
+  const body = await res.json();
+  return body.x;
+}
+
+export async function errorOnly(): Promise<number> {
+  const res = await fetch('/p');
+  if (!res.ok) {
+    const e = await res.json();
+    throw new Error(e.message);
+  }
+  return res.status;
+}
+
+export async function sharedRead(): Promise<number> {
+  const res = await fetch('/p');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message);
+  return data.x;
+}
+
+export async function okElse(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.ok) {
+    const body = await res.json();
+    return body.x;
+  } else {
+    const e = await res.json();
+    throw new Error(e.message);
+  }
+}
+
+export async function okFirst(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.ok) return (await res.json()).x;
+  const e = await res.json();
+  throw new Error(e.message);
+}
+
+export async function statusGuard(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status >= 400) {
+    const e = await res.json();
+    throw new Error(e.error);
+  }
+  const body = await res.json();
+  return body.x;
+}
+
+export async function statusOdd(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status > 100) {
+    const e = await res.json();
+    return e.x;
+  }
+  return 0;
+}
+
+export async function doubleCast(): Promise<number> {
+  const res = await fetch('/p');
+  const body = (await res.json()) as unknown as Order;
+  return body.x;
+}
+
+export async function angleCast(): Promise<number> {
+  const res = await fetch('/p');
+  const body = <Order>(await res.json());
+  return body.x;
+}
+
+export async function parsedBody(): Promise<number> {
+  const res = await fetch('/p');
+  const body = parseBody(await res.json());
+  return body.x;
+}
+
+declare class Wrapped {
+  constructor(value: unknown);
+  x: number;
+}
+
+export async function constructed(): Promise<number> {
+  const res = await fetch('/p');
+  const body = new Wrapped(await res.json());
+  return body.x;
+}
+
+export async function errorFirst(): Promise<number> {
+  const res = await fetch('/p');
+  const payload = await res.json();
+  if (!res.ok) throw new Error(payload.message);
+  return res.status;
+}
+
+export async function notFound(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status === 404) return 0;
+  const body = await res.json();
+  return body.x;
+}
+
+export async function statusNot200(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status !== 200) throw new Error((await res.json()).error);
+  const body = await res.json();
+  return body.x;
+}
+
+export async function ternary(): Promise<number> {
+  const res = await fetch('/p');
+  return res.ok ? (await res.json()).x : (await res.json()).code;
+}
+
+export async function switchStatus(): Promise<number> {
+  const res = await fetch('/p');
+  switch (res.status) {
+    case 200:
+      return (await res.json()).x;
+    default:
+      return 0;
+  }
+}
+
+export async function compoundTest(retry: boolean): Promise<number> {
+  const res = await fetch('/p');
+  if (res.ok || retry) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
+
+export async function okBlockFirst(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.ok) {
+    const body = await res.json();
+    return body.x;
+  }
+  const e = await res.json();
+  throw new Error(e.message);
+}
+
+export async function destructured(): Promise<number> {
+  const res = await fetch('/p');
+  const { x, message } = await res.json();
+  if (!res.ok) throw new Error(message);
+  return x;
+}
 `;
 
 const CASES = {
@@ -148,6 +304,25 @@ const CASES = {
   keyedJson: { line: 96, text: "lookup('/p')" },
   passedRead: { line: 104, text: "fetch('/p')", read: 105 },
   locatedAtRead: { line: 7, text: 'res.json()', read: 8 },
+  errorBranch: { line: 111, text: "fetch('/p')", read: 117 },
+  errorOnly: { line: 121, text: "fetch('/p')" },
+  sharedRead: { line: 130, text: "fetch('/p')" },
+  okElse: { line: 137, text: "fetch('/p')", read: 140 },
+  okFirst: { line: 148, text: "fetch('/p')", read: 149 },
+  statusGuard: { line: 155, text: "fetch('/p')", read: 161 },
+  statusOdd: { line: 165, text: "fetch('/p')" },
+  doubleCast: { line: 174, text: "fetch('/p')" },
+  angleCast: { line: 180, text: "fetch('/p')" },
+  parsedBody: { line: 186, text: "fetch('/p')" },
+  constructed: { line: 197, text: "fetch('/p')" },
+  errorFirst: { line: 203, text: "fetch('/p')" },
+  notFound: { line: 210, text: "fetch('/p')", read: 213 },
+  statusNot200: { line: 217, text: "fetch('/p')", read: 220 },
+  ternary: { line: 224, text: "fetch('/p')", read: 225 },
+  switchStatus: { line: 229, text: "fetch('/p')" },
+  okBlockFirst: { line: 248, text: "fetch('/p')", read: 251 },
+  destructured: { line: 258, text: "fetch('/p')" },
+  compoundTest: { line: 239, text: "fetch('/p')" },
 } as const;
 
 interface Outcome {
@@ -220,6 +395,14 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     'castPromise',
     'inCallback',
     'locatedAtRead',
+    'errorBranch',
+    'okElse',
+    'okFirst',
+    'statusGuard',
+    'notFound',
+    'statusNot200',
+    'ternary',
+    'okBlockFirst',
   ] as const) {
     it(`(${name}) flags the read of a field the producer does not return`, async () => {
       const out = await retype(name, '{ y: number; }');
@@ -245,7 +428,7 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     assert.strictEqual(agreeing.outcome, 'agrees', JSON.stringify(agreeing));
   });
 
-  for (const name of ['arrowBody', 'passedRead'] as const) {
+  for (const name of ['arrowBody'] as const) {
     it(`(${name}) judges a body read handed straight to a typed place`, async () => {
       // The cast read is parenthesised; the finding must still land on the
       // read's own line and not read as the producer's type failing.
@@ -304,6 +487,46 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
     assert.match(out.reason ?? '', /reassigned/);
   });
+
+  it('retypes only the success path: a read on the error path alone abstains', async () => {
+    const out = await retype('errorOnly', '{ y: number; }');
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.match(out.reason ?? '', /only on its error path/);
+  });
+
+  it('retypes only the success path: a read used only on the error path abstains', async () => {
+    const out = await retype('errorFirst', '{ y: number; }');
+    assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+    assert.match(out.reason ?? '', /only on its error path/);
+  });
+
+  for (const name of ['sharedRead', 'destructured'] as const) {
+    it(`(${name}) abstains when one body read serves both the success and the error path`, async () => {
+      const out = await retype(name, '{ x: number; }');
+      assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+      assert.match(out.reason ?? '', /both the success and the error path/);
+    });
+  }
+
+  for (const name of ['statusOdd', 'switchStatus', 'compoundTest'] as const) {
+    it(`(${name}) abstains when a status test does not say which side fails`, async () => {
+      const out = await retype(name, '{ x: number; }');
+      assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+      assert.match(out.reason ?? '', /failing side is unclear/);
+    });
+  }
+
+  for (const name of ['doubleCast', 'angleCast', 'parsedBody', 'passedRead', 'constructed'] as const) {
+    it(`(${name}) abstains when a cast, assertion or call around the read types it`, async () => {
+      // Replacing only the innermost type would let the outer one agree with
+      // any producer.
+      for (const producer of ['{ y: number; }', '{ x: number; }']) {
+        const out = await retype(name, producer);
+        assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));
+        assert.match(out.reason ?? '', /already states a type/);
+      }
+    });
+  }
 
   it('abstains when the body read already states a type', async () => {
     const out = await retype('typedBody', '{ y: number; }');
