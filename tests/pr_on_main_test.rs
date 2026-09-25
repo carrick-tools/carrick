@@ -498,8 +498,10 @@ fn call_at(findings: &[serde_json::Value], line: u32) -> serde_json::Value {
 /// so the recomputation cannot judge them. Main's own scan did judge them,
 /// with main's sources, and stored the answer: that answer is main's.
 ///
-/// The PR changes only a line after the calls, so the surface differs and
-/// main's side runs, while every call keeps its line.
+/// The PR adds an exported function after the calls, so every call keeps its
+/// line and the scanned surface gains a function definition. That difference,
+/// not the unordered sets the surface also holds (carrick#786), is what makes
+/// main's side run, and the test checks it is there.
 #[tokio::test]
 async fn a_break_main_stored_from_its_own_retype_is_on_main() {
     let _serial = SERIAL.lock().await;
@@ -522,17 +524,46 @@ async fn a_break_main_stored_from_its_own_retype_is_on_main() {
             })
             .map(|site| site.consumer_location.clone())
             .collect();
-        assert!(
-            stored.contains(&"web/src/checkout.ts:11".to_string()),
-            "main's scan stored its own retype of the untyped read: {stored:?}"
-        );
+        for line in [6, 11] {
+            let site = format!("web/src/checkout.ts:{line}");
+            assert!(
+                stored.contains(&site),
+                "main's scan stored its own retype of the call at {site}: {stored:?}"
+            );
+        }
     }
 
     let checkout = repo.join("web/src/checkout.ts");
     let mut source = std::fs::read_to_string(&checkout).unwrap();
-    source.push_str("\nexport const checkoutPath = \"/checkout\";\n");
+    source.push_str(
+        "\nexport function checkoutPath(orderId: string): string {\n  return `/checkout/${orderId}`;\n}\n",
+    );
     std::fs::write(&checkout, source).unwrap();
-    commit(&repo, "pr: an export after the calls");
+    commit(&repo, "pr: a function after the calls");
+
+    // The edit is in the surface the PR run compares with main's copy: a
+    // main-branch scan of the PR's tree defines a function main's copy does
+    // not. Checked here so the run count below never rests on chance.
+    let web_functions = |store: &Store| -> std::collections::BTreeSet<String> {
+        store
+            .repos
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|repo| repo.service_name.as_deref() == Some("web"))
+            .flat_map(|repo| repo.function_definitions.keys().cloned())
+            .collect()
+    };
+    let pr_tree = Store::default();
+    scan(&pr_tree, &repo).await;
+    let added: Vec<String> = web_functions(&pr_tree)
+        .difference(&web_functions(&store))
+        .cloned()
+        .collect();
+    assert!(
+        added.iter().any(|name| name.contains("checkoutPath")),
+        "the PR's function is in the scanned surface: added {added:?}"
+    );
 
     let runs = main_side_runs();
     let findings = pr_scan_with(&store, &repo, true).await;
