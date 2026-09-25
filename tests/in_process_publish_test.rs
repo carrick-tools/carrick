@@ -149,12 +149,16 @@ fn only_calls_that_reach_a_transport_or_a_counterpart_stay_pubsub_rows() {
         endpoint("inventory.reserved", &format!("{LISTENER}:9")),
         // A field constructed from a runtime global: the globals include
         // sockets.
-        call("shipment.sent", &format!("{SHIPPING}:13")),
-        // A global called with arguments: `fetch` as much as anything.
-        call("shipment.sent", &format!("{SHIPPING}:14")),
+        call("shipment.sent", &format!("{SHIPPING}:15")),
+        // A global called with arguments (`fetch` as much as anything), next
+        // to a push onto the class's own list.
+        call("shipment.sent", &format!("{SHIPPING}:16")),
         // A constructed field the class reassigns: whatever was attached last
         // is what the call reaches.
-        call("shipment.sent", &format!("{SHIPPING}:15")),
+        call("shipment.sent", &format!("{SHIPPING}:17")),
+        // No call at all, only a write to a handed-in object: nothing shows
+        // the value staying here.
+        call("shipment.sent", &format!("{SHIPPING}:18")),
     ];
     for row in &kept {
         assert!(

@@ -30,6 +30,7 @@ say they are dependencies.
 | `orders.service.ts:31` | `RelayPublisher` sends through a transport it was handed |
 | `orders.service.ts:32` | a call on the package client itself resolves to no repo function |
 | `orders.service.ts:26`, `inventory.listener.ts:9` | in-process, but the service subscribes to the topic it publishes: a pair |
-| `shipping.service.ts:13` | `SocketPublisher` constructs a runtime global (a socket) |
-| `shipping.service.ts:14` | `HttpEvents` calls a global with arguments (`fetch`) |
-| `shipping.service.ts:15` | `SwappableFeed` reassigns the field it sends to |
+| `shipping.service.ts:15` | `SocketPublisher` constructs a runtime global (a socket) |
+| `shipping.service.ts:16` | `HttpEvents` calls a global with arguments (`fetch`), beside a push onto its own list |
+| `shipping.service.ts:17` | `SwappableFeed` reassigns the field it sends to |
+| `shipping.service.ts:18` | `SyncedStore` calls nothing; it writes to an object it was handed |
