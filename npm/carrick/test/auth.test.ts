@@ -118,13 +118,14 @@ test("loopback login binds state, S256, resource and redirect to the token excha
  */
 async function roundTrip(
   callback: (state: string) => string,
-  reply: (url: string, events: string[]) => Response,
+  reply: (url: string, events: string[], signal?: AbortSignal | null) => Response | Promise<Response>,
+  extra: Partial<OAuthOptions> = {},
 ): Promise<{ outcome: PromiseSettledResult<string>; status: number; type: string | null; html: string; events: string[] }> {
   const events: string[] = [];
   let redirect = "";
   let page: Promise<Response> | undefined;
   const outcome = (await Promise.allSettled([authorize({
-    timeoutMs: 3000, say: () => {},
+    timeoutMs: 3000, say: () => {}, ...extra,
     fetch: async (input, options) => {
       const url = String(input);
       if (url.endsWith("/oauth/register")) {
@@ -134,7 +135,7 @@ async function roundTrip(
       // A slow server: a page sent before the exchange would arrive first.
       await new Promise((resolve) => setTimeout(resolve, 30));
       events.push(url.endsWith("/oauth/token") ? "exchange" : "lookup");
-      return reply(url, events);
+      return reply(url, events, options?.signal);
     },
     open: async (value) => {
       page = fetch(`${redirect}?${callback(new URL(value).searchParams.get("state")!)}`)
@@ -166,6 +167,18 @@ test("a failed workspace lookup keeps the token and still says signed in", async
   const run = await roundTrip((state) => `code=accepted&state=${state}`, (url) => url.endsWith("/oauth/token") ? issued(url) : new Response("{}", { status: 503 }));
   assert.equal(run.outcome.status === "fulfilled" && run.outcome.value, "issued");
   assert.match(run.html, /<h1>Signed in to Carrick<\/h1>/);
+});
+
+test("a hung workspace lookup is bounded and the page goes out without the name", async () => {
+  const started = Date.now();
+  const run = await roundTrip((state) => `code=accepted&state=${state}`, (url, _events, signal) => url.endsWith("/oauth/token")
+    ? issued(url)
+    // Never answers; only the caller's signal ends it.
+    : new Promise<Response>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  { lookupTimeoutMs: 100 });
+  assert.equal(run.outcome.status === "fulfilled" && run.outcome.value, "issued");
+  assert.match(run.html, /<h1>Signed in to Carrick<\/h1>/);
+  assert.ok(Date.now() - started < 2000, "the lookup bound, not the login timeout, released the page");
 });
 
 test("a failed exchange shows the failure and the retry on the page", async () => {

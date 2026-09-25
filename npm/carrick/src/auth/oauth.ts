@@ -20,6 +20,8 @@ export type OAuthOptions = {
   open?: (url: string) => Promise<boolean>;
   say?: (message: string) => void;
   timeoutMs?: number;
+  /** Bound on the workspace lookup that names the page. Default 3 s. */
+  lookupTimeoutMs?: number;
   signal?: AbortSignal;
 };
 
@@ -48,9 +50,15 @@ code{font:.95em ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e8eb}
 `;
 }
 
-function answer(res: http.ServerResponse, status: number, heading: string, line: string): void {
-  if (res.writableEnded) return;
+/** Send the page; resolves once it has been flushed or the browser went away. */
+function answer(res: http.ServerResponse, status: number, heading: string, line: string): Promise<void> {
+  if (res.writableEnded) return Promise.resolve();
+  const done = new Promise<void>((resolve) => {
+    res.once("finish", resolve);
+    res.once("close", resolve);
+  });
   res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPage(heading, line));
+  return done;
 }
 
 const TRY_AGAIN = "Run `carrick login` again.";
@@ -68,6 +76,7 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
   // The browser that delivered the code waits on this response until the
   // exchange has finished, so the page states the real outcome.
   let pending: http.ServerResponse | null = null;
+  let delivered: Promise<void> = Promise.resolve();
   const server = http.createServer((req, res) => {
     res.setHeader("Cache-Control", "no-store");
     let url: URL;
@@ -141,8 +150,10 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
     if (pending) {
       // The workspace name is for the page only. A failed lookup must not
       // lose an issued token: the caller saves it and reports the lookup.
-      const workspace = await resolveRepos(body.access_token, [], request, signal).then((r) => r.workspace.slug, () => null);
-      answer(pending, 200, workspace ? `Signed in to ${workspace}` : "Signed in to Carrick",
+      // Bounded: a hung lookup must not hold the token back from the caller.
+      const lookup = AbortSignal.any([signal, AbortSignal.timeout(options.lookupTimeoutMs ?? 3_000)]);
+      const workspace = await resolveRepos(body.access_token, [], request, lookup).then((r) => r.workspace.slug, () => null);
+      delivered = answer(pending, 200, workspace ? `Signed in to ${workspace}` : "Signed in to Carrick",
         "You can close this tab. Next, run `carrick init` in the folder that holds your repos.");
     }
     return body.access_token;
@@ -155,11 +166,13 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
         : new Error("Carrick login could not complete. Check the connection and loopback listener, then run carrick login.");
     if (pending) {
       const said = failure.message.replace(/ Run carrick login.*$/, "").replace(/, then run carrick login\.$/, ".");
-      answer(pending, 400, "Sign-in failed", `${said} ${TRY_AGAIN}`);
+      delivered = answer(pending, 400, "Sign-in failed", `${said} ${TRY_AGAIN}`);
     }
     throw failure;
   } finally {
     signal.removeEventListener("abort", cancel);
+    // Let the page finish writing before connections are torn down.
+    await delivered;
     server.closeAllConnections();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
   }
