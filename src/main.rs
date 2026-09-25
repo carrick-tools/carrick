@@ -51,6 +51,7 @@ mod packages;
 mod panic_report;
 mod parser;
 mod phase_timing;
+mod pr_baseline;
 mod preflight;
 mod progress;
 mod receiver_origin;

@@ -1471,6 +1471,27 @@ pub struct PairCheckOutcome {
     pub notes: Vec<String>,
 }
 
+/// The pairing a type-mismatch outcome is about (carrick-cloud#1369): the
+/// producer service and operation, the consumer service and file, and the
+/// direction. It leaves out the line, which a PR moves by editing the consumer
+/// file above the call, and the aliases, which hash that line.
+fn type_pair_key(outcome: &PairCheckOutcome) -> String {
+    let consumer_file = strip_ci_workspace_prefix(&outcome.consumer_file);
+    let direction = match outcome.type_kind {
+        crate::cloud_storage::ManifestTypeKind::Request => "request",
+        crate::cloud_storage::ManifestTypeKind::Response => "response",
+    };
+    format!(
+        "{}|{}|{}~{}|{}|{}",
+        outcome.producer_service,
+        outcome.pseudo_method,
+        outcome.identity,
+        outcome.consumer_service,
+        consumer_file,
+        direction
+    )
+}
+
 impl CoreExtractor for Analyzer {}
 
 impl Analyzer {
@@ -2556,8 +2577,14 @@ impl Analyzer {
         // advisories — mirrors the report's section order.
         let mut findings: Vec<Finding> = Vec::new();
         for ((method, path, expected), (sites, sources)) in method_mismatches {
+            // The producer this verb misses and the verb the consumers send:
+            // the matcher's own row key, and the pairing a PR run compares
+            // with main's on (carrick-cloud#1369). Which files send it is
+            // compared per call site, so it is not in the key.
+            let pair = format!("{expected} {path}~{method}");
             findings.push(
                 Finding::method_mismatch(method, path, None, sites.into_iter().collect(), expected)
+                    .with_pair(Some(pair))
                     .with_edge_source(crate::findings::EdgeSource::fold(sources))
                     // A wrong verb on a declared route is a routing fact; no type
                     // verdict bears on it, which is not the same as one that could
@@ -3291,6 +3318,11 @@ impl Analyzer {
                 // finding carries it rather than leaving a reader to infer a
                 // direction from an alias name.
                 .with_direction(Some(outcome.type_kind))
+                // The pairing, for the PR run's comparison with main
+                // (carrick-cloud#1369). Not `outcome.pair_key`: both of its
+                // aliases hash a site's line, so an edit above the call would
+                // read as a new pair.
+                .with_pair(Some(type_pair_key(outcome)))
             })
             .collect()
     }
@@ -4775,6 +4807,7 @@ mod tests {
                     vec!["client.ts:12".into()],
                     "POST",
                 )
+                .with_pair(Some("POST /api/orders~GET".to_string()))
                 .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ],
             "a wrong-verb call must surface once, as a risk"
@@ -5755,6 +5788,7 @@ mod tests {
                     vec!["client.ts:7".into()],
                     "POST",
                 )
+                .with_pair(Some("POST /orders/:id~GET".to_string()))
                 .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ]
         );
@@ -5785,6 +5819,7 @@ mod tests {
             vec![
                 // Expected method is the unverified POST, not the verified GET.
                 Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "POST")
+                    .with_pair(Some("POST /a~PUT".to_string()))
                     .with_verdict_state(Some(crate::findings::VerdictState::NotChecked)),
                 // GET /b keeps its orphan classification; POST /a is
                 // suppressed (it is the producer the risk names).
@@ -5820,6 +5855,7 @@ mod tests {
             findings,
             vec![
                 Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "GET",)
+                    .with_pair(Some("GET /a~PUT".to_string()))
                     .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ]
         );
@@ -5883,6 +5919,64 @@ mod tests {
             unresolved_reason: None,
             notes: Vec::new(),
         }
+    }
+
+    /// carrick-cloud#1369: the pairing a type mismatch is compared with
+    /// main's on. A PR that edits the consumer file above the call moves the
+    /// line and, through the site hash, both aliases and the check's own
+    /// `pair_key`; none of them may change the pairing. The file, the
+    /// operation, either service and the direction do.
+    #[test]
+    fn a_type_pairing_ignores_the_line_and_the_aliases() {
+        let base = outcome(
+            "GET",
+            "/orders/:id",
+            "/home/runner/work/web/web/src/client.ts:12",
+            VerdictBucket::Incompatible,
+            None,
+        );
+        let key = type_pair_key(&base);
+        assert_eq!(
+            key,
+            "producer-svc|GET|/orders/:id~consumer-svc|src/client.ts|response"
+        );
+
+        let mut moved = outcome(
+            "GET",
+            "/orders/:id",
+            "/home/runner/work/web/web/src/client.ts:31",
+            VerdictBucket::Incompatible,
+            None,
+        );
+        moved.consumer_alias = "Endpoint_x_Response_Call0123".to_string();
+        moved.producer_alias = "Endpoint_y_Response_At4567".to_string();
+        assert_ne!(moved.pair_key, base.pair_key);
+        assert_eq!(type_pair_key(&moved), key);
+
+        let other_file = outcome(
+            "GET",
+            "/orders/:id",
+            "/home/runner/work/web/web/src/cart.ts:12",
+            VerdictBucket::Incompatible,
+            None,
+        );
+        assert_ne!(type_pair_key(&other_file), key);
+
+        let mut request = base.clone();
+        request.type_kind = crate::cloud_storage::ManifestTypeKind::Request;
+        assert_ne!(type_pair_key(&request), key);
+
+        let mut other_producer = base.clone();
+        other_producer.producer_service = "billing-svc".to_string();
+        assert_ne!(type_pair_key(&other_producer), key);
+
+        let mut other_consumer = base.clone();
+        other_consumer.consumer_service = "admin-svc".to_string();
+        assert_ne!(type_pair_key(&other_consumer), key);
+
+        // And the finding the analyzer emits carries it.
+        let findings = analyzer_with_outcomes(vec![base]).get_type_mismatch_findings();
+        assert_eq!(findings[0].pair(), Some(key.as_str()));
     }
 
     /// A `payments-svc` consumer edge against `producer_key`, with a default
