@@ -1314,6 +1314,7 @@ impl FileOrchestrator {
             stats.wrapper_method_propagations += FileOrchestrator::propagate_wrapper_request_shape(
                 adjusted,
                 pf.wrapper_request_shape.as_ref(),
+                &pf.candidate_map,
             );
             // Collapse inline env-var fallbacks the model rendered
             // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
@@ -7939,18 +7940,47 @@ impl FileOrchestrator {
         normalizer.consumer_call_path(url)
     }
 
+    /// Carry the wrapper's method onto the rows that delegate to it.
+    ///
+    /// A delegating site is a row with no span on a line where no call states
+    /// a request of its own. The span alone is not enough (carrick-cloud#1365):
+    /// a model row whose `candidate_id` did not join also has none, and on a
+    /// line like `api.delete(url)` the call names its verb itself. Overwriting
+    /// that with the verb of whatever wrapper module the file imports turned
+    /// POSTs and DELETEs into GETs. `candidates` is this file's candidate map,
+    /// whose `request_shape` and `request_spec` say which lines state one.
     fn propagate_wrapper_request_shape(
         result: &mut FileAnalysisResult,
         shape: Option<&WrapperRequestShape>,
+        candidates: &HashMap<String, CandidateTarget>,
     ) -> usize {
         let Some(shape) = shape else {
             return 0;
         };
+        let stating_lines: HashSet<usize> = candidates
+            .values()
+            .filter(|candidate| {
+                candidate.request_spec.is_some()
+                    || candidate.request_shape != RequestShapeSignal::NotARequest
+            })
+            .map(|candidate| candidate.line_number)
+            .collect();
         let mut propagated = 0;
         for data_call in &mut result.data_calls {
             // Extracted at its own client call site, not through the wrapper —
             // its method is the one the scanner saw.
             if data_call.call_expression_span_start.is_some() {
+                continue;
+            }
+            // A call on this line states its own request, so the row is not a
+            // delegating site even without a span, and keeps its method.
+            if usize::try_from(data_call.line_number)
+                .is_ok_and(|line| stating_lines.contains(&line))
+            {
+                debug!(
+                    "Not carrying the wrapper's {} onto line {}: a call there states its own request",
+                    shape.method, data_call.line_number
+                );
                 continue;
             }
             let existing = data_call
@@ -11323,8 +11353,11 @@ export * from "./aFetch.js";"#,
             has_body: Some(true),
         };
 
-        let propagated =
-            FileOrchestrator::propagate_wrapper_request_shape(&mut result, Some(&shape));
+        let propagated = FileOrchestrator::propagate_wrapper_request_shape(
+            &mut result,
+            Some(&shape),
+            &HashMap::new(),
+        );
 
         assert_eq!(propagated, 1, "only the delegating site is rewritten");
         assert_eq!(
@@ -11334,6 +11367,77 @@ export * from "./aFetch.js";"#,
         assert_eq!(result.data_calls[1].method.as_deref(), Some("POST"));
     }
 
+    /// carrick-cloud#1365: a model row whose `candidate_id` did not join has no
+    /// span either, but the call on its line names its own verb. The wrapper's
+    /// GET must not reach it. The three line shapes from the ticket: a verb
+    /// call inside `Promise.all(xs.map(...))` (line 11, whose `Promise.all`
+    /// candidate states nothing), a one-line `try` (line 15), and an `if/else`
+    /// with a request on each branch (line 23, two rows). Line 30 has only a
+    /// delegating call, so it still takes the wrapper's verb.
+    #[test]
+    fn a_row_whose_own_line_states_a_request_keeps_its_method() {
+        let verb_call = |id: &str, line: usize, verb: &str| {
+            let mut candidate = candidate_with_snippet(id, None);
+            candidate.line_number = line;
+            candidate.request_shape = RequestShapeSignal::Known(WrapperRequestShape {
+                method: verb.to_string(),
+                has_body: None,
+            });
+            (id.to_string(), candidate)
+        };
+        let mut not_a_request = candidate_with_snippet("span:300-400", None);
+        not_a_request.line_number = 11;
+        let candidates: HashMap<String, CandidateTarget> = [
+            ("span:300-400".to_string(), not_a_request),
+            verb_call("span:350-399", 11, "POST"),
+            verb_call("span:500-560", 15, "DELETE"),
+            verb_call("span:970-1020", 23, "DELETE"),
+            verb_call("span:1030-1080", 23, "POST"),
+        ]
+        .into_iter()
+        .collect();
+        let row = |line: i32, method: &str| DataCallResult {
+            method: Some(method.to_string()),
+            ..call_with_span(line, "/members/${id}", None)
+        };
+        let mut result = result_with_data_calls(vec![
+            row(11, "POST"),
+            row(15, "DELETE"),
+            row(23, "DELETE"),
+            row(23, "POST"),
+            methodless_call(30, "/members", None),
+        ]);
+
+        let propagated = FileOrchestrator::propagate_wrapper_request_shape(
+            &mut result,
+            Some(&WrapperRequestShape {
+                method: "GET".to_string(),
+                has_body: Some(false),
+            }),
+            &candidates,
+        );
+
+        let methods: Vec<Option<&str>> = result
+            .data_calls
+            .iter()
+            .map(|call| call.method.as_deref())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                Some("POST"),
+                Some("DELETE"),
+                Some("DELETE"),
+                Some("POST"),
+                Some("GET")
+            ]
+        );
+        assert_eq!(
+            propagated, 1,
+            "only the delegating line takes the wrapper's verb"
+        );
+    }
+
     /// With no wrapper behind the file — or a wrapper that parameterizes its
     /// method — nothing is rewritten. This is the majority of files, and the
     /// case where the delegating site's own argument IS the method.
@@ -11341,7 +11445,7 @@ export * from "./aFetch.js";"#,
     fn an_unknown_wrapper_shape_rewrites_nothing() {
         let mut result = result_with_data_calls(vec![methodless_call(23, "/catalog/sync", None)]);
         assert_eq!(
-            FileOrchestrator::propagate_wrapper_request_shape(&mut result, None),
+            FileOrchestrator::propagate_wrapper_request_shape(&mut result, None, &HashMap::new()),
             0
         );
         assert_eq!(result.data_calls[0].method, None);
@@ -11364,6 +11468,7 @@ export * from "./aFetch.js";"#,
                 method: "DELETE".to_string(),
                 has_body: Some(false),
             }),
+            &HashMap::new(),
         );
 
         assert_eq!(result.data_calls[0].method.as_deref(), Some("DELETE"));
@@ -11386,6 +11491,7 @@ export * from "./aFetch.js";"#,
                 method: "POST".to_string(),
                 has_body: None,
             }),
+            &HashMap::new(),
         );
 
         assert_eq!(

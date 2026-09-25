@@ -1,0 +1,7 @@
+{
+  "name": "method-per-site",
+  "private": true,
+  "dependencies": {
+    "@example/http": "1.0.0"
+  }
+}

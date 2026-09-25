@@ -1,0 +1,84 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "unjoined:6",
+      "line_number": 6,
+      "target": "/members",
+      "method": "GET",
+      "pattern_matched": "api.get<Member[]>(",
+      "call_expression_text": "api.get<Member[]>(\"/members\")",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "unjoined:11",
+      "line_number": 11,
+      "target": "/booths/${boothId}/members/${memberId}",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(`/booths/${boothId}/members/${memberId}`)",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "unjoined:15",
+      "line_number": 15,
+      "target": "/members/${selected.id}",
+      "method": "DELETE",
+      "pattern_matched": "api.delete(",
+      "call_expression_text": "api.delete(`/members/${selected.id}`, { data: { reason } })",
+      "call_expression_line": 15,
+      "payload_expression_text": "{ reason }",
+      "payload_expression_line": 15,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "unjoined:19",
+      "line_number": 19,
+      "target": "/auth/reset/${selected.id}",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(`/auth/reset/${selected.id}`, { notify: true })",
+      "call_expression_line": 19,
+      "payload_expression_text": "{ notify: true }",
+      "payload_expression_line": 19,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "unjoined:23",
+      "line_number": 23,
+      "target": "/booths/${boothId}/members/${memberId}",
+      "method": "DELETE",
+      "pattern_matched": "api.delete(",
+      "call_expression_text": "api.delete(`/booths/${boothId}/members/${memberId}`)",
+      "call_expression_line": 23,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "unjoined:23",
+      "line_number": 23,
+      "target": "/booths/${boothId}/members/${memberId}",
+      "method": "POST",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(`/booths/${boothId}/members/${memberId}`)",
+      "call_expression_line": 23,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
