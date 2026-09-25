@@ -54,10 +54,11 @@ export async function login(argv: string[]): Promise<number> {
  *
  * The key is its own authority: `POST <app>/oauth/revoke` hashes the bearer
  * and revokes that one row, so the user's other machines and editor keys
- * survive. Any 2xx means the key is no longer live (an unknown or
- * already-revoked key is a 204 too). Everything else is "not revoked",
- * including the 404 an older cloud gives for a route it does not have, and
- * a network failure; the caller signs out locally either way.
+ * survive. Only a 204 means the key is no longer live (an unknown or
+ * already-revoked key is a 204 too). Every other outcome is "not revoked":
+ * a 200, which the endpoint never sends; the 404 an older cloud gives for a
+ * route it does not have; and a network failure. The caller signs out
+ * locally either way.
  */
 export async function revokeKey(token: string, request: typeof fetch = fetch): Promise<boolean> {
   try {
@@ -65,7 +66,7 @@ export async function revokeKey(token: string, request: typeof fetch = fetch): P
       method: "POST", redirect: "error", signal: AbortSignal.timeout(10_000),
       headers: { Authorization: `Bearer ${token}` },
     });
-    return result.ok;
+    return result.status === 204;
   } catch { return false; }
 }
 

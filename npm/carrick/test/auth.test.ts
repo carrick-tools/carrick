@@ -340,7 +340,9 @@ test("logout against a cloud without the revoke route, or offline, still removes
   const oldCloud: typeof fetch = async () => new Response("<html>Not found</html>", { status: 404, headers: { "Content-Type": "text/html" } });
   const offline: typeof fetch = async () => { throw new TypeError("fetch failed"); };
   const serverError: typeof fetch = async () => new Response("{}", { status: 500 });
-  for (const request of [oldCloud, offline, serverError]) {
+  // A 200 is not the contract's answer (a proxy page, a captive portal), so it is not "revoked".
+  const notTheContract: typeof fetch = async () => new Response("<html>ok</html>", { status: 200 });
+  for (const request of [oldCloud, offline, serverError, notTheContract]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-auth-"));
     const env = { XDG_CONFIG_HOME: dir };
     const printed: string[] = [];
