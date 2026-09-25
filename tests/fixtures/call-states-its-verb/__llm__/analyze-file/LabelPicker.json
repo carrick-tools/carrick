@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "span:134-229",
+      "line_number": 4,
+      "target": "/projects/${projectId}/labels/${labelId}",
+      "method": null,
+      "pattern_matched": "client.post(",
+      "call_expression_text": "client.post(`/projects/${projectId}/labels/${labelId}`)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "span:385-449",
+      "line_number": 8,
+      "target": "/projects/${projectId}/labels/${labelId}",
+      "method": null,
+      "pattern_matched": "client.put(",
+      "call_expression_text": "client.put(`/projects/${projectId}/labels/${labelId}`, { name })",
+      "call_expression_line": 8,
+      "payload_expression_text": "{ name }",
+      "payload_expression_line": 8,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

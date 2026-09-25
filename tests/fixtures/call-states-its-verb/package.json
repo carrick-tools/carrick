@@ -1,0 +1,7 @@
+{
+  "name": "call-states-its-verb",
+  "private": true,
+  "dependencies": {
+    "@example/http": "1.0.0"
+  }
+}

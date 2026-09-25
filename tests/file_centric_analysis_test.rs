@@ -313,6 +313,7 @@ fn test_processing_stats_tracking() {
         model_rows_reconciled: 0,
         model_routes_kept_without_a_site: 0,
         model_contradictions_discarded: 0,
+        model_methods_supplied: 0,
         model_endpoints_discarded_in_claimed_modules: 0,
         model_only_rows: 0,
         unemitted_literal_candidates: 0,
