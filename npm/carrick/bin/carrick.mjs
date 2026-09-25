@@ -279,7 +279,7 @@ function extraHelp() {
     "",
     "ACCOUNT:",
     "    login                        sign in to a Carrick workspace",
-    "    logout                       remove the saved local credential",
+    "    logout                       sign this machine out and revoke its key",
     "",
     "INTEGRATION:",
     "    lsp --stdio                  the language server, for an editor or an agent",
@@ -316,7 +316,7 @@ switch (command) {
   }
   case "logout": {
     const { logout } = await import("../dist/auth/run.js");
-    process.exit(logout(rest));
+    process.exit(await logout(rest));
   }
   case "lsp": {
     await pointAtNativeBinary();

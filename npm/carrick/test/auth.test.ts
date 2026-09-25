@@ -5,7 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
-import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE, SCOPE } from "../src/auth/credentials.ts";
+import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE, APP_BASE, SCOPE } from "../src/auth/credentials.ts";
+import { logout } from "../src/auth/run.ts";
 import { authorize, callbackPage, type OAuthOptions } from "../src/auth/oauth.ts";
 import { resolveRepos } from "../src/auth/read.ts";
 
@@ -307,4 +308,69 @@ test("browser refusal closes login without exchanging or persisting a token", as
     },
   }), /declined/);
   assert.equal(calls, 1);
+});
+
+// carrick#1487. The cloud half is carrick-cloud `app/src/pages/oauth/revoke.ts`;
+// its test sends this same request shape and pins what it revokes.
+test("logout revokes the saved key with the key itself as the bearer, then signs out", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-auth-"));
+  const env = { XDG_CONFIG_HOME: dir };
+  const printed: string[] = [];
+  const seen: { url: string; init: RequestInit | undefined }[] = [];
+  try {
+    saveCredential("carrick_sk_live_thismachine", "acme", env);
+    const code = await logout([], {
+      env, out: (text) => printed.push(text), err: (text) => printed.push(text),
+      fetch: async (url, init) => { seen.push({ url: String(url), init }); return new Response(null, { status: 204 }); },
+    });
+    assert.equal(code, 0);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.url, `${APP_BASE}/oauth/revoke`);
+    assert.equal(seen[0]!.init?.method, "POST");
+    assert.equal(seen[0]!.init?.redirect, "error");
+    assert.equal(new Headers(seen[0]!.init?.headers).get("Authorization"), "Bearer carrick_sk_live_thismachine");
+    assert.equal(seen[0]!.init?.body, undefined);
+    assert.equal(fs.existsSync(credentialPath(env)), false);
+    assert.deepEqual(printed, ["Signed out of acme.\n"]);
+    assert.ok(!printed.join("").includes("app.carrick.tools/account"));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("logout against a cloud without the revoke route, or offline, still removes the credential and says the key is live", async () => {
+  const oldCloud: typeof fetch = async () => new Response("<html>Not found</html>", { status: 404, headers: { "Content-Type": "text/html" } });
+  const offline: typeof fetch = async () => { throw new TypeError("fetch failed"); };
+  const serverError: typeof fetch = async () => new Response("{}", { status: 500 });
+  for (const request of [oldCloud, offline, serverError]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-auth-"));
+    const env = { XDG_CONFIG_HOME: dir };
+    const printed: string[] = [];
+    try {
+      saveCredential("carrick_sk_live_thismachine", "acme", env);
+      const code = await logout([], { env, fetch: request, out: (text) => printed.push(text), err: (text) => printed.push(text) });
+      assert.equal(code, 0);
+      assert.equal(fs.existsSync(credentialPath(env)), false);
+      assert.equal(printed.length, 1);
+      assert.match(printed[0]!, /^Signed out of acme on this machine, but Carrick could not revoke the key on the server\./);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("logout revokes the saved key, never CARRICK_TOKEN, and keeps the override warning", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-auth-"));
+  const printed: string[] = [];
+  const bearers: (string | null)[] = [];
+  const request: typeof fetch = async (_url, init) => { bearers.push(new Headers(init?.headers).get("Authorization")); return new Response(null, { status: 204 }); };
+  try {
+    const env = { XDG_CONFIG_HOME: dir, CARRICK_TOKEN: "carrick_sk_live_cioverride" };
+    saveCredential("carrick_sk_live_thismachine", "acme", { XDG_CONFIG_HOME: dir });
+    assert.equal(await logout([], { env, fetch: request, out: (text) => printed.push(text) }), 0);
+    assert.deepEqual(bearers, ["Bearer carrick_sk_live_thismachine"]);
+    assert.deepEqual(printed, ["Signed out of acme.\n", "CARRICK_TOKEN still overrides login; unset it in your shell to sign out.\n"]);
+
+    // Nothing saved: no request at all, and the override key is left alone.
+    printed.length = 0;
+    assert.equal(await logout([], { env, fetch: request, out: (text) => printed.push(text) }), 0);
+    assert.equal(bearers.length, 1);
+    assert.equal(printed[0], "No saved Carrick credential.\n");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

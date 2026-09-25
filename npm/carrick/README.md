@@ -99,8 +99,11 @@ repo in the folder attaches to the one repo there that has no identity.
 
 Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
 to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
-The file is written with mode 0600. `carrick logout` removes it; unset
-`CARRICK_TOKEN` separately if you set that override. Revoke issued keys at
+The file is written with mode 0600. `carrick logout` revokes that file's key
+on the server, then removes the file; other machines and editor connections
+stay signed in. If Carrick cannot be reached, the file is still removed and
+the command says the key is still live. Unset `CARRICK_TOKEN` separately if
+you set that override. Every issued key is listed, and can be revoked, at
 [your account](https://app.carrick.tools/account).
 
 Rust derives the same services for CI, local indexing and `init`. An existing
