@@ -1,0 +1,11 @@
+{
+  "name": "in-process-publish",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@fixture/broker": "1.0.0",
+    "@fixture/jobs": "1.0.0",
+    "@fixture/streams": "1.0.0"
+  }
+}

@@ -103,6 +103,11 @@ struct Registry {
     /// is a service name, or [`WHOLE_SCAN`] when the sidecar never became
     /// ready at all and every service in the run is typeless.
     types_unavailable: Vec<(String, String)>,
+    /// Pub/sub rows the model reported and the scan left out because their
+    /// events never leave the service (carrick#1513), per service. Not a loss:
+    /// a count a reader needs to know the rows were dropped on purpose. A
+    /// service analysed twice in one run keeps its last count.
+    in_process_pubsub: BTreeMap<Scope, usize>,
 }
 
 /// Which service a loss belongs to: its `service_name`, or `None` for a repo
@@ -277,6 +282,23 @@ impl Registry {
              types",
             scopes
         ))
+    }
+
+    /// Records how many pub/sub rows the current service left out as
+    /// in-process. Replaces the service's earlier count, so a service that
+    /// is analysed again is not counted twice.
+    fn record_in_process_pubsub(&mut self, count: usize) {
+        self.in_process_pubsub.insert(self.current.clone(), count);
+    }
+
+    /// One line saying how many pub/sub calls were left out, or `None`.
+    fn in_process_pubsub_line(&self) -> Option<String> {
+        let total: usize = self.in_process_pubsub.values().sum();
+        (total > 0).then(|| {
+            format!(
+                "{total} pub/sub call(s) left out of the index: their events stay inside the service."
+            )
+        })
     }
 
     /// How many files were lost.
@@ -461,6 +483,24 @@ pub fn unanalysed_files_for(service: Option<&str>) -> Vec<crate::cloud_storage::
         .lock()
         .expect("scan health lock")
         .unanalysed_files_for(&service.map(str::to_string))
+}
+
+/// Records how many pub/sub rows the current service left out as in-process
+/// (carrick#1513).
+pub fn record_in_process_pubsub(count: usize) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_in_process_pubsub(count);
+}
+
+/// One line saying how many pub/sub calls the run left out as in-process, or
+/// `None` when it left out none.
+pub fn in_process_pubsub_line() -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .in_process_pubsub_line()
 }
 
 /// Name the service every loss recorded from now on belongs to.
@@ -743,7 +783,27 @@ mod tests {
         let mut run = run();
         run.record_files_attempted(120);
         assert_eq!(run.summary_line(), None);
+        assert_eq!(run.in_process_pubsub_line(), None);
         assert!(run.service_losses(&None).is_empty());
+    }
+
+    /// carrick#1513: rows the scan left out on purpose are counted where a
+    /// reader sees them, summed over services, and a service analysed twice
+    /// counts once. Never a loss.
+    #[test]
+    fn left_out_pubsub_rows_are_counted_once_per_service() {
+        let mut run = run();
+        run.current = Some("api".to_string());
+        run.record_in_process_pubsub(16);
+        run.record_in_process_pubsub(16);
+        run.current = Some("worker".to_string());
+        run.record_in_process_pubsub(2);
+        assert_eq!(
+            run.in_process_pubsub_line().as_deref(),
+            Some("18 pub/sub call(s) left out of the index: their events stay inside the service.")
+        );
+        assert_eq!(run.summary_line(), None);
+        assert!(run.service_losses(&Some("api".to_string())).is_empty());
     }
 
     /// The regression: one lost file must reach the summary AND its service's

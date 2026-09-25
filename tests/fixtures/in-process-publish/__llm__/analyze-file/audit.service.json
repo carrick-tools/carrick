@@ -1,0 +1,37 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "order.traced",
+      "role": "publisher",
+      "line_number": 13,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 13
+    },
+    {
+      "topic": "order.audited",
+      "role": "publisher",
+      "line_number": 14,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: ORDER_AUDITED, payload: { id } }",
+      "payload_expression_line": 14
+    },
+    {
+      "topic": "order.tagged",
+      "role": "publisher",
+      "line_number": 15,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: `order.tagged`, payload: { id } }",
+      "payload_expression_line": 15
+    }
+  ]
+}

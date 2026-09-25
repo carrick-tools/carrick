@@ -1,0 +1,87 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "order.placed",
+      "role": "publisher",
+      "line_number": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: \"order.placed\", payload: { id: order.id } }",
+      "payload_expression_line": 23
+    },
+    {
+      "topic": "order.placed",
+      "role": "publisher",
+      "line_number": 24,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "order",
+      "payload_expression_line": 24
+    },
+    {
+      "topic": "order.totals_changed",
+      "role": "publisher",
+      "line_number": 25,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: \"order.totals_changed\", payload: { total: order.total } }",
+      "payload_expression_line": 25
+    },
+    {
+      "topic": "inventory.reserved",
+      "role": "publisher",
+      "line_number": 26,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ kind: \"inventory.reserved\", payload: { id: order.id } }",
+      "payload_expression_line": 26
+    },
+    {
+      "topic": "order.cancelled",
+      "role": "publisher",
+      "line_number": 30,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 30
+    },
+    {
+      "topic": "order.cancelled",
+      "role": "publisher",
+      "line_number": 31,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 31
+    },
+    {
+      "topic": "order.archived",
+      "role": "publisher",
+      "line_number": 32,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 32
+    },
+    {
+      "topic": "order.noted",
+      "role": "publisher",
+      "line_number": 33,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 33
+    }
+  ]
+}

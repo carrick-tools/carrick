@@ -1,0 +1,27 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "inventory.reserved",
+      "role": "subscriber",
+      "line_number": 9,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "event",
+      "payload_expression_line": 9
+    },
+    {
+      "topic": "stock.checked",
+      "role": "subscriber",
+      "line_number": 10,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "event",
+      "payload_expression_line": 10
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "shipment.sent",
+      "role": "publisher",
+      "line_number": 15,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "id",
+      "payload_expression_line": 15
+    },
+    {
+      "topic": "shipment.sent",
+      "role": "publisher",
+      "line_number": 16,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "id",
+      "payload_expression_line": 16
+    },
+    {
+      "topic": "shipment.sent",
+      "role": "publisher",
+      "line_number": 17,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 17
+    },
+    {
+      "topic": "shipment.sent",
+      "role": "publisher",
+      "line_number": 18,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": "{ id }",
+      "payload_expression_line": 18
+    }
+  ]
+}
