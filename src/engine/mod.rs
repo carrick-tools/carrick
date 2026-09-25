@@ -497,20 +497,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .map(PathBuf::from)
     {
         let sp = logging::spinner("Joining the workspace...");
-        let analyzer = build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
+        // What the check did rides back in the join file, because this
+        // process's own warning is swallowed by the indexer that spawned it
+        // (carrick#1490).
+        let (analyzer, type_check) =
+            build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
         let results = analyzer.get_results();
-        // The same condition `build_cross_repo_analyzer` runs the check on,
-        // carried back because this process's own warning is swallowed by
-        // the indexer that spawned it (carrick#1490).
-        let type_check = match sidecar {
-            Some(_) => crate::local_mode::JoinTypeCheck::Ran,
-            None => crate::local_mode::JoinTypeCheck::Skipped {
-                reason: crate::scan_health::types_unavailable_reason(
-                    crate::scan_health::WHOLE_SCAN,
-                )
-                .unwrap_or_else(|| "the type sidecar is unavailable".to_string()),
-            },
-        };
         crate::local_mode::LocalJoin::from_results(&results, type_check).write(&out_path)?;
         logging::finish_spinner(
             &sp,
@@ -1103,7 +1095,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
         .await
     {
-        Ok(analyzer) => analyzer,
+        Ok((analyzer, type_check)) => {
+            // For the indexer that spawned this scan, which swallows the
+            // warning a skipped check logs (carrick#1490). A no-op anywhere
+            // else.
+            crate::progress::report_type_check(&type_check);
+            analyzer
+        }
         Err(e) => {
             // Cross-repo analysis (which is what runs the type check) failed. Close
             // the spinner with a warning first so the upload's own spinner
@@ -6571,7 +6569,7 @@ async fn build_cross_repo_analyzer(
     mut all_repo_data: Vec<CloudRepoData>,
     current_repos: Vec<CloudRepoData>,
     sidecar: Option<&TypeSidecar>,
-) -> Result<Analyzer, Box<dyn std::error::Error>> {
+) -> Result<(Analyzer, crate::local_mode::JoinTypeCheck), Box<dyn std::error::Error>> {
     // Add the freshly-analyzed local services (one per service) to the mix
     all_repo_data.extend(current_repos);
     // 1. Merge configs using generic function. (The v1 merged-packages value
@@ -6615,18 +6613,53 @@ async fn build_cross_repo_analyzer(
     //    overlay. Without a sidecar, compat is NOT evaluated: outcomes stay
     //    unset and every edge keeps `type_compatible: None` — the harness
     //    greps for this exact "Skipping type checking" trap (§7).
-    if let Some(sidecar) = sidecar {
+    let type_check = if let Some(sidecar) = sidecar {
         let local_consumers = type_compat_v2::take_local_consumers();
-        let outcomes = type_compat_v2::run_check(sidecar, &all_repo_data, &local_consumers);
-        analyzer.set_pair_outcomes(outcomes);
+        let (outcomes, state) = finish_type_check(|| {
+            type_compat_v2::run_check(sidecar, &all_repo_data, &local_consumers)
+        });
+        if let Some(outcomes) = outcomes {
+            analyzer.set_pair_outcomes(outcomes);
+        }
+        state
     } else {
         warn!(
             "Skipping type checking: the type sidecar is unavailable, so v2 \
              capture/check cannot run. Compat verdicts will be absent, not 'compatible'."
         );
-    }
+        crate::local_mode::JoinTypeCheck::Skipped {
+            reason: crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN)
+                .unwrap_or_else(|| "the type sidecar is unavailable".to_string()),
+        }
+    };
 
-    Ok(analyzer)
+    Ok((analyzer, type_check))
+}
+
+/// Run the type check and say whether it finished (carrick#1490).
+///
+/// "Ran" is what the check did, not whether a sidecar existed: a check that
+/// panics leaves no outcomes and is reported as not run, with the panic as the
+/// reason, instead of taking the whole cross-repo analysis down with it.
+fn finish_type_check(
+    run: impl FnOnce() -> Vec<crate::analyzer::PairCheckOutcome>,
+) -> (
+    Option<Vec<crate::analyzer::PairCheckOutcome>>,
+    crate::local_mode::JoinTypeCheck,
+) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(outcomes) => (Some(outcomes), crate::local_mode::JoinTypeCheck::Ran),
+        Err(payload) => {
+            let cause = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("no message");
+            let reason = format!("the type check failed ({cause})");
+            warn!("Skipping type checking: {reason}");
+            (None, crate::local_mode::JoinTypeCheck::Skipped { reason })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6638,6 +6671,25 @@ mod tests {
     fn modules_without_config() -> crate::workspace_resolver::WorkspaceIndex {
         let empty = tempfile::tempdir().expect("tempdir");
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(empty.path(), None)
+    }
+
+    /// carrick#1490: "ran" is what the check did. A check that panics is
+    /// reported as not run, with its reason, and leaves no outcomes behind;
+    /// one that returns is "ran" whatever it judged.
+    #[test]
+    fn a_type_check_that_fails_is_reported_as_not_run_with_its_reason() {
+        let (outcomes, state) = super::finish_type_check(|| panic!("tsc exited 137"));
+        assert!(outcomes.is_none());
+        assert_eq!(
+            state,
+            crate::local_mode::JoinTypeCheck::Skipped {
+                reason: "the type check failed (tsc exited 137)".to_string()
+            }
+        );
+
+        let (outcomes, state) = super::finish_type_check(Vec::new);
+        assert_eq!(outcomes.map(|o| o.len()), Some(0));
+        assert_eq!(state, crate::local_mode::JoinTypeCheck::Ran);
     }
 
     /// The aliased-specifier line, pinned for the same reason as its sibling

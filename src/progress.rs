@@ -191,6 +191,27 @@ pub fn parse_pending(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The prefix a scan states what its cross-repo type check did on.
+const TYPE_CHECK_MARKER: &str = "@carrick-type-check ";
+
+/// State, for the parent, whether this scan's type check ran and why not
+/// (carrick#1490). The indexer swallows a scan's output, so a skipped check
+/// that it does not lift out is a skip nobody is told about.
+pub fn report_type_check(state: &crate::local_mode::JoinTypeCheck) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(state) {
+        crate::errln!("{TYPE_CHECK_MARKER}{payload}");
+    }
+}
+
+/// Read a type-check statement out of a line of a scan's stderr.
+pub fn parse_type_check(line: &str) -> Option<crate::local_mode::JoinTypeCheck> {
+    let payload = line.trim_start().strip_prefix(TYPE_CHECK_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// The prefix a dispatched scan names its job on.
 const DISPATCHED_MARKER: &str = "@carrick-dispatched ";
 

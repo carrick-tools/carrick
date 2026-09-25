@@ -293,6 +293,10 @@ pub struct UnstoredVerdicts {
     /// The consumer was scanned before the producer in this build, so its
     /// upload had no producer to pair with.
     pub indexed_before_producer: bool,
+    /// Why the consumer's own scan did not run its type check, when it did
+    /// not: the skip that scan logged, which the indexer otherwise swallows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_skipped: Option<String>,
 }
 
 impl TypeCheckSummary {
@@ -312,6 +316,12 @@ impl TypeCheckSummary {
                 format!(
                     "{} verdict(s) for {} are not in Carrick Cloud: it was indexed before {}.",
                     gap.verdicts, gap.consumer, gap.producer
+                )
+            } else if let Some(reason) = &gap.check_skipped {
+                format!(
+                    "{} verdict(s) for {} are not in Carrick Cloud: its type check was skipped: \
+                     {reason}.",
+                    gap.verdicts, gap.consumer
                 )
             } else {
                 format!(

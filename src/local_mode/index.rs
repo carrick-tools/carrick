@@ -264,7 +264,7 @@ fn run_generation(
     // The scan position of every service this build scans, and the blobs it
     // uploaded, which is what the type-check summary compares the join with.
     let mut positions: BTreeMap<String, usize> = BTreeMap::new();
-    let mut uploaded_blobs: Vec<(usize, CloudRepoData)> = Vec::new();
+    let mut uploaded_blobs: Vec<UploadedBlob> = Vec::new();
     let mut scanned = Vec::new();
     // The repos this run scanned WITH the model and uploaded. A laptop scan
     // that returns here has written its blob to the cloud — the tee propagates
@@ -365,7 +365,16 @@ fn run_generation(
             write_blob(&peers.join(&file), &blob)?;
             positions.insert(service_id(&blob), position);
             if uploaded.contains(repo) {
-                uploaded_blobs.push((position, blob));
+                uploaded_blobs.push(UploadedBlob {
+                    position,
+                    blob,
+                    check_skipped: match &report.type_check {
+                        Some(super::join::JoinTypeCheck::Skipped { reason }) => {
+                            Some(reason.clone())
+                        }
+                        _ => None,
+                    },
+                });
             }
         }
         scanned.push(name);
@@ -751,6 +760,9 @@ pub(super) struct ScanReport {
     /// Where this scan's wall clock went. `None` from a scan that did not
     /// finish, or one that measured nothing (carrick#1452).
     pub timing: Option<crate::scan_timing::Split>,
+    /// What the scan's own cross-repo type check did. `None` from a scan that
+    /// never reached one (carrick#1490).
+    pub type_check: Option<super::join::JoinTypeCheck>,
 }
 
 /// What one phase of a build calls itself while it runs and once it is done.
@@ -829,6 +841,7 @@ fn run_scan(
     // (`carrick status`, the SessionStart hook) shows that sentence rather
     // than the first line of the scan's log (carrick#1103).
     let mut failure: Option<crate::progress::Failure> = None;
+    let mut type_check: Option<super::join::JoinTypeCheck> = None;
     // The last count and the last notice, so either one arriving redraws the
     // bar with both.
     let mut last_update: Option<crate::progress::Update> = None;
@@ -909,6 +922,10 @@ fn run_scan(
             pending.push(statement);
             continue;
         }
+        if let Some(stated) = crate::progress::parse_type_check(&line) {
+            type_check = Some(stated);
+            continue;
+        }
         if let Some(stated) = crate::progress::parse_failure(&line) {
             failure = Some(stated);
             continue;
@@ -957,6 +974,7 @@ fn run_scan(
             not_dispatched,
             pending,
             timing,
+            type_check,
         });
     }
     bar.finish_and_clear();
@@ -1278,16 +1296,23 @@ fn write_blob(path: &Path, blob: &CloudRepoData) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// One blob this build uploaded: the position its repo was scanned at, and
+/// why that scan's own type check did not run, when it did not.
+pub(super) struct UploadedBlob {
+    pub position: usize,
+    pub blob: CloudRepoData,
+    pub check_skipped: Option<String>,
+}
+
 /// What the build's type check did, and which of its verdicts the uploads
 /// missed (carrick#1490).
 ///
 /// A pair is `(producer, producer key, consumer, consumer key)`, the identity
 /// a stored verdict is keyed on, so several call sites on one pair count once.
-/// `uploaded` is every blob this build uploaded with the position its repo was
-/// scanned at; `positions` is the scan position of every service scanned.
+/// `positions` is the scan position of every service scanned.
 pub(super) fn type_check_summary(
     join: &LocalJoin,
-    uploaded: &[(usize, CloudRepoData)],
+    uploaded: &[UploadedBlob],
     positions: &BTreeMap<String, usize>,
 ) -> super::read_model::TypeCheckSummary {
     type Pair<'a> = (&'a str, &'a str, &'a str, &'a str);
@@ -1309,10 +1334,12 @@ pub(super) fn type_check_summary(
         .map(pair)
         .collect();
 
-    let mut missing: BTreeMap<(String, String), (usize, bool)> = BTreeMap::new();
-    for (position, blob) in uploaded {
-        let consumer = service_id(blob);
-        let stored: std::collections::BTreeSet<Pair> = blob
+    let mut missing: BTreeMap<(String, String), super::read_model::UnstoredVerdicts> =
+        BTreeMap::new();
+    for upload in uploaded {
+        let consumer = service_id(&upload.blob);
+        let stored: std::collections::BTreeSet<Pair> = upload
+            .blob
             .compat_verdicts
             .iter()
             .flatten()
@@ -1330,11 +1357,19 @@ pub(super) fn type_check_summary(
                 continue;
             }
             let producer = judged_pair.0.to_string();
-            let before = positions.get(&producer).is_some_and(|p| p > position);
-            let entry = missing
-                .entry((consumer.clone(), producer))
-                .or_insert((0, before));
-            entry.0 += 1;
+            let before = positions
+                .get(&producer)
+                .is_some_and(|p| *p > upload.position);
+            missing
+                .entry((consumer.clone(), producer.clone()))
+                .or_insert_with(|| super::read_model::UnstoredVerdicts {
+                    consumer: consumer.clone(),
+                    producer,
+                    verdicts: 0,
+                    indexed_before_producer: before,
+                    check_skipped: upload.check_skipped.clone(),
+                })
+                .verdicts += 1;
         }
     }
 
@@ -1345,19 +1380,7 @@ pub(super) fn type_check_summary(
         },
         pairs: pairs.len(),
         judged: judged.len(),
-        not_stored: missing
-            .into_iter()
-            .map(
-                |((consumer, producer), (verdicts, indexed_before_producer))| {
-                    super::read_model::UnstoredVerdicts {
-                        consumer,
-                        producer,
-                        verdicts,
-                        indexed_before_producer,
-                    }
-                },
-            )
-            .collect(),
+        not_stored: missing.into_values().collect(),
     }
 }
 
@@ -2204,17 +2227,46 @@ mod tests {
             ..join
         };
         // The producer is hosted, so it has no scan position in this build.
-        let summary = type_check_summary(
-            &join,
-            &[(0, consumer_blob("web"))],
-            &BTreeMap::from([("web".to_string(), 0)]),
-        );
+        let positions = BTreeMap::from([("web".to_string(), 0)]);
+        let uploaded = |check_skipped: Option<&str>| UploadedBlob {
+            position: 0,
+            blob: consumer_blob("web"),
+            check_skipped: check_skipped.map(str::to_string),
+        };
+        let summary = type_check_summary(&join, &[uploaded(None)], &positions);
         assert_eq!(
             summary.lines(),
             [
                 "type check: 1 of 2 pair(s) judged",
                 "1 verdict(s) for web against api are not in Carrick Cloud.",
             ]
+        );
+
+        // The consumer's own scan skipped its check: that reason, which the
+        // indexer would otherwise swallow, is the one stated.
+        let summary = type_check_summary(&join, &[uploaded(Some("sidecar not found"))], &positions);
+        assert_eq!(
+            summary.lines()[1],
+            "1 verdict(s) for web are not in Carrick Cloud: its type check was skipped: \
+             sidecar not found."
+        );
+    }
+
+    /// carrick#1490: what a scan's type check did crosses the swallowed
+    /// stderr on its own marker, whole.
+    #[test]
+    fn a_scans_type_check_state_crosses_the_marker_channel() {
+        let skipped = super::super::JoinTypeCheck::Skipped {
+            reason: "sidecar not found".to_string(),
+        };
+        let line = format!(
+            "@carrick-type-check {}",
+            serde_json::to_string(&skipped).unwrap()
+        );
+        assert_eq!(crate::progress::parse_type_check(&line), Some(skipped));
+        assert_eq!(
+            crate::progress::parse_type_check("@carrick-pending x"),
+            None
         );
     }
 

@@ -63,7 +63,8 @@
               "consumer": { "type": "string" },
               "producer": { "type": "string" },
               "verdicts": { "type": "integer", "minimum": 1 },
-              "indexed_before_producer": { "type": "boolean", "description": "The consumer was scanned before the producer in this build, so its upload had no producer to pair with." }
+              "indexed_before_producer": { "type": "boolean", "description": "The consumer was scanned before the producer in this build, so its upload had no producer to pair with." },
+              "check_skipped": { "type": "string", "description": "Why the consumer's own scan did not run its type check. Absent when it ran." }
             }
           }
         }
