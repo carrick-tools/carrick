@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.92](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.91...carrick-v0.3.92) (2026-09-25)
+
+
+### Features
+
+* **cli:** carrick logout revokes its own key on the server ([#1487](https://github.com/carrick-tools/carrick/issues/1487)) ([#1500](https://github.com/carrick-tools/carrick/issues/1500)) ([c281ec5](https://github.com/carrick-tools/carrick/commit/c281ec5a496a78f81b418452fba02754ef7c637f))
+* **index:** declare how many repos a carrick index run covers ([#1496](https://github.com/carrick-tools/carrick/issues/1496)) ([93ccd4a](https://github.com/carrick-tools/carrick/commit/93ccd4a5fd29f94b92a14e13df5afe8c06531341))
+
 ## [0.3.91](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.90...carrick-v0.3.91) (2026-09-25)
 
 
