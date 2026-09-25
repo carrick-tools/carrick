@@ -30,7 +30,7 @@ pub(crate) mod recheck;
 pub(crate) mod scan_state;
 mod workspace;
 
-pub use join::LocalJoin;
+pub use join::{JoinTypeCheck, LocalJoin};
 
 /// Set to `1` to run the pipeline with its model stage switched off: no
 /// framework detection, no guidance, no file-analyzer dispatch. Deterministic

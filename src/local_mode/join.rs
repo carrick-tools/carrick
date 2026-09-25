@@ -112,11 +112,23 @@ pub struct LocalJoin {
     pub operations: Vec<JoinedOperation>,
     pub matches: Vec<JoinedMatch>,
     pub findings: Vec<JoinedFinding>,
+    /// Whether the type check ran over the join. The join is a subprocess
+    /// whose output the indexer swallows, so a skip reaches the build's
+    /// output and `carrick status` only through this (carrick#1490).
+    pub type_check: JoinTypeCheck,
+}
+
+/// Whether the join's type check ran, and why not when it did not.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum JoinTypeCheck {
+    Ran,
+    Skipped { reason: String },
 }
 
 impl LocalJoin {
     /// Project a finished cross-repo analysis.
-    pub fn from_results(results: &ApiAnalysisResult) -> Self {
+    pub fn from_results(results: &ApiAnalysisResult, type_check: JoinTypeCheck) -> Self {
         let mut operations: Vec<JoinedOperation> = results
             .endpoints
             .iter()
@@ -194,6 +206,7 @@ impl LocalJoin {
             operations,
             matches,
             findings,
+            type_check,
         }
     }
 

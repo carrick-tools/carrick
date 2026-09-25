@@ -260,6 +260,68 @@ pub struct LocalIndex {
     /// RFC 3339, when the last `index` or `refresh` finished.
     pub indexed_at: String,
     pub repos: Vec<IndexedRepo>,
+    /// What the build's type check did. Absent from an index written before
+    /// carrick#1490, which states nothing about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_check: Option<TypeCheckSummary>,
+}
+
+/// What a build's type check did, kept where `carrick status` reads it: a
+/// detached build's output is a log nobody may open, and a skipped check or a
+/// verdict the upload missed must never be silent (carrick#1490).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TypeCheckSummary {
+    /// Why the check did not run. Absent when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// Producer/consumer pairs the join matched.
+    pub pairs: usize,
+    /// Of those, the pairs the check reached a verdict on.
+    pub judged: usize,
+    /// Verdicts judged here that a consumer's upload does not carry, so
+    /// Carrick Cloud reports those pairs as not compared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_stored: Vec<UnstoredVerdicts>,
+}
+
+/// The verdicts one consumer's upload is missing for one producer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct UnstoredVerdicts {
+    pub consumer: String,
+    pub producer: String,
+    pub verdicts: usize,
+    /// The consumer was scanned before the producer in this build, so its
+    /// upload had no producer to pair with.
+    pub indexed_before_producer: bool,
+}
+
+impl TypeCheckSummary {
+    /// The sentences a build and `carrick status` print, one per line.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![match &self.skipped {
+            Some(reason) => {
+                format!("type check skipped: {reason}. No pair in this index has a type verdict.")
+            }
+            None => format!(
+                "type check: {} of {} pair(s) judged",
+                self.judged, self.pairs
+            ),
+        }];
+        for gap in &self.not_stored {
+            lines.push(if gap.indexed_before_producer {
+                format!(
+                    "{} verdict(s) for {} are not in Carrick Cloud: it was indexed before {}.",
+                    gap.verdicts, gap.consumer, gap.producer
+                )
+            } else {
+                format!(
+                    "{} verdict(s) for {} against {} are not in Carrick Cloud.",
+                    gap.verdicts, gap.consumer, gap.producer
+                )
+            });
+        }
+        lines
+    }
 }
 
 impl LocalIndex {
@@ -370,6 +432,7 @@ mod tests {
             scanner_version: "test".to_string(),
             indexed_at: "2026-09-06T00:00:00Z".to_string(),
             repos: vec![repo("/w/mono", "mono"), repo("/w/mono/packages/api", "api")],
+            type_check: None,
         };
         let (found, relative) = index
             .locate_file(Path::new("/w/mono/packages/api/src/routes.ts"))
@@ -392,6 +455,7 @@ mod tests {
             scanner_version: "test".to_string(),
             indexed_at: "2026-09-06T00:00:00Z".to_string(),
             repos: vec![repo("/w/api", "api")],
+            type_check: None,
         };
         assert!(
             index

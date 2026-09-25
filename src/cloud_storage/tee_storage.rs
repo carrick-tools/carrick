@@ -13,10 +13,10 @@
 //! no `file_results` to the cloud, and the local copy is written from the same
 //! payload, so the next local scan reads back what this one computed.
 //!
-//! Cross-repo reads come from the LOCAL side, so the per-repo phase stays
-//! isolated exactly as it is today and the join phase reads every blob the
-//! run wrote. Everything else — opening the run, the capability flags, the
-//! logs — is the cloud's.
+//! Cross-repo reads come from the LOCAL side: the per-repo phase reads the
+//! siblings its build has already indexed (carrick#1490) and the join phase
+//! reads every blob the run wrote. Everything else — opening the run, the
+//! capability flags, the logs — is the cloud's.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -159,9 +159,10 @@ impl CloudStorage for TeeStorage {
         self.cloud.stages_oversized_payloads()
     }
 
-    /// The local side, so the per-repo phase stays isolated and the join phase
-    /// reads back every blob this run wrote. The sibling data a laptop needs
-    /// arrives as `previous_data`, which the indexer hands in from the hosted
+    /// The local side: the siblings the indexer has already scanned in this
+    /// build, so this repo's upload carries the type verdicts for its pairs
+    /// with them (carrick#1490). This repo's own previous generation arrives
+    /// as `previous_data`, which the indexer hands in from the hosted
     /// snapshot rather than from a cross-repo download.
     async fn download_all_repo_data(
         &self,
@@ -294,7 +295,11 @@ mod tests {
             CloudAuth::Bearer("carrick_sk_live_test".to_string()),
             false,
         );
-        let local = LocalDirStorage::new(cache.to_path_buf(), true).unwrap();
+        let local = LocalDirStorage::new(
+            cache.to_path_buf(),
+            crate::cloud_storage::local_dir_storage::CrossRepoReads::Isolated,
+        )
+        .unwrap();
         (
             TeeStorage {
                 cloud,
@@ -532,9 +537,8 @@ mod tests {
         assert!(dir.path().join("api.json").exists());
     }
 
-    /// The cross-repo read is the local one, so phase 1 stays isolated exactly
-    /// as it is on a facts-only pass and no sibling's data reaches a repo's own
-    /// scan.
+    /// The cross-repo read is the local one and never the cloud's: a local
+    /// side set up isolated returns nothing, whatever its directory holds.
     #[tokio::test]
     async fn cross_repo_reads_come_from_the_isolated_local_side() {
         let dir = tempfile::tempdir().unwrap();

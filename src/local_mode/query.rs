@@ -319,6 +319,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         last_scan: None,
         analysing: Vec::new(),
         services,
+        type_check: index.type_check.clone(),
     })
 }
 
@@ -1068,6 +1069,7 @@ mod drift_tests {
                 name: "service-repo".to_string(),
                 files: Default::default(),
             }],
+            type_check: None,
         };
         let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
         std::fs::create_dir_all(&index_dir).unwrap();
@@ -1121,6 +1123,7 @@ mod drift_tests {
                 services: vec![service(Some("apps/gateway"), &commit)],
                 files: Default::default(),
             }],
+            type_check: None,
         };
         let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
         std::fs::create_dir_all(&index_dir).unwrap();
@@ -1186,6 +1189,7 @@ mod drift_tests {
             scanner_version: "test".to_string(),
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![repo("api"), repo("web")],
+            type_check: None,
         };
         let index_dir = folder.path().join(crate::local_mode::workspace::INDEX_DIR);
         std::fs::create_dir_all(&index_dir).unwrap();

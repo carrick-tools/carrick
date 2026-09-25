@@ -40,6 +40,32 @@
         "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/service" }
+        },
+        "type_check": { "$ref": "#/$defs/type_check" }
+      },
+      "additionalProperties": true
+    },
+    "type_check": {
+      "type": "object",
+      "description": "What the last build's type check did (carrick#1490). Absent on an index written before it existed.",
+      "required": ["pairs", "judged"],
+      "properties": {
+        "skipped": { "type": "string", "description": "Why the check did not run. Absent when it ran." },
+        "pairs": { "type": "integer", "minimum": 0, "description": "Producer/consumer pairs the workspace join matched." },
+        "judged": { "type": "integer", "minimum": 0, "description": "Of those, the pairs the check reached a verdict on." },
+        "not_stored": {
+          "type": "array",
+          "description": "Verdicts judged here that a consumer's upload does not carry, so Carrick Cloud reports those pairs as not compared. Absent when empty.",
+          "items": {
+            "type": "object",
+            "required": ["consumer", "producer", "verdicts", "indexed_before_producer"],
+            "properties": {
+              "consumer": { "type": "string" },
+              "producer": { "type": "string" },
+              "verdicts": { "type": "integer", "minimum": 1 },
+              "indexed_before_producer": { "type": "boolean", "description": "The consumer was scanned before the producer in this build, so its upload had no producer to pair with." }
+            }
+          }
         }
       },
       "additionalProperties": true

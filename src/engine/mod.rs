@@ -499,7 +499,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         let sp = logging::spinner("Joining the workspace...");
         let analyzer = build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
         let results = analyzer.get_results();
-        crate::local_mode::LocalJoin::from_results(&results).write(&out_path)?;
+        // The same condition `build_cross_repo_analyzer` runs the check on,
+        // carried back because this process's own warning is swallowed by
+        // the indexer that spawned it (carrick#1490).
+        let type_check = match sidecar {
+            Some(_) => crate::local_mode::JoinTypeCheck::Ran,
+            None => crate::local_mode::JoinTypeCheck::Skipped {
+                reason: crate::scan_health::types_unavailable_reason(
+                    crate::scan_health::WHOLE_SCAN,
+                )
+                .unwrap_or_else(|| "the type sidecar is unavailable".to_string()),
+            },
+        };
+        crate::local_mode::LocalJoin::from_results(&results, type_check).write(&out_path)?;
         logging::finish_spinner(
             &sp,
             &format!(
