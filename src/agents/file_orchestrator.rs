@@ -7957,13 +7957,22 @@ impl FileOrchestrator {
         let Some(shape) = shape else {
             return 0;
         };
-        let stating_lines: HashSet<usize> = candidates
+        // The lines each candidate that names its own verb covers: a
+        // `request_spec`, or a `request_shape` that read a literal method. An
+        // `Unreadable` shape names none (its method is a parameter), so it says
+        // nothing about which verb the row's call sends.
+        let stating: Vec<(usize, usize)> = candidates
             .values()
             .filter(|candidate| {
                 candidate.request_spec.is_some()
-                    || candidate.request_shape != RequestShapeSignal::NotARequest
+                    || matches!(candidate.request_shape, RequestShapeSignal::Known(_))
             })
-            .map(|candidate| candidate.line_number)
+            .map(|candidate| {
+                (
+                    candidate.line_number,
+                    candidate.end_line.max(candidate.line_number),
+                )
+            })
             .collect();
         let mut propagated = 0;
         for data_call in &mut result.data_calls {
@@ -7972,13 +7981,23 @@ impl FileOrchestrator {
             if data_call.call_expression_span_start.is_some() {
                 continue;
             }
-            // A call on this line states its own request, so the row is not a
-            // delegating site even without a span, and keeps its method.
-            if usize::try_from(data_call.line_number)
-                .is_ok_and(|line| stating_lines.contains(&line))
-            {
+            // A call that names its own verb covers the row's line, so the row
+            // is not a delegating site even without a span, and keeps its
+            // method. Matched on the candidate's whole line range, and on the
+            // call line the model reported beside its row line, so a row placed
+            // one line into a multi-line call is still covered.
+            let row_lines = [Some(data_call.line_number), data_call.call_expression_line]
+                .into_iter()
+                .flatten()
+                .filter_map(|line| usize::try_from(line).ok());
+            let covered = row_lines.into_iter().any(|line| {
+                stating
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&line))
+            });
+            if covered {
                 debug!(
-                    "Not carrying the wrapper's {} onto line {}: a call there states its own request",
+                    "Not carrying the wrapper's {} onto line {}: a call there states its own verb",
                     shape.method, data_call.line_number
                 );
                 continue;
@@ -11373,12 +11392,16 @@ export * from "./aFetch.js";"#,
     /// call inside `Promise.all(xs.map(...))` (line 11, whose `Promise.all`
     /// candidate states nothing), a one-line `try` (line 15), and an `if/else`
     /// with a request on each branch (line 23, two rows). Line 30 has only a
-    /// delegating call, so it still takes the wrapper's verb.
+    /// delegating call, so it still takes the wrapper's verb. Line 40's call
+    /// passes its method as a parameter (`Unreadable`), which names no verb, so
+    /// it takes the wrapper's too. Line 51 is a row the model placed one line
+    /// into a call written over lines 50 to 52, and keeps its own.
     #[test]
     fn a_row_whose_own_line_states_a_request_keeps_its_method() {
         let verb_call = |id: &str, line: usize, verb: &str| {
             let mut candidate = candidate_with_snippet(id, None);
             candidate.line_number = line;
+            candidate.end_line = line;
             candidate.request_shape = RequestShapeSignal::Known(WrapperRequestShape {
                 method: verb.to_string(),
                 has_body: None,
@@ -11387,12 +11410,27 @@ export * from "./aFetch.js";"#,
         };
         let mut not_a_request = candidate_with_snippet("span:300-400", None);
         not_a_request.line_number = 11;
+        not_a_request.end_line = 11;
         let candidates: HashMap<String, CandidateTarget> = [
             ("span:300-400".to_string(), not_a_request),
             verb_call("span:350-399", 11, "POST"),
             verb_call("span:500-560", 15, "DELETE"),
             verb_call("span:970-1020", 23, "DELETE"),
             verb_call("span:1030-1080", 23, "POST"),
+            (
+                "span:1500-1560".to_string(),
+                CandidateTarget {
+                    end_line: 52,
+                    ..verb_call("span:1500-1560", 50, "PATCH").1
+                },
+            ),
+            (
+                "span:1400-1450".to_string(),
+                CandidateTarget {
+                    request_shape: RequestShapeSignal::Unreadable,
+                    ..verb_call("span:1400-1450", 40, "GET").1
+                },
+            ),
         ]
         .into_iter()
         .collect();
@@ -11406,6 +11444,8 @@ export * from "./aFetch.js";"#,
             row(23, "DELETE"),
             row(23, "POST"),
             methodless_call(30, "/members", None),
+            methodless_call(40, "/members", None),
+            row(51, "PATCH"),
         ]);
 
         let propagated = FileOrchestrator::propagate_wrapper_request_shape(
@@ -11429,12 +11469,14 @@ export * from "./aFetch.js";"#,
                 Some("DELETE"),
                 Some("DELETE"),
                 Some("POST"),
-                Some("GET")
+                Some("GET"),
+                Some("GET"),
+                Some("PATCH")
             ]
         );
         assert_eq!(
-            propagated, 1,
-            "only the delegating line takes the wrapper's verb"
+            propagated, 2,
+            "only lines no verb-naming call covers take the wrapper's verb"
         );
     }
 
