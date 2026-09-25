@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.91](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.90...carrick-v0.3.91) (2026-09-25)
+
+
+### Features
+
+* **findings:** mark each PR finding with whether main already had it ([#1507](https://github.com/carrick-tools/carrick/issues/1507)) ([bcd7537](https://github.com/carrick-tools/carrick/commit/bcd7537b0c97ea316e592a55c6fe84c50337e647))
+* **init:** project pick list, name-derived slug, tidy summary and a quieter connect step ([#1497](https://github.com/carrick-tools/carrick/issues/1497)) ([a4cd149](https://github.com/carrick-tools/carrick/commit/a4cd149854aa6dfa96895bb633a36a134927a204))
+* **sidecar:** judge an untyped consumer call by retyping it with the producer's response ([#1492](https://github.com/carrick-tools/carrick/issues/1492)) ([465d669](https://github.com/carrick-tools/carrick/commit/465d669a4021acac9232c1fa091f8ce4665f0352))
+
+
+### Bug Fixes
+
+* **dispatch:** advise an operations block only where a request's operation is selected ([#1502](https://github.com/carrick-tools/carrick/issues/1502)) ([7039820](https://github.com/carrick-tools/carrick/commit/70398203b0c58a7ca10ec959ee5c191c7149a135))
+* **local:** a laptop index stores type verdicts for pairs it can see ([#1503](https://github.com/carrick-tools/carrick/issues/1503)) ([36140c3](https://github.com/carrick-tools/carrick/commit/36140c384e013eba97d90ef6c6560337dae4db99))
+* **login:** styled loopback callback page, answered after the code exchange ([#1499](https://github.com/carrick-tools/carrick/issues/1499)) ([74dd3dc](https://github.com/carrick-tools/carrick/commit/74dd3dcb3fb9c9e85cc12556c4f621ba359525b7))
+* **scanner:** a span-less row whose line names its verb keeps its method ([#1506](https://github.com/carrick-tools/carrick/issues/1506)) ([4a601eb](https://github.com/carrick-tools/carrick/commit/4a601eb2eefd1188431e1bfd34c8ba4c6b229be0))
+* **sidecar:** read keyed body parameters, request calls and request configs as the body they send ([#1495](https://github.com/carrick-tools/carrick/issues/1495)) ([ca8c540](https://github.com/carrick-tools/carrick/commit/ca8c5404501a78b6775d1018fef790967d5f02ae))
+* **sidecar:** the retype check judges a fetch body read ([#1493](https://github.com/carrick-tools/carrick/issues/1493)) ([#1505](https://github.com/carrick-tools/carrick/issues/1505)) ([fab0d81](https://github.com/carrick-tools/carrick/commit/fab0d818c3ff2587668ba87d9acd1af8a628bb8f))
+
 ## [0.3.90](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.89...carrick-v0.3.90) (2026-09-24)
 
 
