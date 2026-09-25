@@ -350,7 +350,7 @@ Response:
 }
 ```
 
-`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, or the producer's type names something the consumer's program cannot resolve. Diagnostics the file had before the rewrite never count.
+`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, the producer's type names something the consumer's program cannot resolve, or the producer's type, as the consumer's program reads it, is `any` or `unknown` as a whole or at a member (the reason names the member, e.g. `'unknown' at 'session'`). Diagnostics the file had before the rewrite never count.
 
 #### `infer` - Resolve the type at a locator
 

@@ -142,7 +142,12 @@ export interface ProbePlan {
  * mutually assignable. `prefix` namespaces the three names so the same
  * transform can be appended to a file that is not ours (the retype check,
  * carrick#1491) without colliding with anything the file declares. The probe
- * uses no prefix, so its text is unchanged.
+ * uses no prefix.
+ *
+ * `null` and `undefined` pass through before any other test. Without
+ * `strictNullChecks` (the retype runs under the consumer's own options) both
+ * are assignable to every type, so the `toJSON` test held for them and
+ * `infer R` came back `unknown` (carrick#1514).
  */
 export function jsonWireDeclarations(prefix: string): string[] {
   const depth = `${prefix}JsonWireDepth`;
@@ -150,7 +155,7 @@ export function jsonWireDeclarations(prefix: string): string[] {
   const same = `${prefix}JsonWireSame`;
   return [
     `type ${depth} = [never, 0, 1, 2, 3, 4, 5, 6];`,
-    `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], ${depth}[D]> } : T;`,
+    `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends null | undefined ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], ${depth}[D]> } : T;`,
     `type ${same}<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`,
   ];
 }
