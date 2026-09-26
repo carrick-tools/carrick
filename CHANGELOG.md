@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.93](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.92...carrick-v0.3.93) (2026-09-26)
+
+
+### Features
+
+* **init:** ask about the repos beside this one, list every action before one Go ahead, and copy hooks into each repo ([#1528](https://github.com/carrick-tools/carrick/issues/1528)) ([58486c5](https://github.com/carrick-tools/carrick/commit/58486c51d758e200c1f6ffca661306f2de913859))
+
+
+### Bug Fixes
+
+* **findings:** a PR run never calls a risk main already has introduced ([#1525](https://github.com/carrick-tools/carrick/issues/1525)) ([552ac1c](https://github.com/carrick-tools/carrick/commit/552ac1c75de8698519c3fb0996ebcc37d6bfc994))
+* **pubsub:** withdraw model pub/sub rows that call into an in-process wrapper ([#1513](https://github.com/carrick-tools/carrick/issues/1513)) ([#1524](https://github.com/carrick-tools/carrick/issues/1524)) ([7c7d196](https://github.com/carrick-tools/carrick/commit/7c7d19681ce16800b0f52abb639a51efe939e1ee))
+* **sidecar:** the retype check no longer reads a null member as unknown ([#1514](https://github.com/carrick-tools/carrick/issues/1514)) ([#1518](https://github.com/carrick-tools/carrick/issues/1518)) ([8141a37](https://github.com/carrick-tools/carrick/commit/8141a37bee6469c24d55b9ef026fe37344d89f83))
+
 ## [0.3.92](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.91...carrick-v0.3.92) (2026-09-25)
 
 
