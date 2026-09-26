@@ -20,7 +20,7 @@ import {
   skillState,
   SKILL_ROOTS,
   TASK_SKILLS,
-  taskSkillLines,
+  taskSkillWarnings,
   taskSkillPaths,
   writeTaskSkills,
 } from "../src/init/task-skills.ts";
@@ -199,7 +199,7 @@ test("a second run writes nothing and reports nothing to fix", () => {
 
   const after = taskSkillPaths().map((relative) => fs.statSync(path.join(dir, relative)).mtimeMs);
   assert.deepEqual(after, before);
-  assert.deepEqual(taskSkillLines(again).warn, []);
+  assert.deepEqual(taskSkillWarnings(again), []);
 });
 
 test("a body somebody has edited is left alone and named", () => {
@@ -225,7 +225,7 @@ test("a body somebody has edited is left alone and named", () => {
   assert.equal(row?.state, "edited");
   assert.equal(row?.wrote, false);
   assert.ok(
-    taskSkillLines(outcomes).warn.some((line) => line.includes("carrick-reuse") && line.includes("edited")),
+    taskSkillWarnings(outcomes).some((line) => line.includes("carrick-reuse") && line.includes("edited")),
     "nothing told the user which file was kept",
   );
 });
@@ -252,7 +252,7 @@ test("a skill of the same name that Carrick never wrote is left alone and named"
   const outcomes = writeTaskSkills(dir, { slug: "acme-index" });
   assert.equal(fs.readFileSync(target, "utf8"), "---\nname: carrick-drift\n---\n\nMine.\n");
   assert.equal(outcomes.find((row) => row.path === skillFile(SKILL_ROOTS[0]!, "carrick-drift"))?.state, "theirs");
-  assert.ok(taskSkillLines(outcomes).warn.some((line) => line.includes("not written by Carrick")));
+  assert.ok(taskSkillWarnings(outcomes).some((line) => line.includes("not written by Carrick")));
 });
 
 test("remove deletes the stamped copies and nothing else", () => {

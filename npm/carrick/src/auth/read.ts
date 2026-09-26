@@ -8,7 +8,17 @@ const repository = z.discriminatedUnion("connected", [
 ]);
 const response = z.object({
   schema: z.literal("carrick.resolve-repos/0"),
-  workspace: z.object({ slug: z.string().regex(/^[a-zA-Z0-9_-]+$/), billing_tier: z.enum(["free", "cross_repo", "paid"]), installed: z.boolean() }),
+  workspace: z.object({
+    slug: z.string().regex(/^[a-zA-Z0-9_-]+$/),
+    billing_tier: z.enum(["free", "cross_repo", "paid"]),
+    installed: z.boolean(),
+    // The signed-in user's role in this workspace, where the server states it
+    // (carrick-cloud#1426). Absent means unknown, and `carrick init` then says
+    // nothing about who can finish a browser step (carrick#1512). A value
+    // outside the pinned three reads as unknown too, rather than failing the
+    // whole read.
+    role: z.enum(["owner", "admin", "member"]).optional().catch(undefined),
+  }),
   allowance_sentence: z.string().nullable(),
   repos: z.array(repository),
   project_repos: z.array(z.object({ project_slug: z.string(), repos: z.array(z.string()) })),

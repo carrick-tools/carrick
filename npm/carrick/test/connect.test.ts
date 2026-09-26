@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ADMIN_WAIT, connectRepos, reposAreInProject } from "../src/init/connect.ts";
+import { adminWait, connectLine, connectRepos, reposAreInProject, unconnectedRepos } from "../src/init/connect.ts";
 import { resolveRepos, type ResolvedRepos } from "../src/auth/read.ts";
 import type { AssignOutcome } from "../src/init/projects.ts";
 
@@ -31,7 +31,9 @@ test("connection polling reports the transition, not an invented hosted index", 
   // (carrick#1489).
   assert.ok(lines.includes("Waiting for GitHub: 0 of 1 repo connected. Press Ctrl-C to stop."), lines.join("\n"));
   assert.equal(lines.at(-1), "1 repo connected");
-  assert.equal(lines.filter((line) => line.includes("acme/api")).length, 1, lines.join("\n"));
+  // The grant is not named here: the list the reader said yes to named it,
+  // and saying it again was the repeat in carrick#1512.
+  assert.equal(lines.filter((line) => line.includes("acme/api")).length, 0, lines.join("\n"));
 });
 
 test("connection cancellation retains the latest metadata and unattended init never polls", async () => {
@@ -79,7 +81,7 @@ test("a repo connected to another project remains pending until it reaches the r
   assert.match(lines.join("\n"), /Assign the requested repos: https:\/\/app\.carrick\.tools\/w\/acme\/repos/);
   // The settled assignment is the claim, read back from the poll, and it is
   // the outcome line of the wait rather than a line per repo (carrick#1489).
-  assert.equal(lines.at(-1), "1 repo connected, in payments");
+  assert.equal(lines.at(-1), "1 repo connected");
   assert.doesNotMatch(lines.join("\n"), /currently in project/);
 });
 
@@ -322,7 +324,7 @@ test("assignment happens when the poll sees the repo, not before", async () => {
 
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
-  assert.equal(lines.at(-1), "1 repo connected, in payments");
+  assert.equal(lines.at(-1), "1 repo connected");
   assert.doesNotMatch(lines.join("\n"), /Moved|currently in project/);
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
 });
@@ -359,19 +361,22 @@ test("a wait with no browser step does not say who can finish one", async () => 
     movable: new Set(["acme/api"]),
     signal: controller.signal,
     say: (line) => lines.push(line),
+    member: true,
     open: async (url) => { opened.push(url); return true; },
     // Placed, but the read has not caught up yet.
     assign: async (repos) => moved(repos, "payments"),
     poll: async () => assignedToDefault,
     wait: async () => { controller.abort(); },
   });
-  assert.ok(!lines.includes(ADMIN_WAIT), lines.join("\n"));
+  assert.ok(!lines.includes(adminWait()), lines.join("\n"));
   assert.deepEqual(opened, []);
 });
 
 // carrick#1489 part 3.1. The grant page re-asks GitHub for the whole repo
 // list, so a repo the read taken just now calls connected is not sent to it,
-// and a wait with nothing unconnected opens no grant page at all.
+// and a wait with nothing unconnected opens no grant page at all. The line
+// that names the grant is the caller's now, said once in the list the reader
+// says yes to (carrick#1512), so this step says nothing about it.
 test("only a repo still unconnected is sent to the GitHub App", async () => {
   const half: ResolvedRepos = {
     ...connected,
@@ -386,18 +391,17 @@ test("only a repo still unconnected is sent to the GitHub App", async () => {
     say: (line) => lines.push(line),
     open: async () => { throw new Error("must not open"); },
   });
-  assert.deepEqual(lines, [
+  assert.deepEqual(lines, []);
+  assert.deepEqual(unconnectedRepos(half, ["acme/api", "acme/web"]), ["acme/web"]);
+  // The line a stopped wait leaves behind, for the repos still to connect.
+  assert.equal(
+    connectLine(["acme/web"], 2, "https://app.carrick.tools/w/acme/connect"),
     "acme/web is not connected yet. Install the Carrick GitHub App on it: https://app.carrick.tools/w/acme/connect",
-  ]);
-
-  const both: string[] = [];
-  await connectRepos("token", ["acme/api", "acme/web"], { ...initial, repos: [] }, {
-    interactive: false,
-    say: (line) => both.push(line),
-  });
-  assert.deepEqual(both, [
+  );
+  assert.equal(
+    connectLine(["acme/api", "acme/web"], 2, "https://app.carrick.tools/w/acme/connect"),
     "Neither repo is connected yet. Install the Carrick GitHub App on both: https://app.carrick.tools/w/acme/connect",
-  ]);
+  );
 
   // Connected, and only the move left: the grant page is not opened.
   const opened: string[] = [];
@@ -440,6 +444,7 @@ test("the wait is one status line, and a failure is the only per-repo line", asy
     movable: new Set(two),
     signal: controller.signal,
     say: (line) => lines.push(line),
+    member: true,
     track: async (label, work, report) => {
       shown.push(label);
       const value = await work((text) => shown.push(text));
@@ -469,26 +474,61 @@ test("the wait is one status line, and a failure is the only per-repo line", asy
   assert.deepEqual(lines.filter((line) => line.includes("was not moved")), [
     "acme/api was not moved: could not be moved just now.",
   ]);
-  assert.ok(lines.indexOf("acme/api was not moved: could not be moved just now.") > lines.indexOf(ADMIN_WAIT));
+  assert.ok(lines.indexOf(adminWait()) >= 0, lines.join("\n"));
+  assert.ok(lines.indexOf("acme/api was not moved: could not be moved just now.") > lines.indexOf(adminWait()));
 });
 
 // carrick#993 row 6. Both pages this waits on refuse anyone who is not an
 // owner or an admin of the workspace, and the wait is thirty minutes long.
-test("every wait says who can end it, before it starts", async () => {
+// Said to a member only: an owner told to go and find an owner was the line
+// in carrick#1512, and a role the read does not state is not a member's.
+test("a member's wait says who can end it, before it starts, and nobody else's does", async () => {
   for (const project of [undefined, "payments"]) {
+    for (const member of [true, false, undefined]) {
+      const lines: string[] = [];
+      const controller = new AbortController();
+      await connectRepos("token", ["acme/api"], project === undefined ? initial : assignedToDefault, {
+        interactive: true,
+        project,
+        ...(member === undefined ? {} : { member }),
+        // The run set up the folder above where it started, so the line
+        // says where to run init again (carrick#1512).
+        again: "run carrick init in ~/shop again",
+        signal: controller.signal,
+        say: (line) => lines.push(line),
+        open: async () => true,
+        wait: async () => { controller.abort(); },
+        poll: async () => { throw new Error("must not poll after cancellation"); },
+      });
+      const waiting = lines.findIndex((line) => line.startsWith("Waiting"));
+      if (member === true) {
+        assert.ok(waiting > 0, lines.join("\n"));
+        assert.equal(
+          lines[waiting - 1],
+          "A workspace owner or admin must do this; Ctrl-C and run carrick init in ~/shop again once they have.",
+        );
+      } else {
+        assert.ok(!lines.includes(adminWait()), `${String(member)}: ${lines.join("\n")}`);
+      }
+    }
+  }
+});
+
+// carrick#1512. The page is named only where it could not be opened: the
+// reader who is looking at it in the browser does not need its address.
+test("the browser page is named only when it could not be opened", async () => {
+  for (const opens of [true, false]) {
     const lines: string[] = [];
     const controller = new AbortController();
-    await connectRepos("token", ["acme/api"], project === undefined ? initial : assignedToDefault, {
+    await connectRepos("token", ["acme/api"], initial, {
       interactive: true,
-      project,
       signal: controller.signal,
       say: (line) => lines.push(line),
-      open: async () => true,
+      open: async () => opens,
       wait: async () => { controller.abort(); },
-      poll: async () => { throw new Error("must not poll after cancellation"); },
+      poll: async () => initial,
     });
-    const waiting = lines.findIndex((line) => line.startsWith("Waiting"));
-    assert.ok(waiting > 0, lines.join("\n"));
-    assert.equal(lines[waiting - 1], ADMIN_WAIT);
+    const named = lines.filter((line) => line.includes("https://app.carrick.tools/w/acme/connect"));
+    assert.deepEqual(named, opens ? [] : ["Open https://app.carrick.tools/w/acme/connect in your browser."]);
   }
 });

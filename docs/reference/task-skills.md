@@ -73,6 +73,16 @@ so in its own numbers.
 .agents/skills/<name>/SKILL.md
 ```
 
+Run in a folder of repos, init also writes the skills and the hooks into each
+repo it covers that is a git repository of its own, because an agent started
+inside a repo reads neither host's files from the folder above (carrick#1512).
+The hooks go in `.claude/settings.local.json` and `.codex/hooks.json`, and a
+path git already tracks is left alone. Every path is listed in a marked block
+at the top of that repo's `.git/info/exclude`, written before any of the files
+it names, so git ignores the copy. `carrick remove` reads the block back,
+removes exactly those files and entries, then the block, which leaves the
+exclude file as it was (`npm/carrick/src/init/repo-copies.ts`).
+
 Where init has settled a Carrick project, its slug is written into every tool
 call in the bodies. Where no repository in the workspace names a GitHub
 repository, no project is settled and the bodies tell the agent to read

@@ -42,6 +42,14 @@ type ConnectOptions = {
   announce?: Set<string>;
   /** How a project is printed: display name beside slug, where one is known. */
   label?: (slug: string) => string;
+  /**
+   * True where the workspace read says the signed-in user is a member, not an
+   * owner or an admin. Only they are told who can finish a browser step: an
+   * owner told to go and find an owner was the line in carrick#1512.
+   */
+  member?: boolean;
+  /** How to run init again, for the member's line: "run carrick init in ~/shop again". */
+  again?: string;
   open?: (url: string) => Promise<boolean>;
   poll?: (signal?: AbortSignal) => Promise<ResolvedRepos>;
   /** Placing repos in the project, injected so tests state the server (carrick#999). */
@@ -53,15 +61,18 @@ type ConnectOptions = {
 };
 
 /**
- * The line before every wait.
+ * The line before a member's wait.
  *
  * What is waited on is a page in the Carrick dashboard, and both of them —
  * the App grant and the Repos page — refuse anyone who is not an owner or an
  * admin of the workspace. Waiting thirty minutes on a page you may not use is
- * the friction this says out loud (carrick#993).
+ * the friction this says out loud (carrick#993), to the members it is true of
+ * (carrick#1512). `again` is how to run init again, which names the folder
+ * when the run set up the one above where it started.
  */
-export const ADMIN_WAIT =
-  "A workspace owner or admin must do this; Ctrl-C and run init again once they have.";
+export function adminWait(again: string = "run carrick init again"): string {
+  return `A workspace owner or admin must do this; Ctrl-C and ${again} once they have.`;
+}
 
 /** The dashboard pages init sends a reader to, for one workspace. */
 export function workspaceUrls(slug: string): { connect: string; projects: string; repos: string } {
@@ -115,10 +126,12 @@ export function unconnectedRepos(identity: ResolvedRepos, repos: string[]): stri
 }
 
 /**
- * The one line that sends a reader to the GitHub App, naming the repos it is
- * for. Printed only for repos a read taken just now says are unconnected: the
- * grant page re-asks GitHub for the whole repo list, which is wasted on a repo
- * that is already connected (carrick#1489).
+ * The line that sends a reader to the GitHub App, naming the repos it is for,
+ * for a run that cannot open the page itself: one with no terminal, and one
+ * whose wait was stopped with the grant still to do. Printed only for repos a
+ * read taken just now says are unconnected: the grant page re-asks GitHub for
+ * the whole repo list, which is wasted on a repo that is already connected
+ * (carrick#1489).
  */
 export function connectLine(unconnected: string[], total: number, url: string): string {
   const which =
@@ -296,8 +309,10 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   } else if (settled(latest)) {
     return latest;
   }
+  // The grant itself is not said here: the list the reader said yes to named
+  // it, with its link where there is no terminal to open it from, and a
+  // second line saying the same thing was the repeat in carrick#1512.
   const unconnected = unconnectedRepos(latest, repos);
-  if (unconnected.length > 0) options.say(connectLine(unconnected, repos.length, urls.connect));
   // Only where this run cannot do the placing itself.
   if (byHand(latest)) browserAssign();
   if (!options.interactive) {
@@ -317,11 +332,15 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
         : byHand(latest)
           ? urls.repos
           : null;
-  // Who can finish a browser step, said only where there is one: a wait on
-  // placements this run makes itself has nothing for an owner to do.
+  // Who can finish a browser step, said only where there is one — a wait on
+  // placements this run makes itself has nothing for an owner to do — and
+  // only to a member, who is the one it is news to (carrick#1512).
   if (target !== null) {
-    options.say(ADMIN_WAIT);
-    void (options.open ?? openBrowser)(target).catch(() => false);
+    if (options.member === true) options.say(adminWait(options.again));
+    // The page is named only where it could not be opened: a reader looking
+    // at it in the browser does not need its address as well.
+    const opened = await (options.open ?? openBrowser)(target).catch(() => false);
+    if (!opened) options.say(`Open ${target} in your browser.`);
   }
 
   /** Where the wait stands, as one line. */
@@ -372,10 +391,9 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
         done
           ? {
               kind: "done",
-              text:
-                project === undefined
-                  ? `${repoCount(repos.length)} connected`
-                  : `${repoCount(repos.length)} connected, in ${label(project)}`,
+              // The count alone: the line after the wait names the project
+              // and its repos (carrick#1512).
+              text: `${repoCount(repos.length)} connected`,
             }
           : {
               kind: "warn",

@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
 import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE, APP_BASE, SCOPE } from "../src/auth/credentials.ts";
-import { logout } from "../src/auth/run.ts";
+import { loginNextStep, logout } from "../src/auth/run.ts";
 import { authorize, callbackPage, type OAuthOptions } from "../src/auth/oauth.ts";
 import { resolveRepos } from "../src/auth/read.ts";
 
@@ -160,8 +160,20 @@ test("the callback page answers after the exchange and names the workspace", asy
   assert.match(run.type ?? "", /^text\/html/);
   assert.deepEqual(run.events, ["exchange", "lookup", "page"]);
   assert.match(run.html, /<h1>Signed in to acme<\/h1>/);
-  assert.match(run.html, /You can close this tab\. Next, run <code>carrick init<\/code> in the folder that holds your repos\./);
+  // That sign-in worked and the tab can go, and nothing about what comes
+  // next: `carrick init` opens this page too, and the terminal knows which
+  // run it is (carrick#1511).
+  assert.match(run.html, /<p>You can close this tab and go back to your terminal\.<\/p>/);
+  assert.doesNotMatch(run.html, /carrick init|Next/);
   assert.doesNotMatch(run.html, /<link|<script|<img|src=|href=/);
+});
+
+// carrick#1511. The next step is said by the terminal, and only to a machine
+// that has never been set up: `carrick init` writes the install id and
+// `carrick remove` deletes it.
+test("login names carrick init as the next step only on a machine never set up", () => {
+  assert.equal(loginNextStep(null), "Next: run carrick init in the folder that holds your repos.");
+  assert.equal(loginNextStep("0f3c9a2e-machine"), null);
 });
 
 test("a failed workspace lookup keeps the token and still says signed in", async () => {

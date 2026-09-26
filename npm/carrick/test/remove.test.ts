@@ -27,6 +27,7 @@ import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
 import { noticeFile } from "../src/init/outdated.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
+import { excludeFile, repoCopyPaths, writeRepoCopy } from "../src/init/repo-copies.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 /** What this machine calls itself to the index, until this command deletes it. */
@@ -415,4 +416,70 @@ test("--keep-login removes everything else and leaves the credential", posixFixt
   assert.equal(fs.existsSync(installIdPath(state.home)), false);
   assert.ok(fs.existsSync(path.join(state.root, "config", "carrick", "credentials.json")));
   assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
+});
+
+// carrick#1512, option A. Init run in a folder of repos also copies its hooks
+// and skills into each repo, recorded in that repo's `.git/info/exclude`.
+// Remove, run in the same folder, takes back each copy and its lines, and
+// leaves every repo's git status as it was before init.
+test("remove takes the hooks and skills back out of each repo in the folder, with their exclude lines", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const repos = ["shop-api", "shop-app"].map((name) => {
+    const dir = path.join(state.workspace, name);
+    fs.mkdirSync(dir, { recursive: true });
+    spawnSync("git", ["init", "-q", dir]);
+    fs.writeFileSync(path.join(dir, "package.json"), "{}\n");
+    return dir;
+  });
+  const before = repos.map((dir) => ({
+    exclude: fs.readFileSync(excludeFile(dir)!, "utf8"),
+    status: spawnSync("git", ["-C", dir, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout,
+  }));
+  for (const dir of repos) writeRepoCopy(dir, "carrick", { slug: "shop" });
+
+  const result = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--workspace", state.workspace], {
+    encoding: "utf8",
+    env: state.env,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  for (const [index, dir] of repos.entries()) {
+    const name = path.basename(dir);
+    assert.ok(result.stdout.includes(`◇ Carrick's hooks and skills removed from ${name}, with its .git/info/exclude lines`), result.stdout);
+    assert.equal(fs.readFileSync(excludeFile(dir)!, "utf8"), before[index]!.exclude);
+    assert.equal(
+      spawnSync("git", ["-C", dir, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout,
+      before[index]!.status,
+    );
+    for (const relative of repoCopyPaths()) assert.equal(fs.existsSync(path.join(dir, relative)), false, relative);
+  }
+});
+
+// carrick#1512 review R1. Remove run inside one repo of a set-up folder: the
+// general cleanup used to empty the copy's settings file first, leave it
+// holding `{"hooks": {}}`, and then take away the exclude line that kept it
+// out of git. The copy is undone first now, and a settings file left with
+// nothing in it goes.
+test("remove run inside a repo takes its copy back whole, and git sees nothing left", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const repo = path.join(state.root, "shop-app");
+  fs.mkdirSync(repo, { recursive: true });
+  spawnSync("git", ["init", "-q", repo]);
+  fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
+  const exclude = fs.readFileSync(excludeFile(repo)!, "utf8");
+  const status = (): string =>
+    spawnSync("git", ["-C", repo, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout;
+  const before = status();
+  writeRepoCopy(repo, "carrick", { slug: "shop" });
+
+  const result = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--keep-login", "--workspace", repo], {
+    encoding: "utf8",
+    env: state.env,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(repo, ".claude", "settings.local.json")), false, result.stdout);
+  assert.equal(fs.existsSync(path.join(repo, ".claude")), false, result.stdout);
+  assert.equal(fs.readFileSync(excludeFile(repo)!, "utf8"), exclude);
+  assert.equal(status(), before);
 });

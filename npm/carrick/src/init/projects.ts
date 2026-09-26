@@ -263,8 +263,24 @@ export function slugFromName(name: string): string {
 export const PROJECT_RULE =
   "One project per interconnected system: repos that call each other belong together.";
 
+/**
+ * Repos as a sentence names them: "shop-app", "shop-app and shop-api", or the
+ * first three and a count of the rest.
+ */
+export function reposPhrase(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  if (names.length > 3) return `${names.slice(0, 3).join(", ")} and ${names.length - 3} more`;
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+
 /** What init asks the terminal during the project step. */
 export type ProjectPrompts = {
+  /**
+   * The repos the project is for, as the reader knows them. Every question
+   * names them: "these repos" asked about a project before the reader had
+   * seen which repos went into it (carrick#1512).
+   */
+  repos: string[];
   say: (line: string) => void;
   /** A free-text answer, already trimmed. Empty means "skip this". */
   ask: (question: string) => Promise<string>;
@@ -321,9 +337,11 @@ export type ProjectChoice = {
  * Nothing here writes: the whole project step runs before the proposal is
  * accepted, and a run the reader stops must leave the workspace exactly as it
  * found it (carrick#1338). `exists` is what this run can state; `create` is
- * what it has permission to do once the proposal is accepted. A workspace
- * whose API has no project list settles neither, and the caller falls back to
- * the browser instructions, which include creating it.
+ * what it will do once the proposal is accepted, which is the one question
+ * that covers it: the create is a line in the list that question is asked
+ * about (carrick#1512). A workspace whose API has no project list settles
+ * neither, and the caller falls back to the browser instructions, which
+ * include creating it.
  */
 export async function planProject(
   slug: string,
@@ -338,9 +356,7 @@ export async function planProject(
   }
   say(projects.length === 0 ? "This workspace has no projects yet." : "Projects in this workspace:");
   for (const line of projectLines(projects)) say(line);
-  if (prompts.assumeYes) return { slug, exists: false, create: true };
-  if (!prompts.interactive) return { slug, exists: false, create: false };
-  return { slug, exists: false, create: await prompts.confirm(`Create project "${slug}"?`) };
+  return { slug, exists: false, create: true };
 }
 
 /**
@@ -367,6 +383,8 @@ export async function projectStep(
 ): Promise<ProjectChoice> {
   const none: ProjectChoice = { slug: null, exists: false, create: false };
   if (current.length === 0) return none;
+  const named = reposPhrase(prompts.repos);
+  const one = prompts.repos.length === 1;
 
   const assigned = [...new Set(current)];
   const sole = assigned.length === 1 ? assigned[0] : null;
@@ -375,7 +393,11 @@ export async function projectStep(
     // someone at the keyboard says otherwise, and the caller states the
     // assignment it verifies, so this says nothing of its own.
     if (!prompts.interactive || prompts.assumeYes) return { slug: sole, exists: true, create: false };
-    if (await prompts.confirm(`These repos are in project ${projectLabel(sole, projects)}. Keep them there?`)) {
+    if (
+      await prompts.confirm(
+        `${named} ${one ? "is" : "are"} in project ${projectLabel(sole, projects)}. Keep ${one ? "it" : "them"} there?`,
+      )
+    ) {
       return { slug: sole, exists: true, create: false };
     }
   }
@@ -393,7 +415,7 @@ export async function projectStep(
   // keeps declining has not chosen a project, and the dashboard is where one
   // is chosen instead.
   for (let round = 0; round < 3; round += 1) {
-    const picked = await prompts.pick("Which project should these repos be in?", options);
+    const picked = await prompts.pick(`Which project should ${named} be in?`, options);
     if (picked === DASHBOARD) break;
     if (picked === NEW_PROJECT) {
       const created = await newProject(projects, prompts);
@@ -403,7 +425,9 @@ export async function projectStep(
     return { slug: picked.slice(PICKED.length), exists: true, create: false };
   }
   if (prompts.dashboard !== undefined) {
-    prompts.say(`Add these repos to a project at ${prompts.dashboard.url}. Until then they are in no project.`);
+    prompts.say(
+      `Add ${named} to a project at ${prompts.dashboard.url}. Until then ${one ? "it is" : "they are"} in no project.`,
+    );
     prompts.dashboard.open(prompts.dashboard.url);
   }
   return none;
@@ -459,8 +483,10 @@ export function nameProblem(name: string, projects: Project[]): string | null {
 /**
  * A project to create, by the name the reader types.
  *
- * Null when the reader gave no name, declined the create, or gave three names
- * that cannot be used: the caller then asks the list again.
+ * Null when the reader gave no name, or gave three names that cannot be used:
+ * the caller then asks the list again. A usable name is not confirmed here:
+ * the create is the first line of the list init asks "Go ahead?" about, which
+ * is where a reader sees which repos go into it (carrick#1512).
  */
 async function newProject(projects: Project[], prompts: ProjectPrompts): Promise<ProjectChoice | null> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -471,10 +497,7 @@ async function newProject(projects: Project[], prompts: ProjectPrompts): Promise
       prompts.say(problem);
       continue;
     }
-    const slug = slugFromName(name);
-    const shown = name === slug ? slug : `${name} (${slug})`;
-    if (!(await prompts.confirm(`Create project ${shown}?`))) return null;
-    return { slug, exists: false, create: true, name };
+    return { slug: slugFromName(name), exists: false, create: true, name };
   }
   return null;
 }

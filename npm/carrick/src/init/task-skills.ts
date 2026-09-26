@@ -238,16 +238,9 @@ export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutc
   return outcomes;
 }
 
-/** The lines `carrick init` prints about what it just did with them. */
-export function taskSkillLines(outcomes: SkillOutcome[]): { done: string[]; warn: string[] } {
-  const done: string[] = [];
+/** The lines `carrick init` prints about the skills it left alone. */
+export function taskSkillWarnings(outcomes: SkillOutcome[]): string[] {
   const warn: string[] = [];
-  const installed = outcomes.filter((row) => row.state === "absent" || row.state === "ours");
-  if (installed.length > 0) {
-    done.push(
-      `Task skills installed in ${SKILL_ROOTS.join(" and ")}: ${TASK_SKILLS.join(", ")}`,
-    );
-  }
   for (const row of outcomes) {
     if (row.state === "edited") {
       warn.push(
@@ -257,7 +250,7 @@ export function taskSkillLines(outcomes: SkillOutcome[]): { done: string[]; warn
       warn.push(`${row.path} was not written by Carrick, so it was left as it is.`);
     }
   }
-  return { done, warn };
+  return warn;
 }
 
 /**
@@ -266,13 +259,20 @@ export function taskSkillLines(outcomes: SkillOutcome[]): { done: string[]; warn
  * An edited body and a file of somebody else's are returned as `kept` for the
  * caller to name, exactly as the write path leaves them. A skill directory
  * emptied by the deletion goes with it; a root holding anything else stays.
+ *
+ * `only` narrows the paths: a repo's own copy is undone for exactly the paths
+ * its exclude block records (carrick#1512).
  */
-export function removeTaskSkills(workspace: string): { deleted: string[]; kept: SkillOutcome[] } {
+export function removeTaskSkills(
+  workspace: string,
+  only: (relative: string) => boolean = () => true,
+): { deleted: string[]; kept: SkillOutcome[] } {
   const deleted: string[] = [];
   const kept: SkillOutcome[] = [];
   for (const root of SKILL_ROOTS) {
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
+      if (!only(relative)) continue;
       const target = path.join(workspace, relative);
       if (!fs.existsSync(target)) continue;
       const state = skillState(fs.readFileSync(target, "utf8"));
