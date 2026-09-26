@@ -86,6 +86,33 @@ export function selectedProposal(derived: DerivedWorkspace, keep: string[]): Der
 export const PROPOSAL_FILE = path.join(".carrick", "proposal.json");
 
 /**
+ * The folder above this repo, where an earlier `carrick init` there set this
+ * repo up with the others; null otherwise.
+ *
+ * Run inside one repo of a folder that is already set up, init used to offer
+ * this repo on its own, which is a second setup beside the first. The
+ * folder's proposal names the repos that setup covers, so a repo it names is
+ * set up from the folder again (carrick#1512, orchestrator ruling).
+ */
+export function initFolderAbove(repo: string): string | null {
+  const here = realPath(repo);
+  const folder = path.dirname(here);
+  if (folder === here) return null;
+  let document: unknown;
+  try {
+    document = JSON.parse(fs.readFileSync(path.join(folder, PROPOSAL_FILE), "utf8"));
+  } catch {
+    return null;
+  }
+  const repos = (document as { repos?: unknown } | null)?.repos;
+  if (!Array.isArray(repos)) return null;
+  const covered = repos.some(
+    (entry) => typeof (entry as { path?: unknown } | null)?.path === "string" && realPath((entry as { path: string }).path) === here,
+  );
+  return covered ? folder : null;
+}
+
+/**
  * Byte-identical to `write_self_ignore` in `src/local_mode/workspace.rs`.
  *
  * Two writers, because either command can be the first to create the
@@ -158,10 +185,12 @@ export const MAX_SIBLINGS = 15;
  *
  * The scanner states the folder above a single repository and what it holds
  * (`parent_proposal`), by the same markers every scan uses, which count a
- * folder holding only `.git`. The question these feed is which repos belong to
- * the same system as this one, so a sibling is kept only where it holds a
- * JavaScript or TypeScript manifest, and not where the folder's own
- * `carrick-workspace.json` already leaves it out (carrick#1512).
+ * folder holding only `.git`, and one holding only a manifest. The question
+ * these feed is which repos belong to the same system as this one, so a
+ * sibling is kept only where it is a git repository (a `.git`, which is a file
+ * in a linked worktree) holding a JavaScript or TypeScript manifest, and not
+ * where the folder's own `carrick-workspace.json` already leaves it out
+ * (carrick#1512).
  */
 export function siblingRepos(
   plan: WorkspaceProposal,
@@ -176,6 +205,7 @@ export function siblingRepos(
       path.dirname(repo) === parent.directory &&
       realPath(repo) !== here &&
       !excluded.includes(path.basename(repo)) &&
+      exists(path.join(repo, ".git")) &&
       JS_MANIFESTS.some((manifest) => exists(path.join(repo, manifest))),
   );
 }

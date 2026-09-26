@@ -225,6 +225,24 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
   // someone hand-edited into invalid JSON must not leave the credential and
   // the MCP entries behind.
   let removed = 0;
+
+  // The copies init put inside each repo of a folder (carrick#1512): exactly
+  // the files its lines in that repo's `.git/info/exclude` name, and then the
+  // lines. A repo with no such lines is one init never copied into. First,
+  // because this folder may itself be one of those repos: the cleanup below
+  // would empty its copy's settings file and leave it, and then take away the
+  // line that kept it out of git.
+  for (const repo of repoRoots(workspace)) {
+    const name = path.relative(workspace, repo) || path.basename(repo);
+    try {
+      if (removeRepoCopy(repo) !== null) {
+        out.done(`Carrick's hooks and skills removed from ${name}, with its .git/info/exclude lines`);
+        removed += 1;
+      }
+    } catch (error) {
+      out.refuse(`Could not remove Carrick's hooks and skills from ${name}: ${(error as Error).message}`);
+    }
+  }
   for (const relative of SETTINGS_FILES) {
     const file = path.join(workspace, relative);
     try {
@@ -305,20 +323,6 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     );
   }
 
-  // The copies init put inside each repo of a folder (carrick#1512): exactly
-  // the files its lines in that repo's `.git/info/exclude` name, and then the
-  // lines. A repo with no such lines is one init never copied into.
-  for (const repo of repoRoots(workspace)) {
-    const name = path.relative(workspace, repo) || path.basename(repo);
-    try {
-      if (removeRepoCopy(repo) !== null) {
-        out.done(`Carrick's hooks and skills removed from ${name}, with its .git/info/exclude lines`);
-        removed += 1;
-      }
-    } catch (error) {
-      out.refuse(`Could not remove Carrick's hooks and skills from ${name}: ${(error as Error).message}`);
-    }
-  }
 
   // The repo selection, which is the one thing init writes into a file a user
   // can also write to (carrick#1344). Only the names init put in the exclude

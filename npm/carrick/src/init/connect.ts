@@ -48,6 +48,8 @@ type ConnectOptions = {
    * owner told to go and find an owner was the line in carrick#1512.
    */
   member?: boolean;
+  /** How to run init again, for the member's line: "run carrick init in ~/shop again". */
+  again?: string;
   open?: (url: string) => Promise<boolean>;
   poll?: (signal?: AbortSignal) => Promise<ResolvedRepos>;
   /** Placing repos in the project, injected so tests state the server (carrick#999). */
@@ -65,10 +67,12 @@ type ConnectOptions = {
  * the App grant and the Repos page — refuse anyone who is not an owner or an
  * admin of the workspace. Waiting thirty minutes on a page you may not use is
  * the friction this says out loud (carrick#993), to the members it is true of
- * (carrick#1512).
+ * (carrick#1512). `again` is how to run init again, which names the folder
+ * when the run set up the one above where it started.
  */
-export const ADMIN_WAIT =
-  "A workspace owner or admin must do this; Ctrl-C and run init again once they have.";
+export function adminWait(again: string = "run carrick init again"): string {
+  return `A workspace owner or admin must do this; Ctrl-C and ${again} once they have.`;
+}
 
 /** The dashboard pages init sends a reader to, for one workspace. */
 export function workspaceUrls(slug: string): { connect: string; projects: string; repos: string } {
@@ -332,7 +336,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   // placements this run makes itself has nothing for an owner to do — and
   // only to a member, who is the one it is news to (carrick#1512).
   if (target !== null) {
-    if (options.member === true) options.say(ADMIN_WAIT);
+    if (options.member === true) options.say(adminWait(options.again));
     // The page is named only where it could not be opened: a reader looking
     // at it in the browser does not need its address as well.
     const opened = await (options.open ?? openBrowser)(target).catch(() => false);
@@ -387,10 +391,9 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
         done
           ? {
               kind: "done",
-              text:
-                project === undefined
-                  ? `${repoCount(repos.length)} connected`
-                  : `${repoCount(repos.length)} connected, in ${label(project)}`,
+              // The count alone: the line after the wait names the project
+              // and its repos (carrick#1512).
+              text: `${repoCount(repos.length)} connected`,
             }
           : {
               kind: "warn",

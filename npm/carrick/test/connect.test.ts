@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ADMIN_WAIT, connectLine, connectRepos, reposAreInProject, unconnectedRepos } from "../src/init/connect.ts";
+import { adminWait, connectLine, connectRepos, reposAreInProject, unconnectedRepos } from "../src/init/connect.ts";
 import { resolveRepos, type ResolvedRepos } from "../src/auth/read.ts";
 import type { AssignOutcome } from "../src/init/projects.ts";
 
@@ -81,7 +81,7 @@ test("a repo connected to another project remains pending until it reaches the r
   assert.match(lines.join("\n"), /Assign the requested repos: https:\/\/app\.carrick\.tools\/w\/acme\/repos/);
   // The settled assignment is the claim, read back from the poll, and it is
   // the outcome line of the wait rather than a line per repo (carrick#1489).
-  assert.equal(lines.at(-1), "1 repo connected, in payments");
+  assert.equal(lines.at(-1), "1 repo connected");
   assert.doesNotMatch(lines.join("\n"), /currently in project/);
 });
 
@@ -324,7 +324,7 @@ test("assignment happens when the poll sees the repo, not before", async () => {
 
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
-  assert.equal(lines.at(-1), "1 repo connected, in payments");
+  assert.equal(lines.at(-1), "1 repo connected");
   assert.doesNotMatch(lines.join("\n"), /Moved|currently in project/);
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
 });
@@ -368,7 +368,7 @@ test("a wait with no browser step does not say who can finish one", async () => 
     poll: async () => assignedToDefault,
     wait: async () => { controller.abort(); },
   });
-  assert.ok(!lines.includes(ADMIN_WAIT), lines.join("\n"));
+  assert.ok(!lines.includes(adminWait()), lines.join("\n"));
   assert.deepEqual(opened, []);
 });
 
@@ -474,8 +474,8 @@ test("the wait is one status line, and a failure is the only per-repo line", asy
   assert.deepEqual(lines.filter((line) => line.includes("was not moved")), [
     "acme/api was not moved: could not be moved just now.",
   ]);
-  assert.ok(lines.indexOf(ADMIN_WAIT) >= 0, lines.join("\n"));
-  assert.ok(lines.indexOf("acme/api was not moved: could not be moved just now.") > lines.indexOf(ADMIN_WAIT));
+  assert.ok(lines.indexOf(adminWait()) >= 0, lines.join("\n"));
+  assert.ok(lines.indexOf("acme/api was not moved: could not be moved just now.") > lines.indexOf(adminWait()));
 });
 
 // carrick#993 row 6. Both pages this waits on refuse anyone who is not an
@@ -491,6 +491,9 @@ test("a member's wait says who can end it, before it starts, and nobody else's d
         interactive: true,
         project,
         ...(member === undefined ? {} : { member }),
+        // The run set up the folder above where it started, so the line
+        // says where to run init again (carrick#1512).
+        again: "run carrick init in ~/shop again",
         signal: controller.signal,
         say: (line) => lines.push(line),
         open: async () => true,
@@ -500,9 +503,12 @@ test("a member's wait says who can end it, before it starts, and nobody else's d
       const waiting = lines.findIndex((line) => line.startsWith("Waiting"));
       if (member === true) {
         assert.ok(waiting > 0, lines.join("\n"));
-        assert.equal(lines[waiting - 1], ADMIN_WAIT);
+        assert.equal(
+          lines[waiting - 1],
+          "A workspace owner or admin must do this; Ctrl-C and run carrick init in ~/shop again once they have.",
+        );
       } else {
-        assert.ok(!lines.includes(ADMIN_WAIT), `${String(member)}: ${lines.join("\n")}`);
+        assert.ok(!lines.includes(adminWait()), `${String(member)}: ${lines.join("\n")}`);
       }
     }
   }

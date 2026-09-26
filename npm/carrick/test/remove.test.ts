@@ -454,3 +454,32 @@ test("remove takes the hooks and skills back out of each repo in the folder, wit
     for (const relative of repoCopyPaths()) assert.equal(fs.existsSync(path.join(dir, relative)), false, relative);
   }
 });
+
+// carrick#1512 review R1. Remove run inside one repo of a set-up folder: the
+// general cleanup used to empty the copy's settings file first, leave it
+// holding `{"hooks": {}}`, and then take away the exclude line that kept it
+// out of git. The copy is undone first now, and a settings file left with
+// nothing in it goes.
+test("remove run inside a repo takes its copy back whole, and git sees nothing left", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const repo = path.join(state.root, "shop-app");
+  fs.mkdirSync(repo, { recursive: true });
+  spawnSync("git", ["init", "-q", repo]);
+  fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
+  const exclude = fs.readFileSync(excludeFile(repo)!, "utf8");
+  const status = (): string =>
+    spawnSync("git", ["-C", repo, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout;
+  const before = status();
+  writeRepoCopy(repo, "carrick", { slug: "shop" });
+
+  const result = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--keep-login", "--workspace", repo], {
+    encoding: "utf8",
+    env: state.env,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(repo, ".claude", "settings.local.json")), false, result.stdout);
+  assert.equal(fs.existsSync(path.join(repo, ".claude")), false, result.stdout);
+  assert.equal(fs.readFileSync(excludeFile(repo)!, "utf8"), exclude);
+  assert.equal(status(), before);
+});
