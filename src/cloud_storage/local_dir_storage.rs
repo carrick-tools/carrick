@@ -40,6 +40,10 @@ pub const ISOLATE_ENV: &str = "CARRICK_LOCAL_STORAGE_ISOLATE";
 /// of the cache dir. Ignored when [`ISOLATE_ENV`] is set: isolation is the
 /// eval harness's guarantee and nothing may widen it.
 pub const PEERS_ENV: &str = "CARRICK_LOCAL_STORAGE_PEERS";
+/// A path for `post_pr_result` to write the PR result to, so an offline replay
+/// of a PR run can read what the cloud would have been sent (the `on_main`
+/// split, carrick-cloud#1408). Unset, the result is dropped as before.
+pub const PR_RESULT_OUT_ENV: &str = "CARRICK_PR_RESULT_OUT";
 
 /// Where `download_all_repo_data` reads the cross-repo set from.
 #[derive(Debug, Clone, PartialEq)]
@@ -290,11 +294,21 @@ impl CloudStorage for LocalDirStorage {
         &self,
         payload: &crate::findings::PrResultPayload,
     ) -> Result<(), StorageError> {
-        debug!(
-            "LOCAL: Skipping PR result for {} (PR #{})",
-            payload.repo, payload.pr_number
-        );
-        Ok(())
+        let Some(out) = std::env::var_os(PR_RESULT_OUT_ENV).filter(|out| !out.is_empty()) else {
+            debug!(
+                "LOCAL: Skipping PR result for {} (PR #{})",
+                payload.repo, payload.pr_number
+            );
+            return Ok(());
+        };
+        let json = serde_json::to_string_pretty(payload)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        std::fs::write(&out, json).map_err(|e| {
+            StorageError::ConnectionError(format!(
+                "could not write the PR result to {}: {e}",
+                PathBuf::from(&out).display()
+            ))
+        })
     }
 }
 

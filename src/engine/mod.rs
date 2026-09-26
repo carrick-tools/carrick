@@ -230,6 +230,97 @@ fn head_sha_from_event() -> Option<String> {
         .map(str::to_string)
 }
 
+/// `pull_request.base.sha` from the GITHUB_EVENT_PATH event payload, or None
+/// on any failure.
+fn base_sha_from_event() -> Option<String> {
+    let path = env::var("GITHUB_EVENT_PATH").ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let event: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    event
+        .get("pull_request")?
+        .get("base")?
+        .get("sha")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The commit this PR run's tree is based on (carrick-cloud#1408): the first
+/// parent of the merge commit a `pull_request` run checks out, which is what
+/// is on disk, else the event's `pull_request.base.sha`.
+fn pr_base_commit(repo_path: &str) -> Option<String> {
+    let parents = crate::git_state::head_parents(repo_path).unwrap_or_default();
+    if let [base, head] = parents.as_slice()
+        && head_sha_from_event().is_none_or(|event_head| event_head == *head)
+    {
+        return Some(base.clone());
+    }
+    base_sha_from_event()
+}
+
+/// Whether main's copy of this repo is main as this PR's base has it
+/// (carrick-cloud#1408), with the reason logged either way.
+///
+/// A copy at another commit is stale only when this clone holds that commit
+/// and it differs from the base under the scanned path: main moved after its
+/// last index, so a finding main's copy lacks may be main's rather than the
+/// PR's. A commit this clone does not hold (the squash-merged branch head a
+/// laptop index scanned, a shallow clone) cannot be compared, and is logged.
+fn main_copy_against_base(
+    repo_path: &str,
+    main_self: &[CloudRepoData],
+) -> crate::pr_baseline::MainCopy {
+    let base = pr_base_commit(repo_path);
+    let copy = crate::pr_baseline::main_copy(main_self, base.as_deref(), |copy, base| {
+        crate::git_state::differs_under(repo_path, copy, base).ok()
+    });
+    let scanned: Vec<String> = main_self
+        .iter()
+        .map(|repo| {
+            format!(
+                "{} by Carrick {}{}",
+                repo.commit_hash,
+                repo.scanner_version
+                    .as_deref()
+                    .unwrap_or("of unknown version"),
+                if repo.dirty == Some(true) {
+                    " with uncommitted changes"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
+    let base_named = base.as_deref().unwrap_or("unknown");
+    match copy {
+        crate::pr_baseline::MainCopy::Stale => info!(
+            "Main's index ({}) is not main as this PR's base ({base_named}) has it, so a \
+             finding it lacks is posted as not compared",
+            scanned.join(", ")
+        ),
+        crate::pr_baseline::MainCopy::OtherScanner => info!(
+            "Main's index ({}) was written by another Carrick version than this run's ({}), \
+             so a finding it lacks is posted as not compared",
+            scanned.join(", "),
+            env!("CARGO_PKG_VERSION")
+        ),
+        crate::pr_baseline::MainCopy::Current
+            if main_self
+                .iter()
+                .any(|repo| Some(repo.commit_hash.as_str()) != base.as_deref())
+                && base.is_some() =>
+        {
+            info!(
+                "Main's index ({}) is not at this PR's base ({base_named}), and this clone \
+                 does not hold that commit to compare, so the run compares with it as main's \
+                 latest index",
+                scanned.join(", ")
+            )
+        }
+        crate::pr_baseline::MainCopy::Current => {}
+    }
+    copy
+}
+
 /// The sidecar the signature pass is allowed to ask, which is none at all when
 /// this run skips inference (`CARRICK_SKIP_SIGNATURES`).
 ///
@@ -988,6 +1079,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 })
                 .collect();
             let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
+            let copy = main_copy_against_base(repo_path, &main_self_data);
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {
@@ -997,6 +1089,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 },
                 main_self: main_self_data,
                 surface_unchanged,
+                copy,
             }
         });
 
@@ -1299,6 +1392,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // run with a prior index.
     if let Some(input) = main_baseline_input {
         mark_findings_on_main(&mut results.findings, input, sidecar).await;
+    } else if is_pr_run {
+        // Nothing of this repo on main to compare with: say so on each
+        // finding, rather than leave the cloud to read it as introduced
+        // (carrick-cloud#1408).
+        crate::pr_baseline::mark_all_unknown(
+            &mut results.findings,
+            crate::findings::OnMainUnknown::NoMainIndex,
+        );
     }
 
     let topology = crate::findings::Topology {
@@ -6726,6 +6827,9 @@ struct MainBaselineInput {
     main_self: Vec<CloudRepoData>,
     /// This run scanned exactly what main's copy describes.
     surface_unchanged: bool,
+    /// Whether main's copy is main as this PR's base has it
+    /// (carrick-cloud#1408).
+    copy: crate::pr_baseline::MainCopy,
 }
 
 /// How long main's side of the comparison may take before the run gives up on
@@ -6748,8 +6852,8 @@ fn main_side_timeout() -> std::time::Duration {
 /// exactly what main's copy describes, every finding is main's and is marked
 /// so without running anything. Otherwise main's side runs under a timeout
 /// and a panic guard: whatever goes wrong there is stated in one line and
-/// leaves every finding without the field, which the cloud reads as today's
-/// behaviour. It never costs the run its PR result.
+/// every finding says the run could not tell (carrick-cloud#1408). It never
+/// costs the run its PR result.
 async fn mark_findings_on_main(
     findings: &mut [crate::findings::Finding],
     input: MainBaselineInput,
@@ -6765,6 +6869,7 @@ async fn mark_findings_on_main(
         return;
     }
 
+    let copy = input.copy;
     let sp = logging::spinner("Comparing findings with main...");
     let timeout = main_side_timeout();
     let outcome = {
@@ -6778,12 +6883,8 @@ async fn mark_findings_on_main(
         .await
     };
     let failure = match outcome {
-        Ok(Ok(Ok((main_findings, types_compared)))) => {
-            crate::pr_baseline::mark_on_main(
-                findings,
-                &main_findings,
-                crate::pr_baseline::Baseline { types_compared },
-            );
+        Ok(Ok(Ok(main))) => {
+            crate::pr_baseline::mark_on_main(findings, &main, copy);
             logging::finish_spinner(&sp, "Compared findings with main");
             return;
         }
@@ -6795,7 +6896,8 @@ async fn mark_findings_on_main(
         Err(_) => format!("main's analysis took longer than {}s", timeout.as_secs()),
     };
     logging::finish_spinner_warn(&sp, "Could not compare findings with main");
-    warn!("Findings are posted without the on-main mark: {failure}");
+    warn!("Findings are posted as not compared with main: {failure}");
+    crate::pr_baseline::mark_all_unknown(findings, crate::findings::OnMainUnknown::MainSideFailed);
 }
 
 /// Main's side of the comparison: the same analysis this run's findings came
@@ -6804,7 +6906,7 @@ async fn mark_findings_on_main(
 async fn main_side_findings(
     input: MainBaselineInput,
     sidecar: Option<&TypeSidecar>,
-) -> Result<(Vec<crate::findings::Finding>, bool), Box<dyn std::error::Error>> {
+) -> Result<crate::pr_baseline::MainSide, Box<dyn std::error::Error>> {
     crate::pr_baseline::record_main_side_run();
     match crate::pr_baseline::take_mock_main_side_fault() {
         Some(crate::pr_baseline::MainSideFault::Error) => {
@@ -6819,6 +6921,10 @@ async fn main_side_findings(
     let MainBaselineInput {
         peers, main_self, ..
     } = input;
+    // Main's own answers, from the scan that had main's sources on disk. The
+    // recomputation below has none, so a response main's scan judged by
+    // retyping the consumer's call (carrick#1491) is reached only here.
+    let stored = crate::pr_baseline::stored_type_sites(&main_self);
     let sdk_input = crate::sdk_edges::SdkJoinInput::collect(
         peers.iter().chain(main_self.iter()),
         main_self.iter(),
@@ -6830,12 +6936,14 @@ async fn main_side_findings(
         &main_results.cross_repo_matches,
         &analyzer.pair_directions(),
     );
-    let mut main_findings = main_results.findings;
-    main_findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
-    Ok((
-        main_findings,
-        type_check == crate::local_mode::JoinTypeCheck::Ran,
-    ))
+    let mut findings = main_results.findings;
+    findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
+    Ok(crate::pr_baseline::MainSide {
+        findings,
+        recomputed: analyzer.type_sites(),
+        stored,
+        types_judged: type_check == crate::local_mode::JoinTypeCheck::Ran,
+    })
 }
 
 async fn build_cross_repo_analyzer(

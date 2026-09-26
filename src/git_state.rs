@@ -216,6 +216,52 @@ pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>,
         .collect())
 }
 
+/// The parents of the commit checked out at `repo_path`, first parent first.
+///
+/// Read from the raw commit object, so a shallow clone (whose history git
+/// otherwise treats as ending at HEAD) still names them. `Err` means git could
+/// not answer.
+pub fn head_parents(repo_path: &str) -> Result<Vec<String>, String> {
+    Ok(run_git(repo_path, &["cat-file", "-p", "HEAD"])?
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix("parent "))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether the trees of commits `a` and `b` differ under `repo_path`.
+///
+/// `Err` when either is not a commit id this clone holds, or git could not
+/// answer: a commit that is not here cannot be compared, which is not the
+/// same as one that differs.
+pub fn differs_under(repo_path: &str, a: &str, b: &str) -> Result<bool, String> {
+    for commit in [a, b] {
+        // A value that is not a hex object name never reaches git's argument
+        // list, where a leading `-` would read as an option.
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{commit:?} is not a commit id"));
+        }
+        run_git(
+            repo_path,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )?;
+    }
+    let status = Command::new("git")
+        .args(["diff", "--quiet", "--no-renames", a, b, "--", "."])
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .map_err(|e| e.to_string())?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(format!("git diff exited {status}")),
+    }
+}
+
 /// The tracked paths under `repo_path` that match any of `pathspecs` (git
 /// pathspec globs such as `*.graphql`), relative to `repo_path`.
 ///
