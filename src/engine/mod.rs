@@ -257,6 +257,34 @@ fn pr_base_commit(repo_path: &str) -> Option<String> {
     base_sha_from_event()
 }
 
+/// What the files this PR leaves alone showed about main's copy, as the middle
+/// clause of the line that says whether the run compares with it.
+fn untouched_reading_clause(reading: &crate::pr_baseline::UntouchedReading) -> String {
+    use crate::pr_baseline::UntouchedReading;
+    match reading {
+        UntouchedReading::Alike { files, .. } => {
+            format!("its rows for the {files} file(s) this PR leaves alone match this run's")
+        }
+        UntouchedReading::Differ {
+            service,
+            file,
+            part,
+        } => {
+            let at = match (file.is_empty(), service) {
+                (true, None) => String::new(),
+                (true, Some(service)) => format!(" in {service}"),
+                (false, None) => format!(" for {file}"),
+                (false, Some(service)) => format!(" for {file} in {service}"),
+            };
+            format!("its {part}{at} differ from this run's")
+        }
+        UntouchedReading::NothingToCompare => {
+            "this PR leaves no file with rows unchanged to compare it on".to_string()
+        }
+        UntouchedReading::Unknown(reason) => reason.clone(),
+    }
+}
+
 /// Whether main's copy of this repo is main as this PR's base has it
 /// (carrick-cloud#1408), with the reason logged either way.
 ///
@@ -265,14 +293,41 @@ fn pr_base_commit(repo_path: &str) -> Option<String> {
 /// last index, so a finding main's copy lacks may be main's rather than the
 /// PR's. A commit this clone does not hold (the squash-merged branch head a
 /// laptop index scanned, a shallow clone) cannot be compared, and is logged.
+///
+/// A copy another scanner version wrote is compared with when that scanner
+/// read the files this PR left alone as this run did (carrick#1530).
+/// `as_uploaded` is this run's services in the form main's copy was stored in.
 fn main_copy_against_base(
     repo_path: &str,
     main_self: &[CloudRepoData],
+    as_uploaded: &[CloudRepoData],
 ) -> crate::pr_baseline::MainCopy {
     let base = pr_base_commit(repo_path);
-    let copy = crate::pr_baseline::main_copy(main_self, base.as_deref(), |copy, base| {
-        crate::git_state::differs_under(repo_path, copy, base).ok()
-    });
+    let mut reading = None;
+    let copy = crate::pr_baseline::main_copy(
+        main_self,
+        base.as_deref(),
+        |copy, base| crate::git_state::differs_under(repo_path, copy, base).ok(),
+        || {
+            let read = match base.as_deref() {
+                None => crate::pr_baseline::UntouchedReading::Unknown(
+                    "this run does not know the PR's base commit".to_string(),
+                ),
+                Some(base) => match crate::git_state::unchanged_since(repo_path, base) {
+                    Ok(untouched) => {
+                        crate::pr_baseline::untouched_reading(as_uploaded, main_self, &untouched)
+                    }
+                    Err(reason) => crate::pr_baseline::UntouchedReading::Unknown(format!(
+                        "git could not compare this tree with the base: {}",
+                        reason.trim()
+                    )),
+                },
+            };
+            let alike = read.alike();
+            reading = Some(read);
+            alike
+        },
+    );
     let scanned: Vec<String> = main_self
         .iter()
         .map(|repo| {
@@ -299,10 +354,29 @@ fn main_copy_against_base(
         ),
         crate::pr_baseline::MainCopy::OtherScanner => info!(
             "Main's index ({}) was written by another Carrick version than this run's ({}), \
-             so a finding it lacks is posted as not compared",
+             and {}, so a finding it lacks is posted as not compared",
             scanned.join(", "),
-            env!("CARGO_PKG_VERSION")
+            env!("CARGO_PKG_VERSION"),
+            reading.as_ref().map_or_else(
+                || "nothing was compared".to_string(),
+                untouched_reading_clause
+            )
         ),
+        crate::pr_baseline::MainCopy::Current
+            if reading
+                .as_ref()
+                .is_some_and(crate::pr_baseline::UntouchedReading::alike) =>
+        {
+            info!(
+                "Main's index ({}) was written by another Carrick version than this run's ({}), \
+                 and {}, so the run compares with it",
+                scanned.join(", "),
+                env!("CARGO_PKG_VERSION"),
+                reading
+                    .as_ref()
+                    .map_or_else(String::new, untouched_reading_clause)
+            )
+        }
         crate::pr_baseline::MainCopy::Current
             if main_self
                 .iter()
@@ -1079,7 +1153,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 })
                 .collect();
             let surface_unchanged = crate::pr_baseline::same_surface(&as_uploaded, &main_self_data);
-            let copy = main_copy_against_base(repo_path, &main_self_data);
+            let copy = main_copy_against_base(repo_path, &main_self_data, &as_uploaded);
             MainBaselineInput {
                 // The peers are only needed when there is something to run.
                 peers: if surface_unchanged {

@@ -654,3 +654,145 @@ async fn a_copy_behind_the_prs_base_never_calls_a_finding_introduced() {
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
+
+/// A second client in the consumer, beside the one the tests edit: a member
+/// that calls the producer's health route, and a caller that imports it. The
+/// PR runs below never touch these files, so their rows are what an earlier
+/// scanner's copy of main is judged on (carrick#1530).
+fn add_health_client(repo: &Path) {
+    std::fs::write(
+        repo.join("src/health-client.ts"),
+        r#"import { send } from "./send.js";
+
+export type Health = {
+  status: string;
+};
+
+export class HealthClient {
+  constructor(private readonly baseUrl: string) {}
+
+  readHealth(): Promise<Health> {
+    return send<Health>(`${this.baseUrl}/api/v1/health`, {
+      method: "GET",
+    });
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/status.ts"),
+        r#"import type { HealthClient } from "./health-client.js";
+
+export async function isUp(client: HealthClient): Promise<boolean> {
+  const health = await client.readHealth();
+  return health.status === "ok";
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// Change main's stored copy of `repo` in place, as another scanner would
+/// have written it.
+fn rewrite_main_copy(store: &Store, repo: &str, rewrite: impl Fn(&mut CloudRepoData)) {
+    let mut repos = store.repos.lock().unwrap();
+    let mut rewritten = 0;
+    for stored in repos.iter_mut().filter(|stored| stored.repo_name == repo) {
+        rewrite(stored);
+        rewritten += 1;
+    }
+    assert!(rewritten > 0, "main has a copy of {repo}");
+}
+
+/// The health client's row sits at its caller.
+fn in_status(location: &str) -> bool {
+    location.starts_with("src/status.ts")
+}
+
+/// carrick#1530. Main's copy was written by another scanner version, as it is
+/// on every repo from a release until main is scanned again. The other
+/// scanner read every file the PR left alone as this run does, so its copy
+/// counts, and a break the PR introduces reads as introduced. Where it read
+/// one of those files differently, the run cannot tell, as before.
+#[tokio::test]
+async fn another_scanners_copy_counts_when_it_reads_the_untouched_files_alike() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+
+    // Main calls with the right verb, and has a second client the PRs leave
+    // alone. Its row is in main's copy, so there is something to compare.
+    add_health_client(&consumer);
+    commit(&consumer, "main: get, and a health client");
+    let base = head(&consumer);
+    scan(&store, &consumer).await;
+    {
+        let repos = store.repos.lock().unwrap();
+        let copy = repos
+            .iter()
+            .find(|stored| stored.repo_name == "inventory-svc")
+            .expect("main's copy of the consumer");
+        assert!(
+            copy.calls
+                .iter()
+                .any(|call| in_status(&call.file_path.to_string_lossy())),
+            "main's copy has a row for a file the PRs leave alone: {:#?}",
+            copy.calls
+        );
+        assert_eq!(
+            copy.scanner_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+    rewrite_main_copy(&store, "inventory-svc", |copy| {
+        copy.scanner_version = Some("0.0.1".to_string());
+    });
+    event_with_base(tmp.path(), &base);
+
+    // The PR changes the client's verb and nothing else. The rows sit at the
+    // callers, which the PR did not touch, and they moved with the client:
+    // the run cannot tell that from a scanner that reads the callers
+    // differently, so it does not compare.
+    set_consumer_verb(&consumer, "PUT", 0);
+    commit(&consumer, "pr: put");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("main_index_other_scanner"),
+        "{finding:#}"
+    );
+
+    // The PR also edits the callers. Every file it left alone reads as main's
+    // copy reads it, so the copy counts and the wrong verb is introduced.
+    let callers = consumer.join("src/inventory.ts");
+    let mut source = std::fs::read_to_string(&callers).unwrap();
+    source.push_str("\n// Counts come from the catalog.\n");
+    std::fs::write(&callers, source).unwrap();
+    commit(&consumer, "pr: and a note in the callers");
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
+
+    // The other scanner never saw the health client's call.
+    rewrite_main_copy(&store, "inventory-svc", |copy| {
+        copy.calls
+            .retain(|call| !in_status(&call.file_path.to_string_lossy()));
+        if let Some(graph) = copy.mount_graph.as_mut() {
+            graph
+                .data_calls
+                .retain(|call| !in_status(&call.file_location));
+        }
+        if let Some(manifest) = copy.type_manifest.as_mut() {
+            manifest.retain(|entry| !in_status(&entry.file_path));
+        }
+    });
+    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
+    unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
+    assert!(finding.get("on_main").is_none(), "{finding:#}");
+    assert_eq!(
+        finding["on_main_unknown"],
+        serde_json::json!("main_index_other_scanner"),
+        "{finding:#}"
+    );
+}

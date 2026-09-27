@@ -29,10 +29,13 @@
 //! base has it, the finding says the run could not tell
 //! ([`OnMainUnknown`]) instead of guessing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde::Serialize;
+
+use crate::analyzer::ApiEndpointDetails;
 use crate::cloud_storage::{CloudRepoData, DirectionVerdict, ManifestTypeKind};
 use crate::findings::{Finding, OnMainUnknown};
 use crate::operation::TypeVerdict;
@@ -311,12 +314,17 @@ fn stored_site(pair: String, site: String, answer: &DirectionVerdict) -> MainTyp
 /// base. A copy at another commit this clone cannot compare, such as the head
 /// of a squash-merged branch that a laptop index scanned, is not shown to
 /// differ and counts as current: its verdicts are still main's latest answer.
-/// Otherwise, a copy another scanner version wrote is told apart, because its
-/// extraction and type check may differ from this run's.
+///
+/// Otherwise, a copy another scanner version wrote counts as current only when
+/// `read_alike` says that scanner read the files this PR left alone as this
+/// run did ([`untouched_reading`], carrick#1530). Its extraction and type check
+/// may differ from this run's, and the files both scanners read unchanged are
+/// the evidence of whether they do. It is asked only for such a copy.
 pub fn main_copy(
     main_self: &[CloudRepoData],
     base: Option<&str>,
     differs: impl Fn(&str, &str) -> Option<bool>,
+    read_alike: impl FnOnce() -> bool,
 ) -> MainCopy {
     let stale = main_self.iter().any(|repo| {
         repo.dirty == Some(true)
@@ -330,11 +338,358 @@ pub fn main_copy(
         .any(|repo| repo.scanner_version.as_deref() != Some(this_version));
     if stale {
         MainCopy::Stale
-    } else if other_scanner {
+    } else if other_scanner && !read_alike() {
         MainCopy::OtherScanner
     } else {
         MainCopy::Current
     }
+}
+
+/// What the files a PR left alone say about a copy of main that another
+/// scanner version wrote (carrick#1530).
+///
+/// Carrick releases most days and main's copy keeps the version of its last
+/// scan, so a version test alone leaves every PR uncompared from each release
+/// until main is scanned again. The PR run has its own reading of every file
+/// and main's copy has the other scanner's. Where the PR changed nothing, both
+/// read the same bytes, so a difference between the two readings is a
+/// difference between the scanners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UntouchedReading {
+    /// Both scanners read every row in those files alike.
+    Alike {
+        /// Operation and type rows compared.
+        rows: usize,
+        /// Files those rows sit in.
+        files: usize,
+    },
+    /// The first place the two readings part.
+    Differ {
+        /// The service, when the repo has more than one.
+        service: Option<String>,
+        /// The file, or empty for a fact about the whole service.
+        file: String,
+        /// What differs there.
+        part: &'static str,
+    },
+    /// No row either side holds sits in a file the PR left alone, so nothing
+    /// vouches for main's copy.
+    NothingToCompare,
+    /// Which files the PR left alone is not known, and why.
+    Unknown(String),
+}
+
+impl UntouchedReading {
+    pub fn alike(&self) -> bool {
+        matches!(self, Self::Alike { .. })
+    }
+}
+
+/// One part of a service's reading: the file it describes (empty for a fact
+/// about the whole service) and what it holds.
+type Part = (String, &'static str);
+
+/// A service's reading of the files a PR left alone, each part as the sorted
+/// JSON of its rows, so two scans that emit the same rows in another order
+/// read alike.
+#[derive(Default, PartialEq)]
+struct Reading {
+    parts: BTreeMap<Part, Vec<String>>,
+    /// Endpoint, call and type manifest rows.
+    rows: usize,
+}
+
+impl Reading {
+    fn add(&mut self, file: String, part: &'static str, row: impl Serialize) {
+        let row = serde_json::to_value(row)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        self.parts.entry((file, part)).or_default().push(row);
+    }
+
+    fn sorted(mut self) -> Self {
+        for rows in self.parts.values_mut() {
+            rows.sort();
+        }
+        self
+    }
+
+    /// The first part the two readings hold differently.
+    fn first_difference<'a>(&'a self, other: &'a Self) -> Option<&'a Part> {
+        self.parts
+            .keys()
+            .chain(other.parts.keys())
+            .filter(|part| self.parts.get(*part) != other.parts.get(*part))
+            .min()
+    }
+
+    fn files(&self) -> impl Iterator<Item = &str> {
+        self.parts
+            .keys()
+            .map(|(file, _)| file.as_str())
+            .filter(|file| !file.is_empty())
+    }
+}
+
+/// One service's reading of the files in `untouched`: what main's side of the
+/// comparison computes findings from.
+///
+/// Endpoints, calls, the type manifest and the mount graph, row by row, and
+/// for each manifest alias its declaration and record in the capture stub,
+/// which is what the type check judges. A mount edge belongs to no file and is
+/// read when neither router it joins sits in a file the PR changed. Left out:
+/// intents, signatures and function definitions, which change with prompts and
+/// feed no finding, and the package and config files, which are what a scanner
+/// reads rather than how it reads them.
+fn untouched_reading_of(data: &CloudRepoData, untouched: &HashSet<String>) -> Reading {
+    let mut reading = Reading::default();
+    let unchanged = |location: &str| -> Option<String> {
+        let file = site_file(location);
+        untouched.contains(&file).then_some(file)
+    };
+
+    for (part, ops) in [("endpoints", &data.endpoints), ("calls", &data.calls)] {
+        for op in ops {
+            let Some(file) = unchanged(&op.file_path.to_string_lossy()) else {
+                continue;
+            };
+            let mut op = op.clone();
+            strip_parsed_types(&mut op);
+            reading.add(file, part, op);
+            reading.rows += 1;
+        }
+    }
+
+    let mut aliases: Vec<(String, &str)> = Vec::new();
+    for entry in data.type_manifest.iter().flatten() {
+        let Some(file) = unchanged(&entry.file_path) else {
+            continue;
+        };
+        aliases.push((file.clone(), &entry.type_alias));
+        reading.add(file, "type manifest", entry);
+        reading.rows += 1;
+    }
+
+    if let Some(graph) = &data.mount_graph {
+        for (name, node) in &graph.nodes {
+            if let Some(file) = unchanged(&node.file_location) {
+                reading.add(file, "mount graph nodes", (name, node));
+            }
+        }
+        for endpoint in &graph.endpoints {
+            if let Some(file) = unchanged(&endpoint.file_location) {
+                reading.add(file, "mount graph endpoints", endpoint);
+            }
+        }
+        for call in &graph.data_calls {
+            if let Some(file) = unchanged(&call.file_location) {
+                reading.add(file, "mount graph calls", call);
+            }
+        }
+        let changed = |router: &str| {
+            graph
+                .nodes
+                .get(router)
+                .is_some_and(|node| unchanged(&node.file_location).is_none())
+        };
+        for edge in &graph.mounts {
+            if !changed(&edge.parent) && !changed(&edge.child) {
+                reading.add(String::new(), "mounts", edge);
+            }
+        }
+        for mount in &data.mounts {
+            let name = |owner: &crate::visitor::OwnerType| match owner {
+                crate::visitor::OwnerType::App(name) | crate::visitor::OwnerType::Router(name) => {
+                    name.clone()
+                }
+            };
+            if !changed(&name(&mount.parent)) && !changed(&name(&mount.child)) {
+                reading.add(String::new(), "mounts", mount);
+            }
+        }
+    } else {
+        for mount in &data.mounts {
+            reading.add(String::new(), "mounts", mount);
+        }
+    }
+
+    if let Some(stub) = &data.capture_stub {
+        let stub = StubReading::of(stub);
+        for (file, alias) in aliases {
+            reading.add(
+                file.clone(),
+                "type declarations",
+                (alias, stub.declarations.get(alias)),
+            );
+            reading.add(file, "capture records", (alias, stub.records.get(alias)));
+        }
+        for (name, text) in stub.unread {
+            reading.add(String::new(), "capture stub", (name, text));
+        }
+    }
+    reading.add(
+        String::new(),
+        "type extraction",
+        (
+            &data.types_degraded,
+            &data.type_extraction_status,
+            data.capture_stub.as_ref().map(|stub| stub.artifact_version),
+        ),
+    );
+    reading.sorted()
+}
+
+/// The capture stub, alias by alias: each alias's declaration text and its
+/// record in `carrick-manifest.json`. A file that does not parse is kept whole
+/// in `unread`, so it is compared in full rather than skipped.
+struct StubReading<'a> {
+    declarations: HashMap<String, Vec<String>>,
+    records: HashMap<String, serde_json::Value>,
+    unread: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> StubReading<'a> {
+    fn of(stub: &'a crate::cloud_storage::CaptureStubArtifact) -> Self {
+        let mut reading = Self {
+            declarations: HashMap::new(),
+            records: HashMap::new(),
+            unread: Vec::new(),
+        };
+        for (name, text) in &stub.files {
+            if name.ends_with(".d.ts") {
+                match declarations_by_name(text) {
+                    Some(found) => {
+                        for (alias, declaration) in found {
+                            reading
+                                .declarations
+                                .entry(alias)
+                                .or_default()
+                                .push(declaration);
+                        }
+                    }
+                    None => reading.unread.push((name, text)),
+                }
+            } else if name == "carrick-manifest.json" {
+                let records = serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .and_then(|manifest| manifest.get("aliases")?.as_array().cloned());
+                match records {
+                    Some(records) => {
+                        for record in records {
+                            if let Some(alias) = record.get("alias").and_then(|a| a.as_str()) {
+                                reading.records.insert(alias.to_string(), record.clone());
+                            }
+                        }
+                    }
+                    None => reading.unread.push((name, text)),
+                }
+            }
+        }
+        for declarations in reading.declarations.values_mut() {
+            declarations.sort();
+        }
+        reading
+    }
+}
+
+/// Every top-level type alias and interface a declaration file declares, by
+/// name, with its source text. `None` when the file does not parse.
+fn declarations_by_name(text: &str) -> Option<Vec<(String, String)>> {
+    use swc_common::{FileName, SourceMap, SourceMapper, Spanned, sync::Lrc};
+    use swc_ecma_ast::{Decl, ModuleDecl, ModuleItem, Stmt};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+
+    let source_map: Lrc<SourceMap> = Default::default();
+    let file = source_map.new_source_file(
+        Lrc::new(FileName::Custom("capture-stub.d.ts".into())),
+        text.to_string(),
+    );
+    let lexer = Lexer::new(
+        Syntax::Typescript(TsSyntax {
+            dts: true,
+            ..Default::default()
+        }),
+        Default::default(),
+        StringInput::from(&*file),
+        None,
+    );
+    let module = Parser::new_from(lexer).parse_module().ok()?;
+    let mut found = Vec::new();
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            _ => continue,
+        };
+        let name = match decl {
+            Decl::TsTypeAlias(alias) => alias.id.sym.to_string(),
+            Decl::TsInterface(interface) => interface.id.sym.to_string(),
+            _ => continue,
+        };
+        found.push((name, source_map.span_to_snippet(item.span()).ok()?));
+    }
+    Some(found)
+}
+
+/// Whether the other scanner that wrote `main` read the files in `untouched`
+/// (the files this PR left alone, repo-relative) as this run did, service for
+/// service. `current` is this run's services in the form they upload in.
+pub fn untouched_reading(
+    current: &[CloudRepoData],
+    main: &[CloudRepoData],
+    untouched: &HashSet<String>,
+) -> UntouchedReading {
+    let services = |repos: &[CloudRepoData]| {
+        let mut names: Vec<Option<String>> =
+            repos.iter().map(|repo| repo.service_name.clone()).collect();
+        names.sort();
+        names
+    };
+    if services(current) != services(main) {
+        return UntouchedReading::Differ {
+            service: None,
+            file: String::new(),
+            part: "services",
+        };
+    }
+    let mut rows = 0;
+    let mut files: HashSet<String> = HashSet::new();
+    for ours in current {
+        let Some(theirs) = main
+            .iter()
+            .find(|repo| repo.service_name == ours.service_name)
+        else {
+            continue;
+        };
+        let ours_read = untouched_reading_of(ours, untouched);
+        let theirs_read = untouched_reading_of(theirs, untouched);
+        if let Some((file, part)) = ours_read.first_difference(&theirs_read) {
+            return UntouchedReading::Differ {
+                service: (current.len() > 1)
+                    .then(|| ours.service_name.clone())
+                    .flatten(),
+                file: file.clone(),
+                part,
+            };
+        }
+        rows += ours_read.rows;
+        files.extend(ours_read.files().map(str::to_string));
+    }
+    if rows == 0 {
+        UntouchedReading::NothingToCompare
+    } else {
+        UntouchedReading::Alike {
+            rows,
+            files: files.len(),
+        }
+    }
+}
+
+/// The upload strips the parsed type nodes (`strip_ast_nodes`), so main's
+/// stored copy never has them and this run's always does.
+fn strip_parsed_types(row: &mut ApiEndpointDetails) {
+    row.request_type = None;
+    row.response_type = None;
 }
 
 /// The fields of a stored service that describe the run rather than the code:
@@ -357,11 +712,8 @@ fn surface(data: &CloudRepoData) -> serde_json::Value {
     data.sdk_edges = None;
     data.sdk_unresolved = None;
     data.boundary = None;
-    // The upload strips the parsed type nodes (`strip_ast_nodes`), so main's
-    // stored copy never has them and this run's always does.
     for row in data.endpoints.iter_mut().chain(data.calls.iter_mut()) {
-        row.request_type = None;
-        row.response_type = None;
+        strip_parsed_types(row);
     }
     // Intents describe functions for search; no finding reads them.
     for definition in data.function_definitions.values_mut() {
@@ -816,45 +1168,286 @@ mod tests {
     /// index and is compared with: the laptop index a new project starts
     /// from scans a branch head that squash-merges to another commit. A copy
     /// at a commit this clone shows to differ from the base and a dirty copy
-    /// are stale; a copy another scanner version wrote is told apart.
+    /// are stale. A copy another scanner version wrote is told apart unless
+    /// that scanner read the files the PR left alone as this run did
+    /// (carrick#1530), and that is asked only of such a copy.
     #[test]
     fn which_copies_are_stale() {
         let copy = main_copy_with("src/screens/rules.tsx:1", "compatible", true);
         let cannot_compare = |_: &str, _: &str| None;
         let differs = |_: &str, _: &str| Some(true);
         let same_tree = |_: &str, _: &str| Some(false);
+        let never_asked = || panic!("a copy this scanner version wrote needs no evidence");
         let one = std::slice::from_ref(&copy);
         assert_eq!(
-            main_copy(one, Some("bbbb2222"), cannot_compare),
+            main_copy(one, Some("bbbb2222"), cannot_compare, never_asked),
             MainCopy::Current
         );
         assert_eq!(
-            main_copy(one, Some("bbbb2222"), same_tree),
+            main_copy(one, Some("bbbb2222"), same_tree, never_asked),
             MainCopy::Current
         );
-        assert_eq!(main_copy(one, Some("aaaa1111"), differs), MainCopy::Current);
-        assert_eq!(main_copy(one, None, differs), MainCopy::Current);
-        assert_eq!(main_copy(one, Some("bbbb2222"), differs), MainCopy::Stale);
+        assert_eq!(
+            main_copy(one, Some("aaaa1111"), differs, never_asked),
+            MainCopy::Current
+        );
+        assert_eq!(
+            main_copy(one, None, differs, never_asked),
+            MainCopy::Current
+        );
+        assert_eq!(
+            main_copy(one, Some("bbbb2222"), differs, never_asked),
+            MainCopy::Stale
+        );
 
         let mut dirty = copy.clone();
         dirty.dirty = Some(true);
         assert_eq!(
-            main_copy(std::slice::from_ref(&dirty), None, cannot_compare),
+            main_copy(
+                std::slice::from_ref(&dirty),
+                None,
+                cannot_compare,
+                never_asked
+            ),
             MainCopy::Stale
         );
         let mut other_version = copy.clone();
         other_version.scanner_version = Some("0.0.1".to_string());
+        let other = std::slice::from_ref(&other_version);
         assert_eq!(
-            main_copy(std::slice::from_ref(&other_version), None, cannot_compare),
+            main_copy(other, None, cannot_compare, || false),
             MainCopy::OtherScanner
         );
         assert_eq!(
-            main_copy(
-                std::slice::from_ref(&other_version),
-                Some("bbbb2222"),
-                differs
-            ),
+            main_copy(other, None, cannot_compare, || true),
+            MainCopy::Current
+        );
+        assert_eq!(
+            main_copy(other, Some("bbbb2222"), differs, || true),
             MainCopy::Stale
+        );
+    }
+
+    // --- carrick#1530: another scanner's copy, judged on the untouched files ---
+
+    /// One call row, as a stored copy or this run's upload holds it.
+    fn call_row(file: &str, line: u32, method: &str, path: &str) -> serde_json::Value {
+        json!({
+            "owner": null,
+            "key": { "protocol": "http", "method": method, "path": path },
+            "params": [], "request_body": null, "response_body": null,
+            "handler_name": null, "request_type": null, "response_type": null,
+            "file_path": format!("{file}:{line}")
+        })
+    }
+
+    /// One consumer manifest row for the call at `file:line`.
+    fn manifest_row(file: &str, line: u32, alias: &str) -> serde_json::Value {
+        json!({
+            "protocol": "http", "method": "GET", "path": "/orders",
+            "role": "consumer", "type_kind": "response", "type_alias": alias,
+            "file_path": file, "line_number": line,
+            "is_explicit": false, "type_state": "implicit",
+            "evidence": {
+                "file_path": file, "line_number": line, "infer_kind": "response_body",
+                "is_explicit": false, "type_state": "implicit"
+            }
+        })
+    }
+
+    /// A consumer service: a call and its manifest row in each of `files`,
+    /// each alias declared in the capture stub as `declared` says.
+    fn service(scanner: &str, files: &[(&str, &str)]) -> CloudRepoData {
+        let alias = |file: &str| format!("Endpoint_orders_Response_Call{}", file.len());
+        let surface: String = files
+            .iter()
+            .map(|(file, declared)| format!("export type {} = {declared};\n", alias(file)))
+            .collect();
+        let records: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(file, _)| json!({ "alias": alias(file), "source_file": file, "self_check": "ok" }))
+            .collect();
+        serde_json::from_value(json!({
+            "repo_name": "web",
+            "service_name": "web",
+            "endpoints": [],
+            "calls": files.iter().map(|(file, _)| call_row(file, 3, "GET", "/orders")).collect::<Vec<_>>(),
+            "mounts": [], "apps": {}, "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-09-27T00:00:00Z",
+            "commit_hash": "aaaa1111",
+            "scanner_version": scanner,
+            "type_manifest": files.iter().map(|(file, _)| manifest_row(file, 3, &alias(file))).collect::<Vec<_>>(),
+            "capture_stub": {
+                "artifact_version": 2, "package_name": "@carrick/web", "ts_version": "5.9.3",
+                "bare_checkout": false,
+                "files": {
+                    "types/surface.d.ts": surface,
+                    "carrick-manifest.json": json!({ "aliases": records }).to_string()
+                }
+            }
+        }))
+        .expect("a stored service deserializes")
+    }
+
+    fn untouched(files: &[&str]) -> HashSet<String> {
+        files.iter().map(|file| file.to_string()).collect()
+    }
+
+    const CART: &str = "src/cart.ts";
+    const CHECKOUT: &str = "src/checkout.ts";
+    const ORDER: &str = "{ id: string; total: number }";
+
+    /// The PR changed the checkout file and left the cart file alone. The
+    /// other scanner read the cart file as this run did, so its copy counts,
+    /// whatever either says about the checkout file.
+    #[test]
+    fn another_scanner_that_reads_the_untouched_files_alike_is_compared_with() {
+        let main = service("0.0.1", &[(CART, ORDER), (CHECKOUT, "unknown")]);
+        let pr = service(
+            env!("CARGO_PKG_VERSION"),
+            &[(CART, ORDER), (CHECKOUT, "{ id: string }")],
+        );
+        let reading = untouched_reading(
+            std::slice::from_ref(&pr),
+            std::slice::from_ref(&main),
+            &untouched(&[CART]),
+        );
+        assert_eq!(reading, UntouchedReading::Alike { rows: 2, files: 1 });
+
+        // The same rows emitted in another order still read alike.
+        let mut reordered = pr.clone();
+        reordered.calls.reverse();
+        reordered.type_manifest.as_mut().unwrap().reverse();
+        let reading = untouched_reading(
+            std::slice::from_ref(&reordered),
+            std::slice::from_ref(&main),
+            &untouched(&[CART]),
+        );
+        assert!(reading.alike(), "{reading:?}");
+    }
+
+    /// A row the other scanner read differently in a file the PR left alone
+    /// is a difference between the scanners, and names where it is.
+    #[test]
+    fn another_scanner_that_reads_an_untouched_row_differently_is_not() {
+        let main = service("0.0.1", &[(CART, ORDER), (CHECKOUT, ORDER)]);
+        let pr = service(
+            env!("CARGO_PKG_VERSION"),
+            &[(CART, ORDER), (CHECKOUT, ORDER)],
+        );
+        let untouched = untouched(&[CART]);
+
+        let mut verb = main.clone();
+        verb.calls[0] = serde_json::from_value(call_row(CART, 3, "POST", "/orders")).unwrap();
+        assert_eq!(
+            untouched_reading(
+                std::slice::from_ref(&pr),
+                std::slice::from_ref(&verb),
+                &untouched
+            ),
+            UntouchedReading::Differ {
+                service: None,
+                file: CART.to_string(),
+                part: "calls",
+            }
+        );
+
+        // A call the other scanner never saw.
+        let mut missed = main.clone();
+        missed
+            .calls
+            .retain(|call| site_file(&call.file_path.to_string_lossy()) != CART);
+        assert_eq!(missed.calls.len(), 1, "the cart call is gone");
+        assert!(
+            !untouched_reading(
+                std::slice::from_ref(&pr),
+                std::slice::from_ref(&missed),
+                &untouched
+            )
+            .alike()
+        );
+
+        // Only the capture stub differs: the type check judges the alias as
+        // the declaration says, so a sidecar that declares it differently
+        // reads the file differently, though every row is the same.
+        let declared = service("0.0.1", &[(CART, "unknown"), (CHECKOUT, ORDER)]);
+        assert_eq!(
+            untouched_reading(
+                std::slice::from_ref(&pr),
+                std::slice::from_ref(&declared),
+                &untouched
+            ),
+            UntouchedReading::Differ {
+                service: None,
+                file: CART.to_string(),
+                part: "type declarations",
+            }
+        );
+    }
+
+    /// A PR that changed every file with rows leaves nothing to compare, and
+    /// a copy whose services are not this run's is not read at all.
+    #[test]
+    fn nothing_untouched_to_compare_is_not_evidence() {
+        let main = service("0.0.1", &[(CART, ORDER), (CHECKOUT, ORDER)]);
+        let pr = service(
+            env!("CARGO_PKG_VERSION"),
+            &[(CART, ORDER), (CHECKOUT, ORDER)],
+        );
+        assert_eq!(
+            untouched_reading(
+                std::slice::from_ref(&pr),
+                std::slice::from_ref(&main),
+                &untouched(&["README.md"])
+            ),
+            UntouchedReading::NothingToCompare
+        );
+
+        let mut renamed = main.clone();
+        renamed.service_name = Some("storefront".to_string());
+        assert_eq!(
+            untouched_reading(
+                std::slice::from_ref(&pr),
+                std::slice::from_ref(&renamed),
+                &untouched(&[CART])
+            ),
+            UntouchedReading::Differ {
+                service: None,
+                file: String::new(),
+                part: "services",
+            }
+        );
+    }
+
+    /// A stub declaration file that does not parse is compared whole, so a
+    /// difference in it is never skipped.
+    #[test]
+    fn a_stub_file_that_does_not_parse_is_compared_whole() {
+        let main = service("0.0.1", &[(CART, ORDER), (CHECKOUT, ORDER)]);
+        let pr = service(
+            env!("CARGO_PKG_VERSION"),
+            &[(CART, ORDER), (CHECKOUT, ORDER)],
+        );
+        let broken = |data: &CloudRepoData, tail: &str| {
+            let mut data = data.clone();
+            let files = &mut data.capture_stub.as_mut().unwrap().files;
+            let text = files.get_mut("types/surface.d.ts").unwrap();
+            text.push_str(tail);
+            data
+        };
+        let reading = untouched_reading(
+            std::slice::from_ref(&broken(&pr, "export type = {")),
+            std::slice::from_ref(&broken(&main, "export type = { x")),
+            &untouched(&[CART]),
+        );
+        assert_eq!(
+            reading,
+            UntouchedReading::Differ {
+                service: None,
+                file: String::new(),
+                part: "capture stub",
+            }
         );
     }
 

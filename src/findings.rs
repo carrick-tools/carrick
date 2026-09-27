@@ -147,10 +147,13 @@ pub enum OnMainUnknown {
     /// clone shows differs from the base (main's own scan may still be
     /// running), or from a working tree with uncommitted changes.
     MainIndexStale,
-    /// Another scanner version wrote main's index. Its extraction or type
-    /// check may differ from this run's, so a finding it lacks may not be the
-    /// PR's. Separate from [`OnMainUnknown::MainIndexStale`] so the cloud can
-    /// treat it differently without a scanner release.
+    /// Another scanner version wrote main's index, and nothing shows it reads
+    /// code as this run does: its rows for a file the PR left alone differ
+    /// from this run's, or the PR left no such file to compare them on
+    /// (carrick#1530). Its extraction or type check may differ from this
+    /// run's, so a finding it lacks may not be the PR's. Separate from
+    /// [`OnMainUnknown::MainIndexStale`] so the cloud can treat it differently
+    /// without a scanner release.
     MainIndexOtherScanner,
     /// Main's side of the comparison failed, panicked or ran out of time.
     MainSideFailed,
