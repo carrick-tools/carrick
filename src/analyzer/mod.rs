@@ -49,6 +49,11 @@ pub struct VerifiedEndpointEntry {
     pub path: String,
     pub provenance: crate::operation::EndpointProvenance,
     pub type_verdict: Option<crate::operation::TypeVerdict>,
+    /// The endpoint is `Compatible` and at least one of its pairs agreed only
+    /// once its handler's return was read with no literal widened
+    /// (carrick#1516): the producer's published type is wider than what it
+    /// sends.
+    pub producer_wider: bool,
     /// The dispatch case this operation is, when it is one of several behind
     /// its route (carrick#831). Part of the row's IDENTITY, not decoration:
     /// without it the nine operations behind one route collapse to one
@@ -65,6 +70,7 @@ impl VerifiedEndpointEntry {
             path,
             provenance,
             type_verdict: None,
+            producer_wider: false,
             dispatch: None,
         }
     }
@@ -589,8 +595,10 @@ fn verdict_of_bucket(bucket: crate::services::type_sidecar::VerdictBucket) -> Ty
         VerdictBucket::Unverifiable | VerdictBucket::GateCaughtBakedAny => {
             TypeVerdict::Unverifiable
         }
-        VerdictBucket::Compatible => TypeVerdict::Compatible,
-        VerdictBucket::ProducerWider => TypeVerdict::ProducerWider,
+        // The values the producer sends fit the consumer; only its published
+        // type is wider (carrick#1516). Compatible, with the class carried
+        // beside it (`PairDirectionOutcome::producer_wider`).
+        VerdictBucket::Compatible | VerdictBucket::ProducerWider => TypeVerdict::Compatible,
     }
 }
 
@@ -613,6 +621,10 @@ pub struct PairDirectionOutcome {
     /// verdict nor an unresolution (carrick#1341). Empty on a direction with
     /// nothing to add; never a substitute for `reason`.
     pub notes: Vec<String>,
+    /// A pair on this direction agreed only once the producer's handler
+    /// return was read with no literal widened (carrick#1516). Set only on a
+    /// `Compatible` direction.
+    pub producer_wider: bool,
 }
 
 /// Both directions of one edge's check. Either may be absent: the check files
@@ -684,9 +696,12 @@ impl PairDirections {
                     resolved: true,
                     unresolved_reason: None,
                     notes: Vec::new(),
+                    producer_wider: false,
                 });
             entry.verdict = entry.verdict.combine(verdict);
             entry.notes.extend(outcome.notes.iter().cloned());
+            entry.producer_wider |=
+                outcome.bucket == crate::services::type_sidecar::VerdictBucket::ProducerWider;
             if verdict == TypeVerdict::Incompatible && entry.reason.is_none() {
                 entry.reason = Some(
                     outcome
@@ -710,6 +725,11 @@ impl PairDirections {
         for entry in by_key.values_mut() {
             if entry.verdict != TypeVerdict::Incompatible {
                 entry.reason = None;
+            }
+            // Only a direction that agreed can have agreed on the narrower
+            // type; a sibling that broke or compared nothing decides it.
+            if entry.verdict != TypeVerdict::Compatible {
+                entry.producer_wider = false;
             }
             // Deliberately NOT gated on the verdict, unlike `reason` above: a
             // note is an observation about a comparison, not a qualifier on a
@@ -740,7 +760,6 @@ impl PairDirections {
 pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
     let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
     let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
-    let mut producer_wider: HashSet<VerdictKey> = HashSet::new();
     let mut compatible: HashSet<VerdictKey> = HashSet::new();
     for outcome in outcomes {
         let key = verdict_key_of_outcome(outcome);
@@ -760,9 +779,6 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
             }
             TypeVerdict::Unverifiable => {
                 unverifiable.insert(key);
-            }
-            TypeVerdict::ProducerWider => {
-                producer_wider.insert(key);
             }
             TypeVerdict::Compatible => {
                 compatible.insert(key);
@@ -802,12 +818,6 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
             // real `Unverifiable`, not absent.
             edge.type_compatible = None;
             edge.type_verdict = Some(crate::operation::TypeVerdict::Unverifiable);
-        } else if producer_wider.contains(&key) {
-            // The values the producer sends fit the consumer; only its
-            // published type is wider (carrick#1516). Not a break, so the
-            // boolean reads compatible and the verdict keeps the class.
-            edge.type_compatible = Some(true);
-            edge.type_verdict = Some(crate::operation::TypeVerdict::ProducerWider);
         } else if compatible.contains(&key) {
             edge.type_compatible = Some(true);
             edge.type_verdict = Some(crate::operation::TypeVerdict::Compatible);
@@ -906,9 +916,11 @@ fn sort_dedup_verified(verified: &mut Vec<VerifiedEndpointEntry>) {
 fn attach_verified_type_verdicts(
     verified: &mut [VerifiedEndpointEntry],
     cross_repo_matches: &[CrossRepoMatch],
+    directions: &PairDirections,
 ) {
     use std::collections::HashMap;
-    let mut by_endpoint: HashMap<(String, String), crate::operation::TypeVerdict> = HashMap::new();
+    let mut by_endpoint: HashMap<(String, String), (crate::operation::TypeVerdict, bool)> =
+        HashMap::new();
     for edge in cross_repo_matches {
         let Some(verdict) = edge.type_verdict else {
             continue;
@@ -916,15 +928,25 @@ fn attach_verified_type_verdicts(
         let Some(display) = producer_display_from_canonical(&edge.producer_key) else {
             continue;
         };
+        let halves = directions.for_edge(edge);
+        let wider = [halves.request, halves.response]
+            .iter()
+            .flatten()
+            .any(|half| half.producer_wider);
         by_endpoint
             .entry(display)
-            .and_modify(|agg| *agg = agg.combine(verdict))
-            .or_insert(verdict);
+            .and_modify(|(agg, agg_wider)| {
+                *agg = agg.combine(verdict);
+                *agg_wider |= wider;
+            })
+            .or_insert((verdict, wider));
     }
     for entry in verified.iter_mut() {
-        entry.type_verdict = by_endpoint
-            .get(&(entry.method.clone(), entry.path.clone()))
-            .copied();
+        let found = by_endpoint.get(&(entry.method.clone(), entry.path.clone()));
+        entry.type_verdict = found.map(|(verdict, _)| *verdict);
+        entry.producer_wider = found.is_some_and(|(verdict, wider)| {
+            *wider && *verdict == crate::operation::TypeVerdict::Compatible
+        });
     }
 }
 
@@ -3154,7 +3176,11 @@ impl Analyzer {
         // so the "Verified" surfaces (PR comment #455, terminal report #456) can
         // bucket rows honestly instead of blanket-claiming compiler comparison.
         // Runs AFTER the overlay so the edges carry their verdicts.
-        attach_verified_type_verdicts(&mut verified_endpoints, &cross_repo_matches);
+        attach_verified_type_verdicts(
+            &mut verified_endpoints,
+            &cross_repo_matches,
+            &self.pair_directions(),
+        );
 
         let detected_graphql_libraries = filter_graphql_libraries(&self.detected_data_fetchers);
         let graphql_operations_indexed = self
@@ -6255,7 +6281,7 @@ mod tests {
                 EndpointProvenance::Route,
             ),
         ];
-        attach_verified_type_verdicts(&mut verified, &edges);
+        attach_verified_type_verdicts(&mut verified, &edges, &PairDirections::default());
 
         assert_eq!(
             verified[0].type_verdict,
@@ -6480,11 +6506,12 @@ mod tests {
         assert!(!request.resolved);
     }
 
-    /// carrick#1516: a producer type wider than what its handler returns is
-    /// its own verdict on the direction and on the edge, never a mismatch: no
-    /// reason, its note kept, and the values it sends read compatible.
+    /// carrick#1516: a producer type wider than what its handler returns is a
+    /// compatible direction carrying the class as a flag, never a mismatch and
+    /// never a verdict value of its own: no reason, its note kept, the edge
+    /// compatible, and the verified endpoint flagged.
     #[test]
-    fn a_producer_wider_outcome_is_its_own_verdict_and_never_a_mismatch() {
+    fn a_producer_wider_outcome_is_compatible_and_carries_the_class() {
         let mut wider = outcome(
             "GET",
             "/api/orders/:id",
@@ -6494,37 +6521,62 @@ mod tests {
         );
         wider.resolved = true;
         wider.notes = vec!["the producer's declared response is wider".to_string()];
+        let response = |outcomes: &[PairCheckOutcome]| {
+            PairDirections::from_outcomes(outcomes)
+                .for_edge(&edge("http|GET|/api/orders/:id"))
+                .response
+                .expect("the response half is stated")
+        };
 
-        let dirs = PairDirections::from_outcomes(std::slice::from_ref(&wider));
-        let response = dirs
-            .for_edge(&edge("http|GET|/api/orders/:id"))
-            .response
-            .expect("the response half is stated");
-        assert_eq!(response.verdict, TypeVerdict::ProducerWider);
-        assert_eq!(response.reason, None);
-        assert!(response.resolved);
-        assert_eq!(response.notes, wider.notes);
+        let alone = response(std::slice::from_ref(&wider));
+        assert_eq!(alone.verdict, TypeVerdict::Compatible);
+        assert!(alone.producer_wider);
+        assert_eq!(alone.reason, None);
+        assert!(alone.resolved);
+        assert_eq!(alone.notes, wider.notes);
 
-        let mut matches = vec![edge("http|GET|/api/orders/:id")];
-        apply_pair_outcomes(std::slice::from_ref(&wider), &mut matches);
-        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::ProducerWider));
-        assert_eq!(matches[0].type_compatible, Some(true));
-        assert_eq!(matches[0].mismatch_reason, None);
+        // A sibling pair that agrees outright does not erase the drift.
+        let mut agrees = wider.clone();
+        agrees.bucket = VerdictBucket::Compatible;
+        agrees.notes = Vec::new();
+        assert!(response(&[agrees.clone(), wider.clone()]).producer_wider);
+        assert!(!response(std::slice::from_ref(&agrees)).producer_wider);
 
-        // A sibling pair that compared nothing is not only a drift.
+        // A sibling pair that compared nothing decides the direction, and the
+        // class goes with the agreement it described.
         let mut unverified = wider.clone();
         unverified.bucket = VerdictBucket::Unverifiable;
         unverified.resolved = false;
-        let mut matches = vec![edge("http|GET|/api/orders/:id")];
-        apply_pair_outcomes(&[wider.clone(), unverified], &mut matches);
-        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::Unverifiable));
+        let mixed = response(&[wider.clone(), unverified]);
+        assert_eq!(mixed.verdict, TypeVerdict::Unverifiable);
+        assert!(!mixed.producer_wider);
 
-        // A sibling pair that agrees does not hide the drift.
-        let mut agrees = wider.clone();
-        agrees.bucket = VerdictBucket::Compatible;
         let mut matches = vec![edge("http|GET|/api/orders/:id")];
-        apply_pair_outcomes(&[agrees, wider], &mut matches);
-        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::ProducerWider));
+        apply_pair_outcomes(std::slice::from_ref(&wider), &mut matches);
+        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::Compatible));
+        assert_eq!(matches[0].type_compatible, Some(true));
+        assert_eq!(matches[0].mismatch_reason, None);
+
+        let mut verified = vec![VerifiedEndpointEntry::new(
+            "GET".to_string(),
+            "/api/orders/:id".to_string(),
+            crate::operation::EndpointProvenance::Route,
+        )];
+        let dirs = PairDirections::from_outcomes(std::slice::from_ref(&wider));
+        attach_verified_type_verdicts(&mut verified, &matches, &dirs);
+        assert_eq!(verified[0].type_verdict, Some(TypeVerdict::Compatible));
+        assert!(verified[0].producer_wider);
+        attach_verified_type_verdicts(&mut verified, &matches, &PairDirections::default());
+        assert!(!verified[0].producer_wider);
+
+        // Another consumer of the same endpoint that compared nothing makes
+        // the endpoint unverifiable, and the class goes with the agreement.
+        let mut elsewhere = edge_at("http|GET|/api/orders/:id", "b", "b/y.ts:2");
+        elsewhere.type_verdict = Some(TypeVerdict::Unverifiable);
+        matches.push(elsewhere);
+        attach_verified_type_verdicts(&mut verified, &matches, &dirs);
+        assert_eq!(verified[0].type_verdict, Some(TypeVerdict::Unverifiable));
+        assert!(!verified[0].producer_wider);
     }
 
     /// A consumer location outside the GitHub Actions workspace passes through

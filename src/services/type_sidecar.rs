@@ -448,7 +448,9 @@ pub struct CaptureV2Result {
 
 /// Four-bucket verdict classifier output (pinned decision 7), plus the
 /// bucket the retype check files when a producer's published type is wider
-/// than what its handler returns (carrick#1516).
+/// than what its handler returns (carrick#1516). That last one never leaves
+/// the scanner as a value: on the wire it is a `compatible` verdict with
+/// `producer_wider: true` beside it.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictBucket {

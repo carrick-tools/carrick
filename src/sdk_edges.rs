@@ -1370,6 +1370,7 @@ mod tests {
             resolved: true,
             unresolved_reason: None,
             notes: Vec::new(),
+            producer_wider: false,
         }
     }
 
@@ -1576,6 +1577,7 @@ mod tests {
                 "the consumer type carries `unknown` at `body.items`".to_string(),
             ),
             notes: Vec::new(),
+            producer_wider: false,
         });
 
         let joined = run(

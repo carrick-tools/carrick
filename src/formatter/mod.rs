@@ -500,13 +500,15 @@ fn direction_cell(label: &str, dir: Option<&crate::cloud_storage::DirectionVerdi
         return format!("{label}: unverified");
     };
     let answer = match dir.verdict {
+        TypeVerdict::Compatible if dir.producer_wider => {
+            "compatible (producer type wider than it returns)".to_string()
+        }
         TypeVerdict::Compatible => "compatible".to_string(),
         TypeVerdict::Incompatible => format!(
             "**INCOMPATIBLE**: {}",
             code_span(dir.reason.as_deref().unwrap_or("no reason recorded"))
         ),
         TypeVerdict::Unverifiable => "unverifiable".to_string(),
-        TypeVerdict::ProducerWider => "producer type wider than it returns".to_string(),
     };
     if dir.resolved {
         format!("{label}: {answer}")
@@ -688,15 +690,17 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
 
     let type_checked: Vec<&_> = verified
         .iter()
-        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible))
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible) && !e.producer_wider)
         .collect();
     let unverifiable: Vec<&_> = verified
         .iter()
         .filter(|e| e.type_verdict == Some(TypeVerdict::Unverifiable))
         .collect();
+    // Compatible, and it agreed only on what the handler returns: its own
+    // section rather than a plain "Type-checked" (carrick#1516).
     let producer_wider: Vec<&_> = verified
         .iter()
-        .filter(|e| e.type_verdict == Some(TypeVerdict::ProducerWider))
+        .filter(|e| e.type_verdict == Some(TypeVerdict::Compatible) && e.producer_wider)
         .collect();
     // Everything else: no verdict (not type-checked / non-HTTP) OR incompatible
     // (already reported as a loud finding above; none of the verified captions
@@ -704,14 +708,8 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
     let matched_only: Vec<&_> = verified
         .iter()
         .filter(|e| {
-            !matches!(
-                e.type_verdict,
-                Some(
-                    TypeVerdict::Compatible
-                        | TypeVerdict::Unverifiable
-                        | TypeVerdict::ProducerWider
-                )
-            )
+            e.type_verdict != Some(TypeVerdict::Compatible)
+                && e.type_verdict != Some(TypeVerdict::Unverifiable)
         })
         .collect();
 
@@ -1459,6 +1457,7 @@ mod tests {
             resolved: true,
             unresolved_reason: None,
             notes: Vec::new(),
+            producer_wider: false,
         }
     }
 
@@ -1548,6 +1547,7 @@ mod tests {
             resolved: false,
             unresolved_reason: Some("the consumer type carries `any` at `<0>`".to_string()),
             notes: Vec::new(),
+            producer_wider: false,
         });
         let output = format_analysis_results(
             result_with_sdk(vec![edge], vec![]),
@@ -1904,6 +1904,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "POST".to_string(),
@@ -1911,6 +1912,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
         ];
 
@@ -1931,6 +1933,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "GET".to_string(),
@@ -1938,6 +1941,7 @@ mod tests {
                 provenance: EndpointProvenance::Mock,
                 type_verdict: None,
                 dispatch: None,
+                producer_wider: false,
             },
         ];
 
@@ -1990,6 +1994,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
@@ -2007,6 +2012,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -2026,6 +2032,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -2056,6 +2063,7 @@ mod tests {
                 provenance: EndpointProvenance::Route,
                 type_verdict: verdict,
                 dispatch: None,
+                producer_wider: false,
             }
         };
         let mut result = result_with(vec![]);
@@ -2099,7 +2107,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/api/holidays".to_string(),
             provenance: EndpointProvenance::Route,
-            type_verdict: Some(TypeVerdict::ProducerWider),
+            type_verdict: Some(TypeVerdict::Compatible),
+            producer_wider: true,
             dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
@@ -2107,6 +2116,7 @@ mod tests {
             output.contains("**Producer type wider than it returns (1)**"),
             "output: {output}"
         );
+        assert!(!output.contains("**Type-checked"), "output: {output}");
         assert!(!output.contains("**Types not compared"), "output: {output}");
     }
 
@@ -2492,6 +2502,7 @@ mod tests {
             provenance: EndpointProvenance::Route,
             type_verdict: None,
             dispatch: None,
+            producer_wider: false,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 

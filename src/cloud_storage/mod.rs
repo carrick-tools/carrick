@@ -222,6 +222,19 @@ pub struct DirectionVerdict {
     /// verdict comes from the judge (carrick#730/#734).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// carrick#1516: the producer's published type does not fit what the
+    /// consumer does with it, and what its handler actually returns does.
+    /// TypeScript widened a literal the handler returns (`scope: 'all' |
+    /// 'specific'` published as `scope: string`), so the declared contract is
+    /// wider than the values sent. Set only on a `compatible` verdict, which is
+    /// what it is: the values fit. A note says where the published type fails.
+    ///
+    /// A field beside the verdict, not a verdict value of its own, so a reader
+    /// that does not know it reads the row as the compatible it is (an older
+    /// scanner parsing a peer's blob included). `false` stays off the wire, so
+    /// every other row is byte-identical to what the pre-#1516 scanner wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub producer_wider: bool,
 }
 
 impl Ord for DirectionVerdict {
@@ -235,7 +248,6 @@ impl Ord for DirectionVerdict {
                 crate::operation::TypeVerdict::Compatible => 0,
                 crate::operation::TypeVerdict::Incompatible => 1,
                 crate::operation::TypeVerdict::Unverifiable => 2,
-                crate::operation::TypeVerdict::ProducerWider => 3,
             }
         }
         // Every field is in the tuple, `notes` included: `SdkEdge` derives
@@ -248,6 +260,7 @@ impl Ord for DirectionVerdict {
             self.resolved,
             &self.unresolved_reason,
             &self.notes,
+            self.producer_wider,
         )
             .cmp(&(
                 rank(other.verdict),
@@ -255,6 +268,7 @@ impl Ord for DirectionVerdict {
                 other.resolved,
                 &other.unresolved_reason,
                 &other.notes,
+                other.producer_wider,
             ))
     }
 }
@@ -1279,6 +1293,7 @@ pub(crate) fn direction_verdict(
         resolved: outcome.resolved,
         unresolved_reason: outcome.unresolved_reason.clone(),
         notes: outcome.notes.clone(),
+        producer_wider: outcome.producer_wider,
     }
 }
 
@@ -1286,8 +1301,7 @@ pub(crate) fn direction_verdict(
 /// compared two KNOWN types (carrick#839).
 ///
 /// The verdict half is exactly [`crate::operation::TypeVerdict::combine`]'s
-/// precedence (incompatible > unverifiable > producer_wider > compatible)
-/// written as an order,
+/// precedence (incompatible > unverifiable > compatible) written as an order,
 /// so a strict increase here is the same replacement decision the fold made
 /// before this function existed.
 ///
@@ -1304,9 +1318,8 @@ fn direction_rank(direction: &DirectionVerdict) -> (u8, u8) {
     use crate::operation::TypeVerdict;
     let verdict = match direction.verdict {
         TypeVerdict::Compatible => 0,
-        TypeVerdict::ProducerWider => 1,
-        TypeVerdict::Unverifiable => 2,
-        TypeVerdict::Incompatible => 3,
+        TypeVerdict::Unverifiable => 1,
+        TypeVerdict::Incompatible => 2,
     };
     (verdict, u8::from(!direction.resolved))
 }
@@ -1328,12 +1341,18 @@ fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<Dire
         Some(existing) => {
             let mut notes = std::mem::take(&mut existing.notes);
             notes.extend(incoming.notes.iter().cloned());
+            // Like a note, true of a comparison that happened, so a sibling
+            // site that agreed outright does not erase it (carrick#1516). It
+            // means something only on a compatible fold.
+            let producer_wider = existing.producer_wider || incoming.producer_wider;
             if direction_rank(incoming) > direction_rank(existing) {
                 *existing = incoming.clone();
             }
             notes.sort();
             notes.dedup();
             existing.notes = notes;
+            existing.producer_wider =
+                producer_wider && existing.verdict == crate::operation::TypeVerdict::Compatible;
         }
     }
 }
@@ -2989,31 +3008,106 @@ mod tests {
         )
     }
 
-    /// carrick#1516: the site fold ranks a producer type wider than what it
-    /// returns exactly as `TypeVerdict::combine` does, in either arrival
-    /// order: over an agreement, under a site that compared nothing.
-    #[test]
-    fn the_site_fold_ranks_producer_wider_as_combine_does() {
-        use crate::operation::TypeVerdict;
-        let direction = |verdict: TypeVerdict| DirectionVerdict {
-            verdict,
+    fn compatible_direction(producer_wider: bool) -> DirectionVerdict {
+        DirectionVerdict {
+            verdict: crate::operation::TypeVerdict::Compatible,
             reason: None,
-            resolved: verdict != TypeVerdict::Unverifiable,
+            resolved: true,
             unresolved_reason: None,
             notes: Vec::new(),
+            producer_wider,
+        }
+    }
+
+    /// carrick#1516, the wire: the class rides beside a `compatible` verdict,
+    /// and a row without it serializes exactly as the pre-#1516 scanner wrote
+    /// it, byte for byte.
+    #[test]
+    fn producer_wider_rides_beside_a_compatible_verdict() {
+        let flagged = serde_json::to_string(&compatible_direction(true)).unwrap();
+        assert_eq!(
+            flagged,
+            r#"{"verdict":"compatible","resolved":true,"producer_wider":true}"#
+        );
+        let plain = serde_json::to_string(&compatible_direction(false)).unwrap();
+        assert_eq!(plain, r#"{"verdict":"compatible","resolved":true}"#);
+    }
+
+    /// carrick#1516, the old blob: a direction written before the field
+    /// existed reads as not flagged.
+    #[test]
+    fn a_direction_from_before_producer_wider_reads_unflagged() {
+        let old: DirectionVerdict =
+            serde_json::from_str(r#"{"verdict":"compatible","resolved":true}"#).unwrap();
+        assert!(!old.producer_wider);
+        assert_eq!(old, compatible_direction(false));
+    }
+
+    /// carrick#1516, the other way round: a blob carrying a field this reader
+    /// does not know still parses. That is what lets a scanner released
+    /// before `producer_wider` read a peer's blob that carries it, and what
+    /// lets the NEXT field ship without waiting on every reader: nothing on
+    /// the blob's path may deny an unknown field.
+    #[test]
+    fn a_blob_carrying_fields_this_reader_does_not_know_still_parses() {
+        let mut repo = empty_repo("org/consumer", Some("consumer"));
+        repo.compat_verdicts = Some(vec![CompatVerdict {
+            producer_repo: "producer".to_string(),
+            producer_key: "http|GET|/x".to_string(),
+            consumer_repo: "consumer".to_string(),
+            consumer_key: "http|GET|/x".to_string(),
+            request: None,
+            response: Some(compatible_direction(false)),
+            sites: vec![CompatVerdictSite {
+                consumer_location: "src/a.ts:1".to_string(),
+                request: None,
+                response: Some(compatible_direction(false)),
+            }],
+            scanner_version: "0.3.93".to_string(),
+        }]);
+        let mut blob = serde_json::to_value(&repo).unwrap();
+        blob["a_field_from_a_later_release"] = serde_json::json!(1);
+        let row = &mut blob["compat_verdicts"][0];
+        row["a_field_from_a_later_release"] = serde_json::json!(true);
+        row["response"]["a_field_from_a_later_release"] = serde_json::json!("x");
+        row["sites"][0]["response"]["a_field_from_a_later_release"] = serde_json::json!([]);
+        let back: CloudRepoData = serde_json::from_value(blob).expect("unknown fields are ignored");
+        assert_eq!(
+            back.compat_verdicts.unwrap()[0].response,
+            Some(compatible_direction(false))
+        );
+    }
+
+    /// carrick#1516: folding call sites keeps the class when a sibling site
+    /// agreed outright, and drops it when a sibling decides the direction
+    /// another way, in either arrival order.
+    #[test]
+    fn the_site_fold_keeps_producer_wider_only_on_a_compatible_direction() {
+        let broken = DirectionVerdict {
+            verdict: crate::operation::TypeVerdict::Incompatible,
+            reason: Some("Type 'A' is not assignable to type 'B'".to_string()),
+            resolved: true,
+            unresolved_reason: None,
+            notes: Vec::new(),
+            producer_wider: false,
         };
-        let order = [
-            TypeVerdict::Compatible,
-            TypeVerdict::ProducerWider,
-            TypeVerdict::Unverifiable,
-            TypeVerdict::Incompatible,
-        ];
-        for a in order {
-            for b in order {
-                let mut stored = Some(direction(a));
-                merge_direction(&mut stored, &Some(direction(b)));
-                assert_eq!(stored.unwrap().verdict, a.combine(b), "{a:?} then {b:?}");
-            }
+        for (first, second, wider) in [
+            (
+                compatible_direction(true),
+                compatible_direction(false),
+                true,
+            ),
+            (
+                compatible_direction(false),
+                compatible_direction(true),
+                true,
+            ),
+            (compatible_direction(true), broken.clone(), false),
+            (broken.clone(), compatible_direction(true), false),
+        ] {
+            let mut stored = Some(first);
+            merge_direction(&mut stored, &Some(second));
+            assert_eq!(stored.unwrap().producer_wider, wider);
         }
     }
 

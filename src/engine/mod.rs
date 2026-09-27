@@ -1505,6 +1505,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 path: entry.path.clone(),
                 provenance: entry.provenance,
                 type_verdict: entry.type_verdict,
+                producer_wider: entry.producer_wider,
             })
             .collect(),
         graphql: crate::findings::GraphqlStatus {

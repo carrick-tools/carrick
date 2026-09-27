@@ -39,24 +39,22 @@ pub enum Protocol {
 /// Absence of a verdict (edge never evaluated) is represented by `Option::None`
 /// around this enum, never by a variant here.
 ///
-/// Wire strings are snake_case (`"compatible"` / `"incompatible"` /
-/// `"unverifiable"` / `"producer_wider"`); the cloud PR-comment renderer keys
-/// the "Type-checked" and "Types not verifiable" buckets on the first and
-/// third, and treats any other value (including absent) as "Types not
-/// compared".
+/// Wire strings are lowercase (`"compatible"` / `"incompatible"` /
+/// `"unverifiable"`); the cloud PR-comment renderer keys the "Type-checked"
+/// and "Types not verifiable" buckets on the first and third, and treats any
+/// other value (including absent) as "Types not compared".
+///
+/// A NEW value here breaks every older scanner that reads a blob carrying it
+/// (no variant catches an unknown string, and one peer's blob failing to
+/// parse loses the whole cross-repo download). Say more about a verdict in an
+/// optional field beside it instead, as `DirectionVerdict::producer_wider`
+/// does (carrick#1516).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeVerdict {
     Compatible,
     Incompatible,
     Unverifiable,
-    /// The producer's published type does not fit what the consumer expects,
-    /// and what its handler actually returns does (carrick#1516): TypeScript
-    /// widened a literal the handler returns (`'all' | 'specific'` published
-    /// as `string`), so the declared contract is wider than the values sent.
-    /// A drift between two sources, not a break; the direction's `notes` say
-    /// what the published type declares.
-    ProducerWider,
 }
 
 impl TypeVerdict {
@@ -65,17 +63,12 @@ impl TypeVerdict {
     /// when EVERY evaluated consumer pair is compatible; any `Unverifiable`
     /// pair degrades the row to `Unverifiable`; any `Incompatible` pair marks
     /// it `Incompatible` (already surfaced as a loud finding elsewhere).
-    /// `ProducerWider` sits between `Unverifiable` and `Compatible`: it is a
-    /// comparison that happened and found a drift, so it outranks agreement,
-    /// and a sibling pair that compared nothing must not be read as only a
-    /// drift.
-    /// Precedence: `Incompatible` > `Unverifiable` > `ProducerWider` > `Compatible`.
+    /// Precedence: `Incompatible` > `Unverifiable` > `Compatible`.
     pub fn combine(self, other: Self) -> Self {
         use TypeVerdict::*;
         match (self, other) {
             (Incompatible, _) | (_, Incompatible) => Incompatible,
             (Unverifiable, _) | (_, Unverifiable) => Unverifiable,
-            (ProducerWider, _) | (_, ProducerWider) => ProducerWider,
             (Compatible, Compatible) => Compatible,
         }
     }
@@ -406,23 +399,6 @@ impl fmt::Display for OperationKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// carrick#1516: a drift outranks agreement, and a pair that compared
-    /// nothing or found a break outranks a drift, whichever side it comes from.
-    #[test]
-    fn combine_places_producer_wider_between_unverifiable_and_compatible() {
-        use TypeVerdict::*;
-        let order = [Compatible, ProducerWider, Unverifiable, Incompatible];
-        for (i, a) in order.iter().enumerate() {
-            for (j, b) in order.iter().enumerate() {
-                assert_eq!(a.combine(*b), order[i.max(j)], "{a:?} + {b:?}");
-            }
-        }
-        assert_eq!(
-            serde_json::to_string(&ProducerWider).unwrap(),
-            "\"producer_wider\""
-        );
-    }
 
     #[test]
     fn http_key_canonicalizes_method() {

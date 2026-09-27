@@ -883,6 +883,12 @@ pub struct VerifiedEndpoint {
     /// payload and a not-type-checked pair both read as "not compared".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_verdict: Option<crate::operation::TypeVerdict>,
+    /// carrick#1516: `type_verdict` is `Compatible` and at least one pair
+    /// agreed only on what the producer's handler returns, its published type
+    /// being wider. Off the wire when false, so every other row is what the
+    /// pre-#1516 scanner sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub producer_wider: bool,
 }
 
 /// GraphQL coverage signal: libraries detected vs operations actually
@@ -1214,6 +1220,7 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: Default::default(),
                 type_verdict: None,
+                producer_wider: false,
             }],
             graphql: GraphqlStatus {
                 libraries: vec![],
@@ -1353,6 +1360,7 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: Default::default(),
                 type_verdict: v,
+                producer_wider: false,
             })
             .unwrap()
         };
@@ -1374,6 +1382,30 @@ mod tests {
         assert!(
             none.get("type_verdict").is_none(),
             "an absent verdict must be omitted from the wire, got: {none}"
+        );
+    }
+
+    /// carrick#1516: the producer-wider class rides beside a `compatible`
+    /// verdict, and a row without it is exactly the pre-#1516 row.
+    #[test]
+    fn verified_endpoint_producer_wider_rides_beside_the_verdict() {
+        let with = |producer_wider: bool| {
+            serde_json::to_string(&VerifiedEndpoint {
+                method: "GET".to_string(),
+                path: "/api/users".to_string(),
+                provenance: Default::default(),
+                type_verdict: Some(crate::operation::TypeVerdict::Compatible),
+                producer_wider,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            with(false),
+            r#"{"method":"GET","path":"/api/users","provenance":"route","type_verdict":"compatible"}"#
+        );
+        assert_eq!(
+            with(true),
+            r#"{"method":"GET","path":"/api/users","provenance":"route","type_verdict":"compatible","producer_wider":true}"#
         );
     }
 
