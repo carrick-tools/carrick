@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.94](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.93...carrick-v0.3.94) (2026-09-27)
+
+
+### Features
+
+* **sidecar:** report a producer type wider than what its handler returns as its own verdict class ([#1539](https://github.com/carrick-tools/carrick/issues/1539)) ([9326cb3](https://github.com/carrick-tools/carrick/commit/9326cb3126f104f92a8cb13cbe178ca7f1c8aaf6))
+
+
+### Bug Fixes
+
+* **findings:** a retyped pair names where the consumer reads, not its generated alias ([#1540](https://github.com/carrick-tools/carrick/issues/1540)) ([9a9a014](https://github.com/carrick-tools/carrick/commit/9a9a01401e1ec4021b2cfe84795d6b80799565be)), closes [#1517](https://github.com/carrick-tools/carrick/issues/1517)
+* **pr:** decide another scanner's main copy from its rows on the files a PR left alone ([#1536](https://github.com/carrick-tools/carrick/issues/1536)) ([0afdc53](https://github.com/carrick-tools/carrick/commit/0afdc5349bd94b715488be070a21d67094a4dd2e))
+
 ## [0.3.93](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.92...carrick-v0.3.93) (2026-09-26)
 
 
