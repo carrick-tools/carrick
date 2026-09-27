@@ -28,6 +28,10 @@
 //! neither source judged a pairing, or main's copy is not main as this PR's
 //! base has it, the finding says the run could not tell
 //! ([`OnMainUnknown`]) instead of guessing.
+//!
+//! A copy another scanner version wrote is judged by how that scanner read the
+//! files the PR left alone ([`untouched_reading`], carrick#1530): read as this
+//! run reads them, it counts as main's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;

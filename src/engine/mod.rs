@@ -346,6 +346,17 @@ fn main_copy_against_base(
         })
         .collect();
     let base_named = base.as_deref().unwrap_or("unknown");
+    if copy == crate::pr_baseline::MainCopy::Current
+        && let Some(reading) = reading.as_ref().filter(|reading| reading.alike())
+    {
+        info!(
+            "Main's index ({}) was written by another Carrick version than this run's ({}), \
+             and {}, so the run compares with it",
+            scanned.join(", "),
+            env!("CARGO_PKG_VERSION"),
+            untouched_reading_clause(reading)
+        );
+    }
     match copy {
         crate::pr_baseline::MainCopy::Stale => info!(
             "Main's index ({}) is not main as this PR's base ({base_named}) has it, so a \
@@ -362,21 +373,6 @@ fn main_copy_against_base(
                 untouched_reading_clause
             )
         ),
-        crate::pr_baseline::MainCopy::Current
-            if reading
-                .as_ref()
-                .is_some_and(crate::pr_baseline::UntouchedReading::alike) =>
-        {
-            info!(
-                "Main's index ({}) was written by another Carrick version than this run's ({}), \
-                 and {}, so the run compares with it",
-                scanned.join(", "),
-                env!("CARGO_PKG_VERSION"),
-                reading
-                    .as_ref()
-                    .map_or_else(String::new, untouched_reading_clause)
-            )
-        }
         crate::pr_baseline::MainCopy::Current
             if main_self
                 .iter()
