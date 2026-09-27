@@ -4599,6 +4599,7 @@ fn add_graphql_request_entry(
         primary_type_symbol: symbol,
         defined_in: None,
         any_provenance: Vec::new(),
+        unwidened_definition: None,
     });
 }
 
@@ -4657,6 +4658,7 @@ fn add_protocol_manifest_entry(
         primary_type_symbol,
         defined_in: None,
         any_provenance: Vec::new(),
+        unwidened_definition: None,
     });
 }
 
@@ -5859,7 +5861,7 @@ fn resolve_per_endpoint_definitions(
     let records = read_capture_records(stub_dir);
     stamp_capture_provenance(manifest, &records);
 
-    let aliases = aliases_to_resolve(manifest);
+    let aliases = aliases_to_resolve(manifest, &records);
 
     if aliases.is_empty() {
         return;
@@ -5901,10 +5903,20 @@ fn resolve_per_endpoint_definitions(
 /// (carrick#735). A `HashSet` iterates under a per-process random seed, which
 /// made that order — and the bytes of the request — differ between two runs of
 /// the same binary over an unchanged tree.
-fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
+///
+/// Beside each entry, the capture alias that carries its unwidened reading
+/// (carrick#1516) when the capture recorded one.
+fn aliases_to_resolve(
+    manifest: &[TypeManifestEntry],
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
+) -> Vec<String> {
     manifest
         .iter()
-        .map(|e| e.type_alias.clone())
+        .flat_map(|e| {
+            let unwidened = type_compat_v2::unwidened_alias(&e.type_alias);
+            let captured = records.contains_key(&unwidened);
+            std::iter::once(e.type_alias.clone()).chain(captured.then_some(unwidened))
+        })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -5992,6 +6004,17 @@ fn apply_resolved_definitions(
 
         entry.resolved_definition = Some(r.definition.clone());
         entry.expanded_definition = Some(r.expanded.clone());
+        entry.unwidened_definition = lookup
+            .get(&type_compat_v2::unwidened_alias(&entry.type_alias))
+            .filter(|u| {
+                !type_compat_v2::contains_disqualifying_top_type(&u.expanded)
+                    && u.expanded.trim() != r.expanded.trim()
+                    && !u.expanded.trim().is_empty()
+                    && records
+                        .get(&u.type_alias)
+                        .is_none_or(|record| record.unpublishable_reason().is_none())
+            })
+            .map(|u| u.expanded.clone());
 
         if v1_unanswered && !type_compat_v2::contains_disqualifying_top_type(&r.expanded) {
             entry.is_explicit = false;
@@ -6325,6 +6348,7 @@ fn add_manifest_pair(
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            unwidened_definition: None,
         });
     }
 }
@@ -8795,6 +8819,7 @@ mod tests {
                 primary_type_symbol: None,
                 defined_in: None,
                 any_provenance: Vec::new(),
+                unwidened_definition: None,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -10899,6 +10924,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            unwidened_definition: None,
         }
     }
 
@@ -11015,6 +11041,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -11047,6 +11074,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -11079,6 +11107,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         }
     }
 
@@ -11149,7 +11178,7 @@ mod tests {
             "v1's own placeholder must not read as a defined type: {dts}"
         );
         assert_eq!(
-            aliases_to_resolve(&manifest),
+            aliases_to_resolve(&manifest, &HashMap::new()),
             vec!["OrderView".to_string()],
             "an alias v1 abstained on is exactly the one the capture exists to answer"
         );
@@ -11293,6 +11322,62 @@ mod tests {
         assert_eq!(manifest[0].evidence.type_state, ManifestTypeState::Implicit);
     }
 
+    /// carrick#1516: the capture's answer for an entry's unwidened sibling is
+    /// published beside the entry's own, when it says something the published
+    /// type does not: never a copy of it, never one with a top type in it.
+    #[test]
+    fn the_unwidened_reading_is_published_beside_the_expanded_definition() {
+        let sibling = crate::engine::type_compat_v2::unwidened_alias("OrderView");
+        let publish = |unwidened: &str| {
+            let mut manifest = vec![consumer_entry("OrderView")];
+            apply_resolved_definitions(
+                &mut manifest,
+                vec![
+                    captured("OrderView", "{ scope: string; }"),
+                    captured(&sibling, unwidened),
+                ],
+                &HashMap::new(),
+            );
+            manifest.remove(0)
+        };
+        let entry = publish("{ scope: \"all\" | \"specific\"; }");
+        assert_eq!(
+            entry.expanded_definition.as_deref(),
+            Some("{ scope: string; }")
+        );
+        assert_eq!(
+            entry.unwidened_definition.as_deref(),
+            Some("{ scope: \"all\" | \"specific\"; }")
+        );
+        assert_eq!(publish("{ scope: string; }").unwidened_definition, None);
+        assert_eq!(publish("{ scope: any; }").unwidened_definition, None);
+
+        let records = read_records_with(&sibling);
+        assert_eq!(
+            aliases_to_resolve(&[consumer_entry("OrderView")], &records),
+            vec!["OrderView".to_string(), sibling.clone()],
+            "the sibling is asked about only when the capture recorded it"
+        );
+    }
+
+    /// A capture record for `alias` and nothing else.
+    fn read_records_with(
+        alias: &str,
+    ) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
+        let record: crate::services::type_sidecar::CaptureAliasRecord =
+            serde_json::from_value(serde_json::json!({
+                "alias": alias,
+                "anchor_kind": "literal",
+                "source_file": "<inline>",
+                "anchor_origin": "deterministic-infer",
+                "serialization": "structural_fallback",
+                "self_check": "ok",
+                "top_type_at_self_check": false
+            }))
+            .expect("a capture record");
+        HashMap::from([(alias.to_string(), record)])
+    }
+
     /// A capture answer that IS a top type describes nothing, so an entry v1
     /// abstained on publishes no definition at all rather than the word `any`.
     /// 210 of one indexed service's 212 rows are exactly this: the bundle said
@@ -11391,7 +11476,7 @@ mod tests {
             "a shape carrying a top type does not state a contract"
         );
         assert_eq!(
-            aliases_to_resolve(&manifest),
+            aliases_to_resolve(&manifest, &HashMap::new()),
             vec!["OrderView".to_string()],
             "the capture must be asked: it is the layer that resolves what v1 could not"
         );
@@ -11604,7 +11689,10 @@ mod tests {
             ManifestTypeState::Unknown,
             "a bare `any` is an abstention"
         );
-        assert_eq!(aliases_to_resolve(&manifest), vec!["OrderView".to_string()]);
+        assert_eq!(
+            aliases_to_resolve(&manifest, &HashMap::new()),
+            vec!["OrderView".to_string()]
+        );
 
         apply_resolved_definitions(
             &mut manifest,

@@ -446,7 +446,9 @@ pub struct CaptureV2Result {
     pub errors: Vec<String>,
 }
 
-/// Four-bucket verdict classifier output (pinned decision 7).
+/// Four-bucket verdict classifier output (pinned decision 7), plus the
+/// bucket the retype check files when a producer's published type is wider
+/// than what its handler returns (carrick#1516).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictBucket {
@@ -454,6 +456,9 @@ pub enum VerdictBucket {
     Incompatible,
     Unverifiable,
     GateCaughtBakedAny,
+    /// The published type does not fit the consumer and the handler's
+    /// unwidened return does: its own class, never a break.
+    ProducerWider,
 }
 
 /// One structured verdict from `check_v2`, keyed by pair identity.
@@ -529,6 +534,13 @@ pub struct RetypeItem {
     pub expression_line: Option<u32>,
     /// The producer's response type as TypeScript text, fully inlined.
     pub producer_type: String,
+    /// The producer's response as its handler returns it, literals read before
+    /// TypeScript widens them (carrick#1516), when that differs from
+    /// `producer_type`. The retype states it only when `producer_type` raised
+    /// diagnostics, to tell a producer type wider than what it sends from a
+    /// break.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_unwidened_type: Option<String>,
     /// Judge the form JSON puts on the wire (an `http` response).
     pub wire: bool,
 }
@@ -543,6 +555,10 @@ pub enum RetypeVerdict {
     Mismatch,
     /// It added none.
     Agrees,
+    /// The producer's published type added diagnostics and its handler's
+    /// unwidened return added none (carrick#1516): the producer's type is
+    /// wider than what it sends. `diagnostics` are the published type's.
+    Wider,
     /// The check could not be made; `reason` says why.
     Abstain,
 }
@@ -745,6 +761,14 @@ pub struct InferredType {
     /// never a role on its own (an async helper taking a path would match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_return_type: Option<String>,
+    /// carrick#1516, response inferences only: the same inference re-read with
+    /// every literal on the handler's path kept at its literal type.
+    /// `type_string` is what the compiler infers and what the index publishes;
+    /// this is what the handler sends when TypeScript widened a literal in it
+    /// (`scope: string` published, `scope: "all" | "specific"` sent). `None`
+    /// when the two are the same or the reading was dropped as unsound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwidened_type_string: Option<String>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -2444,6 +2468,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         }
     }
 

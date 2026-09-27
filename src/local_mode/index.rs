@@ -1719,6 +1719,15 @@ fn verdict_for(
                         .to_string(),
                 });
             }
+            Some(crate::operation::TypeVerdict::ProducerWider) => {
+                verdict = Some(StoredVerdict {
+                    state: "resolved".to_string(),
+                    result: Some("producer_wider".to_string()),
+                    detail: "the producer's declared type is wider than what its handler \
+                             returns, and what it returns fits this consumer"
+                        .to_string(),
+                });
+            }
             // A verdict was attempted and a side of the pair was not
             // resolvable — `any`, `unknown`, or a type the capture could not
             // reach. Distinct from never having been compared, and the

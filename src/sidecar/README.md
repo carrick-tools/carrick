@@ -350,7 +350,7 @@ Response:
 }
 ```
 
-`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees` or `abstain`. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, the producer's type names something the consumer's program cannot resolve, or the producer's type, as the consumer's program reads it, is `unknown` as a whole or at a member, or is `any` there and the rewrite added no diagnostic (the reason names the member, e.g. `'unknown' at 'session'`). An `any` member can hide a diagnostic but never add one, so the diagnostics found beside it still make a `mismatch`. Diagnostics the file had before the rewrite never count.
+`budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees`, `wider` or `abstain`. `wider` answers an item that also carries `producer_unwidened_type`, the producer's response as its handler returns it with no literal widened (an `infer` response's `unwidened_type_string`): the published type added diagnostics and this one added none, so the producer's type is wider than what it sends (carrick#1516). Its `diagnostics` are the published type's. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, the producer's type names something the consumer's program cannot resolve, or the producer's type, as the consumer's program reads it, is `unknown` as a whole or at a member, or is `any` there and the rewrite added no diagnostic (the reason names the member, e.g. `'unknown' at 'session'`). An `any` member can hide a diagnostic but never add one, so the diagnostics found beside it still make a `mismatch`. Diagnostics the file had before the rewrite never count.
 
 #### `infer` - Resolve the type at a locator
 
@@ -359,6 +359,8 @@ Each item locates one expression. The fields are `file_path`, `line_number` and 
 `infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`.
 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
+
+A `response_body` or `function_return` answer can also carry `unwidened_type_string`: the same inference read again with every literal on the handler's path kept at its literal type (`scope: "all" | "specific"` where `type_string` says `scope: string`). It is absent when the two are the same, and when keeping the literals added a diagnostic on the path. The reading of one batch stops after 120 seconds and keeps the answers it has.
 
 ```json
 {

@@ -197,6 +197,14 @@ fn usable_inferred_text(text: &str) -> Option<&str> {
     }
 }
 
+/// The capture alias that carries a response alias's UNWIDENED reading
+/// (carrick#1516): the handler's return with no literal widened, captured
+/// beside the published type so the definitions pass can expand it the same
+/// way. Never a manifest alias of its own.
+pub(crate) fn unwidened_alias(alias: &str) -> String {
+    format!("{alias}_Unwidened")
+}
+
 /// True when an inference for an alias came back BLIND: tsc resolved the use
 /// site to a bare `any`/`unknown` — no anchor symbol, no array depth, no
 /// shape. This is not "the type is scalar"; it is "the compiler could not see
@@ -315,11 +323,24 @@ pub(crate) fn derive_capture_anchors(
     let mut anchors: Vec<CaptureAnchor> = Vec::new();
 
     // First usable inferred text per alias (mirrors the enrich join's
-    // first-wins `or_insert`).
+    // first-wins `or_insert`), and the unwidened reading of that same
+    // inference when it has one (carrick#1516).
     let mut inferred_text: HashMap<&str, &str> = HashMap::new();
+    let mut unwidened_text: HashMap<&str, &str> = HashMap::new();
     for inf in inferred {
         if let Some(text) = usable_inferred_text(&inf.type_string) {
-            inferred_text.entry(inf.alias.as_str()).or_insert(text);
+            if inferred_text.contains_key(inf.alias.as_str()) {
+                continue;
+            }
+            inferred_text.insert(inf.alias.as_str(), text);
+            if let Some(unwidened) = inf
+                .unwidened_type_string
+                .as_deref()
+                .and_then(usable_inferred_text)
+                .filter(|unwidened| *unwidened != text)
+            {
+                unwidened_text.insert(inf.alias.as_str(), unwidened);
+            }
         }
     }
     let blind = blind_inference_aliases(inferred);
@@ -386,6 +407,14 @@ pub(crate) fn derive_capture_anchors(
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
             });
+            if let Some(unwidened) = unwidened_text.get(alias) {
+                anchors.push(CaptureAnchor::Literal {
+                    alias: unwidened_alias(alias),
+                    type_text: (*unwidened).to_string(),
+                    anchor_origin: AnchorOrigin::DeterministicInfer,
+                    source_file: Some(repo_relative(&request.file_path, repo_root)),
+                });
+            }
             continue;
         }
         // The inferrer decided there is no contract here; a raw locator re-run
@@ -868,6 +897,11 @@ pub(crate) struct BuiltPair {
     /// (`expanded_definition`). The retype check states it at the consumer's
     /// call (carrick#1491).
     pub producer_expanded: Option<String>,
+    /// The producer's response as its handler returns it, no literal widened
+    /// (`unwidened_definition`, carrick#1516). The retype states it when the
+    /// published type raised diagnostics, to tell a producer type wider than
+    /// what it sends from a break.
+    pub producer_unwidened: Option<String>,
     /// The consumer's published type for the same kind. With the producer's,
     /// it says whether either side states a request body at all.
     pub consumer_expanded: Option<String>,
@@ -1074,6 +1108,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         pre_verdict,
         pre_verdict_side,
         producer_expanded: producer.entry.expanded_definition.clone(),
+        producer_unwidened: producer.entry.unwidened_definition.clone(),
         consumer_expanded: consumer.entry.expanded_definition.clone(),
     })
 }
@@ -1364,6 +1399,12 @@ fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> b
 const RETYPE_NOTE: &str = "judged by retyping the consumer's call with the producer's response \
      type and type-checking the consumer's own code";
 
+/// Said on a pair whose producer type is wider than what its handler returns
+/// (carrick#1516), before the places the published type fails.
+const PRODUCER_WIDER_NOTE: &str = "the producer's declared response is wider than what its \
+     handler returns: TypeScript widened a literal the handler returns, and the consumer \
+     accepts every value the handler sends";
+
 /// The retype items to send, grouped by consumer service so each service's
 /// program is built once. A pair qualifies when it is an HTTP response pair,
 /// its CONSUMER left the verdict unresolved, the consumer was scanned in this
@@ -1407,6 +1448,13 @@ fn retype_items<'a>(
                 expression_text: call.expression_text.clone(),
                 expression_line: call.expression_line,
                 producer_type: producer_type.to_string(),
+                producer_unwidened_type: pair
+                    .producer_unwidened
+                    .as_deref()
+                    .filter(|text| {
+                        !contains_disqualifying_top_type(text) && !text.trim().is_empty()
+                    })
+                    .map(str::to_string),
                 wire: true,
             });
     }
@@ -1508,6 +1556,25 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
             outcome.diagnostic = None;
             outcome.resolved = true;
             outcome.unresolved_reason = None;
+            outcome.notes.push(RETYPE_NOTE.to_string());
+        }
+        // Not a break, so nothing rides `diagnostic` (a reason is read as a
+        // mismatch); the places the published type fails are a note.
+        RetypeVerdict::Wider => {
+            let places: Vec<String> = answer
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}:{}: {}", outcome.consumer_file, d.line, d.message))
+                .collect();
+            outcome.bucket = VerdictBucket::ProducerWider;
+            outcome.gate = Some("retype:consumer".to_string());
+            outcome.diagnostic = None;
+            outcome.resolved = true;
+            outcome.unresolved_reason = None;
+            outcome.notes.push(format!(
+                "{PRODUCER_WIDER_NOTE}; against the declared type: {}",
+                places.join("; ")
+            ));
             outcome.notes.push(RETYPE_NOTE.to_string());
         }
         RetypeVerdict::Abstain => {
@@ -1764,6 +1831,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            unwidened_definition: None,
         }
     }
 
@@ -1971,6 +2039,87 @@ mod tests {
         assert!(retype_items(&request, &blamed_request, &local).is_empty());
     }
 
+    /// carrick#1516: the producer's unwidened reading rides the retype item
+    /// beside its published type, and is dropped on the same terms.
+    #[test]
+    fn retype_items_carry_the_unwidened_reading() {
+        let local = web_consumer();
+        let mut pair = retype_pair(ManifestTypeKind::Response, Some("{ scope: string; }"));
+        pair.producer_unwidened = Some("{ scope: \"all\" | \"specific\"; }".to_string());
+        let blamed = HashSet::from([pair.spec.pair_key.clone()]);
+        let pairs = [pair];
+        let items = retype_items(&pairs, &blamed, &local);
+        assert_eq!(
+            items["web"][0].producer_unwidened_type.as_deref(),
+            Some("{ scope: \"all\" | \"specific\"; }")
+        );
+
+        let mut loose = retype_pair(ManifestTypeKind::Response, Some("{ scope: string; }"));
+        loose.producer_unwidened = Some("{ scope: \"all\"; meta: any; }".to_string());
+        let blamed = HashSet::from([loose.spec.pair_key.clone()]);
+        let loose = [loose];
+        let items = retype_items(&loose, &blamed, &local);
+        assert_eq!(
+            items["web"][0].producer_unwidened_type, None,
+            "a reading with a top type in it could agree with anything"
+        );
+    }
+
+    /// carrick#1516: an inference whose handler returns a literal TypeScript
+    /// widened is captured twice: the published type under its own alias, the
+    /// unwidened reading under the sibling alias. Equal texts, or a reading
+    /// with a top type in it, add nothing.
+    #[test]
+    fn the_unwidened_reading_is_captured_beside_the_published_type() {
+        let request = InferRequestItem {
+            file_path: "/repo/src/routes.ts".to_string(),
+            line_number: 7,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::ResponseBody,
+            alias: Some("Endpoint_a_Response".to_string()),
+            param_name: None,
+        };
+        let with = |unwidened: Option<&str>| {
+            let mut inf = inferred("Endpoint_a_Response", "{ scope: string; }", None, None);
+            inf.unwidened_type_string = unwidened.map(str::to_string);
+            derive_capture_anchors(
+                &[],
+                std::slice::from_ref(&request),
+                &[],
+                &[inf],
+                &["Endpoint_a_Response".to_string()],
+                "/repo",
+            )
+        };
+        let literal = |anchor: &CaptureAnchor| match anchor {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => (alias.clone(), type_text.clone()),
+            other => panic!("expected a literal anchor, got {other:?}"),
+        };
+
+        let anchors = with(Some("{ scope: \"all\" | \"specific\"; }"));
+        assert_eq!(
+            anchors.iter().map(literal).collect::<Vec<_>>(),
+            vec![
+                (
+                    "Endpoint_a_Response".to_string(),
+                    "{ scope: string; }".to_string()
+                ),
+                (
+                    "Endpoint_a_Response_Unwidened".to_string(),
+                    "{ scope: \"all\" | \"specific\"; }".to_string()
+                ),
+            ]
+        );
+        assert_eq!(with(None).len(), 1);
+        assert_eq!(with(Some("{ scope: string; }")).len(), 1);
+        assert_eq!(with(Some("{ scope: any; }")).len(), 1);
+    }
+
     #[test]
     fn a_consumer_is_to_blame_only_for_a_type_a_retype_can_settle() {
         let verdict = |side: Option<VerdictSide>, gate: Option<&str>| {
@@ -2091,6 +2240,25 @@ mod tests {
         assert_eq!(agrees.bucket, VerdictBucket::Compatible);
         assert!(agrees.resolved);
         assert_eq!((agrees.gate, agrees.diagnostic), (None, None));
+
+        // carrick#1516: its own class, a fact, and never a mismatch reason:
+        // what the declared type fails on is a note.
+        let mut wider = unresolved();
+        apply_retype(&mut wider, &answer(RetypeVerdict::Wider, None));
+        assert_eq!(wider.bucket, VerdictBucket::ProducerWider);
+        assert!(wider.resolved);
+        assert_eq!(wider.unresolved_reason, None);
+        assert_eq!(wider.diagnostic, None);
+        assert_eq!(
+            wider.notes,
+            vec![
+                format!(
+                    "{PRODUCER_WIDER_NOTE}; against the declared type: src/client.ts:9: \
+                     Property 'x' does not exist on type '{{ y: number; }}'."
+                ),
+                RETYPE_NOTE.to_string(),
+            ]
+        );
 
         let mut abstain = unresolved();
         apply_retype(
@@ -2333,6 +2501,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         }
     }
 
@@ -2764,6 +2933,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         };
 
         let infer = vec![
@@ -2891,6 +3061,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -3172,6 +3343,7 @@ mod tests {
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
+            unwidened_type_string: None,
         };
 
         let explicit = vec![
@@ -3812,6 +3984,224 @@ mod tests {
             assert!(outcome.resolved, "{outcome:#?}");
             assert_eq!(outcome.diagnostic, None);
         }
+    }
+
+    /// carrick#1516, end to end against the real sidecar ($0, no model): a
+    /// producer whose handler maps rows to `scope: 'specific' | 'all'`, which
+    /// TypeScript infers as `scope: string`, and an untyped consumer that hands
+    /// the response to a setter declaring the literal union.
+    ///
+    /// The inference reads the handler twice, the capture keeps both readings,
+    /// the definitions pass publishes the unwidened one beside the expanded
+    /// definition, and the retype files the pair as the producer's type being
+    /// wider than what it sends. Without the reading the same pair is
+    /// incompatible, which is what a real scan reported.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn producer_type_wider_than_its_handler_returns_is_its_own_class() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let fixture = manifest_dir.join("tests/fixtures/producer-wider");
+        let api_root = fixture.join("api").canonicalize().expect("api fixture");
+        let web_root = fixture.join("web").canonicalize().expect("web fixture");
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&api_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let key = OperationKey::http("GET", "/holidays");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let producer_infer = vec![InferRequestItem {
+            file_path: api_root
+                .join("src/routes.ts")
+                .to_string_lossy()
+                .into_owned(),
+            line_number: 6,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::ResponseBody,
+            alias: Some(producer_alias.clone()),
+            param_name: None,
+        }];
+        let inferred = sidecar
+            .infer_types(&producer_infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        assert_eq!(inferred.len(), 1, "{inferred:#?}");
+        assert!(
+            inferred[0].type_string.contains("scope: string"),
+            "{inferred:#?}"
+        );
+        let unwidened = inferred[0]
+            .unwidened_type_string
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            unwidened.contains("scope: \"all\" | \"specific\""),
+            "{inferred:#?}"
+        );
+
+        let producer_anchors = derive_capture_anchors(
+            &[],
+            &producer_infer,
+            &[],
+            &inferred,
+            std::slice::from_ref(&producer_alias),
+            api_root.to_str().unwrap(),
+        );
+        let (api_stub, api_artifact) = run_capture(
+            &sidecar,
+            api_root.to_str().unwrap(),
+            "api",
+            &producer_anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("api capture");
+        let mut api = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                &producer_alias,
+                "src/routes.ts",
+                6,
+                ManifestTypeState::Implicit,
+            )],
+            Some(api_artifact),
+        );
+        crate::engine::resolve_per_endpoint_definitions(&sidecar, &mut api, &api_stub);
+        let _ = std::fs::remove_dir_all(&api_stub);
+        let published = api.type_manifest.as_ref().unwrap()[0].clone();
+        assert!(
+            published
+                .expanded_definition
+                .as_deref()
+                .is_some_and(|t| t.contains("scope: string")),
+            "the published type is the compiler's inference: {published:#?}"
+        );
+        assert!(
+            published
+                .unwidened_definition
+                .as_deref()
+                .is_some_and(|t| t.contains("scope: \"all\" | \"specific\"")),
+            "the handler's own return rides beside it: {published:#?}"
+        );
+
+        // The consumer, scanned in the same run.
+        sidecar.start_init(&web_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("re-init");
+        let site = crate::type_manifest::build_site_id(
+            "src/holidays.ts",
+            13,
+            &key,
+            web_root.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_site_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&site),
+        );
+        let consumer_infer = vec![InferRequestItem {
+            file_path: web_root
+                .join("src/holidays.ts")
+                .to_string_lossy()
+                .into_owned(),
+            line_number: 13,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("api.get(\"/holidays\")".to_string()),
+            expression_line: Some(13),
+            infer_kind: InferKind::CallResult,
+            alias: Some(consumer_alias.clone()),
+            param_name: None,
+        }];
+        let consumer_inferred = sidecar
+            .infer_types(&consumer_infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let consumer_anchors = derive_capture_anchors(
+            &[],
+            &consumer_infer,
+            &[],
+            &consumer_inferred,
+            std::slice::from_ref(&consumer_alias),
+            web_root.to_str().unwrap(),
+        );
+        let (web_stub, web_artifact) = run_capture(
+            &sidecar,
+            web_root.to_str().unwrap(),
+            "web",
+            &consumer_anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("web capture");
+        let _ = std::fs::remove_dir_all(&web_stub);
+        let web = repo(
+            "web",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                &consumer_alias,
+                "src/holidays.ts",
+                13,
+                ManifestTypeState::Unknown,
+            )],
+            Some(web_artifact),
+        );
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: web_root.clone(),
+                tsconfig: None,
+                calls: consumer_call_locators(&consumer_infer),
+            },
+        )]);
+
+        let outcomes = run_check(&sidecar, &[api.clone(), web.clone()], &local);
+        assert_eq!(outcomes.len(), 1, "{outcomes:#?}");
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.bucket, VerdictBucket::ProducerWider, "{outcome:#?}");
+        assert!(outcome.resolved, "{outcome:#?}");
+        assert_eq!(outcome.diagnostic, None);
+        let note = outcome
+            .notes
+            .iter()
+            .find(|n| n.starts_with(PRODUCER_WIDER_NOTE))
+            .unwrap_or_else(|| panic!("the drift is stated: {outcome:#?}"));
+        assert!(
+            note.contains("src/holidays.ts:14:") && note.contains("scope"),
+            "the note names where the declared type fails: {note}"
+        );
+
+        // Control: the same pair with no reading published is a mismatch.
+        let mut widened_only = api.clone();
+        widened_only.type_manifest.as_mut().unwrap()[0].unwidened_definition = None;
+        let control = run_check(&sidecar, &[widened_only, web], &local);
+        assert_eq!(
+            control[0].bucket,
+            VerdictBucket::Incompatible,
+            "{control:#?}"
+        );
     }
 
     /// carrick#1493: a consumer that calls `fetch` and reads the body with

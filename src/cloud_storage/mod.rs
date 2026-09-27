@@ -137,6 +137,21 @@ pub struct TypeManifestEntry {
     /// guessing, and an entry with no type at all has nothing to walk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any_provenance: Vec<crate::services::type_sidecar::TypeProvenance>,
+    /// A producer response's type as its handler returns it, fully inlined,
+    /// with no literal widened (carrick#1516).
+    ///
+    /// `expanded_definition` is what the compiler infers for the handler, and
+    /// TypeScript widens a literal the handler returns in an object property,
+    /// an array element or a return (`scope: row.parentId ? 'specific' :
+    /// 'all'` is inferred `scope: string`). This is the same inference with
+    /// those literals kept (`scope: "all" | "specific"`). The published type is
+    /// still `expanded_definition`; this only tells a consumer that accepts
+    /// every value the handler sends from one the published type really
+    /// breaks.
+    ///
+    /// `None` unless it differs from `expanded_definition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwidened_definition: Option<String>,
 }
 
 /// The declaration site of a manifest entry's anchor symbol (carrick#649).
@@ -220,6 +235,7 @@ impl Ord for DirectionVerdict {
                 crate::operation::TypeVerdict::Compatible => 0,
                 crate::operation::TypeVerdict::Incompatible => 1,
                 crate::operation::TypeVerdict::Unverifiable => 2,
+                crate::operation::TypeVerdict::ProducerWider => 3,
             }
         }
         // Every field is in the tuple, `notes` included: `SdkEdge` derives
@@ -1270,7 +1286,8 @@ pub(crate) fn direction_verdict(
 /// compared two KNOWN types (carrick#839).
 ///
 /// The verdict half is exactly [`crate::operation::TypeVerdict::combine`]'s
-/// precedence (incompatible > unverifiable > compatible) written as an order,
+/// precedence (incompatible > unverifiable > producer_wider > compatible)
+/// written as an order,
 /// so a strict increase here is the same replacement decision the fold made
 /// before this function existed.
 ///
@@ -1287,8 +1304,9 @@ fn direction_rank(direction: &DirectionVerdict) -> (u8, u8) {
     use crate::operation::TypeVerdict;
     let verdict = match direction.verdict {
         TypeVerdict::Compatible => 0,
-        TypeVerdict::Unverifiable => 1,
-        TypeVerdict::Incompatible => 2,
+        TypeVerdict::ProducerWider => 1,
+        TypeVerdict::Unverifiable => 2,
+        TypeVerdict::Incompatible => 3,
     };
     (verdict, u8::from(!direction.resolved))
 }
@@ -1585,6 +1603,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            unwidened_definition: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
@@ -2968,6 +2987,34 @@ mod tests {
             false,
             Some(reason),
         )
+    }
+
+    /// carrick#1516: the site fold ranks a producer type wider than what it
+    /// returns exactly as `TypeVerdict::combine` does, in either arrival
+    /// order: over an agreement, under a site that compared nothing.
+    #[test]
+    fn the_site_fold_ranks_producer_wider_as_combine_does() {
+        use crate::operation::TypeVerdict;
+        let direction = |verdict: TypeVerdict| DirectionVerdict {
+            verdict,
+            reason: None,
+            resolved: verdict != TypeVerdict::Unverifiable,
+            unresolved_reason: None,
+            notes: Vec::new(),
+        };
+        let order = [
+            TypeVerdict::Compatible,
+            TypeVerdict::ProducerWider,
+            TypeVerdict::Unverifiable,
+            TypeVerdict::Incompatible,
+        ];
+        for a in order {
+            for b in order {
+                let mut stored = Some(direction(a));
+                merge_direction(&mut stored, &Some(direction(b)));
+                assert_eq!(stored.unwrap().verdict, a.combine(b), "{a:?} then {b:?}");
+            }
+        }
     }
 
     /// The pair-level fold, recomputed from the sites a row lists.

@@ -590,6 +590,7 @@ fn verdict_of_bucket(bucket: crate::services::type_sidecar::VerdictBucket) -> Ty
             TypeVerdict::Unverifiable
         }
         VerdictBucket::Compatible => TypeVerdict::Compatible,
+        VerdictBucket::ProducerWider => TypeVerdict::ProducerWider,
     }
 }
 
@@ -739,6 +740,7 @@ impl PairDirections {
 pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
     let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
     let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
+    let mut producer_wider: HashSet<VerdictKey> = HashSet::new();
     let mut compatible: HashSet<VerdictKey> = HashSet::new();
     for outcome in outcomes {
         let key = verdict_key_of_outcome(outcome);
@@ -758,6 +760,9 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
             }
             TypeVerdict::Unverifiable => {
                 unverifiable.insert(key);
+            }
+            TypeVerdict::ProducerWider => {
+                producer_wider.insert(key);
             }
             TypeVerdict::Compatible => {
                 compatible.insert(key);
@@ -797,6 +802,12 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
             // real `Unverifiable`, not absent.
             edge.type_compatible = None;
             edge.type_verdict = Some(crate::operation::TypeVerdict::Unverifiable);
+        } else if producer_wider.contains(&key) {
+            // The values the producer sends fit the consumer; only its
+            // published type is wider (carrick#1516). Not a break, so the
+            // boolean reads compatible and the verdict keeps the class.
+            edge.type_compatible = Some(true);
+            edge.type_verdict = Some(crate::operation::TypeVerdict::ProducerWider);
         } else if compatible.contains(&key) {
             edge.type_compatible = Some(true);
             edge.type_verdict = Some(crate::operation::TypeVerdict::Compatible);
@@ -6467,6 +6478,53 @@ mod tests {
             Some("Type 'A' is not assignable to type 'B'")
         );
         assert!(!request.resolved);
+    }
+
+    /// carrick#1516: a producer type wider than what its handler returns is
+    /// its own verdict on the direction and on the edge, never a mismatch: no
+    /// reason, its note kept, and the values it sends read compatible.
+    #[test]
+    fn a_producer_wider_outcome_is_its_own_verdict_and_never_a_mismatch() {
+        let mut wider = outcome(
+            "GET",
+            "/api/orders/:id",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::ProducerWider,
+            None,
+        );
+        wider.resolved = true;
+        wider.notes = vec!["the producer's declared response is wider".to_string()];
+
+        let dirs = PairDirections::from_outcomes(std::slice::from_ref(&wider));
+        let response = dirs
+            .for_edge(&edge("http|GET|/api/orders/:id"))
+            .response
+            .expect("the response half is stated");
+        assert_eq!(response.verdict, TypeVerdict::ProducerWider);
+        assert_eq!(response.reason, None);
+        assert!(response.resolved);
+        assert_eq!(response.notes, wider.notes);
+
+        let mut matches = vec![edge("http|GET|/api/orders/:id")];
+        apply_pair_outcomes(std::slice::from_ref(&wider), &mut matches);
+        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::ProducerWider));
+        assert_eq!(matches[0].type_compatible, Some(true));
+        assert_eq!(matches[0].mismatch_reason, None);
+
+        // A sibling pair that compared nothing is not only a drift.
+        let mut unverified = wider.clone();
+        unverified.bucket = VerdictBucket::Unverifiable;
+        unverified.resolved = false;
+        let mut matches = vec![edge("http|GET|/api/orders/:id")];
+        apply_pair_outcomes(&[wider.clone(), unverified], &mut matches);
+        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::Unverifiable));
+
+        // A sibling pair that agrees does not hide the drift.
+        let mut agrees = wider.clone();
+        agrees.bucket = VerdictBucket::Compatible;
+        let mut matches = vec![edge("http|GET|/api/orders/:id")];
+        apply_pair_outcomes(&[agrees, wider], &mut matches);
+        assert_eq!(matches[0].type_verdict, Some(TypeVerdict::ProducerWider));
     }
 
     /// A consumer location outside the GitHub Actions workspace passes through

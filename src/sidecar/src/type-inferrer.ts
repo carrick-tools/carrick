@@ -52,6 +52,18 @@ import type {
 import { validateInferRequestItem } from './validators.js';
 import { isExternalOrigin } from './origin.js';
 import {
+  addedDiagnostics,
+  applyInsertions,
+  fileDiagnostics,
+  literalInsertions,
+  mapBack,
+  mapForward,
+  normalise,
+  pathOf,
+  type Insertion,
+  type PathFunction,
+} from './unwidened.js';
+import {
   expandTypeStructural,
   type ExpandOrigin,
   type MemberOverrides,
@@ -362,7 +374,25 @@ export interface TypeInferrerOptions {
    * `node_modules` symlink from an installed dependency (carrick#1264).
    */
   repoRoot: string;
+  /**
+   * How long the unwidened reading of one `infer` batch may take
+   * (carrick#1516). Defaults to `UNWIDENED_BUDGET_MS`.
+   */
+  unwidenedBudgetMs?: number;
 }
+
+/**
+ * How long the unwidened reading of one batch may take by default. The
+ * reading adds a field and never an answer, so running out costs only the
+ * readings not yet made; the rewrite is always undone.
+ */
+const UNWIDENED_BUDGET_MS = 120_000;
+/**
+ * No reading starts or continues past this long after the batch began: the
+ * scanner's read deadline for one request is 900s, and the inferences the
+ * batch already made must reach it.
+ */
+const UNWIDENED_LATEST_MS = 600_000;
 
 /**
  * Result of unwrapping a type
@@ -429,11 +459,19 @@ export class TypeInferrer {
   private readonly project: Project;
   private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
   private readonly repoRoot: string;
+  /**
+   * The node each inferred type was read from, keyed by the location object
+   * `getNodeLocation` built for it (the one an `InferredType` carries). The
+   * unwidened reading re-reads from here (carrick#1516).
+   */
+  private readonly readNodes = new WeakMap<SourceLocation, Node>();
+  private readonly unwidenedBudgetMs: number;
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
     this.packageOf = options.packageOf;
     this.repoRoot = options.repoRoot;
+    this.unwidenedBudgetMs = options.unwidenedBudgetMs ?? UNWIDENED_BUDGET_MS;
   }
 
   /**
@@ -460,8 +498,11 @@ export class TypeInferrer {
     requests: InferRequestItem[],
     extractionConfig?: ExtractionConfig
   ): InferResult {
+    const started = performance.now();
     const inferredTypes: InferredType[] = [];
     const errors: string[] = [];
+    /** Response inferences the unwidened reading re-reads (carrick#1516). */
+    const responses: Array<{ request: InferRequestItem; result: InferredType }> = [];
 
     for (const request of requests) {
       // Plain JavaScript has no type annotations to extract, and `checkJs` is
@@ -484,6 +525,9 @@ export class TypeInferrer {
         const result = this.inferSingle(request, extractionConfig);
         if (result) {
           inferredTypes.push(result);
+          if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
+            responses.push({ request, result });
+          }
         } else {
           errors.push(
             `Could not infer type at ${request.file_path}:${loc} (${request.infer_kind})`
@@ -498,11 +542,210 @@ export class TypeInferrer {
       }
     }
 
+    try {
+      const deadline = Math.min(
+        performance.now() + this.unwidenedBudgetMs,
+        started + UNWIDENED_LATEST_MS
+      );
+      this.addUnwidenedReadings(responses, extractionConfig, deadline);
+    } catch (err) {
+      // The reading only ever adds a field; it never costs an answer.
+      this.logError(
+        `Unwidened reading failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
     return {
       success: errors.length === 0 || inferredTypes.length > 0,
       inferred_types: inferredTypes.length > 0 ? inferredTypes : undefined,
       errors: errors.length > 0 ? errors : undefined,
     };
+  }
+
+  /**
+   * carrick#1516: read each response inference again with the literals on its
+   * handler's path marked `as const`, and record the narrower type the handler
+   * really returns beside the published one (`unwidened_type_string`). See
+   * `unwidened.ts` for what is marked and why the reading is sound.
+   *
+   * One rewrite for the whole batch: every file on any request's path is
+   * rewritten once, type-checked before and after, the requests re-inferred,
+   * and every file restored before returning, so the project other requests
+   * read is the project the scan loaded.
+   *
+   * Nothing is read past `deadline`: a batch that runs out keeps the readings
+   * it made and publishes none for the rest.
+   */
+  private addUnwidenedReadings(
+    responses: Array<{ request: InferRequestItem; result: InferredType }>,
+    extractionConfig: ExtractionConfig | undefined,
+    deadline: number
+  ): void {
+    const outOfTime = (stage: string): boolean => {
+      if (performance.now() <= deadline) return false;
+      this.log(`Unwidened reading stopped ${stage}: it ran out of its budget`);
+      return true;
+    };
+    interface Plan {
+      request: InferRequestItem;
+      result: InferredType;
+      read: { file: SourceFile; start: number; end: number };
+      path: PathFunction[];
+      /** Original span of the node an expression-text locator names. */
+      locatedByText?: { start: number; end: number };
+    }
+    const plans: Plan[] = [];
+    const insertionsByFile = new Map<SourceFile, Insertion[]>();
+    const checkedFiles = new Set<SourceFile>();
+
+    // Every position is read before the first rewrite: a rewrite forgets
+    // every node of its file.
+    for (const { request, result } of responses) {
+      // A declared return type is the contract; nothing was widened.
+      if (result.is_explicit) continue;
+      const read = this.readNodes.get(result.source_location);
+      if (!read) continue;
+      const functions = pathOf(read);
+      let marked = 0;
+      for (const fn of functions) {
+        const insertions = literalInsertions(fn);
+        marked += insertions.length;
+        if (insertions.length === 0) continue;
+        const file = fn.getSourceFile();
+        insertionsByFile.set(file, [...(insertionsByFile.get(file) ?? []), ...insertions]);
+      }
+      // Nothing on the path to mark: the reading would equal the published type.
+      if (marked === 0) continue;
+      const path = functions.map((fn) => ({
+        file: fn.getSourceFile(),
+        start: fn.getStart(),
+        end: fn.getEnd(),
+      }));
+      for (const fn of path) checkedFiles.add(fn.file);
+      let locatedByText: Plan['locatedByText'];
+      if (request.expression_text && request.span_start === undefined) {
+        const sourceFile = this.getSourceFile(request.file_path);
+        const located = sourceFile
+          ? this.findNodeByText(sourceFile, request.expression_text, request.expression_line)
+          : undefined;
+        if (located) locatedByText = { start: located.getStart(), end: located.getEnd() };
+      }
+      plans.push({
+        request,
+        result,
+        read: { file: read.getSourceFile(), start: read.getStart(), end: read.getEnd() },
+        path,
+        locatedByText,
+      });
+    }
+    if (plans.length === 0) return;
+
+    const insertions = new Map<SourceFile, Insertion[]>();
+    for (const [file, list] of insertionsByFile) insertions.set(file, normalise(list));
+    const before = new Map<SourceFile, ReturnType<typeof fileDiagnostics>>();
+    for (const file of checkedFiles) {
+      if (outOfTime('before the rewrite')) return;
+      before.set(file, fileDiagnostics(file));
+    }
+    const originals = new Map<SourceFile, string>();
+    for (const file of insertions.keys()) originals.set(file, file.getFullText());
+
+    try {
+      for (const [file, list] of insertions) {
+        file.replaceWithText(applyInsertions(originals.get(file)!, list));
+      }
+
+      // A diagnostic the marking added sits in a function on some request's
+      // path (or elsewhere in that function's file): every request whose path
+      // holds it loses its reading.
+      const tainted = new Set<Plan>();
+      for (const file of checkedFiles) {
+        if (outOfTime('while checking the rewrite')) return;
+        const list = insertions.get(file) ?? [];
+        for (const at of addedDiagnostics(before.get(file)!, fileDiagnostics(file), list)) {
+          const holders = plans.flatMap((plan) => plan.path).filter(
+            (fn) => fn.file === file && fn.start <= at && at < fn.end
+          );
+          for (const plan of plans) {
+            const onPath = plan.path.some((fn) =>
+              holders.length > 0 ? holders.includes(fn) : fn.file === file
+            );
+            if (onPath) tainted.add(plan);
+          }
+        }
+      }
+
+      for (const plan of plans) {
+        if (outOfTime('while re-reading')) return;
+        if (tainted.has(plan)) {
+          this.log(
+            `Unwidened reading for ${plan.request.file_path}:${plan.request.line_number} ` +
+              'dropped: marking its literals added a diagnostic on its path'
+          );
+          continue;
+        }
+        const request = this.mappedRequest(plan.request, plan.locatedByText, insertions);
+        let again: InferredType | null = null;
+        try {
+          again = this.inferSingle(request, extractionConfig);
+        } catch {
+          again = null;
+        }
+        if (!again || again.type_string === plan.result.type_string) continue;
+        // An invariant, not a case: `mappedRequest` is what keeps the re-read
+        // on the node the inference read, so no fixture reaches this. It is
+        // what turns a locator the mapping got wrong into no reading instead
+        // of another node's type published as this handler's.
+        const readAgain = this.readNodes.get(again.source_location);
+        const list = insertions.get(plan.read.file) ?? [];
+        const sameNode =
+          readAgain !== undefined &&
+          readAgain.getSourceFile() === plan.read.file &&
+          mapBack(readAgain.getStart(), list) === plan.read.start &&
+          mapBack(readAgain.getEnd(), list) === plan.read.end;
+        if (!sameNode) {
+          this.log(
+            `Unwidened reading for ${plan.request.file_path}:${plan.request.line_number} ` +
+              'dropped: the re-read did not read the node the inference read'
+          );
+          continue;
+        }
+        plan.result.unwidened_type_string = again.type_string;
+      }
+    } finally {
+      for (const [file, text] of originals) file.replaceWithText(text);
+    }
+  }
+
+  /**
+   * The request as it locates in the rewritten files: a span moved past the
+   * insertions before it, an expression text replaced by the rewritten text of
+   * the node it named. Lines do not move (an insertion holds no newline).
+   */
+  private mappedRequest(
+    request: InferRequestItem,
+    locatedByText: { start: number; end: number } | undefined,
+    insertions: Map<SourceFile, Insertion[]>
+  ): InferRequestItem {
+    const sourceFile = this.getSourceFile(request.file_path);
+    const list = sourceFile ? insertions.get(sourceFile) ?? [] : [];
+    if (list.length === 0) return request;
+    if (request.span_start !== undefined && request.span_end !== undefined) {
+      return {
+        ...request,
+        span_start: mapForward(request.span_start, list, 'start'),
+        span_end: mapForward(request.span_end, list, 'end'),
+      };
+    }
+    if (locatedByText && sourceFile) {
+      return {
+        ...request,
+        expression_text: sourceFile
+          .getFullText()
+          .slice(mapForward(locatedByText.start, list, 'start'), mapForward(locatedByText.end, list, 'end')),
+      };
+    }
+    return request;
   }
 
   /**
@@ -6574,13 +6817,15 @@ export class TypeInferrer {
     const startLinePos = node.getStartLineNumber();
     const endLinePos = node.getEndLineNumber();
 
-    return {
+    const location = {
       file_path: node.getSourceFile().getFilePath(),
       start_line: startLinePos,
       end_line: endLinePos,
       start_column: node.getStart() - node.getStartLinePos(),
       end_column: node.getEnd() - node.getStartLinePos(),
     };
+    this.readNodes.set(location, node);
+    return location;
   }
 
   private createInferredType(

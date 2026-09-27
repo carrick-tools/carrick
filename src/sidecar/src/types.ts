@@ -366,6 +366,12 @@ export interface RetypeItem {
   expression_line?: number;
   /** The producer's response type as TypeScript text, fully inlined. */
   producer_type: string;
+  /**
+   * The producer's response as its handler returns it, literals read before
+   * TypeScript widens them (carrick#1516), when that differs from
+   * `producer_type`. Asked only when `producer_type` raised diagnostics.
+   */
+  producer_unwidened_type?: string;
   /** Judge the form JSON puts on the wire (an `http` response). */
   wire: boolean;
 }
@@ -614,11 +620,14 @@ export interface RetypeDiagnostic {
  * - `mismatch`: the rewrite added diagnostics; each is a place the consumer
  *   uses something the producer's response does not provide.
  * - `agrees`: it added none.
+ * - `wider`: the published type added diagnostics and the handler's
+ *   unwidened return added none (carrick#1516): the producer's type is wider
+ *   than what it sends. `diagnostics` are the published type's.
  * - `abstain`: the check could not be made; `reason` says why.
  */
 export interface RetypeOutcome {
   item_id: string;
-  outcome: 'mismatch' | 'agrees' | 'abstain';
+  outcome: 'mismatch' | 'agrees' | 'wider' | 'abstain';
   diagnostics: RetypeDiagnostic[];
   reason?: string;
 }
@@ -735,6 +744,16 @@ export interface InferredType {
    * Sorted by `path`; absent (not empty) when the type carries no top type.
    */
   any_provenance?: TypeProvenance[];
+  /**
+   * carrick#1516, response inferences only: the same inference re-read with
+   * every literal on the handler's path kept at its literal type
+   * (`unwidened.ts`). `type_string` is what the compiler infers and what the
+   * index publishes; this is what the handler actually sends when TypeScript
+   * widened a literal in it (`scope: string` published, `scope: 'all' |
+   * 'specific'` sent). Absent when the two are the same, or when the reading
+   * was dropped as unsound.
+   */
+  unwidened_type_string?: string;
 }
 
 /**

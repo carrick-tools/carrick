@@ -28,6 +28,7 @@
 import { Node, SyntaxKind, ts } from 'ts-morph';
 import type { CallExpression, Identifier, Project, PropertyAccessExpression, SourceFile, Type } from 'ts-morph';
 import type { TypeInferrer } from './type-inferrer.js';
+import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
   RetypeDiagnostic,
@@ -59,12 +60,7 @@ export type TopTypeWalk = (
   location: ts.Node
 ) => Array<{ kind: string; path: string }>;
 
-interface Diag {
-  /** Start position in the file the diagnostic was reported on. */
-  start: number;
-  code: number;
-  message: string;
-}
+type Diag = FileDiagnostic;
 
 /** Where a position in the rewritten text came from. */
 type Origin = { kind: 'original'; pos: number } | { kind: 'inserted' };
@@ -151,6 +147,8 @@ export class Retyper {
 
     const plan = this.plan(call, producer, item.wire);
     if (typeof plan === 'string') return abstain(item, plan);
+    // Planned now: a check forgets every node of the file, `call` included.
+    const unwidened = this.unwidenedPlan(call, item);
 
     const original = sourceFile.getFullText();
     let pre = before.get(sourceFile);
@@ -178,10 +176,20 @@ export class Retyper {
         messages = new Map(plain.added.map((d) => [key(d), d.message]));
       }
     }
+    // carrick#1516: the published type is what the compiler inferred, with
+    // any literal the handler returns widened. When the handler's own return,
+    // read before that widening, raises nothing, the producer's type is wider
+    // than what it sends: its own verdict class, not a break. Anything short
+    // of a clean check (a diagnostic, an abstain) leaves the mismatch.
+    let outcome: RetypeOutcome['outcome'] = 'mismatch';
+    if (unwidened) {
+      const narrowed = this.check(sourceFile, original, unwidened(true), pre);
+      if (narrowed.kind === 'checked' && narrowed.added.length === 0) outcome = 'wider';
+    }
     const lineOf = lineIndex(original);
     return {
       item_id: item.item_id,
-      outcome: 'mismatch',
+      outcome,
       diagnostics: decisive.added.map(
         (d): RetypeDiagnostic => ({
           line: lineOf(d.start),
@@ -190,6 +198,20 @@ export class Retyper {
         })
       ),
     };
+  }
+
+  /**
+   * The rewrite that states the producer's UNWIDENED return (carrick#1516),
+   * when the item carries one that can be stated at this call.
+   */
+  private unwidenedPlan(
+    call: CallExpression,
+    item: RetypeItem
+  ): ((useWire: boolean) => Rewrite) | undefined {
+    const text = oneLine(item.producer_unwidened_type ?? '');
+    if (!text || text.includes('//') || text.includes('/*')) return undefined;
+    const plan = this.plan(call, text, item.wire);
+    return typeof plan === 'string' ? undefined : plan;
   }
 
   /**
@@ -946,18 +968,6 @@ function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
 
 function declaresTypeParameters(call: CallExpression): boolean {
   return (resolvedDeclaration(call)?.typeParameters?.length ?? 0) > 0;
-}
-
-function fileDiagnostics(sourceFile: SourceFile): Diag[] {
-  const program = sourceFile.getProject().getProgram().compilerObject;
-  const node = sourceFile.compilerNode;
-  return [...program.getSyntacticDiagnostics(node), ...program.getSemanticDiagnostics(node)]
-    .filter((d) => d.file === node && d.start !== undefined)
-    .map((d) => ({ start: d.start!, code: d.code, message: flatten(d.messageText) }));
-}
-
-function flatten(text: string | ts.DiagnosticMessageChain): string {
-  return ts.flattenDiagnosticMessageText(text, ' ');
 }
 
 function key(d: Diag): string {

@@ -342,6 +342,7 @@ const RetypeItemSchema = z.object({
   expression_text: z.string().optional(),
   expression_line: z.number().int().positive().optional(),
   producer_type: z.string().min(1),
+  producer_unwidened_type: z.string().min(1).optional(),
   wire: z.boolean(),
 });
 

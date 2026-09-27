@@ -506,6 +506,7 @@ fn direction_cell(label: &str, dir: Option<&crate::cloud_storage::DirectionVerdi
             code_span(dir.reason.as_deref().unwrap_or("no reason recorded"))
         ),
         TypeVerdict::Unverifiable => "unverifiable".to_string(),
+        TypeVerdict::ProducerWider => "producer type wider than it returns".to_string(),
     };
     if dir.resolved {
         format!("{label}: {answer}")
@@ -693,14 +694,24 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
         .iter()
         .filter(|e| e.type_verdict == Some(TypeVerdict::Unverifiable))
         .collect();
+    let producer_wider: Vec<&_> = verified
+        .iter()
+        .filter(|e| e.type_verdict == Some(TypeVerdict::ProducerWider))
+        .collect();
     // Everything else: no verdict (not type-checked / non-HTTP) OR incompatible
-    // (already reported as a loud finding above; none of the three verified
-    // captions fit it, and "not compared" carries the least-wrong advice).
+    // (already reported as a loud finding above; none of the verified captions
+    // fit it, and "not compared" carries the least-wrong advice).
     let matched_only: Vec<&_> = verified
         .iter()
         .filter(|e| {
-            e.type_verdict != Some(TypeVerdict::Compatible)
-                && e.type_verdict != Some(TypeVerdict::Unverifiable)
+            !matches!(
+                e.type_verdict,
+                Some(
+                    TypeVerdict::Compatible
+                        | TypeVerdict::Unverifiable
+                        | TypeVerdict::ProducerWider
+                )
+            )
         })
         .collect();
 
@@ -712,7 +723,7 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
 
     // No per-endpoint type verdicts anywhere: one table, structural claim only
     // — no compiler sentence for pairs nobody proved.
-    if type_checked.is_empty() && unverifiable.is_empty() {
+    if type_checked.is_empty() && unverifiable.is_empty() && producer_wider.is_empty() {
         output.push_str("| Method | Path |\n| :--- | :--- |\n");
         for entry in verified {
             output.push_str(&format_verified_row(entry));
@@ -725,6 +736,11 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
         "Type-checked",
         "Request/response types were resolved and compared by the TypeScript compiler pass.",
         &type_checked,
+    ));
+    output.push_str(&format_verified_subsection(
+        "Producer type wider than it returns",
+        "The compiler pass compared these pairs. The producer's inferred type is wider than what its handler returns (TypeScript widened a literal it returns), and the consumer accepts every value the handler sends. Declaring the handler's return type removes the difference.",
+        &producer_wider,
     ));
     output.push_str(&format_verified_subsection(
         "Types not verifiable",
@@ -2070,6 +2086,28 @@ mod tests {
             users_idx > type_checked_idx && refunds_idx > users_idx,
             "compatible row precedes the unverifiable row across buckets: {output}"
         );
+    }
+
+    /// carrick#1516: a pair whose producer type is wider than what its handler
+    /// returns is compared and is not a break, so it gets its own bucket, and
+    /// never "not compared".
+    #[test]
+    fn test_verified_section_gives_producer_wider_its_own_bucket() {
+        use crate::operation::TypeVerdict;
+        let mut result = result_with(vec![]);
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/holidays".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: Some(TypeVerdict::ProducerWider),
+            dispatch: None,
+        }];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+        assert!(
+            output.contains("**Producer type wider than it returns (1)**"),
+            "output: {output}"
+        );
+        assert!(!output.contains("**Types not compared"), "output: {output}");
     }
 
     #[test]
