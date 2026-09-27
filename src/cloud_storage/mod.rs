@@ -2100,6 +2100,7 @@ mod tests {
             // Set per test with struct-update syntax where a note is the
             // thing under test; every other fixture states none.
             notes: Vec::new(),
+            consumer_reads: Vec::new(),
         }
     }
 

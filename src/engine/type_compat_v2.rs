@@ -1542,6 +1542,7 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
                 .collect();
             outcome.bucket = VerdictBucket::Incompatible;
             outcome.gate = Some("retype:consumer".to_string());
+            outcome.consumer_reads = answer.diagnostics.iter().map(|d| d.line).collect();
             outcome.diagnostic = Some(format!(
                 "the consumer uses what the producer's response does not provide: {}",
                 places.join("; ")
@@ -1682,6 +1683,7 @@ fn outcome_for(
         resolved,
         unresolved_reason,
         notes,
+        consumer_reads: Vec::new(),
     }
 }
 
@@ -2234,6 +2236,8 @@ mod tests {
             )
         );
         assert_eq!(mismatch.notes, vec![RETYPE_NOTE.to_string()]);
+        // carrick#1517: the finding names these reads as the consumer's side.
+        assert_eq!(mismatch.consumer_reads, vec![9]);
 
         let mut agrees = unresolved();
         apply_retype(&mut agrees, &answer(RetypeVerdict::Agrees, None));

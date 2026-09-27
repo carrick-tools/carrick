@@ -298,6 +298,10 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
 /// `None` for both wherever the finding states no direction: without it the
 /// pair cannot be assigned to the two ends, and a finding whose two strings
 /// are service labels rather than types states none (carrick#1033).
+///
+/// `None` for one side whose text is empty. A consumer the retype check judged
+/// from its own code states no type, and its finding leaves `consumer_type`
+/// empty rather than naming the generated alias (carrick#1517).
 fn typed_sides(
     direction: Option<crate::cloud_storage::ManifestTypeKind>,
     producer_type: &str,
@@ -427,6 +431,29 @@ mod tests {
         assert_eq!(joined.direction, None);
         assert_eq!(joined.expected_type, None);
         assert_eq!(joined.actual_type, None);
+    }
+
+    /// A consumer the retype check judged states no type (carrick#1517). The
+    /// reading side is left unstated, so `carrick check` never prints a
+    /// generated alias as what the call site reads.
+    #[test]
+    fn a_retyped_consumer_states_no_expected_type() {
+        let retyped = Finding::type_mismatch(
+            "GET",
+            "/api/users",
+            None,
+            vec!["src/screen.ts:12".to_string()],
+            "{ id: string; }",
+            "GET /api/users → Response",
+            "the consumer uses what the producer's response does not provide: \
+             src/screen.ts:14: Property 'name' does not exist on type '{ id: string; }'.",
+        )
+        .with_direction(Some(ManifestTypeKind::Response))
+        .with_consumer_reads(vec!["src/screen.ts:14".to_string()]);
+        let joined = project_finding(&retyped).expect("a type mismatch projects");
+        assert_eq!(joined.direction.as_deref(), Some("response"));
+        assert_eq!(joined.actual_type.as_deref(), Some("{ id: string; }"));
+        assert_eq!(joined.expected_type, None);
     }
 
     /// A resolved shape can run to thousands of characters. The cap is applied

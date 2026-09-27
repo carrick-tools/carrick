@@ -194,9 +194,20 @@ pub enum Finding {
         service: Option<String>,
         call_sites: Vec<String>,
         producer_type: String,
+        /// Empty when the consumer states no type, and then `consumer_reads`
+        /// says what it was judged on.
         consumer_type: String,
         /// Compiler error, pre-truncated to [`MAX_DETAIL_CHARS`] chars.
         detail: String,
+        /// Where the consumer reads what the producer's response does not
+        /// provide, as `file:line`, when the retype check judged the pair from
+        /// the consumer's own code (carrick#1491). That consumer states no
+        /// type, so a reader shows these reads as its side of the pair
+        /// (carrick#1517). Empty on every other mismatch.
+        ///
+        /// Scan-local, as `direction` is: the cloud reads the same places out
+        /// of `detail`, so the payload does not carry them twice.
+        consumer_reads: Vec<String>,
         /// Whether the producer shape comes from a real route or a mock/test
         /// handler (#380) — a mismatch against a mock is often still real
         /// (mocks frequently encode the canonical contract) but should be
@@ -381,6 +392,7 @@ impl Finding {
             producer_type: producer_type.into(),
             consumer_type: consumer_type.into(),
             detail: truncate_chars(detail, MAX_DETAIL_CHARS),
+            consumer_reads: Vec::new(),
             producer_provenance: EndpointProvenance::default(),
             edge_source: None,
             verdict_state: None,
@@ -491,6 +503,27 @@ impl Finding {
     pub fn with_direction(mut self, kind: Option<crate::cloud_storage::ManifestTypeKind>) -> Self {
         if let Finding::TypeMismatch { direction, .. } = &mut self {
             *direction = kind;
+        }
+        self
+    }
+
+    /// State where a consumer with no type of its own reads what the
+    /// producer's response does not provide (carrick#1517). A non-empty list
+    /// clears `consumer_type`: that consumer's type is not known, and a
+    /// generated alias would read as one. No-op for every other kind, and
+    /// for an empty list.
+    pub fn with_consumer_reads(mut self, reads: Vec<String>) -> Self {
+        if reads.is_empty() {
+            return self;
+        }
+        if let Finding::TypeMismatch {
+            consumer_type,
+            consumer_reads,
+            ..
+        } = &mut self
+        {
+            consumer_type.clear();
+            *consumer_reads = reads;
         }
         self
     }
@@ -688,6 +721,8 @@ impl Serialize for Finding {
                 // Scan-local (carrick-cloud#1369): the comparison key, not a
                 // fact a reader needs.
                 pair: _,
+                // Scan-local (carrick#1517): `detail` already names each read.
+                consumer_reads: _,
                 on_main,
                 on_main_unknown,
             } => {

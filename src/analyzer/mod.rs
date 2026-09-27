@@ -1502,6 +1502,12 @@ pub struct PairCheckOutcome {
     /// verdict nor an unresolution (carrick#1341), carried verbatim from the
     /// sidecar's `CheckVerdict.notes`. Empty when there is nothing to add.
     pub notes: Vec<String>,
+    /// The lines of `consumer_file` where the consumer reads what the
+    /// producer's response does not provide, as the retype check found them
+    /// (carrick#1491). Set only on a pair the retype decided incompatible and
+    /// empty on every other outcome. Such a consumer states no type of its
+    /// own, so its finding names these reads instead (carrick#1517).
+    pub consumer_reads: Vec<u32>,
 }
 
 /// The pairing a type-mismatch outcome is about (carrick-cloud#1369): the
@@ -3340,8 +3346,9 @@ impl Analyzer {
     /// [`Finding::TypeMismatch`]s. Returns empty when compat was not
     /// evaluated for this run. The producer/consumer type labels come from
     /// the manifest entries (real anchor symbol, else the expanded
-    /// definition, else the display name); the detail is the scrubbed
-    /// compiler diagnostic.
+    /// definition, else the display name), except that a consumer the retype
+    /// check judged carries the lines it reads on instead of a type; the
+    /// detail is the scrubbed compiler diagnostic.
     fn get_type_mismatch_findings(&self) -> Vec<Finding> {
         let Some(outcomes) = self.pair_outcomes.as_ref() else {
             return Vec::new();
@@ -3408,6 +3415,18 @@ impl Analyzer {
                     .clone()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "producer and consumer types are incompatible".to_string());
+                // A consumer the retype judged states no type: its side is
+                // where it reads, not its generated alias (carrick#1517).
+                let consumer_reads: Vec<String> = outcome
+                    .consumer_reads
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|line| {
+                        let site = format!("{}:{}", outcome.consumer_file, line);
+                        strip_ci_workspace_prefix(&site).to_string()
+                    })
+                    .collect();
                 Finding::type_mismatch(
                     method,
                     path,
@@ -3417,6 +3436,7 @@ impl Analyzer {
                     self.clean_type_string(&type_label(&outcome.consumer_alias), &display_names),
                     &self.clean_error_message(&detail, &display_names),
                 )
+                .with_consumer_reads(consumer_reads)
                 .with_producer_provenance(producer_provenance)
                 .with_edge_source(edge_source)
                 .with_verdict_state(Some(verdict_state_for(outcome)))
@@ -6025,6 +6045,7 @@ mod tests {
             resolved: false,
             unresolved_reason: None,
             notes: Vec::new(),
+            consumer_reads: Vec::new(),
         }
     }
 
@@ -6369,6 +6390,75 @@ mod tests {
         };
         assert_eq!(call_sites, &vec!["server.ts:66".to_string()]);
         assert_eq!(detail, "NotificationStatus not assignable to StatusView");
+    }
+
+    /// carrick#1517: a pair the retype check decided has a consumer that states
+    /// no type. Its finding carries the lines the consumer reads on, once each
+    /// and without the runner prefix, and no consumer type, so nothing shows
+    /// the generated alias as the consumer's. The detail is left as the check
+    /// wrote it: the cloud reads each place back out of it.
+    #[test]
+    fn a_retyped_mismatch_names_the_consumer_reads_not_its_alias() {
+        let detail = "the consumer uses what the producer's response does not provide: \
+             src/client.ts:14: Property 'total' does not exist on type '{ id: string; }'.";
+        let mut retyped = outcome(
+            "GET",
+            "/api/orders/:id",
+            "/home/runner/work/web/web/src/client.ts:12",
+            VerdictBucket::Incompatible,
+            Some(detail),
+        );
+        retyped.gate = Some("retype:consumer".to_string());
+        retyped.resolved = true;
+        retyped.consumer_reads = vec![20, 14, 20];
+        // A mismatch check_v2 found between two types keeps its consumer type.
+        let compared = outcome(
+            "GET",
+            "/api/orders",
+            "/home/runner/work/web/web/src/client.ts:30",
+            VerdictBucket::Incompatible,
+            Some("Type 'A' is not assignable to type 'B'"),
+        );
+
+        let mut unread = retyped.clone();
+        unread.consumer_reads.clear();
+        let detail_without_reads =
+            match &analyzer_with_outcomes(vec![unread]).get_type_mismatch_findings()[0] {
+                Finding::TypeMismatch { detail, .. } => detail.clone(),
+                other => panic!("expected a TypeMismatch finding, got {other:?}"),
+            };
+
+        let findings = analyzer_with_outcomes(vec![retyped, compared]).get_type_mismatch_findings();
+        let Finding::TypeMismatch {
+            consumer_type,
+            consumer_reads,
+            detail: said,
+            ..
+        } = &findings[0]
+        else {
+            panic!("expected a TypeMismatch finding, got {:?}", findings[0]);
+        };
+        assert_eq!(
+            consumer_reads,
+            &vec![
+                "src/client.ts:14".to_string(),
+                "src/client.ts:20".to_string()
+            ]
+        );
+        assert_eq!(consumer_type, "");
+        assert_eq!(said, &detail_without_reads);
+        assert!(said.contains("src/client.ts:14: Property 'total' does not exist"));
+
+        let Finding::TypeMismatch {
+            consumer_type,
+            consumer_reads,
+            ..
+        } = &findings[1]
+        else {
+            panic!("expected a TypeMismatch finding, got {:?}", findings[1]);
+        };
+        assert!(consumer_reads.is_empty());
+        assert_eq!(consumer_type, "Consumer_Alias");
     }
 
     /// The finding's verdict state comes from the outcome's `resolved` flag,

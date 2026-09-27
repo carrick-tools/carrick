@@ -939,12 +939,13 @@ fn format_critical_section(risks: &[&Finding]) -> String {
                 producer_type,
                 consumer_type,
                 detail,
+                consumer_reads,
                 producer_provenance,
                 ..
             } => (
                 format!("{} {}", method, path),
                 format!(
-                    "producer `{}`{} vs consumer `{}`: {}",
+                    "producer `{}`{} vs {}: {}",
                     producer_type,
                     // The producer shape comes from a mock/test handler —
                     // often still the canonical contract, but say so (#380).
@@ -953,7 +954,7 @@ fn format_critical_section(risks: &[&Finding]) -> String {
                     } else {
                         ""
                     },
-                    consumer_type,
+                    consumer_side(consumer_type, consumer_reads),
                     detail
                 ),
             ),
@@ -976,6 +977,29 @@ fn format_critical_section(risks: &[&Finding]) -> String {
     }
     output.push_str("\n</details>");
     output
+}
+
+/// How many read sites a risk row names before it counts the rest.
+const MAX_SHOWN_READS: usize = 3;
+
+/// The consumer's side of a type-mismatch row: its type, or, for a consumer
+/// that states none and was judged from its own code, where it reads
+/// (carrick#1517).
+fn consumer_side(consumer_type: &str, reads: &[String]) -> String {
+    if reads.is_empty() {
+        return format!("consumer `{consumer_type}`");
+    }
+    let shown: Vec<String> = reads
+        .iter()
+        .take(MAX_SHOWN_READS)
+        .map(|site| format!("`{}`", code_cell(site)))
+        .collect();
+    let more = reads.len() - shown.len();
+    if more == 0 {
+        format!("consumer reads at {}", shown.join(", "))
+    } else {
+        format!("consumer reads at {} and {more} more", shown.join(", "))
+    }
 }
 
 /// Escape a value for a Markdown table cell: no pipes, and no line breaks
@@ -1982,6 +2006,59 @@ mod tests {
         assert!(
             output.contains("`/api/widgets` (mock handler)"),
             "orphaned row must mark a mock producer: {output}"
+        );
+    }
+
+    /// carrick#1517: a consumer the retype check judged states no type, so its
+    /// side of the row is where it reads, never its generated alias. Past
+    /// three reads the row counts the rest.
+    #[test]
+    fn a_retyped_mismatch_row_names_the_reads_not_the_alias() {
+        let retyped = |reads: &[&str]| {
+            Finding::type_mismatch(
+                "GET",
+                "/api/widgets",
+                None,
+                vec!["src/screen.ts:3".into()],
+                "{ id: string; }",
+                "GET /api/widgets → Response",
+                "boom",
+            )
+            .with_consumer_reads(reads.iter().map(|s| s.to_string()).collect())
+        };
+        let output = format_analysis_results(
+            result_with(vec![retyped(&["src/screen.ts:9"])]),
+            &topology_baseline(),
+            None,
+        );
+        assert!(
+            output.contains(
+                "producer `{ id: string; }` vs consumer reads at `src/screen.ts:9`: boom"
+            ),
+            "the row names the read: {output}"
+        );
+        assert!(
+            !output.contains("→ Response"),
+            "no generated alias: {output}"
+        );
+
+        let many = [
+            "src/screen.ts:9",
+            "src/screen.ts:10",
+            "src/screen.ts:11",
+            "src/screen.ts:12",
+            "src/screen.ts:20",
+        ];
+        let output = format_analysis_results(
+            result_with(vec![retyped(&many)]),
+            &topology_baseline(),
+            None,
+        );
+        assert!(
+            output.contains(
+                "consumer reads at `src/screen.ts:9`, `src/screen.ts:10`, `src/screen.ts:11` and 2 more: boom"
+            ),
+            "the row counts reads past three: {output}"
         );
     }
 

@@ -1494,6 +1494,7 @@ mod tests {
             resolved,
             unresolved_reason: reason.map(str::to_string),
             notes: Vec::new(),
+            consumer_reads: Vec::new(),
         }
     }
 

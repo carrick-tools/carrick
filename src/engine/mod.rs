@@ -10051,6 +10051,7 @@ mod tests {
             resolved: true,
             unresolved_reason: None,
             notes: Vec::new(),
+            consumer_reads: Vec::new(),
         }];
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
