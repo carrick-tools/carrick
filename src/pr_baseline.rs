@@ -438,13 +438,14 @@ impl Reading {
 /// One service's reading of the files in `untouched`: what main's side of the
 /// comparison computes findings from.
 ///
-/// Endpoints, calls, the type manifest and the mount graph, row by row, and
-/// for each manifest alias its declaration and record in the capture stub,
-/// which is what the type check judges. A mount edge belongs to no file and is
-/// read when neither router it joins sits in a file the PR changed. Left out:
-/// intents, signatures and function definitions, which change with prompts and
-/// feed no finding, and the package and config files, which are what a scanner
-/// reads rather than how it reads them.
+/// Endpoints, calls, the type manifest, the mount graph and the SDK calls and
+/// surface, row by row, and for each manifest alias its declaration and record
+/// in the capture stub, which is what the type check judges. A mount edge
+/// belongs to no file and is read when neither router it joins sits in a file
+/// the PR changed. Left out: intents, signatures and function definitions,
+/// which change with prompts and feed no finding, outbound candidates that are
+/// not SDK calls, which no finding reads, and the package and config files,
+/// which are what a scanner reads rather than how it reads them.
 fn untouched_reading_of(data: &CloudRepoData, untouched: &HashSet<String>) -> Reading {
     let mut reading = Reading::default();
     let unchanged = |location: &str| -> Option<String> {
@@ -514,6 +515,23 @@ fn untouched_reading_of(data: &CloudRepoData, untouched: &HashSet<String>) -> Re
     } else {
         for mount in &data.mounts {
             reading.add(String::new(), "mounts", mount);
+        }
+    }
+
+    // The SDK join reads a consumer's calls into published packages from the
+    // outbound candidates, and a publisher's members from its surface.
+    for candidate in data.external_call_candidates.iter().flatten() {
+        if candidate.mechanism != crate::external_call_candidates::CallMechanism::Sdk {
+            continue;
+        }
+        if let Some(file) = unchanged(&candidate.file) {
+            reading.add(file, "SDK calls", candidate);
+            reading.rows += 1;
+        }
+    }
+    for member in data.sdk_surface.iter().flatten() {
+        if let Some(file) = unchanged(&member.file) {
+            reading.add(file, "SDK surface", member);
         }
     }
 
@@ -1370,6 +1388,34 @@ mod tests {
                 &untouched
             )
             .alike()
+        );
+
+        // A call into a published package, which the SDK join reads from the
+        // outbound candidates: the other scanner placed it on another line.
+        let sdk_call = |line: usize| crate::external_call_candidates::ExternalCallCandidate {
+            file: CART.to_string(),
+            line,
+            callee: "ledger.orders.create".to_string(),
+            package: "@acme/ledger".to_string(),
+            mechanism: crate::external_call_candidates::CallMechanism::Sdk,
+            import_symbol: Some("ledger".to_string()),
+            subpath: None,
+        };
+        let mut with_sdk = pr.clone();
+        with_sdk.external_call_candidates = Some(vec![sdk_call(7)]);
+        let mut sdk_moved = main.clone();
+        sdk_moved.external_call_candidates = Some(vec![sdk_call(8)]);
+        assert_eq!(
+            untouched_reading(
+                std::slice::from_ref(&with_sdk),
+                std::slice::from_ref(&sdk_moved),
+                &untouched
+            ),
+            UntouchedReading::Differ {
+                service: None,
+                file: CART.to_string(),
+                part: "SDK calls",
+            }
         );
 
         // Only the capture stub differs: the type check judges the alias as
