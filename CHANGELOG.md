@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.95](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.94...carrick-v0.3.95) (2026-09-27)
+
+
+### Features
+
+* directory listing manifests for the MCP Registry, Glama and the Claude Code plugin marketplace ([#1543](https://github.com/carrick-tools/carrick/issues/1543)) ([94cd868](https://github.com/carrick-tools/carrick/commit/94cd86878756e3418bd96b43e734e506622a9f01))
+
+
+### Bug Fixes
+
+* **action:** Marketplace description says what Carrick gives the agent ([#1546](https://github.com/carrick-tools/carrick/issues/1546)) ([a7e4709](https://github.com/carrick-tools/carrick/commit/a7e47090503ad7f7d31ea5cdc392ec0334b36c1f))
+* **plugin:** the plugin and marketplace manifests carry 0.3.94 ([#1544](https://github.com/carrick-tools/carrick/issues/1544)) ([1f12db7](https://github.com/carrick-tools/carrick/commit/1f12db7e958325192ef4c88947ae87387ad354bb))
+
 ## [0.3.94](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.93...carrick-v0.3.94) (2026-09-27)
 
 
