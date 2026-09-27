@@ -54,10 +54,12 @@ wrong.
 ## Claude Code
 
 ```
-claude --plugin-dir /path/to/carrick/plugin
+claude plugin marketplace add carrick-tools/carrick
+claude plugin install carrick@carrick
 ```
 
-That registers both the hooks (`hooks/hooks.json`, which run `carrick hook
+`claude --plugin-dir /path/to/carrick/plugin` loads a checkout instead. Either
+registers both the hooks (`hooks/hooks.json`, which run `carrick hook
 post-edit` and `carrick hook session-start`) and the language server
 (`.lsp.json`, which runs `carrick lsp --stdio`) in one step. The hook is the channel that delivers; the server is
 there for the case below.

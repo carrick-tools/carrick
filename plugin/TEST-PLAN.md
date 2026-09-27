@@ -213,10 +213,11 @@ server, which then publishes nothing; an editor starts the server without that
 flag and has no hook, so the server publishes. `CARRICK_CHANNEL=hook|lsp|off`
 overrides, and is how a measurement pins one arm.
 
-There is **no plugin marketplace manifest in this repository** (nothing matching
-`marketplace` is tracked), so `--plugin-dir` is the only install path today.
-Publishing one is carrick#710 territory; when it lands, every arm below is re-run
-through it and the results table gains a column.
+The repository root carries a plugin marketplace manifest
+(`.claude-plugin/marketplace.json`), so `claude plugin marketplace add
+carrick-tools/carrick` then `claude plugin install carrick@carrick` installs the
+plugin from `main`. The arms below still load it with `--plugin-dir`; re-running
+them through the marketplace install adds a column to the results table.
 
 Two plugin directories must both be exercised, because one is a copy of the
 other made at pack time and a copy can go stale:
@@ -490,7 +491,7 @@ Open tickets this plan runs into, so a red row can be recognised as a known one.
 | Ticket | What it is | Which rows it touches |
 |---|---|---|
 | carrick#834 | Nothing publishes the package: there is no `npm publish` step in any workflow, and neither `carrick` nor the platform packages resolve on the registry. The pull request that adds it is a draft and must stay one until the npm organisation exists | 1.10, 1.11 (registry form), 1.14, 4.2, 4.3, 4.4 |
-| carrick#710 | The packaging ticket itself: the npm organisation, the Marketplace publisher and the Open VSX namespace are the owner actions it lists | 1.14, 3 (marketplace path), 4.2 to 4.4 |
+| carrick#710 | The packaging ticket itself: the npm organisation, the Marketplace publisher and the Open VSX namespace are the owner actions it lists | 1.14, 4.2 to 4.4 |
 | carrick#833 | The vendored `pnpm` and `tsc` lookup. Fixed in #841 and proven against a packed tarball; deliberately open until a registry install proves it, because the close criterion is the published package | 1.1 to 1.9 |
 | carrick#842 | Windows cannot spawn the vendored bins (`.bin/tsc` is a `.CMD` and the spawn has no shell). Expected red | 1.5 |
 | carrick#843 | Half answered: pnpm and yarn classic are measured in CI and work (1.6, 1.7). Yarn PnP has no `node_modules` at all, so the walk cannot work there by construction | 1.8 |

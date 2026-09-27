@@ -73,6 +73,20 @@ test("the version tracks the scanner's, because the Action installs it by that n
   );
 });
 
+test("the Claude Code plugin and its marketplace entry carry this package's version", () => {
+  // Claude Code caches a marketplace install by version, and plugin.json's
+  // version wins over the marketplace entry's. A manifest release-please stops
+  // bumping leaves every install on the hooks it first installed.
+  const plugin = readJson(path.join(repoRoot, "plugin", ".claude-plugin", "plugin.json"));
+  assert.equal(plugin["version"], pkg["version"], "plugin/.claude-plugin/plugin.json version");
+  const marketplace = readJson(path.join(repoRoot, ".claude-plugin", "marketplace.json"));
+  // release-please addresses the entry as `$.plugins[0]`.
+  const [entry] = marketplace["plugins"];
+  assert.equal(entry["name"], plugin["name"], "the first marketplace entry is this plugin");
+  assert.equal(entry["source"], "./plugin");
+  assert.equal(entry["version"], pkg["version"], ".claude-plugin/marketplace.json plugins[0].version");
+});
+
 test("what ships: the entry point, the emit, the sidecar and the templates", () => {
   for (const entry of ["bin", "dist", "sidecar", "templates"]) {
     assert.ok((pkg["files"] as string[]).includes(entry), `files is missing ${entry}`);

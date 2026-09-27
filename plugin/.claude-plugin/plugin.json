@@ -1,6 +1,21 @@
 {
   "name": "carrick",
-  "description": "Puts the workspace index's answer about the file you just edited into the session: its routes and calls, who is on the other side of them, and any contract that no longer holds",
-  "version": "0.0.1",
-  "homepage": "https://carrick.tools"
+  "description": "Claude Code plugin for Carrick, which indexes TypeScript codebases across service and repository boundaries. After each edit it adds the file's routes, calls, and cross-service type mismatches to the session, and it registers Carrick's language server. It pairs with the Carrick MCP server, which lets agents search functions by intent rather than name.",
+  "version": "0.3.93",
+  "author": {
+    "name": "Carrick",
+    "email": "hello@carrick.tools"
+  },
+  "homepage": "https://carrick.tools",
+  "repository": "https://github.com/carrick-tools/carrick",
+  "license": "Elastic-2.0",
+  "keywords": [
+    "typescript",
+    "mcp",
+    "api-contracts",
+    "monorepo",
+    "microservices",
+    "coding-agents",
+    "language-server"
+  ]
 }

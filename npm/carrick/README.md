@@ -182,7 +182,8 @@ for the machine-readable shape, pinned in
 ## Where the answers land
 
 - **Claude Code**: the hooks `carrick init` writes deliver on the edit itself.
-  `claude --plugin-dir <carrick checkout>/plugin` adds the language server too.
+  `claude plugin marketplace add carrick-tools/carrick` then
+  `claude plugin install carrick@carrick` adds the language server too.
 - **VS Code, Cursor, Windsurf**: the `carrick-tools.carrick` extension is a
   client on `carrick lsp --stdio` and publishes diagnostics in the Problems
   panel. Whether an editor-hosted agent reads those diagnostics depends on its

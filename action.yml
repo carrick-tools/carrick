@@ -1,5 +1,5 @@
-name: "Carrick"
-description: "Add a TypeScript service to your Carrick org index, queryable by AI coding agents over MCP."
+name: "Carrick - TypeScript Context Engine"
+description: "Adds a TypeScript service to the Carrick index, so AI coding agents see its endpoints, types, and callers from every repo."
 
 branding:
   icon: "link"
