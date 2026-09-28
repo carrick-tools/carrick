@@ -1,3 +1,5 @@
+<p align="center"><img src="https://carrick.tools/brand/carrick-icon-512.png" alt="Carrick" width="96" height="96"></p>
+
 # carrick
 
 Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
