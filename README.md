@@ -21,13 +21,31 @@ carrick init
 
 `carrick init` signs you in, asks which repositories to index and connects your agent. Your agent then writes each repository's `carrick.json` and runs the first scan. The [quick start](https://docs.carrick.tools/quickstart) has the details (Node 24 or newer).
 
-## One index, three surfaces
+## Know the whole codebase before you change it
 
-Read indexed contracts in your editor, find existing code through your agent, and check changes on your pull request.
+### Grep by meaning, not by name
 
-- **In your editor.** See an indexed counterpart, its contract, and the local file on the other side without leaving the editor.
-- **In your agent.** Code that already exists, found by what it does, the real shape of any endpoint, the service graph, and who breaks if it changes.
-- **In your pull request.** Contract risks, duplicated work and version drift across the indexed services.
+About half the time an agent completes a task, it has quietly rewritten something the codebase already had. Grep only finds the name it guessed. Carrick maps every function to its intent, so agents find the implementation that exists and build on it.
+
+### Cross-boundary type safety
+
+The compiler's type safety stops at the service boundary. It can't see the service on the other side of a fetch. Carrick resolves request and response types across that boundary, mapping routing topology and middleware chains, so contract drift surfaces without a dedicated test suite.
+
+### Skills for impact, reuse, drift and census
+
+Carrick ships with four skills for the most common agent failures — breaking a caller in another service, rebuilding existing code, trusting a stale copy of another service's type, and missing places in a codebase-wide change. Each skill gets its answer from the Carrick index.
+
+### Go to definition, across the service boundary
+
+The same index, inside the editor. Go to definition jumps from an indexed call to its handler when the other service's code is on disk. A route's code lens lists the counterpart call sites held in the local index. Type disagreements appear as diagnostics on the indexed route or call.
+
+### Catch contract drift in the pull request
+
+The same index your agent uses runs in CI. When a producer and consumer drift apart, whichever protocol they speak, Carrick flags the mismatch in the PR before it merges. It also flags dependency version conflicts across services.
+
+### The workspace
+
+Every service, type and contract in one index, browsable in the dashboard and served to your agents over MCP.
 
 ## Ask your agent
 
