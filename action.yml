@@ -3,7 +3,7 @@ description: "Maps your TypeScript codebase across services and repositories, gi
 
 branding:
   icon: "link"
-  color: "blue"
+  color: "purple"
 
 inputs:
   path:
