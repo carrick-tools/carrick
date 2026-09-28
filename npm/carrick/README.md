@@ -1,16 +1,13 @@
 # carrick
 
-Carrick indexes local TypeScript repositories and identifies the routes and
-calls in the file you are editing, their counterparts in indexed repositories,
-and whether their contracts agree. Configured editors show diagnostics, and
-coding agents can receive context through supported hooks or explicit checks.
+Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
 
 ```
-npm install -g carrick
-carrick login
-cd ~/code            # a repo, or the folder that holds your repos
+npm i -g carrick
 carrick init
 ```
+
+The [quick start](https://docs.carrick.tools/quickstart) covers the full setup (Node 24 or newer).
 
 `carrick login` opens the browser to authorise a Carrick workspace. `init`
 accepts that credential or a `CARRICK_TOKEN` environment override, and signs in

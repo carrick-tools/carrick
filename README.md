@@ -6,20 +6,12 @@ Carrick maps your entire TypeScript codebase across services and repositories, g
 
 ## Get started
 
-1. **Install the CLI.** You need Node 24 or newer.
-   ```bash
-   npm install -g carrick
-   ```
-2. **Sign in and set up.** Run these in a repository, or in a folder of repositories.
-   ```bash
-   carrick login
-   carrick init
-   ```
-   `carrick init` asks which repositories to include and opens GitHub so you can approve the Carrick GitHub App. It connects Claude Code, offers to connect Cursor, Windsurf and VS Code, and prints a prompt.
-3. **Paste the prompt into your coding agent.** The agent writes `carrick.json` and the CI workflow, starts the first scan, and opens a pull request.
-4. **Merge the pull request.** From then on, the Carrick GitHub Action keeps the index current on every push to `main`.
+```bash
+npm i -g carrick
+carrick init
+```
 
-The [quickstart](https://docs.carrick.tools/quickstart) covers each step, and [connecting your agent](https://docs.carrick.tools/connecting-your-agent) covers Codex and other MCP clients.
+The [quick start](https://docs.carrick.tools/quickstart) covers the full setup (Node 24 or newer).
 
 ## Agents see the whole system before they write
 
