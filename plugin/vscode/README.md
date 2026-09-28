@@ -51,7 +51,7 @@ Each setting turns off its own surface and leaves the others standing. Changes t
 | --- | --- | --- |
 | `carrick.binary` | `""` (the `carrick` on `PATH`) | Path to the Carrick CLI the extension starts `lsp --stdio` on. |
 | `carrick.diagnostics` | `true` | Publish the workspace verdicts in the Problems panel. |
-| `carrick.definition` | `true` | Cross-repository *Go to Definition* between routes and their callers. |
+| `carrick.definition` | `true` | Cross-service *Go to Definition* between routes and their callers. |
 | `carrick.boundary` | `true` | The status bar item (service, commit) and its tooltip. |
 | `carrick.codeLens` | `true` | The lens above a route or call the index holds a counterpart or a mismatch for. |
 

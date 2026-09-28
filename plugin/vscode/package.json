@@ -40,7 +40,7 @@
         "carrick.definition": {
           "type": "boolean",
           "default": true,
-          "description": "Go to definition on a call site jumps to the handler in the other repo, and on a route lists the call sites that reach it. Off means Carrick answers nothing and your other definition providers are untouched."
+          "description": "Go to definition on a call site jumps to the handler in another service or repository, and on a route lists the call sites that reach it. Off means Carrick answers nothing and your other definition providers are untouched."
         },
         "carrick.boundary": {
           "type": "boolean",
