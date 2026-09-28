@@ -31,13 +31,13 @@ Works with any MCP-compatible agent, including Claude Code, Cursor, Windsurf, an
 
 ### In your editor
 
-Inspect cross-service contracts and jump between connected files without leaving your IDE. "Go to Definition" jumps directly from a service call to its handler when the code is on disk, while Code Lens displays every caller across your index inline. If a frontend call and backend handler fall out of sync, Carrick surfaces type mismatches as native editor diagnostics.
+Inspect cross-service contracts and jump between connected files without leaving your IDE. "Go to Definition" jumps directly from a service call to its handler when the code is on disk, while Code Lens displays every caller across your local index inline. If a frontend call and backend handler fall out of sync, Carrick surfaces type mismatches as native editor diagnostics.
 
 Available on the Visual Studio Marketplace and Open VSX, or runnable as a standard LSP server.
 
 ### In your pull request
 
-Bring the exact same index into CI to eliminate contract risks, duplicate work, and silent version drift. When a producer and consumer fall out of sync—regardless of protocol—Carrick flags the exact mismatch directly on your PR before it merges. It also monitors dependency versions across services to catch conflicting package updates early.
+Bring the exact same index into CI to catch contract risks, duplicate work, and silent version drift. When a producer and consumer fall out of sync—regardless of protocol—Carrick flags the exact mismatch directly on your PR before it merges. It also checks dependency versions across services to catch conflicting package updates early.
 
 ## Skills
 
