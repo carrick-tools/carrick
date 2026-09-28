@@ -23,19 +23,23 @@ carrick init
 
 ## One index, three surfaces
 
-Find existing code through your agent, read indexed contracts in your editor, and check changes on your pull request.
+Search existing code through your agent, inspect live contracts in your editor, and catch breaking changes in your pull requests.
 
 ### In your agent
 
-Code that already exists, found by what it does, the real shape of any endpoint, the service graph, and who breaks if it changes. Carrick maps every function to its intent, so agents find the implementation that exists and build on it, including in repositories that are not checked out. Endpoint types come from the TypeScript compiler in the service that serves them. Agents that support MCP can connect to Carrick, including Claude Code, Cursor, Windsurf and Codex.
+Give your AI assistants complete context on what already exists, how endpoints are shaped, and who breaks if something changes. Carrick maps every function by what it actually does, allowing agents to find existing implementations and build on them—even in repositories you haven't checked out locally. Endpoint types are pulled straight from the TypeScript compiler in the service that exposes them.
+
+Works with any MCP-compatible agent, including Claude Code, Cursor, Windsurf, and Codex.
 
 ### In your editor
 
-See an indexed counterpart, its contract, and the local file on the other side without leaving the editor. Go to definition jumps from an indexed call to its handler when the other service's code is on disk. A route's code lens lists the counterpart call sites held in the local index, and type disagreements appear as diagnostics on the indexed route or call. The editor extension is available from Visual Studio Marketplace and Open VSX, and other LSP clients can start the same server directly.
+Inspect cross-service contracts and jump between connected files without leaving your IDE. "Go to Definition" jumps directly from a service call to its handler when the code is on disk, while Code Lens displays every caller across your index inline. If a frontend call and backend handler fall out of sync, Carrick surfaces type mismatches as native editor diagnostics.
+
+Available on the Visual Studio Marketplace and Open VSX, or runnable as a standard LSP server.
 
 ### In your pull request
 
-Contract risks, duplicated work and version drift across the indexed services. The same index your agent uses runs in CI. When a producer and consumer drift apart, whichever protocol they speak, Carrick flags the mismatch in the PR before it merges. It also flags dependency version conflicts across services.
+Bring the exact same index into CI to eliminate contract risks, duplicate work, and silent version drift. When a producer and consumer fall out of sync—regardless of protocol—Carrick flags the exact mismatch directly on your PR before it merges. It also monitors dependency versions across services to catch conflicting package updates early.
 
 ## Skills
 
