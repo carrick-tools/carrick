@@ -1,45 +1,49 @@
 # Carrick
 
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/carrick-tools/carrick) [![GitHub Marketplace](https://img.shields.io/badge/GitHub%20Marketplace-Action-7a55e8)](https://github.com/marketplace/actions/carrick-typescript-context-engine) [![Carrick MCP connector – tool definition quality and endpoint health on Glama](https://glama.ai/mcp/connectors/io.github.carrick-tools/carrick/badges/score.svg)](https://glama.ai/mcp/connectors/io.github.carrick-tools/carrick) [![Claude directory](https://img.shields.io/badge/Claude%20directory-connector-7a55e8)](https://claude.ai/directory/connectors/carrick) [![npm](https://img.shields.io/npm/v/carrick?color=7a55e8)](https://www.npmjs.com/package/carrick) [![Open VSX](https://img.shields.io/badge/Open%20VSX-extension-7a55e8)](https://open-vsx.org/extension/carrick-tools/carrick) [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-listed-7a55e8)](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.carrick-tools/carrick)
+
 Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
 
-> Carrick scans TypeScript projects using npm, pnpm, Yarn, Bun, or Deno. Deno projects require Deno 2.9.4 or newer; the Action supplies the runtime and reads existing `deno.json` or `deno.jsonc` manifests. Dependency preparation disables lifecycle scripts ([details](#dependencies)). Cross-repo features need at least two services indexed in the same Carrick project; a single-service install still gets same-repo validation.
+## Get started
 
-**Get started:** sign up at [app.carrick.tools](https://app.carrick.tools) · full documentation at [docs.carrick.tools](https://docs.carrick.tools)
+1. **Install the CLI.** You need Node 24 or newer.
+   ```bash
+   npm install -g carrick
+   ```
+2. **Sign in and set up.** Run these in a repository, or in a folder of repositories.
+   ```bash
+   carrick login
+   carrick init
+   ```
+   `carrick init` asks which repositories to include and opens GitHub so you can approve the Carrick GitHub App. It connects Claude Code, offers to connect Cursor, Windsurf and VS Code, and prints a prompt.
+3. **Paste the prompt into your coding agent.** The agent writes `carrick.json` and the CI workflow, starts the first scan, and opens a pull request.
+4. **Merge the pull request.** From then on, the Carrick GitHub Action keeps the index current on every push to `main`.
 
-## What an agent can ask
+The [quickstart](https://docs.carrick.tools/quickstart) covers each step, and [connecting your agent](https://docs.carrick.tools/connecting-your-agent) covers Codex and other MCP clients.
 
-Connect Claude Code, Cursor, Windsurf, or Codex to the Carrick MCP endpoint. Carrick answers semantic questions about your org that an agent normally has to grep across repos to answer, badly:
+## Agents see the whole system before they write
+
+Most code in a TypeScript organisation will be written by agents, and their failures will not be syntax errors. The ones that matter are an agent rebuilding a helper that already exists, trusting a stale local copy of another service's type, or changing a response nobody knew was consumed. A smarter model cannot fix what it cannot see, so Carrick gives the agent the same source of truth the compiler has, across every service, at the moment it decides.
+
+- **Find what exists.** Agents search every indexed function across services and repositories by what it does, whatever it is called, including repositories that are not checked out, so they build on the helper that exists instead of writing a second one.
+- **Build against the real contract.** An agent reads an endpoint's request and response types as the TypeScript compiler resolved them in the service that serves it.
+- **Change a route with its consumers in view.** Before changing a route, an agent can see every service that calls it and check each consumer against the producer.
+- **Catch breaks in review.** The Carrick App comments on pull requests to flag cross-repo contract breaks introduced by the change, such as a changed response type that no longer matches a consumer in another repository.
+
+Claude Code, Cursor, Windsurf, Codex and Claude (as a connector in the Claude directory) all connect to one MCP endpoint, `https://api.carrick.tools/mcp`, with GitHub sign-in, and the Carrick editor extension reads the same index in your editor. The index is built by the `carrick` CLI from a laptop or by the Carrick GitHub Action, which runs read-only in CI and refreshes each repository's part of the index on every push to its main branch. There is a free tier, and the scanner in this repository is source-available under the [Elastic License 2.0](LICENSE.md).
+
+## Example questions
 
 - "Which functions handle webhook signing across our services?"
 - "Where do we deduplicate users by email?"
-- "What calls `/api/users` and what response shape do they expect?"
+- "What calls `/api/users`, and what response shape does each caller expect?"
 - "Show me every function that retries on rate-limit errors."
 
-These work because the index combines structural facts, resolved types, and a per-function description of what the code actually does.
-
-## What's in the index
-
-For every scanned function in every repo in your org, Carrick stores three layers:
-
-- **Structural.** Endpoints declared, outbound calls made, mounts, normalised paths.
-- **Type-aware.** Request and response types resolved through the TypeScript compiler, so cross-repo type compatibility is checkable.
-- **Intent-aware.** A one or two sentence description of what each function does, generated at scan time and stored alongside the structural and type data.
-
-The intent layer is the difference. It is what lets an agent answer "where do we deduplicate users by email" rather than "which functions are named `dedupeUser`."
-
-## Connect your agent
-
-The MCP endpoint lives at `https://api.carrick.tools/mcp`.
-
-```bash
-claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
-```
-
-The recommended authentication is sign-in-with-Carrick: your agent opens a browser, you click Approve once, and no API key changes hands. A manual key paste is available as a fallback. To get started, sign up at [app.carrick.tools](https://app.carrick.tools) — the full setup guide lives at [docs.carrick.tools](https://docs.carrick.tools).
+Each answer comes from one index that holds each service's routes and outbound calls, their request and response types as resolved by the TypeScript compiler, and a short description of what every indexed function does.
 
 ## Populate the index
 
-The index is populated by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main branch the action refreshes that repo's contribution to the index. On pull requests the Carrick App posts a drift comment for you (no extra workflow steps required).
+The first index is built by `carrick index`. After that, the index is kept current by running the Carrick GitHub Action on each TypeScript repo you want indexed. On the main (or master) branch the action refreshes that repo's contribution to the index. On pull requests the Carrick App posts a drift comment for you (no extra workflow steps required).
 
 ```yaml
 name: Carrick
@@ -50,12 +54,27 @@ on:
   pull_request:
     branches: [main]
   # Lets Carrick re-trigger this repo's main scan when a sibling repo in the
-  # project changes. Optional today and dormant unless enabled server-side —
-  # included here so it's already wired if you ever turn it on.
+  # same project changes on its main branch. It is enabled server-side but not
+  # delivering yet. If you add deploy steps to this file, gate them on
+  # github.event_name so a sibling change never deploys this repo.
   repository_dispatch:
     types: [carrick-sibling-updated]
+  # Rescan on demand (Actions tab, or: gh workflow run carrick.yml). After a
+  # Carrick release the index only refreshes on the next scan.
+  workflow_dispatch:
+    inputs:
+      full-scan:
+        description: >-
+          Re-analyze every file instead of reusing the cached answer for a file
+          that has not changed. Slower and costs a full analysis; ask for it
+          when Carrick has started extracting something it did not extract
+          before, so the cache holds answers from before it could.
+        type: boolean
+        default: false
 
 permissions:
+  # Mint a short-lived OIDC token Carrick exchanges for keyless upload auth
+  # (no upload secret to configure).
   id-token: write
   contents: read
 
@@ -67,20 +86,23 @@ jobs:
         # Full git history lets Carrick diff against the last scan and run incrementally.
         with:
           fetch-depth: 0
-
       - uses: carrick-tools/carrick@v1
+        with:
+          # Empty on every trigger but workflow_dispatch, which is the point:
+          # a full re-analysis is asked for, never carried by a push.
+          full-scan: ${{ inputs.full-scan }}
 ```
 
-No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no extra permissions and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
+No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no extra permissions and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project (`carrick init` or the dashboard).
 
-Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC credentials from fork runs, so the action prints a notice and exits successfully instead of failing the check. The scan runs when a maintainer pushes the branch to the repository itself.
+Pull requests opened from forks are skipped gracefully. GitHub withholds OIDC credentials from fork runs, so the action prints a notice and exits successfully instead of failing the check. The scan runs when a maintainer pushes the branch to the repository itself.
 
 ### Dependencies
 
 Package types need their dependencies on disk. Node projects use installed `node_modules`, and Deno projects use the Deno dependency cache. The Action prepares those dependencies before analysis:
 
-- For Node projects, installation runs for every service the scan will visit, at that service's own nearest lockfile. A monorepo whose packages carry their own lockfiles is installed package by package; a workspace that hoists to one lockfile at its root is installed once. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
-- Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
+- For Node projects, installation runs for every service the scan will visit, at that service's own nearest lockfile. A monorepo whose packages carry their own lockfiles is installed package by package; a workspace that hoists to one lockfile at its root is installed once. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install` (add `oven-sh/setup-bun` first).
+- Lifecycle scripts are disabled in every case.
 - Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and the scan that follows refuses any service whose dependencies are still missing (see below).
 - Existing `node_modules` skips that service's Node install. A Deno manifest still triggers Deno cache preparation, which the separate Deno cache does not get from a Node install.
 - The package managers' download caches are restored between runs, keyed on the hash of every lockfile the run installs from.
@@ -98,28 +120,27 @@ generate those declarations through their normal build before indexing.
 Carrick refuses to scan a checkout it cannot type, rather than charging for an
 index whose types are `any` and saying nothing about why. The check runs before
 the scan starts, per service, on what is reachable from that service's own
-directory — a monorepo root that is installed says nothing about a nested
+directory. A monorepo root that is installed says nothing about a nested
 workspace that is not. Two things are refused:
 
-- **Dependencies a lockfile states and the tree has not installed.** The
-  refusal names the service and the exact command, because the lockfile names
-  the package manager. A tree with no lockfile above the service states no
+- **Dependencies an npm, pnpm, Yarn or Deno lockfile states and the tree has
+  not installed.** The refusal names the service and the exact command,
+  because the lockfile names the package manager. A tree with no lockfile above the service states no
   install and is scanned as it is. Deno services are asked only when their
   config sets `nodeModulesDir`, since Deno otherwise caches outside the tree.
 - **A config mapping whose target directory is not on the checkout, that the
   service imports through.** A TypeScript `paths` entry, a `package.json`
   `imports` key or a Deno import-map entry pointing at, say, a generated client
   whose generator has not run. The refusal names the mapping and the missing
-  directory and stops there: nothing in the config says what fills a generated
+  directory and stops there. Nothing in the config says what fills a generated
   directory. A mapping left behind by a deleted package, that nothing imports,
-  is logged and scanned past — no type can be `any` through a mapping no import
-  uses.
+  is logged and scanned past.
 
-Both are proxies, so there is always a way past: `--allow-unprepared` on the
-command, `CARRICK_ALLOW_UNPREPARED=1` in the environment, or
+Both are proxies. To scan anyway, pass `--allow-unprepared` on the command,
+set `CARRICK_ALLOW_UNPREPARED=1` in the environment, or set
 `allow-unprepared: true` on the Action (which `install-dependencies: false`
 already implies). A pipeline that scans a bare checkout deliberately keeps
-working; it just says so.
+working, with a warning.
 
 Deno services normally omit `tsconfig` and use their nearest Deno manifest.
 An explicit ordinary TypeScript config selects the TypeScript path. An explicit
@@ -146,11 +167,11 @@ Private registries use your own credentials. Carrick adds no auth of its own: pu
 
 A scan reads the model once per changed file and reuses what it already has for
 the rest, which is what makes a routine scan cheap. Occasionally the answers
-themselves need redoing rather than the files: Carrick starts extracting
-something it did not extract before, and the cache holds answers from before it
-could. `full-scan` re-analyzes every file for one run.
+themselves need redoing rather than the files. That happens when Carrick starts
+extracting something it did not extract before, and the cache holds answers
+from before it could. `full-scan` re-analyzes every file for one run.
 
-Ask for it, rather than leaving it on. Wire it to the workflow's
+To ask for it on one run rather than leaving it on, wire it to the workflow's
 `workflow_dispatch` input, which is what `carrick init` scaffolds:
 
 ```yaml
@@ -184,26 +205,34 @@ On every other trigger the expression is empty and the incremental scan runs
 exactly as before.
 
 An ordinary scan indexes a commit once per scanner version, so a second run on
-an unchanged commit stores nothing and says so. A full scan is the exception:
-its answers replace what the index holds for that commit, because re-analyzing
-everything is a statement that the stored answers were the stale part.
+an unchanged commit stores nothing and says so. A full scan, or any run that
+re-analyses a file, is the exception. Its answers replace what the index holds
+for that commit, because re-analysing is a statement that the stored answers
+were the stale part.
 
 ## MCP tools
 
-The MCP endpoint exposes the index as structured tools your agent can call directly.
+The MCP endpoint exposes the index as structured tools your agent can call directly. The [MCP tools reference](https://docs.carrick.tools/mcp-tools) lists each tool's parameters and response.
 
 | Tool | Purpose |
 | :--- | :--- |
-| `search_by_intent` | Find functions by what they do — a plain-English query matched against the intent descriptions |
-| `list_projects` | The Carrick projects in your workspace and each project's connected repos |
-| `list_services` | Every service Carrick has indexed in your org |
-| `list_function_intents` | One or two sentence descriptions of indexed functions, searchable by service |
-| `get_api_endpoints` | Endpoints declared by a given service |
-| `get_endpoint_types` | Resolved request and response types for a specific endpoint |
-| `get_type_definition` | Fully resolved TypeScript type by name, across the org |
-| `get_service_dependencies` | Services that call a given producer |
-| `check_compatibility` | Whether service A's call to service B matches the producer's contract |
-| `scaffold` | Generates the files to onboard a repo: the GitHub Actions workflow, an agent guide, and a `carrick.json` skeleton |
+| `search_by_intent` | Search functions by what they do, matching a plain-English query against each function's intent |
+| `find_similar` | Find similar functions, for code you are about to write or duplicates already in the project |
+| `list_function_intents` | Browse indexed functions and intents, a page at a time, by service or file |
+| `get_project_map` | Show the project map, a short summary of services, contracts and unmatched calls |
+| `list_projects` | List workspace projects and the repositories connected to each |
+| `list_services` | List the project's services, with their endpoint, call and function counts |
+| `get_service_graph` | Show the cross-service call graph, with unmatched calls and orphaned endpoints |
+| `get_operation` | Find who serves and calls an operation, given its method and path |
+| `get_callers` | Find callers of a function anywhere in the project |
+| `get_api_endpoints` | List a service's operations across HTTP, GraphQL, WebSockets and pub/sub |
+| `get_endpoint_types` | Read an endpoint's request and response types as the TypeScript compiler resolved them |
+| `get_type_definition` | Resolve a named type definition to its expanded TypeScript |
+| `check_compatibility` | Check a consumer against a producer, with a type verdict for each call |
+| `get_service_dependencies` | Read npm dependencies and version conflicts, for one service or across the project |
+| `list_external_calls` | List outbound calls to external targets, such as SDK calls, external domains and env-var URLs |
+| `get_contract_pair` | Compare consumer and producer types, operation by operation |
+| `scaffold` | Generate Carrick setup files (the workflow, a Carrick skill, `carrick.json` and Claude Code hooks) |
 
 ## On pull requests
 
@@ -227,34 +256,34 @@ Add a `carrick.json` to each indexed service to help classify outbound calls.
 | :--- | :--- |
 | `serviceName` | Friendly name for this service |
 | `internalEnvVars` | Env vars pointing at other services in your org. Calls are validated against the index. |
-| `externalEnvVars` | Env vars pointing at third-party APIs. Calls are ignored. |
+| `externalEnvVars` | Env vars pointing at third-party APIs. Calls are not matched. They are listed as external calls. |
 | `internalDomains` | Full URL prefixes for internal services |
-| `externalDomains` | Full URL prefixes for third-party APIs to ignore |
+| `externalDomains` | Full URL prefixes for third-party APIs to list as external calls rather than match |
 
 When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`, it needs to know whether `ORDER_SERVICE_URL` points internally or externally. Unclassified env vars surface as a configuration suggestion in the PR comment.
 
 ### Monorepos
 
-`carrick.json` is optional. Without it, Carrick derives services from npm or pnpm workspace manifests; a plain repo is one service. An explicit config takes precedence over derivation. To set service boundaries and shared source includes, declare a `services` array. Each entry is scanned independently and indexed as its own service:
+`carrick.json` is optional. Without it, Carrick derives services from npm, pnpm or Deno workspace manifests; a plain repo is one service. An explicit config takes precedence over derivation. To set service boundaries and shared source includes, declare a `services` array. Each entry is scanned independently and indexed as its own service:
 
 ```json
 {
   "includes": {
-    "lambdas/_shared": {
-      "externalEnvVars": ["GITHUB_API_BASE"],
-      "externalDomains": ["https://api.github.com"]
+    "packages/shared": {
+      "externalEnvVars": ["STRIPE_API"],
+      "externalDomains": ["https://api.stripe.com"]
     }
   },
   "services": [
     {
-      "serviceName": "check-or-upload",
-      "directory": "lambdas/check-or-upload",
-      "include": ["lambdas/_shared"],
-      "internalEnvVars": ["CARRICK_API_ENDPOINT"]
+      "serviceName": "api",
+      "directory": "apps/api",
+      "include": ["packages/shared"],
+      "internalEnvVars": ["USER_SERVICE_URL"]
     },
     {
-      "serviceName": "dashboard",
-      "directory": "app",
+      "serviceName": "web",
+      "directory": "apps/web",
       "tsconfig": "tsconfig.json"
     }
   ]
@@ -263,7 +292,7 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 
 | Field | Description |
 | :--- | :--- |
-| `serviceName` | Service name, and the key the index is written under: what a sibling repo's calls are matched against, and what `carrick status` and the hosted rows name. `name` is accepted as an alias inside a `services` entry |
+| `serviceName` | Service name, and the key the index is written under. A sibling repo's calls are matched against it, and `carrick status` and the hosted rows name it. `name` is accepted as an alias inside a `services` entry |
 | `directory` | Service root, relative to `carrick.json`. Files outside every declared directory are ignored |
 | `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
 | `tsconfig` | Optional TypeScript config path, relative to `directory`. Deno services normally omit this field and use their nearest Deno manifest |
@@ -280,9 +309,9 @@ When several services reach a third-party API through the same shared directory,
 ```json
 {
   "includes": {
-    "lambdas/_shared": {
-      "externalEnvVars": ["GITHUB_API_BASE"],
-      "externalDomains": ["https://api.github.com"]
+    "packages/shared": {
+      "externalEnvVars": ["STRIPE_API"],
+      "externalDomains": ["https://api.stripe.com"]
     }
   }
 }
@@ -333,11 +362,11 @@ A document written in a `.graphql`/`.gql` file and compiled into a typed declara
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.
-2. A static-analysis pass extracts function exports, mounted routers, pattern-matched HTTP calls, GraphQL schemas and operations, and WebSocket event contracts.
-3. An LLM agent handles the cases pattern matching can't reach: dynamic URLs, factory functions, framework-specific routing.
+2. A static-analysis pass extracts function exports, GraphQL schemas and operations, and WebSocket event contracts, and gates files with candidate routes or calls.
+3. An LLM reads each gated file and extracts its routes, mounts and calls.
 4. A TypeScript sidecar resolves request and response types against the actual TypeScript compiler.
 5. A second LLM pass writes the per-function intent description.
-6. The org index lives in DynamoDB and S3 and refreshes each time a service's main branch runs.
+6. The project index lives in DynamoDB and S3 and refreshes on each main-branch scan or `carrick index` run.
 
 ## License
 
