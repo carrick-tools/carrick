@@ -2,7 +2,7 @@
 
 # Carrick
 
-**TypeScript codebase intelligence for AI agents & IDEs.**
+### TypeScript codebase intelligence for AI agents & IDEs.
 
 Carrick indexes every service in your TypeScript codebase, in one repository or many. Coding agents and editors read the functions, routes and types that already exist, so new code builds on them instead of duplicating or breaking them.
 
