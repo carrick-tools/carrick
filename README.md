@@ -155,13 +155,13 @@ Private registries use your own credentials. Carrick adds no auth of its own: pu
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 ```
 
-### Re-analyzing everything
+### Re-analysing everything
 
 A scan reads the model once per changed file and reuses what it already has for
 the rest, which is what makes a routine scan cheap. Occasionally the answers
 themselves need redoing rather than the files. That happens when Carrick starts
 extracting something it did not extract before, and the cache holds answers
-from before it could. `full-scan` re-analyzes every file for one run.
+from before it could. `full-scan` re-analyses every file for one run.
 
 To ask for it on one run rather than leaving it on, wire it to the workflow's
 `workflow_dispatch` input, which is what `carrick init` scaffolds:
