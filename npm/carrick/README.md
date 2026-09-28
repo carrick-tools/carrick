@@ -1,4 +1,8 @@
-<p align="center"><a href="https://carrick.tools"><img src="https://carrick.tools/brand/carrick-banner@2x.png" alt="Carrick — TypeScript codebase intelligence for AI agents &amp; IDEs." width="100%"></a></p>
+<p align="center"><a href="https://carrick.tools"><img src="https://carrick.tools/brand/carrick-banner@2x.png" alt="Carrick" width="100%"></a></p>
+
+# Carrick
+
+**TypeScript codebase intelligence for AI agents & IDEs.**
 
 Carrick indexes every service in your TypeScript codebase, in one repository or many. Coding agents and editors read the functions, routes and types that already exist, so new code builds on them instead of duplicating or breaking them.
 
