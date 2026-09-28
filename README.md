@@ -6,7 +6,11 @@
 
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/carrick-tools/carrick) [![GitHub Marketplace](https://img.shields.io/badge/GitHub%20Marketplace-Action-7a55e8)](https://github.com/marketplace/actions/carrick-typescript-context-engine) [![Carrick MCP connector – tool definition quality and endpoint health on Glama](https://glama.ai/mcp/connectors/io.github.carrick-tools/carrick/badges/score.svg)](https://glama.ai/mcp/connectors/io.github.carrick-tools/carrick) [![Claude directory](https://img.shields.io/badge/Claude%20directory-connector-7a55e8)](https://claude.ai/directory/connectors/carrick) [![npm](https://img.shields.io/npm/v/carrick?color=7a55e8)](https://www.npmjs.com/package/carrick) [![Open VSX](https://img.shields.io/badge/Open%20VSX-extension-7a55e8)](https://open-vsx.org/extension/carrick-tools/carrick) [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-listed-7a55e8)](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.carrick-tools/carrick)
 
-Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
+Coding agents working across full-stack and multi-service codebases routinely rebuild existing helpers, trust stale type definitions, and modify API contracts without knowing who consumes them.
+
+Carrick solves this by indexing your entire TypeScript ecosystem—from frontend apps to backend services—whether in a monorepo or across multiple repositories. By integrating deeply with the TypeScript compiler, Carrick traces every route, type, and cross-service call while recording function behavior—so agents search by intent rather than name and stay grounded in your real architecture.
+
+Delivered via MCP for AI agents and LSP for IDEs, Carrick ensures models see existing endpoints and utilities before generating new code. The scanner is source-available, runs from your CLI or CI pipeline, and includes a Free plan so you can start building safer agent workflows immediately.
 
 ## Get started
 
