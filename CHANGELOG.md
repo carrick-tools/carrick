@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.96](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.95...carrick-v0.3.96) (2026-09-28)
+
+
+### Bug Fixes
+
+* **action:** Marketplace description, README opening and badge follow the canonical pitch ([#1547](https://github.com/carrick-tools/carrick/issues/1547)) ([aba67f7](https://github.com/carrick-tools/carrick/commit/aba67f7f442c6a03c018ee70ccf17f9f4da6dd10))
+
 ## [0.3.95](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.94...carrick-v0.3.95) (2026-09-27)
 
 
