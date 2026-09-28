@@ -23,9 +23,11 @@ carrick init
 
 ## One index, three surfaces
 
-- **Your agent, over MCP.** Claude Code, Cursor, Windsurf, Codex and Claude search every function by what it does, across all your services, whether they are checked out or not. They read an endpoint's request and response types as the TypeScript compiler resolved them, and see who calls a route before they change it.
-- **Your editor.** The extension shows broken contracts in the Problems panel, and jumps from a call to the handler that serves it.
-- **Your pull requests.** The Carrick GitHub App comments when a change breaks a contract that another service depends on.
+Read indexed contracts in your editor, find existing code through your agent, and check changes on your pull request.
+
+- **In your editor.** See an indexed counterpart, its contract, and the local file on the other side without leaving the editor.
+- **In your agent.** Code that already exists, found by what it does, the real shape of any endpoint, the service graph, and who breaks if it changes.
+- **In your pull request.** Contract risks, duplicated work and version drift across the indexed services.
 
 ## Ask your agent
 
@@ -33,6 +35,30 @@ carrick init
 - "Where do we deduplicate users by email?"
 - "What calls `/api/users`, and what response shape does each caller expect?"
 - "Show me every function that retries on rate-limit errors."
+
+## MCP tools
+
+The MCP endpoint exposes the index as structured tools your agent can call directly. The [MCP tools reference](https://docs.carrick.tools/mcp-tools) lists each tool's parameters and response.
+
+| Tool | Purpose |
+| :--- | :--- |
+| `search_by_intent` | Search functions by what they do, matching a plain-English query against each function's intent |
+| `find_similar` | Find similar functions, for code you are about to write or duplicates already in the project |
+| `list_function_intents` | Browse indexed functions and intents, a page at a time, by service or file |
+| `get_project_map` | Show the project map, a short summary of services, contracts and unmatched calls |
+| `list_projects` | List workspace projects and the repositories connected to each |
+| `list_services` | List the project's services, with their endpoint, call and function counts |
+| `get_service_graph` | Show the cross-service call graph, with unmatched calls and orphaned endpoints |
+| `get_operation` | Find who serves and calls an operation, given its method and path |
+| `get_callers` | Find callers of a function anywhere in the project |
+| `get_api_endpoints` | List a service's operations across HTTP, GraphQL, WebSockets and pub/sub |
+| `get_endpoint_types` | Read an endpoint's request and response types as the TypeScript compiler resolved them |
+| `get_type_definition` | Resolve a named type definition to its expanded TypeScript |
+| `check_compatibility` | Check a consumer against a producer, with a type verdict for each call |
+| `get_service_dependencies` | Read npm dependencies and version conflicts, for one service or across the project |
+| `list_external_calls` | List outbound calls to external targets, such as SDK calls, external domains and env-var URLs |
+| `get_contract_pair` | Compare consumer and producer types, operation by operation |
+| `scaffold` | Generate Carrick setup files (the workflow, a Carrick skill, `carrick.json` and Claude Code hooks) |
 
 ## Keep the index current
 

@@ -21,9 +21,11 @@ carrick init
 
 ## One index, three surfaces
 
-- **Your agent, over MCP.** Claude Code, Cursor, Windsurf, Codex and Claude search every function by what it does, across all your services, whether they are checked out or not. They read an endpoint's request and response types as the TypeScript compiler resolved them, and see who calls a route before they change it.
-- **Your editor.** The extension shows broken contracts in the Problems panel, and jumps from a call to the handler that serves it.
-- **Your pull requests.** The Carrick GitHub App comments when a change breaks a contract that another service depends on.
+Read indexed contracts in your editor, find existing code through your agent, and check changes on your pull request.
+
+- **In your editor.** See an indexed counterpart, its contract, and the local file on the other side without leaving the editor.
+- **In your agent.** Code that already exists, found by what it does, the real shape of any endpoint, the service graph, and who breaks if it changes.
+- **In your pull request.** Contract risks, duplicated work and version drift across the indexed services.
 
 ## Ask your agent
 
