@@ -19,31 +19,32 @@ carrick init
 
 `carrick init` signs you in, asks which repositories to index and connects your agent. Your agent then writes each repository's `carrick.json` and runs the first scan. The [quick start](https://docs.carrick.tools/quickstart) has the details (Node 24 or newer).
 
-## Know the whole codebase before you change it
+## One index, three surfaces
 
-### Grep by meaning, not by name
+Find existing code through your agent, read indexed contracts in your editor, and check changes on your pull request.
 
-About half the time an agent completes a task, it has quietly rewritten something the codebase already had. Grep only finds the name it guessed. Carrick maps every function to its intent, so agents find the implementation that exists and build on it.
+### In your agent
 
-### Cross-boundary type safety
+Code that already exists, found by what it does, the real shape of any endpoint, the service graph, and who breaks if it changes. Carrick maps every function to its intent, so agents find the implementation that exists and build on it, including in repositories that are not checked out. Endpoint types come from the TypeScript compiler in the service that serves them. Agents that support MCP can connect to Carrick, including Claude Code, Cursor, Windsurf and Codex.
 
-The compiler's type safety stops at the service boundary. It can't see the service on the other side of a fetch. Carrick resolves request and response types across that boundary, mapping routing topology and middleware chains, so contract drift surfaces without a dedicated test suite.
+### In your editor
 
-### Skills for impact, reuse, drift and census
+See an indexed counterpart, its contract, and the local file on the other side without leaving the editor. Go to definition jumps from an indexed call to its handler when the other service's code is on disk. A route's code lens lists the counterpart call sites held in the local index, and type disagreements appear as diagnostics on the indexed route or call. The editor extension is available from Visual Studio Marketplace and Open VSX, and other LSP clients can start the same server directly.
 
-Carrick ships with four skills for the most common agent failures — breaking a caller in another service, rebuilding existing code, trusting a stale copy of another service's type, and missing places in a codebase-wide change. Each skill gets its answer from the Carrick index.
+### In your pull request
 
-### Go to definition, across the service boundary
+Contract risks, duplicated work and version drift across the indexed services. The same index your agent uses runs in CI. When a producer and consumer drift apart, whichever protocol they speak, Carrick flags the mismatch in the PR before it merges. It also flags dependency version conflicts across services.
 
-The same index, inside the editor. Go to definition jumps from an indexed call to its handler when the other service's code is on disk. A route's code lens lists the counterpart call sites held in the local index. Type disagreements appear as diagnostics on the indexed route or call.
+## Skills
 
-### Catch contract drift in the pull request
+Carrick ships with four skills for the most common agent failures — breaking a caller in another service, rebuilding existing code, trusting a stale copy of another service's type, and missing places in a codebase-wide change. Each skill gets its answer from the Carrick index. `carrick init` installs them into `.claude/skills/` and `.agents/skills/`.
 
-The same index your agent uses runs in CI. When a producer and consumer drift apart, whichever protocol they speak, Carrick flags the mismatch in the PR before it merges. It also flags dependency version conflicts across services.
-
-### The workspace
-
-Every service, type and contract in one index, browsable in the dashboard and served to your agents over MCP.
+| Skill | Use it | What it returns |
+| :--- | :--- | :--- |
+| [`carrick-impact`](https://docs.carrick.tools/carrick-impact) | Before changing or deleting a route, handler, response shape, event or shared function, or to ask "who calls this?" | Everything that depends on the code you are about to change, with a file and line for each, and a type verdict for each consumer |
+| [`carrick-reuse`](https://docs.carrick.tools/carrick-reuse) | At the end of a task that added or changed functions, or to ask "does this already exist?" | The new functions compared against the whole function index, and the places the project has built the same thing twice |
+| [`carrick-drift`](https://docs.carrick.tools/carrick-drift) | Before changing a request or response type, or when a compatibility verdict names a problem you cannot place | The producer's type, each consumer call site's expected type and the stored verdict, side by side, one operation at a time |
+| [`carrick-census`](https://docs.carrick.tools/carrick-census) | For "find every place that does X" questions | Every match for two wordings of one concept, paged to the end and joined into one list with a receipt |
 
 ## Ask your agent
 
@@ -58,6 +59,7 @@ Every service, type and contract in one index, browsable in the dashboard and se
 - [Building the index](https://docs.carrick.tools/building-the-index)
 - [carrick.json](https://docs.carrick.tools/carrick-json)
 - [MCP tools](https://docs.carrick.tools/mcp-tools)
+- [Task skills](https://docs.carrick.tools/task-skills)
 - [In your editor](https://docs.carrick.tools/editor)
 
 ## Licence
