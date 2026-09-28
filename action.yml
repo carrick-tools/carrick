@@ -1,5 +1,5 @@
 name: "Carrick - TypeScript Context Engine"
-description: "Maps your TypeScript codebase across repos so AI agents see existing types, routes and functions before writing new code."
+description: "Maps your TypeScript services, even across repositories, so AI agents see existing types, routes and functions first."
 
 branding:
   icon: "link"
