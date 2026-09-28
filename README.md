@@ -1,6 +1,6 @@
 # Carrick
 
-Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
+Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
 
 > Carrick scans TypeScript projects using npm, pnpm, Yarn, Bun, or Deno. Deno projects require Deno 2.9.4 or newer; the Action supplies the runtime and reads existing `deno.json` or `deno.jsonc` manifests. Dependency preparation disables lifecycle scripts ([details](#dependencies)). Cross-repo features need at least two services indexed in the same Carrick project; a single-service install still gets same-repo validation.
 
