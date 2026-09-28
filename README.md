@@ -4,6 +4,8 @@
 
 Carrick maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.
 
+When coding agents work across the services of a TypeScript codebase, the failures that matter are rebuilding a helper that already exists, trusting a stale local copy of another service's type, or changing a response nobody knew was consumed. A smarter model cannot fix what it cannot see, so Carrick gives the agent the same source of truth the compiler has, across every service, at the moment it decides.
+
 ## Get started
 
 ```bash
@@ -14,8 +16,6 @@ carrick init
 The [quick start](https://docs.carrick.tools/quickstart) covers the full setup (Node 24 or newer).
 
 ## Agents see the whole system before they write
-
-Most code in a TypeScript organisation will be written by agents, and their failures will not be syntax errors. The ones that matter are an agent rebuilding a helper that already exists, trusting a stale local copy of another service's type, or changing a response nobody knew was consumed. A smarter model cannot fix what it cannot see, so Carrick gives the agent the same source of truth the compiler has, across every service, at the moment it decides.
 
 - **Find what exists.** Agents search every indexed function across services and repositories by what it does, whatever it is called, including repositories that are not checked out, so they build on the helper that exists instead of writing a second one.
 - **Build against the real contract.** An agent reads an endpoint's request and response types as the TypeScript compiler resolved them in the service that serves it.
