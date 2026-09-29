@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.97](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.96...carrick-v0.3.97) (2026-09-29)
+
+
+### Features
+
+* **scanner:** request summaries — state calls through clients from the client's source ([#1565](https://github.com/carrick-tools/carrick/issues/1565)) ([62faeb9](https://github.com/carrick-tools/carrick/commit/62faeb92e0271d1520f5434eb0d025d8536e2f23))
+
+
+### Bug Fixes
+
+* **npm,vscode:** package descriptions follow the canonical pitch ([#1549](https://github.com/carrick-tools/carrick/issues/1549)) ([3440ee8](https://github.com/carrick-tools/carrick/commit/3440ee83538e71c34a45029d4ac27bf7242bffae))
+
+
+### Documentation
+
+* **readme:** make both READMEs a front page, and say cross-service ([#1552](https://github.com/carrick-tools/carrick/issues/1552)) ([765a5d6](https://github.com/carrick-tools/carrick/commit/765a5d6c26387b41f98b889c886bbe657e611904))
+* security policy with a reporting address ([#1553](https://github.com/carrick-tools/carrick/issues/1553)) ([9a5f1fc](https://github.com/carrick-tools/carrick/commit/9a5f1fcf3ddb19975a64cec47cf791658dc734fa))
+
+
+### CI/CD
+
+* pin third-party actions to commit SHAs, read-only token by default ([#1554](https://github.com/carrick-tools/carrick/issues/1554)) ([cdc2fc4](https://github.com/carrick-tools/carrick/commit/cdc2fc4e5bf5770d45f0dbdfb65c64c831594164))
+
 ## [0.3.96](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.95...carrick-v0.3.96) (2026-09-28)
 
 
