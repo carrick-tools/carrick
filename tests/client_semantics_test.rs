@@ -532,6 +532,84 @@ async fn the_rereviews_sites_read_a_base_only_where_nothing_can_change_it() {
     }
 }
 
+/// The third review's sites (carrick#1564), through the real sidecar. A
+/// client a file stores, returns, configures, reads a property of, or calls
+/// a member outside the verified surface of reads exactly as the tree does
+/// without the semantics, as does one built from options the file passes to
+/// a call before the base; a base written after that spread, and a client
+/// used only to call through it, are read. A plain `fetch` handed a constant
+/// the file writes through states nothing, and one handed a clean constant
+/// states its method.
+#[tokio::test]
+#[serial]
+async fn the_third_reviews_sites_read_nothing_the_file_can_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    let get = ids(HTTP, &["factory:create", "verb:get"]);
+    let get: Vec<&str> = get.iter().map(String::as_str).collect();
+    assert_library_row(
+        &rows,
+        "src/r1-passed-const.ts",
+        10,
+        "GET",
+        "/r1b/passed-after",
+        &get,
+    );
+    assert_library_row(&rows, "src/r4c-control.ts", 5, "GET", "/r4c/control", &get);
+    let at = |rows: &[DataFetchingCall], file: &str, line: u32| {
+        rendered(
+            rows.iter()
+                .filter(|row| row.file_location.contains(file) && row.line == Some(line))
+                .cloned()
+                .collect(),
+        )
+    };
+    for (file, line) in [
+        ("src/r1-passed-const.ts", 9),
+        ("src/r2-stored.ts", 9),
+        ("src/r3-returned.ts", 6),
+        ("src/r4-export-read.ts", 6),
+        ("src/r4b-instanceof.ts", 6),
+        ("src/r5-setter.ts", 6),
+        ("src/r6-header-write.ts", 6),
+        ("src/r7-interceptor.ts", 6),
+    ] {
+        assert_eq!(
+            at(&rows, file, line),
+            at(&without, file, line),
+            "{file}:{line} reads as it does without the semantics"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.file_location.contains(file) && row.line == Some(line))
+                .all(|row| row.library_semantics.is_empty()),
+            "{file}:{line} is read through no claim"
+        );
+    }
+
+    let stated = |line: u32| -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|row| {
+                row.file_location.contains("src/p-fetch-consts.ts")
+                    && row.line == Some(line)
+                    && row.resolution_source == Some(ResolutionSource::RequestSummary)
+            })
+            .map(|row| (row.method.clone(), row.target_url.clone()))
+            .collect()
+    };
+    assert!(
+        stated(15).is_empty(),
+        "a written-through constant states nothing"
+    );
+    assert_eq!(stated(18), [("PATCH".to_string(), "/api/p4".to_string())]);
+    assert_eq!(stated(20), [("GET".to_string(), "/api/p6".to_string())]);
+}
+
 /// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a
 /// base key written through the instance, a base named in the call's own
 /// options, options and a config open to a spread, a field a constructor
