@@ -55,7 +55,9 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   shorthand property. Exporting it (`export default api`, `module.exports.api
   = api`) is fine. An instance also holds no client when its export's
   binding is used that way, since a write to the export's defaults before
-  the factory runs reaches the instance.
+  the factory runs reaches the instance, or when the file calls a member of
+  the instance its verified surface does not name as a verb or request
+  member (`api.setBaseURL("/v2")`, `api[name]()`).
 - **The base** is the factory options' value at the verified key, joined to
   the path with exactly one slash. A path that is an absolute URL ignores
   it. An empty base is no base, and a base holding `?` or `#` states no URL.
@@ -68,7 +70,8 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
 - **A spread of a constant** puts its keys in place only when the constant
   is declared once in the file, as `const` holding one object literal, and
   the file never writes through it, passes it to a call or aliases it. Any
-  other spread may carry any key.
+  other spread may carry any key. A constant the file writes through holds
+  no known key wherever it is named, spread or not.
 - **The method** is the verb claim's, or the literal a request call writes
   at the method key. No literal, no row: a library's default is never
   assumed.
@@ -112,6 +115,11 @@ first, so the schedule after it makes at most two more.
 A run retrying its own owed work asks neither way: its detection is minutes
 old. A service whose model stages were deferred has no detection to settle.
 
+The schedule is aborted when the scan stops before it reads the summaries,
+so an interrupted scan asks nothing further. A panic inside it keeps what
+the first ask gave and never reports the scan as failed: its polls are
+quiet to the process-wide panic hook (`panic_report::quiet`).
+
 **The most it can add to a scan is 110 s**: 30 s for the ask on a stored
 detection, before the analysis, then 5 + 30 + 15 + 30 s for the schedule,
 beside the analysis. The schedule adds only what outlasts the analysis.
@@ -126,9 +134,9 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   which can be a receiver-type fact stating the path without the base
   (carrick#1583).
 - A verb whose member name is not the HTTP method is not read (carrick#1566).
-- A method call through the client other than a verb is assumed not to
-  change its base (a setter such as `api.setBase("/v2")` is not recognised,
-  carrick#1589).
+- A method call through the export binding, other than a verb or its
+  factory, is assumed not to change its base (carrick#1589). Through an
+  instance, any such call contests it.
 - Shapes that lose a reading to the rules above: a client whose defaults
   the file configures (`api.defaults.headers.common.X = …`, or through the
   export), a client handed to a helper or kept in an object, one read by a

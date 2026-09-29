@@ -45,6 +45,14 @@ The sources:
   reassigns or writes through (n6), a spread constant the file writes to
   (n7), a base written through an alias of the client or `Object.assign`
   (n8), and the same spread shapes on a plain `fetch` (n9).
+- `src/r1-passed-const.ts` to `src/r7-interceptor.ts` and
+  `src/p-fetch-consts.ts` are the third review's: options the file passes
+  to a call (r1), an instance stored in an array and an object (r2),
+  returned (r3), built from an export whose property is read (r4) or tested
+  with `instanceof` (r4b) beside a control (r4c), called through a member
+  its surface does not name (r5), with a header written (r6) or an
+  interceptor added (r7), and a plain `fetch` handed constants the file
+  writes through, passes to a call, or leaves alone (p).
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -80,6 +88,8 @@ With the vendored declarations, through the real type sidecar:
 | `n3-cond-spread.ts:11` | `GET /same/agree` | factory, `verb:get` |
 | `n4-getter-computed.ts:11` | `GET /s1/string-key` | factory, `verb:get` |
 | `n4-getter-computed.ts:12` | `GET /m1/method-prop` | factory, `verb:get` |
+| `r1-passed-const.ts:10` | `GET /r1b/passed-after` | factory, `verb:get` |
+| `r4c-control.ts:5` | `GET /r4c/control` | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
 
@@ -109,11 +119,25 @@ the reading cannot see:
 | `n7-mutated-spread-const.ts:10` | `GET /mutated-const`, `receiver_type` |
 | `n8-indirect-write.ts:10` | `GET /alias-write`, `receiver_type` |
 | `n8-indirect-write.ts:11` | `GET /assign-write`, `receiver_type` |
+| `r1-passed-const.ts:9` | `GET /passed`, `receiver_type` |
+| `r2-stored.ts:9` | `GET /direct`, `receiver_type` |
+| `r3-returned.ts:6` | `GET /returned`, `receiver_type` |
+| `r4-export-read.ts:6` | `GET /const-read`, `receiver_type` |
+| `r4b-instanceof.ts:6` | `GET /instanceof`, `receiver_type` (carrick#1568 would recover it) |
+| `r5-setter.ts:6` | `GET /setter`, `receiver_type` |
+| `r6-header-write.ts:6` | `GET /header-write`, `receiver_type` |
+| `r7-interceptor.ts:6` | `GET /interceptor`, `receiver_type` |
 
 `n9-phase1-fetch.ts` has no library in it. Its request summaries state `POST
 /api/f2` at line 10 (the method written after the spread) and `GET /api/f5`
 at line 13, and nothing at lines 9, 11 and 12, where a spread may set the
 method; any other row there is the model's.
+
+`p-fetch-consts.ts` states `PATCH /api/p4` at line 18 and `GET /api/p6` at
+line 20, and nothing at line 15, where the constant is written through, or
+at 17 and 19, where a spread reads a constant the file writes to or passes
+to a call. Line 16 states `DELETE /api/p2` from a constant the file passes to
+a call first, which may change it (carrick#1588).
 
 The `receiver_type` rows state the path without the instance's base. That
 is how main reads them today, and it is a wrong fact of its own
