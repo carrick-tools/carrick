@@ -38,6 +38,18 @@ scripts/scan-twice.sh /path/to/probe-dir  # plus a one-service carrick.json tree
 `CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections per
 target. The script header lists the exclusions and why.
 
+## Recording a cassette
+
+A cassette is one real analyzer run, never hand-written. The recording run
+makes real model calls, so it is paid spend and needs the owner's yes first.
+
+```bash
+cargo build --release
+scripts/record-cassette.sh tests/fixtures/<fixture>
+```
+
+It writes `__llm__/analyze-file/` and `__golden__.json`, and uploads nothing.
+
 ## Cold-cache dispatch smoke
 
 Hands a fixture's prompts to Carrick Cloud for real and collects them, against
