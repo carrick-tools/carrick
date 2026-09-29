@@ -70,7 +70,23 @@
 //!
 //! One row per request reached (carrick#1555, decision 2): a call reaching two
 //! requests is two rows, each with the literals its own body writes.
+//!
+//! **Library clients** (carrick#1564). A call through a data-fetching
+//! package's client is read through that package's verified semantics
+//! ([`crate::client_semantics`]): `api.post("/orders", body)` on
+//! `const api = http.create({ baseURL: "/api/v1" })` sends `POST
+//! /api/v1/orders` with that body. The receiver is identified from the syntax
+//! alone: a binding imported from the package, or a binding or class field
+//! initialised by `<that binding>.<factory>(<object literal>)` and never
+//! reassigned. Nothing is inferred per site, so `new Map().get("/r")` reaches
+//! no claim. A verified receiver's verb call states a row at its own site,
+//! which a verb call otherwise never does; an unverified one is read exactly
+//! as it would be without the semantics. Summaries are composed only once the
+//! semantics are verified, which is after framework detection and the
+//! service's sidecar init, so discovery hands over its inputs
+//! ([`RequestSummaryInputs`]) rather than its rows.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -79,8 +95,12 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::call_graph::CallSiteTargets;
+use crate::client_semantics::{LibrarySemantics, instance_receiver};
+use crate::commonjs::{require_bound_names, require_specifier};
+use crate::services::type_sidecar::{SemanticsRequestArgs, SemanticsVerbArgs};
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::is_http_method;
+use crate::visitor::SymbolKind;
 use crate::wrapper_request_shape::{is_request_options, verb_from_callee_property};
 
 /// One piece of a URL or a body value.
@@ -173,6 +193,11 @@ enum RequestKind {
     /// at its own site. Inside a function another module calls, it is what the
     /// imported-member join always read it as: the member's request.
     Verb,
+    /// A call through a library client whose semantics the package's own
+    /// declarations verified (carrick#1564). The receiver's type is what the
+    /// verification read, so its verb calls are requests, and one states a
+    /// row at its own site.
+    Library,
 }
 
 /// A request's body, as far as the call writes it.
@@ -202,6 +227,41 @@ struct RequestShape {
     /// own base rules; a summary states its own line only for a URL it read
     /// through a binding the site does not write (a field, a constant).
     url_inline: bool,
+    /// A library client's base, joined to `url` only when the row is stated
+    /// (see [`join_base`]). Empty for every other request.
+    base: Vec<Piece>,
+    /// The library-semantics claim ids this reading used. Empty for every
+    /// other request.
+    semantics: BTreeSet<String>,
+}
+
+/// A client of a library package, as the source names it (carrick#1564): a
+/// binding imported from the package, or one built by a factory call on such
+/// a binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientRef {
+    /// The import specifier, exactly as written.
+    package: String,
+    /// `"default"` or the named export the binding was imported as.
+    export: String,
+    /// Set when the binding holds an instance the export's factory built.
+    instance: Option<ClientInstance>,
+}
+
+/// `export.factory({ ... })`: the factory member and the object literal it
+/// was handed, read where the instance is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientInstance {
+    factory: String,
+    options: ObjValue,
+}
+
+/// A call made through a library client: on one of its members, or on the
+/// client itself (`member: None`).
+#[derive(Debug, Clone)]
+struct CallReceiver {
+    client: ClientRef,
+    member: Option<String>,
 }
 
 /// Where a call is written.
@@ -236,6 +296,10 @@ struct CallIr {
     /// What it sends is the caller's callback's, counted where the callback
     /// is written.
     invokes_param: Option<usize>,
+    /// The library client the call is made through, when the syntax names
+    /// one. What it sends is read through the client's verified semantics,
+    /// which are known only when the summaries are composed.
+    receiver: Option<CallReceiver>,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -287,7 +351,17 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
-    let mut consts: HashMap<String, Value> = HashMap::new();
+    let mut module_scope = ModuleScope {
+        consts: HashMap::new(),
+        receivers: import_receivers(module),
+    };
+    // A name some function or block declares again means something else
+    // there, and nothing here tracks which scope a use sits in, so it is no
+    // client anywhere in the file.
+    let redeclared = redeclared_names(module);
+    module_scope
+        .receivers
+        .retain(|name, _| !redeclared.contains(name));
     let mut file = FileIr::default();
     let reader = Reader { source_map };
 
@@ -301,18 +375,28 @@ pub fn extract_file_ir(
                 if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
                     && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
                 {
-                    let scope = Scope::module(&consts);
-                    let value = reader.eval(init, &scope);
-                    consts.insert(ident.id.sym.to_string(), value);
+                    let name = ident.id.sym.to_string();
+                    let (value, client) = {
+                        let scope = Scope::module(&module_scope);
+                        (reader.eval(init, &scope), reader.factory_call(init, &scope))
+                    };
+                    if let Some(client) = client
+                        && !redeclared.contains(&name)
+                    {
+                        module_scope.receivers.insert(name.clone(), client);
+                    }
+                    module_scope.consts.insert(name, value);
                 }
             }
         }
     }
+    let module_scope = &module_scope;
+    let none = Captured::default();
 
     for item in &module.body {
         match module_decl(item) {
             Some(Decl::Fn(fn_decl)) => {
-                let ir = reader.function(&fn_decl.function, None, &consts, &HashMap::new());
+                let ir = reader.function(&fn_decl.function, None, module_scope, &none);
                 file.functions.insert(fn_decl.ident.sym.to_string(), ir);
             }
             Some(Decl::Var(var)) => {
@@ -322,9 +406,9 @@ pub fn extract_file_ir(
                         continue;
                     };
                     let ir = match &**init {
-                        Expr::Arrow(arrow) => reader.arrow(arrow, None, &consts, &HashMap::new()),
+                        Expr::Arrow(arrow) => reader.arrow(arrow, None, module_scope, &none),
                         Expr::Fn(fn_expr) => {
-                            reader.function(&fn_expr.function, None, &consts, &HashMap::new())
+                            reader.function(&fn_expr.function, None, module_scope, &none)
                         }
                         _ => continue,
                     };
@@ -335,7 +419,7 @@ pub fn extract_file_ir(
                 reader.class(
                     class.ident.sym.as_ref(),
                     &class.class,
-                    &consts,
+                    module_scope,
                     definition_keys,
                     &mut file,
                 );
@@ -350,7 +434,7 @@ pub fn extract_file_ir(
                     ident: Some(ident),
                     function,
                 }) => {
-                    let ir = reader.function(function, None, &consts, &HashMap::new());
+                    let ir = reader.function(function, None, module_scope, &none);
                     file.functions.insert(ident.sym.to_string(), ir);
                 }
                 DefaultDecl::Class(ClassExpr {
@@ -360,7 +444,7 @@ pub fn extract_file_ir(
                     reader.class(
                         ident.sym.as_ref(),
                         class,
-                        &consts,
+                        module_scope,
                         definition_keys,
                         &mut file,
                     );
@@ -387,27 +471,215 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
     }
 }
 
+/// What module scope holds for every function in the file: its constants,
+/// and the bindings that name a library client (carrick#1564).
+#[derive(Default)]
+struct ModuleScope {
+    consts: HashMap<String, Value>,
+    receivers: HashMap<String, ClientRef>,
+}
+
+/// A class's field table: the value each field holds, and the fields that
+/// hold a library client's instance.
+#[derive(Default)]
+struct ClassFields {
+    values: HashMap<String, Value>,
+    receivers: HashMap<String, ClientRef>,
+}
+
+/// What a function written inside another can read of it.
+#[derive(Default)]
+struct Captured {
+    values: HashMap<String, Value>,
+    receivers: HashMap<String, ClientRef>,
+}
+
+/// Every module-scope binding a package specifier introduces, with the export
+/// it names (carrick#1564): `import x from "p"` and `const x = require("p")`
+/// name `default`; `import { a as x } from "p"`, `const { a: x } =
+/// require("p")` and `const x = require("p").a` name `a`. A namespace import
+/// names the module rather than an export, and a relative specifier names no
+/// package, so neither is a client.
+fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
+    const DEFAULT: &str = "default";
+    let mut receivers = HashMap::new();
+    let mut add = |local: String, package: String, export: String| {
+        if !package.starts_with('.') && !package.starts_with('/') {
+            receivers.insert(
+                local,
+                ClientRef {
+                    package,
+                    export,
+                    instance: None,
+                },
+            );
+        }
+    };
+    for item in &module.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) if !import.type_only => {
+                let package = import.src.value.to_string();
+                for specifier in &import.specifiers {
+                    match specifier {
+                        ImportSpecifier::Default(default) => {
+                            add(
+                                default.local.sym.to_string(),
+                                package.clone(),
+                                DEFAULT.to_string(),
+                            );
+                        }
+                        ImportSpecifier::Named(named) if !named.is_type_only => {
+                            let export = match &named.imported {
+                                Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                                Some(ModuleExportName::Str(name)) => name.value.to_string(),
+                                None => named.local.sym.to_string(),
+                            };
+                            add(named.local.sym.to_string(), package.clone(), export);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::TsImportEquals(decl)) if !decl.is_type_only => {
+                if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref {
+                    add(
+                        decl.id.sym.to_string(),
+                        external.expr.value.to_string(),
+                        DEFAULT.to_string(),
+                    );
+                }
+            }
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) if var.kind == VarDeclKind::Const => {
+                for declarator in &var.decls {
+                    let Some(init) = declarator.init.as_deref() else {
+                        continue;
+                    };
+                    if let Expr::Member(member) = init
+                        && let Some(package) = require_specifier(&member.obj)
+                        && let MemberProp::Ident(property) = &member.prop
+                        && let Pat::Ident(local) = &declarator.name
+                    {
+                        add(local.id.sym.to_string(), package, property.sym.to_string());
+                        continue;
+                    }
+                    let Some(package) = require_specifier(init) else {
+                        continue;
+                    };
+                    for bound in require_bound_names(&declarator.name) {
+                        let export = match bound.kind {
+                            SymbolKind::Namespace => DEFAULT.to_string(),
+                            SymbolKind::Named | SymbolKind::Default => bound.imported,
+                        };
+                        add(bound.local.id.sym.to_string(), package.clone(), export);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    receivers
+}
+
+/// Every name declared below module scope: in a function (its parameters
+/// included), a class, or a block.
+fn redeclared_names(module: &Module) -> HashSet<String> {
+    let mut names = DeclaredNames::default();
+    for item in &module.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(_) | ModuleDecl::TsImportEquals(_)) => {}
+            _ => match module_decl(item) {
+                // The binding a module-scope declaration introduces is the
+                // module's own; only what is written inside it declares
+                // anything further down.
+                Some(Decl::Var(var)) => {
+                    for declarator in &var.decls {
+                        declarator.init.visit_with(&mut names);
+                    }
+                }
+                Some(Decl::Fn(fn_decl)) => fn_decl.function.visit_with(&mut names),
+                Some(Decl::Class(class)) => class.class.visit_with(&mut names),
+                _ => item.visit_with(&mut names),
+            },
+        }
+    }
+    names.names
+}
+
+/// Every binding a subtree declares.
+#[derive(Default)]
+struct DeclaredNames {
+    names: HashSet<String>,
+    /// How many times each is declared, for [`Reader::body`].
+    counts: HashMap<String, usize>,
+}
+
+impl DeclaredNames {
+    fn declare(&mut self, name: String) {
+        *self.counts.entry(name.clone()).or_default() += 1;
+        self.names.insert(name);
+    }
+}
+
+impl Visit for DeclaredNames {
+    fn visit_binding_ident(&mut self, ident: &BindingIdent) {
+        self.declare(ident.id.sym.to_string());
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        self.declare(decl.ident.sym.to_string());
+        decl.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, decl: &ClassDecl) {
+        self.declare(decl.ident.sym.to_string());
+        decl.visit_children_with(self);
+    }
+
+    // A parameter named in a type (`(api: Api) => void`) binds nothing.
+    fn visit_ts_type(&mut self, _: &TsType) {}
+
+    fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+}
+
 /// What an expression can read: the function's parameters and constants, the
 /// enclosing class's fields, and the module's constants.
 struct Scope<'a> {
     params: Vec<Option<String>>,
     locals: HashMap<String, Value>,
-    fields: Option<&'a HashMap<String, Value>>,
-    consts: &'a HashMap<String, Value>,
+    /// Locals holding a library client's instance (carrick#1564).
+    local_receivers: HashMap<String, ClientRef>,
+    fields: Option<&'a ClassFields>,
+    module: &'a ModuleScope,
 }
 
 impl<'a> Scope<'a> {
-    fn module(consts: &'a HashMap<String, Value>) -> Self {
+    fn module(module: &'a ModuleScope) -> Self {
         Self {
             params: Vec::new(),
             locals: HashMap::new(),
+            local_receivers: HashMap::new(),
             fields: None,
-            consts,
+            module,
         }
     }
 
     fn param_index(&self, name: &str) -> Option<usize> {
         self.params.iter().position(|p| p.as_deref() == Some(name))
+    }
+
+    /// The library client `name` holds here, if it holds one. A parameter or
+    /// a local of the same name is not the module's binding.
+    fn receiver(&self, name: &str) -> Option<&ClientRef> {
+        if self.param_index(name).is_some() {
+            return None;
+        }
+        if let Some(client) = self.local_receivers.get(name) {
+            return Some(client);
+        }
+        if self.locals.contains_key(name) {
+            return None;
+        }
+        self.module.receivers.get(name)
     }
 }
 
@@ -440,11 +712,12 @@ impl Reader<'_> {
         &self,
         name: &str,
         class: &Class,
-        consts: &HashMap<String, Value>,
+        module: &ModuleScope,
         definition_keys: &HashSet<String>,
         file: &mut FileIr,
     ) {
-        let fields = self.class_fields(class, consts);
+        let fields = self.class_fields(class, module);
+        let none = Captured::default();
         let key = |member: &str, is_static: bool| {
             let plain = format!("{name}.{member}");
             let statik = format!("{name}.static.{member}");
@@ -460,8 +733,7 @@ impl Reader<'_> {
                     let Some(member_name) = prop_name(&method.key) else {
                         continue;
                     };
-                    let ir =
-                        self.function(&method.function, Some(&fields), consts, &HashMap::new());
+                    let ir = self.function(&method.function, Some(&fields), module, &none);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -469,8 +741,7 @@ impl Reader<'_> {
                     if !matches!(method.kind, MethodKind::Setter) =>
                 {
                     let member_name = format!("#{}", method.key.name);
-                    let ir =
-                        self.function(&method.function, Some(&fields), consts, &HashMap::new());
+                    let ir = self.function(&method.function, Some(&fields), module, &none);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -480,11 +751,9 @@ impl Reader<'_> {
                         continue;
                     };
                     let ir = match &**init {
-                        Expr::Arrow(arrow) => {
-                            self.arrow(arrow, Some(&fields), consts, &HashMap::new())
-                        }
+                        Expr::Arrow(arrow) => self.arrow(arrow, Some(&fields), module, &none),
                         Expr::Fn(fn_expr) => {
-                            self.function(&fn_expr.function, Some(&fields), consts, &HashMap::new())
+                            self.function(&fn_expr.function, Some(&fields), module, &none)
                         }
                         _ => continue,
                     };
@@ -499,14 +768,20 @@ impl Reader<'_> {
     /// initialiser, and nowhere else. A constructor parameter read into a field
     /// is opaque: nothing here follows `new ApiClient(config)` back to the
     /// value it was built with.
-    fn class_fields(
-        &self,
-        class: &Class,
-        consts: &HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
+    ///
+    /// A field assigned that way from a library client's factory call holds
+    /// that client's instance (carrick#1564).
+    fn class_fields(&self, class: &Class, module: &ModuleScope) -> ClassFields {
         let mut fields: HashMap<String, Value> = HashMap::new();
+        let mut receivers: HashMap<String, ClientRef> = HashMap::new();
         let mut contested: HashSet<String> = HashSet::new();
-        let mut assign = |name: String, value: Value, fields: &mut HashMap<String, Value>| {
+        let mut assign = |name: String,
+                          value: Value,
+                          client: Option<ClientRef>,
+                          fields: &mut HashMap<String, Value>| {
+            if let Some(client) = client {
+                receivers.insert(name.clone(), client);
+            }
             if fields.insert(name.clone(), value).is_some() {
                 contested.insert(name);
             }
@@ -518,24 +793,28 @@ impl Reader<'_> {
                     if let (Some(name), Some(init)) = (prop_name(&prop.key), &prop.value)
                         && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
                     {
-                        let value = self.eval(init, &Scope::module(consts));
-                        assign(name, value, &mut fields);
+                        let scope = Scope::module(module);
+                        let value = self.eval(init, &scope);
+                        let client = self.factory_call(init, &scope);
+                        assign(name, value, client, &mut fields);
                     }
                 }
                 ClassMember::PrivateProp(prop) if !prop.is_static => {
                     if let Some(init) = &prop.value {
-                        let value = self.eval(init, &Scope::module(consts));
-                        assign(format!("#{}", prop.key.name), value, &mut fields);
+                        let scope = Scope::module(module);
+                        let value = self.eval(init, &scope);
+                        let client = self.factory_call(init, &scope);
+                        assign(format!("#{}", prop.key.name), value, client, &mut fields);
                     }
                 }
                 ClassMember::Constructor(ctor) => {
-                    let mut scope = Scope::module(consts);
+                    let mut scope = Scope::module(module);
                     for param in &ctor.params {
                         match param {
                             ParamOrTsParamProp::TsParamProp(prop) => {
                                 if let TsParamPropParam::Ident(ident) = &prop.param {
                                     let name = ident.id.sym.to_string();
-                                    assign(name.clone(), Value::opaque(name), &mut fields);
+                                    assign(name.clone(), Value::opaque(name), None, &mut fields);
                                 }
                             }
                             ParamOrTsParamProp::Param(_) => {}
@@ -558,8 +837,9 @@ impl Reader<'_> {
                             }
                         }
                         if let Some((name, value)) = this_assignment(stmt) {
+                            let client = self.factory_call(value, &scope);
                             let value = self.eval(value, &scope);
-                            assign(name, value, &mut fields);
+                            assign(name, value, client, &mut fields);
                         }
                     }
                 }
@@ -580,33 +860,36 @@ impl Reader<'_> {
         }
         contested.extend(writes.fields);
         for name in contested {
+            receivers.remove(&name);
             fields.insert(name.clone(), Value::opaque(format!("this.{name}")));
         }
         // A field holding only a value the class is handed (`this.baseUrl =
         // baseUrl`, a parameter property) is written the way the request
         // writes it; one the class BUILDS is read through.
-        fields
+        let values = fields
             .into_iter()
             .map(|(name, value)| {
                 let value = bound(format!("this.{name}"), value);
                 (name, value)
             })
-            .collect()
+            .collect();
+        ClassFields { values, receivers }
     }
 
     fn function(
         &self,
         function: &Function,
-        fields: Option<&HashMap<String, Value>>,
-        consts: &HashMap<String, Value>,
-        captured: &HashMap<String, Value>,
+        fields: Option<&ClassFields>,
+        module: &ModuleScope,
+        captured: &Captured,
     ) -> FnIr {
         let params = function.params.iter().map(|p| pat_name(&p.pat)).collect();
         let mut scope = Scope {
             params,
-            locals: captured.clone(),
+            locals: captured.values.clone(),
+            local_receivers: inherited_receivers(captured, function),
             fields,
-            consts,
+            module,
         };
         let mut ir = FnIr::default();
         match &function.body {
@@ -619,16 +902,17 @@ impl Reader<'_> {
     fn arrow(
         &self,
         arrow: &ArrowExpr,
-        fields: Option<&HashMap<String, Value>>,
-        consts: &HashMap<String, Value>,
-        captured: &HashMap<String, Value>,
+        fields: Option<&ClassFields>,
+        module: &ModuleScope,
+        captured: &Captured,
     ) -> FnIr {
         let params = arrow.params.iter().map(pat_name).collect();
         let mut scope = Scope {
             params,
-            locals: captured.clone(),
+            locals: captured.values.clone(),
+            local_receivers: inherited_receivers(captured, arrow),
             fields,
-            consts,
+            module,
         };
         let mut ir = FnIr::default();
         match &*arrow.body {
@@ -641,11 +925,16 @@ impl Reader<'_> {
     /// A function body, statement by statement, so a constant is readable
     /// by the statements after it. A binding assigned again anywhere in the
     /// body is opaque everywhere.
+    ///
+    /// A constant built by a library client's factory call holds that
+    /// client's instance (carrick#1564), unless the body declares its name a
+    /// second time somewhere, where nothing here says which one a use means.
     fn body(&self, stmts: &[Stmt], scope: &mut Scope<'_>, ir: &mut FnIr) {
         let mut reassigned = Reassigned::default();
         for stmt in stmts {
             stmt.visit_with(&mut reassigned);
         }
+        let mut declared: Option<DeclaredNames> = None;
         for stmt in stmts {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
@@ -654,12 +943,30 @@ impl Reader<'_> {
                     }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
+                        let client = if reassigned.names.contains(&name) {
+                            None
+                        } else {
+                            self.factory_call(init, scope)
+                        };
                         let value = if reassigned.names.contains(&name) {
                             Value::opaque(name.clone())
                         } else {
                             bound(name.clone(), self.eval(init, scope))
                         };
-                        scope.locals.insert(name, value);
+                        scope.locals.insert(name.clone(), value);
+                        scope.local_receivers.remove(&name);
+                        if let Some(client) = client {
+                            let declared = declared.get_or_insert_with(|| {
+                                let mut names = DeclaredNames::default();
+                                for stmt in stmts {
+                                    stmt.visit_with(&mut names);
+                                }
+                                names
+                            });
+                            if declared.counts.get(&name) == Some(&1) {
+                                scope.local_receivers.insert(name, client);
+                            }
+                        }
                     }
                 }
                 continue;
@@ -715,7 +1022,11 @@ impl Reader<'_> {
                 if let Some(index) = scope.param_index(name) {
                     return Value::Str(vec![Piece::Param(index, name.to_string())]);
                 }
-                if let Some(value) = scope.locals.get(name).or_else(|| scope.consts.get(name)) {
+                if let Some(value) = scope
+                    .locals
+                    .get(name)
+                    .or_else(|| scope.module.consts.get(name))
+                {
                     return value.clone();
                 }
                 Value::opaque(name.to_string())
@@ -780,7 +1091,7 @@ impl Reader<'_> {
                 MemberProp::Computed(_) => None,
             };
             if let Some(name) = name {
-                if let Some(value) = scope.fields.and_then(|fields| fields.get(&name)) {
+                if let Some(value) = scope.fields.and_then(|fields| fields.values.get(&name)) {
                     return value.clone();
                 }
                 return Value::opaque(format!("this.{name}"));
@@ -913,7 +1224,9 @@ impl Reader<'_> {
 
         let url_expr = match kind {
             RequestKind::Fetch | RequestKind::Verb => call.args.first().map(|arg| &*arg.expr),
-            RequestKind::Bag => None,
+            // A library reading is built from the client's claims
+            // ([`library_shape`]), never from the call's written shape.
+            RequestKind::Bag | RequestKind::Library => None,
         };
         let url_inline = url_expr.is_some_and(|expr| {
             matches!(
@@ -945,6 +1258,7 @@ impl Reader<'_> {
                     url
                 }
             },
+            RequestKind::Library => return None,
         };
 
         // `fetch(url, init)` with `init` the function's own parameter: the
@@ -979,14 +1293,6 @@ impl Reader<'_> {
             },
         };
 
-        let body_of = |value: &Value| match value {
-            Value::Obj(body) => BodyValue::Fields(body.clone()),
-            Value::Str(pieces) => match pieces.as_slice() {
-                [Piece::Param(index, _)] => BodyValue::Param(*index),
-                _ => BodyValue::Unstated,
-            },
-            Value::Callback(_) => BodyValue::Unstated,
-        };
         let body = match bag.map(|(_, obj)| obj) {
             _ if options_param.is_some() => {
                 BodyValue::ParamKey(options_param.unwrap_or_default(), "body".to_string())
@@ -1018,7 +1324,90 @@ impl Reader<'_> {
                             Expr::Lit(Lit::Str(_)) | Expr::Tpl(_)
                         )
                     })),
+            base: Vec::new(),
+            semantics: BTreeSet::new(),
         })
+    }
+
+    /// `<client>.<factory>({ ... })`, where `<client>` is a binding imported
+    /// from a package (carrick#1564): the instance it builds, with the object
+    /// literal it was handed. Anything else — an instance's own factory call,
+    /// options that are not written as one literal — builds nothing this pass
+    /// reads.
+    fn factory_call(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+        let expr = match expr {
+            Expr::TsAs(e) => &*e.expr,
+            Expr::TsNonNull(e) => &*e.expr,
+            Expr::TsSatisfies(e) => &*e.expr,
+            other => other,
+        };
+        let Expr::Call(call) = expr.unwrap_parens() else {
+            return None;
+        };
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let Expr::Member(member) = &**callee else {
+            return None;
+        };
+        let Expr::Ident(binding) = &*member.obj else {
+            return None;
+        };
+        let factory = member_prop(member)?;
+        let client = scope.receiver(binding.sym.as_ref())?;
+        if client.instance.is_some() {
+            return None;
+        }
+        let [options] = call.args.as_slice() else {
+            return None;
+        };
+        let Expr::Object(options_literal) = &*options.expr else {
+            return None;
+        };
+        if options.spread.is_some() {
+            return None;
+        }
+        Some(ClientRef {
+            package: client.package.clone(),
+            export: client.export.clone(),
+            instance: Some(ClientInstance {
+                factory,
+                options: self.object(options_literal, scope),
+            }),
+        })
+    }
+
+    /// The library client a call is made through, when the syntax names one
+    /// (carrick#1564): `client.member(...)`, `client(...)`, and the same on a
+    /// class field (`this.api.member(...)`, `this.api(...)`).
+    fn call_receiver(&self, callee: &Expr, scope: &Scope<'_>) -> Option<CallReceiver> {
+        match callee.unwrap_parens() {
+            Expr::Ident(ident) => Some(CallReceiver {
+                client: scope.receiver(ident.sym.as_ref())?.clone(),
+                member: None,
+            }),
+            Expr::Member(member) => {
+                if let Expr::This(_) = &*member.obj {
+                    return Some(CallReceiver {
+                        client: field_receiver(member, scope)?.clone(),
+                        member: None,
+                    });
+                }
+                let member_name = member_prop(member)?;
+                let client = match member.obj.unwrap_parens() {
+                    Expr::Ident(ident) => scope.receiver(ident.sym.as_ref())?,
+                    Expr::Member(field) if matches!(&*field.obj, Expr::This(_)) => {
+                        field_receiver(field, scope)?
+                    }
+                    _ => return None,
+                };
+                Some(CallReceiver {
+                    client: client.clone(),
+                    member: Some(member_name),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// A receiver the source builds as one of the language's own keyed
@@ -1081,6 +1470,47 @@ fn bound(name: String, value: Value) -> Value {
     }
 }
 
+/// The body a value states, where it stands for one.
+fn body_of(value: &Value) -> BodyValue {
+    match value {
+        Value::Obj(body) => BodyValue::Fields(body.clone()),
+        Value::Str(pieces) => match pieces.as_slice() {
+            [Piece::Param(index, _)] => BodyValue::Param(*index),
+            _ => BodyValue::Unstated,
+        },
+        Value::Callback(_) => BodyValue::Unstated,
+    }
+}
+
+/// The library client a class field holds (`this.api`), when it holds one.
+fn field_receiver<'s>(member: &MemberExpr, scope: &'s Scope<'_>) -> Option<&'s ClientRef> {
+    let name = match &member.prop {
+        MemberProp::Ident(ident) => ident.sym.to_string(),
+        MemberProp::PrivateName(private) => format!("#{}", private.name),
+        MemberProp::Computed(_) => return None,
+    };
+    scope.fields?.receivers.get(&name)
+}
+
+/// The library instances a function written inside another can read: the
+/// enclosing function's, less any name it declares again itself.
+fn inherited_receivers<N>(captured: &Captured, node: &N) -> HashMap<String, ClientRef>
+where
+    N: VisitWith<DeclaredNames>,
+{
+    if captured.receivers.is_empty() {
+        return HashMap::new();
+    }
+    let mut declared = DeclaredNames::default();
+    node.visit_with(&mut declared);
+    captured
+        .receivers
+        .iter()
+        .filter(|(name, _)| !declared.names.contains(*name))
+        .map(|(name, client)| (name.clone(), client.clone()))
+        .collect()
+}
+
 fn method_of(pieces: &[Piece]) -> MethodValue {
     match pieces {
         [Piece::Lit(method)] if is_http_method(method) => MethodValue::Lit(method.to_uppercase()),
@@ -1128,7 +1558,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                     let nested = self.reader.arrow(
                         arrow,
                         self.scope.fields,
-                        self.scope.consts,
+                        self.scope.module,
                         &self.captured(),
                     );
                     self.ir.nested.push(nested);
@@ -1139,7 +1569,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                     let nested = self.reader.function(
                         &fn_expr.function,
                         None,
-                        self.scope.consts,
+                        self.scope.module,
                         &self.captured(),
                     );
                     self.ir.nested.push(nested);
@@ -1156,10 +1586,17 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee.visit_with(self);
         }
 
-        let request = if call.args.iter().any(|arg| arg.spread.is_some()) {
+        let spread = call.args.iter().any(|arg| arg.spread.is_some());
+        let request = if spread {
             None
         } else {
             self.reader.request_shape(call, &args, self.scope)
+        };
+        // A spread argument moves every position after it, and the claims
+        // say what a position means.
+        let receiver = match &call.callee {
+            Callee::Expr(callee) if !spread => self.reader.call_receiver(callee, self.scope),
+            _ => None,
         };
         let inert = match &call.callee {
             Callee::Expr(callee) => match &**callee {
@@ -1184,6 +1621,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             request,
             inert,
             invokes_param,
+            receiver,
         });
     }
 
@@ -1193,7 +1631,7 @@ impl Visit for CallWalker<'_, '_, '_> {
     fn visit_function(&mut self, function: &Function) {
         let detached = self
             .reader
-            .function(function, None, self.scope.consts, &self.captured());
+            .function(function, None, self.scope.module, &self.captured());
         self.ir.detached.push(detached);
     }
 
@@ -1201,7 +1639,7 @@ impl Visit for CallWalker<'_, '_, '_> {
         let detached = self.reader.arrow(
             arrow,
             self.scope.fields,
-            self.scope.consts,
+            self.scope.module,
             &self.captured(),
         );
         self.ir.detached.push(detached);
@@ -1254,13 +1692,17 @@ impl Visit for CallWalker<'_, '_, '_> {
 
 impl CallWalker<'_, '_, '_> {
     /// What a callback written here can read: this body's constants, and its
-    /// parameters as opaque names (the callback is not called with them).
-    fn captured(&self) -> HashMap<String, Value> {
-        let mut captured = self.scope.locals.clone();
+    /// parameters as opaque names (the callback is not called with them), and
+    /// the library instances this body holds.
+    fn captured(&self) -> Captured {
+        let mut values = self.scope.locals.clone();
         for name in self.scope.params.iter().flatten() {
-            captured.insert(name.clone(), Value::opaque(name.clone()));
+            values.insert(name.clone(), Value::opaque(name.clone()));
         }
-        captured
+        Captured {
+            values,
+            receivers: self.scope.local_receivers.clone(),
+        }
     }
 }
 
@@ -1394,6 +1836,12 @@ struct Effect {
     body_param: Option<(usize, Option<String>)>,
     /// A verb call: a request only when reached from another function.
     verb: bool,
+    /// A library client's base, kept apart from `url` until the row is
+    /// stated, so a path a caller fills in is joined as it is finally
+    /// written (carrick#1564).
+    base: Vec<Piece>,
+    /// The library-semantics claim ids the request was read through.
+    semantics: BTreeSet<String>,
 }
 
 impl Effect {
@@ -1414,6 +1862,8 @@ impl Effect {
             body,
             body_param,
             verb: shape.kind == RequestKind::Verb,
+            base: shape.base.clone(),
+            semantics: shape.semantics.clone(),
         }
     }
 
@@ -1428,7 +1878,10 @@ impl Effect {
             MethodValue::Param(_) | MethodValue::ParamKey(..)
         ) || self.url.iter().enumerate().any(|(position, piece)| {
             matches!(piece, Piece::Param(..)) && !is_whole_segment(&self.url, position)
-        })
+        }) || self
+            .base
+            .iter()
+            .any(|piece| matches!(piece, Piece::Param(..)))
     }
 
     /// This effect as seen from a call passing `args`.
@@ -1517,6 +1970,8 @@ impl Effect {
             body,
             body_param,
             verb: self.verb,
+            base: fill(&self.base),
+            semantics: self.semantics.clone(),
         }
     }
 
@@ -1581,6 +2036,19 @@ pub struct SummaryRow {
     /// The request primitive's own line (`fetch(...)` itself), where the
     /// passes that read a site's own source state it too and are kept.
     pub own_site: bool,
+    /// The library-semantics claim ids the row was read through
+    /// (carrick#1564), sorted. Empty on every other row.
+    pub library_semantics: Vec<String>,
+}
+
+/// What the summaries are composed from, as discovery leaves it: every
+/// file's functions and the call sites the call graph resolved. Held until
+/// the service's library semantics are verified, which needs detection and
+/// the service's sidecar (carrick#1564).
+#[derive(Debug, Default)]
+pub struct RequestSummaryInputs {
+    pub files: HashMap<PathBuf, FileIr>,
+    pub sites: CallSiteTargets,
 }
 
 /// Everything the pass states, per file (keyed by the file as walked).
@@ -1593,6 +2061,15 @@ pub struct RequestSummaryIndex {
 }
 
 impl RequestSummaryIndex {
+    /// Rows read through library semantics (carrick#1564).
+    pub fn library_row_count(&self) -> usize {
+        self.rows
+            .values()
+            .flat_map(|sites| sites.values().flatten())
+            .filter(|row| !row.library_semantics.is_empty())
+            .count()
+    }
+
     /// The rows at each call site of `file`, keyed by span start.
     pub fn rows(&self, file: &Path) -> Option<&BTreeMap<u32, Vec<SummaryRow>>> {
         self.rows.get(file)
@@ -1620,6 +2097,7 @@ impl RequestSummaryIndex {
 struct Composer<'a> {
     files: &'a HashMap<PathBuf, FileIr>,
     sites: &'a CallSiteTargets,
+    semantics: &'a LibrarySemantics,
     memo: HashMap<(PathBuf, String), Summary>,
     in_progress: HashSet<(PathBuf, String)>,
 }
@@ -1687,10 +2165,10 @@ impl Composer<'_> {
                     }
                 }
                 None => {
-                    if let Some(request) = &call.request {
+                    if let Some(request) = shape_of(call, self.semantics) {
                         summary
                             .effects
-                            .insert(Effect::from_shape(request, file, call.site.line));
+                            .insert(Effect::from_shape(&request, file, call.site.line));
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -1711,11 +2189,18 @@ impl Composer<'_> {
     }
 }
 
-/// Compose every function's summary and state the rows it supports.
-pub fn summarize(files: &HashMap<PathBuf, FileIr>, sites: &CallSiteTargets) -> RequestSummaryIndex {
+/// Compose every function's summary and state the rows it supports, reading
+/// calls through library clients with the semantics the service verified
+/// (carrick#1564; empty where it verified none).
+pub fn summarize(
+    inputs: &RequestSummaryInputs,
+    semantics: &LibrarySemantics,
+) -> RequestSummaryIndex {
+    let files = &inputs.files;
     let mut composer = Composer {
         files,
-        sites,
+        sites: &inputs.sites,
+        semantics,
         memo: HashMap::new(),
         in_progress: HashSet::new(),
     };
@@ -1804,15 +2289,19 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 }
             }
             None => {
-                if let Some(request) = &call.request
-                    && request.kind != RequestKind::Verb
-                    && !request.url_inline
-                {
-                    let effect = Effect::from_shape(request, file, call.site.line);
-                    if !effect.has_params() {
-                        match row(&effect, call, None, true) {
-                            Some(row) => rows.push(row),
-                            None => index.undetermined += 1,
+                // A call through a verified library client states its own
+                // row, and claims the site as a summary does anywhere else:
+                // the passes that read the site's own source cannot read the
+                // client's base, so their reading is not the one to keep.
+                if let Some(request) = shape_of(call, composer.semantics) {
+                    let library = request.kind == RequestKind::Library;
+                    if library || (request.kind != RequestKind::Verb && !request.url_inline) {
+                        let effect = Effect::from_shape(&request, file, call.site.line);
+                        if !effect.has_params() {
+                            match row(&effect, call, None, !library) {
+                                Some(row) => rows.push(row),
+                                None => index.undetermined += 1,
+                            }
                         }
                     }
                 }
@@ -1845,7 +2334,7 @@ fn row(
     let MethodValue::Lit(method) = &effect.method else {
         return None;
     };
-    let target = render_target(&effect.url)?;
+    let target = render_target(&join_base(&effect.base, &effect.url))?;
     let body_literals = effect
         .body
         .iter()
@@ -1864,7 +2353,195 @@ fn row(
         body_literals,
         reaches_request,
         own_site,
+        library_semantics: effect.semantics.iter().cloned().collect(),
     })
+}
+
+/// What a call sends when the call graph resolves it to nothing of this
+/// service: through a verified library client, what the client's claims say
+/// (carrick#1564); otherwise the shape the call is written in.
+fn shape_of<'c>(call: &'c CallIr, semantics: &LibrarySemantics) -> Option<Cow<'c, RequestShape>> {
+    call.receiver
+        .as_ref()
+        .and_then(|receiver| library_shape(receiver, &call.args, semantics))
+        .map(Cow::Owned)
+        .or_else(|| call.request.as_ref().map(Cow::Borrowed))
+}
+
+/// The request a call through a library client sends, read through the
+/// claims its package's declarations verified (carrick#1564).
+///
+/// `None` whenever those claims do not state both the URL and the method:
+/// the receiver or its factory did not verify, the instance's options hide
+/// the base key behind a spread, or a request call writes no literal
+/// method (a library's default is never assumed). The call then keeps the
+/// reading it has without the semantics. A body is read only through a
+/// verified body claim.
+fn library_shape(
+    receiver: &CallReceiver,
+    args: &[Value],
+    semantics: &LibrarySemantics,
+) -> Option<RequestShape> {
+    if semantics.is_empty() {
+        return None;
+    }
+    let client = &receiver.client;
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let (surface, base) = match &client.instance {
+        None => (
+            semantics.surface(&client.package, &client.export, "export")?,
+            Vec::new(),
+        ),
+        Some(instance) => {
+            let factory = semantics.factory(&client.package, &client.export, &instance.factory)?;
+            let surface = semantics.surface(
+                &client.package,
+                &client.export,
+                &instance_receiver(&instance.factory),
+            )?;
+            // The base is the literal or opaque value the options hold, or
+            // none when they do not name the key at all.
+            let base = match instance.options.fields.get(&factory.base_url_key) {
+                Some(Value::Str(pieces)) => pieces.clone(),
+                Some(_) => return None,
+                None if instance.options.open => return None,
+                None => Vec::new(),
+            };
+            used.insert(factory.claim_id.clone());
+            (surface, base)
+        }
+    };
+
+    let (method, url, body, body_claim) = match receiver
+        .member
+        .as_deref()
+        .and_then(|member| surface.verb(member))
+    {
+        Some(verb) => {
+            let Some(Value::Str(url)) = args.first() else {
+                return None;
+            };
+            used.insert(verb.claim_id.clone());
+            let (body, body_claim) = match &verb.body {
+                Some(claim) => {
+                    let body = match (claim.args, args.get(1), &claim.body_key) {
+                        (SemanticsVerbArgs::PathBody, Some(value), _) => body_of(value),
+                        (SemanticsVerbArgs::PathOptions, Some(Value::Obj(options)), Some(key)) => {
+                            options.fields.get(key).map(body_of).unwrap_or_default()
+                        }
+                        _ => BodyValue::Unstated,
+                    };
+                    (body, Some(claim.claim_id.clone()))
+                }
+                None => (BodyValue::Unstated, None),
+            };
+            (
+                MethodValue::Lit(verb.method.clone()),
+                url.clone(),
+                body,
+                body_claim,
+            )
+        }
+        None => {
+            let request = surface
+                .requests(receiver.member.as_deref())
+                .find(|request| {
+                    matches!(
+                        (request.args, args.first()),
+                        (SemanticsRequestArgs::Config, Some(Value::Obj(_)))
+                            | (SemanticsRequestArgs::PathOptions, Some(Value::Str(_)))
+                    )
+                })?;
+            let (url, options) = match (request.args, args.first(), args.get(1)) {
+                (SemanticsRequestArgs::Config, Some(Value::Obj(config)), _) => {
+                    match config.fields.get(request.url_key.as_deref()?) {
+                        Some(Value::Str(url)) => (url.clone(), config),
+                        _ => return None,
+                    }
+                }
+                (
+                    SemanticsRequestArgs::PathOptions,
+                    Some(Value::Str(url)),
+                    Some(Value::Obj(options)),
+                ) => (url.clone(), options),
+                _ => return None,
+            };
+            let method = match options.fields.get(&request.method_key) {
+                Some(Value::Str(pieces)) => method_of(pieces),
+                _ => MethodValue::Unknown,
+            };
+            if method == MethodValue::Unknown {
+                return None;
+            }
+            used.insert(request.claim_id.clone());
+            let (body, body_claim) = match &request.body {
+                Some((claim_id, key)) => (
+                    options.fields.get(key).map(body_of).unwrap_or_default(),
+                    Some(claim_id.clone()),
+                ),
+                None => (BodyValue::Unstated, None),
+            };
+            (method, url, body, body_claim)
+        }
+    };
+    if body != BodyValue::Unstated
+        && let Some(claim_id) = body_claim
+    {
+        used.insert(claim_id);
+    }
+
+    Some(RequestShape {
+        kind: RequestKind::Library,
+        method,
+        url,
+        body,
+        url_inline: false,
+        base,
+        semantics: used,
+    })
+}
+
+/// A library client's base and a call's path, as one URL (carrick#1564).
+///
+/// Joined with exactly one slash between them, and a path that is itself an
+/// absolute URL ignores the base, as a client resolving against a base does.
+/// A path that does not start with text the source writes says nothing about
+/// the slash between the two, so the join states no URL.
+fn join_base(base: &[Piece], path: &[Piece]) -> Vec<Piece> {
+    if base.is_empty() {
+        return path.to_vec();
+    }
+    let Some(Piece::Lit(first)) = path.first() else {
+        return vec![Piece::Unknown];
+    };
+    if is_absolute_url(first) {
+        return path.to_vec();
+    }
+    let mut path = path.to_vec();
+    let base_slash = matches!(base.last(), Some(Piece::Lit(text)) if text.ends_with('/'));
+    let path_slash = first.starts_with('/');
+    let separator = match (base_slash, path_slash) {
+        (true, true) => {
+            if let Some(Piece::Lit(text)) = path.first_mut() {
+                text.remove(0);
+            }
+            Vec::new()
+        }
+        (false, false) if !first.is_empty() => vec![Piece::Lit("/".to_string())],
+        _ => Vec::new(),
+    };
+    concat([base.to_vec(), separator, path])
+}
+
+/// `scheme://…` or a protocol-relative `//…`.
+fn is_absolute_url(text: &str) -> bool {
+    text.starts_with("//")
+        || text.split_once("://").is_some_and(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
 }
 
 /// A URL written the way the scanner's other rows write one: literal text,
@@ -1992,6 +2669,46 @@ mod tests {
             render_target(&[lit("/users/"), Piece::Param(0, "id".to_string())]).as_deref(),
             Some("/users/${id}")
         );
+    }
+
+    /// carrick#1564: a client's base and a call's path meet at exactly one
+    /// slash, and a path that is a URL of its own ignores the base.
+    #[test]
+    fn a_base_and_a_path_join_with_exactly_one_slash() {
+        let joined = |base: &[Piece], path: &[Piece]| render_target(&join_base(base, path));
+        assert_eq!(
+            joined(&[lit("/api")], &[lit("/users")]).as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(
+            joined(&[lit("/api/")], &[lit("/users")]).as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(
+            joined(&[lit("/api/")], &[lit("users")]).as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(
+            joined(&[lit("/api")], &[lit("users")]).as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(
+            joined(&[opaque("process.env.API")], &[lit("users/"), opaque("id")]).as_deref(),
+            Some("${process.env.API}/users/${id}")
+        );
+        // No base: the path is the URL.
+        assert_eq!(joined(&[], &[lit("/users")]).as_deref(), Some("/users"));
+        // A URL of its own ignores the base.
+        assert_eq!(
+            join_base(&[lit("/api")], &[lit("https://other.example/x")]),
+            vec![lit("https://other.example/x")]
+        );
+        assert_eq!(
+            join_base(&[lit("/api")], &[lit("//cdn.example/x")]),
+            vec![lit("//cdn.example/x")]
+        );
+        // A path that does not start with text says nothing about the slash.
+        assert_eq!(joined(&[lit("/api")], &[opaque("path")]), None);
     }
 
     #[test]

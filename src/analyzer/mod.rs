@@ -5028,6 +5028,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             });
 
             let (findings, _verified, _edges) =
@@ -5122,6 +5123,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
 
         let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5550,6 +5552,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5665,6 +5668,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
         analyzer
             .calls
@@ -5749,6 +5753,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
         analyzer
             .calls
@@ -5816,6 +5821,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -7265,6 +7271,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }
     }
 

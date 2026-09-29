@@ -91,6 +91,7 @@ fn create_express_detection() -> DetectionResult {
         messaging_clients: vec![],
         socket_clients: vec![],
         notes: "Test detection result".to_string(),
+        client_semantics: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn test_file_analysis_result_structures() {
         dispatch: None,
         reaches_request: None,
         body_literals: Default::default(),
+        library_semantics: Vec::new(),
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -258,6 +260,7 @@ fn test_file_analysis_result_serialization() {
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }],
         dispatch_tables: Vec::new(),
     };
@@ -618,6 +621,7 @@ fn test_data_call_extraction() {
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
             DataCallResult {
                 call_kind: None,
@@ -642,6 +646,7 @@ fn test_data_call_extraction() {
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
             DataCallResult {
                 call_kind: None,
@@ -666,6 +671,7 @@ fn test_data_call_extraction() {
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             },
         ],
         dispatch_tables: Vec::new(),

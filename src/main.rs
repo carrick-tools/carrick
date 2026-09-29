@@ -8,6 +8,7 @@ mod boundary;
 mod call_base;
 mod call_graph;
 mod call_site_extractor;
+mod client_semantics;
 mod cloud_storage;
 mod commonjs;
 mod config;

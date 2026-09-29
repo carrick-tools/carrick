@@ -6336,6 +6336,7 @@ impl FileOrchestrator {
                     // here states the target, so there is nothing to reach.
                     reaches_request: None,
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 })),
             });
         }
@@ -6435,6 +6436,7 @@ impl FileOrchestrator {
                 resolution_source: Some(ResolutionSource::RequestSummary),
                 reaches_request: row.reaches_request.clone(),
                 body_literals: row.body_literals.clone(),
+                library_semantics: row.library_semantics.clone(),
             })),
         }
     }
@@ -6613,6 +6615,7 @@ impl FileOrchestrator {
             // that links a call through a declaration never touches one.
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }
     }
 
@@ -9187,6 +9190,9 @@ impl FileOrchestrator {
                         // dispatches on (carrick#831). Read by matching, and
                         // only against a producer that dispatches.
                         dispatch: data_call.dispatch.clone(),
+                        // The library claims the row was read through
+                        // (carrick#1564).
+                        library_semantics: data_call.library_semantics.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -11445,6 +11451,7 @@ export * from "./aFetch.js";"#,
                     dispatch: None,
                     reaches_request: None,
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -11502,6 +11509,7 @@ export * from "./aFetch.js";"#,
                     dispatch: None,
                     reaches_request: None,
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 }
             };
 
@@ -11587,6 +11595,7 @@ export * from "./aFetch.js";"#,
                     dispatch: None,
                     reaches_request: Some("src/lib/things.ts:12".to_string()),
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 }],
                 ..Default::default()
             },
@@ -11756,6 +11765,7 @@ export * from "./aFetch.js";"#,
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }
     }
 
@@ -12211,6 +12221,7 @@ export * from "./aFetch.js";"#,
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             }],
             ..Default::default()
         };
@@ -12304,6 +12315,7 @@ export * from "./aFetch.js";"#,
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         };
 
         let mut file_results = HashMap::new();
@@ -12429,6 +12441,7 @@ export * from "./aFetch.js";"#,
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         };
 
         let mut file_results = HashMap::new();
@@ -12527,6 +12540,7 @@ export * from "./aFetch.js";"#,
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -12619,6 +12633,7 @@ export * from "./aFetch.js";"#,
                         dispatch: None,
                         reaches_request: None,
                         body_literals: Default::default(),
+                        library_semantics: Vec::new(),
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12643,6 +12658,7 @@ export * from "./aFetch.js";"#,
                         dispatch: None,
                         reaches_request: None,
                         body_literals: Default::default(),
+                        library_semantics: Vec::new(),
                     },
                 ],
                 graphql_operations: vec![],
@@ -12704,6 +12720,7 @@ export * from "./aFetch.js";"#,
                     dispatch: None,
                     reaches_request: None,
                     body_literals: Default::default(),
+                    library_semantics: Vec::new(),
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -12768,6 +12785,7 @@ export * from "./aFetch.js";"#,
                         dispatch: None,
                         reaches_request: None,
                         body_literals: Default::default(),
+                        library_semantics: Vec::new(),
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12792,6 +12810,7 @@ export * from "./aFetch.js";"#,
                         dispatch: None,
                         reaches_request: None,
                         body_literals: Default::default(),
+                        library_semantics: Vec::new(),
                     },
                 ],
                 graphql_operations: vec![],
@@ -13400,6 +13419,7 @@ export * from "./aFetch.js";"#,
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -13507,6 +13527,7 @@ export * from "./aFetch.js";"#,
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -13869,6 +13890,7 @@ export * from "./aFetch.js";"#,
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -16355,6 +16377,7 @@ export { routes };
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }
     }
 
@@ -18488,6 +18511,7 @@ export function publishWrapped(order: OrderPlaced): void {
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         }
     }
 

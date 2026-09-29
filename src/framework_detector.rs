@@ -37,6 +37,33 @@ pub struct DetectionResult {
     #[serde(default)]
     pub socket_clients: Vec<String>,
     pub notes: String,
+    /// How each data-fetching package builds its requests, answered per
+    /// `package@major` because the request asks for it
+    /// ([`FrameworkDetectionInput::ask_client_semantics`], carrick#1564).
+    ///
+    /// `None` means never asked: a detection from before the field existed,
+    /// or a cloud that does not answer it yet. Read leniently, one element at
+    /// a time, so this field can never fail a detection. Every claim in it is
+    /// checked against the package's own declarations before anything uses
+    /// it; see [`crate::client_semantics`].
+    #[serde(
+        default,
+        deserialize_with = "crate::client_semantics::deserialize_entries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_semantics: Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+}
+
+impl DetectionResult {
+    /// Whether two detections name the same packages in every list the
+    /// guidance and the analysis are keyed on, each compared as a set.
+    pub fn same_lists(&self, other: &DetectionResult) -> bool {
+        let set = |list: &[String]| list.iter().cloned().collect::<BTreeSet<String>>();
+        set(&self.frameworks) == set(&other.frameworks)
+            && set(&self.data_fetchers) == set(&other.data_fetchers)
+            && set(&self.messaging_clients) == set(&other.messaging_clients)
+            && set(&self.socket_clients) == set(&other.socket_clients)
+    }
 }
 
 /// Input data for LLM-based framework detection.
@@ -55,6 +82,11 @@ pub struct DetectionResult {
 struct FrameworkDetectionInput {
     package_json: PackageJsonSummary,
     imports: Vec<String>,
+    /// Always `true`: this scanner reads `client_semantics`, so the cloud
+    /// answers it (carrick#1564). The opt-in is what keeps a cloud deployed
+    /// first from paying for semantics a released scanner cannot use. Neither
+    /// the detection prompt nor its cache key reads it.
+    ask_client_semantics: bool,
 }
 
 /// Simplified package.json summary for LLM analysis. `BTreeMap` so the JSON
@@ -196,6 +228,7 @@ fn build_detection_input(
     FrameworkDetectionInput {
         package_json: extract_package_summary(packages),
         imports: extract_import_statements(imports),
+        ask_client_semantics: true,
     }
 }
 
@@ -379,6 +412,99 @@ mod tests {
             forward, reversed,
             "the framework-detect body must not depend on the order files were parsed in"
         );
+        // The opt-in rides every request (carrick#1564), inside the bytes
+        // that must not move.
+        let body: serde_json::Value = serde_json::from_str(&forward).unwrap();
+        assert_eq!(body["ask_client_semantics"], serde_json::json!(true));
+    }
+
+    /// The contract sample (carrick#1564), byte for byte as both repos hold it.
+    const SAMPLE: &str = include_str!(
+        "../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+    );
+
+    fn sample_with(semantics: Option<serde_json::Value>) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        let object = value.as_object_mut().unwrap();
+        match semantics {
+            Some(semantics) => object.insert("client_semantics".to_string(), semantics),
+            None => object.remove("client_semantics"),
+        };
+        value.to_string()
+    }
+
+    fn assert_lists_parse(detection: &DetectionResult) {
+        assert_eq!(detection.data_fetchers.len(), 4, "{detection:?}");
+        assert!(detection.frameworks.is_empty());
+    }
+
+    #[test]
+    fn the_contract_sample_parses() {
+        let detection: DetectionResult = serde_json::from_str(SAMPLE).expect("the sample parses");
+        assert_lists_parse(&detection);
+        let entries = detection.client_semantics.expect("the sample answers");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].package, "@fixture/http");
+        assert_eq!(entries[0].clients[0].verbs.len(), 2);
+        assert_eq!(entries[1].clients[0].factories[0].base_url_key, "prefixUrl");
+    }
+
+    #[test]
+    fn an_answer_without_the_field_was_never_asked() {
+        let detection: DetectionResult = serde_json::from_str(&sample_with(None)).unwrap();
+        assert_lists_parse(&detection);
+        assert_eq!(detection.client_semantics, None);
+
+        // And a detection this scanner persisted without it reads back the
+        // same way, with the key absent rather than null.
+        let persisted = serde_json::to_value(&detection).unwrap();
+        assert!(persisted.get("client_semantics").is_none());
+    }
+
+    #[test]
+    fn a_field_that_is_not_an_array_reads_as_never_asked() {
+        for odd in [
+            serde_json::Value::Null,
+            serde_json::json!("answered"),
+            serde_json::json!(7),
+            serde_json::json!({ "package": "@fixture/http" }),
+        ] {
+            let detection: DetectionResult = serde_json::from_str(&sample_with(Some(odd.clone())))
+                .unwrap_or_else(|e| panic!("{odd} must not fail the detection: {e}"));
+            assert_lists_parse(&detection);
+            assert_eq!(detection.client_semantics, None, "{odd}");
+        }
+    }
+
+    #[test]
+    fn one_malformed_claim_drops_on_its_own() {
+        let mut value: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        let mut semantics = value["client_semantics"].take();
+        semantics[0]["clients"][0]["verbs"][1]["method"] = serde_json::json!(42);
+        let detection: DetectionResult =
+            serde_json::from_str(&sample_with(Some(semantics))).unwrap();
+        assert_lists_parse(&detection);
+        let entries = detection.client_semantics.unwrap();
+        assert_eq!(entries.len(), 4);
+        let verbs: Vec<&str> = entries[0].clients[0]
+            .verbs
+            .iter()
+            .map(|verb| verb.member.as_str())
+            .collect();
+        assert_eq!(verbs, vec!["get"], "the bad verb goes, its sibling stays");
+        assert_eq!(entries[0].clients[0].requests.len(), 2);
+    }
+
+    #[test]
+    fn detections_with_the_same_lists_in_another_order_are_the_same() {
+        let detection: DetectionResult = serde_json::from_str(SAMPLE).unwrap();
+        let mut reordered = detection.clone();
+        reordered.data_fetchers.reverse();
+        reordered.notes = "other words".to_string();
+        reordered.client_semantics = None;
+        assert!(detection.same_lists(&reordered));
+        reordered.data_fetchers.pop();
+        assert!(!detection.same_lists(&reordered));
     }
 
     #[test]

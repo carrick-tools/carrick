@@ -801,6 +801,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }];
         data.mount_graph = Some(graph);
         data
@@ -944,6 +945,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }];
         sdk.mount_graph = Some(graph);
 
@@ -1005,6 +1007,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         }];
         data.mount_graph = Some(graph);
         data

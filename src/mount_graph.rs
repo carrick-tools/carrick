@@ -324,6 +324,12 @@ pub struct DataFetchingCall {
     /// cannot say which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<crate::dispatch::Dispatch>,
+    /// The library-semantics claim ids the row was read through
+    /// (carrick#1564), carried from the per-file row. Empty on every row not
+    /// read through a library client. Retention only: nothing in matching
+    /// reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_semantics: Vec<String>,
 }
 
 /// The complete mount and endpoint graph
@@ -726,6 +732,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -754,6 +761,9 @@ mod tests {
         // And one field further (carrick#1402): a row naming no request site
         // reaches nothing this scan read, which is every request row.
         assert_eq!(older.reaches_request, None);
+        // A row written before library semantics existed (carrick#1564) was
+        // read through none.
+        assert!(older.library_semantics.is_empty());
 
         let retained = DataFetchingCall {
             host: Some("api.vendor.test".to_string()),
@@ -763,9 +773,23 @@ mod tests {
             ),
             role: Some(ConsumerRole::WrapperCall),
             reaches_request: Some("src/lib/client.ts:88".to_string()),
+            library_semantics: vec![
+                "@fixture/http@1:default:factory:create".to_string(),
+                "@fixture/http@1:default:verb:get".to_string(),
+            ],
             ..call
         };
         let json = serde_json::to_value(&retained).unwrap();
+        assert_eq!(
+            json["library_semantics"],
+            serde_json::json!([
+                "@fixture/http@1:default:factory:create",
+                "@fixture/http@1:default:verb:get"
+            ]),
+            "the claim ids the row was read through, as a list"
+        );
+        let back: DataFetchingCall = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.library_semantics, retained.library_semantics);
         assert_eq!(json["host"], serde_json::json!("api.vendor.test"));
         assert_eq!(json["line"], serde_json::json!(4));
         assert_eq!(json["role"], serde_json::json!("wrapper_call"));
@@ -1500,6 +1524,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

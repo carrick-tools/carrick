@@ -1569,6 +1569,7 @@ mod tests {
                 messaging_clients: vec![],
                 socket_clients: vec![],
                 notes: String::new(),
+                client_semantics: None,
             },
             framework_guidance: ProtocolGuidance::new(),
             mount_graph: MountGraph::new(),
@@ -1731,6 +1732,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1804,6 +1806,7 @@ mod tests {
             dispatch: Some(case("search-by-intent")),
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1933,6 +1936,7 @@ mod tests {
             dispatch: None,
             role: None,
             reaches_request: None,
+            library_semantics: Vec::new(),
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);

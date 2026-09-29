@@ -38,6 +38,7 @@ async fn fetch_extraction_config_parses_canned_rules() {
         messaging_clients: vec![],
         socket_clients: vec![],
         notes: String::new(),
+        client_semantics: None,
     };
     let dependencies = vec!["fastify".to_string(), "got".to_string()];
 

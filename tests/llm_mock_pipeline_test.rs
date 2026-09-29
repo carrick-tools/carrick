@@ -64,6 +64,7 @@ fn express_detection() -> DetectionResult {
         messaging_clients: vec![],
         socket_clients: vec![],
         notes: String::new(),
+        client_semantics: None,
     }
 }
 

@@ -519,6 +519,15 @@ pub struct DataCallResult {
     /// Never from the model. Empty on every row the summaries did not state.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub body_literals: std::collections::BTreeMap<String, String>,
+    /// The library-semantics claim ids this row was read through
+    /// (carrick#1564): the client-library facts framework detection stated and
+    /// the package's own declarations verified, which said where the source's
+    /// literals sit. Sorted.
+    ///
+    /// Never from the model. Empty on every row the summaries did not read
+    /// through a library client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_semantics: Vec<String>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1925,6 +1934,7 @@ mod tests {
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
+            library_semantics: Vec::new(),
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1987,6 +1997,7 @@ mod tests {
                 dispatch: None,
                 reaches_request: None,
                 body_literals: Default::default(),
+                library_semantics: Vec::new(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

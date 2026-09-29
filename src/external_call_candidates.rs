@@ -3820,6 +3820,7 @@ mod tests {
                 dispatch: None,
                 role: None,
                 reaches_request: None,
+                library_semantics: Vec::new(),
             }
         }
 

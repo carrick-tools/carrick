@@ -1,0 +1,48 @@
+{
+  "frameworks": [],
+  "data_fetchers": ["@fixture/http", "fixture-prefix-http", "fixture-slow-http", "@fixture/internal-sdk"],
+  "messaging_clients": [],
+  "socket_clients": [],
+  "notes": "",
+  "client_semantics": [
+    {
+      "package": "@fixture/http",
+      "major": 1,
+      "status": "answered",
+      "clients": [
+        {
+          "export": "default",
+          "factories": [{ "member": "create", "base_url_key": "baseURL" }],
+          "verbs": [
+            { "member": "get", "method": "GET", "args": "path_options" },
+            { "member": "post", "method": "POST", "args": "path_body" }
+          ],
+          "requests": [
+            { "member": "request", "args": "config", "url_key": "url", "method_key": "method", "body_key": "data" },
+            { "member": null, "args": "config", "url_key": "url", "method_key": "method", "body_key": "data" }
+          ]
+        }
+      ]
+    },
+    {
+      "package": "fixture-prefix-http",
+      "major": 2,
+      "status": "answered",
+      "clients": [
+        {
+          "export": "default",
+          "factories": [{ "member": "create", "base_url_key": "prefixUrl" }],
+          "verbs": [
+            { "member": "get", "method": "GET", "args": "path_options" },
+            { "member": "post", "method": "POST", "args": "path_options", "body_key": "json" }
+          ],
+          "requests": [
+            { "member": null, "args": "path_options", "method_key": "method", "body_key": "json" }
+          ]
+        }
+      ]
+    },
+    { "package": "fixture-slow-http", "major": 3, "status": "pending", "clients": [] },
+    { "package": "@fixture/internal-sdk", "major": null, "status": "skipped", "clients": [] }
+  ]
+}
