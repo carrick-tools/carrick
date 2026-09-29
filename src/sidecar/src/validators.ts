@@ -391,9 +391,9 @@ const SemanticsCheckSchema = z.object({
   claim_id: z.string().min(1),
   package: z.string().min(1),
   export: z.string().min(1),
-  receiver: z
-    .string()
-    .regex(/^(export|instance:\S+)$/, 'receiver must be "export" or "instance:<factory member>"'),
+  // Any other receiver answers `unchecked` (`receiver_invalid`) on its own
+  // rather than failing the batch.
+  receiver: z.string().min(1),
   claim: SemanticsClaimSchema,
 });
 

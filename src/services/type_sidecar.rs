@@ -1650,11 +1650,7 @@ impl TypeSidecar {
         };
         self.send_request(&request)?;
         let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
-        if response.status != "success" {
-            let errors = response.errors.unwrap_or_default();
-            return Err(SidecarError::CheckFailed(errors.join("; ")));
-        }
-        Ok(response.semantics.unwrap_or_default())
+        read_semantics(response, checks)
     }
 
     /// Run the v2 "tsc as serializer" capture for one service, producing a
@@ -2372,6 +2368,43 @@ impl std::error::Error for SidecarError {}
 // Tests
 // ============================================================================
 
+/// The verdicts of a `verify_client_semantics` response, one per check in
+/// request order (carrick#1564). A response that answers a different set of
+/// checks is an error, never a partial answer: the scanner pairs verdicts
+/// with claims by position. A response with no `semantics` reads as empty.
+fn read_semantics(
+    response: SidecarResponse,
+    checks: &[SemanticsCheck],
+) -> Result<Vec<SemanticsResult>, SidecarError> {
+    if response.status != "success" {
+        let errors = response.errors.unwrap_or_default();
+        return Err(SidecarError::CheckFailed(errors.join("; ")));
+    }
+    for module in response.semantics_modules.unwrap_or_default() {
+        debug!(
+            "[type_sidecar] client semantics module {}: file {:?}, version {:?}, reason {:?}",
+            module.package, module.resolved_file, module.installed_version, module.reason
+        );
+    }
+    let semantics = response.semantics.unwrap_or_default();
+    if semantics.len() != checks.len() {
+        return Err(SidecarError::CheckFailed(format!(
+            "verify_client_semantics answered {} of {} checks",
+            semantics.len(),
+            checks.len()
+        )));
+    }
+    if let Some((result, check)) = semantics.iter().zip(checks).find(|(result, check)| {
+        result.claim_id != check.claim_id || result.receiver != check.receiver
+    }) {
+        return Err(SidecarError::CheckFailed(format!(
+            "verify_client_semantics answered {} @ {} where {} @ {} was asked",
+            result.claim_id, result.receiver, check.claim_id, check.receiver
+        )));
+    }
+    Ok(semantics)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2742,6 +2775,74 @@ mod tests {
         let response: SidecarResponse = serde_json::from_str(bare).unwrap();
         assert_eq!(response.semantics.unwrap_or_default(), Vec::new());
         assert!(response.semantics_modules.is_none());
+    }
+
+    /// The scanner pairs verdicts with claims by position, so a response that
+    /// answers a different set of checks is an error rather than a partial
+    /// answer, and an error status carries the sidecar's message.
+    #[test]
+    fn read_semantics_requires_one_verdict_per_check_in_order() {
+        let check = |claim_id: &str, receiver: &str| SemanticsCheck {
+            claim_id: claim_id.into(),
+            package: "@fixture/http".into(),
+            export: "default".into(),
+            receiver: receiver.into(),
+            claim: SemanticsClaim::Verb {
+                member: "get".into(),
+                method: "GET".into(),
+            },
+        };
+        let checks = [check("a", "export"), check("b", "instance:create")];
+        let response =
+            |json: serde_json::Value| -> SidecarResponse { serde_json::from_value(json).unwrap() };
+        let verdict = |claim_id: &str, receiver: &str| serde_json::json!({ "claim_id": claim_id, "receiver": receiver, "verdict": "verified" });
+
+        let answered = read_semantics(
+            response(serde_json::json!({
+                "request_id": "1", "status": "success",
+                "semantics": [verdict("a", "export"), verdict("b", "instance:create")],
+                "semantics_modules": [{ "package": "@fixture/http" }]
+            })),
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(answered.len(), 2);
+
+        let short = read_semantics(
+            response(serde_json::json!({
+                "request_id": "2", "status": "success",
+                "semantics": [verdict("a", "export")]
+            })),
+            &checks,
+        );
+        assert!(matches!(short, Err(SidecarError::CheckFailed(m)) if m.contains("1 of 2")));
+
+        let missing = read_semantics(
+            response(serde_json::json!({ "request_id": "3", "status": "success" })),
+            &checks,
+        );
+        assert!(matches!(missing, Err(SidecarError::CheckFailed(m)) if m.contains("0 of 2")));
+
+        let swapped = read_semantics(
+            response(serde_json::json!({
+                "request_id": "4", "status": "success",
+                "semantics": [verdict("b", "instance:create"), verdict("a", "export")]
+            })),
+            &checks,
+        );
+        assert!(
+            matches!(swapped, Err(SidecarError::CheckFailed(m)) if m.contains("where a @ export"))
+        );
+
+        let refused = read_semantics(
+            response(serde_json::json!({
+                "request_id": "5", "status": "error", "errors": ["Sidecar not initialized"]
+            })),
+            &checks,
+        );
+        assert!(
+            matches!(refused, Err(SidecarError::CheckFailed(m)) if m == "Sidecar not initialized")
+        );
     }
 
     #[test]
