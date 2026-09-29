@@ -183,6 +183,11 @@ impl ConsumerRole {
             | S::NewUrl
             | S::ReceiverType
             | S::InlineLiteral => Some(Self::NetworkRequest),
+            // A request summary states both roles (carrick#1555): the row is
+            // a call through a declaration exactly when it names the request
+            // it reaches, which this match cannot see. Classified where the
+            // row is, with its `reaches_request`.
+            S::RequestSummary => None,
             // The model's own reading, and the sources that only ever state a
             // ROUTE. Neither says what a consumer row is.
             S::Model

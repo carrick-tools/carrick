@@ -49,6 +49,7 @@ use crate::{
     operation::{OperationKey, Protocol},
     parser::parse_file,
     receiver_origin::{ReceiverOrigins, collect_receiver_origins},
+    request_summary::{RequestSummaryIndex, SummaryRow},
     services::type_sidecar::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
@@ -189,6 +190,12 @@ pub struct ProcessingStats {
     /// fact with two provenances. A subset of `total_endpoints` +
     /// `total_data_calls`. See [`ResolutionSource`].
     pub deterministic_rows_emitted: BTreeMap<ResolutionSource, usize>,
+    /// Model rows withdrawn at call sites whose callee provably sends nothing
+    /// (carrick#1555).
+    pub summary_rows_withdrawn: usize,
+    /// Summary rows whose dispatch value was settled from their own body
+    /// under the field the request line's row names (carrick#1555).
+    pub summary_dispatch_settled: usize,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
     /// anchors themselves are computed for every gated file; only the ones the
@@ -872,6 +879,9 @@ pub struct FileOrchestrator {
     /// guidance that is not the service's own. Same posture as local mode, for
     /// one service rather than the whole process.
     model_deferred: bool,
+    /// What each call site's callee sends, composed over the call graph at
+    /// discovery (carrick#1555). Empty unless the engine hands one over.
+    request_summaries: RequestSummaryIndex,
 }
 
 /// What the model had to say about one file, once every source of an answer
@@ -962,6 +972,14 @@ impl ResolutionSource {
             // ranked below the env rule so that if a file ever declared both,
             // the environment's reading is the one kept.
             Self::LiteralBasePath => 6,
+            // A request summary states what the imported-member join states
+            // and more, through the call graph rather than by name, so where
+            // both claim a site they agree or the summary is the better
+            // witness. Claimed before the per-candidate passes, so it holds a
+            // site the member join also reaches. Below the base rules: at a
+            // request's own line those read the env binding a base came from,
+            // and a summary keeps it opaque.
+            Self::RequestSummary => 5,
             Self::ImportedMember => 5,
             Self::RequestSpec => 4,
             Self::NewUrl => 3,
@@ -1022,7 +1040,15 @@ impl FileOrchestrator {
             file_analyzer: FileAnalyzerAgent::new(agent_service),
             swc_scanner: SwcScanner::new(),
             model_deferred: false,
+            request_summaries: RequestSummaryIndex::default(),
         }
+    }
+
+    /// The request summaries discovery composed for this service
+    /// (carrick#1555), read by the deterministic layer.
+    pub fn with_request_summaries(mut self, summaries: RequestSummaryIndex) -> Self {
+        self.request_summaries = summaries;
+        self
     }
 
     /// The same orchestrator, sending no file to the model.
@@ -1266,6 +1292,9 @@ impl FileOrchestrator {
             /// is called. These become the file's rows; the model's answer is
             /// joined onto them. See [`FileOrchestrator::resolve_candidates`].
             resolved: Vec<Resolved>,
+            /// Call sites whose callee provably sends nothing (carrick#1555),
+            /// by span start: a model row at one is withdrawn after the join.
+            silent_sites: BTreeSet<u32>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1311,6 +1340,10 @@ impl FileOrchestrator {
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
             dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
         ) {
+            // A model row at a site whose callee provably sends nothing is
+            // the model reading a request into a name (carrick#1555).
+            stats.summary_rows_withdrawn +=
+                FileOrchestrator::withdraw_silent_sites(adjusted, &pf.silent_sites);
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
             // passes over the joined rows, because it tells a
@@ -1396,11 +1429,17 @@ impl FileOrchestrator {
             // `get`) is a producer, not a consumer that went
             // unfollowed — the same exclusion the emission applies
             // before it states a row.
+            // A site the request summaries state (carrick#1555) was followed,
+            // through the call graph rather than by name, and is not lost.
             for (span, name) in &pf.unresolved_member_sites {
                 if adjusted
                     .endpoints
                     .iter()
                     .any(|endpoint| endpoint.call_expression_span_start == Some(*span))
+                    || adjusted.data_calls.iter().any(|call| {
+                        call.call_expression_span_start == Some(*span)
+                            && call.resolution_source == Some(ResolutionSource::RequestSummary)
+                    })
                 {
                     continue;
                 }
@@ -1741,6 +1780,9 @@ impl FileOrchestrator {
                             // No call-site candidates here by construction, so
                             // no receiver to ask about.
                             &HashMap::new(),
+                            self.request_summaries
+                                .rows(file_path)
+                                .unwrap_or(&BTreeMap::new()),
                         ),
                         &mut stats.deterministic_rows_emitted,
                     );
@@ -1866,6 +1908,7 @@ impl FileOrchestrator {
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
+                silent_sites: BTreeSet::new(),
             });
         }
 
@@ -2215,7 +2258,34 @@ impl FileOrchestrator {
                 // The zero-cost skip, and the one the cache must not freeze:
                 // this file is re-examined by phase 1 on every scan, so a
                 // scanner that later raises a candidate for it dispatches it.
-                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                //
+                // What its calls through declarations send is the source's to
+                // state all the same (carrick#1555): the call graph found them
+                // where the candidate scanner raised nothing, and no model call
+                // is needed to emit them.
+                let mut result = FileAnalysisResult::default();
+                if let Some(summary_rows) = self.request_summaries.rows(&deferred.file_path) {
+                    let _ = Self::emit_resolved_rows(
+                        &mut result,
+                        Self::resolve_candidates(
+                            &HashMap::new(),
+                            &HashMap::new(),
+                            &[],
+                            &EnvAliasMap::new(),
+                            &WholeUrlFallbackMap::new(),
+                            &EnvFallbackMap::new(),
+                            &LiteralBaseMap::new(),
+                            &[],
+                            &[],
+                            &[],
+                            &HashMap::new(),
+                            summary_rows,
+                        ),
+                        &mut stats.deterministic_rows_emitted,
+                    );
+                    stats.total_data_calls += result.data_calls.len();
+                }
+                file_results.insert(deferred.path_str, result);
                 continue;
             }
             debug!(
@@ -2273,6 +2343,7 @@ impl FileOrchestrator {
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
+                silent_sites: BTreeSet::new(),
             });
         }
 
@@ -2383,7 +2454,12 @@ impl FileOrchestrator {
             &mut stats,
         );
         let empty_roles: HashMap<u32, ReceiverRole> = HashMap::new();
+        let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
         for pf in &mut pending {
+            let file = Path::new(&pf.path_str);
+            if let Some(silent) = self.request_summaries.silent(file) {
+                pf.silent_sites = silent.clone();
+            }
             pf.resolved = Self::resolve_candidates(
                 &pf.candidate_map,
                 &pf.resolved_members,
@@ -2396,6 +2472,9 @@ impl FileOrchestrator {
                 &pf.descriptor_endpoints,
                 &pf.decorator_endpoints,
                 receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
+                self.request_summaries
+                    .rows(file)
+                    .unwrap_or(&no_summary_rows),
             );
         }
 
@@ -2921,6 +3000,9 @@ impl FileOrchestrator {
         // the wrapper's file and the row is in the consumer's, so neither
         // file's own pass can see both.
         let carried = Self::carry_wrapper_dispatch(&mut file_results, &dispatch_sites, &analysed);
+        // The dispatch value a call through a declaration sends, from its own
+        // body, under the field the request line's row names (carrick#1555).
+        stats.summary_dispatch_settled = Self::settle_reached_dispatch(&mut file_results);
         if carried > 0 {
             debug!("  - Rows carrying a wrapper's dispatch value: {carried}");
         }
@@ -5862,6 +5944,10 @@ impl FileOrchestrator {
         // IS, keyed by the candidate's span start (carrick#695). Empty when no
         // sidecar answered, which is exactly today's behaviour.
         receiver_roles: &HashMap<u32, ReceiverRole>,
+        // What each call site's callee sends, from the request summaries
+        // (carrick#1555), keyed by span start. A site may reach more than
+        // one request.
+        summary_rows: &BTreeMap<u32, Vec<SummaryRow>>,
     ) -> Vec<Resolved> {
         // Keyed by the span START, which is the join key: a chained call
         // (`client.cancelRun(id).catch(fn)`) raises a candidate per link and
@@ -5897,6 +5983,44 @@ impl FileOrchestrator {
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .collect();
         candidates.sort_by_key(|candidate| (candidate.span_start, candidate.span_end));
+
+        // What each site's callee sends, read off the callee's body and
+        // composed over the call graph (carrick#1555). Claimed first: the
+        // member join states the same site from the same body where it can,
+        // and at equal rank the first claim holds. A site reaching several
+        // requests states one row per request; the ones after the first are
+        // kept aside and emitted only if the summary holds the site.
+        //
+        // A request's OWN line is different: there the passes that read the
+        // site's own source state it too, each with the spelling its base
+        // rules settle on, and they are kept. A summary row there only fills
+        // a site nothing else states.
+        let mut summary_extras: Vec<(u32, Resolved)> = Vec::new();
+        let mut summary_own_sites: Vec<(u32, Vec<Resolved>)> = Vec::new();
+        for (start, rows) in summary_rows {
+            let candidate = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.span_start == *start)
+                .min_by_key(|candidate| candidate.span_end);
+            if rows.iter().all(|row| row.own_site) {
+                summary_own_sites.push((
+                    *start,
+                    rows.iter()
+                        .map(|row| Self::summary_resolved(row, candidate))
+                        .collect(),
+                ));
+                continue;
+            }
+            for (index, row) in rows.iter().enumerate() {
+                let resolved = Self::summary_resolved(row, candidate);
+                if index == 0 {
+                    claim(resolved);
+                } else {
+                    summary_extras.push((*start, resolved));
+                }
+            }
+        }
 
         for candidate in candidates {
             let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
@@ -6211,11 +6335,37 @@ impl FileOrchestrator {
                     // The request is made at this site: the wrapper resolved
                     // here states the target, so there is nothing to reach.
                     reaches_request: None,
+                    body_literals: Default::default(),
                 })),
             });
         }
 
+        for (start, rows) in summary_own_sites {
+            let vacant = by_span
+                .get(&start)
+                .is_none_or(|held| held.source.precedence() == 0);
+            if !vacant {
+                continue;
+            }
+            let mut rows = rows.into_iter();
+            if let Some(first) = rows.next() {
+                by_span.insert(start, first);
+            }
+            summary_extras.extend(rows.map(|extra| (start, extra)));
+        }
+
+        let summary_held: BTreeSet<u32> = by_span
+            .iter()
+            .filter(|(_, held)| held.source == ResolutionSource::RequestSummary)
+            .map(|(start, _)| *start)
+            .collect();
         let mut resolved: Vec<Resolved> = by_span.into_values().collect();
+        resolved.extend(
+            summary_extras
+                .into_iter()
+                .filter(|(start, _)| summary_held.contains(start))
+                .map(|(_, extra)| extra),
+        );
 
         // Routes the source declares without a call site: their path and
         // method are read off the file layout or off route data, so there is
@@ -6240,6 +6390,174 @@ impl FileOrchestrator {
             }
         }
         resolved
+    }
+
+    /// The row a request summary states at a call site (carrick#1555).
+    ///
+    /// Candidate-backed where the scanner raised a candidate at the site, so
+    /// the model's answer joins onto it by the same id; otherwise keyed by the
+    /// site's own span, exactly as a same-file wrapper site is.
+    fn summary_resolved(row: &SummaryRow, candidate: Option<&CandidateTarget>) -> Resolved {
+        let line = i32::try_from(row.line).unwrap_or(i32::MAX);
+        let candidate_id = candidate
+            .map(|candidate| candidate.candidate_id.clone())
+            .unwrap_or_else(|| format!("span:{}-{}", row.span_start, row.span_end));
+        Resolved {
+            method: Some(row.method.clone()),
+            url: row.target.clone(),
+            span: Some((row.span_start, row.span_end)),
+            line,
+            source: ResolutionSource::RequestSummary,
+            emits: true,
+            row: ResolvedRow::Call(Box::new(DataCallResult {
+                candidate_id,
+                line_number: line,
+                target: row.target.clone(),
+                method: Some(row.method.clone()),
+                // Classification is judgment, not an AST fact.
+                call_kind: None,
+                pattern_matched: row.callee.clone(),
+                call_expression_span_start: Some(row.span_start),
+                call_expression_span_end: Some(row.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(line),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+                loopback_default_url: None,
+                base: None,
+                consumers_not_resolved: None,
+                // Settled once the field the target dispatches on is known:
+                // at the join, from the model's reading of which field that
+                // is, and across files from the request line's own row.
+                dispatch: None,
+                resolution_source: Some(ResolutionSource::RequestSummary),
+                reaches_request: row.reaches_request.clone(),
+                body_literals: row.body_literals.clone(),
+            })),
+        }
+    }
+
+    /// The value a call sends for the field its target dispatches on, where
+    /// the source writes it (carrick#1555, amending carrick#831).
+    ///
+    /// Which field discriminates is the producer's to declare; the model reads
+    /// it off the call, and that reading is kept. The VALUE is what the
+    /// call's own body writes, and where the body writes that field as a
+    /// literal, the literal is the answer whatever the model said.
+    fn settle_dispatch(
+        body_literals: &BTreeMap<String, String>,
+        stated: Option<crate::dispatch::Dispatch>,
+    ) -> Option<crate::dispatch::Dispatch> {
+        match stated {
+            Some(dispatch)
+                if dispatch.location == crate::dispatch::DispatchLocation::Body
+                    && body_literals.contains_key(&dispatch.field) =>
+            {
+                let value = body_literals[&dispatch.field].clone();
+                Some(crate::dispatch::Dispatch { value, ..dispatch })
+            }
+            other => other,
+        }
+    }
+
+    /// Drop the model's row at every call site whose callee provably sends
+    /// nothing (carrick#1555): the summary composed every call the callee
+    /// makes and found no request. A model row there is the model reading a
+    /// request into a name.
+    fn withdraw_silent_sites(result: &mut FileAnalysisResult, silent: &BTreeSet<u32>) -> usize {
+        if silent.is_empty() {
+            return 0;
+        }
+        let before = result.data_calls.len();
+        result.data_calls.retain(|call| {
+            call.resolution_source != Some(ResolutionSource::Model)
+                || !call
+                    .call_expression_span_start
+                    .is_some_and(|start| silent.contains(&start))
+        });
+        before - result.data_calls.len()
+    }
+
+    /// Settle the dispatch value on summary rows whose own site gave the
+    /// model nothing to read (carrick#1555).
+    ///
+    /// Dispatch is a property of the ROUTE: a handler switches on one field,
+    /// whichever request reaches it. So the field is the model's reading
+    /// wherever it states one for that route (method and path, base aside),
+    /// every summary row to the route shares it, and each takes the VALUE from
+    /// its own body. A route the model named two different fields for is left
+    /// alone.
+    fn settle_reached_dispatch(file_results: &mut HashMap<String, FileAnalysisResult>) -> usize {
+        let mut fields: HashMap<String, Option<crate::dispatch::Dispatch>> = HashMap::new();
+        for result in file_results.values() {
+            for call in &result.data_calls {
+                let Some(dispatch) = &call.dispatch else {
+                    continue;
+                };
+                if dispatch.location != crate::dispatch::DispatchLocation::Body {
+                    continue;
+                }
+                let Some(route) = Self::dispatch_route(call) else {
+                    continue;
+                };
+                let entry = fields
+                    .entry(route)
+                    .or_insert_with(|| Some(dispatch.clone()));
+                if entry
+                    .as_ref()
+                    .is_some_and(|held| held.field != dispatch.field)
+                {
+                    *entry = None;
+                }
+            }
+        }
+        let fields: HashMap<String, crate::dispatch::Dispatch> = fields
+            .into_iter()
+            .filter_map(|(site, dispatch)| dispatch.map(|dispatch| (site, dispatch)))
+            .collect();
+        let mut settled = 0;
+        for result in file_results.values_mut() {
+            for call in &mut result.data_calls {
+                if call.resolution_source != Some(ResolutionSource::RequestSummary) {
+                    continue;
+                }
+                let Some(stated) = Self::dispatch_route(call).and_then(|route| fields.get(&route))
+                else {
+                    continue;
+                };
+                let Some(value) = call.body_literals.get(&stated.field) else {
+                    continue;
+                };
+                if call.dispatch.as_ref().is_some_and(|d| &d.value == value) {
+                    continue;
+                }
+                call.dispatch = Some(crate::dispatch::Dispatch {
+                    location: stated.location,
+                    field: stated.field.clone(),
+                    value: value.clone(),
+                });
+                settled += 1;
+            }
+        }
+        settled
+    }
+
+    /// The route a row requests, for keying what the route dispatches on:
+    /// its method and its path with any leading `${…}` base set aside.
+    fn dispatch_route(call: &DataCallResult) -> Option<String> {
+        let method = call.method.as_deref()?.to_uppercase();
+        let mut path = call.target.as_str();
+        if path.starts_with("${")
+            && let Some(close) = path.find('}')
+        {
+            path = &path[close + 1..];
+        }
+        if !path.starts_with('/') {
+            return None;
+        }
+        Some(format!("{method} {path}"))
     }
 
     /// The row shape every candidate-backed deterministic call shares.
@@ -6294,6 +6612,7 @@ impl FileOrchestrator {
             // A row read off the site's own source IS the request; the join
             // that links a call through a declaration never touches one.
             reaches_request: None,
+            body_literals: Default::default(),
         }
     }
 
@@ -6512,11 +6831,21 @@ impl FileOrchestrator {
             }
             match entry.row {
                 ResolvedRow::Call(call) => {
+                    // One row per site, except that a site whose callee
+                    // sends several requests states one row per request
+                    // (carrick#1555).
                     let duplicate = call.call_expression_span_start.is_some_and(|span| {
-                        result
-                            .data_calls
-                            .iter()
-                            .any(|existing| existing.call_expression_span_start == Some(span))
+                        result.data_calls.iter().any(|existing| {
+                            existing.call_expression_span_start == Some(span)
+                                && !(entry.source == ResolutionSource::RequestSummary
+                                    && existing.resolution_source
+                                        == Some(ResolutionSource::RequestSummary)
+                                    && (
+                                        &existing.method,
+                                        &existing.target,
+                                        &existing.body_literals,
+                                    ) != (&call.method, &call.target, &call.body_literals))
+                        })
                     });
                     if duplicate {
                         continue;
@@ -7102,8 +7431,11 @@ impl FileOrchestrator {
         // (carrick#831). Determinism states no dispatch anywhere — which field
         // discriminates is the producer's fact, and the model is the only side
         // that reads it — so a deterministic row that swallowed the model's
-        // answer here lost the only statement of it there was.
-        deterministic.dispatch = model.dispatch;
+        // answer here lost the only statement of it there was. Where the
+        // row's own body writes the field the model names, the body's literal
+        // is the value (carrick#1555).
+        deterministic.dispatch =
+            Self::settle_dispatch(&deterministic.body_literals, model.dispatch);
     }
 
     /// Apply a statement that is not a row of its own to the model row at its
@@ -8821,13 +9153,25 @@ impl FileOrchestrator {
                         // its own rows — so the link decides the role where
                         // the source says nothing, and never overrules a
                         // source that does.
-                        role: crate::mount_graph::ConsumerRole::of(data_call.resolution_source)
-                            .or_else(|| {
+                        //
+                        // A request summary's row is one or the other by the
+                        // same test, stated by the summary itself (carrick#1555):
+                        // a row naming the request it reaches is the call
+                        // through, and any other summary row is the request.
+                        role: match data_call.resolution_source {
+                            Some(ResolutionSource::RequestSummary) => {
+                                Some(match data_call.reaches_request {
+                                    Some(_) => crate::mount_graph::ConsumerRole::WrapperCall,
+                                    None => crate::mount_graph::ConsumerRole::NetworkRequest,
+                                })
+                            }
+                            source => crate::mount_graph::ConsumerRole::of(source).or_else(|| {
                                 data_call
                                     .reaches_request
                                     .as_ref()
                                     .map(|_| crate::mount_graph::ConsumerRole::WrapperCall)
                             }),
+                        },
                         // The request that call reaches (carrick#1402), so the
                         // two rows of one request can be grouped rather than
                         // counted around.
@@ -11093,6 +11437,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: None,
                     dispatch: None,
                     reaches_request: None,
+                    body_literals: Default::default(),
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -11149,6 +11494,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: source,
                     dispatch: None,
                     reaches_request: None,
+                    body_literals: Default::default(),
                 }
             };
 
@@ -11233,6 +11579,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: Some(ResolutionSource::Model),
                     dispatch: None,
                     reaches_request: Some("src/lib/things.ts:12".to_string()),
+                    body_literals: Default::default(),
                 }],
                 ..Default::default()
             },
@@ -11401,6 +11748,7 @@ export * from "./aFetch.js";"#,
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         }
     }
 
@@ -11855,6 +12203,7 @@ export * from "./aFetch.js";"#,
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
             }],
             ..Default::default()
         };
@@ -11947,6 +12296,7 @@ export * from "./aFetch.js";"#,
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         };
 
         let mut file_results = HashMap::new();
@@ -12071,6 +12421,7 @@ export * from "./aFetch.js";"#,
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         };
 
         let mut file_results = HashMap::new();
@@ -12168,6 +12519,7 @@ export * from "./aFetch.js";"#,
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -12259,6 +12611,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                         dispatch: None,
                         reaches_request: None,
+                        body_literals: Default::default(),
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12282,6 +12635,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                         dispatch: None,
                         reaches_request: None,
+                        body_literals: Default::default(),
                     },
                 ],
                 graphql_operations: vec![],
@@ -12342,6 +12696,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: None,
                     dispatch: None,
                     reaches_request: None,
+                    body_literals: Default::default(),
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -12405,6 +12760,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                         dispatch: None,
                         reaches_request: None,
+                        body_literals: Default::default(),
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12428,6 +12784,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                         dispatch: None,
                         reaches_request: None,
+                        body_literals: Default::default(),
                     },
                 ],
                 graphql_operations: vec![],
@@ -13035,6 +13392,7 @@ export * from "./aFetch.js";"#,
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -13141,6 +13499,7 @@ export * from "./aFetch.js";"#,
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -13502,6 +13861,7 @@ export * from "./aFetch.js";"#,
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -15451,6 +15811,7 @@ export { routes };
             &[],
             &[],
             receiver_roles,
+            &BTreeMap::new(),
         );
         let mut result = FileAnalysisResult::default();
         let overrules = FileOrchestrator::emit_resolved_rows(
@@ -15986,6 +16347,7 @@ export { routes };
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         }
     }
 
@@ -18118,6 +18480,7 @@ export function publishWrapped(order: OrderPlaced): void {
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         }
     }
 

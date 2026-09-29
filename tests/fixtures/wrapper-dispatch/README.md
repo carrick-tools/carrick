@@ -26,9 +26,8 @@ dispatch carry read that index. It reads its own, which asserts no target.
     verb-named member call with no string argument, which is not a request.
   - `findService` is two delegations from the request (`findService` →
     `getAllRepoData` → `fetchCrossRepoData`).
-  - `refreshEverything` issues TWO requests with two different actions. It is
-    the control: a site calling it could be asking for either, so the source
-    does not say, and nothing is carried.
+  - `refreshEverything` issues TWO requests with two different actions, so a
+    site calling it sends both and states one row for each (carrick#1555).
 - `src/cache.ts` holds the cache, so the delegation really does leave the
   client's file and come back.
 - `fetchCrossRepoData` also reads a presigned URL with a bare `fetch(url)`. No
@@ -49,7 +48,7 @@ dispatch carry read that index. It reads its own, which asserts no target.
 | `search.ts:4` `client.searchByIntent(query)` | `action=search-by-intent` |
 | `graph.ts:4` `client.getAllRepoData()` | `action=get-cross-repo-data` |
 | `services.ts:4` `client.findService(name)` | `action=get-cross-repo-data` |
-| `refresh.ts:4` `client.refreshEverything()` | none — two requests, no single answer |
+| `refresh.ts:4` `client.refreshEverything()` | two rows, `action=invalidate-cache` and `action=rebuild-index` — one per request the member sends (carrick#1555) |
 | `local.ts:11` `postToGateway("/rpc/gateway", payload)` | `action=store-metadata` |
 
 ## The cassette
@@ -57,10 +56,10 @@ dispatch carry read that index. It reads its own, which asserts no target.
 `__llm__/analyze-file/api-client.json` and `local.json` are the only ones that
 state a `dispatch`, and they state it where the model really can: on the
 client's own requests, beside the object literal that writes it. The client's
-targets are `${this.gatewayUrl}`, which carries no literal path segment and is
-dropped from the index downstream — the same reason the deployed scan recorded
-zero edges for this shape and the delegating sites were the only record of the
-calls.
+targets are `${this.gatewayUrl}`, which carries no literal path segment. The
+request summaries read the field through the constructor that builds it
+(carrick#1555), so the scanner states these requests itself and the cassette's
+targets are only ever overruled.
 
 The consumer cassettes hold what production holds: a row at the delegating site
 with a method and a path and NO value, because the site's own file states no

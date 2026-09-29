@@ -101,14 +101,26 @@ fn a_site_two_delegations_from_the_request_carries_its_value() {
 }
 
 #[test]
-fn a_site_calling_a_member_that_issues_two_requests_carries_nothing() {
+fn a_site_calling_a_member_that_issues_two_requests_states_one_row_per_request() {
+    // `refreshEverything` writes two actions, one per request. The site sends
+    // both, so it states both, each with the value its own body writes
+    // (carrick#1555, decision 2): neither is a guess about which one it asks
+    // for.
     let calls = calls("wrapper-dispatch");
-    let site = call_at(&calls, "refresh.ts", 4);
+    let mut values: Vec<Option<&str>> = calls
+        .iter()
+        .filter(|call| {
+            call["line"].as_i64() == Some(4)
+                && call["file"]
+                    .as_str()
+                    .is_some_and(|f| f.ends_with("refresh.ts"))
+        })
+        .map(dispatch_value)
+        .collect();
+    values.sort();
     assert_eq!(
-        dispatch_value(site),
-        None,
-        "`refreshEverything` writes two actions; which one this site asks for \
-         is not something the source says"
+        values,
+        vec![Some("invalidate-cache"), Some("rebuild-index")]
     );
 }
 
@@ -119,13 +131,12 @@ fn a_same_file_wrapper_site_carries_the_value_the_wrapper_writes() {
     assert_eq!(
         dispatch_value(site),
         Some("store-metadata"),
-        "the row at this site is the same-file wrapper pass's own, and the \
-         value is at the wrapper's request four lines up"
+        "the value is at the wrapper's request four lines up"
     );
     assert_eq!(
         site["resolution_source"].as_str(),
-        Some("same_file_wrapper"),
-        "the row is still the deterministic pass's; the carry stamps a value \
-         and nothing else"
+        Some("request_summary"),
+        "the row is the source's: the wrapper's summary states it where the \
+         site fills the path the wrapper leaves open (carrick#1555)"
     );
 }

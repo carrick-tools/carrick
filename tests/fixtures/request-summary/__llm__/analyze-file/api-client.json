@@ -1,0 +1,71 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:93",
+      "line_number": 93,
+      "target": "${this.lambdaUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.lambdaUrl, { ... })",
+      "call_expression_line": 93,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:103",
+      "line_number": 103,
+      "target": "${this.lambdaUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.lambdaUrl, { ... })",
+      "call_expression_line": 103,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:113",
+      "line_number": 113,
+      "target": "${this.lambdaUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.lambdaUrl, { ... })",
+      "call_expression_line": 113,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:129",
+      "line_number": 129,
+      "target": "${this.lambdaUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.lambdaUrl, { ... })",
+      "call_expression_line": 129,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:147",
+      "line_number": 147,
+      "target": "${this.lambdaUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.lambdaUrl, { ... })",
+      "call_expression_line": 147,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

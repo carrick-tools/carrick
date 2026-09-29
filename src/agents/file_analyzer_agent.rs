@@ -226,6 +226,12 @@ pub enum ResolutionSource {
     SameFileWrapper,
     /// A request member of an imported same-repo module (carrick#588/#623).
     ImportedMember,
+    /// What a call's callee sends, read off the callee's body and composed
+    /// over the call graph (carrick#1555): the request's own line when its URL
+    /// is determined there, the site that fills the last hole a wrapper
+    /// leaves open, or a call through a declaration in another module. See
+    /// [`crate::request_summary`].
+    RequestSummary,
     /// A binding holding the WHOLE request URL, read from an environment
     /// variable (carrick#572/#632).
     WholeUrlEnv,
@@ -504,6 +510,15 @@ pub struct DataCallResult {
     /// the declaring module has now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaches_request: Option<String>,
+    /// The request body's plain keys whose values are literals the source
+    /// writes, as read by [`crate::request_summary`] (carrick#1555). What a
+    /// body-dispatching producer's declared field is looked up in, on either
+    /// side of the seam, so the value a call sends is a fact rather than the
+    /// model's reading.
+    ///
+    /// Never from the model. Empty on every row the summaries did not state.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub body_literals: std::collections::BTreeMap<String, String>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1909,6 +1924,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             reaches_request: None,
+            body_literals: Default::default(),
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1970,6 +1986,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 reaches_request: None,
+                body_literals: Default::default(),
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

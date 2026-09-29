@@ -351,8 +351,9 @@ pub fn resolve_call_edges(
     keys: &RekeyIndex,
     workspace: &WorkspaceIndex,
     repo_root: &Path,
-) -> UnresolvedImports {
+) -> CallResolution {
     let mut resolver = CallResolver::new(per_file, workspace, repo_root);
+    let mut sites = CallSiteTargets::default();
 
     // Sorted so a resolution cache built while walking one file cannot make a
     // later file's result depend on HashMap iteration order.
@@ -381,6 +382,10 @@ pub fn resolve_call_edges(
                 let Some(target) = resolver.resolve(index, callee) else {
                     continue;
                 };
+                // Every resolved site, recursion included: a request summary
+                // is composed per call site, and a function calling itself is
+                // one the composition has to see to widen it.
+                sites.record(&index.path, callee.span, &target);
                 // Direct recursion is not a dependency: it would make the
                 // function its own topological predecessor.
                 if target.file == index.path && target.key == *caller_key {
@@ -417,7 +422,50 @@ pub fn resolve_call_edges(
         "call_graph: package-surface origins resolved {} receiver(s), dropped {} on a member more than one class in the surface declares (carrick#781)",
         resolver.origin_resolved, resolver.origin_conflicts
     );
-    resolver.unresolved
+    CallResolution {
+        unresolved: resolver.unresolved,
+        sites,
+    }
+}
+
+/// What [`resolve_call_edges`] produces besides the edges it writes into the
+/// definitions: the imports it could not follow, and where each call site it
+/// DID follow lands.
+#[derive(Debug, Default)]
+pub struct CallResolution {
+    pub unresolved: UnresolvedImports,
+    pub sites: CallSiteTargets,
+}
+
+/// The definition each resolved call site reaches, keyed by the file the site
+/// is written in (as walked, like [`FileCallIndex::path`]) and the site's
+/// span start in the discovery source map.
+///
+/// The edge list on a [`FunctionDefinition`] says WHICH functions a function
+/// calls; it cannot say which call reaches which, because it is deduplicated
+/// and carries a line, not a span. A request summary is instantiated per call
+/// site with that site's own arguments (carrick#1555), so it needs the site.
+#[derive(Debug, Default)]
+pub struct CallSiteTargets {
+    by_file: HashMap<PathBuf, HashMap<u32, (PathBuf, String)>>,
+}
+
+impl CallSiteTargets {
+    fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
+        if span.is_dummy() {
+            return;
+        }
+        self.by_file
+            .entry(file.to_path_buf())
+            .or_default()
+            .insert(span.lo.0, (target.file.clone(), target.key.clone()));
+    }
+
+    /// The definition (file as walked, definition key) the call whose span
+    /// starts at `span_lo` in `file` reaches, if resolution followed it.
+    pub fn target(&self, file: &Path, span_lo: u32) -> Option<&(PathBuf, String)> {
+        self.by_file.get(file)?.get(&span_lo)
+    }
 }
 
 /// Imports a call depended on whose specifier resolved to no file and no
@@ -1179,7 +1227,8 @@ mod tests {
 
         // The index production builds for this pass, aliases included.
         let workspace = WorkspaceIndex::build_with_aliases(&root, None);
-        let unresolved = resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root);
+        let unresolved =
+            resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root).unresolved;
         (dir, definitions, unresolved)
     }
 

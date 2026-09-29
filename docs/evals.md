@@ -38,6 +38,22 @@ scripts/scan-twice.sh /path/to/probe-dir  # plus a one-service carrick.json tree
 `CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections per
 target. The script header lists the exclusions and why.
 
+## Fact-coverage probe
+
+Scans a checkout with the model stage switched off and counts the consumer
+rows the deterministic layer states, by the pass that stated them. With no
+model every printed row is a fact, so a deterministic-layer change reads as
+rows moving between sources or appearing where there were none. Free: no
+model call and no cloud (carrick#1556).
+
+```bash
+cargo build
+scripts/fact-coverage.sh /path/to/checkout
+CARRICK_BIN=/path/to/main/carrick scripts/fact-coverage.sh /path/to/checkout  # the baseline
+```
+
+Run it on the same tree with the branch and with main, and diff the two.
+
 ## Cold-cache dispatch smoke
 
 Hands a fixture's prompts to Carrick Cloud for real and collects them, against

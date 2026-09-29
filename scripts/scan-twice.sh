@@ -82,6 +82,7 @@ fixture_targets=(
   nextjs-app-monorepo
   pubsub-wrapper-monorepo
   remix-flat
+  request-summary
   scenario-1-dependency-conflicts
   scenario-3-cross-repo-success/repo-a
   scenario-3-cross-repo-success/repo-b

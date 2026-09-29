@@ -61,7 +61,12 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 10, "one row per call site: {calls:#?}");
+    // One row per call site: the ten the member join states, the client's own
+    // four requests — each `send(...)` line fills the URL and the verb its
+    // transport helper leaves open — and the site calling through the
+    // exported instance, which the call graph follows through the instance's
+    // declared construction (carrick#1555).
+    assert_eq!(calls.len(), 15, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -190,31 +195,29 @@ fn a_member_reached_through_a_factory_record_or_a_this_field_resolves() {
     assert_eq!(through_this["target_url"], "/api/v2/session");
 }
 
-/// carrick#656: a row states what the join could not follow.
+/// carrick#656: a row states what the join could not follow — and a site the
+/// request summaries follow is not lost.
 ///
 /// `envvars.ts` calls `readArtifactUrl` on a client another module constructed
-/// and exported as an instance. The receiver is an imported binding whose
-/// source is not the member's module, so the join declines it by design — and
-/// counts it, so the three rows the same member DID produce say the list of
-/// its call sites is one short instead of reading as complete.
+/// and exported as an instance. The name join declines it by design, and used
+/// to count it, so the rows the same member produced said their list of call
+/// sites was one short. The call graph follows the instance's declared
+/// construction to the member (carrick#1555), so the site has a row of its own
+/// and nothing is short.
 #[test]
 fn a_row_states_the_call_sites_the_join_could_not_follow() {
     let calls = calls("imported-request-member");
 
-    for line in [16, 11, 8] {
-        let row = call_at_line(&calls, line);
-        assert_eq!(
-            row["consumers_not_resolved"],
-            serde_json::json!({ "member": "readArtifactUrl", "count": 1 }),
-            "every row the member produced carries what it lost, at line {line}"
-        );
-    }
+    let followed = call_at_line(&calls, 6);
+    assert_eq!(followed["method"], "GET");
+    assert_eq!(followed["path"], "/api/v1/artifacts/:encoded");
+    assert_eq!(followed["resolution_source"], "request_summary");
 
-    // The collision is NOT a lost call site. `artifacts.ts:21` calls
+    // Nothing was lost for any member, so the field is absent everywhere. The
+    // collision is not a lost call site either: `artifacts.ts:21` calls
     // `createArtifactUrl` on a binding imported from `legacy.ts`, which never
-    // imports the client: a different function that shares a name, and
-    // counting it would send a reader after a call site that does not exist.
-    for line in [5, 7, 25, 15, 12] {
+    // imports the client — a different function that shares a name.
+    for line in [5, 7, 8, 11, 12, 15, 16, 25] {
         let row = call_at_line(&calls, line);
         assert!(
             row.get("consumers_not_resolved").is_none(),

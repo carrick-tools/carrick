@@ -377,9 +377,12 @@ fn local_mode_answers_and_follows_an_edit() {
         serde_json::json!("not_checked"),
         "a removed producer is a routing fact, not a type verdict:\n{removed:#}"
     );
+    // The client's own request line (`client.ts:14`, where `send` is handed
+    // the URL and the verb) and the two calls through the client that reach it
+    // (carrick#1555).
     assert_eq!(
         removed["items"][0]["counterparts"].as_array().map(Vec::len),
-        Some(2),
+        Some(3),
         "with its consumers listed:\n{removed:#}"
     );
 }
@@ -743,9 +746,11 @@ fn the_json_matches_the_published_contract() {
     assert_eq!(item["line"], serde_json::json!(9));
     // A local index holds no model rows at all, so every row is a fact.
     assert_eq!(item["source"], serde_json::json!("fact"));
+    // A call through a client another module declares, stated from the
+    // client's body (carrick#1555).
     assert_eq!(
         item["resolution_source"],
-        serde_json::json!("imported_member")
+        serde_json::json!("request_summary")
     );
     let counterpart = &item["counterparts"][0];
     assert_eq!(counterpart["role"], serde_json::json!("producer"));

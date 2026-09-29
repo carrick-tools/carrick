@@ -110,15 +110,19 @@ pub(crate) mod upload_boundary;
 pub(crate) const CACHE_VERSION: u32 = 22;
 
 // Type aliases to reduce complexity
-type FileDiscoveryResult = Result<
-    (
-        Vec<PathBuf>,
-        BTreeSet<crate::visitor::ImportedSymbol>,
-        HashMap<String, FunctionDefinition>,
-        String,
-    ),
-    Box<dyn std::error::Error>,
->;
+/// What discovery reads from a service before any analysis runs.
+#[derive(Debug)]
+struct FileDiscovery {
+    files: Vec<PathBuf>,
+    import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
+    function_definitions: HashMap<String, FunctionDefinition>,
+    repo_name: String,
+    /// What each function's calls send, composed over the call graph
+    /// (carrick#1555).
+    request_summaries: crate::request_summary::RequestSummaryIndex,
+}
+
+type FileDiscoveryResult = Result<FileDiscovery, Box<dyn std::error::Error>>;
 
 /// Determine if we should upload data based on GitHub context
 /// Only upload on main/master branch, not on PRs
@@ -2738,8 +2742,13 @@ async fn analyze_current_repo_incremental(
 
     // Discover files and symbols (fast SWC pass, always full), scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_import_facts, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, config, cm.clone())?;
+    let FileDiscovery {
+        files,
+        import_facts: all_import_facts,
+        function_definitions,
+        repo_name,
+        request_summaries,
+    } = discover_files_and_symbols(repo_path, config, cm.clone())?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode
@@ -2903,7 +2912,8 @@ async fn analyze_current_repo_incremental(
             // dispatched and replayed counts once it knows them.
             let agent_service = AgentService::new();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone())
-                .deferring_model(setup.deferred.is_some());
+                .deferring_model(setup.deferred.is_some())
+                .with_request_summaries(request_summaries);
 
             // Stage B2: GraphQL producer field-list from the service's SDL,
             // derived deterministically so the file-analyzer can emit
@@ -3270,6 +3280,7 @@ async fn analyze_current_repo_incremental(
             import_facts: all_import_facts,
             function_definitions,
             repo_name,
+            request_summaries,
         },
         prev_intents,
         settled,
@@ -5671,6 +5682,9 @@ fn discover_files_and_symbols(
     // repo reached through a symlink would otherwise miss every cross-file
     // lookup with no error.
     let mut per_file_calls: HashMap<PathBuf, crate::call_graph::FileCallIndex> = HashMap::new();
+    // What each file's functions send, read while the module is in hand and
+    // composed once call resolution has run (carrick#1555).
+    let mut request_irs: HashMap<PathBuf, crate::request_summary::FileIr> = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
@@ -5692,6 +5706,16 @@ fn discover_files_and_symbols(
                 FunctionDefinitionExtractor::new(file_path.clone(), cm.clone());
             module.visit_with(&mut func_extractor);
             func_extractor.finalize_exports();
+
+            let definition_keys: HashSet<String> = func_extractor
+                .function_definitions
+                .keys()
+                .cloned()
+                .collect();
+            request_irs.insert(
+                file_path.clone(),
+                crate::request_summary::extract_file_ir(&module, &cm, &definition_keys),
+            );
 
             let canonical = file_path
                 .canonicalize()
@@ -5741,14 +5765,22 @@ fn discover_files_and_symbols(
             .as_ref()
             .map(|(directory, config)| (directory.as_path(), config.as_path())),
     );
-    let unresolved = crate::call_graph::resolve_call_edges(
+    let resolution = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
         &per_file_calls,
         &keys,
         &workspace,
         repo_root,
     );
-    report_unresolved_imports(&unresolved, &workspace.unfollowed_extends());
+    report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
+
+    let request_summaries = crate::request_summary::summarize(&request_irs, &resolution.sites);
+    debug!(
+        "request summaries: {} row(s) at call sites, {} site(s) whose callee sends nothing, {} request(s) with no statable URL",
+        request_summaries.row_count(),
+        request_summaries.silent_count(),
+        request_summaries.undetermined
+    );
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
@@ -5757,7 +5789,13 @@ fn discover_files_and_symbols(
         files.len()
     );
 
-    Ok((files, all_import_facts, all_function_definitions, repo_name))
+    Ok(FileDiscovery {
+        files,
+        import_facts: all_import_facts,
+        function_definitions: all_function_definitions,
+        repo_name,
+        request_summaries,
+    })
 }
 
 /// Resolve a repo's `carrick.json` into one service config per service.
@@ -6558,6 +6596,7 @@ struct Discovered {
     import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
+    request_summaries: crate::request_summary::RequestSummaryIndex,
 }
 
 /// The full analysis of one service over its discovery.
@@ -6587,6 +6626,7 @@ async fn analyze_current_repo(
         import_facts: all_import_facts,
         function_definitions,
         repo_name,
+        request_summaries,
     } = discovered;
     debug!(
         "Repository '{}': {} files, {} function definitions",
@@ -6663,6 +6703,7 @@ async fn analyze_current_repo(
             &normalizer,
             &service_modules,
             sidecar,
+            request_summaries,
         )
         .await?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);
@@ -9333,6 +9374,7 @@ mod tests {
                     resolution_source: None,
                     dispatch: None,
                     reaches_request: None,
+                    body_literals: Default::default(),
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -10764,8 +10806,9 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         let cm: Lrc<SourceMap> = Default::default();
-        let (_, _, definitions, _) =
-            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+        let definitions = discover_files_and_symbols(&repo, &Config::default(), cm)
+            .unwrap()
+            .function_definitions;
         for name in ["Surface.run", "Surface.create", "consume"] {
             assert!(definitions[name].is_exported, "{name} is public");
         }
@@ -10804,8 +10847,9 @@ mod tests {
         let repo = format!("{}/tests/fixtures/sdk-surface", env!("CARGO_MANIFEST_DIR"));
         let cm: Lrc<SourceMap> = Default::default();
 
-        let (_files, _imports, definitions, _repo_name) =
-            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+        let definitions = discover_files_and_symbols(&repo, &Config::default(), cm)
+            .unwrap()
+            .function_definitions;
 
         let scrape = definitions
             .get("Ledger.scrape")
@@ -10839,8 +10883,9 @@ mod tests {
         let repo = format!("{}/tests/fixtures/sdk-surface", env!("CARGO_MANIFEST_DIR"));
         let cm: Lrc<SourceMap> = Default::default();
 
-        let (_files, _imports, definitions, _repo_name) =
-            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+        let definitions = discover_files_and_symbols(&repo, &Config::default(), cm)
+            .unwrap()
+            .function_definitions;
 
         let refresh = definitions.get("refresh").expect("refresh indexed");
         let list = refresh
@@ -10862,6 +10907,132 @@ mod tests {
     /// path in a key would ship a CI checkout prefix to the index, and
     /// `relativize_function_definition_paths` rewrites values, never keys, so
     /// nothing downstream would strip it.
+    /// Write `files` under a temp dir and run discovery over it.
+    fn discover_sources(files: &[(&str, &str)]) -> (tempfile::TempDir, FileDiscovery) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, source) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(&path, source).expect("write");
+        }
+        let cm: Lrc<SourceMap> = Default::default();
+        let discovery =
+            discover_files_and_symbols(&dir.path().to_string_lossy(), &Config::default(), cm)
+                .unwrap();
+        (dir, discovery)
+    }
+
+    /// The summary rows discovery states for `file`, flattened in site order.
+    fn summary_rows_of(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+    ) -> Vec<crate::request_summary::SummaryRow> {
+        discovery
+            .request_summaries
+            .rows(&dir.path().join(file))
+            .map(|sites| sites.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// carrick#1555: a transport helper handed its URL and its options states
+    /// the request where a caller fills them, and a call through the client in
+    /// another module reaches THAT line — the row that states the request —
+    /// not the helper's own `fetch`, which states none.
+    #[test]
+    fn a_request_is_stated_where_its_last_hole_is_filled() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/send.ts",
+                "export async function send(url: string, options: { method: string }) {\n  const response = await fetch(url, options);\n  return response.json();\n}\n",
+            ),
+            (
+                "src/client.ts",
+                "import { send } from \"./send\";\n\nexport class Client {\n  constructor(private readonly baseUrl: string) {}\n\n  read(id: string) {\n    return send(`${this.baseUrl}/api/v1/widgets/${id}`, { method: \"GET\" });\n  }\n}\n",
+            ),
+            (
+                "src/use.ts",
+                "import type { Client } from \"./client\";\n\nexport async function go(client: Client, widget: string) {\n  return client.read(widget);\n}\n",
+            ),
+        ]);
+
+        assert!(
+            summary_rows_of(&dir, &discovery, "src/send.ts").is_empty(),
+            "the helper's own fetch states no URL"
+        );
+
+        let stated = summary_rows_of(&dir, &discovery, "src/client.ts");
+        assert_eq!(stated.len(), 1, "{stated:#?}");
+        assert_eq!(stated[0].line, 7);
+        assert_eq!(stated[0].method, "GET");
+        assert_eq!(stated[0].target, "${this.baseUrl}/api/v1/widgets/${id}");
+        assert_eq!(stated[0].reaches_request, None, "this line IS the request");
+
+        let through = summary_rows_of(&dir, &discovery, "src/use.ts");
+        assert_eq!(through.len(), 1, "{through:#?}");
+        assert_eq!(through[0].line, 4);
+        assert_eq!(through[0].method, "GET");
+        assert_eq!(
+            through[0].target, "${this.baseUrl}/api/v1/widgets/${id}",
+            "the path parameter keeps the client's own name"
+        );
+        let reaches = through[0].reaches_request.as_deref().unwrap_or_default();
+        assert!(
+            reaches.ends_with("src/client.ts:7"),
+            "reaches the line that states the request, got {reaches}"
+        );
+    }
+
+    /// carrick#1555: a URL written inline at the request is the site passes'
+    /// to read; a URL a field holds is stated by the summary at the request's
+    /// own line.
+    #[test]
+    fn a_request_states_its_own_line_only_for_a_url_read_through_a_binding() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/client.ts",
+            "const BASE = process.env.API_URL;\n\nexport async function inline() {\n  return fetch(`${BASE}/inline`, { method: \"GET\" });\n}\n\nexport class Gateway {\n  private url: string;\n  constructor(endpoint: string) {\n    this.url = `${endpoint}/rpc`;\n  }\n  call() {\n    return fetch(this.url, { method: \"POST\", body: JSON.stringify({ op: \"ping\" }) });\n  }\n}\n",
+        )]);
+
+        let rows = summary_rows_of(&dir, &discovery, "src/client.ts");
+        assert_eq!(rows.len(), 1, "only the field-held URL: {rows:#?}");
+        assert_eq!(rows[0].line, 13);
+        assert_eq!(rows[0].method, "POST");
+        assert_eq!(rows[0].target, "${endpoint}/rpc");
+        assert_eq!(
+            rows[0].body_literals.get("op").map(String::as_str),
+            Some("ping")
+        );
+        assert!(rows[0].own_site);
+    }
+
+    /// carrick#1555: a site is recorded as sending nothing only when its callee
+    /// provably sends nothing. A body with no call is proof; a declaration with
+    /// no body, or a construction, is not.
+    #[test]
+    fn a_site_is_silent_only_when_its_callee_is_proven_to_send_nothing() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/counter.ts",
+                "declare function sendMetric(name: string): void;\n\nexport class Counter {\n  private count = 0;\n  bump(): void {\n    this.count += 1;\n  }\n  report(): void {\n    sendMetric(\"count\");\n  }\n  start(): void {\n    new Worker(\"poll.js\");\n  }\n}\n",
+            ),
+            (
+                "src/use.ts",
+                "import type { Counter } from \"./counter\";\n\nexport function tick(counter: Counter) {\n  counter.bump();\n  counter.report();\n  counter.start();\n}\n",
+            ),
+        ]);
+
+        let silent = discovery
+            .request_summaries
+            .silent(&dir.path().join("src/use.ts"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            silent.len(),
+            1,
+            "only `bump()` is proven silent: {silent:?}"
+        );
+    }
+
     #[test]
     fn discovery_rekeys_same_named_definitions_with_a_relative_path() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -10881,9 +11052,10 @@ mod tests {
         }
 
         let cm: Lrc<SourceMap> = Default::default();
-        let (_files, _imports, definitions, _repo_name) =
+        let definitions =
             discover_files_and_symbols(&dir.path().to_string_lossy(), &Config::default(), cm)
-                .unwrap();
+                .unwrap()
+                .function_definitions;
 
         let mut keys: Vec<&String> = definitions.keys().collect();
         keys.sort();

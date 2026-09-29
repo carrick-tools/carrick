@@ -1,0 +1,78 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/types/check-or-upload",
+      "method": "POST",
+      "pattern_matched": "client.analysisJobStatus(",
+      "call_expression_text": "client.analysisJobStatus(repo)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "analysis_job_status"
+      }
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/types/check-or-upload",
+      "method": "POST",
+      "pattern_matched": "client.invalidateCache(",
+      "call_expression_text": "client.invalidateCache()",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "invalidate_cache"
+      }
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "/types/check-or-upload",
+      "method": "POST",
+      "pattern_matched": "client.getAllRepoData(",
+      "call_expression_text": "client.getAllRepoData()",
+      "call_expression_line": 13,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "get_all_repo_data"
+      }
+    },
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "/types/check-or-upload",
+      "method": "POST",
+      "pattern_matched": "client.startPolling(",
+      "call_expression_text": "client.startPolling()",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "start_polling"
+      }
+    }
+  ]
+}
