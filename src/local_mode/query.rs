@@ -535,10 +535,13 @@ fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
     // user can act on (carrick#1009).
     let index = LocalIndex::read(&index_file)
         .map_err(|e| ReadFailure::detailed(ReadError::IndexUnreadable, e))?;
+    // `carrick refresh`, not `carrick index`: the index only has to be read
+    // again under this credential, and since carrick#1008 `carrick index` is
+    // the model scan that uploads (carrick#1574).
     if !super::hosted::can_read_index(&index) {
         return Err(ReadFailure::detailed(
             ReadError::IndexUnreadable,
-            "the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index.",
+            "the hosted index belongs to a different or unavailable credential. Run carrick login, then carrick refresh.",
         ));
     }
     Ok(index)
@@ -732,12 +735,12 @@ pub fn enrichment_note(
             let fetch = format!("`git fetch` in {repo}, then `carrick refresh`");
             let action = match (hosted.source.as_deref(), hosted.uploaded_by.as_deref()) {
                 (Some("laptop"), Some(login)) if !login.is_empty() => format!(
-                    "It came from a laptop scan by @{login}: once that commit is pushed, run \
-                     {fetch}."
+                    "It was built by a laptop scan from @{login}: once that commit is pushed, \
+                     run {fetch}."
                 ),
-                (Some("laptop"), _) => {
-                    format!("It came from a laptop scan: once that commit is pushed, run {fetch}.")
-                }
+                (Some("laptop"), _) => format!(
+                    "It was built by a laptop scan: once that commit is pushed, run {fetch}."
+                ),
                 _ => format!("Run {fetch}."),
             };
             format!(
@@ -1060,14 +1063,14 @@ mod hosted_change_tests {
         assert_eq!(
             missing(hosted_row(Some("laptop"), Some("ihor"), Some(false))),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It came from a laptop scan by @ihor: once that commit is pushed, run `git fetch` \
-             in orders, then `carrick refresh`."
+             It was built by a laptop scan from @ihor: once that commit is pushed, run `git \
+             fetch` in orders, then `carrick refresh`."
         );
         assert_eq!(
             missing(hosted_row(Some("laptop"), None, None)),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It came from a laptop scan: once that commit is pushed, run `git fetch` in orders, \
-             then `carrick refresh`."
+             It was built by a laptop scan: once that commit is pushed, run `git fetch` in \
+             orders, then `carrick refresh`."
         );
     }
 

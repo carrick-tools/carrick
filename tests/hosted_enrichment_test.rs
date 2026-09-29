@@ -225,6 +225,15 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         Some("another-workspace-token"),
     );
     assert_eq!(wrong_account["error"], "index_unreadable");
+    // The free re-read is the fix, and the switch below proves it: `carrick
+    // index` is the model scan that uploads (carrick#1574).
+    assert!(
+        wrong_account["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("Run carrick login, then carrick refresh."),
+        "{wrong_account:#}"
+    );
     let signed_out = run(root, &["status", "--workspace", ".", "--json"], None);
     assert_eq!(signed_out["error"], "index_unreadable");
     let replayed = blobs(root).remove(0);
