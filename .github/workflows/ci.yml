@@ -67,8 +67,9 @@ jobs:
           cargo test --test panic_hook_test --verbose
 
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
-      # themselves. route_request_anchor_test, span_locator_units_test and
-      # retype_consumer_test need the sidecar built above. eval_xrepo is the cross-repo scorer math only:
+      # themselves. route_request_anchor_test, span_locator_units_test,
+      # retype_consumer_test and client_semantics_test need the sidecar built
+      # above. eval_xrepo is the cross-repo scorer math only:
       # default `cargo test` skips its #[ignore]d live scorer + mock smoke (both
       # spawn the binary / cost money); the live scorer runs via eval-xrepo.yml
       # (workflow_dispatch), NOT here. action_install_test is the Action's
@@ -82,6 +83,7 @@ jobs:
           --test alias_shaped_type_imports_test
           --test analysis_failure_keeps_deterministic_rows_test
           --test bundle_row_id_golden_test
+          --test client_semantics_test
           --test commonjs_require_callers_test
           --test dependency_analysis_test
           --test dispatch_resume_test
