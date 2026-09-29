@@ -66,7 +66,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions` and `retype_check` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check` and `verify_client_semantics` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
 `capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -79,6 +79,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `check_v2` | no | Typecheck matched pairs across captured stubs |
 | `infer` | yes | Resolve the type at a set of locators |
 | `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
+| `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
 | `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
@@ -351,6 +352,87 @@ Response:
 ```
 
 `budget_ms` (optional, default 600000) caps the time one request spends; the items it does not reach abstain. `outcome` is `mismatch`, `agrees`, `wider` or `abstain`. `wider` answers an item that also carries `producer_unwidened_type`, the producer's response as its handler returns it with no literal widened (an `infer` response's `unwidened_type_string`): the published type added diagnostics and this one added none, so the producer's type is wider than what it sends (carrick#1516). Its `diagnostics` are the published type's. An abstention carries a `reason`: the call was not found, nothing reads its result, its result escapes to readers outside the file's own type-check (returned from a function with no declared return type, or bound to an exported name), the type parameter it would fill does not carry the response, the call takes no type parameter, the producer's type names something the consumer's program cannot resolve, or the producer's type, as the consumer's program reads it, is `unknown` as a whole or at a member, or is `any` there and the rewrite added no diagnostic (the reason names the member, e.g. `'unknown' at 'session'`). An `any` member can hide a diagnostic but never add one, so the diagnostics found beside it still make a `mismatch`. Diagnostics the file had before the rewrite never count.
+
+#### `verify_client_semantics` - Check a client library's claimed call shapes
+
+The scanner reads a call through an HTTP client library (its base-URL factory, its verbs, its request call) only after this action has checked each claim about that library against the package's own type declarations (carrick#1564). A claim is checked on a receiver: `export`, the export itself, or `instance:<factory>`, what that factory member of the export returns. Module resolution starts at `from_dir`, the absolute service root, under the compiler options `init` resolved: a probe file there imports the export, inside the service's program, and is removed before the action answers.
+
+```json
+{
+  "request_id": "6",
+  "action": "verify_client_semantics",
+  "from_dir": "/abs/web",
+  "checks": [
+    {
+      "claim_id": "@fixture/http@1:default:factory:create",
+      "package": "@fixture/http",
+      "export": "default",
+      "receiver": "export",
+      "claim": { "kind": "factory", "member": "create", "base_url_key": "baseURL" }
+    },
+    {
+      "claim_id": "@fixture/http@1:default:verb:post",
+      "package": "@fixture/http",
+      "export": "default",
+      "receiver": "instance:create",
+      "claim": { "kind": "verb", "member": "post", "method": "POST" }
+    },
+    {
+      "claim_id": "@fixture/http@1:default:request:():config",
+      "package": "@fixture/http",
+      "export": "default",
+      "receiver": "export",
+      "claim": { "kind": "request", "member": null, "args": "config", "url_key": "url", "method_key": "method" }
+    },
+    {
+      "claim_id": "@fixture/http@1:default:verb:fetch",
+      "package": "@fixture/http",
+      "export": "default",
+      "receiver": "export",
+      "claim": { "kind": "verb", "member": "fetch", "method": "GET" }
+    }
+  ]
+}
+```
+
+Response:
+```json
+{
+  "request_id": "6",
+  "status": "success",
+  "semantics": [
+    { "claim_id": "@fixture/http@1:default:factory:create", "receiver": "export", "verdict": "verified" },
+    { "claim_id": "@fixture/http@1:default:verb:post", "receiver": "instance:create", "verdict": "verified" },
+    { "claim_id": "@fixture/http@1:default:request:():config", "receiver": "export", "verdict": "verified" },
+    { "claim_id": "@fixture/http@1:default:verb:fetch", "receiver": "export", "verdict": "failed", "reason": "method_not_member_verb" }
+  ],
+  "semantics_modules": [
+    { "package": "@fixture/http", "resolved_file": "/abs/web/node_modules/@fixture/http/index.d.ts", "installed_version": "1.4.2" }
+  ]
+}
+```
+
+`semantics` holds exactly one result per check, in request order. The claim kinds are `factory`, `verb`, `verb_body` (`args` `path_body` or `path_options`, optional `body_key`), `request` (`member` null means the receiver itself is called; `args` `config` with `url_key`, or `path_options`; `method_key`) and `request_body` (`args` and `body_key`). `verdict` is `verified` (the declarations satisfy the claim), `failed` (they resolved and contradict it) or `unchecked` (they could not be read); `reason` is absent exactly when `verified`. The scanner drops `failed` and `unchecked` alike.
+
+An export typed `any` or `unknown` verifies nothing, so an untyped package or a shorthand `declare module "x";` answers `unchecked`. The reasons:
+
+| Verdict | Reason | Meaning |
+|---|---|---|
+| `unchecked` | `module_unresolved` | The package does not resolve from `from_dir` (not installed, no `node_modules`) |
+| `unchecked` | `module_js_only` | It resolves to JavaScript with no declarations |
+| `unchecked` | `export_missing` | The module has no value export of that name |
+| `unchecked` | `export_untyped` | The export is `any` or `unknown` |
+| `unchecked` | `factory_unresolved` | `instance:<f>`: `f` is not a callable member, no overload builds from an options object, or what it builds is `any` or `unknown`. Also a `factory` claim whose declared option is there but whose result is `any` or `unknown` |
+| `unchecked` | `budget` | The request ran out of `budget_ms` (optional, default 600000) before this check |
+| `failed` | `member_missing`, `member_not_callable` | The member is not declared on the receiver, or has no call signature |
+| `failed` | `method_not_member_verb` | A `verb` claim's method is not its member upper-cased, or not `GET POST PUT PATCH DELETE HEAD OPTIONS` |
+| `failed` | `path_not_string` | No signature of the verb takes a string first |
+| `failed` | `param_missing` | No signature has the parameter the claim needs there |
+| `failed` | `body_not_open` | A `path_body` verb's body parameter is not a type parameter, `any` or `unknown` |
+| `failed` | `options_not_object` | A `path_options` verb's second parameter is not an object type with a declared property |
+| `failed` | `key_missing`, `key_not_string` | The claimed option key is not declared (an index signature does not count), or does not accept a string (a method key may accept an HTTP method literal instead) |
+
+When no overload satisfies a claim, the reason is the one from the overload that got furthest. `semantics_modules` says how each package resolved, for logs.
 
 #### `infer` - Resolve the type at a locator
 
@@ -626,6 +708,7 @@ Response, written before the process exits:
 | `src/bundler.ts` | Legacy symbol bundling and surface emission |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
+| `src/client-semantics.ts` | `verify_client_semantics`: library claims against a package's declarations |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
 | `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |

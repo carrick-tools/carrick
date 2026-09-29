@@ -12,6 +12,7 @@
  * - Process stays alive between requests (warm standby)
  */
 
+import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
@@ -26,6 +27,7 @@ import {
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
+import { ClientSemanticsVerifier } from './client-semantics.js';
 import type {
   SidecarRequest,
   SidecarResponse,
@@ -39,6 +41,7 @@ import type {
   CheckCompatibilityResponse,
   ResolveDefinitionsResponse,
   RetypeCheckResponse,
+  VerifyClientSemanticsResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -63,6 +66,7 @@ interface ProjectComponents {
   typeInferrer: TypeInferrer;
   definitionResolver: DefinitionResolver;
   retyper: Retyper;
+  semanticsVerifier: ClientSemanticsVerifier;
 }
 
 let components: ProjectComponents | null = null;
@@ -111,6 +115,7 @@ function projectComponents(): ProjectComponents {
         jsonWireDeclarations,
         findDisqualifyingTopTypes as unknown as TopTypeWalk
       ),
+      semanticsVerifier: new ClientSemanticsVerifier(project),
     };
   }
   return components;
@@ -400,6 +405,43 @@ function handleRetypeCheck(
 }
 
 /**
+ * How long one verify_client_semantics request may spend before the checks it
+ * has not reached come back `unchecked` with reason `budget`. The first request
+ * on a service may pay the program build, which counts against it; the checks
+ * themselves are cheap. Well inside the scanner's 900s read deadline.
+ */
+const SEMANTICS_BUDGET_MS = 600_000;
+
+/**
+ * Handle the 'verify_client_semantics' action - check library-semantics
+ * claims against each package's type declarations (carrick#1564)
+ */
+function handleVerifyClientSemantics(
+  request: SidecarRequest & { action: 'verify_client_semantics' }
+): VerifyClientSemanticsResponse {
+  try {
+    const { semanticsVerifier } = projectComponents();
+    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
+    const { semantics, modules } = semanticsVerifier.run(
+      fromDir,
+      request.checks,
+      request.budget_ms ?? SEMANTICS_BUDGET_MS
+    );
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      semantics,
+      semantics_modules: modules,
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Client-semantics check failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'build_workspace' action - build synthetic monorepo workspace
  */
 function handleBuildWorkspace(request: SidecarRequest & { action: 'build_workspace' }): BuildWorkspaceResponse {
@@ -576,6 +618,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleResolveDefinitions(request);
     case 'retype_check':
       return handleRetypeCheck(request);
+    case 'verify_client_semantics':
+      return handleVerifyClientSemantics(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':
