@@ -1310,6 +1310,20 @@ describe('verify_client_semantics ignores what the service declares for a packag
     ['B3', 'verbs an installed interface takes from a Record base', 'fixture-iface', VERB_GET, 'verified', undefined],
     ['B3', 'verbs an installed intersection alias takes from a Record part', 'fixture-inter', VERB_GET, 'verified', undefined],
     ['B3', 'a mapped member reached through a base another library base also lists', 'ax-twobase', VERB('post'), 'verified', undefined],
+    // The key source: the service adds a key to the interface a library mapped
+    // type iterates. These members carry no declaration of their own.
+    ['keys', 'a key the service adds to the interface a Record iterates', 'ax-keys-record', VERB('delete'), 'failed', 'member_missing'],
+    ['keys', 'a library key through a Record over keyof', 'ax-keys-record', VERB_GET, 'verified', undefined],
+    ['keys', 'a key the service adds to the interface a keyof-and-string mapped type iterates', 'ax-keys-inter', VERB('delete'), 'failed', 'member_missing'],
+    ['keys', 'a library key through a keyof-and-string mapped type', 'ax-keys-inter', VERB_GET, 'verified', undefined],
+    ['keys', 'a key the service adds to the interface a Lowercase remap iterates', 'ax-keys-remap', VERB('delete'), 'failed', 'member_missing'],
+    ['keys', 'a library key through a Lowercase remap', 'ax-keys-remap', VERB_GET, 'verified', undefined],
+    ['keys', 'an upper-case key the service adds that the remap lower-cases', 'ax-keys-upper', VERB('delete'), 'failed', 'member_missing'],
+    ['keys', 'a library upper-case key the remap lower-cases', 'ax-keys-upper', VERB_GET, 'verified', undefined],
+    ['keys', 'a key the service adds to a global interface a Record iterates', 'ax-keys-global', VERB('options'), 'failed', 'member_missing'],
+    ['keys', 'a library key through a Record over a global interface', 'ax-keys-global', VERB_GET, 'verified', undefined],
+    ['keys', 'a key the service adds through an augmentation of the package\'s subpath', 'ax-keys-sub', VERB('delete'), 'failed', 'member_missing'],
+    ['keys', 'a library key whose interface a subpath declares', 'ax-keys-sub', VERB_GET, 'verified', undefined],
   ];
 
   before(async () => {
@@ -1340,6 +1354,22 @@ describe('verify_client_semantics ignores what the service declares for a packag
       // B2: under a node_modules ancestor, the service's own file still is not installed.
       'src/anc.ts': "import 'ax-anc';\ndeclare module 'ax-anc' { interface S { post(url: string): Promise<unknown> } }\nexport {};\n",
       // B3: the service extends a library base interface with its own mapped type.
+      'src/keys.ts': [
+        "import 'ax-keys-record';",
+        "import 'ax-keys-inter';",
+        "import 'ax-keys-remap';",
+        "import 'ax-keys-upper';",
+        "import 'ax-keys-global';",
+        "import 'ax-keys-sub';",
+        "declare module 'ax-keys-sub/types' { interface MethodMap { delete: true } }",
+        "declare module 'ax-keys-record' { interface MethodMap { delete: true } }",
+        "declare module 'ax-keys-inter' { interface MethodMap { delete: true } }",
+        "declare module 'ax-keys-remap' { interface MethodMap { delete: true } }",
+        "declare module 'ax-keys-upper' { interface MethodMap { DELETE: true } }",
+        'declare global { interface AxKeyRegistry { options: true } }',
+        'export {};',
+        '',
+      ].join('\n'),
       'src/generic.ts': "import 'ax-generic';\ndeclare module 'ax-generic' { interface Base<T> extends Record<'post', (url: string) => Promise<unknown>> {} }\nexport {};\n",
       'src/base.ts': "import 'ax-base';\nimport 'ax-deep';\nimport 'ax-twobase';\ndeclare module 'ax-base' { interface Base extends Record<'post', (url: string, body: unknown) => Promise<unknown>> {} }\ndeclare module 'ax-deep' { interface Root extends Record<'post', (url: string) => Promise<unknown>> {} }\ndeclare module 'ax-twobase' { interface Extra extends Record<'post', (url: string) => Promise<unknown>> {} }\nexport {};\n",
     });
@@ -1366,6 +1396,14 @@ describe('verify_client_semantics ignores what the service declares for a packag
     pkgIn(svc, 'fixture-lib', `export interface S { send(config: RequestInit & { url: string }): Promise<unknown> }\n${tail}`);
     pkgIn(svc, 'ax-base', `export interface Base { get(url: string): Promise<unknown> }\nexport interface S extends Base {}\n${tail}`);
     pkgIn(svc, 'ax-deep', `export interface Root { get(url: string): Promise<unknown> }\nexport interface Mid extends Root {}\nexport interface S extends Mid {}\n${tail}`);
+    const FN = '(url: string, body: unknown) => Promise<unknown>';
+    pkgIn(svc, 'ax-keys-record', `export interface MethodMap { get: true; post: true }\nexport type S = Record<keyof MethodMap, ${FN}>;\n${tail}`);
+    pkgIn(svc, 'ax-keys-inter', `export interface MethodMap { get: true; post: true }\nexport type S = { [K in keyof MethodMap & string]: ${FN} };\n${tail}`);
+    pkgIn(svc, 'ax-keys-remap', `export interface MethodMap { get: true; post: true }\nexport type S = { [K in keyof MethodMap as Lowercase<K & string>]: ${FN} };\n${tail}`);
+    pkgIn(svc, 'ax-keys-upper', `export interface MethodMap { GET: true; POST: true }\nexport type S = { [K in keyof MethodMap as Lowercase<K & string>]: ${FN} };\n${tail}`);
+    pkgIn(svc, 'ax-keys-sub', `import { MethodMap } from './types';\nexport type S = Record<keyof MethodMap, ${FN}>;\n${tail}`);
+    writeTree(svc, { 'node_modules/ax-keys-sub/types.d.ts': 'export interface MethodMap { get: true; post: true }\n' });
+    pkgIn(svc, 'ax-keys-global', `declare global { interface AxKeyRegistry { get: true } }\nexport type S = Record<keyof AxKeyRegistry, ${FN}>;\n${tail}`);
     pkgIn(svc, 'ax-generic', `export interface Base<T> { get(url: T): Promise<unknown> }\nexport interface S<T = string> extends Base<T> {}\n${tail}`);
     pkgIn(svc, 'fixture-iface', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
     pkgIn(svc, 'fixture-inter', `export type S = { timeout: number } & Record<'get' | 'post', (url: string) => Promise<unknown>>;\n${tail}`);

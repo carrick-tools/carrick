@@ -205,6 +205,7 @@ export class ClientSemanticsVerifier {
         }
         const key = exportKey(check);
         const declaration = file.statements[importIndex.get(key)!] as ts.ImportDeclaration;
+        reader.setPackage(check.package);
 
         let moduleRead = moduleReads.get(check.package);
         if (!moduleRead) {
@@ -289,6 +290,10 @@ class DeclarationReader {
   private readonly root: string;
   private readonly packageDirectories = new Map<string, InstalledPackage | null>();
   private readonly realpaths = new Map<string, string>();
+  /** Names the service declares in its own blocks, per augmented package (`global` for `declare global`). */
+  private augmentedNames: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  /** The package of the check being judged; see `serviceAugmentedNames`. */
+  private currentPackage = '';
 
   constructor(
     private readonly program: ts.Program,
@@ -362,8 +367,9 @@ class DeclarationReader {
       // at another installed package. The resolver must land in an installed
       // package directory, and that package must be the one named: by its
       // `packageId` (or its separate `@types` package), or, for an `npm:`
-      // alias, by the directory the installer named after the alias while its
-      // package.json names the target.
+      // alias, by the directory name, which the installer takes from the
+      // alias. (The package.json comparison beside it always holds:
+      // TypeScript builds `packageId` from that same package.json.)
       const installed =
         agrees && resolved !== undefined ? this.installedPackage(resolved.resolvedFileName) : undefined;
       const packageId = resolved?.packageId;
@@ -805,8 +811,70 @@ class DeclarationReader {
    */
   private isLibraryDeclared(property: ts.Symbol, listing: ts.Type): boolean {
     const declarations = property.declarations ?? [];
-    if (declarations.length === 0) return this.isListedByLibraryType(listing, property.getName());
+    if (declarations.length === 0) {
+      return (
+        !this.isNamedByServiceAugmentation(property.getName()) &&
+        this.isListedByLibraryType(listing, property.getName())
+      );
+    }
     return declarations.some(declaration => this.isLibraryFile(declaration.getSourceFile()));
+  }
+
+  /** Judge the next check as a claim about `pkg`. */
+  setPackage(pkg: string): void {
+    this.currentPackage = packageNameOf(pkg);
+  }
+
+  /**
+   * The service's own `declare module '<this package>'` (or one of its
+   * subpaths) or `declare global` blocks declare a member of this name,
+   * compared without case. A mapped type's member has no declaration of its
+   * own, so when the service adds a key to the interface a library mapped
+   * type iterates (`Record<keyof MethodMap, Fn>`, with or without `& string`,
+   * or re-cased by an `as Lowercase<...>` remap), nothing on the member says
+   * the service put it there. Blocks for other packages do not count: a
+   * service augments many packages, and their member names say nothing about
+   * this one.
+   */
+  private isNamedByServiceAugmentation(name: string): boolean {
+    const names = this.serviceAugmentedNames();
+    const lower = name.toLowerCase();
+    return Boolean(names.get(this.currentPackage)?.has(lower) || names.get('global')?.has(lower));
+  }
+
+  private serviceAugmentedNames(): ReadonlyMap<string, ReadonlySet<string>> {
+    if (this.augmentedNames) return this.augmentedNames;
+    const byPackage = new Map<string, Set<string>>();
+    const collect = (node: ts.Node, names: Set<string>): void => {
+      if (
+        (ts.isPropertySignature(node) ||
+          ts.isMethodSignature(node) ||
+          ts.isPropertyDeclaration(node) ||
+          ts.isMethodDeclaration(node) ||
+          ts.isEnumMember(node)) &&
+        (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) || ts.isNumericLiteral(node.name))
+      ) {
+        names.add(node.name.text.toLowerCase());
+      }
+      ts.forEachChild(node, child => collect(child, names));
+    };
+    for (const file of this.program.getSourceFiles()) {
+      if (file === this.probe || this.isLibraryFile(file)) continue;
+      for (const statement of file.statements) {
+        if (!ts.isModuleDeclaration(statement) || !statement.body) continue;
+        const key = ts.isStringLiteral(statement.name)
+          ? packageNameOf(statement.name.text)
+          : statement.flags & ts.NodeFlags.GlobalAugmentation
+            ? 'global'
+            : undefined;
+        if (key === undefined) continue;
+        let names = byPackage.get(key);
+        if (!names) byPackage.set(key, (names = new Set<string>()));
+        collect(statement.body, names);
+      }
+    }
+    this.augmentedNames = byPackage;
+    return byPackage;
   }
 
   /**
