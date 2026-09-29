@@ -202,6 +202,8 @@ fn mock_env(cassette: &Path) {
         std::env::remove_var("GITHUB_EVENT_NAME");
         std::env::remove_var("GITHUB_REF");
         std::env::remove_var("CARRICK_OUTPUT_JSON");
+        // The in-scan schedule's waits, without the sleeping.
+        std::env::set_var(carrick::client_semantics::PENDING_REASK_WAITS_ENV, "0,0");
     }
 }
 
@@ -874,7 +876,8 @@ async fn a_reask_that_names_other_packages_asks_for_guidance_again() {
 }
 
 /// An entry still `pending` for a package that is installed is asked again
-/// on the next scan.
+/// on the next scan: once across scans, then twice more on the in-scan
+/// schedule, which the mock's fixed answer never settles.
 #[tokio::test]
 #[serial]
 async fn a_pending_entry_is_asked_again() {
@@ -894,7 +897,34 @@ async fn a_pending_entry_is_asked_again() {
     );
 
     let (_, detect, guidance) = scan_counting(&storage, &repo).await;
-    assert_eq!((detect, guidance), (1, 0));
+    assert_eq!((detect, guidance), (3, 0));
+}
+
+/// A package that stays `pending` on every ask of the in-scan schedule is
+/// asked about exactly three times in the scan (owner ruling on
+/// carrick#1564): the first detection and two re-asks. The rows the other
+/// packages' semantics state do not move, and the pending entry is kept for
+/// the next scan.
+#[tokio::test]
+#[serial]
+async fn a_package_pending_on_every_ask_is_asked_three_times_in_one_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::PendingInstalled);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    let detect = requests_to("/framework-detect");
+    let data = scan(&StubStorage::default(), &repo, Some(&sidecar)).await;
+    assert_eq!(requests_to("/framework-detect") - detect, 3);
+    assert_answer_key(&rows(&data));
+    assert!(
+        data.cached_detection
+            .and_then(|detection| detection.client_semantics)
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry.package == "fixture-slow-http" && entry.status == SemanticsStatus::Pending
+            })),
+        "still pending, for the next scan to ask about"
+    );
 }
 
 /// A `pending` package that is not installed is not asked about again,
@@ -940,7 +970,10 @@ async fn a_retry_of_owed_work_does_not_ask_again_in_the_same_run() {
             .any(|file| file.ends_with("prefix-client.ts"))),
         "the run retried the file it owed, and the retry answered"
     );
-    assert_eq!(detect, 1, "one detection for the run, and no re-ask in it");
+    assert_eq!(
+        detect, 3,
+        "the first pass's detection and its schedule's two re-asks; the retry asks nothing"
+    );
     assert!(
         data.cached_detection
             .and_then(|detection| detection.client_semantics)

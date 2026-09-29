@@ -801,6 +801,161 @@ fn surface_from(
     LibrarySemantics::from_verdicts(derived, results)
 }
 
+// ---------------------------------------------------------------------------
+// Asking again within the scan
+// ---------------------------------------------------------------------------
+
+/// The waits before each in-scan re-ask about a package detection left
+/// `pending`: one ask, then one after each wait, so three asks in all per
+/// service per scan (owner ruling on carrick#1564). A new user's first scan
+/// should not have to wait for the next scan to read its clients.
+pub const PENDING_REASK_WAITS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+];
+
+/// Replaces [`PENDING_REASK_WAITS`] with comma-separated milliseconds, so a
+/// test runs the schedule without sleeping.
+pub const PENDING_REASK_WAITS_ENV: &str = "CARRICK_PENDING_REASK_WAITS_MS";
+
+/// The longest one re-ask may take: the gateway's limit on the route.
+pub const PENDING_REASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`PENDING_REASK_WAITS`], or what [`PENDING_REASK_WAITS_ENV`] says.
+pub fn pending_reask_waits() -> Vec<std::time::Duration> {
+    std::env::var(PENDING_REASK_WAITS_ENV)
+        .ok()
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(|ms| ms.trim().parse::<u64>().ok())
+                .collect::<Option<Vec<u64>>>()
+        })
+        .map(|waits| {
+            waits
+                .into_iter()
+                .map(std::time::Duration::from_millis)
+                .collect()
+        })
+        .unwrap_or_else(|| PENDING_REASK_WAITS.to_vec())
+}
+
+/// What the scan tells the user about the schedule: counts and time, one
+/// line each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleNotice {
+    /// `waiting` of `described` client libraries are still being described,
+    /// and the scan waits up to `wait` for the next answer.
+    Waiting {
+        waiting: usize,
+        described: usize,
+        wait: std::time::Duration,
+    },
+    /// `remaining` are still not described when the schedule ends.
+    Remaining { remaining: usize },
+}
+
+impl ScheduleNotice {
+    /// The line the user reads.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Waiting {
+                waiting,
+                described,
+                wait,
+            } => format!(
+                "{waiting} of {described} client libraries still being described, waiting up to {} s",
+                wait.as_secs()
+            ),
+            Self::Remaining { remaining } => format!(
+                "{remaining} client {} not described yet; the next scan asks again",
+                if *remaining == 1 {
+                    "library"
+                } else {
+                    "libraries"
+                }
+            ),
+        }
+    }
+}
+
+/// Ask again, on a schedule, about the packages `entries` leaves `pending`
+/// that `installed` says could use an answer.
+///
+/// `entries` is what the scan's first ask left. Before each re-ask the
+/// schedule waits the next of `waits`, and it stops as soon as nothing
+/// installed is pending. `ask` is one attempt: `None` for a failure, or for
+/// an answer the scan cannot use. A later answer fills only entries still
+/// pending, so the first answer for a package stands whichever ask gave it,
+/// and the rows cannot depend on which ask that was.
+pub async fn settle_pending<Ask, AskFut, Wait, WaitFut>(
+    mut entries: Vec<ClientSemanticsEntry>,
+    installed: impl Fn(&str) -> bool,
+    waits: &[std::time::Duration],
+    mut ask: Ask,
+    mut wait: Wait,
+    mut notice: impl FnMut(ScheduleNotice),
+) -> Vec<ClientSemanticsEntry>
+where
+    Ask: FnMut() -> AskFut,
+    AskFut: std::future::Future<Output = Option<Vec<ClientSemanticsEntry>>>,
+    Wait: FnMut(std::time::Duration) -> WaitFut,
+    WaitFut: std::future::Future<Output = ()>,
+{
+    let waiting = |entries: &[ClientSemanticsEntry]| {
+        entries
+            .iter()
+            .filter(|entry| entry.status == SemanticsStatus::Pending && installed(&entry.package))
+            .count()
+    };
+    let described = entries
+        .iter()
+        .filter(|entry| entry.status != SemanticsStatus::Skipped)
+        .count();
+    for pause in waits {
+        let still = waiting(&entries);
+        if still == 0 {
+            return entries;
+        }
+        notice(ScheduleNotice::Waiting {
+            waiting: still,
+            described,
+            wait: *pause + PENDING_REASK_TIMEOUT,
+        });
+        wait(*pause).await;
+        if let Some(later) = ask().await {
+            fill_pending(&mut entries, &later);
+        }
+    }
+    let remaining = waiting(&entries);
+    if remaining > 0 {
+        notice(ScheduleNotice::Remaining { remaining });
+    }
+    entries
+}
+
+/// Fill each entry still `pending` with `later`'s answer for the same
+/// package, where `later` answered it. Nothing else moves.
+fn fill_pending(entries: &mut [ClientSemanticsEntry], later: &[ClientSemanticsEntry]) {
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| entry.status == SemanticsStatus::Pending)
+    {
+        if let Some(answer) = later.iter().find(|answer| {
+            answer.package == entry.package && answer.status == SemanticsStatus::Answered
+        }) {
+            *entry = answer.clone();
+        }
+    }
+}
+
+/// Whether `package` is installed where the service would resolve it.
+pub fn installed_for(service_root: &Path, repo_root: &Path) -> impl Fn(&str) -> bool {
+    let service_root = service_root.to_path_buf();
+    let repo_root = repo_root.to_path_buf();
+    move |package| installed(package, &service_root, &repo_root)
+}
+
 /// Whether `results` is one verdict per check, for the same `(claim_id,
 /// receiver)` pair, in request order, which is what the sidecar answers. A
 /// batch that is not says nothing reliable about any pair in it: a verdict

@@ -102,9 +102,9 @@ impl MultiAgentOrchestrator {
         // deterministic layer asks it what a bare `x.verb("/lit", arg)` site's
         // receiver is (carrick#695).
         sidecar: Option<&crate::services::type_sidecar::TypeSidecar>,
-        // What each call site's callee sends, composed at discovery
-        // (carrick#1555).
-        request_summaries: crate::request_summary::RequestSummaryIndex,
+        // What each call site's callee sends (carrick#1555), possibly still
+        // being composed while the library semantics settle (carrick#1564).
+        request_summaries: crate::agents::file_orchestrator::SummarySource,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 

@@ -2876,7 +2876,7 @@ async fn analyze_current_repo_incremental(
             // (cached or fresh — all three share the package_json_hash gate).
             // A fresh ask that fails defers this service's model analysis
             // instead of ending the run (see `model_setup`).
-            let setup = if crate::local_mode::no_model() {
+            let mut setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
                     ModelSetup::ready(
                         prev.cached_detection.clone().unwrap_or_default(),
@@ -2969,15 +2969,12 @@ async fn analyze_current_repo_incremental(
             // model only if phase 1 raises a candidate for it — and it logs the
             // dispatched and replayed counts once it knows them.
             let agent_service = AgentService::new();
-            let request_summaries = summarize_requests(
-                &request_inputs,
-                &setup.detection,
-                sidecar,
-                &service_scan_root(repo_path, config),
-            );
+            let (summaries_sender, summaries) = tokio::sync::oneshot::channel();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone())
                 .deferring_model(setup.deferred.is_some())
-                .with_request_summaries(request_summaries);
+                .with_request_summaries(crate::agents::file_orchestrator::SummarySource::later(
+                    summaries,
+                ));
 
             // Stage B2: GraphQL producer field-list from the service's SDL,
             // derived deterministically so the file-analyzer can emit
@@ -3018,22 +3015,40 @@ async fn analyze_current_repo_incremental(
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
             enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-            let analysis = file_orchestrator
-                .analyze_files(
+            // The library semantics settle alongside the analysis, which
+            // reads the summaries composed with them only once the model has
+            // been asked (carrick#1564).
+            let declared_dependencies = packages.declared_dependency_names();
+            let semantics_root = service_scan_root(repo_path, config);
+            let (analysis, settled) = tokio::join!(
+                file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
                     &setup.guidance,
                     &setup.detection,
                     &service_root,
                     Path::new(repo_path),
-                    &packages.declared_dependency_names(),
+                    &declared_dependencies,
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
                     &service_modules,
                     sidecar,
-                )
-                .await?;
+                ),
+                settle_semantics_and_summarize(
+                    &request_inputs,
+                    &setup.detection,
+                    semantics_schedule_applies(&setup, generation),
+                    packages,
+                    &all_import_facts,
+                    sidecar,
+                    &semantics_root,
+                    Path::new(repo_path),
+                    summaries_sender,
+                ),
+            );
+            let analysis = analysis?;
+            setup.detection.client_semantics = settled;
             crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
             let merged_results = normalize_file_results_keys(&analysis.file_results, repo_path);
@@ -5936,11 +5951,11 @@ fn discover_files_and_symbols(
 /// summaries are exactly what they are without them.
 fn summarize_requests(
     inputs: &crate::request_summary::RequestSummaryInputs,
-    detection: &DetectionResult,
+    entries: Option<&[crate::client_semantics::ClientSemanticsEntry]>,
     sidecar: Option<&TypeSidecar>,
     service_root: &Path,
 ) -> crate::request_summary::RequestSummaryIndex {
-    let semantics = match (detection.client_semantics.as_deref(), sidecar) {
+    let semantics = match (entries, sidecar) {
         (Some(entries), Some(sidecar)) if !entries.is_empty() => {
             crate::client_semantics::verify(sidecar, service_root, entries)
         }
@@ -5955,6 +5970,84 @@ fn summarize_requests(
         summaries.undetermined
     );
     summaries
+}
+
+/// Settle the service's library semantics and send the request summaries
+/// composed with them (carrick#1564). Runs alongside the file analysis, which
+/// reads the summaries only once the model has been asked, so the waiting
+/// costs the user nothing unless it outlasts the analysis.
+///
+/// Where `schedule` holds, every package detection left `pending` that is
+/// installed is asked about again on the in-scan schedule
+/// ([`crate::client_semantics::settle_pending`]): one HTTP attempt per ask,
+/// each bounded by [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An ask
+/// that fails, or answers different lists than the ones the guidance was
+/// built from, changes nothing; the next scan asks again. Always sends, and
+/// returns the settled entries for the blob to keep.
+#[allow(clippy::too_many_arguments)]
+async fn settle_semantics_and_summarize(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    detection: &DetectionResult,
+    schedule: bool,
+    packages: &Packages,
+    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
+    sidecar: Option<&TypeSidecar>,
+    service_root: &Path,
+    repo_root: &Path,
+    summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    let settled = match &detection.client_semantics {
+        Some(entries) if schedule => Some(
+            crate::client_semantics::settle_pending(
+                entries.clone(),
+                crate::client_semantics::installed_for(service_root, repo_root),
+                &crate::client_semantics::pending_reask_waits(),
+                || async {
+                    let detector = FrameworkDetector::new(reask_agent());
+                    let ask = detector.detect_frameworks_and_libraries(packages, import_facts);
+                    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask)
+                        .await
+                    {
+                        Ok(Ok(fresh)) if fresh.same_lists(detection) => fresh.client_semantics,
+                        Ok(Ok(_)) => {
+                            debug!(
+                                "Asking again for library semantics answered other packages; the next scan settles them"
+                            );
+                            None
+                        }
+                        Ok(Err(error)) => {
+                            debug!("Asking again for library semantics failed ({error})");
+                            None
+                        }
+                        Err(_) => {
+                            debug!("Asking again for library semantics ran out of time");
+                            None
+                        }
+                    }
+                },
+                tokio::time::sleep,
+                |notice| crate::progress::announce(&notice.line()),
+            )
+            .await,
+        ),
+        entries => entries.clone(),
+    };
+    let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
+    if summaries.send(index).is_err() {
+        debug!("The analysis ended before its request summaries were composed");
+    }
+    settled
+}
+
+/// Whether the in-scan schedule may ask about library semantics: a model is
+/// in use, the service's model stages were not deferred, the run is not
+/// collecting prompts, and the service's previous generation is not this
+/// run's own (a retry of owed work asked minutes ago).
+fn semantics_schedule_applies(setup: &ModelSetup, generation: PreviousGeneration) -> bool {
+    !crate::local_mode::no_model()
+        && setup.deferred.is_none()
+        && generation == PreviousGeneration::Stored
+        && !crate::analysis_channel::dispatching()
 }
 
 /// Resolve a repo's `carrick.json` into one service config per service.
@@ -6832,7 +6925,7 @@ async fn analyze_current_repo(
 
     // 3b. Settle the model stages for this service: detection and guidance
     // (or a deferral), plus the extraction config. Local mode asks nothing.
-    let setup = if crate::local_mode::no_model() {
+    let mut setup = if crate::local_mode::no_model() {
         debug!("Local mode: skipping framework detection and guidance (no model)");
         ModelSetup::ready(
             DetectionResult::default(),
@@ -6848,27 +6941,43 @@ async fn analyze_current_repo(
     let service_root = service_scan_root(repo_path, config);
     // Composed here rather than in discovery: the library semantics they read
     // through exist only once detection has answered (carrick#1564).
-    let request_summaries =
-        summarize_requests(&request_inputs, &setup.detection, sidecar, &service_root);
+    let (summaries_sender, summaries) = tokio::sync::oneshot::channel();
     // One index for this service's join passes and, below, its type requests
     // and anchor stamps (carrick#1416).
     let service_modules = service_module_index(repo_path, config);
     enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-    let analysis_result = orchestrator
-        .run_complete_analysis(
+    // The library semantics settle alongside the analysis, which reads the
+    // summaries composed with them only once the model has been asked
+    // (carrick#1564).
+    let service_root_text = service_root.to_string_lossy().into_owned();
+    let (analysis_result, settled) = tokio::join!(
+        orchestrator.run_complete_analysis(
             files.clone(),
             packages,
             &setup,
-            &service_root.to_string_lossy(),
+            &service_root_text,
             Path::new(repo_path),
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
             &service_modules,
             sidecar,
-            request_summaries,
-        )
-        .await?;
+            crate::agents::file_orchestrator::SummarySource::later(summaries),
+        ),
+        settle_semantics_and_summarize(
+            &request_inputs,
+            &setup.detection,
+            semantics_schedule_applies(&setup, PreviousGeneration::Stored),
+            packages,
+            &all_import_facts,
+            sidecar,
+            &service_root,
+            Path::new(repo_path),
+            summaries_sender,
+        ),
+    );
+    let analysis_result = analysis_result?;
+    setup.detection.client_semantics = settled;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
     // 4b. Collect the function intents started after discovery. `Intents`
