@@ -1767,7 +1767,7 @@ mod tests {
 
         let before = input.service(path, &blob);
         assert_eq!(before.hosted_state, HostedState::NoIndexYet);
-        let stale = super::super::query::enrichment_note(&before, None);
+        let stale = super::super::query::enrichment_note(&before, None, "api");
         assert!(stale.contains("has no hosted index yet"), "{stale}");
 
         let after = input.uploaded(path, &blob);
@@ -1780,7 +1780,7 @@ mod tests {
             hosted.scanner_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
-        let note = super::super::query::enrichment_note(&after, None);
+        let note = super::super::query::enrichment_note(&after, None, "api");
         assert!(!note.contains("has no hosted index yet"), "{note}");
         assert!(note.contains("from the hosted index at abcdef"), "{note}");
         assert!(note.contains("by a laptop scan"), "{note}");
@@ -1937,7 +1937,7 @@ mod tests {
         };
         let answer = input.service(repo, &blob());
         assert_eq!(answer.hosted.as_ref().and_then(|h| h.dirty), Some(true));
-        let note = super::super::query::enrichment_note(&answer, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
         assert!(
             note.contains("Written from a tree with uncommitted changes"),
             "{note}"
@@ -1974,7 +1974,7 @@ mod tests {
         };
         let answer = input.uploaded(Path::new("/w/api"), &blob());
         assert!(answer.write_refused_as_current, "{answer:?}");
-        let note = super::super::query::enrichment_note(&answer, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
         assert!(
             note.contains("Nothing this scan computed was stored"),
             "{note}"
@@ -2016,7 +2016,7 @@ mod tests {
         );
         let answer = named.service(path, &blob());
         assert_eq!(answer.hosted_state, HostedState::NotConnected);
-        let note = super::super::query::enrichment_note(&answer, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
         assert!(
             note.contains("is not connected to a Carrick project"),
             "{note}"
@@ -2030,7 +2030,7 @@ mod tests {
         let answer = unnamed.service(path, &blob());
         assert_eq!(answer.hosted_state, HostedState::RemoteUnnamed);
         assert_eq!(answer.remote.as_deref(), Some("/srv/mirrors/api"));
-        let note = super::super::query::enrichment_note(&answer, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
         assert!(
             note.contains("could not read owner/repo from the git remote `/srv/mirrors/api`"),
             "{note}"
@@ -2046,7 +2046,7 @@ mod tests {
         let answer = none.service(path, &blob());
         assert_eq!(answer.hosted_state, HostedState::RemoteUnnamed);
         assert_eq!(answer.remote, None);
-        let note = super::super::query::enrichment_note(&answer, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
         assert!(note.contains("has no origin remote"), "{note}");
     }
 
@@ -2075,7 +2075,7 @@ mod tests {
         // And never as a refused upload: a dirty run forces the reindex, so
         // this write landed and the index an agent reads is this one. Reading
         // that sentence as a refusal is how carrick#1255 was first diagnosed.
-        let note = super::super::query::enrichment_note(&after, None);
+        let note = super::super::query::enrichment_note(&after, None, "api");
         assert!(!note.contains("retained"), "{note}");
         assert!(
             !note.contains("Nothing this scan computed was stored"),

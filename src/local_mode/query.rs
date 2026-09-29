@@ -149,7 +149,7 @@ pub fn answer(
     let enrichment = service_row
         .map(|s| s.enrichment.clone())
         .unwrap_or_default();
-    let boundary_note = enrichment_note(&enrichment, boundary.as_ref());
+    let boundary_note = enrichment_note(&enrichment, boundary.as_ref(), &repo.name);
     let boundary_lines = boundary_lines(&service, &boundary_note, boundary.as_ref());
 
     // Where every other repo in the workspace lives, so a counterpart's
@@ -235,7 +235,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         changed.sort();
 
         for service in &repo.services {
-            let note = enrichment_note(&service.enrichment, service.boundary.as_ref());
+            let note = enrichment_note(&service.enrichment, service.boundary.as_ref(), &repo.name);
             let mut owned: Vec<String> = changed
                 .iter()
                 .filter(|file| service.covers(file))
@@ -694,9 +694,14 @@ fn hosted_provenance_clause(hosted: &super::hosted::HostedProvenance) -> String 
 
 /// Hosted provenance feeds the same boundary renderer used by every local
 /// surface. Read commands never probe the network to compose this sentence.
+///
+/// `repo` is the folder the service's repo is checked out in, named where a
+/// command has to run inside it: in a folder of repos the workspace is the
+/// folder above them, and a `git fetch` there fails.
 pub fn enrichment_note(
     enrichment: &super::hosted::ServiceEnrichment,
     boundary: Option<&crate::boundary::ServiceBoundary>,
+    repo: &str,
 ) -> String {
     use super::hosted::HostedState;
     let remote = enrichment.remote.as_deref().unwrap_or("this repo");
@@ -723,20 +728,24 @@ pub fn enrichment_note(
         // commit pushed to main, so a fetch finds it; a laptop row can be at a
         // commit its author never pushed, and a fetch finds nothing until they
         // do.
-        (HostedState::CommitMissing, Some(hosted)) => format!(
-            "hosted index at {}, which this clone does not have; candidates not replayed. {}",
-            hosted.commit.chars().take(7).collect::<String>(),
-            match (hosted.source.as_deref(), hosted.uploaded_by.as_deref()) {
+        (HostedState::CommitMissing, Some(hosted)) => {
+            let fetch = format!("`git fetch` in {repo}, then `carrick refresh`");
+            let action = match (hosted.source.as_deref(), hosted.uploaded_by.as_deref()) {
                 (Some("laptop"), Some(login)) if !login.is_empty() => format!(
                     "It came from a laptop scan by @{login}: once that commit is pushed, run \
-                     `git fetch`, then `carrick refresh`."
+                     {fetch}."
                 ),
-                (Some("laptop"), _) => "It came from a laptop scan: once that commit is \
-                                        pushed, run `git fetch`, then `carrick refresh`."
-                    .to_string(),
-                _ => "Run `git fetch`, then `carrick refresh`.".to_string(),
-            }
-        ),
+                (Some("laptop"), _) => {
+                    format!("It came from a laptop scan: once that commit is pushed, run {fetch}.")
+                }
+                _ => format!("Run {fetch}."),
+            };
+            format!(
+                "hosted index at {}, which this clone does not have; candidates not replayed. \
+                 {action}",
+                hosted.commit.chars().take(7).collect::<String>()
+            )
+        }
         // The writer named here is the one the ruled first run uses
         // (carrick-cloud#799): the user's own `carrick index`, not a CI run
         // that may be days away or may never be wired up. A CI run on main
@@ -867,7 +876,7 @@ mod tests {
             hosted_state: crate::local_mode::hosted::HostedState::VersionMismatch,
             ..Default::default()
         };
-        let note = enrichment_note(&enrichment, None);
+        let note = enrichment_note(&enrichment, None, "api");
         assert!(
             note.contains(
                 "The hosted index is older than this CLI; run `carrick index --detach` once from \
@@ -946,6 +955,7 @@ mod hosted_change_tests {
                 write_refused_as_current: false,
             },
             None,
+            "api",
         )
     }
 
@@ -970,6 +980,7 @@ mod hosted_change_tests {
                 write_refused_as_current: false,
             },
             None,
+            "api",
         );
         assert!(
             !note.contains("not classified locally"),
@@ -1035,10 +1046,13 @@ mod hosted_change_tests {
                     write_refused_as_current: false,
                 },
                 None,
+                "orders",
             )
         };
+        // The folder is named: in a folder of repos the workspace is the one
+        // above, and a fetch there fails.
         let ci = "hosted index at 4f2a1c9, which this clone does not have; candidates not \
-                  replayed. Run `git fetch`, then `carrick refresh`.";
+                  replayed. Run `git fetch` in orders, then `carrick refresh`.";
         assert_eq!(missing(hosted_row(Some("ci"), None, Some(false))), ci);
         // A row written before `source` existed is a CI row: the laptop path
         // arrived with the field.
@@ -1046,14 +1060,14 @@ mod hosted_change_tests {
         assert_eq!(
             missing(hosted_row(Some("laptop"), Some("ihor"), Some(false))),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It came from a laptop scan by @ihor: once that commit is pushed, run `git fetch`, \
-             then `carrick refresh`."
+             It came from a laptop scan by @ihor: once that commit is pushed, run `git fetch` \
+             in orders, then `carrick refresh`."
         );
         assert_eq!(
             missing(hosted_row(Some("laptop"), None, None)),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It came from a laptop scan: once that commit is pushed, run `git fetch`, then \
-             `carrick refresh`."
+             It came from a laptop scan: once that commit is pushed, run `git fetch` in orders, \
+             then `carrick refresh`."
         );
     }
 

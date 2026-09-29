@@ -71,7 +71,7 @@ type ConnectOptions = {
  * when the run set up the one above where it started.
  */
 export function adminWait(again: string = "run carrick init again"): string {
-  return `A workspace owner or admin must do this; Ctrl-C and ${again} once they have.`;
+  return `A workspace owner or admin must do this; press Ctrl-C and ${again} once they have.`;
 }
 
 /** The dashboard pages init sends a reader to, for one workspace. */

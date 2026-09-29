@@ -501,7 +501,7 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     assert!(
         note.contains(&format!(
             "hosted index at {short}, which this clone does not have; candidates not replayed. \
-             Run `git fetch`, then `carrick refresh`."
+             Run `git fetch` in orders, then `carrick refresh`."
         )),
         "{note}"
     );

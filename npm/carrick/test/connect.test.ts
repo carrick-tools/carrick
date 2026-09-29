@@ -505,7 +505,7 @@ test("a member's wait says who can end it, before it starts, and nobody else's d
         assert.ok(waiting > 0, lines.join("\n"));
         assert.equal(
           lines[waiting - 1],
-          "A workspace owner or admin must do this; Ctrl-C and run carrick init in ~/shop again once they have.",
+          "A workspace owner or admin must do this; press Ctrl-C and run carrick init in ~/shop again once they have.",
         );
       } else {
         assert.ok(!lines.includes(adminWait()), `${String(member)}: ${lines.join("\n")}`);

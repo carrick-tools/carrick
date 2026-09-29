@@ -1055,7 +1055,7 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.equal(result.status, 0, result.stderr);
       // The project is stated once, on the one line that says what is set up
       // (carrick#1026, carrick#1489), and the verdict line is gone.
-      assert.match(result.stdout, /^◇ payments: repo$/m);
+      assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
       assert.doesNotMatch(result.stdout, /Verified 1 repo in project|Signed in as/);
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
       // A repo already in the project is not a project to look up or create.
@@ -1131,7 +1131,7 @@ test("the executable CLI creates the named project and puts the repos in it", po
     assert.ok(proposed >= 0, result.stdout);
     assert.ok(proposed < result.stdout.indexOf("Moved acme/api"), result.stdout);
     // Claimed only because resolve-repos read it back afterwards.
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     // And no browser step is asked for, because none is left.
     assert.doesNotMatch(result.stdout, /Assign the requested repos/);
     assert.doesNotMatch(result.stdout, /Setup continues/);
@@ -1334,7 +1334,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     assert.equal(result.status, 0, result.stderr);
 
     // The run reaches its closing line, the project and its repo.
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
 
     const onPath =
       spawnSync(process.platform === "win32" ? "where" : "which", ["carrick"], { stdio: "ignore" })
@@ -1378,7 +1378,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     assert.equal(
       result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
-        "◇ payments: repo",
+        "◇ Set up in project payments: repo",
         "▲ Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.",
         "",
         "Next: paste this into a new agent session",
@@ -1685,7 +1685,7 @@ test("the executable CLI resolves an ssh host alias and verifies the repo", posi
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -1739,7 +1739,7 @@ test("the executable CLI takes --repo for the identity a remote could not give",
     );
     assert.equal(result.status, 0, result.stderr);
     assert.ok(result.stdout.includes(`◇ acme/api taken as the GitHub repository for ${fixture.repo}`), result.stdout);
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -2248,10 +2248,9 @@ for (const claims of ["adopts", "before-1359"] as const) {
       }
       // No line of its own for the create: the list said it (carrick#1512).
       assert.doesNotMatch(said, /Created project/);
-      // Part 4: one line for what is set up — the project and its repos, as
-      // David's mock has it — the to-dos, then the prompt; part 5: the
-      // install leads it.
-      assert.ok(out.lines.includes("◇ Acme (acme): acme-api"), said);
+      // Part 4: one line for what is set up — the project and its repos —
+      // the to-dos, then the prompt; part 5: the install leads it.
+      assert.ok(out.lines.includes("◇ Set up in project Acme (acme): acme-api"), said);
       assert.equal(
         out.lines.at(-1),
         [
@@ -2759,12 +2758,14 @@ test("the installs a first scan would refuse over lead the agent's instruction",
 // carrick#1489 part 4: nine blocks closed a first run. What is set up is one
 // line; what is left to do is a line each, and only when there is something.
 test("what is set up is one line: the project and the repos in it", () => {
-  // The line David's mock settled on (carrick#1512), in folder order.
-  assert.equal(summaryLine("Shop (shop)", ["shop-app", "shop-api"]), "Shop (shop): shop-api, shop-app");
-  assert.equal(summaryLine(null, ["shop-app"]), "No project: shop-app");
+  // In folder order, and saying what it reports: a bare "Shop (shop): api"
+  // left the reader to guess (carrick#1574).
+  assert.equal(summaryLine("Shop (shop)", ["shop-app", "shop-api"]), "Set up in project Shop (shop): shop-api, shop-app");
+  assert.equal(summaryLine(null, ["shop-app"]), "Set up with no project: shop-app");
+  assert.equal(summaryLine(null, []), "Set up with no project");
   assert.equal(
     summaryLine("Shop (shop)", Array.from({ length: 12 }, (_, index) => `repo-${String(index).padStart(2, "0")}`)),
-    "Shop (shop): repo-00, repo-01, repo-02, repo-03, repo-04, repo-05, repo-06, repo-07, repo-08, repo-09 and 2 more",
+    "Set up in project Shop (shop): repo-00, repo-01, repo-02, repo-03, repo-04, repo-05, repo-06, repo-07, repo-08, repo-09 and 2 more",
   );
 });
 // What the step says while the download runs. Minutes of silence on a line
@@ -2904,13 +2905,20 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
   assert.deepEqual(owed.map((entry) => entry.name), ["acme/web", "acme/jobs", "acme/docs", "acme/site"]);
   assert.deepEqual(reposToScaffold([repos[0]!], (target) => present.has(target)), []);
 
+  // The owner/repo is the value of `repo`, so it is said once (carrick#1574).
   assert.equal(
     scaffoldSentence([repos[1]!]),
-    "Run the carrick scaffold tool for acme/web, passing its owner/repo as `repo`, and follow what it returns.",
+    "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
   );
   assert.equal(
     scaffoldSentence(owed),
-    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
+    "Run the carrick scaffold tool once per repo, with `repo` set to each of acme/web, acme/jobs, acme/docs and 1 more, and follow what it returns.",
+  );
+  // A repo known here only by its folder: the agent still has to find the
+  // owner/repo, and the sentence still asks it to.
+  assert.equal(
+    scaffoldSentence([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
+    "Run the carrick scaffold tool for local, passing its owner/repo as `repo`, and follow what it returns.",
   );
 });
 
@@ -3252,7 +3260,7 @@ test("inside one repo, init asks which repos beside it belong with it, and a yes
     );
     // No line for the create; the closing line is the project and its repos.
     assert.doesNotMatch(said, /Created project/);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), said);
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), said);
     // Not told to run it again anywhere.
     assert.doesNotMatch(said, /Run carrick init \.\.|parent folder/);
     // Nothing was created before the answer: the create is the first write.
@@ -3454,7 +3462,7 @@ test("inside a repo the folder above already set up, init sets up the folder aga
     assert.equal(out.questions[0]!.question, "Which repos should Carrick index?");
     assert.ok(!out.questions.some((entry) => entry.question.includes("same system")));
     assert.equal(fs.existsSync(path.join(fixture.app, ".carrick")), false);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), out.lines.join("\n"));
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), out.lines.join("\n"));
   } finally {
     fixture.restore();
   }
@@ -3527,7 +3535,7 @@ test("a repo with no GitHub remote is named in no project line", posixNativeFixt
     );
     assert.ok(out.questions.some((entry) => entry.question === "Which project should shop-app and shop-api be in?"), said);
     assert.ok(said.includes("  Create project Shop with shop-app and shop-api\n"), said);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), said);
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), said);
   } finally {
     fixture.restore();
   }
