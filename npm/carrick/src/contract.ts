@@ -213,6 +213,11 @@ export type StatusService = {
   boundary_note?: string;
   boundary_lines?: string[];
   /**
+   * The hosted row the hosted state below is about, or null when there is
+   * none (`HostedProvenance` in `src/local_mode/hosted.rs`).
+   */
+  hosted?: StatusHosted | null;
+  /**
    * What the hosted index held for this service at the last index or refresh.
    * `no_index_yet` is a connected repo whose first CI scan has not landed —
    * the one state a session start can do something about (carrick#955).
@@ -226,6 +231,17 @@ export type StatusService = {
     | "version_mismatch"
     | "commit_missing"
     | "read_failed";
+};
+
+/** Where a service's hosted row came from, as `carrick status` states it. */
+export type StatusHosted = {
+  /** The full commit the hosted index was built at. */
+  commit: string;
+  indexed_at?: string;
+  /** `ci` or `laptop`; absent on a row stored before the field existed, which is a CI row. */
+  source?: string | null;
+  /** The GitHub login that uploaded it, when the row records one. */
+  uploaded_by?: string | null;
 };
 
 /**

@@ -63,7 +63,7 @@ import {
   REREADING,
   STEP_LABEL,
 } from "../src/init/hosted.ts";
-import type { NativeRun } from "../src/init/hosted.ts";
+import type { MissingCommit, NativeRun } from "../src/init/hosted.ts";
 import type { RunningScan, StatusResult, StatusService } from "../src/contract.ts";
 import {
   chosenNumbers,
@@ -2359,7 +2359,7 @@ test("the interactive step stops the spinner on the marker its work earned", asy
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 0 && line !== "│");
   assert.deepEqual(lines, [
-    "▲ .carrick/ holds 3 services as this machine read them; the hosted rows could not be replayed onto this checkout",
+    "▲ The hosted rows could not be replayed onto this checkout. Run `carrick status` to see why. Until then .carrick/ has only this machine's scan of 3 services.",
     "◇ Hosted index for 2 services read into .carrick/",
   ]);
   // The label is the spinner's while it spins, and nothing once it stops.
@@ -2444,9 +2444,55 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
   assert.match(older.text, /run `carrick index --detach` once from main/);
   // And never a downgrade: `CACHE_VERSION` moves most weeks (carrick#1012).
   assert.doesNotMatch(older.text, /npm i -g carrick@/);
-  const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing", reread: true });
+  // The failure first, then the commands that move it, then what .carrick/
+  // holds meanwhile. `git fetch` alone moves nothing: the next init finds the
+  // same record, so the refresh is named with it, and the repo is named
+  // because a folder of repos is not itself one (carrick#1574).
+  const missing = (entries: MissingCommit[], reread = true) =>
+    hostedReport({ kind: "local_only", services: entries.length === 1 ? 1 : 3, state: "commit_missing", reread, missing: entries });
+  const local = missing([{ repo: "orders", commit: "abc1234", laptop: null }]);
   assert.equal(local.kind, "warn");
-  assert.match(local.text, /\.carrick\/ holds 3 services as this machine read them; the commit/);
+  assert.equal(
+    local.text,
+    "Hosted index not read: it was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: null }], false).text,
+    "Hosted index not read: it was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service; nothing was re-read.",
+  );
+  // A laptop row can be at a commit nobody pushed, and a fetch finds nothing
+  // until it is: the sentence says so rather than sending the reader to fetch
+  // for ever.
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: "ihor" }]).text,
+    "Hosted index not read: it was built by a laptop scan from @ihor at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: "" }]).text,
+    "Hosted index not read: it was built by a laptop scan at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([
+      { repo: "orders", commit: "abc1234", laptop: null },
+      { repo: "billing", commit: "def5678", laptop: null },
+    ]).text,
+    "Hosted index not read: it was built at commits these clones do not have (orders at abc1234, billing at def5678). Run `git fetch` in each, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 3 services.",
+  );
+  // The other states keep their reason, in the same order, and a state
+  // with a command attached names it.
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 1, state: "read_failed", reread: true }).text,
+    "The hosted rows could not be replayed onto this checkout. Run `carrick status` to see why. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 2, state: "not_connected", reread: true }).text,
+    "These repos are not connected to a Carrick project. For now .carrick/ has only this machine's scan of 2 services.",
+  );
+  // No state's tag reaches the terminal.
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 1, state: "unknown", reread: true }).text,
+    "The hosted rows were not replayed. For now .carrick/ has only this machine's scan of 1 service.",
+  );
   // The state this run can cause itself: a repo it just connected under a name
   // the scanner cannot read back off the git remote (carrick#1056). The clause
   // has to name the remote as the reason, not the connection.

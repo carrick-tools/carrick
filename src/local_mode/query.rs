@@ -717,9 +717,25 @@ pub fn enrichment_note(
             env!("CARGO_PKG_VERSION"),
             crate::engine::CACHE_VERSION
         ),
+        // Both commands, because a fetch alone changes nothing a reader sees:
+        // the state is recorded by the last index or refresh, and only the
+        // next one reads the fetched commit (carrick#1574). A CI row is at a
+        // commit pushed to main, so a fetch finds it; a laptop row can be at a
+        // commit its author never pushed, and a fetch finds nothing until they
+        // do.
         (HostedState::CommitMissing, Some(hosted)) => format!(
-            "hosted index at {}, which this clone does not have; candidates not replayed. Run git fetch.",
-            hosted.commit.chars().take(7).collect::<String>()
+            "hosted index at {}, which this clone does not have; candidates not replayed. {}",
+            hosted.commit.chars().take(7).collect::<String>(),
+            match (hosted.source.as_deref(), hosted.uploaded_by.as_deref()) {
+                (Some("laptop"), Some(login)) if !login.is_empty() => format!(
+                    "It came from a laptop scan by @{login}: once that commit is pushed, run \
+                     `git fetch`, then `carrick refresh`."
+                ),
+                (Some("laptop"), _) => "It came from a laptop scan: once that commit is \
+                                        pushed, run `git fetch`, then `carrick refresh`."
+                    .to_string(),
+                _ => "Run `git fetch`, then `carrick refresh`.".to_string(),
+            }
         ),
         // The writer named here is the one the ruled first run uses
         // (carrick-cloud#799): the user's own `carrick index`, not a CI run
@@ -998,6 +1014,47 @@ mod hosted_change_tests {
             today
         );
         assert_eq!(note_for(hosted_row(None, None, None)), today);
+    }
+
+    /// A commit this clone does not have is recovered by a fetch and then a
+    /// refresh, and a fetch alone leaves the sentence exactly as it was. A
+    /// laptop row may be at a commit nobody pushed, so the fetch is sent only
+    /// once it has been, rather than every time this is read (carrick#1574).
+    #[test]
+    fn a_missing_commit_names_the_fetch_and_the_refresh_that_read_it() {
+        let missing = |hosted| {
+            enrichment_note(
+                &super::super::hosted::ServiceEnrichment {
+                    hosted: Some(hosted),
+                    hosted_state: super::super::hosted::HostedState::CommitMissing,
+                    remote: Some("example/api".to_string()),
+                    failure: None,
+                    allowance_sentence: None,
+                    hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+                    classified_here: false,
+                    write_refused_as_current: false,
+                },
+                None,
+            )
+        };
+        let ci = "hosted index at 4f2a1c9, which this clone does not have; candidates not \
+                  replayed. Run `git fetch`, then `carrick refresh`.";
+        assert_eq!(missing(hosted_row(Some("ci"), None, Some(false))), ci);
+        // A row written before `source` existed is a CI row: the laptop path
+        // arrived with the field.
+        assert_eq!(missing(hosted_row(None, None, None)), ci);
+        assert_eq!(
+            missing(hosted_row(Some("laptop"), Some("ihor"), Some(false))),
+            "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
+             It came from a laptop scan by @ihor: once that commit is pushed, run `git fetch`, \
+             then `carrick refresh`."
+        );
+        assert_eq!(
+            missing(hosted_row(Some("laptop"), None, None)),
+            "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
+             It came from a laptop scan: once that commit is pushed, run `git fetch`, then \
+             `carrick refresh`."
+        );
     }
 
     /// A laptop row with no recorded login still says it was a laptop scan:

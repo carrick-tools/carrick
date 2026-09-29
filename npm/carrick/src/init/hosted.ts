@@ -56,12 +56,25 @@ export type HostedDownload =
   | { kind: "downloaded"; services: number; reread: boolean }
   /** The hosted blob predates this CLI, so its rows were not replayed. */
   | { kind: "version_mismatch"; services: number; reread: boolean }
-  /** There is a local index, without the hosted rows: `state` says why. */
-  | { kind: "local_only"; services: number; state: string; reread: boolean }
+  /**
+   * There is a local index, without the hosted rows: `state` says why.
+   * `missing` is filled for `commit_missing`, one entry per repo.
+   */
+  | { kind: "local_only"; services: number; state: string; reread: boolean; missing?: MissingCommit[] }
   /** A scan is building this workspace's index right now, so this left it alone. */
   | { kind: "scanning" }
   /** There is no local index at all, and `problem` is why. */
   | { kind: "failed"; problem: string };
+
+/**
+ * A repo whose hosted index was built at a commit its clone does not have.
+ *
+ * `repo` is the folder name, because that is where `git fetch` has to run: in
+ * a folder of repos the workspace is the folder above them. `laptop` is set
+ * for a row a laptop scan wrote, whose commit may never have been pushed, and
+ * holds the uploader's login where the row records one.
+ */
+export type MissingCommit = { repo: string; commit: string; laptop: string | null };
 
 /**
  * What `carrick status` says about the index in `.carrick/` before this step.
@@ -442,40 +455,102 @@ function classify(status: StatusResult | null, problem: string | null, reread: b
   const enriched = status.services.filter((service) => service.hosted_state === "enriched");
   if (enriched.length === 0) {
     const state = status.services.find((service) => service.hosted_state)?.hosted_state ?? "unknown";
-    return { kind: "local_only", services, state, reread };
+    if (state !== "commit_missing") return { kind: "local_only", services, state, reread };
+    return { kind: "local_only", services, state, reread, missing: missingCommits(status) };
   }
   return { kind: "downloaded", services: enriched.length, reread };
 }
 
 /**
- * Why a hosted index this machine asked for is not in the answer.
+ * The repos whose hosted commit this clone does not have, once each.
+ *
+ * The services of one repo are scanned from one tree, so they share the
+ * commit; a folder of repos has one commit per repo, and each needs its own
+ * fetch.
+ */
+function missingCommits(status: StatusResult): MissingCommit[] {
+  const missing: MissingCommit[] = [];
+  for (const service of status.services) {
+    if (service.hosted_state !== "commit_missing" || !service.hosted) continue;
+    const repo = path.basename(service.repo);
+    if (missing.some((entry) => entry.repo === repo)) continue;
+    const laptop = service.hosted.source === "laptop" ? (service.hosted.uploaded_by ?? "") : null;
+    missing.push({ repo, commit: service.hosted.commit.slice(0, 7), laptop });
+  }
+  return missing;
+}
+
+/**
+ * Why a hosted index this machine asked for is not in the answer, and the
+ * command that changes that where there is one.
  *
  * The state tag is the index's own word for it and reads as jargon in a
- * terminal, so each one is a clause a reader can act on. The reason BEHIND a
- * failed read — a hosted index built from a dirty tree, a commit this clone
- * does not have — is per service and `carrick status` states it, which is why
- * that is where this points.
+ * terminal, so each one is a sentence a reader can act on. The reason BEHIND a
+ * failed read — a hosted index built from a dirty tree, a service name the
+ * hosted rows do not carry — is per service and `carrick status` states it,
+ * which is why that is where this points.
  */
-function stateClause(state: string): string {
+function stateCause(state: string, missing: MissingCommit[]): { failure: string; action: string | null } {
   switch (state) {
     case "read_failed":
-      return "the hosted rows could not be replayed onto this checkout";
+      return {
+        failure: "The hosted rows could not be replayed onto this checkout",
+        action: "Run `carrick status` to see why",
+      };
     case "commit_missing":
-      return "the commit the hosted index was built at is not in this clone, so run git fetch";
+      return commitCause(missing);
     case "no_index_yet":
-      return "the hosted index has not landed yet";
+      return { failure: "The hosted index has not landed yet", action: null };
     case "not_connected":
-      return "these repos are not connected to a Carrick project";
+      return { failure: "These repos are not connected to a Carrick project", action: null };
     // Said of a repo this run may well have just connected: the scanner
     // derives the name again from the git remote, and an origin whose path is
     // not owner/repo names nothing to derive (carrick#1056).
     case "remote_unnamed":
-      return "the git remote here names no owner/repo, so the hosted index was not asked for";
+      return {
+        failure: "The git remote here names no owner/repo, so the hosted index was not asked for",
+        action: null,
+      };
     case "not_signed_in":
-      return "this machine is not signed in, so the hosted index was not read";
+      return { failure: "This machine is not signed in, so the hosted index was not read", action: null };
     default:
-      return `the hosted rows were not replayed (${state})`;
+      return { failure: "The hosted rows were not replayed", action: null };
   }
+}
+
+/**
+ * A hosted commit this clone does not have, and the two commands that read it.
+ *
+ * Both commands, because the fetch alone changes nothing: the state is the one
+ * the last read recorded, a fetch moves no file of the tree, and so a second
+ * `carrick init` finds the index current and says this again. `carrick
+ * refresh` is the read that sees the fetched commit (carrick#1574). A CI row
+ * is at a commit pushed to main, which a fetch finds; a laptop row can be at a
+ * commit its author never pushed, and a fetch finds nothing until they do.
+ */
+function commitCause(missing: MissingCommit[]): { failure: string; action: string } {
+  const run = (pushed: string): string =>
+    missing.some((entry) => entry.laptop !== null) ? `Once ${pushed} pushed, run` : "Run";
+  const [only] = missing;
+  if (only === undefined) {
+    // A status answer with no hosted row to name: the state alone.
+    return {
+      failure: "Hosted index not read: it was built at a commit this clone does not have",
+      action: "Run `git fetch`, then `carrick refresh`",
+    };
+  }
+  if (missing.length === 1) {
+    const by = only.laptop === null ? "" : ` by a laptop scan${only.laptop === "" ? "" : ` from @${only.laptop}`}`;
+    return {
+      failure: `Hosted index not read: it was built${by} at commit ${only.commit}, which this clone does not have`,
+      action: `${run("that commit is")} \`git fetch\` in ${only.repo}, then \`carrick refresh\``,
+    };
+  }
+  const listed = missing.map((entry) => `${entry.repo} at ${entry.commit}`).join(", ");
+  return {
+    failure: `Hosted index not read: it was built at commits these clones do not have (${listed})`,
+    action: `${run("those commits are")} \`git fetch\` in each, then \`carrick refresh\``,
+  };
 }
 
 /**
@@ -514,13 +589,19 @@ export function hostedReport(outcome: HostedDownload, seconds: number | null = n
         kind: "warn",
         text: "Hosted index is older than this CLI: run `carrick index --detach` once from main",
       };
-    case "local_only":
+    // The failure first, then what moves it, then what `.carrick/` holds in
+    // the meantime: the line used to open on the holdings and end on the
+    // failure as a trailing clause (carrick#1574).
+    case "local_only": {
+      const { failure, action } = stateCause(outcome.state, outcome.missing ?? []);
+      const holds = `.carrick/ has only this machine's scan of ${plural(outcome.services)}${
+        outcome.reread ? "" : "; nothing was re-read"
+      }`;
       return {
         kind: "warn",
-        text: `.carrick/ ${outcome.reread ? "holds" : "already holds"} ${
-          plural(outcome.services)
-        } as this machine read them; ${stateClause(outcome.state)}`,
+        text: action === null ? `${failure}. For now ${holds}.` : `${failure}. ${action}. Until then ${holds}.`,
       };
+    }
     case "scanning":
       return {
         kind: "warn",
