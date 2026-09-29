@@ -1027,6 +1027,57 @@ async fn a_package_a_reask_answers_states_its_rows_in_the_same_scan() {
     assert_answer_key(&rows(&data));
 }
 
+/// A service whose model stages were deferred (here its guidance failed)
+/// runs no in-scan schedule: its analysis is facts-only and reads no model
+/// answer, and the pending entry is kept for the next scan to ask about
+/// (carrick#1564 re-review).
+#[tokio::test]
+#[serial]
+async fn a_deferred_service_runs_no_schedule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::PendingInstalled);
+    mock_env(&cassette);
+    // SAFETY: every test in this binary is `#[serial]`. A spent budget skips
+    // the in-run retry, so the service stays deferred for the whole run.
+    unsafe {
+        std::env::set_var(carrick::retry_budget::BUDGET_ENV, "0");
+    }
+    carrick::agent_service::inject_mock_failure("/framework-guidance", "\"task\":\"general\"", 1);
+    let storage = StubStorage::default();
+    let detect = requests_to("/framework-detect");
+    let guidance = requests_to("/framework-guidance");
+    let _ = run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await;
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var(carrick::retry_budget::BUDGET_ENV);
+    }
+    let data = storage
+        .repos
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the deferred service still uploads its facts");
+    assert!(
+        requests_to("/framework-guidance") > guidance && data.cached_guidance.is_none(),
+        "the guidance failed and is still owed"
+    );
+    assert_eq!(
+        requests_to("/framework-detect") - detect,
+        1,
+        "the detection only: a deferred service runs no schedule"
+    );
+    assert!(
+        data.cached_detection
+            .and_then(|detection| detection.client_semantics)
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry.status == SemanticsStatus::Pending)),
+        "the pending entry is kept for the next scan"
+    );
+}
+
 /// A `pending` package that is not installed is not asked about again,
 /// however many other data fetchers are: no answer about it could be
 /// verified (carrick#1564 review, finding 7).

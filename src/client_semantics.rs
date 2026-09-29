@@ -853,6 +853,12 @@ pub enum ScheduleNotice {
     },
     /// `remaining` are still not described when the schedule ends.
     Remaining { remaining: usize },
+    /// A stored detection never asked for library semantics is asked about
+    /// its `libraries` installed data fetchers, waiting up to `wait`.
+    Describing {
+        libraries: usize,
+        wait: std::time::Duration,
+    },
 }
 
 impl ScheduleNotice {
@@ -867,15 +873,59 @@ impl ScheduleNotice {
                 "{waiting} of {described} client libraries still being described, waiting up to {} s",
                 wait.as_secs()
             ),
-            Self::Remaining { remaining } => format!(
-                "{remaining} client {} not described yet",
-                if *remaining == 1 {
-                    "library"
-                } else {
-                    "libraries"
-                }
+            Self::Remaining { remaining } => {
+                format!(
+                    "{remaining} client {} not described yet",
+                    libraries(*remaining)
+                )
+            }
+            Self::Describing {
+                libraries: count,
+                wait,
+            } => format!(
+                "{count} client {} being described, waiting up to {} s",
+                libraries(*count),
+                wait.as_secs()
             ),
         }
+    }
+}
+
+fn libraries(count: usize) -> &'static str {
+    if count == 1 { "library" } else { "libraries" }
+}
+
+/// What the scan tells the user before it asks again about a stored
+/// detection (see [`wants_reask`]): the ask is one attempt bounded by
+/// [`PENDING_REASK_TIMEOUT`].
+pub fn reask_notice(
+    semantics: Option<&[ClientSemanticsEntry]>,
+    data_fetchers: &[String],
+    service_root: &Path,
+    repo_root: &Path,
+) -> ScheduleNotice {
+    match semantics {
+        None => ScheduleNotice::Describing {
+            libraries: data_fetchers
+                .iter()
+                .filter(|package| installed(package, service_root, repo_root))
+                .count(),
+            wait: PENDING_REASK_TIMEOUT,
+        },
+        Some(entries) => ScheduleNotice::Waiting {
+            waiting: entries
+                .iter()
+                .filter(|entry| {
+                    entry.status == SemanticsStatus::Pending
+                        && installed(&entry.package, service_root, repo_root)
+                })
+                .count(),
+            described: entries
+                .iter()
+                .filter(|entry| entry.status != SemanticsStatus::Skipped)
+                .count(),
+            wait: PENDING_REASK_TIMEOUT,
+        },
     }
 }
 
@@ -950,7 +1000,10 @@ fn fill_pending(entries: &mut [ClientSemanticsEntry], later: &[ClientSemanticsEn
 }
 
 /// Whether `package` is installed where the service would resolve it.
-pub fn installed_for(service_root: &Path, repo_root: &Path) -> impl Fn(&str) -> bool {
+pub fn installed_for(
+    service_root: &Path,
+    repo_root: &Path,
+) -> impl Fn(&str) -> bool + Send + use<> {
     let service_root = service_root.to_path_buf();
     let repo_root = repo_root.to_path_buf();
     move |package| installed(package, &service_root, &repo_root)

@@ -2903,10 +2903,14 @@ async fn analyze_current_repo_incremental(
                     match reask_client_semantics(
                         det,
                         generation,
-                        packages,
-                        &all_import_facts,
                         &service_scan_root(repo_path, config),
                         Path::new(repo_path),
+                        || async {
+                            FrameworkDetector::new(reask_agent())
+                                .detect_frameworks_and_libraries(packages, &all_import_facts)
+                                .await
+                        },
+                        |notice| crate::progress::announce(&notice.line()),
                     )
                     .await
                     {
@@ -2963,6 +2967,16 @@ async fn analyze_current_repo_incremental(
                 debug!("package.json changed, re-running framework detection");
                 model_setup(packages, &all_import_facts, None).await
             };
+            // The in-scan schedule starts now, so it runs beside everything
+            // below (carrick#1564).
+            let settling = start_semantics_schedule(
+                &setup.detection,
+                semantics_schedule_applies(&setup, generation),
+                packages,
+                &all_import_facts,
+                &service_scan_root(repo_path, config),
+                Path::new(repo_path),
+            );
 
             // What this scan actually dispatches is decided per file inside the
             // orchestrator — a file with no cached answer still reaches the
@@ -3015,9 +3029,9 @@ async fn analyze_current_repo_incremental(
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
             enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-            // The library semantics settle alongside the analysis, which
-            // reads the summaries composed with them only once the model has
-            // been asked (carrick#1564).
+            // The summaries are composed once the schedule started above has
+            // settled; the analysis reads them only once the model has been
+            // asked (carrick#1564).
             let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
             let (analysis, settled) = tokio::join!(
@@ -3035,15 +3049,11 @@ async fn analyze_current_repo_incremental(
                     &service_modules,
                     sidecar,
                 ),
-                settle_semantics_and_summarize(
+                compose_summaries(
                     &request_inputs,
-                    &setup.detection,
-                    semantics_schedule_applies(&setup, generation),
-                    packages,
-                    &all_import_facts,
+                    settling,
                     sidecar,
                     &semantics_root,
-                    Path::new(repo_path),
                     summaries_sender,
                 ),
             );
@@ -3390,19 +3400,26 @@ enum Reask {
 /// data fetchers is installed and could verify an answer. This replaces a
 /// `CACHE_VERSION` bump, which would re-analyse every repo cold.
 ///
-/// Best-effort: one HTTP attempt ([`reask_agent`]), and at most once a run,
-/// never when the cached detection is this run's own (a retry of owed work).
-/// A failure keeps the cached detection and never defers the service. When
-/// the answer names the same packages in all four lists, the cached guidance
-/// and extraction config stand and only the semantics are taken.
-async fn reask_client_semantics(
+/// Best-effort: `ask` is one HTTP attempt ([`reask_agent`]) bounded by
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`], announced to the user
+/// through `notice` first, and made at most once a run, never when the
+/// cached detection is this run's own (a retry of owed work). A failure, or
+/// no answer in time, keeps the cached detection and never defers the
+/// service. When the answer names the same packages in all four lists, the
+/// cached guidance and extraction config stand and only the semantics are
+/// taken.
+async fn reask_client_semantics<Ask, AskFut>(
     cached: &DetectionResult,
     generation: PreviousGeneration,
-    packages: &Packages,
-    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
     service_root: &Path,
     repo_root: &Path,
-) -> Reask {
+    ask: Ask,
+    notice: impl FnOnce(crate::client_semantics::ScheduleNotice),
+) -> Reask
+where
+    Ask: FnOnce() -> AskFut,
+    AskFut: std::future::Future<Output = Result<DetectionResult, Box<dyn std::error::Error>>>,
+{
     if crate::local_mode::no_model()
         || generation == PreviousGeneration::ThisRun
         || !crate::client_semantics::wants_reask(
@@ -3415,19 +3432,28 @@ async fn reask_client_semantics(
         return Reask::Kept(cached.clone());
     }
     debug!("Asking framework detection again for this service's library semantics");
-    match FrameworkDetector::new(reask_agent())
-        .detect_frameworks_and_libraries(packages, import_facts)
-        .await
-    {
-        Ok(fresh) if fresh.same_lists(cached) => Reask::Kept(DetectionResult {
+    notice(crate::client_semantics::reask_notice(
+        cached.client_semantics.as_deref(),
+        &cached.data_fetchers,
+        service_root,
+        repo_root,
+    ));
+    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask()).await {
+        Ok(Ok(fresh)) if fresh.same_lists(cached) => Reask::Kept(DetectionResult {
             client_semantics: fresh.client_semantics,
             ..cached.clone()
         }),
-        Ok(fresh) => Reask::Changed(fresh),
+        Ok(Ok(fresh)) => Reask::Changed(fresh),
         // Nothing for the user to act on: the next scan asks again.
-        Err(error) => {
+        Ok(Err(error)) => {
             debug!(
                 "Asking framework detection again for library semantics failed ({error}); keeping the cached detection"
+            );
+            Reask::Kept(cached.clone())
+        }
+        Err(_) => {
+            debug!(
+                "Asking framework detection again for library semantics ran out of time; keeping the cached detection"
             );
             Reask::Kept(cached.clone())
         }
@@ -5972,51 +5998,95 @@ fn summarize_requests(
     summaries
 }
 
-/// Settle the service's library semantics and send the request summaries
-/// composed with them (carrick#1564). Runs alongside the file analysis, which
-/// reads the summaries only once the model has been asked, so the waiting
-/// costs the user nothing unless it outlasts the analysis.
-///
-/// Where `schedule` holds, every package detection left `pending` that is
-/// installed is asked about again on the in-scan schedule
-/// ([`crate::client_semantics::settle_pending`]): one HTTP attempt per ask,
-/// each bounded by [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An ask
-/// that fails, or answers different lists than the ones the guidance was
-/// built from, changes nothing; the next scan asks again. Always sends, and
-/// returns the settled entries for the blob to keep.
-#[allow(clippy::too_many_arguments)]
-async fn settle_semantics_and_summarize(
-    inputs: &crate::request_summary::RequestSummaryInputs,
+/// A service's library semantics while the in-scan schedule settles them
+/// (carrick#1564): known already, or being settled by a task that runs beside
+/// the file analysis from the moment the model setup is known.
+enum SettlingSemantics {
+    Known(Option<Vec<crate::client_semantics::ClientSemanticsEntry>>),
+    Settling {
+        task: tokio::task::JoinHandle<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+        asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
+    },
+}
+
+impl SettlingSemantics {
+    /// The settled entries. A task that did not finish (it panicked, or the
+    /// runtime is shutting down) leaves what the first ask gave.
+    async fn settled(self) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+        match self {
+            Self::Known(entries) => entries,
+            Self::Settling { task, asked } => Some(task.await.unwrap_or(asked)),
+        }
+    }
+}
+
+/// Start the in-scan schedule for `detection` where `schedule` holds and an
+/// installed package is still `pending`: every such package is asked about
+/// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
+/// attempt per ask, each bounded by
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. The task is spawned, so
+/// it runs beside the analysis whatever the analysis blocks on. An ask that
+/// fails, or answers different lists than the ones the guidance was built
+/// from, changes nothing; the next scan asks again.
+fn start_semantics_schedule(
     detection: &DetectionResult,
     schedule: bool,
     packages: &Packages,
     import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
-    sidecar: Option<&TypeSidecar>,
     service_root: &Path,
     repo_root: &Path,
+) -> SettlingSemantics {
+    let Some(asked) = detection.client_semantics.clone() else {
+        return SettlingSemantics::Known(None);
+    };
+    if !schedule
+        || !crate::client_semantics::wants_reask(
+            Some(&asked),
+            &detection.data_fetchers,
+            service_root,
+            repo_root,
+        )
+    {
+        return SettlingSemantics::Known(Some(asked));
+    }
+    let detection = detection.clone();
+    let packages = packages.clone();
+    let import_facts = import_facts.clone();
+    let installed = crate::client_semantics::installed_for(service_root, repo_root);
+    let entries = asked.clone();
+    let task = tokio::spawn(async move {
+        crate::client_semantics::settle_pending(
+            entries,
+            installed,
+            &crate::client_semantics::pending_reask_waits(),
+            || async {
+                let detector = FrameworkDetector::new(reask_agent());
+                semantics_from_reask(
+                    detector.detect_frameworks_and_libraries(&packages, &import_facts),
+                    &detection,
+                )
+                .await
+            },
+            tokio::time::sleep,
+            |notice| crate::progress::announce(&notice.line()),
+        )
+        .await
+    });
+    SettlingSemantics::Settling { task, asked }
+}
+
+/// Once the library semantics have settled, send the request summaries
+/// composed with them, and return the settled entries for the blob to keep.
+/// Runs alongside the file analysis, which reads the summaries only once the
+/// model has been asked. Always sends.
+async fn compose_summaries(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    settling: SettlingSemantics,
+    sidecar: Option<&TypeSidecar>,
+    service_root: &Path,
     summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
 ) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
-    let settled = match &detection.client_semantics {
-        Some(entries) if schedule => Some(
-            crate::client_semantics::settle_pending(
-                entries.clone(),
-                crate::client_semantics::installed_for(service_root, repo_root),
-                &crate::client_semantics::pending_reask_waits(),
-                || async {
-                    let detector = FrameworkDetector::new(reask_agent());
-                    semantics_from_reask(
-                        detector.detect_frameworks_and_libraries(packages, import_facts),
-                        detection,
-                    )
-                    .await
-                },
-                tokio::time::sleep,
-                |notice| crate::progress::announce(&notice.line()),
-            )
-            .await,
-        ),
-        entries => entries.clone(),
-    };
+    let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
@@ -6947,6 +7017,16 @@ async fn analyze_current_repo(
     } else {
         model_setup(packages, &all_import_facts, settled).await
     };
+    // The in-scan schedule starts now, so it runs beside the analysis
+    // (carrick#1564).
+    let settling = start_semantics_schedule(
+        &setup.detection,
+        semantics_schedule_applies(&setup, PreviousGeneration::Stored),
+        packages,
+        &all_import_facts,
+        &service_scan_root(repo_path, config),
+        Path::new(repo_path),
+    );
 
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
@@ -6958,8 +7038,8 @@ async fn analyze_current_repo(
     // and anchor stamps (carrick#1416).
     let service_modules = service_module_index(repo_path, config);
     enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
-    // The library semantics settle alongside the analysis, which reads the
-    // summaries composed with them only once the model has been asked
+    // The summaries are composed once the schedule started above has
+    // settled; the analysis reads them only once the model has been asked
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
     let (analysis_result, settled) = tokio::join!(
@@ -6976,15 +7056,11 @@ async fn analyze_current_repo(
             sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
         ),
-        settle_semantics_and_summarize(
+        compose_summaries(
             &request_inputs,
-            &setup.detection,
-            semantics_schedule_applies(&setup, PreviousGeneration::Stored),
-            packages,
-            &all_import_facts,
+            settling,
             sidecar,
             &service_root,
-            Path::new(repo_path),
             summaries_sender,
         ),
     );
@@ -12004,6 +12080,84 @@ mod tests {
                 (11, "POST", "${process.env.API_URL}/rpc", Some("poll")),
             ],
             "{rows:#?}"
+        );
+    }
+
+    /// carrick#1564 re-review, R4: the first re-ask, made before the analysis
+    /// for a stored detection, tells the user what it waits for and how long,
+    /// and gives up after `PENDING_REASK_TIMEOUT`, keeping the stored
+    /// detection. A detection never asked names the libraries it describes.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_reask_says_what_it_waits_for_and_gives_up_in_time() {
+        let root = tempfile::tempdir().unwrap();
+        for package in ["fixture-slow-http", "@fixture/http"] {
+            let manifest = root
+                .path()
+                .join("node_modules")
+                .join(package)
+                .join("package.json");
+            std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+            std::fs::write(&manifest, "{}").unwrap();
+        }
+        let cached: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        let never_answers =
+            || std::future::pending::<Result<DetectionResult, Box<dyn std::error::Error>>>();
+
+        let mut lines = Vec::new();
+        let started = tokio::time::Instant::now();
+        let reask = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 2,
+            reask_client_semantics(
+                &cached,
+                PreviousGeneration::Stored,
+                root.path(),
+                root.path(),
+                never_answers,
+                |notice| lines.push(notice.line()),
+            ),
+        )
+        .await
+        .expect("the re-ask gives up within its bound");
+        assert_eq!(
+            started.elapsed(),
+            crate::client_semantics::PENDING_REASK_TIMEOUT
+        );
+        let Reask::Kept(kept) = reask else {
+            panic!("an unanswered re-ask keeps the stored detection");
+        };
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::to_value(&cached).unwrap()
+        );
+        assert_eq!(
+            lines,
+            vec!["1 of 3 client libraries still being described, waiting up to 30 s"]
+        );
+
+        let never_asked = DetectionResult {
+            client_semantics: None,
+            ..cached.clone()
+        };
+        let mut lines = Vec::new();
+        let _ = tokio::time::timeout(
+            crate::client_semantics::PENDING_REASK_TIMEOUT * 2,
+            reask_client_semantics(
+                &never_asked,
+                PreviousGeneration::Stored,
+                root.path(),
+                root.path(),
+                never_answers,
+                |notice| lines.push(notice.line()),
+            ),
+        )
+        .await
+        .expect("the re-ask gives up within its bound");
+        assert_eq!(
+            lines,
+            vec!["2 client libraries being described, waiting up to 30 s"]
         );
     }
 
