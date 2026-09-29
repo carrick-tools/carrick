@@ -37,6 +37,14 @@ The sources:
   again (a4), a static member reading `this` beside an instance member (a5),
   and a field a subclass declares again plus a block redeclaring the
   instance's name (a13).
+- `src/n1-spread-before.ts` to `src/n9-phase1-fetch.ts` are the sites from the
+  re-review: a base written after a spread (n1), between two spreads (n2),
+  conditional spreads that disagree, agree, or may spread nothing (n3), a
+  getter, a computed key, a string key and a method beside the base (n4), a
+  field a constructor `try` or loop writes again (n5), a field a method
+  reassigns or writes through (n6), a spread constant the file writes to
+  (n7), a base written through an alias of the client or `Object.assign`
+  (n8), and the same spread shapes on a plain `fetch` (n9).
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -67,6 +75,11 @@ With the vendored declarations, through the real type sidecar:
 | `prefix-client.ts:15` | `PUT /svc/jobs/reports` | factory, `request:():path_options`, `request_body:():path_options` |
 | `negatives.ts` | none | none |
 | `a5-static.ts:10` | `GET /instance/ran` | factory, `verb:get` |
+| `n1-spread-before.ts:7` | `GET /after/stated` | factory, `verb:get` |
+| `n3-cond-spread.ts:10` | `GET /x/keep` | factory, `verb:get` |
+| `n3-cond-spread.ts:11` | `GET /same/agree` | factory, `verb:get` |
+| `n4-getter-computed.ts:11` | `GET /s1/string-key` | factory, `verb:get` |
+| `n4-getter-computed.ts:12` | `GET /m1/method-prop` | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
 
@@ -86,6 +99,21 @@ the reading cannot see:
 | `a13-inherit.ts:6` | none |
 | `a13-inherit.ts:18` | none |
 | `a13-inherit.ts:20` | `GET /outer-ok`, `receiver_type` |
+| `n2-two-spreads.ts:8` | `GET /between`, `receiver_type` |
+| `n3-cond-spread.ts:9` | `GET /cond`, `receiver_type` |
+| `n3-cond-spread.ts:12` | `GET /and`, `receiver_type`: `prod && {…}` may spread nothing |
+| `n4-getter-computed.ts:9` | `GET /getter`, `receiver_type` |
+| `n4-getter-computed.ts:10` | `GET /computed`, `receiver_type` |
+| `n5-ctor-try-loop.ts:12`, `:23` | none |
+| `n6-method-write.ts:8`, `:16` | none |
+| `n7-mutated-spread-const.ts:10` | `GET /mutated-const`, `receiver_type` |
+| `n8-indirect-write.ts:10` | `GET /alias-write`, `receiver_type` |
+| `n8-indirect-write.ts:11` | `GET /assign-write`, `receiver_type` |
+
+`n9-phase1-fetch.ts` has no library in it. Its request summaries state `POST
+/api/f2` at line 10 (the method written after the spread) and `GET /api/f5`
+at line 13, and nothing at lines 9, 11 and 12, where a spread may set the
+method; any other row there is the model's.
 
 The `receiver_type` rows state the path without the instance's base. That
 is how main reads them today, and it is a wrong fact of its own

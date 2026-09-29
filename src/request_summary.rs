@@ -1709,7 +1709,8 @@ impl Reader<'_> {
 
     /// The objects a spread may put in place, when the source states every
     /// key each one can carry: an object literal, a `cond ? {…} : {…}`
-    /// choice, `cond && {…}`, or a constant holding one. `None` for anything
+    /// choice, `cond && {…}`, or a constant [`ModuleScope::spreadable`] says
+    /// holds one. `None` for anything
     /// else, which may carry any key.
     fn spread_branches(&self, expr: &Expr, scope: &Scope<'_>) -> Option<Vec<ObjValue>> {
         let known = |value: ObjValue| (!value.open).then_some(vec![value]);
@@ -2973,10 +2974,12 @@ fn shape_of<'c>(call: &'c CallIr, semantics: &LibrarySemantics) -> Option<Cow<'c
 /// verified body claim.
 ///
 /// `None` too wherever the source may set a base the reading would not see:
-/// the file assigns a base key through the client (`api.defaults.baseURL =
-/// …`), the factory's options are open to a spread, or an options or config
-/// object handed to the call is open or names a base key itself. Every base
-/// key detection claims for the client counts, verified or not.
+/// the file uses the client other than to call through it
+/// ([`ClientRef::contested`]), the factory's options are open and do not
+/// name the base key after everything that could overwrite it, or an
+/// options or config object handed to the call is open or names a base key
+/// itself. Every base key detection claims for the client counts, verified
+/// or not.
 fn library_shape(
     receiver: &CallReceiver,
     args: &[Value],
