@@ -535,20 +535,20 @@ function commitCause(missing: MissingCommit[]): { failure: string; action: strin
   if (only === undefined) {
     // A status answer with no hosted row to name: the state alone.
     return {
-      failure: "Hosted index not read: it was built at a commit this clone does not have",
+      failure: "Hosted index not read. It was built at a commit this clone does not have",
       action: "Run `git fetch`, then `carrick refresh`",
     };
   }
   if (missing.length === 1) {
     const by = only.laptop === null ? "" : ` by a laptop scan${only.laptop === "" ? "" : ` from @${only.laptop}`}`;
     return {
-      failure: `Hosted index not read: it was built${by} at commit ${only.commit}, which this clone does not have`,
+      failure: `Hosted index not read. It was built${by} at commit ${only.commit}, which this clone does not have`,
       action: `${run("that commit is")} \`git fetch\` in ${only.repo}, then \`carrick refresh\``,
     };
   }
   const listed = missing.map((entry) => `${entry.repo} at ${entry.commit}`).join(", ");
   return {
-    failure: `Hosted index not read: it was built at commits these clones do not have (${listed})`,
+    failure: `Hosted index not read. It was built at commits these clones do not have (${listed})`,
     action: `${run("those commits are")} \`git fetch\` in each, then \`carrick refresh\``,
   };
 }

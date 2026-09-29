@@ -1293,7 +1293,7 @@ test("a hosted commit this clone lacks names the commit, the repo, and git fetch
     assert.equal(result.status, 0, result.stderr);
     assert.ok(
       result.stdout.includes(
-        `▲ Hosted index not read: it was built at commit 4f2a1c9, which this clone does not have. Run \`git fetch\` in ${path.basename(fixture.repo)}, then \`carrick refresh\`. Until then .carrick/ has only this machine's scan of 2 services.`,
+        `▲ Hosted index not read. It was built at commit 4f2a1c9, which this clone does not have. Run \`git fetch\` in ${path.basename(fixture.repo)}, then \`carrick refresh\`. Until then .carrick/ has only this machine's scan of 2 services.`,
       ),
       result.stdout,
     );
@@ -2484,29 +2484,29 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
   assert.equal(local.kind, "warn");
   assert.equal(
     local.text,
-    "Hosted index not read: it was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+    "Hosted index not read. It was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
   );
   assert.equal(
     missing([{ repo: "orders", commit: "abc1234", laptop: null }], false).text,
-    "Hosted index not read: it was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service; nothing was re-read.",
+    "Hosted index not read. It was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service; nothing was re-read.",
   );
   // A laptop row can be at a commit nobody pushed, and a fetch finds nothing
   // until it is: the sentence says so rather than sending the reader to fetch
   // for ever.
   assert.equal(
     missing([{ repo: "orders", commit: "abc1234", laptop: "ihor" }]).text,
-    "Hosted index not read: it was built by a laptop scan from @ihor at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+    "Hosted index not read. It was built by a laptop scan from @ihor at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
   );
   assert.equal(
     missing([{ repo: "orders", commit: "abc1234", laptop: "" }]).text,
-    "Hosted index not read: it was built by a laptop scan at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+    "Hosted index not read. It was built by a laptop scan at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
   );
   assert.equal(
     missing([
       { repo: "orders", commit: "abc1234", laptop: null },
       { repo: "billing", commit: "def5678", laptop: null },
     ]).text,
-    "Hosted index not read: it was built at commits these clones do not have (orders at abc1234, billing at def5678). Run `git fetch` in each, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 3 services.",
+    "Hosted index not read. It was built at commits these clones do not have (orders at abc1234, billing at def5678). Run `git fetch` in each, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 3 services.",
   );
   // The other states keep their reason, in the same order, and a state
   // with a command attached names it.

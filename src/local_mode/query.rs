@@ -735,11 +735,11 @@ pub fn enrichment_note(
             let fetch = format!("`git fetch` in {repo}, then `carrick refresh`");
             let action = match (hosted.source.as_deref(), hosted.uploaded_by.as_deref()) {
                 (Some("laptop"), Some(login)) if !login.is_empty() => format!(
-                    "It was built by a laptop scan from @{login}: once that commit is pushed, \
+                    "It was built by a laptop scan from @{login}. Once that commit is pushed, \
                      run {fetch}."
                 ),
                 (Some("laptop"), _) => format!(
-                    "It was built by a laptop scan: once that commit is pushed, run {fetch}."
+                    "It was built by a laptop scan. Once that commit is pushed, run {fetch}."
                 ),
                 _ => format!("Run {fetch}."),
             };
@@ -1063,13 +1063,13 @@ mod hosted_change_tests {
         assert_eq!(
             missing(hosted_row(Some("laptop"), Some("ihor"), Some(false))),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It was built by a laptop scan from @ihor: once that commit is pushed, run `git \
+             It was built by a laptop scan from @ihor. Once that commit is pushed, run `git \
              fetch` in orders, then `carrick refresh`."
         );
         assert_eq!(
             missing(hosted_row(Some("laptop"), None, None)),
             "hosted index at 4f2a1c9, which this clone does not have; candidates not replayed. \
-             It was built by a laptop scan: once that commit is pushed, run `git fetch` in \
+             It was built by a laptop scan. Once that commit is pushed, run `git fetch` in \
              orders, then `carrick refresh`."
         );
     }
