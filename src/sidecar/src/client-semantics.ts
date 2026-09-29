@@ -743,13 +743,12 @@ class DeclarationReader {
   private declaredProperties(slot: Slot): ts.Symbol[] {
     if (slot === VARIADIC) return [];
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(slot));
-    const containerIsLibrary = this.isDeclaredOnlyInLibrary(apparent.getSymbol());
     return this.checker
       .getPropertiesOfType(apparent)
       .filter(
         property =>
           !this.isBuiltinMember(property) &&
-          this.isLibraryDeclared(property, containerIsLibrary) &&
+          this.isLibraryDeclared(property, apparent) &&
           !this.isAbsent(property)
       );
   }
@@ -757,14 +756,33 @@ class DeclarationReader {
   /**
    * Some declaration of the property is in an installed package or the
    * default library. A member a mapped type makes (`extends Record<'get',
-   * Fn>`) has no declaration of its own; it counts when the type it is listed
-   * on is declared only in library files, which a service augmentation of
-   * that type is not.
+   * Fn>`) has no declaration of its own; it counts when the type listing it
+   * was written by the library.
    */
-  private isLibraryDeclared(property: ts.Symbol, containerIsLibrary: boolean): boolean {
+  private isLibraryDeclared(property: ts.Symbol, listing: ts.Type): boolean {
     const declarations = property.declarations ?? [];
-    if (declarations.length === 0) return containerIsLibrary;
+    if (declarations.length === 0) return this.isListedByLibraryType(listing, property.getName());
     return declarations.some(declaration => this.isLibraryFile(declaration.getSourceFile()));
+  }
+
+  /**
+   * The type listing member `name` is declared only in library files, which a
+   * service augmentation of it is not. An intersection has no declaration of
+   * its own (`type Client = {...} & Record<Alias, Fn> & Fn`), so it defers to
+   * the parts that list the member: the library's `Record` does, a base
+   * interface the service extended with its own mapped type does not.
+   */
+  private isListedByLibraryType(listing: ts.Type, name: string): boolean {
+    if (listing.isIntersection()) {
+      return listing.types.some(part => {
+        const apparent = this.checker.getApparentType(part);
+        return (
+          this.checker.getPropertyOfType(apparent, name) !== undefined &&
+          this.isListedByLibraryType(apparent, name)
+        );
+      });
+    }
+    return this.isDeclaredOnlyInLibrary(listing.getSymbol());
   }
 
   private isDeclaredOnlyInLibrary(symbol: ts.Symbol | undefined): boolean {

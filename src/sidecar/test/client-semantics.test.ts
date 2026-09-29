@@ -1010,6 +1010,15 @@ declare const c: S; export default c;
     ['2', 'a member the installed package declares, beside the augmentation', 'rg-aug', 'export', VERB_GET, 'verified', undefined],
     ['2', 'a member an installed interface takes from a mapped type', 'rg-mapped', 'export', VERB_GET, 'verified', undefined],
     ['2', 'a mapped-type member the service\'s augmentation adds', 'rg-mapped-aug', 'export', { kind: 'verb', member: 'patch', method: 'PATCH' }, 'failed', 'member_missing'],
+    // A client typed as an alias of an intersection: \`{ ... } & Record<Alias, Fn> & Fn\`.
+    // An intersection has no symbol of its own; the member is listed by the
+    // Record constituent, which the library wrote.
+    ['2', 'a verb from a Record member of an intersection alias (default export)', 'rg-inter', 'export', VERB_GET, 'verified', undefined],
+    ['2', 'a verb body from a Record member of an intersection alias', 'rg-inter', 'export', { kind: 'verb_body', member: 'post', args: 'path_options', body_key: 'json' }, 'verified', undefined],
+    ['2', 'a verb from a Record member of an intersection alias (instance)', 'rg-inter', 'instance:extend', VERB_GET, 'verified', undefined],
+    ['2', 'a factory on an intersection alias', 'rg-inter', 'export', { kind: 'factory', member: 'extend', base_url_key: 'prefixUrl' }, 'verified', undefined],
+    ['2', 'a mapped member the service adds to a base inside an intersection alias', 'rg-inter-aug', 'export', { kind: 'verb', member: 'post', method: 'POST' }, 'failed', 'member_missing'],
+    ['2', 'a library mapped member beside the service\'s addition to that base', 'rg-inter-aug', 'export', VERB_GET, 'verified', undefined],
     ['3', 'a duplicate install of the same name and version', 'rg-dup', 'export', VERB_GET, 'verified', undefined],
     ['3', 'a duplicate install whose first copy is a service-local file', 'rg-dup-local', 'export', VERB_GET, 'unchecked', 'module_local'],
     ['3', 'the same name declared by an installed copy at another version', 'rg-dup-version', 'export', VERB_GET, 'unchecked', 'module_local'],
@@ -1037,6 +1046,24 @@ declare const c: S; export default c;
     pkgAt('node_modules/rg-mapped', 'rg-mapped', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
     pkgAt('node_modules/rg-mapped-aug', 'rg-mapped-aug', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
     write('src/aug-mapped.ts', "import 'rg-mapped-aug';\ndeclare module 'rg-mapped-aug' {\n  interface S extends Record<'patch', (url: string) => Promise<unknown>> {}\n}\nexport {};\n");
+    const INTER = `export interface Options { prefixUrl?: string; url?: string; method?: string; json?: unknown }
+export type Alias = 'get' | 'post' | 'put' | 'patch' | 'head' | 'delete';
+export type RequestFn = {
+  (url: string | { href: string }, options?: Options): Promise<unknown>;
+  (options: Options & { url: string }): Promise<unknown>;
+};
+export type Client = { extend(...items: Array<Client | Options>): Client; defaults: Options } & Record<Alias, RequestFn> & RequestFn;
+declare const client: Client;
+export default client;
+export { client };
+`;
+    pkgAt('node_modules/rg-inter', 'rg-inter', INTER);
+    pkgAt('node_modules/rg-inter-aug', 'rg-inter-aug', `export interface Base { timeout?: number }
+export type Client = Base & Record<'get', (url: string) => Promise<unknown>>;
+declare const client: Client;
+export default client;
+`);
+    write('src/aug-inter.ts', "import 'rg-inter-aug';\ndeclare module 'rg-inter-aug' {\n  interface Base extends Record<'post', (url: string) => Promise<unknown>> {}\n}\nexport {};\n");
     // Item 3: the same name and version twice, nested (loaded first) and at the top.
     pkgAt('node_modules/rg-dep', 'rg-dep', "import c from 'rg-dup';\ndeclare const d: typeof c; export default d;\n");
     pkgAt('node_modules/rg-dep/node_modules/rg-dup', 'rg-dup', HTTP);
