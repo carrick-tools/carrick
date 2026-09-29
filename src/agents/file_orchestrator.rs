@@ -879,9 +879,56 @@ pub struct FileOrchestrator {
     /// guidance that is not the service's own. Same posture as local mode, for
     /// one service rather than the whole process.
     model_deferred: bool,
-    /// What each call site's callee sends, composed over the call graph at
-    /// discovery (carrick#1555). Empty unless the engine hands one over.
-    request_summaries: RequestSummaryIndex,
+    /// What each call site's callee sends, composed over the call graph
+    /// (carrick#1555). Empty unless the engine hands one over.
+    request_summaries: SummarySource,
+}
+
+/// The request summaries one analysis reads: in hand, or still being
+/// composed while the scan waits on library semantics it is asking about
+/// again (carrick#1564). Nothing reads them before the model has been asked,
+/// so the wait runs alongside the model's work.
+pub enum SummarySource {
+    Ready(std::sync::Mutex<Option<RequestSummaryIndex>>),
+    /// Sent by the engine once the service's library semantics are settled.
+    /// The engine always sends: a dropped sender is a bug, never an empty
+    /// index, because an empty index would silently drop every summary row.
+    Later(std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<RequestSummaryIndex>>>),
+}
+
+impl SummarySource {
+    /// Summaries that arrive over `receiver`.
+    pub fn later(receiver: tokio::sync::oneshot::Receiver<RequestSummaryIndex>) -> Self {
+        Self::Later(std::sync::Mutex::new(Some(receiver)))
+    }
+
+    /// The summaries, waiting for them if they are still being composed.
+    /// Read once per analysis.
+    async fn take(&self) -> RequestSummaryIndex {
+        match self {
+            Self::Ready(summaries) => summaries
+                .lock()
+                .expect("the summary lock is never poisoned")
+                .take()
+                .expect("an analysis reads its request summaries once"),
+            Self::Later(receiver) => {
+                let receiver = receiver
+                    .lock()
+                    .expect("the summary receiver lock is never poisoned")
+                    .take()
+                    .expect("an analysis reads its request summaries once");
+                receiver
+                    .await
+                    .expect("the engine sends the request summaries on every path")
+            }
+        }
+    }
+}
+
+impl From<RequestSummaryIndex> for SummarySource {
+    fn from(summaries: RequestSummaryIndex) -> Self {
+        Self::Ready(std::sync::Mutex::new(Some(summaries)))
+    }
 }
 
 /// What the model had to say about one file, once every source of an answer
@@ -1040,14 +1087,15 @@ impl FileOrchestrator {
             file_analyzer: FileAnalyzerAgent::new(agent_service),
             swc_scanner: SwcScanner::new(),
             model_deferred: false,
-            request_summaries: RequestSummaryIndex::default(),
+            request_summaries: RequestSummaryIndex::default().into(),
         }
     }
 
-    /// The request summaries discovery composed for this service
-    /// (carrick#1555), read by the deterministic layer.
-    pub fn with_request_summaries(mut self, summaries: RequestSummaryIndex) -> Self {
-        self.request_summaries = summaries;
+    /// The request summaries composed for this service (carrick#1555), read
+    /// by the deterministic layer: in hand, or arriving later
+    /// ([`SummarySource::later`]).
+    pub fn with_request_summaries(mut self, summaries: impl Into<SummarySource>) -> Self {
+        self.request_summaries = summaries.into();
         self
     }
 
@@ -1136,6 +1184,9 @@ impl FileOrchestrator {
             .ok_or("missing HTTP guidance: guidance map must contain the http protocol")?;
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // Files that raise no candidate and still hold request-summary rows,
+        // emitted once the summaries are composed (carrick#1564).
+        let mut late_summary_files: Vec<LateSummaryFile> = Vec::new();
         // The other half of the split: what the MODEL said, per file, with
         // nothing folded in. Only a file the model was ASKED about is inserted
         // here — every skip below leaves it out, so the next scan runs phase 1
@@ -1304,6 +1355,17 @@ impl FileOrchestrator {
         /// as before. Content is deliberately NOT retained — most files in a
         /// repo land here, so holding their bodies would spike peak memory to
         /// roughly the repo's source size; the rare rescued file is re-read.
+        /// A file no model is asked about whose request-summary rows are
+        /// emitted once the summaries are composed. Its other rows are in
+        /// `file_results` already.
+        struct LateSummaryFile {
+            path_str: String,
+            file_path: PathBuf,
+            /// Whether its rows count toward `total_data_calls`, as they
+            /// always have for a skipped file and never for a route file.
+            counts_data_calls: bool,
+        }
+
         struct DeferredZeroCandidate {
             path_str: String,
             file_path: PathBuf,
@@ -1780,13 +1842,18 @@ impl FileOrchestrator {
                             // No call-site candidates here by construction, so
                             // no receiver to ask about.
                             &HashMap::new(),
-                            self.request_summaries
-                                .rows(file_path)
-                                .unwrap_or(&BTreeMap::new()),
+                            // Its request summaries are emitted once they are
+                            // composed ([`LateSummaryFile`]).
+                            &BTreeMap::new(),
                         ),
                         &mut stats.deterministic_rows_emitted,
                     );
                     stats.total_endpoints += result.endpoints.len();
+                    late_summary_files.push(LateSummaryFile {
+                        path_str: path_str.clone(),
+                        file_path: file_path.clone(),
+                        counts_data_calls: false,
+                    });
                     file_results.insert(path_str, result);
                     // No cache entry: the model was never asked, and the routes
                     // above are re-derived from the file layout on every scan.
@@ -2262,30 +2329,14 @@ impl FileOrchestrator {
                 // What its calls through declarations send is the source's to
                 // state all the same (carrick#1555): the call graph found them
                 // where the candidate scanner raised nothing, and no model call
-                // is needed to emit them.
-                let mut result = FileAnalysisResult::default();
-                if let Some(summary_rows) = self.request_summaries.rows(&deferred.file_path) {
-                    let _ = Self::emit_resolved_rows(
-                        &mut result,
-                        Self::resolve_candidates(
-                            &HashMap::new(),
-                            &HashMap::new(),
-                            &[],
-                            &EnvAliasMap::new(),
-                            &WholeUrlFallbackMap::new(),
-                            &EnvFallbackMap::new(),
-                            &LiteralBaseMap::new(),
-                            &[],
-                            &[],
-                            &[],
-                            &HashMap::new(),
-                            summary_rows,
-                        ),
-                        &mut stats.deterministic_rows_emitted,
-                    );
-                    stats.total_data_calls += result.data_calls.len();
-                }
-                file_results.insert(deferred.path_str, result);
+                // is needed to emit them. They are emitted once composed
+                // ([`LateSummaryFile`]).
+                late_summary_files.push(LateSummaryFile {
+                    path_str: deferred.path_str.clone(),
+                    file_path: deferred.file_path.clone(),
+                    counts_data_calls: true,
+                });
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             }
             debug!(
@@ -2453,30 +2504,12 @@ impl FileOrchestrator {
             framework_detection,
             &mut stats,
         );
-        let empty_roles: HashMap<u32, ReceiverRole> = HashMap::new();
-        let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
-        for pf in &mut pending {
-            let file = Path::new(&pf.path_str);
-            if let Some(silent) = self.request_summaries.silent(file) {
-                pf.silent_sites = silent.clone();
-            }
-            pf.resolved = Self::resolve_candidates(
-                &pf.candidate_map,
-                &pf.resolved_members,
-                &pf.local_wrapper_calls,
-                &pf.env_alias_map,
-                &pf.whole_url_fallbacks,
-                &pf.env_fallbacks,
-                &pf.literal_bases,
-                &pf.route_endpoints,
-                &pf.descriptor_endpoints,
-                &pf.decorator_endpoints,
-                receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
-                self.request_summaries
-                    .rows(file)
-                    .unwrap_or(&no_summary_rows),
-            );
-        }
+        //
+        // The rest of this layer reads the request summaries, which may still
+        // be waiting on library semantics the scan is asking about again
+        // (carrick#1564). Nothing before phase 3 reads what it produces — the
+        // prompts and the dispatch read the candidates, not the resolved rows
+        // — so it runs once the model has been asked, below.
 
         // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls, queueing up to
         // FILE_ANALYSIS_QUEUE_DEPTH for the process-wide semaphore that caps what is in
@@ -2727,6 +2760,64 @@ impl FileOrchestrator {
             }))
             .chain(not_asked.into_iter().map(|pf| (pf, ModelAnswer::NotAsked)))
             .collect();
+
+        // PHASE 1d, second half: the rows the request summaries state, now
+        // that they are composed. Waiting here is waiting on the scan's last
+        // asks for library semantics, which ran alongside the model's work.
+        let summaries = self.request_summaries.take().await;
+        let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
+        for late in late_summary_files {
+            let Some(summary_rows) = summaries.rows(&late.file_path) else {
+                continue;
+            };
+            let Some(result) = file_results.get_mut(&late.path_str) else {
+                continue;
+            };
+            let calls_before = result.data_calls.len();
+            let _ = Self::emit_resolved_rows(
+                result,
+                Self::resolve_candidates(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &[],
+                    &EnvAliasMap::new(),
+                    &WholeUrlFallbackMap::new(),
+                    &EnvFallbackMap::new(),
+                    &LiteralBaseMap::new(),
+                    &[],
+                    &[],
+                    &[],
+                    &HashMap::new(),
+                    summary_rows,
+                ),
+                &mut stats.deterministic_rows_emitted,
+            );
+            if late.counts_data_calls {
+                stats.total_data_calls += result.data_calls.len() - calls_before;
+            }
+        }
+        let empty_roles: HashMap<u32, ReceiverRole> = HashMap::new();
+        let mut analyzed = analyzed;
+        for (pf, _) in &mut analyzed {
+            let file = Path::new(&pf.path_str);
+            if let Some(silent) = summaries.silent(file) {
+                pf.silent_sites = silent.clone();
+            }
+            pf.resolved = Self::resolve_candidates(
+                &pf.candidate_map,
+                &pf.resolved_members,
+                &pf.local_wrapper_calls,
+                &pf.env_alias_map,
+                &pf.whole_url_fallbacks,
+                &pf.env_fallbacks,
+                &pf.literal_bases,
+                &pf.route_endpoints,
+                &pf.descriptor_endpoints,
+                &pf.decorator_endpoints,
+                receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
+                summaries.rows(file).unwrap_or(&no_summary_rows),
+            );
+        }
 
         // PHASE 3 (serial): emit the deterministic rows for each file, join
         // the model's answer onto them, and fold the result into the
