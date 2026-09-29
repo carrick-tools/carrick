@@ -583,6 +583,108 @@ pub struct RetypeOutcome {
     pub reason: Option<String>,
 }
 
+/// One library-semantics claim to check against the package's own type
+/// declarations, on one receiver (carrick#1564). The unit of verification is
+/// the pair `(claim_id, receiver)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticsCheck {
+    pub claim_id: String,
+    /// Module specifier, resolved from the request's `from_dir`.
+    pub package: String,
+    /// `"default"` or a named export.
+    pub export: String,
+    /// `"export"` or `"instance:<factory member>"`.
+    pub receiver: String,
+    pub claim: SemanticsClaim,
+}
+
+/// What a claim says about the receiver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticsClaim {
+    /// `member(opts)` builds an instance whose base URL is `opts[base_url_key]`.
+    Factory {
+        member: String,
+        base_url_key: String,
+    },
+    /// `member(path, ...)` sends `method` to `path`.
+    Verb { member: String, method: String },
+    /// Where the body of a verb call sits.
+    VerbBody {
+        member: String,
+        args: SemanticsVerbArgs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_key: Option<String>,
+    },
+    /// A request call; `member: None` means the receiver itself is called.
+    Request {
+        member: Option<String>,
+        args: SemanticsRequestArgs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_key: Option<String>,
+        method_key: String,
+    },
+    /// Where the body of a request call sits.
+    RequestBody {
+        member: Option<String>,
+        args: SemanticsRequestArgs,
+        body_key: String,
+    },
+}
+
+/// The arguments of a verb call: `(path, body)` or `(path, options)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticsVerbArgs {
+    PathBody,
+    PathOptions,
+}
+
+/// The arguments of a request call: `(config)` or `(path, options)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticsRequestArgs {
+    Config,
+    PathOptions,
+}
+
+/// `failed` and `unchecked` both drop the claim; the split is for the eval
+/// score and for logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SemanticsVerdict {
+    /// The declarations satisfy the claim.
+    Verified,
+    /// The declarations resolved and contradict the claim.
+    Failed,
+    /// The declarations could not be read.
+    Unchecked,
+}
+
+/// The verdict on one `(claim_id, receiver)` pair. The sidecar returns
+/// exactly one per check, in request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticsResult {
+    pub claim_id: String,
+    pub receiver: String,
+    pub verdict: SemanticsVerdict,
+    /// Absent exactly when `verified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// How one package of a `verify_client_semantics` request resolved, for logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticsModule {
+    pub package: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// A service whose pairs are degraded wholesale (install failure or poison).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DegradedService {
@@ -665,6 +767,14 @@ enum SidecarRequest {
     RetypeCheck {
         request_id: String,
         items: Vec<RetypeItem>,
+    },
+    #[serde(rename = "verify_client_semantics")]
+    VerifyClientSemantics {
+        request_id: String,
+        from_dir: String,
+        checks: Vec<SemanticsCheck>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_ms: Option<u64>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -812,6 +922,12 @@ pub struct SidecarResponse {
     /// Retype outcomes (for retype_check)
     #[serde(default)]
     pub outcomes: Option<Vec<RetypeOutcome>>,
+    /// Claim verdicts (for verify_client_semantics), one per check in order
+    #[serde(default)]
+    pub semantics: Option<Vec<SemanticsResult>>,
+    /// How each package resolved (for verify_client_semantics)
+    #[serde(default)]
+    pub semantics_modules: Option<Vec<SemanticsModule>>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
@@ -1377,6 +1493,8 @@ impl TypeSidecar {
                 inferred_types: None,
                 definitions: None,
                 outcomes: None,
+                semantics: None,
+                semantics_modules: None,
                 errors: None,
             });
         }
@@ -1416,6 +1534,8 @@ impl TypeSidecar {
                 inferred_types: Some(vec![]),
                 definitions: None,
                 outcomes: None,
+                semantics: None,
+                semantics_modules: None,
                 errors: None,
             });
         }
@@ -1501,6 +1621,36 @@ impl TypeSidecar {
             return Err(SidecarError::CheckFailed(errors.join("; ")));
         }
         Ok(response.outcomes.unwrap_or_default())
+    }
+
+    /// Check library-semantics claims against each package's own type
+    /// declarations, resolved from `from_dir` (carrick#1564). Reads the init'd
+    /// project: the caller scopes the sidecar to the service first, so module
+    /// resolution runs under the service's compiler options. The sidecar
+    /// returns one result per check, in request order; checks it had no time
+    /// for come back `unchecked` with reason `budget`.
+    pub fn verify_client_semantics(
+        &self,
+        from_dir: &Path,
+        checks: &[SemanticsCheck],
+    ) -> Result<Vec<SemanticsResult>, SidecarError> {
+        self.ensure_ready()?;
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = SidecarRequest::VerifyClientSemantics {
+            request_id: self.next_request_id(),
+            from_dir: from_dir.to_string_lossy().into_owned(),
+            checks: checks.to_vec(),
+            budget_ms: None,
+        };
+        self.send_request(&request)?;
+        let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::CheckFailed(errors.join("; ")));
+        }
+        Ok(response.semantics.unwrap_or_default())
     }
 
     /// Run the v2 "tsc as serializer" capture for one service, producing a
@@ -2408,6 +2558,166 @@ mod tests {
             let parsed: VerdictBucket = serde_json::from_str(&format!(r#""{}""#, wire)).unwrap();
             assert_eq!(parsed, bucket);
         }
+    }
+
+    /// The `verify_client_semantics` wire names must match the sidecar's
+    /// `SemanticsCheck` union exactly (carrick#1564): snake_case kinds and
+    /// args, `member: null` for a request on the receiver itself, and the
+    /// optional keys omitted rather than sent as null.
+    #[test]
+    fn verify_client_semantics_request_wire_shape() {
+        let check = |claim_id: &str, receiver: &str, claim: SemanticsClaim| SemanticsCheck {
+            claim_id: claim_id.into(),
+            package: "@fixture/http".into(),
+            export: "default".into(),
+            receiver: receiver.into(),
+            claim,
+        };
+        let request = SidecarRequest::VerifyClientSemantics {
+            request_id: "req-9".into(),
+            from_dir: "/svc".into(),
+            checks: vec![
+                check(
+                    "f",
+                    "export",
+                    SemanticsClaim::Factory {
+                        member: "create".into(),
+                        base_url_key: "baseURL".into(),
+                    },
+                ),
+                check(
+                    "v",
+                    "instance:create",
+                    SemanticsClaim::Verb {
+                        member: "get".into(),
+                        method: "GET".into(),
+                    },
+                ),
+                check(
+                    "vb",
+                    "export",
+                    SemanticsClaim::VerbBody {
+                        member: "post".into(),
+                        args: SemanticsVerbArgs::PathBody,
+                        body_key: None,
+                    },
+                ),
+                check(
+                    "r",
+                    "export",
+                    SemanticsClaim::Request {
+                        member: None,
+                        args: SemanticsRequestArgs::Config,
+                        url_key: Some("url".into()),
+                        method_key: "method".into(),
+                    },
+                ),
+                check(
+                    "rb",
+                    "export",
+                    SemanticsClaim::RequestBody {
+                        member: Some("request".into()),
+                        args: SemanticsRequestArgs::PathOptions,
+                        body_key: "json".into(),
+                    },
+                ),
+            ],
+            budget_ms: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["action"], "verify_client_semantics");
+        assert_eq!(value["request_id"], "req-9");
+        assert_eq!(value["from_dir"], "/svc");
+        assert!(value.get("budget_ms").is_none());
+        let checks = value["checks"].as_array().unwrap();
+        assert_eq!(
+            checks[0],
+            serde_json::json!({
+                "claim_id": "f",
+                "package": "@fixture/http",
+                "export": "default",
+                "receiver": "export",
+                "claim": { "kind": "factory", "member": "create", "base_url_key": "baseURL" }
+            })
+        );
+        assert_eq!(
+            checks[1]["claim"],
+            serde_json::json!({ "kind": "verb", "member": "get", "method": "GET" })
+        );
+        assert_eq!(checks[1]["receiver"], "instance:create");
+        assert_eq!(
+            checks[2]["claim"],
+            serde_json::json!({ "kind": "verb_body", "member": "post", "args": "path_body" })
+        );
+        assert_eq!(
+            checks[3]["claim"],
+            serde_json::json!({
+                "kind": "request", "member": null, "args": "config",
+                "url_key": "url", "method_key": "method"
+            })
+        );
+        assert_eq!(
+            checks[4]["claim"],
+            serde_json::json!({
+                "kind": "request_body", "member": "request", "args": "path_options",
+                "body_key": "json"
+            })
+        );
+
+        let with_budget = SidecarRequest::VerifyClientSemantics {
+            request_id: "req-10".into(),
+            from_dir: "/svc".into(),
+            checks: vec![],
+            budget_ms: Some(250),
+        };
+        let value = serde_json::to_value(&with_budget).unwrap();
+        assert_eq!(value["budget_ms"], 250);
+    }
+
+    /// A response carries one verdict per check; `reason` is absent exactly
+    /// when verified, and a response with no `semantics` key reads as empty.
+    #[test]
+    fn verify_client_semantics_response_wire_shape() {
+        let json = r#"{
+            "request_id": "req-9",
+            "status": "success",
+            "semantics": [
+                { "claim_id": "f", "receiver": "export", "verdict": "verified" },
+                { "claim_id": "v", "receiver": "instance:create", "verdict": "failed",
+                  "reason": "member_missing" },
+                { "claim_id": "r", "receiver": "export", "verdict": "unchecked",
+                  "reason": "budget" }
+            ],
+            "semantics_modules": [
+                { "package": "@fixture/http", "resolved_file": "/svc/node_modules/x/index.d.ts",
+                  "installed_version": "1.2.3" },
+                { "package": "fixture-prefix-http", "reason": "module_unresolved" }
+            ]
+        }"#;
+        let response: SidecarResponse = serde_json::from_str(json).unwrap();
+        let semantics = response.semantics.unwrap();
+        assert_eq!(
+            semantics[0],
+            SemanticsResult {
+                claim_id: "f".into(),
+                receiver: "export".into(),
+                verdict: SemanticsVerdict::Verified,
+                reason: None,
+            }
+        );
+        assert_eq!(semantics[1].verdict, SemanticsVerdict::Failed);
+        assert_eq!(semantics[1].reason.as_deref(), Some("member_missing"));
+        assert_eq!(semantics[2].verdict, SemanticsVerdict::Unchecked);
+        assert_eq!(semantics[2].reason.as_deref(), Some("budget"));
+        let modules = response.semantics_modules.unwrap();
+        assert_eq!(modules[0].installed_version.as_deref(), Some("1.2.3"));
+        assert_eq!(modules[1].resolved_file, None);
+        assert_eq!(modules[1].reason.as_deref(), Some("module_unresolved"));
+
+        let bare = r#"{ "request_id": "req-9", "status": "success" }"#;
+        let response: SidecarResponse = serde_json::from_str(bare).unwrap();
+        assert_eq!(response.semantics.unwrap_or_default(), Vec::new());
+        assert!(response.semantics_modules.is_none());
     }
 
     #[test]
