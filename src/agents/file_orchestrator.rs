@@ -17334,6 +17334,48 @@ export { routes };
         assert!(file_results["consumer.ts"].data_calls[0].dispatch.is_none());
     }
 
+    /// A row the request summaries state carries only the value its own body
+    /// writes, so a wrapper's model value is never carried onto it, even where
+    /// it states none (carrick#1564 review, finding 9).
+    #[test]
+    fn carry_wrapper_dispatch_leaves_a_row_the_source_states() {
+        let mut client = FileAnalysisResult::default();
+        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
+        wrapper_row.dispatch = Some(Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "findSimilar".to_string(),
+        });
+        client.data_calls.push(wrapper_row);
+        let mut consumer = FileAnalysisResult::default();
+        let mut site_row = call_with_span(4, "/rpc/gateway", Some(100));
+        site_row.resolution_source = Some(ResolutionSource::RequestSummary);
+        consumer.data_calls.push(site_row);
+        let mut file_results = HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ]);
+
+        let carried = FileOrchestrator::carry_wrapper_dispatch(
+            &mut file_results,
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(
+                    100,
+                    DispatchSite {
+                        name: "findSimilar".to_string(),
+                        module: PathBuf::from("/repo/client.ts"),
+                        request_line: 19,
+                    },
+                )]),
+            )]),
+            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+        );
+
+        assert_eq!(carried, 0);
+        assert!(file_results["consumer.ts"].data_calls[0].dispatch.is_none());
+    }
+
     /// A site that states a literal of its OWN keeps it: a value written at
     /// the site is a stronger statement than one a delegation away.
     #[test]
