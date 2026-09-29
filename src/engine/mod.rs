@@ -6987,6 +6987,30 @@ async fn analyze_current_repo(
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
 
+    // 3b. Settle the model stages for this service: detection and guidance
+    // (or a deferral), plus the extraction config. Local mode asks nothing.
+    let mut setup = if crate::local_mode::no_model() {
+        debug!("Local mode: skipping framework detection and guidance (no model)");
+        ModelSetup::ready(
+            DetectionResult::default(),
+            crate::local_mode::offline_guidance(),
+            None,
+        )
+    } else {
+        model_setup(packages, &all_import_facts, settled).await
+    };
+    // The in-scan schedule starts now, before the GraphQL hints below, so it
+    // runs beside everything up to the point the analysis reads the
+    // summaries (carrick#1564).
+    let settling = start_semantics_schedule(
+        &setup.detection,
+        semantics_schedule_applies(PreviousGeneration::Stored),
+        packages,
+        &all_import_facts,
+        &service_scan_root(repo_path, config),
+        Path::new(repo_path),
+    );
+
     // Stage B2: derive the GraphQL producer field-list from the service's SDL
     // (deterministic, cheap) so the file-analyzer can link resolver functions to
     // schema fields and emit `graphql_operations`. Empty (a no-op) for non-GraphQL
@@ -7005,29 +7029,6 @@ async fn analyze_current_repo(
         service_graphql_roots(repo_path, service),
         &files,
         repo_path,
-    );
-
-    // 3b. Settle the model stages for this service: detection and guidance
-    // (or a deferral), plus the extraction config. Local mode asks nothing.
-    let mut setup = if crate::local_mode::no_model() {
-        debug!("Local mode: skipping framework detection and guidance (no model)");
-        ModelSetup::ready(
-            DetectionResult::default(),
-            crate::local_mode::offline_guidance(),
-            None,
-        )
-    } else {
-        model_setup(packages, &all_import_facts, settled).await
-    };
-    // The in-scan schedule starts now, so it runs beside the analysis
-    // (carrick#1564).
-    let settling = start_semantics_schedule(
-        &setup.detection,
-        semantics_schedule_applies(PreviousGeneration::Stored),
-        packages,
-        &all_import_facts,
-        &service_scan_root(repo_path, config),
-        Path::new(repo_path),
     );
 
     // 4. Run the complete multi-agent analysis
