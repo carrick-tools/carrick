@@ -445,9 +445,9 @@ class DeclarationReader {
 
   /** One factory overload against the factory predicate; rank `Infinity` holds. */
   private factorySignatureOutcome(signature: ts.Signature, baseUrlKey: string): RankedFailure {
-    const first = this.parameterAt(signature, 0);
+    const first = this.keyParameterAt(signature, 0);
     if (first === undefined) return { rank: 1, outcome: failed('param_missing') };
-    const key = this.declaredProperty(first, baseUrlKey);
+    const key = this.keyProperty(first, baseUrlKey, type => this.acceptsString(type));
     if (!key) return { rank: 2, outcome: this.slotFailure(first, 'key_missing') };
     const keyType = this.checker.getTypeOfSymbol(key);
     if (!this.acceptsString(keyType)) return { rank: 3, outcome: this.slotFailure(keyType, 'key_not_string') };
@@ -472,7 +472,7 @@ class DeclarationReader {
     if ('failure' in callable) return callable.failure;
     let best: RankedFailure | undefined;
     for (const signature of callable.signatures) {
-      const first = this.parameterAt(signature, 0);
+      const first = this.keyParameterAt(signature, 0);
       if (first !== undefined && this.acceptsString(first)) return VERIFIED;
       best = furthest(
         best,
@@ -498,8 +498,11 @@ class DeclarationReader {
     if ('failure' in callable) return callable.failure;
     let best: RankedFailure | undefined;
     for (const signature of callable.signatures) {
-      const first = this.parameterAt(signature, 0);
-      const second = this.parameterAt(signature, 1);
+      const first = this.keyParameterAt(signature, 0);
+      // An open body is read as declared: a type parameter is the open body
+      // itself, not its constraint.
+      const second =
+        args === 'path_body' ? this.parameterAt(signature, 1) : this.keyParameterAt(signature, 1);
       if (first === undefined || second === undefined) {
         best = furthest(best, 1, failed('param_missing'));
         continue;
@@ -536,7 +539,7 @@ class DeclarationReader {
     if ('failure' in selected) return selected.failure;
     const position = claim.args === 'config' ? 0 : 1;
     const declared = selected.signatures.some(signature => {
-      const config = this.parameterAt(signature, position);
+      const config = this.keyParameterAt(signature, position);
       return config !== undefined && this.declaredProperty(config, claim.body_key) !== undefined;
     });
     return declared ? VERIFIED : failed('key_missing');
@@ -565,14 +568,14 @@ class DeclarationReader {
     const selected: ts.Signature[] = [];
     let best: RankedFailure | undefined;
     for (const signature of callable.signatures) {
-      const first = this.parameterAt(signature, 0);
+      const first = this.keyParameterAt(signature, 0);
       let config: Slot | undefined = first;
       if (args === 'path_options') {
         if (first === undefined || !this.acceptsString(first)) {
           best = furthest(best, 1, first === undefined ? failed('param_missing') : this.slotFailure(first, 'param_missing'));
           continue;
         }
-        config = this.parameterAt(signature, 1);
+        config = this.keyParameterAt(signature, 1);
       }
       if (config === undefined) {
         best = furthest(best, 1, failed('param_missing'));
@@ -587,9 +590,9 @@ class DeclarationReader {
         args === 'config'
           ? urlKey === undefined
             ? undefined
-            : this.declaredProperty(config, urlKey)
+            : this.keyProperty(config, urlKey, type => this.acceptsString(type))
           : null;
-      const method = this.declaredProperty(config, methodKey);
+      const method = this.keyProperty(config, methodKey, type => this.acceptsMethod(type));
       if (url === undefined || !method) {
         best = furthest(best, 2, failed('key_missing'));
         continue;
@@ -640,6 +643,61 @@ class DeclarationReader {
     return this.declaredProperties(slot).find(property => property.getName() === name);
   }
 
+  /**
+   * The property `name` of a parameter a key is looked for on. It is the
+   * declared property of the whole type; failing that, for a union, one that an
+   * object constituent declares and whose type passes `accepts`. A constituent
+   * counts only when it is an object type that says something and is not a
+   * function type, so defaults written as `Options | ((parent) => Options)`
+   * are read through `Options`. When a constituent declares the name but no
+   * declaration passes `accepts`, that property is returned for the caller to
+   * reject.
+   */
+  private keyProperty(slot: Slot, name: string, accepts: (type: ts.Type) => boolean): ts.Symbol | undefined {
+    const whole = this.declaredProperty(slot, name);
+    if (whole || slot === VARIADIC) return whole;
+    let declaredOnly: ts.Symbol | undefined;
+    for (const part of this.parts(slot)) {
+      if (!this.isPlainObject(part)) continue;
+      const property = this.declaredProperty(part, name);
+      if (!property) continue;
+      if (accepts(this.checker.getTypeOfSymbol(property))) return property;
+      declaredOnly ??= property;
+    }
+    return declaredOnly;
+  }
+
+  /**
+   * An object type that is not a function type. (One that says nothing
+   * declares no property, so it never supplies a key.)
+   */
+  private isPlainObject(type: ts.Type): boolean {
+    return (
+      this.isObjectLike(type) &&
+      type.getCallSignatures().length === 0 &&
+      type.getConstructSignatures().length === 0
+    );
+  }
+
+  /**
+   * A parameter a key is looked for on, or that must accept a string: read
+   * through a rest parameter's element and through a type parameter's
+   * constraint. A type parameter with no constraint, or one of `any` or
+   * `unknown`, stays as it is and says nothing.
+   */
+  private keyParameterAt(signature: ts.Signature, index: number): Slot | undefined {
+    const slot = this.parameterAt(signature, index, true);
+    return slot === undefined ? undefined : this.throughConstraint(slot);
+  }
+
+  private throughConstraint(slot: Slot): Slot {
+    if (slot === VARIADIC) return slot;
+    const parts = this.parts(slot);
+    if (parts.length !== 1 || !(parts[0].flags & ts.TypeFlags.TypeParameter)) return slot;
+    // An `any` or `unknown` constraint says nothing, as the bare parameter does.
+    return this.checker.getBaseConstraintOfType(parts[0]) ?? slot;
+  }
+
   private declaredProperties(slot: Slot): ts.Symbol[] {
     if (slot === VARIADIC) return [];
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(slot));
@@ -664,7 +722,8 @@ class DeclarationReader {
    * undefined is string-like. `any`, `unknown`, `{}` and `Object` accept a
    * string without saying anything about one.
    */
-  private acceptsString(slot: Slot): boolean {
+  private acceptsString(declared: Slot): boolean {
+    const slot = this.throughConstraint(declared);
     if (slot === VARIADIC) return false;
     return (
       this.checker.isTypeAssignableTo(this.checker.getStringType(), slot) &&
@@ -673,7 +732,8 @@ class DeclarationReader {
   }
 
   /** Accepts string, or names an HTTP method as a literal in either case. */
-  private acceptsMethod(slot: Slot): boolean {
+  private acceptsMethod(declared: Slot): boolean {
+    const slot = this.throughConstraint(declared);
     if (slot === VARIADIC) return false;
     if (this.acceptsString(slot)) return true;
     return this.parts(slot).some(
@@ -777,9 +837,11 @@ class DeclarationReader {
 
   /**
    * What the signature has at parameter `index`, reading through a rest
-   * parameter; `undefined` when it has none there.
+   * parameter; `undefined` when it has none there. A rest typed by a type
+   * parameter (`...rest: A`) is unreadable, unless `readConstraint` asks for
+   * its element through the constraint (`A extends Array<X>` reads `X`).
    */
-  private parameterAt(signature: ts.Signature, index: number): Slot | undefined {
+  private parameterAt(signature: ts.Signature, index: number, readConstraint = false): Slot | undefined {
     const parameters = signature.getParameters();
     const last = parameters[parameters.length - 1];
     const declaration = last?.valueDeclaration;
@@ -790,7 +852,10 @@ class DeclarationReader {
     if (restIndex === -1 || index < restIndex) {
       return index < parameters.length ? this.checker.getTypeOfSymbol(parameters[index]) : undefined;
     }
-    const rest = this.checker.getTypeOfSymbol(last);
+    let rest = this.checker.getTypeOfSymbol(last);
+    if (readConstraint && rest.flags & ts.TypeFlags.TypeParameter) {
+      rest = this.checker.getBaseConstraintOfType(rest) ?? rest;
+    }
     if (this.checker.isTupleType(rest)) {
       return this.checker.getTypeArguments(rest as ts.TypeReference)[index - restIndex];
     }

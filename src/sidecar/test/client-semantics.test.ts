@@ -816,3 +816,125 @@ describe('verify_client_semantics against declarations that say nothing (review 
     assert.strictEqual(installed.installed_version, '1.0.0');
   });
 });
+
+/**
+ * The one place the check widens (carrick#1564, after the review of #1567):
+ * a key is looked for through a type parameter's constraint, through a rest
+ * parameter's element, and on the object constituents of a union, because
+ * real client declarations take their defaults as `Options | (parent =>
+ * Options)` or as a generic rest of instances and options. Everything else
+ * here asserts the widening does NOT verify.
+ */
+describe('verify_client_semantics reads keys through unions, constraints and generic rests', () => {
+  const FILES: Record<string, string> = {
+    'tsconfig.json': TSCONFIG,
+    'src/index.ts': 'export const service = 1;\n',
+    'node_modules/fixture-extend-http/package.json': packageJson('fixture-extend-http', '1.0.0', { types: 'index.d.ts' }),
+    'node_modules/fixture-extend-http/index.d.ts': `export interface Options {
+  prefixUrl?: string;
+  method?: string;
+  json?: unknown;
+}
+export interface Instance {
+  (url: string, options?: Options): Promise<unknown>;
+  get(url: string, options?: Options): Promise<unknown>;
+  head<U extends string>(url: U): Promise<unknown>;
+  send(config: { url: string; method: string } | ((previous: Options) => void)): Promise<unknown>;
+  extend(defaults: Options | ((parent: Options) => Options)): Instance;
+  mixed(defaults: { prefixUrl: number } | { prefixUrl: string; retries?: number } | (() => void)): Instance;
+  keyed<K extends string>(defaults: { prefixUrl: K }): Instance;
+  call<M extends 'get' | 'post'>(config: { url: string; method: M }): Promise<unknown>;
+}
+declare const client: Instance;
+export default client;
+`,
+    'node_modules/fixture-merge-http/package.json': packageJson('fixture-merge-http', '1.0.0', { types: 'index.d.ts' }),
+    'node_modules/fixture-merge-http/index.d.ts': `export interface Options {
+  prefixUrl?: string;
+}
+export interface Instance {
+  (url: string, options?: Options): Promise<unknown>;
+  get(url: string, options?: Options): Promise<unknown>;
+  extend<T extends Array<Instance | Options>>(...items: T): Instance;
+}
+declare const client: Instance;
+export default client;
+`,
+    'node_modules/fixture-widen-wrong/package.json': packageJson('fixture-widen-wrong', '1.0.0', { types: 'index.d.ts' }),
+    'node_modules/fixture-widen-wrong/index.d.ts': `export interface Options {
+  prefixUrl?: string;
+}
+export interface Callable {
+  (): void;
+  prefixUrl: string;
+}
+export interface Instance {
+  get(url: string): Promise<unknown>;
+}
+export interface Static {
+  anyPart(defaults: Options | any): Instance;
+  anyKey(defaults: { prefixUrl: any } | ((parent: Options) => Options)): Instance;
+  indexOnly(defaults: { [key: string]: string } | ((parent: Options) => Options)): Instance;
+  onFunction(defaults: Callable | number): Instance;
+  anyConstraint<T extends any>(defaults: T): Instance;
+  unknownElements<T extends unknown[]>(...items: T): Instance;
+  numberKey(defaults: { prefixUrl: number } | ((parent: Options) => Options)): Instance;
+}
+declare const client: Static;
+export default client;
+`,
+  };
+
+  const factory = (member: string): Claim => ({ kind: 'factory', member, base_url_key: 'prefixUrl' });
+
+  /** [what it shows, package, receiver, claim, verdict, reason] */
+  const CASES: Array<[string, string, string, Claim, Result['verdict'], string | undefined]> = [
+    ['a factory taking an options object or a function of the parent options', 'fixture-extend-http', 'export', factory('extend'), 'verified', undefined],
+    ['a factory taking a generic rest of instances and options', 'fixture-merge-http', 'export', factory('extend'), 'verified', undefined],
+    ['a path typed by a type parameter constrained to string', 'fixture-extend-http', 'export', { kind: 'verb', member: 'head', method: 'HEAD' }, 'verified', undefined],
+    ['request keys on the object constituent of a union', 'fixture-extend-http', 'export', { kind: 'request', member: 'send', args: 'config', url_key: 'url', method_key: 'method' }, 'verified', undefined],
+    ['a union where one object constituent types the key string and another number', 'fixture-extend-http', 'export', factory('mixed'), 'verified', undefined],
+    ['a key typed by a type parameter constrained to string', 'fixture-extend-http', 'export', factory('keyed'), 'verified', undefined],
+    ['a method key typed by a type parameter constrained to method literals', 'fixture-extend-http', 'export', { kind: 'request', member: 'call', args: 'config', url_key: 'url', method_key: 'method' }, 'verified', undefined],
+    ['a union whose key-bearing part collapses to any', 'fixture-widen-wrong', 'export', factory('anyPart'), 'unchecked', 'member_untyped'],
+    ['a union whose only key-bearing constituent types the key any', 'fixture-widen-wrong', 'export', factory('anyKey'), 'unchecked', 'member_untyped'],
+    ['a union where the key exists only through an index signature', 'fixture-widen-wrong', 'export', factory('indexOnly'), 'failed', 'key_missing'],
+    ["a union where the key is a function constituent's own property", 'fixture-widen-wrong', 'export', factory('onFunction'), 'failed', 'key_missing'],
+    ['a type parameter constrained to any', 'fixture-widen-wrong', 'export', factory('anyConstraint'), 'unchecked', 'member_untyped'],
+    ['a generic rest whose element is unknown', 'fixture-widen-wrong', 'export', factory('unknownElements'), 'unchecked', 'member_untyped'],
+    ['a union where the key is declared but typed number', 'fixture-widen-wrong', 'export', factory('numberKey'), 'failed', 'key_not_string'],
+  ];
+
+  let root: string;
+  let client: SidecarClient;
+  const results = new Map<string, Result>();
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-semantics-widen-'));
+    writeTree(root, FILES);
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 'widen-init', action: 'init', repo_root: root });
+    assert.strictEqual(ready.status, 'ready');
+    const checks = CASES.map(([, pkg, receiver, claim], i) => ({ ...check(pkg, receiver, claim), claim_id: `widen-${i}` }));
+    const response = await client.send<Response>(
+      { request_id: 'widen', action: 'verify_client_semantics', from_dir: root, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(pairs(response.semantics!), pairs(checks));
+    for (const result of response.semantics!) results.set(result.claim_id, result);
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  CASES.forEach(([shows, , , , verdict, reason], i) => {
+    it(`${shows} is ${verdict}${reason ? ` (${reason})` : ''}`, () => {
+      const result = results.get(`widen-${i}`)!;
+      assert.deepStrictEqual([result.verdict, result.reason], [verdict, reason]);
+    });
+  });
+});
