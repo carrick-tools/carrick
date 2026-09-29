@@ -29,6 +29,14 @@ The sources:
 - `src/negatives.ts` holds a `get` on a `Map` built in place, one on a `Map`
   held in a module constant, and one on a `Map` bound to the client's own
   name inside a function.
+- `src/a1-mutated.ts` to `src/a5-static.ts` and `src/a13-inherit.ts` are the
+  adversarial sites from the review of the pull request that added this
+  fixture: a base key written through the instance after the factory ran
+  (a1), a base named in the call's own options (a2), factory options and a
+  request config open to a spread (a3), a field a constructor branch writes
+  again (a4), a static member reading `this` beside an instance member (a5),
+  and a field a subclass declares again plus a block redeclaring the
+  instance's name (a13).
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -58,8 +66,30 @@ With the vendored declarations, through the real type sidecar:
 | `prefix-client.ts:11` | `POST /svc/jobs/run` | factory, `verb:post`, `verb_body:post` |
 | `prefix-client.ts:15` | `PUT /svc/jobs/reports` | factory, `request:():path_options`, `request_body:():path_options` |
 | `negatives.ts` | none | none |
+| `a5-static.ts:10` | `GET /instance/ran` | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
+
+Every other adversarial site reads exactly as the same tree does without
+the semantics, because the source may set the base, or the field, somewhere
+the reading cannot see:
+
+| site | row |
+|---|---|
+| `a1-mutated.ts:7` | `GET /mutated`, `receiver_type` |
+| `a2-percall-base.ts:6` | `GET /users`, `receiver_type` |
+| `a2-percall-base.ts:10` | `GET /plain`, `receiver_type` |
+| `a3-spread-after.ts:7` | `GET /spread`, `receiver_type` |
+| `a3-spread-after.ts:11` | none: the config's `url` and `method` come before a spread |
+| `a4-ctor-branch.ts:12` | none |
+| `a5-static.ts:7` | none |
+| `a13-inherit.ts:6` | none |
+| `a13-inherit.ts:18` | none |
+| `a13-inherit.ts:20` | `GET /outer-ok`, `receiver_type` |
+
+The `receiver_type` rows state the path without the instance's base. That
+is how main reads them today, and it is a wrong fact of its own
+(carrick#1583).
 
 With `variants/http-without-base-key.d.ts` installed, the factory claim for
 `@fixture/http` fails with `key_missing` while the sidecar still verifies
@@ -75,6 +105,8 @@ Deno service importing both packages through `npm:` into an empty Deno
 cache: every check is `unchecked` and the scan completes (carrick#1570).
 
 The re-ask rule runs over the same tree without the sidecar: a stored
-detection with no semantics, or with a `pending` entry, is asked once more on
-the next scan; a failed ask keeps the stored detection; an answer naming other
-packages asks for guidance again; a fully answered detection asks nothing.
+detection with no semantics is asked once more on the next scan, and one with
+a `pending` entry only when the test installs that package too; a failed ask
+keeps the stored detection; an answer naming other packages asks for
+guidance again; a fully answered detection asks nothing; and a run retrying
+the work it still owes does not ask again in the same run.

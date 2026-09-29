@@ -44,11 +44,16 @@ the re-ask rule) and `src/request_summary.rs` (reading calls through it).
   package (`import`, or `require`), or a binding or class field initialised
   by the export's factory with one object literal and never reassigned. A
   name the file declares again anywhere below module scope is no client in
-  that file. Nothing is inferred per site, so `new Map().get("/r")` reaches no
-  claim.
+  that file. A field written anywhere but the constructor's own statements,
+  or declared again by a subclass in the file, holds no client, and a static
+  member reads no instance field. Nothing is inferred per site, so `new
+  Map().get("/r")` reaches no claim.
 - **The base** is the factory options' value at the verified key, joined to
   the path with exactly one slash. A path that is an absolute URL ignores
-  it.
+  it. An empty base is no base, and a base holding `?` or `#` states no URL.
+  Nothing is read where the source may set the base elsewhere: factory
+  options open to a spread, a call's options or config that are open or
+  name a base key, or a base key assigned through the client.
 - **The method** is the verb claim's, or the literal a request call writes
   at the method key. No literal, no row: a library's default is never
   assumed.
@@ -65,16 +70,21 @@ exist only once detection has answered and the service's sidecar is up.
 ## Asking again
 
 There is no cache-version bump. A stored detection with no
-`client_semantics`, or with an entry still `pending`, is asked again once on
-the next scan, when one of its data fetchers is installed. If the answer
-names the same packages in all four lists, the stored guidance stands and
-only the semantics are taken; if not, guidance is asked again from the new
-answer. A failed ask keeps the stored detection.
+`client_semantics` is asked again on the next scan when one of its data
+fetchers is installed, and one with an entry still `pending` when that
+package is installed. The ask is one HTTP attempt, and a run retrying its
+own owed work does not send it. If the answer names the same packages in
+all four lists, the stored guidance stands and only the semantics are taken;
+if not, guidance is asked again from the new answer. A failed ask keeps the
+stored detection.
 
 ## Limits
 
 - An instance exported from one module and imported by another is not read
   as a client in the importing module (carrick#1568).
-- A base that is an absolute URL written as a literal states no row, because
-  a summary row states only a path behind an opaque base (carrick#1569).
+- A base that is an absolute URL written as a literal gives no library row,
+  because a summary row states only a path behind an opaque base
+  (carrick#1569). The call keeps the reading it has without the semantics,
+  which can be a receiver-type fact stating the path without the base
+  (carrick#1583).
 - A verb whose member name is not the HTTP method is not read (carrick#1566).
