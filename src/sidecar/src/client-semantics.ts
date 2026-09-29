@@ -331,12 +331,17 @@ class DeclarationReader {
     if (file) {
       entry.resolved_file = file.fileName;
       const agrees = resolved !== undefined && this.isSameInstalledFile(resolved.resolvedFileName, file);
-      if (agrees) {
+      // Under `node_modules` is not enough: a `paths` alias can point the name
+      // at another installed package. The package the resolver landed in must
+      // be the one named, or its separate `@types` package. An `npm:` alias
+      // installs a package that names itself otherwise, so it reads local too.
+      const named = agrees && isNamedPackage(pkg, resolved.packageId?.name);
+      if (named) {
         const version = resolved.packageId?.version;
         if (version) entry.installed_version = version;
       }
       if (!TYPESCRIPT_FILE.test(file.fileName)) return done('module_js_only');
-      if (!agrees || !resolved.isExternalLibraryImport) return done('module_local');
+      if (!agrees || !resolved.isExternalLibraryImport || !named) return done('module_local');
       return done();
     }
 
@@ -946,6 +951,18 @@ class DeclarationReader {
     }
     return this.isOpenTop(rest) ? rest : VARIADIC;
   }
+}
+
+/**
+ * The package a specifier names (`@scope/name` or `name`, without a subpath)
+ * is `packageName`, or `packageName` is its `@types` package
+ * (`@types/scope__name` for a scoped one).
+ */
+function isNamedPackage(specifier: string, packageName: string | undefined): boolean {
+  const segments = specifier.split('/');
+  const named = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
+  const types = `@types/${named.startsWith('@') ? named.slice(1).replace('/', '__') : named}`;
+  return packageName === named || packageName === types;
 }
 
 /** A file under a `node_modules` directory: installed, not the service's own. */

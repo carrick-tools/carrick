@@ -1086,3 +1086,133 @@ declare const c: S; export default c;
     assert.match(duplicate.resolved_file!, /node_modules\/rg-dep\/node_modules\/rg-dup\/index\.d\.ts$/);
   });
 });
+
+/**
+ * Third review of #1567 (A1). A resolved file under `node_modules` is not
+ * enough: a `paths` alias can point the requested name at ANOTHER installed
+ * package. The package the resolver landed in must be the requested one (or
+ * its separate `@types` package). The rest of this block pins the installs
+ * that must still read as the named package.
+ */
+describe('verify_client_semantics requires the installed package to be the one named (third review of #1567)', () => {
+  const HTTP = `export interface S { get(url: string): Promise<unknown>; create(o: { baseURL: string }): S }
+declare const c: S; export default c;
+`;
+  let root: string;
+  let client: SidecarClient;
+  const results = new Map<string, Result>();
+  let modules = new Map<string, Module>();
+  const pkgAt = (dir: string, name: string, dts: string, entry: Record<string, unknown> = { types: 'index.d.ts' }, version = '1.0.0') =>
+    writeTree(root, {
+      [`${dir}/package.json`]: JSON.stringify({ name, version, ...entry }),
+      [`${dir}/index.d.ts`]: dts,
+    });
+
+  const FACTORY: Claim = { kind: 'factory', member: 'create', base_url_key: 'baseURL' };
+  /** [what it shows, package, claim, verdict, reason] */
+  const CASES: Array<[string, string, Claim, Result['verdict'], string | undefined]> = [
+    ['A1: a paths alias from the named package to another installed package (verb)', 'ax-named', VERB_GET, 'unchecked', 'module_local'],
+    ['A1: a paths alias from the named package to another installed package (factory)', 'ax-named', FACTORY, 'unchecked', 'module_local'],
+    ['A1: a paths alias to another installed package\'s directory', 'ax-named-dir', VERB_GET, 'unchecked', 'module_local'],
+    ['a scoped package', '@fixture/scoped', VERB_GET, 'verified', undefined],
+    ['a package typed through its separate @types package', 'fixture-typed', VERB_GET, 'verified', undefined],
+    ['a scoped package typed through its mangled @types package', '@fixture/typed', VERB_GET, 'verified', undefined],
+    ['a subpath the package exports', 'fixture-sub/client', VERB_GET, 'verified', undefined],
+    ['a pnpm-style symlinked install', 'fixture-pnpm', VERB_GET, 'verified', undefined],
+    ['a duplicate install of the same name and version', 'fixture-dup', VERB_GET, 'verified', undefined],
+    // Ruled strict for this PR: the alias's installed package.json names the
+    // target, so the name check cannot pass. Directory-name acceptance is
+    // follow-up work, decided together with what counts as an installed path.
+    ['an npm alias whose installed package names itself otherwise', 'fixture-alias', VERB_GET, 'unchecked', 'module_local'],
+  ];
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-semantics-named-'));
+    writeTree(root, {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          target: 'es2020',
+          lib: ['es2020'],
+          module: 'esnext',
+          moduleResolution: 'bundler',
+          strict: true,
+          esModuleInterop: true,
+          skipLibCheck: true,
+          types: [],
+          baseUrl: '.',
+          paths: {
+            'ax-named': ['node_modules/ax-other/index.d.ts'],
+            'ax-named-dir': ['node_modules/ax-other'],
+          },
+        },
+        include: ['src/**/*.ts'],
+      }),
+      // The nested copy of the duplicate is imported first, so the top-level one becomes a redirect to it.
+      'src/index.ts': "import dep from 'fixture-dep';\nexport const service = dep;\n",
+    });
+    pkgAt('node_modules/ax-other', 'ax-other', HTTP);
+    pkgAt('node_modules/ax-named', 'ax-named', 'export interface S { fetchIt(u: number): void }\ndeclare const c: S; export default c;\n');
+    pkgAt('node_modules/@fixture/scoped', '@fixture/scoped', HTTP);
+    const jsOnly = (dir: string, name: string) =>
+      writeTree(root, {
+        [`${dir}/package.json`]: JSON.stringify({ name, version: '1.0.0', main: 'index.js' }),
+        [`${dir}/index.js`]: 'module.exports = {};\n',
+      });
+    jsOnly('node_modules/fixture-typed', 'fixture-typed');
+    pkgAt('node_modules/@types/fixture-typed', '@types/fixture-typed', HTTP, { types: 'index.d.ts' }, '2.0.1');
+    jsOnly('node_modules/@fixture/typed', '@fixture/typed');
+    pkgAt('node_modules/@types/fixture__typed', '@types/fixture__typed', HTTP, { types: 'index.d.ts' }, '3.0.2');
+    writeTree(root, {
+      'node_modules/fixture-sub/package.json': JSON.stringify({
+        name: 'fixture-sub',
+        version: '1.0.0',
+        exports: { './client': { types: './dist/client.d.ts' } },
+      }),
+      'node_modules/fixture-sub/dist/client.d.ts': HTTP,
+    });
+    pkgAt('node_modules/.pnpm/fixture-pnpm@1.0.0/node_modules/fixture-pnpm', 'fixture-pnpm', HTTP);
+    fs.symlinkSync(
+      path.join(root, 'node_modules/.pnpm/fixture-pnpm@1.0.0/node_modules/fixture-pnpm'),
+      path.join(root, 'node_modules/fixture-pnpm')
+    );
+    pkgAt('node_modules/fixture-dep', 'fixture-dep', "import c from 'fixture-dup';\ndeclare const d: typeof c; export default d;\n");
+    pkgAt('node_modules/fixture-dep/node_modules/fixture-dup', 'fixture-dup', HTTP);
+    pkgAt('node_modules/fixture-dup', 'fixture-dup', HTTP);
+    // What `"fixture-alias": "npm:fixture-target@1"` installs: the target, under the alias's directory.
+    pkgAt('node_modules/fixture-alias', 'fixture-target', HTTP);
+
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 'named-init', action: 'init', repo_root: root });
+    assert.strictEqual(ready.status, 'ready');
+    const checks = CASES.map(([, pkg, claim], i) => ({ ...check(pkg, 'export', claim), claim_id: `named-${i}` }));
+    const response = await client.send<Response>(
+      { request_id: 'named', action: 'verify_client_semantics', from_dir: root, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(pairs(response.semantics!), pairs(checks));
+    for (const result of response.semantics!) results.set(result.claim_id, result);
+    modules = new Map(response.semantics_modules!.map(m => [m.package, m]));
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  CASES.forEach(([shows, , , verdict, reason], i) => {
+    it(`${shows} is ${verdict}${reason ? ` (${reason})` : ''}`, () => {
+      const result = results.get(`named-${i}`)!;
+      assert.deepStrictEqual([result.verdict, result.reason], [verdict, reason]);
+    });
+  });
+
+  it('reads installed_version from the named package, @types included', () => {
+    assert.strictEqual(modules.get('ax-named')!.installed_version, undefined);
+    // The directory alias resolves with the other package's id; its version is not the named one's.
+    assert.strictEqual(modules.get('ax-named-dir')!.installed_version, undefined);
+    assert.strictEqual(modules.get('@fixture/typed')!.installed_version, '3.0.2');
+    assert.strictEqual(modules.get('fixture-sub/client')!.installed_version, '1.0.0');
+  });
+});
