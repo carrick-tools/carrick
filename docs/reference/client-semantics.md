@@ -127,7 +127,8 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   (carrick#1583).
 - A verb whose member name is not the HTTP method is not read (carrick#1566).
 - A method call through the client other than a verb is assumed not to
-  change its base (a setter such as `api.setBase("/v2")` is not recognised).
+  change its base (a setter such as `api.setBase("/v2")` is not recognised,
+  carrick#1589).
 - Shapes that lose a reading to the rules above: a client whose defaults
   the file configures (`api.defaults.headers.common.X = …`, or through the
   export), a client handed to a helper or kept in an object, one read by a
