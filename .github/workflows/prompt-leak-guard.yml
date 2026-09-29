@@ -10,12 +10,15 @@ on:
       - ".github/prompt-leak-baseline.txt"
       - ".github/workflows/prompt-leak-guard.yml"
 
+permissions:
+  contents: read
+
 jobs:
   guard:
     name: Guard against prompt strings in public Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Generate current counts
         id: counts

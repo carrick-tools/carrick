@@ -70,7 +70,7 @@ jobs:
       # contributor makes the PR theirs and the runs start on their own. Falls
       # back to GITHUB_TOKEN when the secret is absent, so nothing breaks
       # before it exists.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -201,7 +201,7 @@ jobs:
       # wrong commit, stops here rather than publishing a mislabelled package.
       # `crates/carrick-match/Cargo.toml` is deliberately not checked — it is
       # versioned outside release-please.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: ${{ steps.resolve.outputs.resolved == 'true' }}
         with:
           ref: ${{ steps.resolve.outputs.sha }}
@@ -265,7 +265,7 @@ jobs:
     steps:
       # The tag's commit, resolved once by `target`. On the dispatch path
       # `github.sha` is main's head, which is not what is being published.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.target.outputs.sha }}
 
@@ -276,12 +276,13 @@ jobs:
           echo "version=${{ needs.target.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -330,7 +331,7 @@ jobs:
           ls -l "$TARBALLS"
 
       - name: Upload the platform package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: platform-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/tarballs/*.tgz
@@ -349,17 +350,18 @@ jobs:
     steps:
       # The tag's commit, resolved once by `target`. On the dispatch path
       # `github.sha` is main's head, which is not what is being published.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.target.outputs.sha }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -370,7 +372,7 @@ jobs:
             ${{ runner.os }}-cargo-release-
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: "npm"
@@ -393,7 +395,7 @@ jobs:
           tar -czf carrick-action-linux.tar.gz carrick sidecar
 
       - name: Upload release artifact
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.target.outputs.tag_name }}
           files: release/carrick-action-linux.tar.gz
@@ -435,12 +437,12 @@ jobs:
     steps:
       # The tag's commit, resolved once by `target`. On the dispatch path
       # `github.sha` is main's head, which is not what is being published.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.target.outputs.sha }}
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -451,7 +453,7 @@ jobs:
         run: npm install -g npm@latest
 
       - name: Download the platform packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: platform-*
           path: dist/tarballs
@@ -627,7 +629,7 @@ jobs:
     steps:
       # The tag's commit, resolved once by `target`. On the dispatch path
       # `github.sha` is main's head, which is not what is being published.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.target.outputs.sha }}
 
@@ -637,7 +639,7 @@ jobs:
           echo "version=${{ needs.target.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: "npm"
@@ -673,7 +675,7 @@ jobs:
       # Attached first, so that a gallery rejection still leaves a .vsix that a
       # user can install by file and the owner can upload to the Marketplace.
       - name: Attach the .vsix to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.target.outputs.tag_name }}
           files: ${{ steps.vsix.outputs.vsix }}

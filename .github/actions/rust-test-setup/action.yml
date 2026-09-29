@@ -9,8 +9,9 @@ runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       with:
+        toolchain: stable
         components: rustfmt, clippy
 
     # Keyed apart from the lint/build caches: the test jobs compile with
@@ -18,7 +19,7 @@ runs:
     # directory built with full debuginfo is a full rebuild under that
     # profile, which the once-per-lockfile save would then never replace.
     - name: Cache dependencies
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ~/.cargo/registry
@@ -29,7 +30,7 @@ runs:
           ${{ runner.os }}-cargo-test-ltd-
 
     - name: Install Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
         node-version: "24"
         cache: "npm"
@@ -41,7 +42,7 @@ runs:
           src/sidecar/package-lock.json
 
     - name: Install Deno for type and dependency preparation tests
-      uses: denoland/setup-deno@v2
+      uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
       with:
         deno-version: "2.9.4"
 
