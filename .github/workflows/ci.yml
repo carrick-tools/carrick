@@ -113,6 +113,7 @@ jobs:
           --test pr_on_main_test
           --test prompt_determinism_test
           --test receiver_type_classification_test
+          --test request_summary_test
           --test retype_consumer_test
           --test route_request_anchor_test
           --test scan_durability_test
