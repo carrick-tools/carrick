@@ -352,6 +352,56 @@ export const RetypeCheckRequestSchema = BaseRequestSchema.extend({
   budget_ms: z.number().int().nonnegative().optional(),
 });
 
+/** One library-semantics claim, as the scanner derives it (carrick#1564). */
+const SemanticsClaimSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('factory'),
+    member: z.string().min(1),
+    base_url_key: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('verb'),
+    member: z.string().min(1),
+    method: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('verb_body'),
+    member: z.string().min(1),
+    args: z.enum(['path_body', 'path_options']),
+    body_key: z.string().min(1).optional(),
+  }),
+  z.object({
+    kind: z.literal('request'),
+    member: z.string().min(1).nullable(),
+    args: z.enum(['config', 'path_options']),
+    url_key: z.string().min(1).optional(),
+    method_key: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('request_body'),
+    member: z.string().min(1).nullable(),
+    args: z.enum(['config', 'path_options']),
+    body_key: z.string().min(1),
+  }),
+]);
+
+const SemanticsCheckSchema = z.object({
+  claim_id: z.string().min(1),
+  package: z.string().min(1),
+  export: z.string().min(1),
+  receiver: z
+    .string()
+    .regex(/^(export|instance:\S+)$/, 'receiver must be "export" or "instance:<factory member>"'),
+  claim: SemanticsClaimSchema,
+});
+
+export const VerifyClientSemanticsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('verify_client_semantics'),
+  from_dir: z.string().min(1),
+  checks: z.array(SemanticsCheckSchema),
+  budget_ms: z.number().int().nonnegative().optional(),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -370,6 +420,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   CheckCompatibilityRequestSchema,
   ResolveDefinitionsRequestSchema,
   RetypeCheckRequestSchema,
+  VerifyClientSemanticsRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

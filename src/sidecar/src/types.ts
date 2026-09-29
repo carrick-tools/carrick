@@ -389,10 +389,46 @@ export interface RetypeCheckRequest extends BaseRequest {
 }
 
 /**
+ * One library-semantics claim to check against the package's own type
+ * declarations, on one receiver (carrick#1564). The unit of verification is
+ * the pair `(claim_id, receiver)`.
+ */
+export interface SemanticsCheck {
+  claim_id: string;
+  /** Module specifier, resolved from the request's `from_dir`. */
+  package: string;
+  /** `"default"` or a named export. */
+  export: string;
+  /** `"export"` or `"instance:<factory member>"`. */
+  receiver: string;
+  claim:
+    | { kind: 'factory'; member: string; base_url_key: string }
+    | { kind: 'verb'; member: string; method: string }
+    | { kind: 'verb_body'; member: string; args: 'path_body' | 'path_options'; body_key?: string }
+    | { kind: 'request'; member: string | null; args: 'config' | 'path_options'; url_key?: string; method_key: string }
+    | { kind: 'request_body'; member: string | null; args: 'config' | 'path_options'; body_key: string };
+}
+
+/**
+ * Check library-semantics claims against each package's type declarations.
+ * Needs `init`: module resolution runs under the service's compiler options,
+ * in the service's program.
+ */
+export interface VerifyClientSemanticsRequest extends BaseRequest {
+  action: 'verify_client_semantics';
+  /** Absolute service root; module resolution starts here. */
+  from_dir: string;
+  checks: SemanticsCheck[];
+  /** Checks not reached in time come back `unchecked` with reason `budget`. */
+  budget_ms?: number;
+}
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
   | RetypeCheckRequest
+  | VerifyClientSemanticsRequest
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
@@ -638,10 +674,41 @@ export interface RetypeCheckResponse extends BaseResponse {
 }
 
 /**
+ * The verdict on one `(claim_id, receiver)` pair.
+ *
+ * - `verified`: the declarations satisfy the claim.
+ * - `failed`: the declarations resolved and contradict it.
+ * - `unchecked`: the declarations could not be read.
+ */
+export interface SemanticsResult {
+  claim_id: string;
+  receiver: string;
+  verdict: 'verified' | 'failed' | 'unchecked';
+  /** Absent exactly when verified. */
+  reason?: string;
+}
+
+/** How one package of the request resolved, for logs. */
+export interface SemanticsModule {
+  package: string;
+  resolved_file?: string;
+  installed_version?: string;
+  reason?: string;
+}
+
+export interface VerifyClientSemanticsResponse extends BaseResponse {
+  /** Exactly one per check, in request order. */
+  semantics?: SemanticsResult[];
+  semantics_modules?: SemanticsModule[];
+  errors?: string[];
+}
+
+/**
  * Union type for all possible sidecar responses
  */
 export type SidecarResponse =
   | RetypeCheckResponse
+  | VerifyClientSemanticsResponse
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse
