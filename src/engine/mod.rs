@@ -2971,7 +2971,7 @@ async fn analyze_current_repo_incremental(
             // below (carrick#1564).
             let settling = start_semantics_schedule(
                 &setup.detection,
-                semantics_schedule_applies(&setup, generation),
+                semantics_schedule_applies(generation),
                 packages,
                 &all_import_facts,
                 &service_scan_root(repo_path, config),
@@ -6122,12 +6122,14 @@ pub(crate) async fn semantics_from_reask<E: std::fmt::Display>(
 }
 
 /// Whether the in-scan schedule may ask about library semantics: a model is
-/// in use, the service's model stages were not deferred, the run is not
-/// collecting prompts, and the service's previous generation is not this
-/// run's own (a retry of owed work asked minutes ago).
-fn semantics_schedule_applies(setup: &ModelSetup, generation: PreviousGeneration) -> bool {
+/// in use, the run is not collecting prompts, and the service's previous
+/// generation is not this run's own (a retry of owed work asked minutes ago).
+///
+/// A service whose model stages were deferred needs no rule here: its setup
+/// carries the empty detection ([`ModelSetup::deferred`]), so there is
+/// nothing pending to settle (the `a_deferred_service_runs_no_schedule` test).
+fn semantics_schedule_applies(generation: PreviousGeneration) -> bool {
     !crate::local_mode::no_model()
-        && setup.deferred.is_none()
         && generation == PreviousGeneration::Stored
         && !crate::analysis_channel::dispatching()
 }
@@ -7021,7 +7023,7 @@ async fn analyze_current_repo(
     // (carrick#1564).
     let settling = start_semantics_schedule(
         &setup.detection,
-        semantics_schedule_applies(&setup, PreviousGeneration::Stored),
+        semantics_schedule_applies(PreviousGeneration::Stored),
         packages,
         &all_import_facts,
         &service_scan_root(repo_path, config),
