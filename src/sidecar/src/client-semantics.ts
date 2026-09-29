@@ -20,6 +20,7 @@
  * for itself is not evidence about the library.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
 import type {
@@ -184,7 +185,8 @@ export class ClientSemanticsVerifier {
       const reader = new DeclarationReader(
         program,
         file,
-        this.project.getModuleResolutionHost()
+        this.project.getModuleResolutionHost(),
+        fromDir
       );
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -203,6 +205,7 @@ export class ClientSemanticsVerifier {
         }
         const key = exportKey(check);
         const declaration = file.statements[importIndex.get(key)!] as ts.ImportDeclaration;
+        reader.setPackage(check.package);
 
         let moduleRead = moduleReads.get(check.package);
         if (!moduleRead) {
@@ -283,13 +286,42 @@ function asciiUpperCase(text: string): string {
  */
 class DeclarationReader {
   private readonly checker: ts.TypeChecker;
+  /** The service root, as a realpath. */
+  private readonly root: string;
+  private readonly packageDirectories = new Map<string, InstalledPackage | null>();
+  private readonly realpaths = new Map<string, string>();
+  /** Names the service declares in its own blocks, per augmented package (`global` for `declare global`). */
+  private augmentedNames: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  /** The package of the check being judged; see `serviceAugmentedNames`. */
+  private currentPackage = '';
 
   constructor(
     private readonly program: ts.Program,
     private readonly probe: ts.SourceFile,
-    private readonly host: ts.ModuleResolutionHost
+    private readonly host: ts.ModuleResolutionHost,
+    serviceRoot: string
   ) {
     this.checker = program.getTypeChecker();
+    this.root = this.realpath(serviceRoot);
+  }
+
+  /**
+   * A path with its symlinks resolved. The compiler spells the service's own
+   * files as given and resolved dependencies as realpaths, so both sides of a
+   * comparison go through here. A path not on disk (the default library ts-morph
+   * serves from memory) is kept as it is.
+   */
+  private realpath(fileName: string): string {
+    let real = this.realpaths.get(fileName);
+    if (real === undefined) {
+      try {
+        real = fs.realpathSync(fileName);
+      } catch {
+        real = fileName;
+      }
+      this.realpaths.set(fileName, real);
+    }
+    return real;
   }
 
   // --------------------------------------------------------------------------
@@ -332,16 +364,23 @@ class DeclarationReader {
       entry.resolved_file = file.fileName;
       const agrees = resolved !== undefined && this.isSameInstalledFile(resolved.resolvedFileName, file);
       // Under `node_modules` is not enough: a `paths` alias can point the name
-      // at another installed package. The package the resolver landed in must
-      // be the one named, or its separate `@types` package. An `npm:` alias
-      // installs a package that names itself otherwise, so it reads local too.
-      const named = agrees && isNamedPackage(pkg, resolved.packageId?.name);
-      if (named) {
-        const version = resolved.packageId?.version;
-        if (version) entry.installed_version = version;
-      }
+      // at another installed package. The resolver must land in an installed
+      // package directory, and that package must be the one named: by its
+      // `packageId` (or its separate `@types` package), or, for an `npm:`
+      // alias, by the directory name, which the installer takes from the
+      // alias. (The package.json comparison beside it always holds:
+      // TypeScript builds `packageId` from that same package.json.)
+      const installed =
+        agrees && resolved !== undefined ? this.installedPackage(resolved.resolvedFileName) : undefined;
+      const packageId = resolved?.packageId;
+      const named =
+        installed !== undefined &&
+        packageId !== undefined &&
+        (isNamedPackage(pkg, packageId.name) ||
+          (installed.directoryName === packageNameOf(pkg) && installed.packageName === packageId.name));
+      if (named && packageId.version) entry.installed_version = packageId.version;
       if (!TYPESCRIPT_FILE.test(file.fileName)) return done('module_js_only');
-      if (!agrees || !resolved.isExternalLibraryImport || !named) return done('module_local');
+      if (!named) return done('module_local');
       return done();
     }
 
@@ -368,7 +407,7 @@ class DeclarationReader {
     // which copy TypeScript deduplicated a package into.
     const target = (resolved as { redirectInfo?: { redirectTarget: ts.SourceFile } } | undefined)
       ?.redirectInfo?.redirectTarget;
-    return target === file && isInstalledFile(file.fileName);
+    return target === file && this.isInstalledFile(file.fileName);
   }
 
   /** `T`: the type the probe's import gets. */
@@ -665,8 +704,19 @@ class DeclarationReader {
     return this.callSignatures(this.checker.getTypeOfSymbol(property));
   }
 
+  /**
+   * The call signatures the library declares. A service `declare module`
+   * block can add an overload to a library member; that signature is the
+   * service's claim about the library, not the library's.
+   */
   private callSignatures(type: ts.Type): Callable {
-    const signatures = this.checker.getNonNullableType(type).getCallSignatures();
+    const signatures = this.checker
+      .getNonNullableType(type)
+      .getCallSignatures()
+      .filter(signature => {
+        const declaration = signature.getDeclaration();
+        return declaration !== undefined && this.isLibraryFile(declaration.getSourceFile());
+      });
     if (signatures.length > 0) return { signatures };
     return { failure: this.slotFailure(type, 'member_not_callable') };
   }
@@ -761,28 +811,99 @@ class DeclarationReader {
    */
   private isLibraryDeclared(property: ts.Symbol, listing: ts.Type): boolean {
     const declarations = property.declarations ?? [];
-    if (declarations.length === 0) return this.isListedByLibraryType(listing, property.getName());
+    if (declarations.length === 0) {
+      return (
+        !this.isNamedByServiceAugmentation(property.getName()) &&
+        this.isListedByLibraryType(listing, property.getName())
+      );
+    }
     return declarations.some(declaration => this.isLibraryFile(declaration.getSourceFile()));
   }
 
+  /** Judge the next check as a claim about `pkg`. */
+  setPackage(pkg: string): void {
+    this.currentPackage = packageNameOf(pkg);
+  }
+
   /**
-   * The type listing member `name` is declared only in library files, which a
-   * service augmentation of it is not. An intersection has no declaration of
-   * its own (`type Client = {...} & Record<Alias, Fn> & Fn`), so it defers to
-   * the parts that list the member: the library's `Record` does, a base
-   * interface the service extended with its own mapped type does not.
+   * The service's own `declare module '<this package>'` (or one of its
+   * subpaths) or `declare global` blocks declare a member of this name,
+   * compared without case. A mapped type's member has no declaration of its
+   * own, so when the service adds a key to the interface a library mapped
+   * type iterates (`Record<keyof MethodMap, Fn>`, with or without `& string`,
+   * or re-cased by an `as Lowercase<...>` remap), nothing on the member says
+   * the service put it there. Blocks for other packages do not count: a
+   * service augments many packages, and their member names say nothing about
+   * this one.
+   */
+  private isNamedByServiceAugmentation(name: string): boolean {
+    const names = this.serviceAugmentedNames();
+    const lower = name.toLowerCase();
+    return Boolean(names.get(this.currentPackage)?.has(lower) || names.get('global')?.has(lower));
+  }
+
+  private serviceAugmentedNames(): ReadonlyMap<string, ReadonlySet<string>> {
+    if (this.augmentedNames) return this.augmentedNames;
+    const byPackage = new Map<string, Set<string>>();
+    const collect = (node: ts.Node, names: Set<string>): void => {
+      if (
+        (ts.isPropertySignature(node) ||
+          ts.isMethodSignature(node) ||
+          ts.isPropertyDeclaration(node) ||
+          ts.isMethodDeclaration(node) ||
+          ts.isEnumMember(node)) &&
+        (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) || ts.isNumericLiteral(node.name))
+      ) {
+        names.add(node.name.text.toLowerCase());
+      }
+      ts.forEachChild(node, child => collect(child, names));
+    };
+    for (const file of this.program.getSourceFiles()) {
+      if (file === this.probe || this.isLibraryFile(file)) continue;
+      for (const statement of file.statements) {
+        if (!ts.isModuleDeclaration(statement) || !statement.body) continue;
+        const key = ts.isStringLiteral(statement.name)
+          ? packageNameOf(statement.name.text)
+          : statement.flags & ts.NodeFlags.GlobalAugmentation
+            ? 'global'
+            : undefined;
+        if (key === undefined) continue;
+        let names = byPackage.get(key);
+        if (!names) byPackage.set(key, (names = new Set<string>()));
+        collect(statement.body, names);
+      }
+    }
+    this.augmentedNames = byPackage;
+    return byPackage;
+  }
+
+  /**
+   * Member `name`, which has no declaration of its own, reaches `listing`
+   * along a path of types the library alone declares. The path runs through
+   * the types that list the member: an intersection's parts
+   * (`type Client = {...} & Record<Alias, Fn> & Fn`), and an interface's base
+   * types (`interface S extends Base`), each declared only in library files.
+   * The library's `Record` is; a base interface the service extended with its
+   * own mapped type is not, at any depth.
    */
   private isListedByLibraryType(listing: ts.Type, name: string): boolean {
-    if (listing.isIntersection()) {
-      return listing.types.some(part => {
+    const listedBy = (types: readonly ts.Type[]) =>
+      types.some(part => {
         const apparent = this.checker.getApparentType(part);
         return (
           this.checker.getPropertyOfType(apparent, name) !== undefined &&
           this.isListedByLibraryType(apparent, name)
         );
       });
-    }
-    return this.isDeclaredOnlyInLibrary(listing.getSymbol());
+    if (listing.isIntersection()) return listedBy(listing.types);
+    if (!this.isDeclaredOnlyInLibrary(listing.getSymbol())) return false;
+    const objectFlags = (listing as ts.ObjectType).objectFlags ?? 0;
+    const target =
+      objectFlags & ts.ObjectFlags.Reference ? (listing as ts.TypeReference).target : listing;
+    const targetFlags = (target as ts.ObjectType).objectFlags ?? 0;
+    // A type literal or mapped type lists its members itself.
+    if (!(targetFlags & ts.ObjectFlags.ClassOrInterface)) return true;
+    return listedBy(this.checker.getBaseTypes(target as ts.InterfaceType));
   }
 
   private isDeclaredOnlyInLibrary(symbol: ts.Symbol | undefined): boolean {
@@ -793,13 +914,38 @@ class DeclarationReader {
     );
   }
 
-  /**
-   * An installed package's file, or the default library's: ts-morph serves
-   * the default library from `/node_modules/typescript/lib`, so one test
-   * answers both (pinned by the test of a method key `RequestInit` declares).
-   */
+  /** An installed package's file, or the default library's. */
   private isLibraryFile(file: ts.SourceFile): boolean {
-    return isInstalledFile(file.fileName);
+    return this.program.isSourceFileDefaultLibrary(file) || this.isInstalledFile(file.fileName);
+  }
+
+  private isInstalledFile(fileName: string): boolean {
+    return this.installedPackage(fileName) !== undefined;
+  }
+
+  /**
+   * The installed package a file belongs to. Its path, taken relative to the
+   * service root, has a package directory after its last `node_modules`
+   * segment (two segments for a scope), holding a package.json. A service
+   * source file in a directory that happens to be named `node_modules`, or a
+   * repository checked out under a `node_modules` ancestor, is not installed.
+   * An install hoisted above the service root (`../../node_modules/pkg`) and
+   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are.
+   */
+  private installedPackage(fileName: string): InstalledPackage | undefined {
+    const segments = path.relative(this.root, this.realpath(fileName)).split(path.sep);
+    const last = segments.lastIndexOf('node_modules');
+    if (last < 0) return undefined;
+    const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
+    const nameSegments = segments.slice(last + 1, last + 1 + width);
+    // No package.json there (a file directly under node_modules included) means no package.
+    const directory = path.resolve(this.root, ...segments.slice(0, last + 1 + width));
+    let known = this.packageDirectories.get(directory);
+    if (known === undefined) {
+      known = readInstalledPackage(this.host, directory, nameSegments.join('/'));
+      this.packageDirectories.set(directory, known);
+    }
+    return known ?? undefined;
   }
 
   /** Typed so that nothing can be passed: `never`, or only `undefined`. */
@@ -977,15 +1123,39 @@ class DeclarationReader {
  * (`@types/scope__name` for a scoped one).
  */
 function isNamedPackage(specifier: string, packageName: string | undefined): boolean {
-  const segments = specifier.split('/');
-  const named = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
+  const named = packageNameOf(specifier);
   const types = `@types/${named.startsWith('@') ? named.slice(1).replace('/', '__') : named}`;
   return packageName === named || packageName === types;
 }
 
-/** A file under a `node_modules` directory: installed, not the service's own. */
-function isInstalledFile(fileName: string): boolean {
-  return /[\\/]node_modules[\\/]/.test(fileName);
+/** The package a specifier names: `@scope/name` or `name`, without a subpath. */
+function packageNameOf(specifier: string): string {
+  const segments = specifier.split('/');
+  return specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
+}
+
+/** A package directory under `node_modules`: the name it is installed as, and the name its package.json gives. */
+interface InstalledPackage {
+  directoryName: string;
+  packageName: string | undefined;
+}
+
+function readInstalledPackage(
+  host: ts.ModuleResolutionHost,
+  directory: string,
+  directoryName: string
+): InstalledPackage | null {
+  const manifest = path.join(directory, 'package.json');
+  if (!host.fileExists(manifest)) return null;
+  let packageName: string | undefined;
+  try {
+    const parsed: unknown = JSON.parse(host.readFile(manifest) ?? '');
+    const name = (parsed as { name?: unknown } | null)?.name;
+    if (typeof name === 'string') packageName = name;
+  } catch {
+    // An unreadable manifest still marks an installed directory; it names no package.
+  }
+  return { directoryName, packageName };
 }
 
 function isNullish(type: ts.Type): boolean {
