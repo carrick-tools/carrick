@@ -6464,6 +6464,22 @@ impl FileOrchestrator {
         }
     }
 
+    /// [`Self::settle_dispatch`] for a row the source states: the field is
+    /// still the model's reading, and the value is the body's literal or
+    /// nothing. The model's value is never kept, because on a fact it would
+    /// be a guess stated as what the source sends.
+    fn stated_dispatch(
+        body_literals: &BTreeMap<String, String>,
+        stated: Option<crate::dispatch::Dispatch>,
+    ) -> Option<crate::dispatch::Dispatch> {
+        let dispatch = stated?;
+        if dispatch.location != crate::dispatch::DispatchLocation::Body {
+            return None;
+        }
+        let value = body_literals.get(&dispatch.field)?.clone();
+        Some(crate::dispatch::Dispatch { value, ..dispatch })
+    }
+
     /// Drop the model's row at every call site whose callee provably sends
     /// nothing (carrick#1555): the summary composed every call the callee
     /// makes and found no request. A model row there is the model reading a
@@ -7437,8 +7453,17 @@ impl FileOrchestrator {
         // answer here lost the only statement of it there was. Where the
         // row's own body writes the field the model names, the body's literal
         // is the value (carrick#1555).
+        //
+        // A row the request summaries state is a fact, and a fact carries no
+        // value the source does not write: where its body does not state the
+        // field, it carries no dispatch at all (carrick#1564 review, finding
+        // 9). Every other row keeps the model's value there (carrick#1584).
         deterministic.dispatch =
-            Self::settle_dispatch(&deterministic.body_literals, model.dispatch);
+            if deterministic.resolution_source == Some(ResolutionSource::RequestSummary) {
+                Self::stated_dispatch(&deterministic.body_literals, model.dispatch)
+            } else {
+                Self::settle_dispatch(&deterministic.body_literals, model.dispatch)
+            };
     }
 
     /// Apply a statement that is not a row of its own to the model row at its
@@ -8297,8 +8322,12 @@ impl FileOrchestrator {
                 continue;
             };
             for data_call in &mut result.data_calls {
+                // A row the summaries state carries only the value its own
+                // body writes (carrick#1564 review, finding 9); a wrapper's
+                // model value is not that.
                 if data_call.call_expression_span_start != Some(span)
                     || data_call.dispatch.is_some()
+                    || data_call.resolution_source == Some(ResolutionSource::RequestSummary)
                 {
                     continue;
                 }

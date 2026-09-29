@@ -23,6 +23,11 @@ shape was first reported (cloud#386, carrick#588, carrick#872):
   follow a construction, so it never proves the method sends nothing.
 - `src/negatives.ts` holds calls shaped like requests that are not: a `get`
   on a `Map`, and a route registration.
+- `findSimilar` writes its `action` BEFORE spreading the caller's params
+  into the body, and `refresh` writes it AFTER. A spread of a value whose
+  keys the source does not state may overwrite anything written before it,
+  so only the second action is one the source states (carrick#1564 review,
+  finding 1).
 
 ## The cassette
 
@@ -38,15 +43,16 @@ one the source writes.
 | site | row |
 |---|---|
 | `api-client.ts:93` | `POST /types/check-or-upload {action=search-by-intent}` |
-| `api-client.ts:103` | `POST /types/check-or-upload {action=find-similar}` |
+| `api-client.ts:103` | `POST /types/check-or-upload`, no action: the params spread after it may set one |
 | `api-client.ts:113` | `POST /types/check-or-upload {action=analysis-job-status}` |
 | `api-client.ts:129` | `POST /types/check-or-upload`, no action: the body is the caller's |
 | `api-client.ts:147` | `POST /types/check-or-upload {action=get-cross-repo-data}` |
 | `api-client.ts:163` | none: a presigned URL the source does not state |
+| `api-client.ts:171` | `POST /types/check-or-upload {action=refresh}`: written after the spread |
 | `tools/graph.ts:4` | `POST … {action=get-cross-repo-data}` |
 | `tools/check-compat.ts:4` | `POST … {action=get-cross-repo-data}` |
 | `tools/services.ts:4` | `POST … {action=get-cross-repo-data}` (two delegations) |
-| `tools/find-similar.ts:4` | `POST … {action=find-similar}` |
+| `tools/find-similar.ts:4` | `POST …`, no action: the request line states none, and the model's `findSimilar` is never kept on a row the source states |
 | `tools/projects.ts:4` | `POST … {action=list-projects}` (body through the helper) |
 | `tools/lookup.ts:6` | `POST … {action=search-by-intent}` (no candidate) |
 | `server.ts:9` | `POST … {action=analysis-job-status}` (inside a lambda) |

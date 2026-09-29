@@ -94,9 +94,19 @@ fn assert_gateway_row(calls: &[serde_json::Value], file: &str, line: i64, action
 fn the_clients_own_requests_are_stated_through_the_field_that_holds_the_url() {
     let calls = calls();
     assert_gateway_row(&calls, "api-client.ts", 93, Some("search-by-intent"));
-    assert_gateway_row(&calls, "api-client.ts", 103, Some("find-similar"));
     assert_gateway_row(&calls, "api-client.ts", 113, Some("analysis-job-status"));
     assert_gateway_row(&calls, "api-client.ts", 147, Some("get-cross-repo-data"));
+}
+
+/// A key written before a spread of the caller's params is one the params may
+/// overwrite, so the source does not state it; written after, it does
+/// (carrick#1564 review, finding 1). The route and the method stay facts
+/// either way.
+#[test]
+fn an_action_the_params_spread_may_overwrite_is_not_stated() {
+    let calls = calls();
+    assert_gateway_row(&calls, "api-client.ts", 103, None);
+    assert_gateway_row(&calls, "api-client.ts", 171, Some("refresh"));
 }
 
 #[test]
@@ -132,8 +142,15 @@ fn an_invented_action_is_replaced_by_the_literal_the_body_writes() {
     let calls = calls();
     // `findService` -> `getAllRepoData` -> the cache -> `fetchCrossRepoData`.
     assert_gateway_row(&calls, "tools/services.ts", 4, Some("get-cross-repo-data"));
-    assert_gateway_row(&calls, "tools/find-similar.ts", 4, Some("find-similar"));
     assert_gateway_row(&calls, "server.ts", 13, Some("get-cross-repo-data"));
+}
+
+/// Where the request line states no action, the row the source states
+/// carries none: the model's invented `findSimilar` is never kept on it
+/// (carrick#1564 review, finding 9).
+#[test]
+fn a_fact_row_never_carries_the_models_action() {
+    assert_gateway_row(&calls(), "tools/find-similar.ts", 4, None);
 }
 
 #[test]

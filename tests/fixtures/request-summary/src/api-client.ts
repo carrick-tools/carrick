@@ -165,4 +165,13 @@ export class ApiClient {
     }
     return { data: body.repos, digest: body.digest };
   }
+
+  /** Refreshes the index. The caller's options ride first; the action last. */
+  async refresh(params: { force?: boolean }): Promise<void> {
+    await fetch(this.lambdaUrl, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ ...params, action: "refresh" }),
+    });
+  }
 }
