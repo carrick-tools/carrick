@@ -34,7 +34,6 @@ import {
   summaryLine,
   nextLines,
   nextBlock,
-  wrapped,
   connectItem,
   writesLine,
   parseArgs,
@@ -63,7 +62,7 @@ import {
   REREADING,
   STEP_LABEL,
 } from "../src/init/hosted.ts";
-import type { NativeRun } from "../src/init/hosted.ts";
+import type { MissingCommit, NativeRun } from "../src/init/hosted.ts";
 import type { RunningScan, StatusResult, StatusService } from "../src/contract.ts";
 import {
   chosenNumbers,
@@ -71,6 +70,7 @@ import {
   interactiveOutput,
   plainOutput,
   PromptCancelled,
+  wrapped,
   type Choice,
   type InitOutput,
 } from "../src/init/output.ts";
@@ -152,6 +152,8 @@ function executableInitFixture(
     indexed?: boolean;
     alsoInProject?: string[];
     hostedState?: string;
+    /** The hosted row each service's status names, as `carrick status --json` writes it. */
+    hosted?: { commit: string; source?: string; uploaded_by?: string };
     refreshFails?: boolean;
     localIndex?: "absent" | "stale" | "current";
   } = {},
@@ -217,6 +219,7 @@ if (indexed && argv[0] === "status") {
     indexed_at: "2026-09-12T00:00:00Z", routes: 3, calls: 2,
     changed_since_index: name === "api" ? changed : 0,
     hosted_state: state,
+    hosted: ${JSON.stringify(workspace.hosted ?? null)},
   });
   const state = ${JSON.stringify(workspace.hostedState ?? "enriched")};
   process.stdout.write(JSON.stringify({
@@ -1055,7 +1058,7 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.equal(result.status, 0, result.stderr);
       // The project is stated once, on the one line that says what is set up
       // (carrick#1026, carrick#1489), and the verdict line is gone.
-      assert.match(result.stdout, /^◇ payments: repo$/m);
+      assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
       assert.doesNotMatch(result.stdout, /Verified 1 repo in project|Signed in as/);
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
       // A repo already in the project is not a project to look up or create.
@@ -1131,7 +1134,7 @@ test("the executable CLI creates the named project and puts the repos in it", po
     assert.ok(proposed >= 0, result.stdout);
     assert.ok(proposed < result.stdout.indexOf("Moved acme/api"), result.stdout);
     // Claimed only because resolve-repos read it back afterwards.
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     // And no browser step is asked for, because none is left.
     assert.doesNotMatch(result.stdout, /Assign the requested repos/);
     assert.doesNotMatch(result.stdout, /Setup continues/);
@@ -1271,6 +1274,34 @@ test("a hosted index older than this CLI is reported as such, and no downgrade i
   }
 });
 
+// carrick#1574. A hosted commit this clone does not have: the run names the
+// commit and the repo from the status answer's `hosted` row, and the two
+// commands that bring the rows. The Rust side proves those two commands do
+// (`hosted_enrichment_test`), and that `hosted.commit` is where the commit is.
+test("a hosted commit this clone lacks names the commit, the repo, and git fetch then carrick refresh", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    hostedState: "commit_missing",
+    hosted: { commit: "4f2a1c9000000000000000000000000000000000" },
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(
+      result.stdout.includes(
+        `▲ Hosted index not read. It was built at commit 4f2a1c9, which this clone does not have. Run \`git fetch\` in ${path.basename(fixture.repo)}, then \`carrick refresh\`. Until then .carrick/ has only this machine's scan of 2 services.`,
+      ),
+      result.stdout,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 // A read that fails is a sentence, not a crash and not a silence: the rest of
 // the setup is written either way, and the reader is told there is nothing to
 // answer from yet.
@@ -1334,7 +1365,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     assert.equal(result.status, 0, result.stderr);
 
     // The run reaches its closing line, the project and its repo.
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
 
     const onPath =
       spawnSync(process.platform === "win32" ? "where" : "which", ["carrick"], { stdio: "ignore" })
@@ -1378,7 +1409,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     assert.equal(
       result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
-        "◇ payments: repo",
+        "◇ Set up in project payments: repo",
         "▲ Codex asks you to trust the Carrick hooks the next time it starts; until you do, they do not run.",
         "",
         "Next: paste this into a new agent session",
@@ -1685,7 +1716,7 @@ test("the executable CLI resolves an ssh host alias and verifies the repo", posi
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -1739,7 +1770,7 @@ test("the executable CLI takes --repo for the identity a remote could not give",
     );
     assert.equal(result.status, 0, result.stderr);
     assert.ok(result.stdout.includes(`◇ acme/api taken as the GitHub repository for ${fixture.repo}`), result.stdout);
-    assert.match(result.stdout, /^◇ payments: repo$/m);
+    assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -2248,10 +2279,9 @@ for (const claims of ["adopts", "before-1359"] as const) {
       }
       // No line of its own for the create: the list said it (carrick#1512).
       assert.doesNotMatch(said, /Created project/);
-      // Part 4: one line for what is set up — the project and its repos, as
-      // David's mock has it — the to-dos, then the prompt; part 5: the
-      // install leads it.
-      assert.ok(out.lines.includes("◇ Acme (acme): acme-api"), said);
+      // Part 4: one line for what is set up — the project and its repos —
+      // the to-dos, then the prompt; part 5: the install leads it.
+      assert.ok(out.lines.includes("◇ Set up in project Acme (acme): acme-api"), said);
       assert.equal(
         out.lines.at(-1),
         [
@@ -2359,7 +2389,7 @@ test("the interactive step stops the spinner on the marker its work earned", asy
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => line.length > 0 && line !== "│");
   assert.deepEqual(lines, [
-    "▲ .carrick/ holds 3 services as this machine read them; the hosted rows could not be replayed onto this checkout",
+    "▲ The hosted rows could not be replayed onto this checkout. Run `carrick status` to see why. Until then .carrick/ has only this machine's scan of 3 services.",
     "◇ Hosted index for 2 services read into .carrick/",
   ]);
   // The label is the spinner's while it spins, and nothing once it stops.
@@ -2444,9 +2474,55 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
   assert.match(older.text, /run `carrick index --detach` once from main/);
   // And never a downgrade: `CACHE_VERSION` moves most weeks (carrick#1012).
   assert.doesNotMatch(older.text, /npm i -g carrick@/);
-  const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing", reread: true });
+  // The failure first, then the commands that move it, then what .carrick/
+  // holds meanwhile. `git fetch` alone moves nothing: the next init finds the
+  // same record, so the refresh is named with it, and the repo is named
+  // because a folder of repos is not itself one (carrick#1574).
+  const missing = (entries: MissingCommit[], reread = true) =>
+    hostedReport({ kind: "local_only", services: entries.length === 1 ? 1 : 3, state: "commit_missing", reread, missing: entries });
+  const local = missing([{ repo: "orders", commit: "abc1234", laptop: null }]);
   assert.equal(local.kind, "warn");
-  assert.match(local.text, /\.carrick\/ holds 3 services as this machine read them; the commit/);
+  assert.equal(
+    local.text,
+    "Hosted index not read. It was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: null }], false).text,
+    "Hosted index not read. It was built at commit abc1234, which this clone does not have. Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service; nothing was re-read.",
+  );
+  // A laptop row can be at a commit nobody pushed, and a fetch finds nothing
+  // until it is: the sentence says so rather than sending the reader to fetch
+  // for ever.
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: "ihor" }]).text,
+    "Hosted index not read. It was built by a laptop scan from @ihor at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([{ repo: "orders", commit: "abc1234", laptop: "" }]).text,
+    "Hosted index not read. It was built by a laptop scan at commit abc1234, which this clone does not have. Once that commit is pushed, run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    missing([
+      { repo: "orders", commit: "abc1234", laptop: null },
+      { repo: "billing", commit: "def5678", laptop: null },
+    ]).text,
+    "Hosted index not read. It was built at commits these clones do not have (orders at abc1234, billing at def5678). Run `git fetch` in each, then `carrick refresh`. Until then .carrick/ has only this machine's scan of 3 services.",
+  );
+  // The other states keep their reason, in the same order, and a state
+  // with a command attached names it.
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 1, state: "read_failed", reread: true }).text,
+    "The hosted rows could not be replayed onto this checkout. Run `carrick status` to see why. Until then .carrick/ has only this machine's scan of 1 service.",
+  );
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 2, state: "not_connected", reread: true }).text,
+    "These repos are not connected to a Carrick project. For now .carrick/ has only this machine's scan of 2 services.",
+  );
+  // No state's tag reaches the terminal.
+  assert.equal(
+    hostedReport({ kind: "local_only", services: 1, state: "unknown", reread: true }).text,
+    "The hosted rows were not replayed. For now .carrick/ has only this machine's scan of 1 service.",
+  );
   // The state this run can cause itself: a repo it just connected under a name
   // the scanner cannot read back off the git remote (carrick#1056). The clause
   // has to name the remote as the reason, not the connection.
@@ -2713,12 +2789,14 @@ test("the installs a first scan would refuse over lead the agent's instruction",
 // carrick#1489 part 4: nine blocks closed a first run. What is set up is one
 // line; what is left to do is a line each, and only when there is something.
 test("what is set up is one line: the project and the repos in it", () => {
-  // The line David's mock settled on (carrick#1512), in folder order.
-  assert.equal(summaryLine("Shop (shop)", ["shop-app", "shop-api"]), "Shop (shop): shop-api, shop-app");
-  assert.equal(summaryLine(null, ["shop-app"]), "No project: shop-app");
+  // In folder order, and saying what it reports: a bare "Shop (shop): api"
+  // left the reader to guess (carrick#1574).
+  assert.equal(summaryLine("Shop (shop)", ["shop-app", "shop-api"]), "Set up in project Shop (shop): shop-api, shop-app");
+  assert.equal(summaryLine(null, ["shop-app"]), "Set up with no project: shop-app");
+  assert.equal(summaryLine(null, []), "Set up with no project");
   assert.equal(
     summaryLine("Shop (shop)", Array.from({ length: 12 }, (_, index) => `repo-${String(index).padStart(2, "0")}`)),
-    "Shop (shop): repo-00, repo-01, repo-02, repo-03, repo-04, repo-05, repo-06, repo-07, repo-08, repo-09 and 2 more",
+    "Set up in project Shop (shop): repo-00, repo-01, repo-02, repo-03, repo-04, repo-05, repo-06, repo-07, repo-08, repo-09 and 2 more",
   );
 });
 // What the step says while the download runs. Minutes of silence on a line
@@ -2858,13 +2936,21 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
   assert.deepEqual(owed.map((entry) => entry.name), ["acme/web", "acme/jobs", "acme/docs", "acme/site"]);
   assert.deepEqual(reposToScaffold([repos[0]!], (target) => present.has(target)), []);
 
+  // The owner/repo is the value of `repo`, so it is said once (carrick#1574).
   assert.equal(
     scaffoldSentence([repos[1]!]),
-    "Run the carrick scaffold tool for acme/web, passing its owner/repo as `repo`, and follow what it returns.",
+    "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
   );
+  // Several repos: carrick-cloud#1404 moves this to one `repos` call.
   assert.equal(
     scaffoldSentence(owed),
     "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
+  );
+  // A repo known here only by its folder: the agent still has to find the
+  // owner/repo, and the sentence still asks it to.
+  assert.equal(
+    scaffoldSentence([{ path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
+    "Run the carrick scaffold tool for local, passing its owner/repo as `repo`, and follow what it returns.",
   );
 });
 
@@ -3206,7 +3292,7 @@ test("inside one repo, init asks which repos beside it belong with it, and a yes
     );
     // No line for the create; the closing line is the project and its repos.
     assert.doesNotMatch(said, /Created project/);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), said);
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), said);
     // Not told to run it again anywhere.
     assert.doesNotMatch(said, /Run carrick init \.\.|parent folder/);
     // Nothing was created before the answer: the create is the first write.
@@ -3408,7 +3494,7 @@ test("inside a repo the folder above already set up, init sets up the folder aga
     assert.equal(out.questions[0]!.question, "Which repos should Carrick index?");
     assert.ok(!out.questions.some((entry) => entry.question.includes("same system")));
     assert.equal(fs.existsSync(path.join(fixture.app, ".carrick")), false);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), out.lines.join("\n"));
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), out.lines.join("\n"));
   } finally {
     fixture.restore();
   }
@@ -3481,7 +3567,7 @@ test("a repo with no GitHub remote is named in no project line", posixNativeFixt
     );
     assert.ok(out.questions.some((entry) => entry.question === "Which project should shop-app and shop-api be in?"), said);
     assert.ok(said.includes("  Create project Shop with shop-app and shop-api\n"), said);
-    assert.ok(out.lines.includes("◇ Shop (shop): shop-api, shop-app"), said);
+    assert.ok(out.lines.includes("◇ Set up in project Shop (shop): shop-api, shop-app"), said);
   } finally {
     fixture.restore();
   }

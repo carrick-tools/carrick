@@ -49,11 +49,11 @@ const [command, ...rest] = argv;
  * The commands that say nothing about the state of the install (carrick#1333).
  *
  * `hook` and `lsp` are protocol channels — a line of prose on either is a line
- * an agent reads as data — and `init`, `doctor` and `remove` are the commands
- * that write, audit and undo the very files the notice would be about, so each
- * of them says it better in its own words.
+ * an agent reads as data — and `init`, `doctor`, `remove` and `uninstall` are
+ * the commands that write, audit and undo the very files the notice would be
+ * about, so each of them says it better in its own words.
  */
-const NO_NOTICE = new Set(["hook", "lsp", "init", "doctor", "remove"]);
+const NO_NOTICE = new Set(["hook", "lsp", "init", "doctor", "remove", "uninstall"]);
 
 /**
  * One line a day, on stderr, naming what an upgrade left behind here.
@@ -268,10 +268,12 @@ async function printVersion() {
  * spawned for that text and answers none of these names, so its groups are
  * repeated here as headings instead of being interleaved (carrick#976).
  *
- * `init` is named in the binary's own WORKSPACE block instead of here: it is
- * where the first run starts, and a help text a reader stops part-way through
- * must not be the reason they never find it (carrick#997 item 5). Its
- * arguments are still this package's.
+ * `init`, `doctor`, `remove` and `uninstall` are named in the binary's own
+ * WORKSPACE block instead of here: `init` is where the first run starts, and a
+ * help text a reader stops part-way through must not be the reason they never
+ * find it (carrick#997 item 5). `doctor` and `remove` shipped named only in a
+ * sentence under this block, where nobody looking for them found them
+ * (carrick#1572). Their arguments are still this package's.
  */
 function extraHelp() {
   return [
@@ -302,9 +304,7 @@ function extraHelp() {
     "                                 background; it never installs anything.",
     "",
     "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
-    "prints its own arguments. `carrick doctor` re-checks that setup and exits",
-    "non-zero on anything it finds. `carrick remove` undoes what init wrote on",
-    "this machine and lists the files the scaffold added to the repository.",
+    "prints its own arguments.",
     "",
   ].join("\n");
 }
@@ -340,12 +340,17 @@ switch (command) {
     const { init } = await import("../dist/init/run.js");
     process.exit(await init(rest));
   }
-  // Named here rather than left to the binary: `remove` is this package's own
-  // command, and the binary reads a name it does not know as a path to scan
-  // (carrick#981).
+  // Named here rather than left to the binary: `remove` and `uninstall` are
+  // this package's own commands, and the binary reads a name it does not know
+  // as a path to scan (carrick#981). `remove` acts on one folder, `uninstall`
+  // on this machine (carrick#1573).
   case "remove": {
     const { remove } = await import("../dist/init/remove.js");
     process.exit(await remove(rest));
+  }
+  case "uninstall": {
+    const { uninstall } = await import("../dist/init/remove.js");
+    process.exit(await uninstall(rest));
   }
   // Also this package's own: the hook, MCP and workflow halves of the check
   // are things this package wrote, and the binary answers for the rest of it

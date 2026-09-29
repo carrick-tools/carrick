@@ -62,7 +62,17 @@ import { findCarrick, offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
 import { excludedRepos, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
-import { createOutput, DOCS_EDITOR, DOCS_INDEX, DOCS_INIT_FILES, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
+import {
+  createOutput,
+  DOCS_EDITOR,
+  DOCS_INDEX,
+  DOCS_INIT_FILES,
+  listBlock,
+  PromptCancelled,
+  tilde,
+  type Choice,
+  type InitOutput,
+} from "./output.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 
 /**
@@ -96,11 +106,19 @@ export function reposToScaffold(
  * the scan — on a repo CI already indexes, which is the row the whole
  * workspace reads (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
  * So the names are in the sentence, one call per repo.
+ *
+ * One repo whose owner/repo is known is the value of `repo`, said once; the
+ * sentence used to name it and then ask for it again (carrick#1574). A repo
+ * known here only by its folder still needs the agent to find its owner/repo.
+ * The several-repo sentence is carrick-cloud#1404's: the tool now takes them
+ * all in one `repos` call.
  */
 export function scaffoldSentence(repos: RepoIdentity[]): string {
   const names = repos.map((repo) => repo.name ?? path.basename(repo.path));
   if (names.length === 1) {
-    return `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
+    return repos[0]?.name
+      ? `Run the carrick scaffold tool with \`repo\` set to ${names[0]}, and follow what it returns.`
+      : `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
   }
   const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
   return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
@@ -338,16 +356,17 @@ function listed(items: string[], cap: number): string {
  * The one line that says what is set up: the project and the repos in it
  * from this run (carrick#1489, carrick#1512).
  *
- * The line David's mock settled on. What was written was the list the reader
- * said yes to, and a hook file that could not be written has its own line, so
- * what is left to say is where the repos are. Only repos with a GitHub remote
- * are named: a repo with none is in no project.
+ * What was written was the list the reader said yes to, and a hook file that
+ * could not be written has its own line, so what is left to say is where the
+ * repos are. Only repos with a GitHub remote are named: a repo with none is in
+ * no project. The line says what it reports: a bare "Shop (shop): api" did
+ * not (carrick#1574).
  */
 export function summaryLine(project: string | null, repos: string[]): string {
   const sorted = [...repos].sort();
   const names = sorted.length > 10 ? `${sorted.slice(0, 10).join(", ")} and ${sorted.length - 10} more` : sorted.join(", ");
-  if (project === null) return repos.length === 0 ? "No project" : `No project: ${names}`;
-  return repos.length === 0 ? project : `${project}: ${names}`;
+  const where = project === null ? "Set up with no project" : `Set up in project ${project}`;
+  return repos.length === 0 ? where : `${where}: ${names}`;
 }
 
 /**
@@ -379,12 +398,6 @@ export function installSentence(commands: string[], to: "agent" | "reader"): str
   return to === "agent"
     ? `First install dependencies: run ${listed(commands, 5)}.`
     : `Dependencies are not installed. Run ${listed(commands, 5)} before the next scan.`;
-}
-
-/** A path as a reader types it, with the home directory as `~`. */
-export function tilde(target: string, home: string = os.homedir()): string {
-  if (target === home) return "~";
-  return target.startsWith(`${home}${path.sep}`) ? `~${target.slice(home.length)}` : target;
 }
 
 /**
@@ -421,31 +434,9 @@ export function writesLine(options: {
   return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
 }
 
-/** The width a line of the "Next:" list wraps at, inside the gutter. */
-export const NEXT_WIDTH = 68;
-
-/**
- * One line of the list, broken between words so that it stays inside the
- * terminal's gutter: a line the terminal wraps for itself runs back to the
- * first column, under the gutter, which is what the smoke run showed
- * (carrick#1512).
- */
-export function wrapped(text: string, width: number = NEXT_WIDTH): string[] {
-  const lines: string[] = [];
-  let current = "";
-  for (const word of text.split(" ")) {
-    if (current !== "" && current.length + 1 + word.length > width) {
-      lines.push(current);
-      current = word;
-    } else current = current === "" ? word : `${current} ${word}`;
-  }
-  if (current !== "") lines.push(current);
-  return lines;
-}
-
-/** The list as it is printed: a heading, and each line indented and wrapped. */
+/** The list "Go ahead?" is asked about, under its heading. */
 export function nextBlock(lines: string[]): string {
-  return ["Next:", ...lines.flatMap((line) => wrapped(line).map((part) => `  ${part}`))].join("\n");
+  return listBlock("Next:", lines);
 }
 
 /**
@@ -1006,8 +997,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     }
     if (missingIdentities.length > 0) {
       const one = missingIdentities.length === 1;
+      // The ssh fix is said as the one it is: "the alias" named nothing for a
+      // repo with no remote at all (carrick#1574).
       out.warn(
-        `Carrick has nothing to connect ${one ? "it" : "them"} to. Run carrick init --repo owner/repo${one ? "" : " in each of them"}, or give the alias a HostName github.com line in your ssh config.`,
+        `Carrick has nothing to connect ${one ? "it" : "them"} to. Run carrick init --repo owner/repo${one ? "" : " in each of them"}, or, for an origin on an ssh alias, give that alias a HostName github.com line in your ssh config.`,
       );
     }
     if (parsed.project && missingIdentities.length > 0) {
@@ -1089,7 +1082,9 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     const warnings = plan.repos.flatMap((repo) => repo.warnings);
     for (const warning of warnings.slice(0, 3)) out.warn(warning);
     if (warnings.length > 3) out.warn(`${warnings.length - 3} more notes on the proposal are in ${PROPOSAL_FILE}.`);
-    for (const missing of plan.missing) out.warn(`Missing workspace override: ${missing}`);
+    // What the scanner's `missing` holds, in the reader's terms: a path the
+    // workspace file lists that is not here (carrick#1574).
+    for (const missing of plan.missing) out.warn(`${WORKSPACE_FILE} lists ${missing}, which is not a directory on this machine.`);
     // Which editors get an entry, asked before the yes that covers it. The
     // files are outside the workspace and belong to editors this reader may not
     // use, and they used to be written on the strength of a yes to the proposal

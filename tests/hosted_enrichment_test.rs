@@ -225,6 +225,15 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         Some("another-workspace-token"),
     );
     assert_eq!(wrong_account["error"], "index_unreadable");
+    // The free re-read is the fix, and the switch below proves it: `carrick
+    // index` is the model scan that uploads (carrick#1574).
+    assert!(
+        wrong_account["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("Run carrick login, then carrick refresh."),
+        "{wrong_account:#}"
+    );
     let signed_out = run(root, &["status", "--workspace", ".", "--json"], None);
     assert_eq!(signed_out["error"], "index_unreadable");
     let replayed = blobs(root).remove(0);
@@ -384,6 +393,145 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         check(root, "orders/app.ts")["hosted_state"],
         "not_signed_in"
     );
+}
+
+/// A clone that does not hold the commit the hosted index was built at gets
+/// none of its rows, and the sentence that says so names the two commands that
+/// bring them: `git fetch` in the repo, then `carrick refresh` (carrick#1574).
+///
+/// `carrick init` again is not one of them. Init reads the recorded hosted
+/// state and skips the re-read when the tree has not moved (`localIndexState`
+/// in `npm/carrick/src/init/hosted.ts`), and a fetch moves no file of the
+/// tree, so a second init answers from the same record. Init's own line is
+/// pinned by `npm/carrick/test/init.test.ts` from the status fields asserted
+/// here.
+#[test]
+fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    // What origin holds, outside the workspace: the clone below starts one
+    // commit behind it, and the hosted index is built at the newer commit.
+    let remote = tempfile::tempdir().unwrap();
+    let upstream = remote.path().join("orders");
+    std::fs::create_dir(&upstream).unwrap();
+    let source = "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\n";
+    std::fs::write(upstream.join("app.ts"), source).unwrap();
+    std::fs::write(
+        upstream.join("package.json"),
+        r#"{"name":"orders","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        upstream.join("carrick.json"),
+        r#"{"service_name":"orders","include":["."]}"#,
+    )
+    .unwrap();
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    git(&upstream, &["config", "user.email", "fixture@carrick.test"]);
+    git(&upstream, &["config", "user.name", "fixture"]);
+    git(&upstream, &["add", "."]);
+    git(&upstream, &["commit", "-qm", "first"]);
+    let repo = root.join("orders");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            upstream.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    let url = "https://github.com/example/orders.git";
+    git(&repo, &["remote", "set-url", "origin", url]);
+    // The commit the hosted index is built at touches no source file, so every
+    // row it holds for `app.ts` applies to this clone once the commit is here.
+    std::fs::write(upstream.join("README.md"), "orders\n").unwrap();
+    git(&upstream, &["add", "README.md"]);
+    git(&upstream, &["commit", "-qm", "second"]);
+    let hosted_commit = git(&upstream, &["rev-parse", "HEAD"]);
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        r#"{"repos":["orders"]}"#,
+    )
+    .unwrap();
+    run(root, &["refresh", "--workspace", "."], None);
+    let mut hosted = blobs(root).remove(0);
+    hosted["commit_hash"] = json!(hosted_commit);
+    let start = source.find("app.get(").unwrap() + 1;
+    let end = start + "app.get(\"/hosted\", handler)".len();
+    hosted["file_results"] = json!({"app.ts":{"mounts":[],"data_calls":[],"endpoints":[{
+        "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET","path":"/hosted",
+        "handler_name":"handler","pattern_matched":"fixture","call_expression_span_start":start,"call_expression_span_end":end,
+        "resolution_source":"model"
+    }]}});
+    snapshot(root, "orders", &[hosted]);
+    let replayed = |answer: &Value| {
+        answer["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == "/hosted" && r["source"] == "candidate")
+    };
+
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+    let missing = check(root, "orders/app.ts");
+    assert_eq!(missing["hosted_state"], "commit_missing", "{missing:#}");
+    assert!(!replayed(&missing), "{missing:#}");
+    let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
+    let note = status["services"][0]["boundary_note"].as_str().unwrap();
+    let short = &hosted_commit[..7];
+    assert!(
+        note.contains(&format!(
+            "hosted index at {short}, which this clone does not have; candidates not replayed. \
+             Run `git fetch` in orders, then `carrick refresh`."
+        )),
+        "{note}"
+    );
+    // What `carrick init` builds its line from (`missingCommits` in the npm
+    // CLI): the full commit on the service's `hosted` row, the repo path, and
+    // no `source`, because the row stands for one written before the field.
+    let service = &status["services"][0];
+    assert_eq!(service["hosted"]["commit"], hosted_commit.as_str());
+    assert!(service["hosted"].get("source").is_none(), "{service:#}");
+    assert!(
+        service["repo"].as_str().unwrap().ends_with("orders"),
+        "{service:#}"
+    );
+
+    // The fetch the sentence names, from the remote `origin` names. Only the
+    // transport is redirected to the directory above; the remote itself stays
+    // the owner/repo URL the hosted index is asked about.
+    git(
+        &repo,
+        &[
+            "-c",
+            &format!("url.{}.insteadOf={url}", upstream.display()),
+            "fetch",
+            "-q",
+        ],
+    );
+    assert_eq!(git(&repo, &["remote", "get-url", "origin"]), url);
+    // A fetch moves no file of the tree: the working copy is still the older
+    // commit, which is what makes this the next command and not a re-scan of
+    // changed files.
+    assert_ne!(git(&repo, &["rev-parse", "HEAD"]), hosted_commit);
+    // Fetched, and not read yet: the state is the one the last refresh
+    // recorded and the tree has not moved, so `carrick init` again finds the
+    // index current and prints the same line, which still names the read that
+    // is owed.
+    let fetched_only = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
+    assert_eq!(
+        fetched_only["services"][0]["hosted_state"],
+        "commit_missing"
+    );
+    assert_eq!(fetched_only["services"][0]["changed_since_index"], 0);
+    assert_eq!(fetched_only["services"][0]["boundary_note"], note);
+
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+    let fetched = check(root, "orders/app.ts");
+    assert_eq!(fetched["hosted_state"], "enriched", "{fetched:#}");
+    assert_eq!(fetched["hosted"]["commit"], hosted_commit.as_str());
+    assert!(replayed(&fetched), "{fetched:#}");
 }
 
 fn copy_tree(from: &Path, to: &Path) {

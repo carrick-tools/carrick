@@ -35,6 +35,8 @@
 // `◇`, `error` is `▲`, `cancel` is `■` — so the work's report goes to `step`
 // and the spinner stops as whatever the work turned out to be (carrick#1032).
 
+import os from "node:os";
+import path from "node:path";
 import readline from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import * as clack from "@clack/prompts";
@@ -46,7 +48,7 @@ export const WARN = "▲";
 export const REFUSE = "■";
 
 export const DOCS = "https://docs.carrick.tools/quickstart";
-/** What `init` writes on this machine, file by file: the page `doctor` and `remove` point at. */
+/** What `init` writes on this machine, file by file: the page `doctor`, `remove` and `uninstall` point at. */
 export const DOCS_INIT_FILES = "https://docs.carrick.tools/cli#workspace-initialisation";
 export const DOCS_INDEX = "https://docs.carrick.tools/building-the-index";
 export const DOCS_EDITOR = "https://docs.carrick.tools/editor";
@@ -67,6 +69,43 @@ export class PromptCancelled extends Error {
     super("cancelled");
     this.name = "PromptCancelled";
   }
+}
+
+/** A path as a reader types it, with the home directory as `~`. */
+export function tilde(target: string, home: string = os.homedir()): string {
+  if (target === home) return "~";
+  return target.startsWith(`${home}${path.sep}`) ? `~${target.slice(home.length)}` : target;
+}
+
+/** The width a line of a listed block wraps at, inside the gutter. */
+export const NEXT_WIDTH = 68;
+
+/**
+ * One line of the list, broken between words so that it stays inside the
+ * terminal's gutter: a line the terminal wraps for itself runs back to the
+ * first column, under the gutter, which is what the smoke run showed
+ * (carrick#1512).
+ */
+export function wrapped(text: string, width: number = NEXT_WIDTH): string[] {
+  const lines: string[] = [];
+  let current = "";
+  for (const word of text.split(" ")) {
+    if (current !== "" && current.length + 1 + word.length > width) {
+      lines.push(current);
+      current = word;
+    } else current = current === "" ? word : `${current} ${word}`;
+  }
+  if (current !== "") lines.push(current);
+  return lines;
+}
+
+/**
+ * A list as it is printed before a question about all of it: a heading, and
+ * each line indented and wrapped. `init`'s "Next:" and the lists `remove` and
+ * `uninstall` print before they ask (carrick#1573) are this one shape.
+ */
+export function listBlock(heading: string, lines: string[]): string {
+  return [heading, ...lines.flatMap((line) => wrapped(line).map((part) => `  ${part}`))].join("\n");
 }
 
 /** One row of a `choose`: what it is called, and what it is worth knowing. */

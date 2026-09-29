@@ -39,7 +39,7 @@ export async function signIn(
  * The browser page used to say "Next, run carrick init" to everyone, which was
  * wrong under init itself and on every login after the first (carrick#1511).
  * The terminal knows which it is: `carrick init` writes this machine's install
- * id and `carrick remove` deletes it, so a machine without one has never been
+ * id and `carrick uninstall` deletes it, so a machine without one has never been
  * set up, and that is the only login with a step left.
  */
 export function loginNextStep(installId: string | null = readInstallId()): string | null {

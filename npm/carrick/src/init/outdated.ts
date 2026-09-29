@@ -258,7 +258,7 @@ function today(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
-/** Delete the throttle file, as `carrick remove` does. True when there was one. */
+/** Delete the throttle file, as `carrick uninstall` does. True when there was one. */
 export function removeNotice(home?: string): boolean {
   try {
     fs.rmSync(noticeFile(home));

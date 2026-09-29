@@ -8,9 +8,11 @@
 //! (carrick#708) to carrick#976, so the test at the bottom holds this text to
 //! `local_mode::cli::LOCAL_COMMANDS`.
 
-pub const HELP: &str = r#"Carrick keeps a live, type-aware, intent-aware index of every TypeScript
-service in your GitHub org, so coding agents and editors can answer across
-repos.
+pub const HELP: &str = r#"TypeScript codebase intelligence for AI agents & IDEs.
+
+Carrick indexes TypeScript codebases across service and repository boundaries,
+so AI coding agents search existing code by intent and see every route, type,
+and consumer before writing new code.
 
 USAGE:
     carrick [OPTIONS] [REPO_PATH]   scan one repository and upload its index
@@ -25,7 +27,13 @@ WORKSPACE:
     init       Set up this folder: sign in, connect the repos, propose the
                services, and wire up your editor and agent. The command the
                first run starts with. Installed by the npm package.
-    derive     Print the repos and services a folder resolves to, writing nothing.
+    doctor     Re-check the setup init wrote, and exit non-zero on anything it
+               finds. Installed by the npm package.
+    remove     Undo what init wrote in this folder only, and list the files the
+               scaffold added to the repository. Installed by the npm package.
+    uninstall  Undo what init wrote on this machine for every folder: the MCP
+               server in each agent client, the install id and the sign-in.
+    derive    Print the repos and services a folder resolves to, writing nothing.
     index      Scan every repo in the workspace and build <workspace>/.carrick/.
                Carrick Cloud classifies what the deterministic passes could
                not, so this is the scan that builds the index, and the one a
@@ -110,10 +118,11 @@ ENVIRONMENT VARIABLES:
 /// still be able to say where they are: `init` is where the first run starts,
 /// so "unknown command" is the wrong answer for it, and a user who reached
 /// the binary directly needs the package named rather than the name denied.
-pub const PACKAGE_COMMANDS: [&str; 8] = [
+pub const PACKAGE_COMMANDS: [&str; 9] = [
     "init",
     "doctor",
     "remove",
+    "uninstall",
     "login",
     "logout",
     "lsp",
@@ -152,6 +161,61 @@ mod tests {
             .expect("`carrick init` is named in --help");
         assert!(line.trim_start().len() > "init".len() + 8, "{line}");
         assert!(PACKAGE_COMMANDS.contains(&"init"));
+    }
+
+    /// A line of a command list: four spaces, the command, then its description
+    /// after a column gap (`    login      sign in…`, `    hook stop  Claude…`).
+    /// The gap can start right after the command: `uninstall` is nine letters,
+    /// and two spaces put its description in the block's column.
+    fn lists_with_a_description(line: &str, command: &str) -> bool {
+        line.strip_prefix("    ")
+            .and_then(|line| line.strip_prefix(command))
+            .filter(|rest| rest.starts_with(' '))
+            .and_then(|rest| rest.split_once("  "))
+            .is_some_and(|(_, description)| description.trim().len() >= 8)
+    }
+
+    /// The npm package's commands are held to the rule the binary's are.
+    /// `doctor` and `remove` shipped named only in a sentence after the
+    /// environment block, and a reader looking for them in a command list did
+    /// not find them (carrick#1572). So every command the shim dispatches is in
+    /// `PACKAGE_COMMANDS`, every entry there is dispatched, and each is listed
+    /// with a description here or in the shim's own help.
+    #[test]
+    fn every_command_the_npm_package_dispatches_is_listed_with_a_description() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("npm/carrick/bin/carrick.mjs");
+        let shim = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        let dispatched: std::collections::BTreeSet<&str> = shim
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("case \"")?.split('"').next())
+            .filter(|name| !name.starts_with('-'))
+            .collect();
+        let declared: std::collections::BTreeSet<&str> = PACKAGE_COMMANDS.into_iter().collect();
+        assert_eq!(
+            dispatched, declared,
+            "the commands carrick.mjs dispatches and PACKAGE_COMMANDS disagree"
+        );
+
+        // The shim's help is an array of string literals, one line each.
+        let shim_help: Vec<&str> = shim
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim().strip_prefix('"')?;
+                line.strip_suffix("\",").or_else(|| line.strip_suffix('"'))
+            })
+            .collect();
+        for command in PACKAGE_COMMANDS {
+            assert!(
+                HELP.lines()
+                    .chain(shim_help.iter().copied())
+                    .any(|line| lists_with_a_description(line, command)),
+                "`carrick {command}` is dispatched by the npm package but not listed with a \
+                 description in --help"
+            );
+        }
     }
 
     #[test]

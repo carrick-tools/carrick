@@ -412,12 +412,13 @@ export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
 /**
  * The commands this never runs on.
  *
- * `hook` and `lsp` speak a protocol and run on every edit; `remove` is somebody
- * undoing this install, and upgrading one on the way out is the opposite of
- * what they asked for. The three argument forms are the ones that answer in
- * milliseconds and are typed to find something out, not to do work.
+ * `hook` and `lsp` speak a protocol and run on every edit; `remove` and
+ * `uninstall` are somebody undoing this install, and upgrading one on the way
+ * out is the opposite of what they asked for. The three argument forms are the
+ * ones that answer in milliseconds and are typed to find something out, not to
+ * do work.
  */
-const NO_SYNC = new Set(["hook", "lsp", "remove", "--version", "-V", "--help", "-h"]);
+const NO_SYNC = new Set(["hook", "lsp", "remove", "uninstall", "--version", "-V", "--help", "-h"]);
 
 /**
  * Whether this invocation keeps the global install level.

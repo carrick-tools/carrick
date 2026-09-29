@@ -214,21 +214,35 @@ function stripHooks(target: string): void {
 }
 
 /**
- * Undo a repo copy: the paths our exclude block names, then the block.
+ * The paths a repo copy's exclude block records, reading only.
  *
  * Null where the repo holds no block, which is every repo init never copied
- * into, and every folder that is not a repository of its own. A folder emptied
- * on the way goes too, and so does an exclude file that held nothing but the
- * block.
+ * into, and every folder that is not a repository of its own. The read half of
+ * `removeRepoCopy`, so `carrick remove` can list a copy before it asks
+ * (carrick#1573).
  */
-export function removeRepoCopy(repo: string): string[] | null {
+export function recordedRepoCopy(repo: string): { exclude: string; block: ReturnType<typeof withoutExcludeBlock>; recorded: string[] } | null {
   if (!ownRepository(repo)) return null;
   const exclude = excludeFile(repo);
   const existing = exclude === null ? null : readOrNull(exclude);
   if (exclude === null || existing === null) return null;
   const block = withoutExcludeBlock(existing);
   if (!block.found) return null;
-  const recorded = new Set(block.lines.filter((line) => line.startsWith("/")).map(fromPattern));
+  return { exclude, block, recorded: block.lines.filter((line) => line.startsWith("/")).map(fromPattern) };
+}
+
+/**
+ * Undo a repo copy: the paths our exclude block names, then the block.
+ *
+ * Null where the repo holds no block (see `recordedRepoCopy`). A folder
+ * emptied on the way goes too, and so does an exclude file that held nothing
+ * but the block.
+ */
+export function removeRepoCopy(repo: string): string[] | null {
+  const copy = recordedRepoCopy(repo);
+  if (copy === null) return null;
+  const { exclude, block } = copy;
+  const recorded = new Set(copy.recorded);
   for (const relative of [LOCAL_SETTINGS, CODEX_HOOKS_FILE]) {
     if (recorded.has(relative)) stripHooks(path.join(repo, relative));
   }

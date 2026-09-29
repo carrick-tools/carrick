@@ -1,4 +1,5 @@
-// What `carrick remove` takes off a machine, and what it refuses to touch.
+// What `carrick remove` takes out of a folder and `carrick uninstall` takes off
+// a machine, what each refuses to touch, and the typed answer each waits for.
 //
 // The two that matter are the two that can destroy something: a settings file
 // holding somebody else's hooks, and a repository holding committed files.
@@ -13,10 +14,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { mergeCarrickHooks, removeCarrickHooks, SETTINGS_FILES } from "../src/init/settings.ts";
 import {
-  parseArgs,
+  folderLines,
+  folderPlan,
+  parseRemoveArgs,
+  parseUninstallArgs,
+  removeWith,
   repoLeftovers,
   mcpRemovalLines,
   SCAFFOLD_FILES,
@@ -28,19 +34,38 @@ import { noticeFile } from "../src/init/outdated.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
 import { excludeFile, repoCopyPaths, writeRepoCopy } from "../src/init/repo-copies.ts";
+import { plainOutput } from "../src/init/output.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 /** What this machine calls itself to the index, until this command deletes it. */
 const INSTALL_ID = "11111111-2222-4333-8444-555555555555";
 
 test("remove reads its arguments", () => {
-  assert.deepEqual(parseArgs([], "/work"), { workspace: "/work", keepLogin: false });
-  assert.deepEqual(parseArgs(["--keep-login"], "/work"), { workspace: "/work", keepLogin: true });
-  assert.deepEqual(parseArgs(["repo"], "/work"), { workspace: "/work/repo", keepLogin: false });
-  assert.deepEqual(parseArgs(["-w", "/elsewhere"], "/work"), { workspace: "/elsewhere", keepLogin: false });
-  assert.match(parseArgs(["--workspace"], "/work") as string, /needs a directory/);
-  assert.match(parseArgs(["--nonsense"], "/work") as string, /unknown option/);
-  assert.match(parseArgs(["--help"], "/work") as string, /^carrick remove/);
+  assert.deepEqual(parseRemoveArgs([], "/work"), { workspace: "/work", confirm: null });
+  assert.deepEqual(parseRemoveArgs(["repo"], "/work"), { workspace: "/work/repo", confirm: null });
+  assert.deepEqual(parseRemoveArgs(["-w", "/elsewhere"], "/work"), { workspace: "/elsewhere", confirm: null });
+  assert.deepEqual(parseRemoveArgs(["--confirm", "work"], "/work"), { workspace: "/work", confirm: "work" });
+  assert.match(parseRemoveArgs(["--workspace"], "/work") as string, /needs a directory/);
+  assert.match(parseRemoveArgs(["--confirm"], "/work") as string, /needs this folder's name/);
+  // The machine's half is not this command's any more (carrick#1573), so its
+  // flag is refused rather than quietly ignored.
+  assert.match(parseRemoveArgs(["--keep-login"], "/work") as string, /unknown option/);
+  // `--yes` is init's "take the proposal", which an agent adds by reflex; it
+  // answers nothing here.
+  assert.match(parseRemoveArgs(["--yes"], "/work") as string, /unknown option/);
+  assert.match(parseRemoveArgs(["--help"], "/work") as string, /^carrick remove/);
+});
+
+test("uninstall reads its arguments, and takes no directory", () => {
+  assert.deepEqual(parseUninstallArgs([]), { keepLogin: false, confirm: null });
+  assert.deepEqual(parseUninstallArgs(["--keep-login", "--confirm", "uninstall"]), {
+    keepLogin: true,
+    confirm: "uninstall",
+  });
+  assert.match(parseUninstallArgs(["--confirm"]) as string, /needs the word uninstall/);
+  assert.match(parseUninstallArgs(["--yes"]) as string, /unknown option/);
+  assert.match(parseUninstallArgs(["."]) as string, /takes no directory: it acts on this machine/);
+  assert.match(parseUninstallArgs(["--help"]) as string, /^carrick uninstall/);
 });
 
 test("the hooks the writer merged in are exactly the hooks the remover takes out", () => {
@@ -297,34 +322,178 @@ process.exit(0);
 
 const posixFixture = { skip: process.platform === "win32" ? "the fixture client needs a POSIX shebang" : false };
 
-test("remove takes back what init wrote, lists what it will not touch, and says so once", posixFixture, (t) => {
+type Run = { status: number | null; stdout: string; stderr: string };
+
+/** Run the shim as a user would, with no terminal: stdin is a pipe. */
+function carrick(state: { env: NodeJS.ProcessEnv }, ...args: string[]): Run {
+  return spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), ...args], {
+    encoding: "utf8",
+    env: state.env,
+  });
+}
+
+/**
+ * The list a run printed under its heading, with the wrapping undone.
+ *
+ * The block breaks lines between words only, so the lines of it joined by a
+ * space are its items joined by a space.
+ */
+function listed(stdout: string, heading: string): string {
+  const lines = stdout.split("\n");
+  const start = lines.indexOf(heading);
+  assert.notEqual(start, -1, `no "${heading}" in:\n${stdout}`);
+  const block: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (!line.startsWith("  ")) break;
+    block.push(line.trim());
+  }
+  return block.join(" ");
+}
+
+/** Every file under a directory with its bytes, to say that a run touched none of them. */
+function snapshot(root: string): Map<string, string> {
+  const files = new Map<string, string>();
+  for (const entry of fs.readdirSync(root, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const file = path.join(entry.parentPath, entry.name);
+    files.set(path.relative(root, file), fs.readFileSync(file, "utf8"));
+  }
+  return files;
+}
+
+/** Everything `carrick uninstall` takes, which `carrick remove` must leave byte for byte (carrick#1573). */
+function machineFiles(state: { root: string; home: string }): Map<string, string> {
+  const files = snapshot(state.home);
+  files.set("credentials.json", fs.readFileSync(path.join(state.root, "config", "carrick", "credentials.json"), "utf8"));
+  return files;
+}
+
+// carrick#1573. With no terminal and no --confirm, both commands print what
+// they would delete and stop there. An agent that runs one by reflex gets the
+// list and the flag to ask its user about, and nothing is gone.
+test("with no terminal, remove and uninstall list what they would delete and delete none of it", posixFixture, (t) => {
   const state = machine();
   t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const folder = snapshot(state.workspace);
+  const machineBefore = machineFiles(state);
 
-  const run = (): { status: number | null; stdout: string; stderr: string } =>
-    spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--workspace", state.workspace], {
-      encoding: "utf8",
-      env: state.env,
-    });
+  const removal = carrick(state, "remove", "--workspace", state.workspace);
+  assert.equal(removal.status, 1, removal.stdout);
+  assert.equal(removal.stderr, "carrick remove: use --confirm repo to remove these without a terminal.\n");
+  assert.equal(
+    listed(removal.stdout, `Remove from ${state.workspace}:`),
+    folderLines(folderPlan(state.workspace)).join(" "),
+  );
+  assert.equal(removal.stdout.includes("◇"), false, removal.stdout);
+
+  const uninstall = carrick(state, "uninstall");
+  assert.equal(uninstall.status, 1, uninstall.stdout);
+  assert.equal(uninstall.stderr, "carrick uninstall: use --confirm uninstall to remove these without a terminal.\n");
+  assert.match(listed(uninstall.stdout, "Remove from this machine:"), /^Carrick's MCP server in Claude Code /);
+  assert.equal(uninstall.stdout.includes("◇"), false, uninstall.stdout);
+
+  assert.deepEqual(snapshot(state.workspace), folder);
+  assert.deepEqual(machineFiles(state), machineBefore);
+  // Only the read that made the list reached the client.
+  assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), ["mcp get carrick"]);
+});
+
+test("a wrong --confirm is refused with the answer it wanted, and deletes nothing", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const folder = snapshot(state.workspace);
+  const machineBefore = machineFiles(state);
+
+  // Exact, case included, as the dashboard's project delete compares the slug.
+  const removal = carrick(state, "remove", "--workspace", state.workspace, "--confirm", "Repo");
+  assert.equal(removal.status, 1, removal.stderr);
+  assert.ok(removal.stdout.includes('■ "Repo" is not repo. Nothing was removed.'), removal.stdout);
+
+  const uninstall = carrick(state, "uninstall", "--confirm", "yes");
+  assert.equal(uninstall.status, 1, uninstall.stderr);
+  assert.ok(uninstall.stdout.includes('■ "yes" is not uninstall. Nothing was removed.'), uninstall.stdout);
+
+  assert.deepEqual(snapshot(state.workspace), folder);
+  assert.deepEqual(machineFiles(state), machineBefore);
+});
+
+// carrick#1573: the terminal's half of the question, driven in-process because
+// a spawned child has no terminal to be asked on.
+test("remove asks for the folder's name on a terminal, and only that name deletes", posixFixture, async (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const folder = snapshot(state.workspace);
+
+  const ask = async (answer: string | null): Promise<{ code: number; written: string; asked: string }> => {
+    const written: string[] = [];
+    const input = new PassThrough();
+    const echo = new PassThrough();
+    let asked = "";
+    echo.on("data", (chunk: Buffer) => void (asked += chunk.toString()));
+    const run = removeWith(
+      ["--workspace", state.workspace],
+      plainOutput((text) => void written.push(text), { input, output: echo }),
+      true,
+    );
+    setImmediate(() => (answer === null ? input.end() : input.write(`${answer}\n`)));
+    return { code: await run, written: written.join(""), asked };
+  };
+
+  const wrong = await ask("my-repo");
+  assert.equal(wrong.code, 1);
+  assert.match(wrong.asked, /^Type this folder's name, repo, to remove these\n> /);
+  assert.ok(wrong.written.includes('■ "my-repo" is not repo. Nothing was removed.'), wrong.written);
+  assert.deepEqual(snapshot(state.workspace), folder);
+
+  // A closed input is a cancel, never an answer (carrick#1338).
+  const cancelled = await ask(null);
+  assert.equal(cancelled.code, 1);
+  assert.ok(cancelled.written.includes("■ Cancelled. Nothing was removed."), cancelled.written);
+  assert.deepEqual(snapshot(state.workspace), folder);
+
+  const right = await ask("repo");
+  assert.equal(right.code, 0, right.written);
+  assert.ok(right.written.includes("◇ .carrick removed, with the proposal and the index in it"), right.written);
+  assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
+});
+
+test("remove takes back what init wrote in this folder, and nothing of the machine's", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const machineBefore = machineFiles(state);
+  const plan = folderLines(folderPlan(state.workspace));
+  assert.deepEqual(plan, [
+    `Carrick's hook entries in ${SETTINGS_FILES[0]}`,
+    `Carrick's hook entries in ${CODEX_HOOKS_FILE}`,
+    `web from the exclude list in ${WORKSPACE_FILE}`,
+    ".carrick, with the proposal and the index in it",
+  ]);
+
+  const run = (): Run => carrick(state, "remove", "--workspace", state.workspace, "--confirm", "repo");
 
   const first = run();
   assert.equal(first.status, 0, first.stderr);
   assert.equal(first.stderr, "");
+  assert.equal(listed(first.stdout, `Remove from ${state.workspace}:`), plan.join(" "));
+  // What was listed is what went: one done line per item.
+  assert.equal(first.stdout.split("\n").filter((line) => line.startsWith("◇ ")).length, plan.length, first.stdout);
   const settingsFile = path.join(state.workspace, SETTINGS_FILES[0]!);
   for (const line of [
     `◇ Carrick hook entries removed from ${SETTINGS_FILES[0]}`,
     `◇ Carrick hook entries removed from ${CODEX_HOOKS_FILE}`,
-    "◇ MCP server removed for Claude Code",
-    `◇ MCP server removed for Cursor: ${path.join(state.home, ".cursor", "mcp.json")}`,
-    "◇ This machine's install id removed",
     "◇ .carrick removed, with the proposal and the index in it",
-    "◇ Signed out: the saved credential is gone",
     `  git rm ${[".github/workflows/carrick.yml", ".claude/skills/carrick/SKILL.md", "carrick.json"].join(" ")}`,
     '  by hand — AGENTS.md: the "## Carrick" section',
-    "  npm uninstall -g carrick",
+    "The MCP server, the install id and the sign-in belong to this machine and stay: carrick uninstall removes them.",
   ]) {
     assert.ok(first.stdout.includes(line), `missing from the output: ${line}\n${first.stdout}`);
   }
+
+  // The complaint in carrick#1573: resetting one folder took every other
+  // folder's agent connection and the sign-in with it. None of it is touched,
+  // and the agent client is never even asked.
+  assert.deepEqual(machineFiles(state), machineBefore);
+  assert.equal(fs.existsSync(state.log), false);
 
   // The file with none of our entries is byte for byte what it was, and no
   // line claims anything was removed from it.
@@ -352,24 +521,6 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   assert.equal(codexLeft.hooks["PostToolUse"], undefined);
   assert.equal(codexLeft.hooks["UserPromptSubmit"], undefined);
 
-  // The client's own file keeps the server that is not ours, and the header
-  // went with the entry it was on.
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(state.home, ".cursor", "mcp.json"), "utf8")), {
-    mcpServers: { other: { url: "https://example.test/mcp" } },
-  });
-  // The id itself is gone, and the directory it was alone in with it: the
-  // next `carrick init` is a new install (carrick-cloud#890).
-  assert.equal(fs.existsSync(installIdPath(state.home)), false);
-  // The session records go with it: they are a scratch note about
-  // conversations that have ended (carrick#1330).
-  assert.match(first.stdout, /1 session record\(s\) removed/);
-  assert.equal(fs.existsSync(sessionsDir(state.home)), false);
-  assert.equal(fs.existsSync(path.join(state.home, ".carrick")), false);
-  assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), [
-    "mcp get carrick",
-    "mcp remove --scope user carrick",
-  ]);
-
   // The selection comes out of the file the user also writes to: our name
   // only, and the file stays because theirs is still in it (carrick#1344).
   assert.match(first.stdout, /◇ web taken out of the exclude list in carrick-workspace\.json/);
@@ -379,43 +530,106 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   );
 
   assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
-  assert.equal(fs.existsSync(path.join(state.root, "config", "carrick", "credentials.json")), false);
   // Nothing tracked was touched: every scaffold file is still there, which is
   // why they are printed rather than deleted.
   for (const relative of [".github/workflows/carrick.yml", ".claude/skills/carrick/SKILL.md", "carrick.json", "AGENTS.md"]) {
     assert.ok(fs.existsSync(path.join(state.workspace, relative)), relative);
   }
 
+  // Nothing left means nothing to ask about: a second run, and an agent
+  // re-running on a clean folder, is not refused for want of a terminal.
   const before = fs.readFileSync(settingsFile, "utf8");
-  const second = run();
+  const second = carrick(state, "remove", "--workspace", state.workspace);
   assert.equal(second.status, 0, second.stderr);
-  assert.ok(second.stdout.includes("Nothing left to remove on this machine."));
+  assert.equal(second.stderr, "");
+  assert.ok(second.stdout.includes("Nothing left to remove in this folder."));
   assert.equal(second.stdout.includes("◇"), false, second.stdout);
   // The repo listing is advice, not a removal, so it is printed both times.
   assert.ok(second.stdout.includes("git rm "));
   assert.equal(fs.readFileSync(settingsFile, "utf8"), before);
+  assert.deepEqual(machineFiles(state), machineBefore);
+});
+
+test("uninstall takes back what init wrote on this machine, and nothing of any folder's", posixFixture, (t) => {
+  const state = machine();
+  t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
+  const folder = snapshot(state.workspace);
+  const credential = path.join(state.root, "config", "carrick", "credentials.json");
+  // The home directory as a reader types it; the credential is outside it here.
+  const home = (target: string): string => path.join("~", path.relative(state.home, target));
+  const plan = [
+    "Carrick's MCP server in Claude Code",
+    "Carrick's MCP server in Cursor",
+    `1 session record(s) in ${home(sessionsDir(state.home))}`,
+    `The refresh notice's last-shown date, in ${home(noticeFile(state.home))}`,
+    `This machine's install id, in ${home(installIdPath(state.home))}`,
+    `The saved credential, in ${credential}, which signs this machine out`,
+  ];
+
+  const first = carrick(state, "uninstall", "--confirm", "uninstall");
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(first.stderr, "");
+  assert.equal(listed(first.stdout, "Remove from this machine:"), plan.join(" "));
+  // What was listed is what went: one done line per item.
+  assert.equal(first.stdout.split("\n").filter((line) => line.startsWith("◇ ")).length, plan.length, first.stdout);
+  for (const line of [
+    "◇ MCP server removed for Claude Code",
+    `◇ MCP server removed for Cursor: ${path.join(state.home, ".cursor", "mcp.json")}`,
+    `◇ 1 session record(s) removed from ${home(sessionsDir(state.home))}`,
+    "◇ The refresh notice's last-shown date removed",
+    "◇ This machine's install id removed",
+    "◇ Signed out: the saved credential is gone",
+    "  carrick remove, in each folder carrick init set up",
+    "  npm uninstall -g carrick",
+  ]) {
+    assert.ok(first.stdout.includes(line), `missing from the output: ${line}\n${first.stdout}`);
+  }
+
+  // The client's own file keeps the server that is not ours, and the header
+  // went with the entry it was on.
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(state.home, ".cursor", "mcp.json"), "utf8")), {
+    mcpServers: { other: { url: "https://example.test/mcp" } },
+  });
+  // The id itself is gone, and the directory it was alone in with it: the
+  // next `carrick init` is a new install (carrick-cloud#890). The session
+  // records and the notice share that directory (carrick#1330, carrick#1333).
+  assert.equal(fs.existsSync(installIdPath(state.home)), false);
+  assert.equal(fs.existsSync(sessionsDir(state.home)), false);
+  assert.equal(fs.existsSync(path.join(state.home, ".carrick")), false);
+  assert.equal(fs.existsSync(credential), false);
+  // One read for the list, one for the removal's own gate, then the removal.
   assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), [
+    "mcp get carrick",
+    "mcp get carrick",
+    "mcp remove --scope user carrick",
+  ]);
+
+  // Every folder keeps its hooks, its skills, its selection and its index.
+  assert.deepEqual(snapshot(state.workspace), folder);
+
+  const second = carrick(state, "uninstall");
+  assert.equal(second.status, 0, second.stderr);
+  assert.ok(second.stdout.includes("Nothing left to remove on this machine."), second.stdout);
+  assert.equal(second.stdout.includes("◇"), false, second.stdout);
+  assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), [
+    "mcp get carrick",
     "mcp get carrick",
     "mcp remove --scope user carrick",
     "mcp get carrick",
   ]);
 });
 
-test("--keep-login removes everything else and leaves the credential", posixFixture, (t) => {
+test("uninstall --keep-login removes everything else and leaves the credential", posixFixture, (t) => {
   const state = machine();
   t.after(() => fs.rmSync(state.root, { recursive: true, force: true }));
-  const result = spawnSync(
-    process.execPath,
-    [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--workspace", state.workspace, "--keep-login"],
-    { encoding: "utf8", env: state.env },
-  );
+  const result = carrick(state, "uninstall", "--keep-login", "--confirm", "uninstall");
   assert.equal(result.status, 0, result.stderr);
   assert.ok(result.stdout.includes("This machine stays signed in"));
   assert.equal(result.stdout.includes("Signed out"), false);
+  assert.equal(result.stdout.includes("credentials.json, which signs"), false, result.stdout);
   // The install id is not a login: it goes whichever way this flag points.
   assert.equal(fs.existsSync(installIdPath(state.home)), false);
   assert.ok(fs.existsSync(path.join(state.root, "config", "carrick", "credentials.json")));
-  assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
 });
 
 // carrick#1512, option A. Init run in a folder of repos also copies its hooks
@@ -438,10 +652,7 @@ test("remove takes the hooks and skills back out of each repo in the folder, wit
   }));
   for (const dir of repos) writeRepoCopy(dir, "carrick", { slug: "shop" });
 
-  const result = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--workspace", state.workspace], {
-    encoding: "utf8",
-    env: state.env,
-  });
+  const result = carrick(state, "remove", "--workspace", state.workspace, "--confirm", "repo");
   assert.equal(result.status, 0, result.stderr);
   for (const [index, dir] of repos.entries()) {
     const name = path.basename(dir);
@@ -473,11 +684,15 @@ test("remove run inside a repo takes its copy back whole, and git sees nothing l
   const before = status();
   writeRepoCopy(repo, "carrick", { slug: "shop" });
 
-  const result = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "remove", "--keep-login", "--workspace", repo], {
-    encoding: "utf8",
-    env: state.env,
-  });
+  // The copy is one item, and its settings file, Codex file and skills are not
+  // listed again as this folder's own: they are the copy (carrick#1573).
+  const plan = [`Carrick's hooks and skills in shop-app, with its .git/info/exclude lines`];
+  assert.deepEqual(folderLines(folderPlan(repo)), plan);
+
+  const result = carrick(state, "remove", "--workspace", repo, "--confirm", "shop-app");
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(listed(result.stdout, `Remove from ${repo}:`), plan.join(" "));
+  assert.equal(result.stdout.split("\n").filter((line) => line.startsWith("◇ ")).length, plan.length, result.stdout);
   assert.equal(fs.existsSync(path.join(repo, ".claude", "settings.local.json")), false, result.stdout);
   assert.equal(fs.existsSync(path.join(repo, ".claude")), false, result.stdout);
   assert.equal(fs.readFileSync(excludeFile(repo)!, "utf8"), exclude);

@@ -427,7 +427,7 @@ test("every path written is reported, for the line init prints", () => {
   assert.equal(outcomes[0]?.detail, cursorFile);
 });
 
-// The other half: what `carrick remove` takes back out (carrick#1034). Each
+// The other half: what `carrick uninstall` takes back out (carrick#1034). Each
 // test states the machine the same way, because the subject is still a user's
 // own configuration files.
 

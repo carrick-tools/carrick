@@ -368,6 +368,7 @@ test("which invocations count as a scan", () => {
     "hook",
     "init",
     "remove",
+    "uninstall",
     "doctor",
     "templates",
   ]) {

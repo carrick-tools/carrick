@@ -485,6 +485,10 @@ test("missing skills, skills an older version wrote, and skills edited here", ()
     assert.equal(findingCount(lines), 2, all);
     assert.match(all, /1 of the 8 task skill file\(s\) are missing here/);
     assert.match(all, /1 task skill file\(s\) here were written by an older version of carrick/);
+    // One file is named as one, not as the first of several (carrick#1574).
+    assert.match(all, /carrick-census\/SKILL\.md\), so your agent/);
+    assert.match(all, /carrick-drift\/SKILL\.md\)\. Re-run/);
+    assert.doesNotMatch(all, /and others/);
     assert.match(all, /carrick-reuse\/SKILL\.md has been edited here/);
     assert.equal(lines.find((line) => line.text.includes("edited here"))?.level, "say");
   } finally {
