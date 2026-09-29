@@ -330,8 +330,7 @@ class DeclarationReader {
     const file = primary?.getSourceFile();
     if (file) {
       entry.resolved_file = file.fileName;
-      const agrees =
-        resolved !== undefined && this.program.getSourceFile(resolved.resolvedFileName) === file;
+      const agrees = resolved !== undefined && this.isSameInstalledFile(resolved.resolvedFileName, file);
       if (agrees) {
         const version = resolved.packageId?.version;
         if (version) entry.installed_version = version;
@@ -349,6 +348,22 @@ class DeclarationReader {
     // A declaration file with no module symbol exports nothing: every export
     // of it is missing.
     return done();
+  }
+
+  /**
+   * The resolver's file is the checker's file. With two installs of the same
+   * name and version, TypeScript loads one and makes the other a redirect to
+   * it, so the resolver's copy may be a redirect whose target is the checker's
+   * file; that counts only when the target is itself an installed file.
+   */
+  private isSameInstalledFile(resolvedFileName: string, file: ts.SourceFile): boolean {
+    const resolved = this.program.getSourceFile(resolvedFileName);
+    if (resolved === file) return true;
+    // `redirectInfo` is internal to the compiler, but it is the only record of
+    // which copy TypeScript deduplicated a package into.
+    const target = (resolved as { redirectInfo?: { redirectTarget: ts.SourceFile } } | undefined)
+      ?.redirectInfo?.redirectTarget;
+    return target === file && isInstalledFile(file.fileName);
   }
 
   /** `T`: the type the probe's import gets. */
@@ -421,8 +436,17 @@ class DeclarationReader {
         const selected = this.selectRequest(receiver, claim.member, claim.args, claim.url_key, claim.method_key);
         return 'failure' in selected ? selected.failure : VERIFIED;
       }
-      case 'request_body':
-        return this.judgeRequestBody(receiver, claim);
+      case 'request_body': {
+        const selected = this.selectRequest(
+          receiver,
+          claim.member,
+          claim.args,
+          claim.url_key,
+          claim.method_key,
+          claim.body_key
+        );
+        return 'failure' in selected ? selected.failure : VERIFIED;
+      }
     }
   }
 
@@ -530,36 +554,26 @@ class DeclarationReader {
   }
 
   /**
-   * The signatures the `request` claim with the same keys selects, and
-   * `body_key` declared on the config of one of them: the first parameter for
-   * `config`, the second for `path_options`.
-   */
-  private judgeRequestBody(receiver: ts.Type, claim: Extract<Claim, { kind: 'request_body' }>): Outcome {
-    const selected = this.selectRequest(receiver, claim.member, claim.args, claim.url_key, claim.method_key);
-    if ('failure' in selected) return selected.failure;
-    const position = claim.args === 'config' ? 0 : 1;
-    const declared = selected.signatures.some(signature => {
-      const config = this.keyParameterAt(signature, position);
-      return config !== undefined && this.declaredProperty(config, claim.body_key) !== undefined;
-    });
-    return declared ? VERIFIED : failed('key_missing');
-  }
-
-  /**
    * The callee's signatures a request claim can be read through. The callee
    * is `receiver[member]`, or the receiver itself when `member` is null.
    *
    * `config`: the first parameter is an object type declaring `url_key`
    * accepting string and `method_key` accepting string or an HTTP method
    * literal. `path_options`: the first parameter accepts string and the second
-   * is an object type declaring `method_key` accepting the same.
+   * is an object type declaring `method_key` accepting the same. A
+   * `request_body` claim also needs `body_key` declared there.
+   *
+   * All the keys come from ONE config object: for a union, from one member
+   * that is an object type and not a function type. Keys split across union
+   * members (`{ url } | { method }`) describe no call anyone can make.
    */
   private selectRequest(
     receiver: ts.Type,
     member: string | null,
     args: RequestArgs,
     urlKey: string | undefined,
-    methodKey: string
+    methodKey: string,
+    bodyKey?: string
   ): { signatures: readonly ts.Signature[] } | { failure: Outcome } {
     const callable =
       member === null ? this.callSignatures(receiver) : this.callableProperty(receiver, member);
@@ -581,36 +595,55 @@ class DeclarationReader {
         best = furthest(best, 1, failed('param_missing'));
         continue;
       }
-      if (!this.isObjectType(config)) {
+      if (config === VARIADIC || !this.isObjectType(config)) {
         best = furthest(best, 1, this.slotFailure(config, 'param_missing'));
         continue;
       }
-      // A `config` claim names its url key; with none there is nothing to find.
-      const url =
-        args === 'config'
-          ? urlKey === undefined
-            ? undefined
-            : this.keyProperty(config, urlKey, type => this.acceptsString(type))
-          : null;
-      const method = this.keyProperty(config, methodKey, type => this.acceptsMethod(type));
-      if (url === undefined || !method) {
-        best = furthest(best, 2, failed('key_missing'));
-        continue;
+      const parts = this.parts(config);
+      const views = parts.length > 1 ? parts.filter(part => this.isPlainObject(part)) : [config];
+      if (views.length === 0) best = furthest(best, 2, failed('key_missing'));
+      for (const view of views) {
+        const outcome = this.requestKeysOutcome(view, args, urlKey, methodKey, bodyKey);
+        if (outcome.rank === Infinity) {
+          selected.push(signature);
+          break;
+        }
+        best = furthest(best, outcome.rank, outcome.outcome);
       }
-      const urlType = url === null ? undefined : this.checker.getTypeOfSymbol(url);
-      if (urlType !== undefined && !this.acceptsString(urlType)) {
-        best = furthest(best, 3, this.slotFailure(urlType, 'key_not_string'));
-        continue;
-      }
-      const methodType = this.checker.getTypeOfSymbol(method);
-      if (!this.acceptsMethod(methodType)) {
-        best = furthest(best, 3, this.slotFailure(methodType, 'key_not_string'));
-        continue;
-      }
-      selected.push(signature);
     }
     if (selected.length > 0) return { signatures: selected };
     return { failure: best!.outcome };
+  }
+
+  /** One config object against a request claim's keys; rank `Infinity` holds. */
+  private requestKeysOutcome(
+    config: Slot,
+    args: RequestArgs,
+    urlKey: string | undefined,
+    methodKey: string,
+    bodyKey: string | undefined
+  ): RankedFailure {
+    // A `config` claim names its url key; with none there is nothing to find.
+    const url =
+      args === 'config'
+        ? urlKey === undefined
+          ? undefined
+          : this.declaredProperty(config, urlKey)
+        : null;
+    const method = this.declaredProperty(config, methodKey);
+    if (url === undefined || !method) return { rank: 2, outcome: failed('key_missing') };
+    const urlType = url === null ? undefined : this.checker.getTypeOfSymbol(url);
+    if (urlType !== undefined && !this.acceptsString(urlType)) {
+      return { rank: 3, outcome: this.slotFailure(urlType, 'key_not_string') };
+    }
+    const methodType = this.checker.getTypeOfSymbol(method);
+    if (!this.acceptsMethod(methodType)) {
+      return { rank: 3, outcome: this.slotFailure(methodType, 'key_not_string') };
+    }
+    if (bodyKey !== undefined && !this.declaredProperty(config, bodyKey)) {
+      return { rank: 4, outcome: failed('key_missing') };
+    }
+    return { rank: Infinity, outcome: VERIFIED };
   }
 
   // --------------------------------------------------------------------------
@@ -637,7 +670,11 @@ class DeclarationReader {
    * A declared property of `type`: one the checker lists on its apparent type
    * with null and undefined removed, and not one every value of that kind
    * inherits (`constructor`, `toString`, a primitive wrapper's members). An
-   * index signature does not count.
+   * index signature does not count. Nor does a property typed `never` (or
+   * only `undefined`): it cannot be passed. And a library declares it: at
+   * least one declaration sits in an installed package or the default
+   * library, so a member only the service's own module augmentation adds is
+   * not the package's.
    */
   private declaredProperty(slot: Slot, name: string): ts.Symbol | undefined {
     return this.declaredProperties(slot).find(property => property.getName() === name);
@@ -701,7 +738,52 @@ class DeclarationReader {
   private declaredProperties(slot: Slot): ts.Symbol[] {
     if (slot === VARIADIC) return [];
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(slot));
-    return this.checker.getPropertiesOfType(apparent).filter(property => !this.isBuiltinMember(property));
+    const containerIsLibrary = this.isDeclaredOnlyInLibrary(apparent.getSymbol());
+    return this.checker
+      .getPropertiesOfType(apparent)
+      .filter(
+        property =>
+          !this.isBuiltinMember(property) &&
+          this.isLibraryDeclared(property, containerIsLibrary) &&
+          !this.isAbsent(property)
+      );
+  }
+
+  /**
+   * Some declaration of the property is in an installed package or the
+   * default library. A member a mapped type makes (`extends Record<'get',
+   * Fn>`) has no declaration of its own; it counts when the type it is listed
+   * on is declared only in library files, which a service augmentation of
+   * that type is not.
+   */
+  private isLibraryDeclared(property: ts.Symbol, containerIsLibrary: boolean): boolean {
+    const declarations = property.declarations ?? [];
+    if (declarations.length === 0) return containerIsLibrary;
+    return declarations.some(declaration => this.isLibraryFile(declaration.getSourceFile()));
+  }
+
+  private isDeclaredOnlyInLibrary(symbol: ts.Symbol | undefined): boolean {
+    const declarations = symbol?.declarations ?? [];
+    return (
+      declarations.length > 0 &&
+      declarations.every(declaration => this.isLibraryFile(declaration.getSourceFile()))
+    );
+  }
+
+  /**
+   * An installed package's file, or the default library's: ts-morph serves
+   * the default library from `/node_modules/typescript/lib`, so one test
+   * answers both (pinned by the test of a method key `RequestInit` declares).
+   */
+  private isLibraryFile(file: ts.SourceFile): boolean {
+    return isInstalledFile(file.fileName);
+  }
+
+  /** Typed so that nothing can be passed: `never`, or only `undefined`. */
+  private isAbsent(property: ts.Symbol): boolean {
+    return this.parts(this.checker.getTypeOfSymbol(property)).every(
+      part => (part.flags & ts.TypeFlags.Never) !== 0
+    );
   }
 
   private isBuiltinMember(property: ts.Symbol): boolean {
@@ -864,6 +946,11 @@ class DeclarationReader {
     }
     return this.isOpenTop(rest) ? rest : VARIADIC;
   }
+}
+
+/** A file under a `node_modules` directory: installed, not the service's own. */
+function isInstalledFile(fileName: string): boolean {
+  return /[\\/]node_modules[\\/]/.test(fileName);
 }
 
 function isNullish(type: ts.Type): boolean {

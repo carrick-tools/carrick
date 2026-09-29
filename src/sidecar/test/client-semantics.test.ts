@@ -844,6 +844,7 @@ export interface Instance {
   mixed(defaults: { prefixUrl: number } | { prefixUrl: string; retries?: number } | (() => void)): Instance;
   keyed<K extends string>(defaults: { prefixUrl: K }): Instance;
   call<M extends 'get' | 'post'>(config: { url: string; method: M }): Promise<unknown>;
+  fetchLike(config: RequestInit & { url: string }): Promise<unknown>;
 }
 declare const client: Instance;
 export default client;
@@ -896,6 +897,7 @@ export default client;
     ['a union where one object constituent types the key string and another number', 'fixture-extend-http', 'export', factory('mixed'), 'verified', undefined],
     ['a key typed by a type parameter constrained to string', 'fixture-extend-http', 'export', factory('keyed'), 'verified', undefined],
     ['a method key typed by a type parameter constrained to method literals', 'fixture-extend-http', 'export', { kind: 'request', member: 'call', args: 'config', url_key: 'url', method_key: 'method' }, 'verified', undefined],
+    ['a method key the default library declares', 'fixture-extend-http', 'export', { kind: 'request', member: 'fetchLike', args: 'config', url_key: 'url', method_key: 'method' }, 'verified', undefined],
     ['a union whose key-bearing part collapses to any', 'fixture-widen-wrong', 'export', factory('anyPart'), 'unchecked', 'member_untyped'],
     ['a union whose only key-bearing constituent types the key any', 'fixture-widen-wrong', 'export', factory('anyKey'), 'unchecked', 'member_untyped'],
     ['a union where the key exists only through an index signature', 'fixture-widen-wrong', 'export', factory('indexOnly'), 'failed', 'key_missing'],
@@ -936,5 +938,151 @@ export default client;
       const result = results.get(`widen-${i}`)!;
       assert.deepStrictEqual([result.verdict, result.reason], [verdict, reason]);
     });
+  });
+});
+
+/**
+ * Re-review of #1567. Three ways a claim read true without any one installed
+ * declaration saying so: a request's keys taken from different members of a
+ * union config, a member the service's own module augmentation adds, and (the
+ * other direction) an ordinary duplicate install that read `module_local`.
+ */
+describe('verify_client_semantics reads a config, a member and an install as one declaration (re-review of #1567)', () => {
+  const RE_TSCONFIG = JSON.stringify({
+    compilerOptions: {
+      target: 'es2020',
+      lib: ['es2020'],
+      module: 'commonjs',
+      moduleResolution: 'node',
+      strict: true,
+      esModuleInterop: true,
+      skipLibCheck: true,
+      types: [],
+    },
+    include: ['src/**/*.ts'],
+  });
+  const HTTP = `export interface Inst { get(url: string, config?: object): Promise<unknown>; post<D = unknown>(url: string, data?: D): Promise<unknown> }
+export interface S extends Inst { create(config?: { baseURL?: string }): Inst }
+declare const c: S; export default c;
+`;
+  const tail = 'declare const c: S; export default c;\n';
+  let root: string;
+  let client: SidecarClient;
+  const results = new Map<string, Result>();
+  let modules = new Map<string, Module>();
+
+  const write = (rel: string, text: string) => writeTree(root, { [rel]: text });
+  const pkgAt = (dir: string, name: string, dts: string, version = '1.0.0') =>
+    writeTree(root, {
+      [`${dir}/package.json`]: packageJson(name, version, { types: 'index.d.ts' }),
+      [`${dir}/index.d.ts`]: dts,
+    });
+
+  const RQ = (member: string | null): Claim => ({ kind: 'request', member, args: 'config', url_key: 'url', method_key: 'method' });
+  const RQB = (member: string | null, bodyKey: string): Claim => ({
+    kind: 'request_body',
+    member,
+    args: 'config',
+    url_key: 'url',
+    method_key: 'method',
+    body_key: bodyKey,
+  });
+
+  /** [item, what it shows, package, receiver, claim, verdict, reason] */
+  const CASES: Array<[string, string, string, string, Claim, Result['verdict'], string | undefined]> = [
+    ['1', 'url and method on different members of a discriminated union', 'wz-disc', 'export', RQ('request'), 'failed', 'key_missing'],
+    ['1', 'url and method on different members of a union the receiver takes', 'wz-disc', 'export', RQ(null), 'failed', 'key_missing'],
+    ['1', 'either/or members that each type the other key never', 'wz-xor', 'export', RQ('request'), 'failed', 'key_missing'],
+    ['1', 'url and method on different members of a generic rest element', 'wz-nested-rest', 'export', RQ('request'), 'failed', 'key_missing'],
+    ['1', 'url on one member and method on an intersection in a tuple rest', 'wz-nested-rest', 'export', RQ('send'), 'failed', 'key_missing'],
+    ['1', 'url and method on different members of a labelled tuple rest', 'wz-tuple', 'export', RQ('fire'), 'failed', 'key_missing'],
+    ['1', 'a string url only on the member without a method', 'wz-split-types', 'export', RQ('request'), 'failed', 'key_not_string'],
+    ['1', 'url on a constrained type parameter and method on another member', 'wz-tp-member', 'export', RQ('request'), 'failed', 'key_missing'],
+    ['1', 'a body key on another member than the url and method', 'wz-body-split', 'export', RQB('request', 'data'), 'failed', 'key_missing'],
+    ['1', 'url, method and body key on one member of a union', 'wz-body-split', 'export', RQB('send', 'data'), 'verified', undefined],
+    ['1', 'url and method on one member of a union', 'wz-body-split', 'export', RQ('send'), 'verified', undefined],
+    ['1', 'a config union of function types only', 'wz-body-split', 'export', RQ('call'), 'failed', 'key_missing'],
+    ['1', 'url and method only on a function member of a union', 'wz-body-split', 'export', RQ('fire'), 'failed', 'key_missing'],
+    ['1', 'a factory key on the object member of options or a function', 'wz-extend', 'export', { kind: 'factory', member: 'extend', base_url_key: 'prefixUrl' }, 'verified', undefined],
+    ['1', 'a factory key through a generic rest of instances and options', 'wz-extend', 'export', { kind: 'factory', member: 'create', base_url_key: 'prefixUrl' }, 'verified', undefined],
+    ['2', 'a member only the service\'s own augmentation declares', 'rg-aug', 'export', { kind: 'verb_body', member: 'post', args: 'path_body' }, 'failed', 'member_missing'],
+    ['2', 'a key only the service\'s own augmentation declares', 'rg-aug', 'export', { kind: 'factory', member: 'create', base_url_key: 'retryURL' }, 'failed', 'key_missing'],
+    ['2', 'a member the installed package declares, beside the augmentation', 'rg-aug', 'export', VERB_GET, 'verified', undefined],
+    ['2', 'a member an installed interface takes from a mapped type', 'rg-mapped', 'export', VERB_GET, 'verified', undefined],
+    ['2', 'a mapped-type member the service\'s augmentation adds', 'rg-mapped-aug', 'export', { kind: 'verb', member: 'patch', method: 'PATCH' }, 'failed', 'member_missing'],
+    ['3', 'a duplicate install of the same name and version', 'rg-dup', 'export', VERB_GET, 'verified', undefined],
+    ['3', 'a duplicate install whose first copy is a service-local file', 'rg-dup-local', 'export', VERB_GET, 'unchecked', 'module_local'],
+    ['3', 'the same name declared by an installed copy at another version', 'rg-dup-version', 'export', VERB_GET, 'unchecked', 'module_local'],
+  ];
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-semantics-re-'));
+    write('tsconfig.json', RE_TSCONFIG);
+    // Service code imports the nested copies first, so the top-level copy of
+    // the same name and version becomes a redirect to the nested one.
+    write('src/a.ts', "import dep from 'rg-dep'; import local from 'rg-dep-local'; import old from 'rg-dep-version'; export const d = [dep, local, old];\n");
+    write('src/aug.ts', "import 'rg-aug';\ndeclare module 'rg-aug' {\n  interface S { post(url: string, body: unknown): Promise<unknown> }\n  interface Options { retryURL: string }\n}\nexport {};\n");
+    // Item 1: request keys split across a union.
+    pkgAt('node_modules/wz-disc', 'wz-disc', `export interface S { request(config: { kind: 'u'; url: string } | { kind: 'm'; method: string }): Promise<unknown>; (config: { url: string } | { method: 'GET' | 'POST' }): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-xor', 'wz-xor', `export interface S { request(config: { url: string; method?: never } | { method: string; url?: never }): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-nested-rest', 'wz-nested-rest', `export interface A { url: string } export interface B { method: string } export interface C { other: number }\nexport interface S { request<T extends Array<A | (B | C)>>(...args: T): Promise<unknown>; send<T extends [A | (B & C)]>(...args: T): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-tuple', 'wz-tuple', `export interface S { fire(...a: [config: { url: string } | { method: string }]): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-split-types', 'wz-split-types', `export interface S { request(config: { url: number; method: string } | { url: string; flag: true }): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-tp-member', 'wz-tp-member', `export interface S { request<C extends { url: string }>(config: C | { method: string }): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-body-split', 'wz-body-split', `export interface S { request(config: { url: string; method: string } | { data: unknown }): Promise<unknown>; send(config: { url: string; method: string; data?: unknown } | (() => void)): Promise<unknown>; call(config: (() => void) | ((n: number) => void)): Promise<unknown>; fire(config: { timeout?: number } | { (): void; url: string; method: string }): Promise<unknown> }\n${tail}`);
+    pkgAt('node_modules/wz-extend', 'wz-extend', `export interface Options { prefixUrl?: string; method?: string; json?: unknown }\nexport interface Inst { (url: string, options?: Options): Promise<unknown>; get(url: string, options?: Options): Promise<unknown>; extend(defaults: Options | ((parent: Options) => Options)): Inst; create<T extends Array<Inst | Options>>(...items: T): Inst }\ndeclare const c: Inst; export default c;\n`);
+    // Item 2: the installed package declares get and create; the service adds the rest.
+    pkgAt('node_modules/rg-aug', 'rg-aug', `export interface Options { timeout?: number }\nexport interface S { get(url: string): Promise<unknown>; create(options: Options): S }\n${tail}`);
+    // Members made by a mapped type carry no declaration of their own.
+    pkgAt('node_modules/rg-mapped', 'rg-mapped', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
+    pkgAt('node_modules/rg-mapped-aug', 'rg-mapped-aug', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
+    write('src/aug-mapped.ts', "import 'rg-mapped-aug';\ndeclare module 'rg-mapped-aug' {\n  interface S extends Record<'patch', (url: string) => Promise<unknown>> {}\n}\nexport {};\n");
+    // Item 3: the same name and version twice, nested (loaded first) and at the top.
+    pkgAt('node_modules/rg-dep', 'rg-dep', "import c from 'rg-dup';\ndeclare const d: typeof c; export default d;\n");
+    pkgAt('node_modules/rg-dep/node_modules/rg-dup', 'rg-dup', HTTP);
+    pkgAt('node_modules/rg-dup', 'rg-dup', HTTP);
+    // ...where the first copy is a service-local directory reached through a symlink.
+    pkgAt('node_modules/rg-dep-local', 'rg-dep-local', "import c from 'rg-dup-local';\ndeclare const d: typeof c; export default d;\n");
+    pkgAt('vendor/rg-dup-local', 'rg-dup-local', HTTP);
+    fs.mkdirSync(path.join(root, 'node_modules/rg-dep-local/node_modules'), { recursive: true });
+    fs.symlinkSync(path.join(root, 'vendor/rg-dup-local'), path.join(root, 'node_modules/rg-dep-local/node_modules/rg-dup-local'));
+    pkgAt('node_modules/rg-dup-local', 'rg-dup-local', HTTP);
+    // ...and where an installed copy at another version declares the module itself.
+    pkgAt('node_modules/rg-dep-version', 'rg-dep-version', "/// <reference path=\"./node_modules/rg-dup-version/index.d.ts\" />\nimport c from 'rg-dup-version';\ndeclare const d: typeof c; export default d;\n");
+    pkgAt('node_modules/rg-dep-version/node_modules/rg-dup-version', 'rg-dup-version', `declare module 'rg-dup-version' {\n${HTTP}}\n`, '2.0.0');
+    pkgAt('node_modules/rg-dup-version', 'rg-dup-version', HTTP);
+
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 're-init', action: 'init', repo_root: root });
+    assert.strictEqual(ready.status, 'ready');
+    const checks = CASES.map(([, , pkg, receiver, claim], i) => ({ ...check(pkg, receiver, claim), claim_id: `re-${i}` }));
+    const response = await client.send<Response>(
+      { request_id: 're', action: 'verify_client_semantics', from_dir: root, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(pairs(response.semantics!), pairs(checks));
+    for (const result of response.semantics!) results.set(result.claim_id, result);
+    modules = new Map(response.semantics_modules!.map(m => [m.package, m]));
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  CASES.forEach(([item, shows, , , , verdict, reason], i) => {
+    it(`${item}: ${shows} is ${verdict}${reason ? ` (${reason})` : ''}`, () => {
+      const result = results.get(`re-${i}`)!;
+      assert.deepStrictEqual([result.verdict, result.reason], [verdict, reason]);
+    });
+  });
+
+  it('3: reads the version of a duplicate install from the copy it resolves to', () => {
+    const duplicate = modules.get('rg-dup')!;
+    assert.strictEqual(duplicate.reason, undefined);
+    assert.strictEqual(duplicate.installed_version, '1.0.0');
+    assert.match(duplicate.resolved_file!, /node_modules\/rg-dep\/node_modules\/rg-dup\/index\.d\.ts$/);
   });
 });
