@@ -414,25 +414,35 @@ Response:
 
 `semantics` holds exactly one result per check, in request order. The claim kinds are `factory`, `verb`, `verb_body` (`args` `path_body` or `path_options`, optional `body_key`), `request` (`member` null means the receiver itself is called; `args` `config` with `url_key`, or `path_options`; `method_key`) and `request_body` (the same `member`, `args`, `url_key` and `method_key` as its `request` claim, plus `body_key`). `verdict` is `verified` (the declarations satisfy the claim), `failed` (they resolved and contradict it) or `unchecked` (they could not be read); `reason` is absent exactly when `verified`. The scanner drops `failed` and `unchecked` alike.
 
-An export typed `any` or `unknown` verifies nothing, so an untyped package or a shorthand `declare module "x";` answers `unchecked`. The reasons:
+A verified claim becomes a fact the scanner can report on, so a claim verifies only where the declarations say so positively. The definitions the predicates use:
+
+- **Accepts string**: `string` is assignable to the type, and some part of it other than `null` and `undefined` is string-like (`string`, a string literal or template, or `string & {}`). `any`, `unknown`, `{}` and `Object` accept a string without saying anything about one.
+- **Declared property**: a property the checker lists on the type's apparent type, with `null` and `undefined` removed. An index signature does not count, and neither does a member of `Object`, `Function`, `Array` or a primitive's wrapper (`constructor`, `toString`, a string's `length`).
+- **Open** (a `path_body` body): `unknown`, or a type parameter with no constraint (or a constraint of `unknown` or `any`). `any` is not open: a declared `any`, an unresolved type and a defaulted type argument all read as `any`.
+- **Says nothing**: `any`, `unknown`, an unconstrained type parameter, an object type with nothing declared on it, or an element of a rest parameter typed by a type parameter. Where the claim needs a type that says nothing, the verdict is `unchecked` (`member_untyped`), not `failed`.
+
+The package's declarations must be the installed package's: the resolver and the checker must land on the same file, reached through `node_modules`. The reasons:
 
 | Verdict | Reason | Meaning |
 |---|---|---|
 | `unchecked` | `module_unresolved` | The package does not resolve from `from_dir` (not installed, no `node_modules`) |
 | `unchecked` | `module_js_only` | It resolves to JavaScript with no declarations |
+| `unchecked` | `module_local` | Its types come from the service itself: a `paths` alias, or a `declare module` block (a shorthand one included) that stands in for the package |
 | `unchecked` | `export_missing` | The module has no value export of that name |
 | `unchecked` | `export_untyped` | The export is `any` or `unknown` |
-| `unchecked` | `factory_unresolved` | `instance:<f>`: `f` is not a callable member, no overload builds from an options object, or what it builds is `any` or `unknown`. Also a `factory` claim whose declared option is there but whose result is `any` or `unknown` |
+| `unchecked` | `factory_unresolved` | `instance:<f>`: `f` is not a callable member, no overload builds from an options object, what it builds says nothing (including a conditional return with an `any` branch), or a `factory` claim for `f` in the same request holds on a different overload. Also a `factory` claim whose declared option is there but whose result says nothing |
+| `unchecked` | `member_untyped` | The member, parameter or key the claim needs is typed so that it says nothing |
+| `unchecked` | `receiver_invalid` | The receiver is neither `export` nor `instance:<factory member>` |
 | `unchecked` | `budget` | The request ran out of `budget_ms` (optional, default 600000) before this check |
 | `failed` | `member_missing`, `member_not_callable` | The member is not declared on the receiver, or has no call signature |
-| `failed` | `method_not_member_verb` | A `verb` claim's method is not its member upper-cased, or not `GET POST PUT PATCH DELETE HEAD OPTIONS` |
+| `failed` | `method_not_member_verb` | A `verb` claim's method is not its member upper-cased (ASCII letters only), or not `GET POST PUT PATCH DELETE HEAD OPTIONS` |
 | `failed` | `path_not_string` | No signature of the verb takes a string first |
-| `failed` | `param_missing` | No signature has the parameter the claim needs there |
-| `failed` | `body_not_open` | A `path_body` verb's body parameter is not a type parameter, `any` or `unknown` |
+| `failed` | `param_missing` | No signature has the parameter the claim needs there (a request's config must be an object type) |
+| `failed` | `body_not_open` | A `path_body` verb's body parameter is not open |
 | `failed` | `options_not_object` | A `path_options` verb's second parameter is not an object type with a declared property |
-| `failed` | `key_missing`, `key_not_string` | The claimed option key is not declared (an index signature does not count), or does not accept a string (a method key may accept an HTTP method literal instead) |
+| `failed` | `key_missing`, `key_not_string` | The claimed key is not a declared property, or does not accept a string (a method key may accept an HTTP method literal instead) |
 
-When no overload satisfies a claim, the reason is the one from the overload that got furthest. `semantics_modules` says how each package resolved, for logs.
+When no overload satisfies a claim, the reason is the one from the overload that got furthest, and at the same depth `unchecked` wins. A `request_body` claim reads the signatures its `request` claim selects. `semantics_modules` says how each package resolved, for logs.
 
 #### `infer` - Resolve the type at a locator
 

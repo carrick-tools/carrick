@@ -69,6 +69,7 @@ export interface Client {
   put(...args: [url: string, options?: Options]): ResponsePromise;
   delete(...parts: string[]): ResponsePromise;
   patch?(url: string, options?: Options): ResponsePromise;
+  head(url: { href: string } | (string & {}), options?: Options): ResponsePromise;
   create(defaults?: Options): Client;
 }
 declare const client: Client;
@@ -92,6 +93,7 @@ const WRONG_CLIENT = `export interface Instance {
   walk(path: number, options: { method: string }): Promise<unknown>;
   submit(config: { url: string; method: string }): Promise<unknown>;
   trace(url: string, options: string): Promise<unknown>;
+  brand(url: string, options: string & { json?: unknown }): Promise<unknown>;
   ping(): Promise<unknown>;
   ping(config: { url?: string }): Promise<unknown>;
   index(config: { [key: string]: string }): Promise<unknown>;
@@ -103,6 +105,19 @@ export interface Static extends Instance {
   spawn(options: { baseURL: number }): Instance;
 }
 declare const client: Static;
+export default client;
+`;
+
+// A method key typed only by lower-case HTTP method literals.
+const LOWER_CLIENT = `export interface Config {
+  url: string;
+  method: 'get' | 'post';
+}
+export interface Instance {
+  request(config: Config): Promise<unknown>;
+  post(url: string, body?: unknown): Promise<unknown>;
+}
+declare const client: Instance;
 export default client;
 `;
 
@@ -232,6 +247,8 @@ const PREFIX_CHECKS = sampleChecks(
     { kind: 'verb', member: 'delete', method: 'DELETE' },
     // An optional member is still a declared callable property.
     { kind: 'verb', member: 'patch', method: 'PATCH' },
+    // \`string & {}\` takes any string, as \`string\` does.
+    { kind: 'verb', member: 'head', method: 'HEAD' },
     { kind: 'request', member: null, args: 'path_options', method_key: 'method' },
     { kind: 'request_body', member: null, args: 'path_options', method_key: 'method', body_key: 'json' },
   ]
@@ -250,11 +267,18 @@ const WRONG_CASES: Array<[Claim, Result['verdict'], string]> = [
   [{ kind: 'verb', member: 'options', method: 'OPTIONS' }, 'failed', 'member_missing'],
   [{ kind: 'verb', member: 'head', method: 'HEAD' }, 'failed', 'member_not_callable'],
   [{ kind: 'verb', member: 'get', method: 'GET' }, 'failed', 'path_not_string'],
+  [{ kind: 'verb_body', member: 'absent', args: 'path_body' }, 'failed', 'member_missing'],
   [{ kind: 'verb_body', member: 'post', args: 'path_body' }, 'failed', 'param_missing'],
   [{ kind: 'verb_body', member: 'put', args: 'path_body' }, 'failed', 'body_not_open'],
   [{ kind: 'verb_body', member: 'patch', args: 'path_options' }, 'failed', 'options_not_object'],
   // A string has properties, but it is not an options object.
   [{ kind: 'verb_body', member: 'trace', args: 'path_options' }, 'failed', 'options_not_object'],
+  // Nor is a string branded with an options-shaped object.
+  [
+    { kind: 'verb_body', member: 'brand', args: 'path_options', body_key: 'json' },
+    'failed',
+    'options_not_object',
+  ],
   [
     { kind: 'verb_body', member: 'delete', args: 'path_options', body_key: 'body' },
     'failed',
@@ -275,6 +299,8 @@ const WRONG_CASES: Array<[Claim, Result['verdict'], string]> = [
     'failed',
     'param_missing',
   ],
+  // A config claim that names no url key has nothing to find.
+  [{ kind: 'request', member: 'submit', args: 'config', method_key: 'method' }, 'failed', 'key_missing'],
   [
     { kind: 'request', member: 'call', args: 'config', url_key: 'url', method_key: 'method' },
     'failed',
@@ -362,6 +388,9 @@ describe('verify_client_semantics (carrick#1564)', () => {
       'tsconfig.json': TSCONFIG,
       'src/index.ts': 'export const service = 1;\n',
       'types/shims.d.ts': "declare module 'fixture-shorthand-http';\n",
+      // The service augments an installed package; the package is still the module.
+      'src/augment.ts':
+        "import '@fixture/http';\ndeclare module '@fixture/http' {\n  interface RequestConfig {\n    retry?: number;\n  }\n}\n",
       'node_modules/@fixture/http/package.json': packageJson('@fixture/http', '1.4.2', { types: 'index.d.ts' }),
       'node_modules/@fixture/http/index.d.ts': CONFIG_CLIENT,
       'node_modules/fixture-prefix-http/package.json': packageJson('fixture-prefix-http', '2.0.0', { types: 'index.d.ts' }),
@@ -370,6 +399,8 @@ describe('verify_client_semantics (carrick#1564)', () => {
       [`node_modules/${W}/index.d.ts`]: WRONG_CLIENT,
       'node_modules/fixture-broken-factory/package.json': packageJson('fixture-broken-factory', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-broken-factory/index.d.ts': BROKEN_FACTORY,
+      'node_modules/fixture-lower-http/package.json': packageJson('fixture-lower-http', '1.0.0', { types: 'index.d.ts' }),
+      'node_modules/fixture-lower-http/index.d.ts': LOWER_CLIENT,
       'node_modules/fixture-overload-factory/package.json': packageJson('fixture-overload-factory', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-overload-factory/index.d.ts': OVERLOADED_FACTORY,
       'node_modules/fixture-any-http/package.json': packageJson('fixture-any-http', '1.0.0', { types: 'index.d.ts' }),
@@ -425,12 +456,11 @@ describe('verify_client_semantics (carrick#1564)', () => {
     assert.deepStrictEqual(got, want);
   });
 
-  it('verifies nothing through an export typed any or unknown, or a shorthand module', async () => {
+  it('verifies nothing through an export typed any or unknown', async () => {
     const checks = [
       check('fixture-any-http', 'export', VERB_GET),
       check('fixture-any-http', 'instance:create', VERB_GET),
       check('fixture-any-http', 'export', VERB_GET, 'vague'),
-      check('fixture-shorthand-http', 'export', VERB_GET),
     ];
     const response = await verify(root, checks);
     for (const result of response.semantics!) {
@@ -440,6 +470,34 @@ describe('verify_client_semantics (carrick#1564)', () => {
         `${result.claim_id} @ ${result.receiver}`
       );
     }
+  });
+
+  it('verifies nothing through a shorthand module the service declares for itself', async () => {
+    const response = await verify(root, [check('fixture-shorthand-http', 'export', VERB_GET)]);
+    assert.deepStrictEqual(
+      response.semantics!.map(r => [r.verdict, r.reason]),
+      [['unchecked', 'module_local']]
+    );
+  });
+
+  it('reads a body typed unknown as open', async () => {
+    const response = await verify(root, [
+      check('fixture-lower-http', 'export', { kind: 'verb_body', member: 'post', args: 'path_body' }),
+    ]);
+    assert.deepStrictEqual(response.semantics!.map(r => r.verdict), ['verified']);
+  });
+
+  it('accepts a method key typed only by lower-case HTTP method literals', async () => {
+    const response = await verify(root, [
+      check('fixture-lower-http', 'export', {
+        kind: 'request',
+        member: 'request',
+        args: 'config',
+        url_key: 'url',
+        method_key: 'method',
+      }),
+    ]);
+    assert.deepStrictEqual(response.semantics!.map(r => r.verdict), ['verified']);
   });
 
   it('leaves a JS-only package, a missing package and a missing export unchecked', async () => {
@@ -525,11 +583,17 @@ describe('verify_client_semantics (carrick#1564)', () => {
     assert.deepStrictEqual(second.semantics_modules, first.semantics_modules);
   });
 
-  it('refuses a receiver that is neither the export nor an instance', async () => {
+  it('answers a receiver that is neither the export nor an instance on its own', async () => {
     const bad = { ...check('@fixture/http', 'export', VERB_GET), receiver: 'create' };
-    const response = await verify(root, [bad]);
-    assert.strictEqual(response.status, 'error');
-    assert.match(response.errors!.join(' '), /receiver/);
+    const response = await verify(root, [bad, check('@fixture/http', 'export', VERB_GET)]);
+    assert.strictEqual(response.status, 'success');
+    assert.deepStrictEqual(
+      response.semantics!.map(r => [r.receiver, r.verdict, r.reason]),
+      [
+        ['create', 'unchecked', 'receiver_invalid'],
+        ['export', 'verified', undefined],
+      ]
+    );
   });
 
   it('leaves every check unchecked on a service with no node_modules', async () => {
@@ -571,5 +635,184 @@ describe('verify_client_semantics before init', () => {
     } finally {
       await client.stop();
     }
+  });
+});
+
+/**
+ * The review of PR #1567 wrote one invented package per way the declarations
+ * can make a claim look true when they say nothing about it. Each case below
+ * got `verified` before the fix; each asserts the verdict it gets now. A
+ * verified claim becomes a fact that can fail a pull request check, so these
+ * only ever move `verified` to `failed` or `unchecked`.
+ */
+describe('verify_client_semantics against declarations that say nothing (review of #1567)', () => {
+  const ADV_TSCONFIG = JSON.stringify({
+    compilerOptions: {
+      target: 'es2020',
+      module: 'commonjs',
+      moduleResolution: 'node',
+      strict: true,
+      esModuleInterop: true,
+      skipLibCheck: true,
+      types: [],
+      baseUrl: '.',
+      paths: { 'adv-aliased': ['src/local-wrapper.ts'] },
+    },
+    include: ['src/**/*.ts', 'types/**/*.d.ts'],
+  });
+  const adv = (name: string, dts: string): Record<string, string> => ({
+    [`node_modules/${name}/package.json`]: packageJson(name, '1.0.0', { types: 'index.d.ts' }),
+    [`node_modules/${name}/index.d.ts`]: dts,
+  });
+  const FILES: Record<string, string> = {
+    'tsconfig.json': ADV_TSCONFIG,
+    'src/index.ts': 'export const service = 1;\n',
+    // The service's own wrapper, reached through a `paths` alias under a package name.
+    'src/local-wrapper.ts':
+      "const w = { get(path: string): Promise<unknown> { return Promise.resolve(path); } };\nexport default w;\n",
+    // A shim the service writes that shadows an installed package.
+    'types/shim.d.ts':
+      "declare module 'adv-shadowed' {\n  const c: { get(url: string): Promise<any>; post(url: string, body?: any): Promise<any> };\n  export default c;\n}\n",
+    ...adv('adv-anyparams', 'export interface I { get(...args: any[]): any; post(...args: any[]): any }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-peer', "import type { Url, Body } from 'adv-missing-peer';\nexport interface Inst { get(url: Url): Promise<unknown>; post(url: Url, body: Body): Promise<unknown>; request(config: { url: Url; method: Url }): Promise<unknown> }\nexport interface S extends Inst { create(o: { baseURL: Url }): Inst }\ndeclare const c: S; export default c;\n"),
+    ...adv('adv-genopts', 'export interface Options { json?: unknown; headers?: Record<string, string> }\nexport interface I { post<O extends Options>(url: string, options?: O): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-defaultany', 'export interface Client<C = any> { get(url: C): Promise<unknown>; post(url: string, body: C): Promise<unknown>; create(o: { baseURL: C }): Client<C> }\ndeclare const c: Client; export default c;\n'),
+    ...adv('adv-augment', 'export interface I { request(config: { url: string; method: string }): Promise<unknown>; post(url: string, options: { headers?: Record<string, string> }): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-splitsig', 'export interface I {\n  request(config: { url: string; method: string }): Promise<unknown>;\n  request(config: { data: unknown }): Promise<unknown>;\n}\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-tpreturn', 'export interface S { create<T = any>(o: { baseURL: string }): T; get(url: string): Promise<unknown> }\ndeclare const c: S; export default c;\n'),
+    ...adv('adv-restparam', 'export interface I { post<A extends unknown[]>(url: string, ...rest: A): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-unicode', 'export interface I { poſt(url: string): Promise<unknown>; optıons(url: string): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-shadowed', 'export interface I { fetchIt(url: string): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-factorysplit', 'export interface Http { get(url: string): Promise<unknown> }\nexport interface Other { label: string }\nexport interface S {\n  create(o: { name: string }): Http;\n  create(o: { baseURL: string }): Other;\n}\ndeclare const c: S; export default c;\n'),
+    ...adv('adv-loose', 'export interface I { get(url: {}): Promise<unknown>; request(config: { url: unknown; method: {} }): Promise<unknown>; create(o: { baseURL: unknown }): I }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-cond', 'export interface Http { get(url: string): Promise<unknown> }\nexport interface S { create<O = any>(o: O & { baseURL?: string }): O extends { raw: true } ? any : Http }\ndeclare const c: S; export default c;\n'),
+    ...adv('adv-indexany', 'export interface Http { get(url: string): Promise<unknown> }\ndeclare const c: Http & { [k: string]: any }; export default c;\n'),
+    ...adv('adv-fnproto', 'declare function c(input: number): Promise<unknown>; export default c;\n'),
+    ...adv('adv-mixed', 'export interface I { get(url: number): Promise<unknown>; get(url: any): Promise<unknown>; post: any }\ndeclare const c: I; export default c;\n'),
+    ...adv('adv-object', 'export interface I { post(url: string, options: Object): Promise<unknown> }\ndeclare const c: I; export default c;\n'),
+  };
+
+  const FACTORY = (baseUrlKey: string): Claim => ({ kind: 'factory', member: 'create', base_url_key: baseUrlKey });
+  const PATH_BODY = (member: string): Claim => ({ kind: 'verb_body', member, args: 'path_body' });
+  const CONFIG_REQUEST: Claim = { kind: 'request', member: 'request', args: 'config', url_key: 'url', method_key: 'method' };
+  const CONFIG_BODY = (member: string | null, bodyKey: string): Claim => ({
+    kind: 'request_body',
+    member,
+    args: 'config',
+    url_key: 'url',
+    method_key: 'method',
+    body_key: bodyKey,
+  });
+
+  /** [finding, what it shows, package, receiver, claim, verdict, reason] */
+  const CASES: Array<[string, string, string, string, Claim, Result['verdict'], string]> = [
+    ['A', 'a path typed any[] via a rest parameter', 'adv-anyparams', 'export', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A', 'a body behind a path typed any', 'adv-anyparams', 'export', PATH_BODY('post'), 'unchecked', 'member_untyped'],
+    ['A', 'a path typed by a missing peer', 'adv-peer', 'export', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A', 'a body behind a path typed by a missing peer', 'adv-peer', 'export', PATH_BODY('post'), 'unchecked', 'member_untyped'],
+    ['A', 'a base-URL key typed by a missing peer', 'adv-peer', 'export', FACTORY('baseURL'), 'unchecked', 'member_untyped'],
+    ['A', 'request keys typed by a missing peer', 'adv-peer', 'export', CONFIG_REQUEST, 'unchecked', 'member_untyped'],
+    ['A', 'a path typed by a type argument defaulted to any', 'adv-defaultany', 'export', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A/D', 'a body typed by a type argument defaulted to any', 'adv-defaultany', 'export', PATH_BODY('post'), 'unchecked', 'member_untyped'],
+    ['A', 'a base-URL key typed by a type argument defaulted to any', 'adv-defaultany', 'export', FACTORY('baseURL'), 'unchecked', 'member_untyped'],
+    ['A', 'an instance path typed by a type argument defaulted to any', 'adv-defaultany', 'instance:create', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A', 'a path typed {}', 'adv-loose', 'export', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A', 'request keys typed unknown and {}', 'adv-loose', 'export', CONFIG_REQUEST, 'unchecked', 'member_untyped'],
+    ['A', 'a base-URL key typed unknown', 'adv-loose', 'export', FACTORY('baseURL'), 'unchecked', 'member_untyped'],
+    ['B', 'a body key on another overload than the request keys', 'adv-splitsig', 'export', CONFIG_BODY('request', 'data'), 'failed', 'key_missing'],
+    ['B', 'a body key on a number read as a config', 'adv-fnproto', 'export', CONFIG_BODY(null, 'toFixed'), 'failed', 'param_missing'],
+    ['C', 'a body key every object inherits (constructor)', 'adv-augment', 'export', CONFIG_BODY('request', 'constructor'), 'failed', 'key_missing'],
+    ['C', 'a body key every object inherits (toString)', 'adv-augment', 'export', CONFIG_BODY('request', 'toString'), 'failed', 'key_missing'],
+    ['C', 'an options key every object inherits (valueOf)', 'adv-augment', 'export', { kind: 'verb_body', member: 'post', args: 'path_options', body_key: 'valueOf' }, 'failed', 'key_missing'],
+    ['D', 'a body typed by a type parameter constrained to an options type', 'adv-genopts', 'export', PATH_BODY('post'), 'failed', 'body_not_open'],
+    ['E', 'a service shim shadowing the installed package (verb)', 'adv-shadowed', 'export', VERB_GET, 'unchecked', 'module_local'],
+    ['E', 'a service shim shadowing the installed package (body)', 'adv-shadowed', 'export', PATH_BODY('post'), 'unchecked', 'module_local'],
+    ['E', 'a paths alias to the service\'s own wrapper', 'adv-aliased', 'export', VERB_GET, 'unchecked', 'module_local'],
+    ['G', 'a factory returning an unconstrained type parameter', 'adv-tpreturn', 'export', FACTORY('baseURL'), 'unchecked', 'factory_unresolved'],
+    ['G', 'a factory whose conditional return has an any branch', 'adv-cond', 'export', FACTORY('baseURL'), 'unchecked', 'factory_unresolved'],
+    ['G', 'an instance from a conditional return with an any branch', 'adv-cond', 'instance:create', VERB_GET, 'unchecked', 'factory_unresolved'],
+    ['H', 'a member that upper-cases to POST only through Unicode', 'adv-unicode', 'export', { kind: 'verb', member: 'poſt', method: 'POST' }, 'failed', 'method_not_member_verb'],
+    ['H', 'a member that upper-cases to OPTIONS only through Unicode', 'adv-unicode', 'export', { kind: 'verb', member: 'optıons', method: 'OPTIONS' }, 'failed', 'method_not_member_verb'],
+    ['I', 'an instance from another overload than the base-URL key', 'adv-factorysplit', 'instance:create', VERB_GET, 'unchecked', 'factory_unresolved'],
+    ['J', 'a body read through a rest parameter typed by a type parameter', 'adv-restparam', 'export', PATH_BODY('post'), 'unchecked', 'member_untyped'],
+    // Beyond the review's packages: the same definitions, other shapes.
+    ['A', 'an overload typed any beside one that contradicts', 'adv-mixed', 'export', VERB_GET, 'unchecked', 'member_untyped'],
+    ['A', 'a member typed any', 'adv-mixed', 'export', { kind: 'verb', member: 'post', method: 'POST' }, 'unchecked', 'member_untyped'],
+    ['C', 'an options key only Object declares', 'adv-object', 'export', { kind: 'verb_body', member: 'post', args: 'path_options', body_key: 'valueOf' }, 'unchecked', 'member_untyped'],
+  ];
+
+  // True under the amended definitions; they must stay verified.
+  const TRUE_CASES: Array<[string, string, string, Claim]> = [
+    ['request keys on one overload', 'adv-splitsig', 'export', CONFIG_REQUEST],
+    ['a json key on an options type parameter constrained to declare it', 'adv-genopts', 'export', { kind: 'verb_body', member: 'post', args: 'path_options', body_key: 'json' }],
+    ['a factory overload declaring the base-URL key', 'adv-factorysplit', 'export', FACTORY('baseURL')],
+    ['a declared verb beside an index signature typed any', 'adv-indexany', 'export', VERB_GET],
+  ];
+
+  let root: string;
+  let client: SidecarClient;
+  const results = new Map<string, Result>();
+  const idOf = (index: number, pkg: string) => `adv-${index}:${pkg}`;
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-semantics-adv-'));
+    writeTree(root, FILES);
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 'adv-init', action: 'init', repo_root: root });
+    assert.strictEqual(ready.status, 'ready');
+    const checks: Check[] = [
+      ...CASES.map(([, , pkg, receiver, claim], i) => ({ ...check(pkg, receiver, claim), claim_id: idOf(i, pkg) })),
+      ...TRUE_CASES.map(([, pkg, receiver, claim], i) => ({
+        ...check(pkg, receiver, claim),
+        claim_id: idOf(CASES.length + i, pkg),
+      })),
+    ];
+    const response = await client.send<Response>(
+      { request_id: 'adv', action: 'verify_client_semantics', from_dir: root, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(pairs(response.semantics!), pairs(checks));
+    for (const result of response.semantics!) results.set(result.claim_id, result);
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  CASES.forEach(([finding, shows, pkg, receiver, , verdict, reason], i) => {
+    it(`${finding}: ${shows} is ${verdict} (${reason})`, () => {
+      const result = results.get(idOf(i, pkg))!;
+      assert.deepStrictEqual(
+        [result.receiver, result.verdict, result.reason],
+        [receiver, verdict, reason]
+      );
+    });
+  });
+
+  TRUE_CASES.forEach(([shows, pkg], i) => {
+    it(`stays verified: ${shows}`, () => {
+      const result = results.get(idOf(CASES.length + i, pkg))!;
+      assert.deepStrictEqual([result.verdict, result.reason], ['verified', undefined]);
+    });
+  });
+
+  it('reads resolved_file and installed_version from one answer', async () => {
+    const response = await client.send<Response>({
+      request_id: 'adv-modules',
+      action: 'verify_client_semantics',
+      from_dir: root,
+      checks: [check('adv-shadowed', 'export', VERB_GET), check('adv-indexany', 'export', VERB_GET)],
+    });
+    const modules = new Map(response.semantics_modules!.map(m => [m.package, m]));
+    const shadowed = modules.get('adv-shadowed')!;
+    assert.match(shadowed.resolved_file!, /types\/shim\.d\.ts$/);
+    assert.strictEqual(shadowed.installed_version, undefined);
+    assert.strictEqual(shadowed.reason, 'module_local');
+    const installed = modules.get('adv-indexany')!;
+    assert.match(installed.resolved_file!, /node_modules\/adv-indexany\/index\.d\.ts$/);
+    assert.strictEqual(installed.installed_version, '1.0.0');
   });
 });
