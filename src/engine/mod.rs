@@ -11753,7 +11753,26 @@ mod tests {
                  \x20 private api = http.create({ baseURL: \"/inst\" });\n\
                  \x20 static load = () => this.api.get(\"/static-arrow\");\n\
                  \x20 run() { return this.api.get(\"/ran\"); }\n\
-                 }\n",
+                 }\n\
+                 \n\
+                 export class Retarget {\n\
+                 \x20 private svc = http.create({ baseURL: \"/dw\" });\n\
+                 \x20 retarget() { this.svc.defaults.baseURL = \"/elsewhere\"; }\n\
+                 \x20 list() { return this.svc.get(\"/dw-list\"); }\n\
+                 }\n\
+                 \n\
+                 const short = http.create({ baseURL: \"/short\" });\n\
+                 register({ short });\n\
+                 declare function register(clients: object): void;\n\
+                 export function viaShort() { return short.get(\"/shorthand\"); }\n\
+                 \n\
+                 const cjs = http.create({ baseURL: \"/cjs\" });\n\
+                 module.exports.cjs = cjs;\n\
+                 export function viaCjs() { return cjs.get(\"/commonjs\"); }\n\
+                 \n\
+                 const opt = http.create({ baseURL: \"/opt\" });\n\
+                 export function maybe() { return opt?.get(\"/optional\"); }\n\
+                 export function plainCall() { return opt.get(\"/plain-call\"); }\n",
             ),
             (
                 "src/export-defaults.ts",
@@ -11773,7 +11792,12 @@ mod tests {
             .collect();
         assert_eq!(
             stated,
-            vec![(21, "/kept/exported"), (32, "/inst/ran")],
+            vec![
+                (21, "/kept/exported"),
+                (32, "/inst/ran"),
+                (48, "/cjs/commonjs"),
+                (52, "/opt/plain-call"),
+            ],
             "{rows:#?}"
         );
         let rows = library_rows_of(
@@ -11826,7 +11850,27 @@ mod tests {
                  export function known() { return fetch(KNOWN, { ...OPTS }); }\n\
                  export function sent() { return fetch(SENT_URL, { ...SENT }); }\n\
                  export function aliased() { return fetch(ALIASED_URL, { ...ALIASED }); }\n\
-                 export function written() { return fetch(WRITTEN_URL, { ...WRITTEN }); }\n",
+                 export function written() { return fetch(WRITTEN_URL, { ...WRITTEN }); }\n\
+                 \n\
+                 const DELETED_URL = \"/api/deleted\";\n\
+                 const BUMPED_URL = \"/api/bumped\";\n\
+                 const TAKEN_URL = \"/api/taken\";\n\
+                 const SHADOWED_URL = \"/api/shadowed\";\n\
+                 const DELETED = { method: \"POST\", count: 1 };\n\
+                 const BUMPED = { method: \"POST\", count: 1 };\n\
+                 const TAKEN = { method: \"POST\" };\n\
+                 const SHADOWED = { method: \"POST\" };\n\
+                 delete (DELETED as any).method;\n\
+                 BUMPED.count++;\n\
+                 declare const source: { method: string };\n\
+                 ({ method: TAKEN.method } = source);\n\
+                 export function deleted() { return fetch(DELETED_URL, { ...DELETED }); }\n\
+                 export function bumped() { return fetch(BUMPED_URL, { ...BUMPED }); }\n\
+                 export function taken() { return fetch(TAKEN_URL, { ...TAKEN }); }\n\
+                 export function shadowed() {\n\
+                 \x20 let SHADOWED = { method: \"PUT\" };\n\
+                 \x20 return fetch(SHADOWED_URL, { ...SHADOWED });\n\
+                 }\n",
             ),
         ]);
         let rows = library_rows_of(&dir, &discovery, "src/library.ts", &verified_sample());
