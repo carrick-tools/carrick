@@ -70,7 +70,9 @@ base. `http-client.ts:16` is on the export and keeps its row, and the prefix
 client is untouched.
 
 With no `node_modules`, nothing verifies and every row is the one the same
-tree states without library semantics.
+tree states without library semantics. The same holds for the tree as a
+Deno service importing both packages through `npm:` into an empty Deno
+cache: every check is `unchecked` and the scan completes (carrick#1570).
 
 The re-ask rule runs over the same tree without the sidecar: a stored
 detection with no semantics, or with a `pending` entry, is asked once more on

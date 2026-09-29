@@ -101,7 +101,20 @@ enum Install {
     KeyAbsent,
     /// No `node_modules` at all.
     None,
+    /// A Deno service importing both packages through `npm:` specifiers into
+    /// Deno's own cache, which holds nothing: the packages resolve nowhere.
+    DenoUncached,
 }
+
+/// `deno.json` for [`Install::DenoUncached`].
+const DENO_CONFIG: &str = r#"{
+  "nodeModulesDir": "none",
+  "imports": {
+    "@fixture/http": "npm:@fixture/http@^1.4.0",
+    "fixture-prefix-http": "npm:fixture-prefix-http@^2.1.0"
+  }
+}
+"#;
 
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
@@ -151,6 +164,10 @@ fn fixture_copy(tmp: &Path, install: Install) -> (PathBuf, PathBuf) {
             .unwrap();
         }
         Install::None => std::fs::remove_dir_all(repo.join("node_modules")).unwrap(),
+        Install::DenoUncached => {
+            std::fs::remove_dir_all(repo.join("node_modules")).unwrap();
+            std::fs::write(repo.join("deno.json"), DENO_CONFIG).unwrap();
+        }
     }
     run_git(&repo, &["init", "-q"]);
     // The copy's own node_modules is part of the fixture, not an install to
@@ -567,6 +584,42 @@ async fn without_node_modules_every_site_stays_a_candidate() {
     for line in [7, 15] {
         assert!(rows_at(&rows, "src/prefix-client.ts", line).is_empty());
     }
+}
+
+/// A Deno service whose packages the sidecar cannot read (carrick#1570: a
+/// Deno service reads no library semantics yet) scans to the end, and every
+/// site reads as it does without the semantics.
+#[tokio::test]
+#[serial]
+async fn a_deno_service_whose_packages_do_not_resolve_states_no_library_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::DenoUncached);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    // The premise: every check is unchecked, none verified.
+    let sample: carrick::framework_detector::DetectionResult = serde_json::from_str(
+        &std::fs::read_to_string(cassette.join("framework-detect/framework-detect.json")).unwrap(),
+    )
+    .unwrap();
+    let checks = derive_claims(&sample.client_semantics.unwrap()).checks();
+    let results = sidecar
+        .verify_client_semantics(&repo.canonicalize().unwrap(), &checks)
+        .expect("the sidecar answers a Deno service too");
+    assert!(
+        results
+            .iter()
+            .all(|result| result.verdict == SemanticsVerdict::Unchecked),
+        "{results:#?}"
+    );
+
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    assert!(
+        rows.iter().all(|row| row.library_semantics.is_empty()),
+        "{rows:#?}"
+    );
+    assert_eq!(rendered(rows), rendered(without));
 }
 
 /// Two scans of one tree state the same rows, claim ids included.
