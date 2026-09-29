@@ -1,0 +1,11 @@
+{
+  "name": "client-semantics-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.4.0",
+    "@fixture/internal-sdk": "workspace:*",
+    "fixture-prefix-http": "^2.1.0",
+    "fixture-slow-http": "^3.0.2"
+  }
+}
