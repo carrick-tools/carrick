@@ -293,6 +293,17 @@ impl RetryPolicy {
         run_budgeted: true,
     };
 
+    /// A best-effort call whose failure costs nothing: one attempt, no
+    /// retry. The re-ask for library semantics is one (carrick#1564): a
+    /// failure keeps what the service already has, and the next scan asks
+    /// again, so a retry only spends.
+    pub const ONCE: Self = Self {
+        max_attempts: 1,
+        max_delay: Duration::ZERO,
+        wait_budget: Duration::ZERO,
+        run_budgeted: false,
+    };
+
     /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
     /// after `waited` has already been slept on this call.
     fn permits(&self, attempt: u32, waited: Duration, next: Duration) -> bool {
@@ -3004,6 +3015,79 @@ pub(crate) mod tests {
         assert!(
             retry_wait(1, u32::MAX, Some(Duration::from_secs(86_400))) <= RETRY_AFTER_CAP * 3 / 2
         );
+    }
+
+    /// carrick#1564 review, finding 5: the library-semantics re-ask is one
+    /// HTTP attempt. Every connection the server sees is counted, over a
+    /// window longer than the standard policy's first backoff, and a
+    /// retriable failure the standard policy would send again ends the call.
+    #[tokio::test]
+    async fn the_library_semantics_reask_makes_one_http_attempt() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let window = Duration::from_secs(4);
+        let server = std::thread::spawn(move || {
+            let body = r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#;
+            let deadline = std::time::Instant::now() + window;
+            while std::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let complete = text.find("\r\n\r\n").is_some_and(|end| {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        raw.len() >= end + 4 + length
+                    });
+                    if n == 0 || complete {
+                        break;
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 503 X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let result = tokio::time::timeout(
+            window,
+            crate::engine::reask_agent().post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &format!("http://{addr}"),
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            ),
+        )
+        .await
+        .expect("one attempt answers without waiting out a backoff");
+        assert!(result.is_err(), "the failure is the call's answer");
+        server.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     /// The loop link end to end (carrick-cloud#875): the first request says it

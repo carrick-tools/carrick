@@ -139,6 +139,35 @@ pub struct ObjValue {
     pub open: bool,
 }
 
+impl ObjValue {
+    /// Put a spread in place whose possible objects are `branches`: a key it
+    /// sets to the same value on every branch holds that value; a key only
+    /// some branches set, or set to different values, holds nothing the
+    /// source states, and the object is open. Keys no branch carries stand.
+    fn spread(&mut self, branches: &[ObjValue]) {
+        let keys: BTreeSet<&String> = branches
+            .iter()
+            .flat_map(|branch| branch.fields.keys())
+            .collect();
+        for key in keys {
+            let first = branches[0].fields.get(key);
+            let same = first.is_some()
+                && branches
+                    .iter()
+                    .all(|branch| branch.fields.get(key) == first);
+            match first {
+                Some(value) if same => {
+                    self.fields.insert(key.clone(), value.clone());
+                }
+                _ => {
+                    self.fields.remove(key);
+                    self.open = true;
+                }
+            }
+        }
+    }
+}
+
 impl Value {
     fn opaque(text: String) -> Self {
         Value::Str(vec![Piece::Opaque(text)])
@@ -246,6 +275,11 @@ struct ClientRef {
     export: String,
     /// Set when the binding holds an instance the export's factory built.
     instance: Option<ClientInstance>,
+    /// The last property of every assignment the file makes through this
+    /// binding (`api.defaults.baseURL = …` gives `baseURL`). A write to the
+    /// base key through the client changes where its requests go after the
+    /// factory ran, so a reading through it would state the old base.
+    assigned: BTreeSet<String>,
 }
 
 /// `export.factory({ ... })`: the factory member and the object literal it
@@ -351,10 +385,21 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
+    let mut writes = MemberWrites::default();
+    module.visit_with(&mut writes);
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
-        receivers: import_receivers(module),
+        receivers: HashMap::new(),
+        member_writes: writes.by_root,
+        subclass_fields: subclass_fields(module),
     };
+    module_scope.receivers = import_receivers(module)
+        .into_iter()
+        .map(|(name, client)| {
+            let client = module_scope.with_writes(client, &name);
+            (name, client)
+        })
+        .collect();
     // A name some function or block declares again means something else
     // there, and nothing here tracks which scope a use sits in, so it is no
     // client anywhere in the file.
@@ -383,6 +428,7 @@ pub fn extract_file_ir(
                     if let Some(client) = client
                         && !redeclared.contains(&name)
                     {
+                        let client = module_scope.with_writes(client, &name);
                         module_scope.receivers.insert(name.clone(), client);
                     }
                     module_scope.consts.insert(name, value);
@@ -477,6 +523,151 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
 struct ModuleScope {
     consts: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
+    /// [`MemberWrites`] over the whole file.
+    member_writes: HashMap<String, BTreeSet<String>>,
+    /// Class name -> the fields a class in this file that extends it
+    /// declares or writes again.
+    subclass_fields: HashMap<String, HashSet<String>>,
+}
+
+impl ModuleScope {
+    /// `client`, with the properties the file assigns through `binding`.
+    fn with_writes(&self, mut client: ClientRef, binding: &str) -> ClientRef {
+        client.assigned = self.member_writes.get(binding).cloned().unwrap_or_default();
+        client
+    }
+}
+
+/// The last property of every member assignment in a subtree, keyed by the
+/// binding the member chain starts at: `api` for `api.defaults.baseURL = …`,
+/// `this.api` for `this.api.defaults.baseURL = …`.
+#[derive(Default)]
+struct MemberWrites {
+    by_root: HashMap<String, BTreeSet<String>>,
+}
+
+impl Visit for MemberWrites {
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left
+            && let Some(last) = written_key(&member.prop)
+            && let Some(root) = member_root(&member.obj)
+        {
+            self.by_root.entry(root).or_default().insert(last);
+        }
+        assign.visit_children_with(self);
+    }
+}
+
+/// The property a member assignment writes, where the source names it.
+fn written_key(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(Lit::Str(key)) => Some(key.value.to_string()),
+            _ => None,
+        },
+    }
+}
+
+/// The binding a member chain starts at: an identifier, or a field of
+/// `this`.
+fn member_root(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Paren(e) => member_root(&e.expr),
+        Expr::TsAs(e) => member_root(&e.expr),
+        Expr::TsNonNull(e) => member_root(&e.expr),
+        Expr::TsSatisfies(e) => member_root(&e.expr),
+        Expr::TsTypeAssertion(e) => member_root(&e.expr),
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Member(member) => match member.obj.unwrap_parens() {
+            Expr::This(_) => written_key(&member.prop).map(|field| format!("this.{field}")),
+            _ => member_root(&member.obj),
+        },
+        _ => None,
+    }
+}
+
+/// Every class this file declares by name, with the class it extends (when
+/// that is a name) and the fields it declares or writes.
+fn class_fields_by_name(module: &Module) -> HashMap<String, (Option<String>, HashSet<String>)> {
+    #[derive(Default)]
+    struct Classes {
+        found: HashMap<String, (Option<String>, HashSet<String>)>,
+    }
+    impl Classes {
+        fn record(&mut self, name: String, class: &Class) {
+            let superclass = match class.super_class.as_deref().map(Expr::unwrap_parens) {
+                Some(Expr::Ident(ident)) => Some(ident.sym.to_string()),
+                _ => None,
+            };
+            let mut fields = HashSet::new();
+            let mut writes = ThisWrites::default();
+            for member in &class.body {
+                match member {
+                    ClassMember::ClassProp(prop) if !prop.is_static => {
+                        if let Some(name) = prop_name(&prop.key) {
+                            fields.insert(name);
+                        }
+                    }
+                    ClassMember::PrivateProp(prop) if !prop.is_static => {
+                        fields.insert(format!("#{}", prop.key.name));
+                    }
+                    ClassMember::Constructor(ctor) => {
+                        for param in &ctor.params {
+                            if let ParamOrTsParamProp::TsParamProp(prop) = param
+                                && let TsParamPropParam::Ident(ident) = &prop.param
+                            {
+                                fields.insert(ident.id.sym.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                member.visit_with(&mut writes);
+            }
+            fields.extend(writes.fields);
+            self.found.insert(name, (superclass, fields));
+        }
+    }
+    impl Visit for Classes {
+        fn visit_class_decl(&mut self, decl: &ClassDecl) {
+            self.record(decl.ident.sym.to_string(), &decl.class);
+            decl.visit_children_with(self);
+        }
+        fn visit_class_expr(&mut self, expr: &ClassExpr) {
+            if let Some(ident) = &expr.ident {
+                self.record(ident.sym.to_string(), &expr.class);
+            }
+            expr.visit_children_with(self);
+        }
+    }
+    let mut classes = Classes::default();
+    module.visit_with(&mut classes);
+    classes.found
+}
+
+/// Class name -> every field a class extending it, directly or through
+/// others in this file, declares or writes. Such a field holds the
+/// subclass's value on a subclass instance, so the base class's own
+/// methods cannot read it as the base class writes it.
+fn subclass_fields(module: &Module) -> HashMap<String, HashSet<String>> {
+    let classes = class_fields_by_name(module);
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, (superclass, fields)) in &classes {
+        let mut seen: HashSet<&str> = HashSet::from([name.as_str()]);
+        let mut ancestor = superclass.as_deref();
+        while let Some(base) = ancestor {
+            if !seen.insert(base) {
+                break;
+            }
+            out.entry(base.to_string())
+                .or_default()
+                .extend(fields.iter().cloned());
+            ancestor = classes.get(base).and_then(|(sup, _)| sup.as_deref());
+        }
+    }
+    out
 }
 
 /// A class's field table: the value each field holds, and the fields that
@@ -511,6 +702,7 @@ fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
                     package,
                     export,
                     instance: None,
+                    assigned: BTreeSet::new(),
                 },
             );
         }
@@ -716,7 +908,8 @@ impl Reader<'_> {
         definition_keys: &HashSet<String>,
         file: &mut FileIr,
     ) {
-        let fields = self.class_fields(class, module);
+        let redeclared = module.subclass_fields.get(name);
+        let fields = self.class_fields(class, module, redeclared);
         let none = Captured::default();
         let key = |member: &str, is_static: bool| {
             let plain = format!("{name}.{member}");
@@ -727,13 +920,17 @@ impl Reader<'_> {
                 plain
             }
         };
+        // In a static member `this` is the class, not an instance: the
+        // instance field table says nothing about what it holds.
+        let table = |is_static: bool| (!is_static).then_some(&fields);
         for member in &class.body {
             match member {
                 ClassMember::Method(method) if !matches!(method.kind, MethodKind::Setter) => {
                     let Some(member_name) = prop_name(&method.key) else {
                         continue;
                     };
-                    let ir = self.function(&method.function, Some(&fields), module, &none);
+                    let ir =
+                        self.function(&method.function, table(method.is_static), module, &none);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -741,7 +938,8 @@ impl Reader<'_> {
                     if !matches!(method.kind, MethodKind::Setter) =>
                 {
                     let member_name = format!("#{}", method.key.name);
-                    let ir = self.function(&method.function, Some(&fields), module, &none);
+                    let ir =
+                        self.function(&method.function, table(method.is_static), module, &none);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -751,9 +949,11 @@ impl Reader<'_> {
                         continue;
                     };
                     let ir = match &**init {
-                        Expr::Arrow(arrow) => self.arrow(arrow, Some(&fields), module, &none),
+                        Expr::Arrow(arrow) => {
+                            self.arrow(arrow, table(prop.is_static), module, &none)
+                        }
                         Expr::Fn(fn_expr) => {
-                            self.function(&fn_expr.function, Some(&fields), module, &none)
+                            self.function(&fn_expr.function, table(prop.is_static), module, &none)
                         }
                         _ => continue,
                     };
@@ -764,17 +964,28 @@ impl Reader<'_> {
         }
     }
 
-    /// Each field the class assigns exactly once, in its constructor or its
-    /// initialiser, and nowhere else. A constructor parameter read into a field
-    /// is opaque: nothing here follows `new ApiClient(config)` back to the
-    /// value it was built with.
+    /// Each field the class assigns exactly once, in its constructor's own
+    /// statements or its initialiser, and nowhere else. A constructor
+    /// parameter read into a field is opaque: nothing here follows `new
+    /// ApiClient(config)` back to the value it was built with.
+    ///
+    /// Anywhere else is anywhere: a method, a branch or a closure inside the
+    /// constructor, and a class in this file that extends this one and
+    /// declares or writes the field again (`redeclared`), since on its
+    /// instances the base class's methods read the subclass's value.
     ///
     /// A field assigned that way from a library client's factory call holds
     /// that client's instance (carrick#1564).
-    fn class_fields(&self, class: &Class, module: &ModuleScope) -> ClassFields {
+    fn class_fields(
+        &self,
+        class: &Class,
+        module: &ModuleScope,
+        redeclared: Option<&HashSet<String>>,
+    ) -> ClassFields {
         let mut fields: HashMap<String, Value> = HashMap::new();
         let mut receivers: HashMap<String, ClientRef> = HashMap::new();
         let mut contested: HashSet<String> = HashSet::new();
+        let mut nested_writes: HashSet<String> = HashSet::new();
         let mut assign = |name: String,
                           value: Value,
                           client: Option<ClientRef>,
@@ -825,6 +1036,12 @@ impl Reader<'_> {
                     };
                     // Constructor parameters stay opaque: they are read by
                     // name, not as positions a call site could fill.
+                    //
+                    // Only a statement of the constructor's own body is a
+                    // write the field table reads; one inside a branch, a
+                    // loop or a closure may or may not run, and is contested
+                    // like a write from a method.
+                    let mut nested = ThisWrites::default();
                     for stmt in &body.stmts {
                         if let Stmt::Decl(Decl::Var(var)) = stmt {
                             for declarator in &var.decls {
@@ -836,16 +1053,22 @@ impl Reader<'_> {
                                 }
                             }
                         }
-                        if let Some((name, value)) = this_assignment(stmt) {
-                            let client = self.factory_call(value, &scope);
-                            let value = self.eval(value, &scope);
-                            assign(name, value, client, &mut fields);
+                        match this_assignment(stmt) {
+                            Some((name, value)) => {
+                                value.visit_with(&mut nested);
+                                let client = self.factory_call(value, &scope);
+                                let value = self.eval(value, &scope);
+                                assign(name, value, client, &mut fields);
+                            }
+                            None => stmt.visit_with(&mut nested),
                         }
                     }
+                    nested_writes.extend(nested.fields);
                 }
                 _ => {}
             }
         }
+        contested.extend(nested_writes);
 
         // A field written outside the constructor holds whatever the last
         // writer put there.
@@ -855,14 +1078,24 @@ impl Reader<'_> {
                 ClassMember::Method(method) => method.function.visit_with(&mut writes),
                 ClassMember::PrivateMethod(method) => method.function.visit_with(&mut writes),
                 ClassMember::ClassProp(prop) => prop.value.visit_with(&mut writes),
+                ClassMember::PrivateProp(prop) => prop.value.visit_with(&mut writes),
+                ClassMember::StaticBlock(block) => block.visit_with(&mut writes),
                 _ => {}
             }
         }
         contested.extend(writes.fields);
+        contested.extend(redeclared.into_iter().flatten().cloned());
         for name in contested {
             receivers.remove(&name);
             fields.insert(name.clone(), Value::opaque(format!("this.{name}")));
         }
+        let receivers = receivers
+            .into_iter()
+            .map(|(name, client)| {
+                let client = module.with_writes(client, &format!("this.{name}"));
+                (name, client)
+            })
+            .collect();
         // A field holding only a value the class is handed (`this.baseUrl =
         // baseUrl`, a parameter property) is written the way the request
         // writes it; one the class BUILDS is read through.
@@ -964,6 +1197,7 @@ impl Reader<'_> {
                                 names
                             });
                             if declared.counts.get(&name) == Some(&1) {
+                                let client = scope.module.with_writes(client, &name);
                                 scope.local_receivers.insert(name, client);
                             }
                         }
@@ -1138,19 +1372,40 @@ impl Reader<'_> {
         }
     }
 
+    /// An object literal's keys, in source order, so a later entry overwrites
+    /// an earlier one exactly as the runtime does.
+    ///
+    /// A spread, or a computed key, can overwrite what came before it, so a
+    /// key written earlier is kept only where the source says what the later
+    /// entry holds. A spread whose possible keys the source states (an object
+    /// literal, or a condition choosing between them) overwrites exactly those
+    /// keys; any other spread, and any computed key, may overwrite every one,
+    /// and the object is open. A key written after a spread is known.
     fn object(&self, obj: &ObjectLit, scope: &Scope<'_>) -> ObjValue {
         let mut value = ObjValue::default();
         for prop in &obj.props {
-            let PropOrSpread::Prop(prop) = prop else {
-                value.open = true;
-                continue;
+            let prop = match prop {
+                PropOrSpread::Spread(spread) => {
+                    match self.spread_branches(&spread.expr, scope) {
+                        Some(branches) => value.spread(&branches),
+                        None => {
+                            value.fields.clear();
+                            value.open = true;
+                        }
+                    }
+                    continue;
+                }
+                PropOrSpread::Prop(prop) => prop,
             };
             match &**prop {
                 Prop::KeyValue(kv) => match prop_name(&kv.key) {
                     Some(key) => {
                         value.fields.insert(key, self.eval(&kv.value, scope));
                     }
-                    None => value.open = true,
+                    None => {
+                        value.fields.clear();
+                        value.open = true;
+                    }
                 },
                 Prop::Shorthand(ident) => {
                     let expr = Expr::Ident(ident.clone());
@@ -1158,10 +1413,55 @@ impl Reader<'_> {
                         .fields
                         .insert(ident.sym.to_string(), self.eval(&expr, scope));
                 }
-                _ => value.open = true,
+                // A method, a getter or a setter: its key holds no value this
+                // pass reads.
+                other => {
+                    match other {
+                        Prop::Method(MethodProp { key, .. })
+                        | Prop::Getter(GetterProp { key, .. })
+                        | Prop::Setter(SetterProp { key, .. }) => match prop_name(key) {
+                            Some(name) => {
+                                value.fields.remove(&name);
+                            }
+                            None => value.fields.clear(),
+                        },
+                        _ => {}
+                    }
+                    value.open = true;
+                }
             }
         }
         value
+    }
+
+    /// The objects a spread may put in place, when the source states every
+    /// key each one can carry: an object literal, a `cond ? {…} : {…}`
+    /// choice, `cond && {…}`, or a constant holding one. `None` for anything
+    /// else, which may carry any key.
+    fn spread_branches(&self, expr: &Expr, scope: &Scope<'_>) -> Option<Vec<ObjValue>> {
+        let known = |value: ObjValue| (!value.open).then_some(vec![value]);
+        match expr {
+            Expr::Paren(paren) => self.spread_branches(&paren.expr, scope),
+            Expr::TsAs(e) => self.spread_branches(&e.expr, scope),
+            Expr::TsSatisfies(e) => self.spread_branches(&e.expr, scope),
+            Expr::TsNonNull(e) => self.spread_branches(&e.expr, scope),
+            Expr::Object(obj) => known(self.object(obj, scope)),
+            Expr::Cond(cond) => {
+                let mut branches = self.spread_branches(&cond.cons, scope)?;
+                branches.extend(self.spread_branches(&cond.alt, scope)?);
+                Some(branches)
+            }
+            // Spreading a falsy left side adds nothing.
+            Expr::Bin(bin) if bin.op == BinaryOp::LogicalAnd => {
+                let mut branches = self.spread_branches(&bin.right, scope)?;
+                branches.push(ObjValue::default());
+                Some(branches)
+            }
+            other => match self.eval(other, scope) {
+                Value::Obj(value) => known(value),
+                _ => None,
+            },
+        }
     }
 
     /// Whether `call` is shaped like a request, and what it sends if so.
@@ -1281,14 +1581,25 @@ impl Reader<'_> {
                 None if verb.is_some() => MethodValue::Lit(verb.clone().unwrap_or_default()),
                 // A bag stating no method and carrying no body is a GET, the
                 // default every fetch-shaped client applies. A body with no
-                // method is a verb someone else supplies.
-                None if obj.fields.contains_key("body") || obj.fields.contains_key("data") => {
+                // method is a verb someone else supplies, and so may be a
+                // method a spread or a computed key puts in the bag.
+                None if obj.open
+                    || obj.fields.contains_key("body")
+                    || obj.fields.contains_key("data") =>
+                {
                     MethodValue::Unknown
                 }
                 None => MethodValue::Lit("GET".to_string()),
             },
             None => match &verb {
                 Some(verb) => MethodValue::Lit(verb.clone()),
+                // `fetch(url, { ...init })`: the options are an object whose
+                // method a spread may set.
+                None if kind == RequestKind::Fetch
+                    && matches!(args.get(1), Some(Value::Obj(options)) if options.open) =>
+                {
+                    MethodValue::Unknown
+                }
                 None => MethodValue::Lit("GET".to_string()),
             },
         };
@@ -1374,6 +1685,8 @@ impl Reader<'_> {
                 factory,
                 options: self.object(options_literal, scope),
             }),
+            // Filled in by the caller, which knows the binding it goes to.
+            assigned: BTreeSet::new(),
         })
     }
 
@@ -2372,11 +2685,16 @@ fn shape_of<'c>(call: &'c CallIr, semantics: &LibrarySemantics) -> Option<Cow<'c
 /// claims its package's declarations verified (carrick#1564).
 ///
 /// `None` whenever those claims do not state both the URL and the method:
-/// the receiver or its factory did not verify, the instance's options hide
-/// the base key behind a spread, or a request call writes no literal
-/// method (a library's default is never assumed). The call then keeps the
-/// reading it has without the semantics. A body is read only through a
+/// the receiver or its factory did not verify, or a request call writes no
+/// literal method (a library's default is never assumed). The call then keeps
+/// the reading it has without the semantics. A body is read only through a
 /// verified body claim.
+///
+/// `None` too wherever the source may set a base the reading would not see:
+/// the file assigns a base key through the client (`api.defaults.baseURL =
+/// …`), the factory's options are open to a spread, or an options or config
+/// object handed to the call is open or names a base key itself. Every base
+/// key detection claims for the client counts, verified or not.
 fn library_shape(
     receiver: &CallReceiver,
     args: &[Value],
@@ -2386,6 +2704,10 @@ fn library_shape(
         return None;
     }
     let client = &receiver.client;
+    let base_keys = semantics.claimed_base_keys(&client.package, &client.export);
+    if base_keys.iter().any(|key| client.assigned.contains(*key)) {
+        return None;
+    }
     let mut used: BTreeSet<String> = BTreeSet::new();
     let (surface, base) = match &client.instance {
         None => (
@@ -2399,12 +2721,14 @@ fn library_shape(
                 &client.export,
                 &instance_receiver(&instance.factory),
             )?;
+            if instance.options.open {
+                return None;
+            }
             // The base is the literal or opaque value the options hold, or
             // none when they do not name the key at all.
             let base = match instance.options.fields.get(&factory.base_url_key) {
                 Some(Value::Str(pieces)) => pieces.clone(),
                 Some(_) => return None,
-                None if instance.options.open => return None,
                 None => Vec::new(),
             };
             used.insert(factory.claim_id.clone());
@@ -2412,11 +2736,29 @@ fn library_shape(
         }
     };
 
-    let (method, url, body, body_claim) = match receiver
+    let verb = receiver
         .member
         .as_deref()
-        .and_then(|member| surface.verb(member))
-    {
+        .and_then(|member| surface.verb(member));
+    // The data a `(path, body)` verb sends is not options: a spread in it,
+    // or a field that happens to share a base key's name, says nothing
+    // about where the request goes.
+    let body_argument = verb
+        .and_then(|verb| verb.body.as_ref())
+        .filter(|claim| claim.args == SemanticsVerbArgs::PathBody)
+        .map(|_| 1);
+    for (index, arg) in args.iter().enumerate() {
+        if Some(index) == body_argument {
+            continue;
+        }
+        if let Value::Obj(object) = arg
+            && (object.open || base_keys.iter().any(|key| object.fields.contains_key(*key)))
+        {
+            return None;
+        }
+    }
+
+    let (method, url, body, body_claim) = match verb {
         Some(verb) => {
             let Some(Value::Str(url)) = args.first() else {
                 return None;
@@ -2506,10 +2848,19 @@ fn library_shape(
 /// Joined with exactly one slash between them, and a path that is itself an
 /// absolute URL ignores the base, as a client resolving against a base does.
 /// A path that does not start with text the source writes says nothing about
-/// the slash between the two, so the join states no URL.
+/// the slash between the two, so the join states no URL. An empty base is no
+/// base, and a base holding a query or a fragment states no URL: the path
+/// would land after it.
 fn join_base(base: &[Piece], path: &[Piece]) -> Vec<Piece> {
+    let base = concat([base.to_vec()]);
     if base.is_empty() {
         return path.to_vec();
+    }
+    if base
+        .iter()
+        .any(|piece| matches!(piece, Piece::Lit(text) if text.contains(['?', '#'])))
+    {
+        return vec![Piece::Unknown];
     }
     let Some(Piece::Lit(first)) = path.first() else {
         return vec![Piece::Unknown];
@@ -2709,6 +3060,57 @@ mod tests {
         );
         // A path that does not start with text says nothing about the slash.
         assert_eq!(joined(&[lit("/api")], &[opaque("path")]), None);
+        // An empty base is no base: a path with no slash of its own is not
+        // a route.
+        assert_eq!(joined(&[lit("")], &[lit("users")]), None);
+        assert_eq!(
+            joined(&[lit("")], &[lit("/users")]).as_deref(),
+            Some("/users")
+        );
+        // A base holding a query or a fragment would put the path after it.
+        assert_eq!(joined(&[lit("/api?v=1")], &[lit("/users")]), None);
+        assert_eq!(joined(&[lit("/api#top")], &[lit("/users")]), None);
+    }
+
+    /// A spread overwrites the keys it may carry, and only those: every key
+    /// when the source does not state them, the literal's own keys when it
+    /// does, and a key only some branches set becomes unknown.
+    #[test]
+    fn a_spread_overwrites_exactly_the_keys_it_may_carry() {
+        let mut value = ObjValue::default();
+        value
+            .fields
+            .insert("action".to_string(), Value::Str(vec![lit("sync")]));
+        value
+            .fields
+            .insert("limit".to_string(), Value::Str(vec![lit("5")]));
+        value.spread(&[
+            ObjValue {
+                fields: BTreeMap::from([("limit".to_string(), Value::Str(vec![lit("1")]))]),
+                open: false,
+            },
+            ObjValue::default(),
+        ]);
+        assert_eq!(
+            value.fields.keys().collect::<Vec<_>>(),
+            vec!["action"],
+            "the key one branch sets is unknown, the rest stand"
+        );
+        assert!(value.open);
+
+        let mut same = ObjValue::default();
+        same.spread(&[
+            ObjValue {
+                fields: BTreeMap::from([("op".to_string(), Value::Str(vec![lit("x")]))]),
+                open: false,
+            },
+            ObjValue {
+                fields: BTreeMap::from([("op".to_string(), Value::Str(vec![lit("x")]))]),
+                open: false,
+            },
+        ]);
+        assert_eq!(same.fields.get("op"), Some(&Value::Str(vec![lit("x")])));
+        assert!(!same.open, "every branch states the same value");
     }
 
     #[test]

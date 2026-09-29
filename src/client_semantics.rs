@@ -545,6 +545,9 @@ struct VerifiedClient {
     factories: BTreeMap<String, VerifiedFactory>,
     /// `"export"` or `"instance:<factory>"` -> its surface.
     receivers: BTreeMap<String, ReceiverSurface>,
+    /// Every base-URL key detection claims for the client's factories,
+    /// verified or not: a call that sets one itself may move the base.
+    claimed_base_keys: BTreeSet<String>,
 }
 
 /// The library semantics a request summary may use: exactly the
@@ -563,6 +566,21 @@ impl LibrarySemantics {
     /// The verified factory `member` of `package`'s `export`.
     pub fn factory(&self, package: &str, export: &str, member: &str) -> Option<&VerifiedFactory> {
         self.client(package, export)?.factories.get(member)
+    }
+
+    /// Every base-URL key detection claims for `package`'s `export`,
+    /// whether or not its factory verified. A reading of a call has to refuse
+    /// wherever the source may set one of them itself.
+    pub fn claimed_base_keys(&self, package: &str, export: &str) -> Vec<&str> {
+        self.client(package, export)
+            .map(|client| {
+                client
+                    .claimed_base_keys
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// What `receiver` (`"export"` or `"instance:<factory>"`) of `package`'s
@@ -599,7 +617,14 @@ impl LibrarySemantics {
     fn build(derived: &DerivedClaims, verified: impl Fn(&str, &str) -> bool) -> Self {
         let mut semantics = LibrarySemantics::default();
         for (client_key, client) in &derived.clients {
-            let mut out = VerifiedClient::default();
+            let mut out = VerifiedClient {
+                claimed_base_keys: client
+                    .factories
+                    .values()
+                    .map(|(_, key)| key.clone())
+                    .collect(),
+                ..VerifiedClient::default()
+            };
             for (member, (claim_id, base_url_key)) in &client.factories {
                 if verified(claim_id, EXPORT_RECEIVER) {
                     out.factories.insert(
@@ -788,25 +813,27 @@ fn answers_every_check(checks: &[SemanticsCheck], results: &[SemanticsResult]) -
 }
 
 /// Whether a cached detection should be asked again for its library
-/// semantics: it was never asked (`None`) or an entry is still `pending`,
-/// and at least one of its data fetchers is installed, so an answer could
-/// be verified and used.
+/// semantics, where an answer could be verified and used: it was never
+/// asked (`None`) and one of its data fetchers is installed, or an entry is
+/// still `pending` for a package that is installed itself.
 pub fn wants_reask(
     semantics: Option<&[ClientSemanticsEntry]>,
     data_fetchers: &[String],
     service_root: &Path,
     repo_root: &Path,
 ) -> bool {
-    let unanswered = match semantics {
-        None => true,
-        Some(entries) => entries
+    match semantics {
+        None => data_fetchers
             .iter()
-            .any(|entry| entry.status == SemanticsStatus::Pending),
-    };
-    unanswered
-        && data_fetchers
-            .iter()
-            .any(|package| installed(package, service_root, repo_root))
+            .any(|package| installed(package, service_root, repo_root)),
+        // A package still pending is worth asking about only where its own
+        // answer could be verified: one that is not installed would be asked
+        // again on every scan for nothing.
+        Some(entries) => entries.iter().any(|entry| {
+            entry.status == SemanticsStatus::Pending
+                && installed(&entry.package, service_root, repo_root)
+        }),
+    }
 }
 
 /// Whether `package` has an installed manifest in a `node_modules` at or
@@ -1211,12 +1238,6 @@ mod tests {
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         std::fs::write(&manifest, "{}").unwrap();
         assert!(wants_reask(None, &fetchers, &service, repo.path()));
-        assert!(wants_reask(
-            Some(&sample_entries()),
-            &fetchers,
-            &service,
-            repo.path()
-        ));
         assert!(!wants_reask(
             Some(&answered),
             &fetchers,
@@ -1224,5 +1245,25 @@ mod tests {
             repo.path()
         ));
         assert!(!wants_reask(None, &[], &service, repo.path()));
+
+        // The sample's pending package is not installed: asking again could
+        // not change a row, however many other fetchers are installed.
+        assert!(!wants_reask(
+            Some(&sample_entries()),
+            &fetchers,
+            &service,
+            repo.path()
+        ));
+        let pending = repo
+            .path()
+            .join("node_modules/fixture-slow-http/package.json");
+        std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        std::fs::write(&pending, "{}").unwrap();
+        assert!(wants_reask(
+            Some(&sample_entries()),
+            &fetchers,
+            &service,
+            repo.path()
+        ));
     }
 }

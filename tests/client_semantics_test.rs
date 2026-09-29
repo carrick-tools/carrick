@@ -104,6 +104,9 @@ enum Install {
     /// A Deno service importing both packages through `npm:` specifiers into
     /// Deno's own cache, which holds nothing: the packages resolve nowhere.
     DenoUncached,
+    /// The vendored declarations, and the package detection leaves
+    /// `pending` installed too.
+    PendingInstalled,
 }
 
 /// `deno.json` for [`Install::DenoUncached`].
@@ -167,6 +170,15 @@ fn fixture_copy(tmp: &Path, install: Install) -> (PathBuf, PathBuf) {
         Install::DenoUncached => {
             std::fs::remove_dir_all(repo.join("node_modules")).unwrap();
             std::fs::write(repo.join("deno.json"), DENO_CONFIG).unwrap();
+        }
+        Install::PendingInstalled => {
+            let manifest = repo.join("node_modules/fixture-slow-http/package.json");
+            std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+            std::fs::write(
+                manifest,
+                r#"{ "name": "fixture-slow-http", "version": "3.0.2" }"#,
+            )
+            .unwrap();
         }
     }
     run_git(&repo, &["init", "-q"]);
@@ -449,6 +461,104 @@ async fn a_map_is_never_read_as_the_client() {
         .filter(|row| row.file_location.contains("src/negatives.ts"))
         .collect();
     assert!(negatives.is_empty(), "{negatives:#?}");
+}
+
+/// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a
+/// base key written through the instance, a base named in the call's own
+/// options, options and a config open to a spread, a field a constructor
+/// branch writes again, a field a subclass declares again, a static member
+/// reading `this`, and a block redeclaring the instance's name. Each reads
+/// exactly as the same tree does without the semantics; the one row they add
+/// is the instance method reading its own class's instance field.
+#[tokio::test]
+#[serial]
+async fn the_reviews_adversarial_sites_read_as_they_do_without_semantics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    let in_file = |rows: &[DataFetchingCall], file: &str| -> Vec<DataFetchingCall> {
+        rows.iter()
+            .filter(|row| row.file_location.contains(file))
+            .cloned()
+            .collect()
+    };
+    for file in [
+        "src/a1-mutated.ts",
+        "src/a2-percall-base.ts",
+        "src/a3-spread-after.ts",
+        "src/a4-ctor-branch.ts",
+        "src/a13-inherit.ts",
+    ] {
+        assert_eq!(
+            rendered(in_file(&rows, file)),
+            rendered(in_file(&without, file)),
+            "{file} reads as it does without the semantics"
+        );
+    }
+
+    // What that is: the receiver-type rows the site's own literals state,
+    // and nothing where the receiver's type says nothing.
+    let receiver = ResolutionSource::ReceiverType;
+    assert_unread_row(&rows, "src/a1-mutated.ts", 7, receiver, "GET", "/mutated");
+    assert_unread_row(
+        &rows,
+        "src/a2-percall-base.ts",
+        6,
+        receiver,
+        "GET",
+        "/users",
+    );
+    assert_unread_row(
+        &rows,
+        "src/a2-percall-base.ts",
+        10,
+        receiver,
+        "GET",
+        "/plain",
+    );
+    assert_unread_row(
+        &rows,
+        "src/a3-spread-after.ts",
+        7,
+        receiver,
+        "GET",
+        "/spread",
+    );
+    assert_unread_row(
+        &rows,
+        "src/a13-inherit.ts",
+        20,
+        receiver,
+        "GET",
+        "/outer-ok",
+    );
+    for (file, line) in [
+        ("src/a3-spread-after.ts", 11),
+        ("src/a4-ctor-branch.ts", 12),
+        ("src/a13-inherit.ts", 6),
+        ("src/a13-inherit.ts", 18),
+        ("src/a5-static.ts", 7),
+    ] {
+        assert!(
+            rows_at(&rows, file, line).is_empty(),
+            "{file}:{line}: {rows:#?}"
+        );
+    }
+    assert_library_row(
+        &rows,
+        "src/a5-static.ts",
+        10,
+        "GET",
+        "/instance/ran",
+        &[
+            "@fixture/http@1:default:factory:create",
+            "@fixture/http@1:default:verb:get",
+        ],
+    );
 }
 
 /// A claimed option key the declarations do not have fails the factory
@@ -763,12 +873,13 @@ async fn a_reask_that_names_other_packages_asks_for_guidance_again() {
     assert!(detection.client_semantics.is_some());
 }
 
-/// An entry still `pending` is asked again on the next scan.
+/// An entry still `pending` for a package that is installed is asked again
+/// on the next scan.
 #[tokio::test]
 #[serial]
 async fn a_pending_entry_is_asked_again() {
     let tmp = tempfile::tempdir().unwrap();
-    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::PendingInstalled);
     mock_env(&cassette);
     let storage = StubStorage::default();
     let first = scan(&storage, &repo, None).await;
@@ -784,6 +895,60 @@ async fn a_pending_entry_is_asked_again() {
 
     let (_, detect, guidance) = scan_counting(&storage, &repo).await;
     assert_eq!((detect, guidance), (1, 0));
+}
+
+/// A `pending` package that is not installed is not asked about again,
+/// however many other data fetchers are: no answer about it could be
+/// verified (carrick#1564 review, finding 7).
+#[tokio::test]
+#[serial]
+async fn a_pending_package_that_is_not_installed_is_not_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+    scan(&storage, &repo, None).await;
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (0, 0));
+}
+
+/// When a run retries the work it still owes, the service's previous
+/// generation is this run's own blob, asked minutes ago: its `pending`
+/// entry is not asked about again in the same run (carrick#1564 review,
+/// finding 5).
+#[tokio::test]
+#[serial]
+async fn a_retry_of_owed_work_does_not_ask_again_in_the_same_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::PendingInstalled);
+    mock_env(&cassette);
+    // SAFETY: every test in this binary is `#[serial]`.
+    unsafe {
+        std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "0");
+    }
+    // One analysis fails, so the service owes it and the run retries it.
+    carrick::agent_service::inject_mock_failure("/analyze-file", "JobsGateway", 1);
+    let (data, detect, _) = scan_counting(&StubStorage::default(), &repo).await;
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var(carrick::engine::durability::RETRY_DELAY_ENV);
+    }
+    assert!(
+        data.file_results.as_ref().is_some_and(|answers| answers
+            .keys()
+            .any(|file| file.ends_with("prefix-client.ts"))),
+        "the run retried the file it owed, and the retry answered"
+    );
+    assert_eq!(detect, 1, "one detection for the run, and no re-ask in it");
+    assert!(
+        data.cached_detection
+            .and_then(|detection| detection.client_semantics)
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry.status == SemanticsStatus::Pending)),
+        "the pending entry is still there for the next run to ask about"
+    );
 }
 
 /// Every entry answered (or skipped): nothing is asked again.

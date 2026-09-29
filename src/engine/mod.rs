@@ -751,7 +751,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             previous_generation(previous_generations, &repo_name, service)
         };
         match scan
-            .analyze(index, service, previous_data.as_ref(), &mut workspace_scan)
+            .analyze(
+                index,
+                service,
+                previous_data.as_ref(),
+                PreviousGeneration::Stored,
+                &mut workspace_scan,
+            )
             .await
         {
             Ok(run) => runs.push(run),
@@ -891,7 +897,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             // answer it holds replays, and only what it lacks is asked for.
             let this_run = runs[index].data.clone();
             match scan
-                .analyze(index, service, Some(&this_run), &mut workspace_scan)
+                .analyze(
+                    index,
+                    service,
+                    Some(&this_run),
+                    PreviousGeneration::ThisRun,
+                    &mut workspace_scan,
+                )
                 .await
             {
                 Ok(run) => runs[index] = run,
@@ -1649,6 +1661,7 @@ impl ServiceScan<'_> {
         index: usize,
         service: &Config,
         previous_data: Option<&CloudRepoData>,
+        generation: PreviousGeneration,
         workspace: &mut crate::external_call_candidates::WorkspaceScan,
     ) -> Result<ServiceRun, Box<dyn std::error::Error>> {
         // One line per service, at info, before the work starts. A scan of a
@@ -1690,6 +1703,7 @@ impl ServiceScan<'_> {
             &packages,
             self.sidecar,
             previous_data,
+            generation,
             workspace,
             self.run_intents,
             self.graphql_schemas,
@@ -2719,6 +2733,17 @@ fn reusable_model_answers(
         .collect()
 }
 
+/// Where a service's previous generation comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousGeneration {
+    /// The blob an earlier scan stored (or none at all).
+    Stored,
+    /// This run's own blob, re-entered to retry the work it still owes. What
+    /// it holds was asked for minutes ago, so nothing in it is asked again
+    /// for its own sake (carrick#1564: the library-semantics re-ask).
+    ThisRun,
+}
+
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
 #[allow(clippy::too_many_arguments)]
 async fn analyze_current_repo_incremental(
@@ -2727,6 +2752,7 @@ async fn analyze_current_repo_incremental(
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
+    generation: PreviousGeneration,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
@@ -2876,6 +2902,7 @@ async fn analyze_current_repo_incremental(
                     debug!("Reusing cached framework detection and guidance");
                     match reask_client_semantics(
                         det,
+                        generation,
                         packages,
                         &all_import_facts,
                         &service_scan_root(repo_path, config),
@@ -3348,18 +3375,21 @@ enum Reask {
 /// data fetchers is installed and could verify an answer. This replaces a
 /// `CACHE_VERSION` bump, which would re-analyse every repo cold.
 ///
-/// Best-effort and asked once, under the ordinary retry policy: a failure
-/// keeps the cached detection and never defers the service. When the answer
-/// names the same packages in all four lists, the cached guidance and
-/// extraction config stand and only the semantics are taken.
+/// Best-effort: one HTTP attempt ([`reask_agent`]), and at most once a run,
+/// never when the cached detection is this run's own (a retry of owed work).
+/// A failure keeps the cached detection and never defers the service. When
+/// the answer names the same packages in all four lists, the cached guidance
+/// and extraction config stand and only the semantics are taken.
 async fn reask_client_semantics(
     cached: &DetectionResult,
+    generation: PreviousGeneration,
     packages: &Packages,
     import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
     service_root: &Path,
     repo_root: &Path,
 ) -> Reask {
     if crate::local_mode::no_model()
+        || generation == PreviousGeneration::ThisRun
         || !crate::client_semantics::wants_reask(
             cached.client_semantics.as_deref(),
             &cached.data_fetchers,
@@ -3370,7 +3400,7 @@ async fn reask_client_semantics(
         return Reask::Kept(cached.clone());
     }
     debug!("Asking framework detection again for this service's library semantics");
-    match FrameworkDetector::new(AgentService::new())
+    match FrameworkDetector::new(reask_agent())
         .detect_frameworks_and_libraries(packages, import_facts)
         .await
     {
@@ -3387,6 +3417,12 @@ async fn reask_client_semantics(
             Reask::Kept(cached.clone())
         }
     }
+}
+
+/// The client the library-semantics re-ask is sent with: one HTTP attempt,
+/// no retry, because a failure costs nothing the next scan does not fix.
+pub(crate) fn reask_agent() -> AgentService {
+    AgentService::new().with_retry_policy(crate::agent_service::RetryPolicy::ONCE)
 }
 
 /// A detection an earlier pass of this service already has, with the
@@ -11429,6 +11465,12 @@ mod tests {
                 "src/shadow.ts",
                 "import http from \"@fixture/http\";\n\nexport function shadowed() {\n  const http = new Map<string, string>();\n  return http.get(\"/shadow\");\n}\n\nexport function looped(keys: string[]) {\n  for (const http of [new Map<string, string>()]) {\n    http.get(\"/loop\");\n  }\n}\n",
             ),
+            // A block inside the function declares the instance's name again:
+            // nothing tracks which one a use means, so neither is read.
+            (
+                "src/block.ts",
+                "import http from \"@fixture/http\";\n\nexport function block() {\n  const api = http.create({ baseURL: \"/outer\" });\n  {\n    const api = new Map<string, string>();\n    api.get(\"/inner-map\");\n  }\n  return api.get(\"/outer-ok\");\n}\n",
+            ),
         ]);
         // Without verified semantics a verb call states no row at its own
         // site; the config-object call at line 23 is a request by its own
@@ -11441,10 +11483,171 @@ mod tests {
             "{plain:#?}"
         );
         assert!(plain.iter().all(|row| row.library_semantics.is_empty()));
-        for file in ["src/negatives.ts", "src/shadow.ts"] {
+        for file in ["src/negatives.ts", "src/shadow.ts", "src/block.ts"] {
             let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
             assert!(rows.is_empty(), "{file}: {rows:#?}");
         }
+    }
+
+    /// carrick#1564 review, findings 1 and 3: wherever the source may set the
+    /// base itself, nothing is read through the client. A base key written
+    /// through the client after the factory ran, options open to a spread,
+    /// and an options or config object that names a base key or is open, all
+    /// leave the call as it reads without the semantics. The data a `(path,
+    /// body)` verb sends is not options, so a spread there changes nothing.
+    #[test]
+    fn a_base_the_source_may_set_elsewhere_reads_nothing_through_the_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/overrides.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             declare const overrides: { baseURL?: string };\n\
+             const api = http.create({ baseURL: \"/v1\" });\n\
+             const mutated = http.create({ baseURL: \"/v1\" });\n\
+             (mutated as any).defaults.baseURL = \"/v2\";\n\
+             const spread = http.create({ baseURL: \"/v1\", ...overrides });\n\
+             \n\
+             export function a() { return mutated.get(\"/mutated\"); }\n\
+             export function b() { return api.get(\"/users\", { baseURL: \"/override\" } as any); }\n\
+             export function c() { return http.get(\"/plain\", { baseURL: \"/elsewhere\" } as any); }\n\
+             export function d() { return spread.get(\"/spread\"); }\n\
+             export function e(cfg: object) { return http.request({ url: \"/cfg\", method: \"post\", ...cfg }); }\n\
+             export function f(d: unknown) { return api.post(\"/body\", d, { baseURL: \"/over\" } as any); }\n\
+             export function g(order: object) { return api.post(\"/orders\", { ...order, status: \"new\" }); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/overrides.ts", &verified_sample());
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(15, "POST", "/v1/orders")],
+            "only the call whose body alone is spread reads through the client: {rows:#?}"
+        );
+        assert_eq!(
+            rows[0].body_literals.get("status").map(String::as_str),
+            Some("new"),
+            "a key written after the spread is the body's own"
+        );
+    }
+
+    /// carrick#1564 review, findings 2 and 4 on the library path: a field a
+    /// constructor branch writes again, a field a subclass in the file
+    /// declares again, and a static member reading `this` hold no instance;
+    /// an instance field read by an instance method still does.
+    #[test]
+    fn a_field_written_twice_or_read_statically_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/fields.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             export class Gateway {\n\
+             \x20 private api;\n\
+             \x20 constructor(beta: boolean) {\n\
+             \x20   this.api = http.create({ baseURL: \"/stable\" });\n\
+             \x20   if (beta) {\n\
+             \x20     this.api = http.create({ baseURL: \"/beta\" });\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 list() { return this.api.get(\"/items\"); }\n\
+             }\n\
+             \n\
+             export class Both {\n\
+             \x20 static api = http.create({ baseURL: \"/static\" });\n\
+             \x20 api = http.create({ baseURL: \"/instance\" });\n\
+             \x20 static load() { return this.api.get(\"/loaded\"); }\n\
+             \x20 run() { return this.api.get(\"/ran\"); }\n\
+             }\n\
+             \n\
+             export class BaseApi {\n\
+             \x20 protected api = http.create({ baseURL: \"/default\" });\n\
+             \x20 list() { return this.api.get(\"/items\"); }\n\
+             }\n\
+             \n\
+             export class UsersApi extends BaseApi {\n\
+             \x20 protected api = http.create({ baseURL: \"/users-svc\" });\n\
+             }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/fields.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(18, "/instance/ran")], "{rows:#?}");
+    }
+
+    /// The review's Phase 1 shapes with no library at all (carrick#1564
+    /// review, findings 1 and 2, in code carrick#1555 shipped): a method or a
+    /// body key written before a spread the source cannot read, a URL field
+    /// a constructor branch writes again, a URL field a subclass redeclares,
+    /// and a static method reading `this.url`. None states a row, while a key
+    /// written after a spread, and a spread whose keys the source states,
+    /// keep theirs.
+    #[test]
+    fn a_value_the_source_may_overwrite_states_nothing_in_a_request_summary() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/phase1.ts",
+            "const BASE = process.env.API_URL;\n\
+             \n\
+             export class Sender {\n\
+             \x20 private url = `${BASE}/rpc`;\n\
+             \x20 before(opts: object) { return fetch(this.url, { method: \"POST\", ...opts }); }\n\
+             \x20 after(opts: object) { return fetch(this.url, { ...opts, method: \"PUT\" }); }\n\
+             \x20 body(extra: object) {\n\
+             \x20   return fetch(this.url, { method: \"POST\", body: JSON.stringify({ action: \"sync\", ...extra }) });\n\
+             \x20 }\n\
+             \x20 known(flag: boolean) {\n\
+             \x20   return fetch(this.url, { method: \"POST\", body: JSON.stringify({ action: \"poll\", ...(flag ? { limit: 1 } : {}) }) });\n\
+             \x20 }\n\
+             }\n\
+             \n\
+             export class Branchy {\n\
+             \x20 private url: string;\n\
+             \x20 constructor(beta: boolean) {\n\
+             \x20   this.url = `${BASE}/v1/items`;\n\
+             \x20   if (beta) {\n\
+             \x20     this.url = `${BASE}/beta/items`;\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 list() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n\
+             \n\
+             export class Parent {\n\
+             \x20 protected url = `${BASE}/parent/items`;\n\
+             \x20 list() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n\
+             \n\
+             export class Child extends Parent {\n\
+             \x20 protected url = `${BASE}/child/items`;\n\
+             }\n\
+             \n\
+             export class Statics {\n\
+             \x20 url = `${BASE}/instance/items`;\n\
+             \x20 static load() { return fetch(this.url, { method: \"GET\" }); }\n\
+             }\n",
+        )]);
+        let rows = summary_rows_of(&dir, &discovery, "src/phase1.ts");
+        let stated: Vec<(u32, &str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.line,
+                    row.method.as_str(),
+                    row.target.as_str(),
+                    row.body_literals.get("action").map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (6, "PUT", "${process.env.API_URL}/rpc", None),
+                (8, "POST", "${process.env.API_URL}/rpc", None),
+                (11, "POST", "${process.env.API_URL}/rpc", Some("poll")),
+            ],
+            "{rows:#?}"
+        );
     }
 
     /// carrick#1564: an instance is read only when its factory's own claim
