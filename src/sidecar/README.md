@@ -412,7 +412,7 @@ Response:
 }
 ```
 
-`semantics` holds exactly one result per check, in request order. The claim kinds are `factory`, `verb`, `verb_body` (`args` `path_body` or `path_options`, optional `body_key`), `request` (`member` null means the receiver itself is called; `args` `config` with `url_key`, or `path_options`; `method_key`) and `request_body` (`args` and `body_key`). `verdict` is `verified` (the declarations satisfy the claim), `failed` (they resolved and contradict it) or `unchecked` (they could not be read); `reason` is absent exactly when `verified`. The scanner drops `failed` and `unchecked` alike.
+`semantics` holds exactly one result per check, in request order. The claim kinds are `factory`, `verb`, `verb_body` (`args` `path_body` or `path_options`, optional `body_key`), `request` (`member` null means the receiver itself is called; `args` `config` with `url_key`, or `path_options`; `method_key`) and `request_body` (the same `member`, `args`, `url_key` and `method_key` as its `request` claim, plus `body_key`). `verdict` is `verified` (the declarations satisfy the claim), `failed` (they resolved and contradict it) or `unchecked` (they could not be read); `reason` is absent exactly when `verified`. The scanner drops `failed` and `unchecked` alike.
 
 An export typed `any` or `unknown` verifies nothing, so an untyped package or a shorthand `declare module "x";` answers `unchecked`. The reasons:
 

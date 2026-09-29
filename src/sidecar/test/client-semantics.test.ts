@@ -214,8 +214,8 @@ const CONFIG_CHECKS = sampleChecks(
     { kind: 'verb_body', member: 'post', args: 'path_body' },
     { kind: 'request', member: 'request', args: 'config', url_key: 'url', method_key: 'method' },
     { kind: 'request', member: null, args: 'config', url_key: 'url', method_key: 'method' },
-    { kind: 'request_body', member: 'request', args: 'config', body_key: 'data' },
-    { kind: 'request_body', member: null, args: 'config', body_key: 'data' },
+    { kind: 'request_body', member: 'request', args: 'config', url_key: 'url', method_key: 'method', body_key: 'data' },
+    { kind: 'request_body', member: null, args: 'config', url_key: 'url', method_key: 'method', body_key: 'data' },
   ]
 );
 
@@ -233,7 +233,7 @@ const PREFIX_CHECKS = sampleChecks(
     // An optional member is still a declared callable property.
     { kind: 'verb', member: 'patch', method: 'PATCH' },
     { kind: 'request', member: null, args: 'path_options', method_key: 'method' },
-    { kind: 'request_body', member: null, args: 'path_options', body_key: 'json' },
+    { kind: 'request_body', member: null, args: 'path_options', method_key: 'method', body_key: 'json' },
   ]
 );
 
@@ -318,12 +318,12 @@ const WRONG_CASES: Array<[Claim, Result['verdict'], string]> = [
     'key_not_string',
   ],
   [
-    { kind: 'request_body', member: 'submit', args: 'config', body_key: 'data' },
+    { kind: 'request_body', member: 'submit', args: 'config', url_key: 'url', method_key: 'method', body_key: 'data' },
     'failed',
     'key_missing',
   ],
   [
-    { kind: 'request_body', member: 'send', args: 'config', body_key: 'data' },
+    { kind: 'request_body', member: 'send', args: 'config', url_key: 'url', method_key: 'method', body_key: 'data' },
     'failed',
     'param_missing',
   ],

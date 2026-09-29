@@ -406,7 +406,7 @@ export interface SemanticsCheck {
     | { kind: 'verb'; member: string; method: string }
     | { kind: 'verb_body'; member: string; args: 'path_body' | 'path_options'; body_key?: string }
     | { kind: 'request'; member: string | null; args: 'config' | 'path_options'; url_key?: string; method_key: string }
-    | { kind: 'request_body'; member: string | null; args: 'config' | 'path_options'; body_key: string };
+    | { kind: 'request_body'; member: string | null; args: 'config' | 'path_options'; url_key?: string; method_key: string; body_key: string };
 }
 
 /**

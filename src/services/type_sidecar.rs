@@ -624,10 +624,14 @@ pub enum SemanticsClaim {
         url_key: Option<String>,
         method_key: String,
     },
-    /// Where the body of a request call sits.
+    /// Where the body of a request call sits. The call is read through the
+    /// same signatures as its `Request` claim, so it carries the same keys.
     RequestBody {
         member: Option<String>,
         args: SemanticsRequestArgs,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_key: Option<String>,
+        method_key: String,
         body_key: String,
     },
 }
@@ -2618,7 +2622,20 @@ mod tests {
                     SemanticsClaim::RequestBody {
                         member: Some("request".into()),
                         args: SemanticsRequestArgs::PathOptions,
+                        url_key: None,
+                        method_key: "method".into(),
                         body_key: "json".into(),
+                    },
+                ),
+                check(
+                    "rbc",
+                    "export",
+                    SemanticsClaim::RequestBody {
+                        member: None,
+                        args: SemanticsRequestArgs::Config,
+                        url_key: Some("url".into()),
+                        method_key: "method".into(),
+                        body_key: "data".into(),
                     },
                 ),
             ],
@@ -2660,7 +2677,14 @@ mod tests {
             checks[4]["claim"],
             serde_json::json!({
                 "kind": "request_body", "member": "request", "args": "path_options",
-                "body_key": "json"
+                "method_key": "method", "body_key": "json"
+            })
+        );
+        assert_eq!(
+            checks[5]["claim"],
+            serde_json::json!({
+                "kind": "request_body", "member": null, "args": "config",
+                "url_key": "url", "method_key": "method", "body_key": "data"
             })
         );
 
