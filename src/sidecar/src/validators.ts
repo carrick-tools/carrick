@@ -381,6 +381,8 @@ const SemanticsClaimSchema = z.discriminatedUnion('kind', [
     kind: z.literal('request_body'),
     member: z.string().min(1).nullable(),
     args: z.enum(['config', 'path_options']),
+    url_key: z.string().min(1).optional(),
+    method_key: z.string().min(1),
     body_key: z.string().min(1),
   }),
 ]);
