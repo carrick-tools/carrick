@@ -24,7 +24,7 @@
 // a client that cannot be configured falls back to a printed line, because a
 // failed MCP write must not fail a setup that has already written files.
 //
-// The other half of each writer is here too, because `carrick remove` has to
+// The other half of each writer is here too, because `carrick uninstall` has to
 // undo exactly what was done and by the same rules (carrick#1034): the same
 // detection, the same container the file uses, and one gate of its own — an
 // entry is only removed when it points at this server's host.
@@ -38,7 +38,7 @@ import { INSTALL_ID_HEADER, INSTALL_ID_PATTERN, installIdOrNull, readInstallId }
 
 export const MCP_URL = "https://api.carrick.tools/mcp";
 export const MCP_NAME = "carrick";
-/** The host an entry has to name before `carrick remove` will take it out. */
+/** The host an entry has to name before `carrick uninstall` will take it out. */
 export const MCP_HOST = new URL(MCP_URL).hostname;
 
 /**
@@ -410,7 +410,7 @@ export function connectMcpClients(
   return outcomes;
 }
 
-/** What happened for one client when `carrick remove` ran (carrick#1034). */
+/** What happened for one client when `carrick uninstall` ran (carrick#1034, carrick#1573). */
 export type McpRemoval = {
   client: string;
   /**

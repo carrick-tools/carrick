@@ -13,7 +13,7 @@
 // from the hostname, the user name or a MAC address. A derived id would
 // identify the person rather than the install, would survive a deliberate
 // reset, and would be the same value on two machines that happen to share a
-// name. `carrick remove` deletes the file, and the next `carrick init` is a
+// name. `carrick uninstall` deletes the file, and the next `carrick init` is a
 // new install — which is the only reset anybody should have to know about.
 
 import fs from "node:fs";
@@ -32,7 +32,7 @@ export const INSTALL_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
  *
  * `~/.carrick`, not the configuration directory the credential uses: this is
  * not a secret and not per-workspace — it is one line naming one machine, and
- * `carrick remove` has one place to delete it from.
+ * `carrick uninstall` has one place to delete it from.
  */
 export function installIdPath(home: string = os.homedir()): string {
   return path.join(home, ".carrick", "install-id");
@@ -93,7 +93,7 @@ export function installIdOrNull(home?: string): string | null {
 }
 
 /**
- * Delete it, as `carrick remove` does. True when there was one.
+ * Delete it, as `carrick uninstall` does. True when there was one.
  *
  * The directory goes too when the id was the last thing in it: `~/.carrick` is
  * this package's, and an empty one left behind is litter a user would have to

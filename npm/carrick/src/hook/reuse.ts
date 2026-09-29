@@ -64,7 +64,7 @@ export function sessionFile(sessionId: string, home: string = os.homedir()): str
   return id === null ? null : path.join(home, ".carrick", "sessions", `${id}.json`);
 }
 
-/** The directory `carrick remove` deletes. */
+/** The directory `carrick uninstall` deletes. */
 export function sessionsDir(home: string = os.homedir()): string {
   return path.join(home, ".carrick", "sessions");
 }
@@ -148,11 +148,23 @@ export function prune(home?: string, now: number = Date.now()): void {
 }
 
 /**
- * Delete every session record on this machine, for `carrick remove`.
+ * How many session records this machine holds, changing nothing: the count
+ * `carrick uninstall` lists before it asks (carrick#1573).
+ */
+export function sessionRecords(home?: string): number {
+  try {
+    return fs.readdirSync(sessionsDir(home)).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Delete every session record on this machine, for `carrick uninstall`.
  *
  * Returns how many files went, so the command can stay silent about a machine
  * that never recorded one. The remover lives beside the writer, which is the
- * rule every other half of `carrick remove` follows (carrick#1034).
+ * rule every other half of `carrick uninstall` follows (carrick#1034).
  */
 export function removeSessions(home?: string): number {
   const dir = sessionsDir(home);

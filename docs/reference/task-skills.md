@@ -126,7 +126,7 @@ workspace keeps the hook entries and skill bodies of whichever version first ran
   are findings; an edited file is a note, because a team that changed a skill
   meant to and init will not touch it.
 - **One line a day**, on stderr, from any command that is not a hook, `lsp`,
-  `init`, `doctor` or `remove` (`npm/carrick/src/init/outdated.ts`). The day it
+  `init`, `doctor`, `remove` or `uninstall` (`npm/carrick/src/init/outdated.ts`). The day it
   was last said is `~/.carrick/last-notice`, and it is only spent when there was
   something to say.
 - **`carrick init`, run again**, is the refresh. It rewrites only what is still
@@ -207,7 +207,7 @@ what an empty answer means: a function added on this branch is compared against
 the default branch as the last scan saw it, and the comparison is on what each
 function is described as doing, not on its source.
 
-`carrick remove` deletes the session records; `carrick doctor` reports a missing
+`carrick uninstall` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.
 
 The same three parts run on Codex through a different event and a different

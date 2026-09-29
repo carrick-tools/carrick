@@ -62,7 +62,17 @@ import { findCarrick, offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
 import { excludedRepos, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
-import { createOutput, DOCS_EDITOR, DOCS_INDEX, DOCS_INIT_FILES, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
+import {
+  createOutput,
+  DOCS_EDITOR,
+  DOCS_INDEX,
+  DOCS_INIT_FILES,
+  listBlock,
+  PromptCancelled,
+  tilde,
+  type Choice,
+  type InitOutput,
+} from "./output.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
 
 /**
@@ -381,12 +391,6 @@ export function installSentence(commands: string[], to: "agent" | "reader"): str
     : `Dependencies are not installed. Run ${listed(commands, 5)} before the next scan.`;
 }
 
-/** A path as a reader types it, with the home directory as `~`. */
-export function tilde(target: string, home: string = os.homedir()): string {
-  if (target === home) return "~";
-  return target.startsWith(`${home}${path.sep}`) ? `~${target.slice(home.length)}` : target;
-}
-
 /**
  * The files the write step creates, as one line of the list "Go ahead?" is
  * asked about (carrick#1489, carrick#1512).
@@ -421,31 +425,9 @@ export function writesLine(options: {
   return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
 }
 
-/** The width a line of the "Next:" list wraps at, inside the gutter. */
-export const NEXT_WIDTH = 68;
-
-/**
- * One line of the list, broken between words so that it stays inside the
- * terminal's gutter: a line the terminal wraps for itself runs back to the
- * first column, under the gutter, which is what the smoke run showed
- * (carrick#1512).
- */
-export function wrapped(text: string, width: number = NEXT_WIDTH): string[] {
-  const lines: string[] = [];
-  let current = "";
-  for (const word of text.split(" ")) {
-    if (current !== "" && current.length + 1 + word.length > width) {
-      lines.push(current);
-      current = word;
-    } else current = current === "" ? word : `${current} ${word}`;
-  }
-  if (current !== "") lines.push(current);
-  return lines;
-}
-
-/** The list as it is printed: a heading, and each line indented and wrapped. */
+/** The list "Go ahead?" is asked about, under its heading. */
 export function nextBlock(lines: string[]): string {
-  return ["Next:", ...lines.flatMap((line) => wrapped(line).map((part) => `  ${part}`))].join("\n");
+  return listBlock("Next:", lines);
 }
 
 /**

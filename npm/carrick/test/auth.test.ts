@@ -170,7 +170,7 @@ test("the callback page answers after the exchange and names the workspace", asy
 
 // carrick#1511. The next step is said by the terminal, and only to a machine
 // that has never been set up: `carrick init` writes the install id and
-// `carrick remove` deletes it.
+// `carrick uninstall` deletes it.
 test("login names carrick init as the next step only on a machine never set up", () => {
   assert.equal(loginNextStep(null), "Next: run carrick init in the folder that holds your repos.");
   assert.equal(loginNextStep("0f3c9a2e-machine"), null);

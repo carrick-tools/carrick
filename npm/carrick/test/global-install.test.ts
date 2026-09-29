@@ -189,7 +189,7 @@ test("the sync runs on a command started through npx, and on nothing else", () =
   for (const command of ["index", "status", "refresh", "resume", "init", "doctor"]) {
     assert.equal(syncsOnThisRun(command, env, npx), true, `${command} through npx`);
   }
-  for (const command of ["hook", "lsp", "remove", "--version", "-V", "--help", "-h", undefined]) {
+  for (const command of ["hook", "lsp", "remove", "uninstall", "--version", "-V", "--help", "-h", undefined]) {
     assert.equal(syncsOnThisRun(command, env, npx), false, `${command} through npx`);
   }
   assert.equal(syncsOnThisRun("index", env, global), false, "a global install is what it would upgrade");

@@ -169,7 +169,7 @@ So a command started through npx, before it does anything else:
 A refusal is printed with its reason and the one command, and the run carries
 on. Nothing is retried with more force.
 
-`hook`, `lsp`, `remove`, `--version` and `--help` are excluded, along with CI
+`hook`, `lsp`, `remove`, `uninstall`, `--version` and `--help` are excluded, along with CI
 and `CARRICK_NO_UPDATE_CHECK=1`. A run that is not through npx is skipped
 because it IS the install in question: a global `carrick index` is already the
 version on PATH, and a project dependency belongs to the repository that pins

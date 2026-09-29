@@ -29,8 +29,10 @@ WORKSPACE:
                first run starts with. Installed by the npm package.
     doctor     Re-check the setup init wrote, and exit non-zero on anything it
                finds. Installed by the npm package.
-    remove     Undo what init wrote on this machine, and list the files the
+    remove     Undo what init wrote in this folder only, and list the files the
                scaffold added to the repository. Installed by the npm package.
+    uninstall  Undo what init wrote on this machine for every folder: the MCP
+               server in each agent client, the install id and the sign-in.
     derive    Print the repos and services a folder resolves to, writing nothing.
     index      Scan every repo in the workspace and build <workspace>/.carrick/.
                Carrick Cloud classifies what the deterministic passes could
@@ -116,10 +118,11 @@ ENVIRONMENT VARIABLES:
 /// still be able to say where they are: `init` is where the first run starts,
 /// so "unknown command" is the wrong answer for it, and a user who reached
 /// the binary directly needs the package named rather than the name denied.
-pub const PACKAGE_COMMANDS: [&str; 8] = [
+pub const PACKAGE_COMMANDS: [&str; 9] = [
     "init",
     "doctor",
     "remove",
+    "uninstall",
     "login",
     "logout",
     "lsp",
@@ -162,10 +165,12 @@ mod tests {
 
     /// A line of a command list: four spaces, the command, then its description
     /// after a column gap (`    login      sign in…`, `    hook stop  Claude…`).
+    /// The gap can start right after the command: `uninstall` is nine letters,
+    /// and two spaces put its description in the block's column.
     fn lists_with_a_description(line: &str, command: &str) -> bool {
         line.strip_prefix("    ")
             .and_then(|line| line.strip_prefix(command))
-            .and_then(|line| line.strip_prefix(' '))
+            .filter(|rest| rest.starts_with(' '))
             .and_then(|rest| rest.split_once("  "))
             .is_some_and(|(_, description)| description.trim().len() >= 8)
     }

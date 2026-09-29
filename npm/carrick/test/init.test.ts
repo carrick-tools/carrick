@@ -34,7 +34,6 @@ import {
   summaryLine,
   nextLines,
   nextBlock,
-  wrapped,
   connectItem,
   writesLine,
   parseArgs,
@@ -71,6 +70,7 @@ import {
   interactiveOutput,
   plainOutput,
   PromptCancelled,
+  wrapped,
   type Choice,
   type InitOutput,
 } from "../src/init/output.ts";

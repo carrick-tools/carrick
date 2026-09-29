@@ -400,6 +400,7 @@ const COMMANDS = new Set([
   "hook",
   "init",
   "remove",
+  "uninstall",
   "doctor",
   "templates",
 ]);
