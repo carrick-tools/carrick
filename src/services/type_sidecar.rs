@@ -2371,7 +2371,9 @@ impl std::error::Error for SidecarError {}
 /// The verdicts of a `verify_client_semantics` response, one per check in
 /// request order (carrick#1564). A response that answers a different set of
 /// checks is an error, never a partial answer: the scanner pairs verdicts
-/// with claims by position. A response with no `semantics` reads as empty.
+/// with claims by position. A response with no `semantics` deserialises as
+/// an empty list, so it is that error too ("answered 0 of N checks"); only a
+/// request with no checks, which is never sent, answers with no verdicts.
 fn read_semantics(
     response: SidecarResponse,
     checks: &[SemanticsCheck],
