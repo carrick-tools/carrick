@@ -97,23 +97,21 @@ export function reposToScaffold(
  * workspace reads (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
  * So the names are in the sentence, one call per repo.
  *
- * Where every name is already the owner/repo, it is the value of `repo` and
- * is said once; the sentence used to name it and then ask for it again
- * (carrick#1574). A repo known here only by its folder still needs the agent
- * to find its owner/repo.
+ * One repo whose owner/repo is known is the value of `repo`, said once; the
+ * sentence used to name it and then ask for it again (carrick#1574). A repo
+ * known here only by its folder still needs the agent to find its owner/repo.
+ * The several-repo sentence is carrick-cloud#1404's: the tool now takes them
+ * all in one `repos` call.
  */
 export function scaffoldSentence(repos: RepoIdentity[]): string {
   const names = repos.map((repo) => repo.name ?? path.basename(repo.path));
-  const named = repos.every((repo) => repo.name !== null);
   if (names.length === 1) {
-    return named
+    return repos[0]?.name
       ? `Run the carrick scaffold tool with \`repo\` set to ${names[0]}, and follow what it returns.`
       : `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
   }
   const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-  return named
-    ? `Run the carrick scaffold tool once per repo, with \`repo\` set to each of ${shown}, and follow what it returns.`
-    : `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
+  return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
 }
 
 /** The title of the block a run closes on when there is scaffolding left to do. */

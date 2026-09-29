@@ -2910,9 +2910,10 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
     scaffoldSentence([repos[1]!]),
     "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
   );
+  // Several repos: carrick-cloud#1404 moves this to one `repos` call.
   assert.equal(
     scaffoldSentence(owed),
-    "Run the carrick scaffold tool once per repo, with `repo` set to each of acme/web, acme/jobs, acme/docs and 1 more, and follow what it returns.",
+    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
   );
   // A repo known here only by its folder: the agent still has to find the
   // owner/repo, and the sentence still asks it to.
