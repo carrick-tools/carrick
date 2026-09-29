@@ -11600,6 +11600,7 @@ mod tests {
              \x20 known(flag: boolean) {\n\
              \x20   return fetch(this.url, { method: \"POST\", body: JSON.stringify({ action: \"poll\", ...(flag ? { limit: 1 } : {}) }) });\n\
              \x20 }\n\
+             \x20 spreadOnly(opts: object) { return fetch(this.url, { ...opts }); }\n\
              }\n\
              \n\
              export class Branchy {\n\
