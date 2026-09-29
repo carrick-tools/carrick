@@ -424,12 +424,17 @@ pub fn derive_claims(entries: &[ClientSemanticsEntry]) -> DerivedClaims {
                         method_key: request.method_key.clone(),
                     },
                 );
+                // The body claim names the same url and method keys as the
+                // request it belongs to, so the sidecar picks the body's
+                // signature exactly as it picked the request's.
                 if let Some(body_key) = &request.body_key {
                     state(
                         format!("{prefix}:request_body:{member}:{args}"),
                         SemanticsClaim::RequestBody {
                             member: request.member.clone(),
                             args: request.args,
+                            url_key: request.url_key.clone(),
+                            method_key: request.method_key.clone(),
                             body_key: body_key.clone(),
                         },
                     );
@@ -655,6 +660,7 @@ fn surface_on(
                 member,
                 args,
                 body_key,
+                ..
             } => {
                 request_bodies.insert(
                     (member.as_deref(), request_args_name(*args)),
@@ -730,7 +736,17 @@ pub fn verify(
             return LibrarySemantics::default();
         }
     };
-    if !answers_every_check(&checks, &results) {
+    surface_from(&derived, &checks, &results)
+}
+
+/// The surface one request's answer supports: nothing at all unless it is
+/// one verdict per check, for the same pair, in request order.
+fn surface_from(
+    derived: &DerivedClaims,
+    checks: &[SemanticsCheck],
+    results: &[SemanticsResult],
+) -> LibrarySemantics {
+    if !answers_every_check(checks, results) {
         debug!(
             "Client-library semantics: the sidecar answered {} result(s) for {} check(s), not one per check in order; nothing is verified this scan",
             results.len(),
@@ -739,7 +755,7 @@ pub fn verify(
         return LibrarySemantics::default();
     }
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for result in &results {
+    for result in results {
         let label = match (&result.verdict, &result.reason) {
             (SemanticsVerdict::Verified, _) => "verified".to_string(),
             (verdict, reason) => {
@@ -757,7 +773,7 @@ pub fn verify(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    LibrarySemantics::from_verdicts(&derived, &results)
+    LibrarySemantics::from_verdicts(derived, results)
 }
 
 /// Whether `results` is one verdict per check, for the same `(claim_id,
@@ -886,6 +902,67 @@ mod tests {
         );
         assert_eq!(request.package, "@fixture/http");
         assert_eq!(request.export, "default");
+    }
+
+    /// The sidecar reads an instance's type through the factory claim for the
+    /// same export and member when that claim is in the same request, so a
+    /// factory claim travels with every check on its instances. [`verify`]
+    /// sends [`DerivedClaims::checks`] as one request; this pins that the
+    /// list holds both halves for every instance.
+    #[test]
+    fn every_instance_check_travels_with_its_factory_claim() {
+        let checks = derive_claims(&sample_entries()).checks();
+        let instances: Vec<&SemanticsCheck> = checks
+            .iter()
+            .filter(|check| check.receiver.starts_with("instance:"))
+            .collect();
+        assert!(!instances.is_empty());
+        for check in instances {
+            let factory = check.receiver.trim_start_matches("instance:");
+            assert!(
+                checks.iter().any(|other| {
+                    other.package == check.package
+                        && other.export == check.export
+                        && other.receiver == "export"
+                        && matches!(&other.claim, SemanticsClaim::Factory { member, .. } if member == factory)
+                }),
+                "{} on {} has no factory claim beside it",
+                check.claim_id,
+                check.receiver
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_body_claim_names_its_requests_keys() {
+        let checks = derive_claims(&sample_entries()).checks();
+        let claim_of = |id: &str| {
+            checks
+                .iter()
+                .find(|check| check.claim_id == id)
+                .map(|check| check.claim.clone())
+                .unwrap_or_else(|| panic!("{id} is claimed"))
+        };
+        assert_eq!(
+            claim_of("@fixture/http@1:default:request_body:request:config"),
+            SemanticsClaim::RequestBody {
+                member: Some("request".to_string()),
+                args: SemanticsRequestArgs::Config,
+                url_key: Some("url".to_string()),
+                method_key: "method".to_string(),
+                body_key: "data".to_string(),
+            }
+        );
+        assert_eq!(
+            claim_of("fixture-prefix-http@2:default:request_body:():path_options"),
+            SemanticsClaim::RequestBody {
+                member: None,
+                args: SemanticsRequestArgs::PathOptions,
+                url_key: None,
+                method_key: "method".to_string(),
+                body_key: "json".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1078,7 +1155,8 @@ mod tests {
 
     #[test]
     fn a_batch_that_is_not_one_verdict_per_check_in_order_verifies_nothing() {
-        let checks = derive_claims(&sample_entries()).checks();
+        let derived = derive_claims(&sample_entries());
+        let checks = derived.checks();
         let verified = |check: &SemanticsCheck| SemanticsResult {
             claim_id: check.claim_id.clone(),
             receiver: check.receiver.clone(),
@@ -1086,22 +1164,30 @@ mod tests {
             reason: None,
         };
         let exact: Vec<SemanticsResult> = checks.iter().map(verified).collect();
-        assert!(answers_every_check(&checks, &exact));
+        assert!(!surface_from(&derived, &checks, &exact).is_empty());
 
         // One short.
-        assert!(!answers_every_check(&checks, &exact[1..]));
+        let short = &exact[1..];
         // One too many.
         let mut long = exact.clone();
         long.push(exact[0].clone());
-        assert!(!answers_every_check(&checks, &long));
         // Every pair answered, two of them in each other's place.
         let mut swapped = exact.clone();
         swapped.swap(0, 1);
-        assert!(!answers_every_check(&checks, &swapped));
         // A receiver the request did not name.
-        let mut renamed = exact;
+        let mut renamed = exact.clone();
         renamed[0].receiver = "instance:other".to_string();
-        assert!(!answers_every_check(&checks, &renamed));
+        for (label, results) in [
+            ("short", short),
+            ("long", long.as_slice()),
+            ("swapped", swapped.as_slice()),
+            ("renamed", renamed.as_slice()),
+        ] {
+            assert!(
+                surface_from(&derived, &checks, results).is_empty(),
+                "{label}: a batch that does not answer the request verifies nothing"
+            );
+        }
         // No checks, no results: nothing to disagree about.
         assert!(answers_every_check(&[], &[]));
     }

@@ -141,7 +141,6 @@ fn fixture_copy(tmp: &Path, install: Install) -> (PathBuf, PathBuf) {
     let repo = tmp.join("service");
     copy_dir(&fixture_root(), &repo);
     std::fs::remove_dir_all(repo.join("variants")).unwrap();
-    std::fs::remove_file(repo.join("README.md")).unwrap();
     match install {
         Install::Vendored => {}
         Install::KeyAbsent => {
@@ -220,6 +219,38 @@ fn rows(data: &CloudRepoData) -> Vec<DataFetchingCall> {
     rows
 }
 
+/// Rows as sorted JSON, so two scans compare field by field in any order.
+fn rendered(rows: Vec<DataFetchingCall>) -> Vec<String> {
+    let mut rendered: Vec<String> = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap())
+        .collect();
+    rendered.sort();
+    rendered
+}
+
+/// The rows a scan of `repo` states when detection answers the same four
+/// lists and no library semantics: what every site reads as without them.
+/// The cassette is restored before this returns.
+async fn rows_without_semantics(
+    repo: &Path,
+    cassette: &Path,
+    sidecar: &TypeSidecar,
+) -> Vec<DataFetchingCall> {
+    let path = cassette.join("framework-detect/framework-detect.json");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut answer: serde_json::Value = serde_json::from_str(&original).unwrap();
+    answer
+        .as_object_mut()
+        .expect("the answer is an object")
+        .remove("client_semantics")
+        .expect("the sample answers library semantics");
+    std::fs::write(&path, answer.to_string()).unwrap();
+    let without = rows(&scan(&StubStorage::default(), repo, Some(sidecar)).await);
+    std::fs::write(&path, original).unwrap();
+    without
+}
+
 fn rows_at(rows: &[DataFetchingCall], file: &str, line: u32) -> Vec<DataFetchingCall> {
     rows.iter()
         .filter(|row| row.line == Some(line) && row.file_location.contains(file))
@@ -257,27 +288,41 @@ fn assert_library_row(
     assert_eq!(row.library_semantics, claims, "{file}:{line}: {row:#?}");
 }
 
-/// A row that is the model's answer, exactly as the cassette states it.
-fn assert_model_row(rows: &[DataFetchingCall], file: &str, line: u32, method: &str, target: &str) {
+/// A row read through no library claim: the site as it reads without the
+/// semantics, with the base-less target the cassette's model answer states.
+/// Which layer states it is the scan's ordinary rules; `source` says which.
+fn assert_unread_row(
+    rows: &[DataFetchingCall],
+    file: &str,
+    line: u32,
+    source: ResolutionSource,
+    method: &str,
+    target: &str,
+) {
     let row = row_at(rows, file, line);
-    assert_eq!(
-        row.resolution_source,
-        Some(ResolutionSource::Model),
-        "{file}:{line} must stay the model's candidate: {row:#?}"
+    assert!(
+        row.library_semantics.is_empty(),
+        "{file}:{line} was read through no claim: {row:#?}"
     );
     assert_eq!(
-        (row.method.as_str(), row.target_url.as_str()),
-        (method, target),
-        "{file}:{line}: {row:#?}"
+        (
+            row.resolution_source,
+            row.method.as_str(),
+            row.target_url.as_str()
+        ),
+        (Some(source), method, target),
+        "{file}:{line} reads as it does without library semantics: {row:#?}"
     );
-    assert!(row.library_semantics.is_empty(), "{row:#?}");
 }
 
 const HTTP: &str = "@fixture/http@1:default";
 const PREFIX: &str = "fixture-prefix-http@2:default";
 
 fn ids(prefix: &str, kinds: &[&str]) -> Vec<String> {
-    kinds.iter().map(|kind| format!("{prefix}:{kind}")).collect()
+    kinds
+        .iter()
+        .map(|kind| format!("{prefix}:{kind}"))
+        .collect()
 }
 
 /// The answer key's positive rows, stated through the vendored declarations.
@@ -290,7 +335,10 @@ fn assert_answer_key(rows: &[DataFetchingCall]) {
         6,
         "GET",
         "/api/v1/users",
-        &http(&["factory:create", "verb:get"]).iter().map(String::as_str).collect::<Vec<_>>(),
+        &http(&["factory:create", "verb:get"])
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
     );
     assert_library_row(
         rows,
@@ -424,9 +472,34 @@ async fn a_claimed_option_key_absent_from_the_declarations_stays_a_candidate() {
         "the instance's verb verifies on its own; only the scanner's factory gate drops it"
     );
 
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
     let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
-    assert_model_row(&rows, "src/http-client.ts", 6, "GET", "/users");
-    assert_model_row(&rows, "src/http-client.ts", 11, "GET", "/orders");
+    // The instance's sites read exactly as they do with no semantics at all:
+    // the receiver-type rows the site's own literals state (carrick#695),
+    // with no base, since nothing verified says where the base is.
+    for line in [6, 11] {
+        assert_eq!(
+            rendered(rows_at(&rows, "src/http-client.ts", line)),
+            rendered(rows_at(&without, "src/http-client.ts", line)),
+            "src/http-client.ts:{line} must read as it does without the semantics"
+        );
+    }
+    assert_unread_row(
+        &rows,
+        "src/http-client.ts",
+        6,
+        ResolutionSource::ReceiverType,
+        "GET",
+        "/users",
+    );
+    assert_unread_row(
+        &rows,
+        "src/http-client.ts",
+        11,
+        ResolutionSource::ReceiverType,
+        "POST",
+        "/orders",
+    );
     assert_library_row(
         &rows,
         "src/http-client.ts",
@@ -463,16 +536,37 @@ async fn without_node_modules_every_site_stays_a_candidate() {
     mock_env(&cassette);
     let sidecar = real_sidecar(&repo);
 
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
     let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
-    assert!(
-        rows.iter().all(|row| row.library_semantics.is_empty()),
-        "{rows:#?}"
+    assert_eq!(
+        rendered(rows.clone()),
+        rendered(without),
+        "with nothing installed, the semantics change no row"
     );
-    assert_model_row(&rows, "src/http-client.ts", 6, "GET", "/users");
-    assert_model_row(&rows, "src/http-client.ts", 11, "GET", "/orders");
-    assert_model_row(&rows, "src/prefix-client.ts", 7, "GET", "queued");
-    assert_model_row(&rows, "src/prefix-client.ts", 11, "GET", "/run");
-    assert_model_row(&rows, "src/prefix-client.ts", 15, "GET", "reports");
+    // What that is, on the sites the answer key states: the model's rows,
+    // base-less, with the verb the call itself is spelled with; and nothing
+    // at the two prefix-client sites whose model answer names no route.
+    for (line, method, target) in [(6, "GET", "/users"), (11, "POST", "/orders")] {
+        assert_unread_row(
+            &rows,
+            "src/http-client.ts",
+            line,
+            ResolutionSource::Model,
+            method,
+            target,
+        );
+    }
+    assert_unread_row(
+        &rows,
+        "src/prefix-client.ts",
+        11,
+        ResolutionSource::Model,
+        "POST",
+        "/run",
+    );
+    for line in [7, 15] {
+        assert!(rows_at(&rows, "src/prefix-client.ts", line).is_empty());
+    }
 }
 
 /// Two scans of one tree state the same rows, claim ids included.
@@ -484,16 +578,12 @@ async fn two_identical_scans_state_identical_rows() {
     mock_env(&cassette);
     let sidecar = real_sidecar(&repo);
 
-    let render = |rows: Vec<DataFetchingCall>| -> Vec<String> {
-        let mut rendered: Vec<String> = rows
-            .iter()
-            .map(|row| serde_json::to_string(row).unwrap())
-            .collect();
-        rendered.sort();
-        rendered
-    };
-    let first = render(rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await));
-    let second = render(rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await));
+    let first = rendered(rows(
+        &scan(&StubStorage::default(), &repo, Some(&sidecar)).await,
+    ));
+    let second = rendered(rows(
+        &scan(&StubStorage::default(), &repo, Some(&sidecar)).await,
+    ));
     assert!(first.iter().any(|row| row.contains("library_semantics")));
     assert_eq!(first, second);
 }
@@ -576,7 +666,10 @@ async fn a_failed_reask_keeps_the_cached_detection() {
     carrick::agent_service::inject_mock_failure("/framework-detect", "ask_client_semantics", 1);
     let (data, detect, guidance) = scan_counting(&storage, &repo).await;
     assert_eq!((detect, guidance), (1, 0));
-    let detection = data.cached_detection.expect("the cached detection stands");
+    let detection = data
+        .cached_detection
+        .clone()
+        .expect("the cached detection stands");
     assert_eq!(detection.client_semantics, None, "nothing new was answered");
     assert_eq!(detection.data_fetchers.len(), 4);
     assert!(
@@ -589,6 +682,32 @@ async fn a_failed_reask_keeps_the_cached_detection() {
             .any(|row| row.resolution_source == Some(ResolutionSource::Model)),
         "the model's cached answers still joined"
     );
+}
+
+/// An answer that names other packages than the cached detection changes
+/// what guidance and the analysis are keyed on, so guidance is asked again,
+/// from the answer already in hand: no second detection request.
+#[tokio::test]
+#[serial]
+async fn a_reask_that_names_other_packages_asks_for_guidance_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+    scan(&storage, &repo, None).await;
+    age_cached_detection(&storage, |detection| {
+        detection.client_semantics = None;
+        detection
+            .data_fetchers
+            .retain(|package| package != "fixture-slow-http");
+    });
+
+    let (data, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!(detect, 1, "detection is asked once");
+    assert!(guidance > 0, "guidance is asked again for the new lists");
+    let detection = data.cached_detection.expect("the new detection is kept");
+    assert_eq!(detection.data_fetchers.len(), 4);
+    assert!(detection.client_semantics.is_some());
 }
 
 /// An entry still `pending` is asked again on the next scan.
