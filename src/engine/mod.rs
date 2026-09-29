@@ -11653,6 +11653,62 @@ mod tests {
         );
     }
 
+    /// carrick#1564 re-review, R1: a base key the factory options write after
+    /// every entry that could overwrite it is read, however open the options
+    /// are; one a later spread, a getter, a computed key or a disagreeing
+    /// conditional spread may overwrite is not. `cond && {…}` may spread
+    /// nothing, so the key it carries is not the only value the base can hold.
+    #[test]
+    fn a_base_written_after_everything_that_could_overwrite_it_is_read() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/options.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             declare const defaults: { timeout?: number };\n\
+             declare const a: object;\n\
+             declare const b: object;\n\
+             declare const prod: boolean;\n\
+             const KEY = \"baseURL\";\n\
+             const after = http.create({ ...defaults, baseURL: \"/after\" });\n\
+             const between = http.create({ ...a, baseURL: \"/between\", ...b });\n\
+             const cond = http.create({ baseURL: \"/dev\", ...(prod ? { baseURL: \"/prod\" } : {}) });\n\
+             const same = http.create({ baseURL: \"/x\", ...(prod ? { timeout: 1 } : { timeout: 2 }) });\n\
+             const agree = http.create({ ...(prod ? { baseURL: \"/same\" } : { baseURL: \"/same\" }) });\n\
+             const andSpread = http.create({ baseURL: \"/and\", ...(prod && { baseURL: \"/and-prod\" }) });\n\
+             const getter = http.create({ baseURL: \"/g1\", get baseURL() { return \"/g2\"; } } as any);\n\
+             const computed = http.create({ baseURL: \"/c1\", [KEY]: \"/c2\" });\n\
+             const strKey = http.create({ \"baseURL\": \"/s1\" });\n\
+             const methodProp = http.create({ baseURL: \"/m1\", timeout() { return 1; } } as any);\n\
+             \n\
+             export function n1() { return after.get(\"/stated\"); }\n\
+             export function n2() { return between.get(\"/between\"); }\n\
+             export function n3a() { return cond.get(\"/cond\"); }\n\
+             export function n3b() { return same.get(\"/keep\"); }\n\
+             export function n3c() { return agree.get(\"/agree\"); }\n\
+             export function n3d() { return andSpread.get(\"/and\"); }\n\
+             export function n4a() { return getter.get(\"/getter\"); }\n\
+             export function n4b() { return computed.get(\"/computed\"); }\n\
+             export function n4c() { return strKey.get(\"/string-key\"); }\n\
+             export function n4d() { return methodProp.get(\"/method-prop\"); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/options.ts", &verified_sample());
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                (19, "GET", "/after/stated"),
+                (22, "GET", "/x/keep"),
+                (23, "GET", "/same/agree"),
+                (27, "GET", "/s1/string-key"),
+                (28, "GET", "/m1/method-prop"),
+            ],
+            "{rows:#?}"
+        );
+    }
+
     /// carrick#1564 review, findings 2 and 4 on the library path: a field a
     /// constructor branch writes again, a field a subclass in the file
     /// declares again, and a static member reading `this` hold no instance;

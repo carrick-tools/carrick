@@ -1672,12 +1672,14 @@ impl Reader<'_> {
         let [options] = call.args.as_slice() else {
             return None;
         };
-        let Expr::Object(options_literal) = &*options.expr else {
-            return None;
-        };
         if options.spread.is_some() {
             return None;
         }
+        let Expr::Object(options_literal) =
+            crate::graphql_document_sites::unwrap_expression(&options.expr)
+        else {
+            return None;
+        };
         Some(ClientRef {
             package: client.package.clone(),
             export: client.export.clone(),
@@ -2721,14 +2723,16 @@ fn library_shape(
                 &client.export,
                 &instance_receiver(&instance.factory),
             )?;
-            if instance.options.open {
-                return None;
-            }
             // The base is the literal or opaque value the options hold, or
-            // none when they do not name the key at all.
+            // none when they do not name the key at all. A key still in the
+            // options was written after every entry that could overwrite it
+            // ([`Reader::object`] drops the rest), so it stands even in open
+            // options; a key missing from open options may be in the part the
+            // source does not state.
             let base = match instance.options.fields.get(&factory.base_url_key) {
                 Some(Value::Str(pieces)) => pieces.clone(),
                 Some(_) => return None,
+                None if instance.options.open => return None,
                 None => Vec::new(),
             };
             used.insert(factory.claim_id.clone());

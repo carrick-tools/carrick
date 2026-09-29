@@ -868,7 +868,7 @@ impl ScheduleNotice {
                 wait.as_secs()
             ),
             Self::Remaining { remaining } => format!(
-                "{remaining} client {} not described yet; the next scan asks again",
+                "{remaining} client {} not described yet",
                 if *remaining == 1 {
                     "library"
                 } else {

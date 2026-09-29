@@ -270,6 +270,9 @@ pub struct RetryPolicy {
     /// Whether this call's sleeps draw on the run-wide budget
     /// ([`crate::retry_budget`]) as well as its own.
     run_budgeted: bool,
+    /// Lease waits ([`ANALYSIS_IN_FLIGHT_CODE`]) sat out without spending an
+    /// attempt. Past it a lease wait is a retriable error like any other.
+    max_in_flight_waits: u32,
 }
 
 impl RetryPolicy {
@@ -280,6 +283,7 @@ impl RetryPolicy {
         // Never the binding limit: the attempts run out first (~126 s at most).
         wait_budget: Duration::from_secs(3600),
         run_budgeted: false,
+        max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
     };
 
     /// A call a whole service depends on: exponential with jitter, sleeps of
@@ -291,17 +295,20 @@ impl RetryPolicy {
         max_delay: PATIENT_RETRY_MAX_DELAY,
         wait_budget: Duration::from_secs(600),
         run_budgeted: true,
+        max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
     };
 
-    /// A best-effort call whose failure costs nothing: one attempt, no
-    /// retry. The re-ask for library semantics is one (carrick#1564): a
-    /// failure keeps what the service already has, and the next scan asks
-    /// again, so a retry only spends.
+    /// A best-effort call whose failure costs nothing: one HTTP attempt, no
+    /// retry, and no re-send after a lease wait either. The re-ask for
+    /// library semantics is one (carrick#1564): a failure keeps what the
+    /// service already has, and the next scan asks again, so a retry only
+    /// spends.
     pub const ONCE: Self = Self {
         max_attempts: 1,
         max_delay: Duration::ZERO,
         wait_budget: Duration::ZERO,
         run_budgeted: false,
+        max_in_flight_waits: 0,
     };
 
     /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
@@ -759,7 +766,7 @@ impl AgentService {
         // What this call has slept so far, against the policy's wait budget.
         let mut waited = Duration::ZERO;
         let route_limit = self.limits.for_route(path);
-        // Lease waits sat out so far, against [`MAX_IN_FLIGHT_WAITS`]. Counted
+        // Lease waits sat out so far, against the policy's cap. Counted
         // by hand, with `attempt`, so a wait can hand its attempt back.
         let mut in_flight_waits: u32 = 0;
         let mut attempt: u32 = 0;
@@ -1060,14 +1067,17 @@ impl AgentService {
                     // back. The model was not asked, so `X-Carrick-Attempt`
                     // does not advance either: a re-send that finds the lease
                     // gone and becomes the holder keeps the chain it had.
-                    if in_flight && call_err.retriable && in_flight_waits < MAX_IN_FLIGHT_WAITS {
+                    if in_flight
+                        && call_err.retriable
+                        && in_flight_waits < policy.max_in_flight_waits
+                    {
                         in_flight_waits += 1;
                         let wait_time =
                             in_flight_wait(jitter_seed(), retry_after, policy.max_delay);
                         debug!(
                             "An earlier request for this {} call is still being analysed; \
                              collecting its answer in {:?} (wait {}/{})",
-                            path, wait_time, in_flight_waits, MAX_IN_FLIGHT_WAITS
+                            path, wait_time, in_flight_waits, policy.max_in_flight_waits
                         );
                         drop(permit);
                         drop(route_slot);
@@ -3147,6 +3157,29 @@ pub(crate) mod tests {
         assert_eq!(stub.attempts(), 1);
     }
 
+    /// carrick#1564 re-review, R5: a lease wait is no free re-send for the
+    /// re-ask either. The standard policy sits out eight of them without
+    /// spending an attempt; the re-ask's single attempt ends on the first.
+    #[tokio::test]
+    async fn the_library_semantics_reask_sits_out_no_lease_wait() {
+        let in_flight = (
+            409,
+            r#"{"success":false,"error":{"code":"analysis_in_flight","message":"still being analysed","retriable":true}}"#
+                .to_string(),
+        );
+        let stub = CountingStub::start(vec![in_flight; 9]);
+        let result = crate::engine::reask_agent()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &stub.api_base,
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            )
+            .await;
+        assert!(result.is_err(), "the wait is the call's answer");
+        assert_eq!(stub.attempts(), 1);
+    }
+
     /// The contract's sample detection (carrick#1564), as `/framework-detect`
     /// answers it, after `edit`. The sample leaves `fixture-slow-http`
     /// pending and `@fixture/internal-sdk` skipped.
@@ -3299,7 +3332,7 @@ pub(crate) mod tests {
             vec![
                 "1 of 3 client libraries still being described, waiting up to 35 s",
                 "1 of 3 client libraries still being described, waiting up to 45 s",
-                "1 client library not described yet; the next scan asks again",
+                "1 client library not described yet",
             ]
         );
         assert_eq!(settled.entries, settled.first);
@@ -3763,6 +3796,7 @@ pub(crate) mod tests {
             max_delay: Duration::from_millis(20),
             wait_budget: Duration::from_secs(60),
             run_budgeted: false,
+            max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
         }
     }
 
@@ -4650,6 +4684,7 @@ pub(crate) mod tests {
             max_delay: Duration::from_millis(200),
             wait_budget: Duration::from_secs(600),
             run_budgeted: false,
+            max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
         }
     }
 
