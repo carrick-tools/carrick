@@ -6004,9 +6004,20 @@ fn summarize_requests(
 enum SettlingSemantics {
     Known(Option<Vec<crate::client_semantics::ClientSemanticsEntry>>),
     Settling {
-        task: tokio::task::JoinHandle<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+        task: ScheduleTask,
         asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
     },
+}
+
+/// The spawned schedule, aborted when dropped: a scan that stops before it
+/// reads the summaries (interrupted, or failed) sends no further ask and
+/// prints no further line.
+struct ScheduleTask(tokio::task::JoinHandle<Vec<crate::client_semantics::ClientSemanticsEntry>>);
+
+impl Drop for ScheduleTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl SettlingSemantics {
@@ -6015,7 +6026,15 @@ impl SettlingSemantics {
     async fn settled(self) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
         match self {
             Self::Known(entries) => entries,
-            Self::Settling { task, asked } => Some(task.await.unwrap_or(asked)),
+            Self::Settling { mut task, asked } => match (&mut task.0).await {
+                Ok(settled) => Some(settled),
+                Err(error) => {
+                    debug!(
+                        "The in-scan library-semantics schedule did not finish ({error}); keeping what the first ask gave"
+                    );
+                    Some(asked)
+                }
+            },
         }
     }
 }
@@ -6024,10 +6043,9 @@ impl SettlingSemantics {
 /// installed package is still `pending`: every such package is asked about
 /// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
 /// attempt per ask, each bounded by
-/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. The task is spawned, so
-/// it runs beside the analysis whatever the analysis blocks on. An ask that
-/// fails, or answers different lists than the ones the guidance was built
-/// from, changes nothing; the next scan asks again.
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An ask that fails, or
+/// answers different lists than the ones the guidance was built from,
+/// changes nothing; the next scan asks again.
 fn start_semantics_schedule(
     detection: &DetectionResult,
     schedule: bool,
@@ -6049,30 +6067,63 @@ fn start_semantics_schedule(
     {
         return SettlingSemantics::Known(Some(asked));
     }
-    let detection = detection.clone();
-    let packages = packages.clone();
-    let import_facts = import_facts.clone();
-    let installed = crate::client_semantics::installed_for(service_root, repo_root);
-    let entries = asked.clone();
-    let task = tokio::spawn(async move {
-        crate::client_semantics::settle_pending(
-            entries,
-            installed,
-            &crate::client_semantics::pending_reask_waits(),
-            || async {
+    let detection = std::sync::Arc::new(detection.clone());
+    let packages = std::sync::Arc::new(packages.clone());
+    let import_facts = std::sync::Arc::new(import_facts.clone());
+    spawn_schedule(
+        asked,
+        crate::client_semantics::installed_for(service_root, repo_root),
+        crate::client_semantics::pending_reask_waits(),
+        move || {
+            let (detection, packages, import_facts) =
+                (detection.clone(), packages.clone(), import_facts.clone());
+            async move {
                 let detector = FrameworkDetector::new(reask_agent());
                 semantics_from_reask(
                     detector.detect_frameworks_and_libraries(&packages, &import_facts),
                     &detection,
                 )
                 .await
-            },
+            }
+        },
+        |notice| crate::progress::announce(&notice.line()),
+    )
+}
+
+/// Spawn [`crate::client_semantics::settle_pending`] over `asked`, so it runs
+/// beside the analysis whatever the analysis blocks on. Aborted when the
+/// returned value is dropped ([`ScheduleTask`]), and quiet about its own
+/// panics ([`crate::panic_report::quiet`]): the schedule is best effort, so
+/// a failure inside it keeps what the first ask gave and never reports the
+/// scan as failed.
+fn spawn_schedule<Ask, AskFut>(
+    asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
+    installed: impl Fn(&str) -> bool + Send + Sync + 'static,
+    waits: Vec<std::time::Duration>,
+    ask: Ask,
+    notice: impl FnMut(crate::client_semantics::ScheduleNotice) + Send + 'static,
+) -> SettlingSemantics
+where
+    Ask: FnMut() -> AskFut + Send + 'static,
+    AskFut: std::future::Future<Output = Option<Vec<crate::client_semantics::ClientSemanticsEntry>>>
+        + Send,
+{
+    let entries = asked.clone();
+    let task = tokio::spawn(crate::panic_report::quiet(async move {
+        crate::client_semantics::settle_pending(
+            entries,
+            installed,
+            &waits,
+            ask,
             tokio::time::sleep,
-            |notice| crate::progress::announce(&notice.line()),
+            notice,
         )
         .await
-    });
-    SettlingSemantics::Settling { task, asked }
+    }));
+    SettlingSemantics::Settling {
+        task: ScheduleTask(task),
+        asked,
+    }
 }
 
 /// Once the library semantics have settled, send the request summaries
@@ -11888,6 +11939,74 @@ mod tests {
         assert!(rows.is_empty(), "{rows:#?}");
     }
 
+    /// carrick#1564, third review: a call through an instance to a member
+    /// outside its verified surface may change its base, so the instance
+    /// holds no client; one that only calls verified verbs still does.
+    #[test]
+    fn a_call_outside_the_instance_surface_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/surface.ts",
+            "import http from \"@fixture/http\";\n\
+             \n\
+             const setter = http.create({ baseURL: \"/r5\" });\n\
+             (setter as any).setBaseURL(\"/elsewhere\");\n\
+             const keyed = http.create({ baseURL: \"/keyed\" });\n\
+             declare const name: string;\n\
+             (keyed as any)[name]();\n\
+             const verbs = http.create({ baseURL: \"/verbs\" });\n\
+             \n\
+             export function r5() { return setter.get(\"/setter\"); }\n\
+             export function viaKey() { return keyed.get(\"/keyed-call\"); }\n\
+             export function other() { return verbs.post(\"/other\", {}); }\n\
+             export function viaVerbs() { return verbs.get(\"/verbs-only\"); }\n",
+        )]);
+        let rows = library_rows_of(&dir, &discovery, "src/surface.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(12, "/verbs/other"), (13, "/verbs/verbs-only")],
+            "{rows:#?}"
+        );
+    }
+
+    /// carrick#1564, third review: an object constant the file writes
+    /// through holds keys its literal does not state, read directly as well
+    /// as spread. A clean constant still states its keys.
+    #[test]
+    fn a_constant_the_file_writes_through_states_no_key_read_directly() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/direct.ts",
+            "const U1 = \"/api/p1\";\n\
+             const U4 = \"/api/p4\";\n\
+             const U6 = \"/api/p6\";\n\
+             const U7 = \"/api/p7\";\n\
+             const WRITTEN = { method: \"POST\" };\n\
+             WRITTEN.method = \"PUT\";\n\
+             const CLEAN = { method: \"PATCH\" };\n\
+             const NOMETHOD = { headers: { a: \"b\" } };\n\
+             const READ = { method: \"POST\" };\n\
+             delete (READ as any).method;\n\
+             \n\
+             export function p1() { return fetch(U1, WRITTEN); }\n\
+             export function p4() { return fetch(U4, CLEAN); }\n\
+             export function p6() { return fetch(U6, NOMETHOD); }\n\
+             export function p7() { return fetch(U7, { method: READ.method }); }\n",
+        )]);
+        let rows = summary_rows_of(&dir, &discovery, "src/direct.ts");
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(13, "PATCH", "/api/p4"), (14, "GET", "/api/p6")],
+            "{rows:#?}"
+        );
+    }
+
     /// carrick#1564 re-review, R2: a spread of a constant puts in place
     /// exactly the keys its object literal writes only while the file never
     /// writes through it, passes it to a call or aliases it; otherwise it may
@@ -12083,6 +12202,83 @@ mod tests {
                 (11, "POST", "${process.env.API_URL}/rpc", Some("poll")),
             ],
             "{rows:#?}"
+        );
+    }
+
+    /// The contract sample's entries: `fixture-slow-http` pending.
+    fn sample_entries() -> Vec<crate::client_semantics::ClientSemanticsEntry> {
+        let detection: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        detection.client_semantics.unwrap()
+    }
+
+    /// carrick#1564, third review: a scan that stops before it reads the
+    /// summaries drops the schedule, and the dropped schedule sends no
+    /// further ask and prints no further line.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_schedule_asks_nothing_further() {
+        let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (counted, printed) = (asks.clone(), lines.clone());
+        let settling = spawn_schedule(
+            sample_entries(),
+            |_| true,
+            crate::client_semantics::PENDING_REASK_WAITS.to_vec(),
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { None }
+            },
+            move |notice| printed.lock().unwrap().push(notice.line()),
+        );
+        // The task prints its first line and sleeps out the first wait.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(lines.lock().unwrap().len(), 1, "the schedule started");
+        drop(settling);
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            1,
+            "{:?}",
+            lines.lock().unwrap()
+        );
+    }
+
+    fn broken_ask() -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+        panic!("the schedule broke")
+    }
+
+    /// carrick#1564, third review: a panic inside the schedule is the
+    /// schedule's own. It is raised inside a quiet poll, which the
+    /// process-wide hook neither reports as the scan failing nor prints
+    /// (`tests/panic_hook_test.rs` proves that half), and the scan keeps what
+    /// the first ask gave.
+    #[tokio::test]
+    async fn a_panic_in_the_schedule_is_quiet_and_keeps_the_first_answer() {
+        let quiet = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = quiet.clone();
+        let asked = sample_entries();
+        let settling = spawn_schedule(
+            asked.clone(),
+            |_| true,
+            vec![std::time::Duration::ZERO; 2],
+            move || {
+                seen.store(
+                    crate::panic_report::in_quiet_poll(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                async { broken_ask() }
+            },
+            |_| {},
+        );
+        assert_eq!(settling.settled().await, Some(asked));
+        assert!(
+            quiet.load(std::sync::atomic::Ordering::SeqCst),
+            "the ask ran inside a quiet poll"
         );
     }
 

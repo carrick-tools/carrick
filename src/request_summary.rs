@@ -281,6 +281,13 @@ struct ClientRef {
     /// requests go (`const d = api.defaults; d.baseURL = …`), so nothing is
     /// read through it.
     contested: bool,
+    /// The members the file calls through the binding (`None`: the binding
+    /// itself called). An instance with a call outside its verified surface
+    /// is read through nothing: the call may change its base
+    /// (`api.setBaseURL("/v2")`).
+    called: BTreeSet<Option<String>>,
+    /// A member called by a key the source does not state.
+    called_computed: bool,
 }
 
 /// `export.factory({ ... })`: the factory member and the object literal it
@@ -538,11 +545,18 @@ impl ModuleScope {
     /// `client`, contested when the file uses `binding` other than to call
     /// through it or export it (carrick#1564 re-review, R6).
     fn with_uses(&self, mut client: ClientRef, binding: &str) -> ClientRef {
-        client.contested |= self
-            .uses
-            .get(binding)
-            .is_some_and(BindingUse::contests_client);
+        if let Some(used) = self.uses.get(binding) {
+            client.contested |= used.contests_client();
+            client.called = used.called.clone();
+            client.called_computed = used.called_computed;
+        }
         client
+    }
+
+    /// Whether the file writes through `name` (`name.key = …`, `delete
+    /// name.key`, `name.key++`).
+    fn written_through(&self, name: &str) -> bool {
+        self.uses.get(name).is_some_and(|used| used.written)
     }
 
     /// Whether a spread of `name` puts in place exactly the keys its object
@@ -557,8 +571,13 @@ impl ModuleScope {
 
 /// How one binding is used beyond its own declaration: an identifier, or a
 /// field of `this` keyed `this.<field>` ([`binding_key`]).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct BindingUse {
+    /// The members called through it (`None`: the binding itself called).
+    called: BTreeSet<Option<String>>,
+    /// A member called through it by a key the source does not state
+    /// (`api[name](…)`).
+    called_computed: bool,
     /// The root of a member assignment, update or `delete` target
     /// (`api.defaults.baseURL = …`, `o.x++`).
     written: bool,
@@ -638,7 +657,10 @@ impl BindingUses {
     /// member called, records nothing; a deeper receiver is read.
     fn callee(&mut self, callee: &Expr) {
         let callee = crate::graphql_document_sites::unwrap_expression(callee);
-        if binding_key(callee).is_some() {
+        if let Some(key) = binding_key(callee) {
+            self.mark(key, |used| {
+                used.called.insert(None);
+            });
             return;
         }
         let Some(member) = as_member(callee) else {
@@ -649,7 +671,14 @@ impl BindingUses {
             key.expr.visit_with(self);
         }
         let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
-        if binding_key(obj).is_some() {
+        if let Some(key) = binding_key(obj) {
+            let called = called_member(&member.prop);
+            self.mark(key, |used| match called {
+                Some(name) => {
+                    used.called.insert(Some(name));
+                }
+                None => used.called_computed = true,
+            });
             return;
         }
         match as_member(obj) {
@@ -796,6 +825,18 @@ fn binding_key(expr: &Expr) -> Option<String> {
             MemberProp::Computed(_) => None,
         },
         _ => None,
+    }
+}
+
+/// The member a call names: an identifier, a private name, or a string key.
+fn called_member(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(Lit::Str(key)) => Some(key.value.to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -976,6 +1017,8 @@ fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
                     export,
                     instance: None,
                     contested: false,
+                    called: BTreeSet::new(),
+                    called_computed: false,
                 },
             );
         }
@@ -1534,6 +1577,14 @@ impl Reader<'_> {
                     .get(name)
                     .or_else(|| scope.module.consts.get(name))
                 {
+                    // An object the file writes through holds keys its
+                    // literal does not state (carrick#1564, third review).
+                    if matches!(value, Value::Obj(_)) && scope.module.written_through(name) {
+                        return Value::Obj(ObjValue {
+                            fields: BTreeMap::new(),
+                            open: true,
+                        });
+                    }
                     return value.clone();
                 }
                 Value::opaque(name.to_string())
@@ -1970,6 +2021,8 @@ impl Reader<'_> {
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
             contested: client.contested,
+            called: BTreeSet::new(),
+            called_computed: false,
         })
     }
 
@@ -3006,6 +3059,14 @@ fn library_shape(
                 &client.export,
                 &instance_receiver(&instance.factory),
             )?;
+            if client.called_computed
+                || client
+                    .called
+                    .iter()
+                    .any(|member| !surface.names(member.as_deref()))
+            {
+                return None;
+            }
             // The base is the literal or opaque value the options hold, or
             // none when they do not name the key at all. A key still in the
             // options was written after every entry that could overwrite it

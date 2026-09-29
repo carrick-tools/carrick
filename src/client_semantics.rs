@@ -528,6 +528,13 @@ impl ReceiverSurface {
         self.verbs.get(member)
     }
 
+    /// Whether `member` (`None`: the receiver itself) is a verified verb or
+    /// request member of this receiver.
+    pub fn names(&self, member: Option<&str>) -> bool {
+        member.is_some_and(|member| self.verbs.contains_key(member))
+            || self.requests(member).next().is_some()
+    }
+
     /// The verified requests made through `member` (`None`: the receiver
     /// itself called), in claim-id order.
     pub fn requests<'a>(
@@ -1003,7 +1010,7 @@ fn fill_pending(entries: &mut [ClientSemanticsEntry], later: &[ClientSemanticsEn
 pub fn installed_for(
     service_root: &Path,
     repo_root: &Path,
-) -> impl Fn(&str) -> bool + Send + use<> {
+) -> impl Fn(&str) -> bool + Send + Sync + use<> {
     let service_root = service_root.to_path_buf();
     let repo_root = repo_root.to_path_buf();
     move |package| installed(package, &service_root, &repo_root)

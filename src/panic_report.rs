@@ -53,7 +53,7 @@ pub fn install(repo_path: String) {
         // A panic the code around it catches and states itself is not the
         // run dying, so it neither marks the scan failed nor prints Rust's
         // own lines (carrick-cloud#1369).
-        if CAUGHT.load(Ordering::SeqCst) > 0 {
+        if CAUGHT.load(Ordering::SeqCst) > 0 || in_quiet_poll() {
             return;
         }
         report(info, &repo_path);
@@ -82,6 +82,50 @@ impl CaughtPanics {
 impl Drop for CaughtPanics {
     fn drop(&mut self) {
         CAUGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+thread_local! {
+    /// How many [`quiet`] futures this thread is polling right now.
+    static QUIET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread is inside a poll of a [`quiet`] future. Read by the
+/// hook, which runs on the thread that panicked while the panicking poll is
+/// still on its stack.
+pub fn in_quiet_poll() -> bool {
+    QUIET.try_with(|quiet| quiet.get() > 0).unwrap_or(false)
+}
+
+/// `future`, with every panic raised while it is polled left to whoever
+/// awaits it: the hook neither posts the failure marker nor prints.
+///
+/// Scoped to the future's own polls, on the thread each poll runs on, so a
+/// long-lived task beside the analysis (the in-scan library-semantics
+/// schedule, carrick#1564) can fail without the run being reported dead,
+/// while a panic anywhere else in the run still is. The caller answers the
+/// panic itself: a spawned task's `JoinError`, or a `catch_unwind`.
+pub fn quiet<F: std::future::Future>(future: F) -> impl std::future::Future<Output = F::Output> {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        let _quiet = QuietPoll::enter();
+        future.as_mut().poll(cx)
+    })
+}
+
+/// One poll of a [`quiet`] future; left on drop, an unwinding one included.
+struct QuietPoll(());
+
+impl QuietPoll {
+    fn enter() -> Self {
+        QUIET.with(|quiet| quiet.set(quiet.get() + 1));
+        QuietPoll(())
+    }
+}
+
+impl Drop for QuietPoll {
+    fn drop(&mut self) {
+        let _ = QUIET.try_with(|quiet| quiet.set(quiet.get().saturating_sub(1)));
     }
 }
 

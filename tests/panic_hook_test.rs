@@ -53,6 +53,19 @@ fn a_panic_is_written_to_this_run_s_log_by_the_hook_the_scan_installs() {
         "a caught panic is not the run's: {written}"
     );
 
+    // A panic raised while a `quiet` future is polled is the awaiting code's
+    // to answer, as the in-scan library-semantics schedule answers its own
+    // (carrick#1564): the hook neither logs it nor marks the scan failed.
+    let quiet = futures::executor::block_on(carrick::panic_report::quiet(async {
+        std::panic::catch_unwind(|| panic!("a schedule that gave up"))
+    }));
+    assert!(quiet.is_err(), "the quiet panic was raised");
+    let written = std::fs::read_to_string(&log).expect("read this run's log");
+    assert!(
+        !written.contains("a schedule that gave up"),
+        "a quiet panic is not the run's: {written}"
+    );
+
     let panicked = std::panic::catch_unwind(|| panic!("a scan that could not go on"));
     assert!(panicked.is_err(), "the panic was raised");
 
