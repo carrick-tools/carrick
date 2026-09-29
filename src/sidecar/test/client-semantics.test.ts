@@ -1147,10 +1147,17 @@ declare const c: S; export default c;
     ['a subpath the package exports', 'fixture-sub/client', VERB_GET, 'verified', undefined],
     ['a pnpm-style symlinked install', 'fixture-pnpm', VERB_GET, 'verified', undefined],
     ['a duplicate install of the same name and version', 'fixture-dup', VERB_GET, 'verified', undefined],
-    // Ruled strict for this PR: the alias's installed package.json names the
-    // target, so the name check cannot pass. Directory-name acceptance is
-    // follow-up work, decided together with what counts as an installed path.
-    ['an npm alias whose installed package names itself otherwise', 'fixture-alias', VERB_GET, 'unchecked', 'module_local'],
+    // #1582: an npm alias installs the target under the alias's directory. The
+    // directory after the last node_modules segment is the name asked for, and
+    // its package is the one the resolver's packageId names.
+    ['an npm alias whose installed package names itself otherwise', 'fixture-alias', VERB_GET, 'verified', undefined],
+    ['a scoped npm alias', '@fixture/alias', VERB_GET, 'verified', undefined],
+    // pnpm resolves an alias through the target's realpath, whose directory is
+    // the target's name: this limit keeps it local.
+    ['a pnpm npm alias (limit: the realpath names the target)', 'fixture-palias', VERB_GET, 'unchecked', 'module_local'],
+    ['A1: a paths alias into a package nested inside the named package\'s directory', 'ax-holder', VERB_GET, 'unchecked', 'module_local'],
+    ['A1: a paths alias to another package kept in a subdirectory of the named directory', 'fixture-shadow', VERB_GET, 'unchecked', 'module_local'],
+    ['A1: a paths alias to a service-local copy whose package.json names the package', 'fixture-local', VERB_GET, 'unchecked', 'module_local'],
   ];
 
   before(async () => {
@@ -1170,6 +1177,9 @@ declare const c: S; export default c;
           paths: {
             'ax-named': ['node_modules/ax-other/index.d.ts'],
             'ax-named-dir': ['node_modules/ax-other'],
+            'ax-holder': ['node_modules/ax-holder/node_modules/ax-inner'],
+            'fixture-shadow': ['node_modules/fixture-shadow/lib/other'],
+            'fixture-local': ['vendor/fixture-local'],
           },
         },
         include: ['src/**/*.ts'],
@@ -1207,6 +1217,17 @@ declare const c: S; export default c;
     pkgAt('node_modules/fixture-dup', 'fixture-dup', HTTP);
     // What `"fixture-alias": "npm:fixture-target@1"` installs: the target, under the alias's directory.
     pkgAt('node_modules/fixture-alias', 'fixture-target', HTTP);
+    pkgAt('node_modules/@fixture/alias', 'fixture-target', HTTP);
+    pkgAt('node_modules/.pnpm/fixture-ptarget@1.0.0/node_modules/fixture-ptarget', 'fixture-ptarget', HTTP);
+    fs.symlinkSync(
+      path.join(root, 'node_modules/.pnpm/fixture-ptarget@1.0.0/node_modules/fixture-ptarget'),
+      path.join(root, 'node_modules/fixture-palias')
+    );
+    pkgAt('node_modules/ax-holder', 'ax-holder', 'export interface S { fetchIt(u: number): void }\ndeclare const c: S; export default c;\n');
+    pkgAt('node_modules/ax-holder/node_modules/ax-inner', 'ax-inner', HTTP);
+    pkgAt('node_modules/fixture-shadow', 'fixture-shadow', 'export interface S { fetchIt(u: number): void }\ndeclare const c: S; export default c;\n');
+    pkgAt('node_modules/fixture-shadow/lib/other', 'ax-other', HTTP);
+    pkgAt('vendor/fixture-local', 'fixture-local', HTTP);
 
     client = new SidecarClient();
     await client.start();
@@ -1241,5 +1262,173 @@ declare const c: S; export default c;
     assert.strictEqual(modules.get('ax-named-dir')!.installed_version, undefined);
     assert.strictEqual(modules.get('@fixture/typed')!.installed_version, '3.0.2');
     assert.strictEqual(modules.get('fixture-sub/client')!.installed_version, '1.0.0');
+  });
+});
+
+/**
+ * #1582: declarations the service writes for itself. The whole tree sits under
+ * an ancestor directory named `node_modules` and the service is a package of a
+ * monorepo, so every row here also pins what "installed" means: a package
+ * directory after the last `node_modules` segment of the path relative to the
+ * service root.
+ */
+describe('verify_client_semantics ignores what the service declares for a package (#1582)', () => {
+  let base: string;
+  let repo: string;
+  let svc: string;
+  let link: string;
+  let alias: string;
+  let client: SidecarClient;
+  const results = new Map<string, Result>();
+  const tail = 'declare const c: S; export default c;\n';
+  const write = (rel: string, text: string) => writeTree(svc, { [rel]: text });
+  const pkgIn = (dir: string, name: string, dts: string) =>
+    writeTree(dir, {
+      [`node_modules/${name}/package.json`]: packageJson(name, '1.0.0', { types: 'index.d.ts' }),
+      [`node_modules/${name}/index.d.ts`]: dts,
+    });
+
+  const PB = (member: string): Claim => ({ kind: 'verb_body', member, args: 'path_body' });
+  const VERB = (member: string): Claim => ({ kind: 'verb', member, method: member.toUpperCase() });
+  /** [finding, what it shows, package, claim, verdict, reason] */
+  const CASES: Array<[string, string, string, Claim, Result['verdict'], string | undefined]> = [
+    ['B1', 'a string overload the service adds to a member the library types number', 'ax-over', VERB_GET, 'failed', 'path_not_string'],
+    ['B1', 'a call signature the service adds to the callable export, over a library config type', 'ax-callable', { kind: 'request', member: null, args: 'config', url_key: 'url', method_key: 'method' }, 'failed', 'param_missing'],
+    ['B2', 'a member added by a service file in a source directory named node_modules (verb)', 'ax-aug3', VERB('post'), 'failed', 'member_missing'],
+    ['B2', 'a member added by a service file in a source directory named node_modules (body)', 'ax-aug3', PB('post'), 'failed', 'member_missing'],
+    ['B2', 'a member the service adds when its repository sits under a node_modules ancestor', 'ax-anc', VERB('post'), 'failed', 'member_missing'],
+    ['B2', 'a member added by a service file in a node_modules directory with no package.json', 'ax-aug5', VERB('post'), 'failed', 'member_missing'],
+    ['B2', 'a package installed in the service', 'ax-anc', VERB_GET, 'verified', undefined],
+    ['B2', 'a package hoisted to the monorepo root above the service', 'fixture-hoisted', VERB_GET, 'verified', undefined],
+    ['B2', 'a pnpm-style symlinked install', 'fixture-pnpm2', VERB_GET, 'verified', undefined],
+    ['B2', 'a method key the default library declares', 'fixture-lib', { kind: 'request', member: 'send', args: 'config', url_key: 'url', method_key: 'method' }, 'verified', undefined],
+    ['B3', 'a mapped member the service adds to a library base interface (verb)', 'ax-base', VERB('post'), 'failed', 'member_missing'],
+    ['B3', 'a mapped member the service adds to a library base interface (body)', 'ax-base', PB('post'), 'failed', 'member_missing'],
+    ['B3', 'a mapped member the service adds two bases down', 'ax-deep', VERB('post'), 'failed', 'member_missing'],
+    ['B3', 'a mapped member the service adds to the base of a generic interface', 'ax-generic', VERB('post'), 'failed', 'member_missing'],
+    ['B3', 'the library member beside the service\'s addition to the base', 'ax-base', VERB_GET, 'verified', undefined],
+    ['B3', 'verbs an installed interface takes from a Record base', 'fixture-iface', VERB_GET, 'verified', undefined],
+    ['B3', 'verbs an installed intersection alias takes from a Record part', 'fixture-inter', VERB_GET, 'verified', undefined],
+    ['B3', 'a mapped member reached through a base another library base also lists', 'ax-twobase', VERB('post'), 'verified', undefined],
+  ];
+
+  before(async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-semantics-1582-'));
+    repo = path.join(base, 'real', 'node_modules', 'work', 'repo');
+    svc = path.join(repo, 'packages', 'svc');
+    link = path.join(base, 'svc-link');
+    alias = path.join(base, 'alias');
+    writeTree(svc, {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          target: 'es2020',
+          module: 'commonjs',
+          moduleResolution: 'node',
+          strict: true,
+          esModuleInterop: true,
+          skipLibCheck: true,
+          types: [],
+        },
+        include: ['src/**/*.ts'],
+      }),
+      'src/index.ts': "import './node_modules/aug';\nimport './node_modules/plugins/aug5';\nexport const service = 1;\n",
+      'src/node_modules/plugins/aug5.ts': "import 'ax-aug5';\ndeclare module 'ax-aug5' { interface S { post(url: string): Promise<unknown> } }\nexport {};\n",
+      // B2: a service source file in a directory that happens to be named node_modules.
+      'src/node_modules/aug.ts': "import 'ax-aug3';\ndeclare module 'ax-aug3' { interface S { post(url: string, body: unknown): Promise<unknown> } }\nexport {};\n",
+      // B1: overloads the service adds.
+      'src/over.ts': "import 'ax-over';\nimport 'ax-callable';\ndeclare module 'ax-over' { interface S { get(url: string): Promise<unknown> } }\ndeclare module 'ax-callable' { interface S { (config: Config): Promise<unknown> } }\nexport {};\n",
+      // B2: under a node_modules ancestor, the service's own file still is not installed.
+      'src/anc.ts': "import 'ax-anc';\ndeclare module 'ax-anc' { interface S { post(url: string): Promise<unknown> } }\nexport {};\n",
+      // B3: the service extends a library base interface with its own mapped type.
+      'src/generic.ts': "import 'ax-generic';\ndeclare module 'ax-generic' { interface Base<T> extends Record<'post', (url: string) => Promise<unknown>> {} }\nexport {};\n",
+      'src/base.ts': "import 'ax-base';\nimport 'ax-deep';\nimport 'ax-twobase';\ndeclare module 'ax-base' { interface Base extends Record<'post', (url: string, body: unknown) => Promise<unknown>> {} }\ndeclare module 'ax-deep' { interface Root extends Record<'post', (url: string) => Promise<unknown>> {} }\ndeclare module 'ax-twobase' { interface Extra extends Record<'post', (url: string) => Promise<unknown>> {} }\nexport {};\n",
+    });
+    pkgIn(svc, 'ax-over', `export interface S { get(url: number): Promise<unknown> }\n${tail}`);
+    pkgIn(svc, 'ax-callable', `export interface Config { url: string; method: string }\nexport interface S { (config: number): Promise<unknown> }\n${tail}`);
+    pkgIn(svc, 'ax-aug3', `export interface S { get(url: string): Promise<unknown> }\n${tail}`);
+    pkgIn(svc, 'ax-anc', `export interface S { get(url: string): Promise<unknown> }\n${tail}`);
+    pkgIn(svc, 'ax-aug5', `export interface S { get(url: string): Promise<unknown> }\n${tail}`);
+    // The ancestor named node_modules is itself a package directory. Two
+    // symlinks reach the service: one to its root, one to the tree above the
+    // ancestor, so file names can carry `node_modules/work` without being real.
+    writeTree(base, { 'real/node_modules/work/package.json': packageJson('work', '1.0.0', {}) });
+    fs.symlinkSync(svc, link);
+    fs.symlinkSync(path.join(base, 'real'), alias);
+    pkgIn(repo, 'fixture-hoisted', `export interface S { get(url: string): Promise<unknown> }\n${tail}`);
+    writeTree(svc, {
+      'node_modules/.pnpm/fixture-pnpm2@1.0.0/node_modules/fixture-pnpm2/package.json': packageJson('fixture-pnpm2', '1.0.0', { types: 'index.d.ts' }),
+      'node_modules/.pnpm/fixture-pnpm2@1.0.0/node_modules/fixture-pnpm2/index.d.ts': `export interface S { get(url: string): Promise<unknown> }\n${tail}`,
+    });
+    fs.symlinkSync(
+      path.join(svc, 'node_modules/.pnpm/fixture-pnpm2@1.0.0/node_modules/fixture-pnpm2'),
+      path.join(svc, 'node_modules/fixture-pnpm2')
+    );
+    pkgIn(svc, 'fixture-lib', `export interface S { send(config: RequestInit & { url: string }): Promise<unknown> }\n${tail}`);
+    pkgIn(svc, 'ax-base', `export interface Base { get(url: string): Promise<unknown> }\nexport interface S extends Base {}\n${tail}`);
+    pkgIn(svc, 'ax-deep', `export interface Root { get(url: string): Promise<unknown> }\nexport interface Mid extends Root {}\nexport interface S extends Mid {}\n${tail}`);
+    pkgIn(svc, 'ax-generic', `export interface Base<T> { get(url: T): Promise<unknown> }\nexport interface S<T = string> extends Base<T> {}\n${tail}`);
+    pkgIn(svc, 'fixture-iface', `export interface S extends Record<'get' | 'post', (url: string) => Promise<unknown>> { timeout: number }\n${tail}`);
+    pkgIn(svc, 'fixture-inter', `export type S = { timeout: number } & Record<'get' | 'post', (url: string) => Promise<unknown>>;\n${tail}`);
+    pkgIn(svc, 'ax-twobase', `export interface Lib extends Record<'post', (url: string) => Promise<unknown>> {}\nexport interface Extra {}\nexport interface S extends Lib, Extra {}\n${tail}`);
+
+    client = new SidecarClient();
+    await client.start();
+    const ready = await client.send<{ status: string }>({ request_id: 'b-init', action: 'init', repo_root: svc });
+    assert.strictEqual(ready.status, 'ready');
+    const checks = CASES.map(([, , pkg, claim], i) => ({ ...check(pkg, 'export', claim), claim_id: `b-${i}` }));
+    const response = await client.send<Response>(
+      { request_id: 'b', action: 'verify_client_semantics', from_dir: svc, checks },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(pairs(response.semantics!), pairs(checks));
+    for (const result of response.semantics!) results.set(result.claim_id, result);
+  });
+
+  after(async () => {
+    await client.stop();
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  CASES.forEach(([finding, shows, , , verdict, reason], i) => {
+    it(`${finding}: ${shows} is ${verdict}${reason ? ` (${reason})` : ''}`, () => {
+      const result = results.get(`b-${i}`)!;
+      assert.deepStrictEqual([result.verdict, result.reason], [verdict, reason]);
+    });
+  });
+
+  const ANCESTOR_CHECKS = () => [check('ax-anc', 'export', VERB('post')), check('ax-anc', 'export', VERB_GET)];
+  const ANCESTOR_VERDICTS = [
+    ['failed', 'member_missing'],
+    ['verified', undefined],
+  ];
+
+  it('B2: judges files against the realpath of a service root reached through a symlink', async () => {
+    const response = await client.send<Response>({
+      request_id: 'b-link',
+      action: 'verify_client_semantics',
+      from_dir: link,
+      checks: ANCESTOR_CHECKS(),
+    });
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    assert.deepStrictEqual(response.semantics!.map(r => [r.verdict, r.reason]), ANCESTOR_VERDICTS);
+  });
+
+  it('B2: judges files named through a symlinked path by their realpath', async () => {
+    const through = path.join(alias, 'node_modules', 'work', 'repo', 'packages', 'svc');
+    const other = new SidecarClient();
+    await other.start();
+    try {
+      const ready = await other.send<{ status: string }>({ request_id: 'b-alias-init', action: 'init', repo_root: through });
+      assert.strictEqual(ready.status, 'ready');
+      const response = await other.send<Response>(
+        { request_id: 'b-alias', action: 'verify_client_semantics', from_dir: through, checks: ANCESTOR_CHECKS() },
+        60_000
+      );
+      assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+      assert.deepStrictEqual(response.semantics!.map(r => [r.verdict, r.reason]), ANCESTOR_VERDICTS);
+    } finally {
+      await other.stop();
+    }
   });
 });
