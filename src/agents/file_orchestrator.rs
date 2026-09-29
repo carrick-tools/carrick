@@ -8855,6 +8855,13 @@ impl FileOrchestrator {
     ) -> MountGraph {
         let mut graph = MountGraph::new();
 
+        // Every pass reads the files in path order, so the graph's rows come
+        // out in one order for one input: two files stating the same
+        // operation otherwise swap places between scans of the same tree, and
+        // the PR run reads that as a changed surface.
+        let mut files: Vec<(&String, &FileAnalysisResult)> = file_results.iter().collect();
+        files.sort_by(|a, b| a.0.cmp(b.0));
+
         // Which mount-site binding stands for which analysed file, resolved
         // through the module graph — (file, exported name), never a bare name.
         // This is what attributes a mounted plugin's routes to the binding it
@@ -8871,7 +8878,7 @@ impl FileOrchestrator {
         let mut import_map: HashMap<String, BTreeSet<String>> = HashMap::new();
 
         // First pass: collect all nodes and build import mappings
-        for (file_path, result) in file_results {
+        for &(file_path, result) in &files {
             // Add nodes from endpoints
             for endpoint in &result.endpoints {
                 let node_key = format!("{}:{}", file_path, endpoint.owner_node);
@@ -8929,7 +8936,7 @@ impl FileOrchestrator {
         }
 
         // Second pass: build mount edges with resolved names
-        for (file_path, result) in file_results {
+        for &(file_path, result) in &files {
             // Children mounted in THIS file. A parent that is one of them is a
             // router this file created or imported and then mounted itself, so
             // it is already a node in the graph and must not be rewritten.
@@ -8991,7 +8998,7 @@ impl FileOrchestrator {
         // it is read once, by `resolve_endpoint_paths` below, and nothing
         // between here and there adds or removes an endpoint.
         let mut registration_literals: Vec<Option<String>> = Vec::new();
-        for (file_path, result) in file_results {
+        for &(file_path, result) in &files {
             for endpoint in &result.endpoints {
                 let method = endpoint.method.trim().to_uppercase();
                 if !is_producer_method(&method) {
@@ -9083,7 +9090,7 @@ impl FileOrchestrator {
         // SWC HTTP candidate, i.e. only when the deterministic scanner saw an
         // HTTP client call at that source location.
         let mut collected: Vec<(DataFetchingCall, bool)> = Vec::new();
-        for (file_path, result) in file_results {
+        for &(file_path, result) in &files {
             for data_call in &result.data_calls {
                 let Some(method) = Self::normalize_consumer_method(data_call.method.as_deref())
                 else {
