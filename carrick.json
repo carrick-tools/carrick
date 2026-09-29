@@ -4,6 +4,11 @@
       "name": "type-sidecar",
       "directory": "src/sidecar",
       "tsconfig": "tsconfig.json"
+    },
+    {
+      "name": "carrick-cli",
+      "directory": "npm/carrick",
+      "tsconfig": "tsconfig.json"
     }
   ]
 }

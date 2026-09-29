@@ -1,0 +1,61 @@
+name: Positioning Copy Guard
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "src/**"
+      - "npm/carrick/src/**"
+      - "npm/carrick/bin/**"
+      - "npm/carrick/package.json"
+      - "npm/carrick/README.md"
+      - "README.md"
+      - "action.yml"
+      - "Cargo.toml"
+      - ".github/workflows/positioning-copy-guard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Guard against the cross-repo positioning in customer-facing strings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Find the retired positioning
+        run: |
+          # Carrick is cross-service: the services can share one repository or
+          # sit in many (owner ruling, 2026-09-28). Copy that says the index
+          # covers a GitHub org, or answers across repos, tells a monorepo team
+          # the product is not for them. `carrick --help` said exactly that for
+          # a release after every README and listing had moved on (carrick#1572).
+          #
+          # The phrases are the positioning ones, not every "cross-repo": the
+          # scanner has a cross-repo join, and a comment naming it is a fact
+          # about repository boundaries. A guard that fires on those gets
+          # edited to pass, and then it guards nothing.
+          #
+          # The agreed wording is carrick-site docs/listing-copy.md.
+          PATTERN='GitHub org\b|answer across repos|cross-repo TypeScript|cross-repo context'
+
+          # Both halves of what a person reads: the Rust CLI's own output and
+          # the npm package, plus the text the Marketplace, npm and the MCP
+          # directories render.
+          if matches=$(
+            {
+              find src npm/carrick/src npm/carrick/bin \
+                -type f \( -name '*.rs' -o -name '*.ts' -o -name '*.mjs' \) \
+                -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/dist/*'
+              printf '%s\n' README.md npm/carrick/README.md action.yml npm/carrick/package.json Cargo.toml
+            } | sort | xargs grep -niE "$PATTERN"
+          ); then
+            echo "$matches"
+            echo ""
+            echo "FAIL: the lines above use the retired cross-repo positioning."
+            echo "      Take the headline or a variant from carrick-site"
+            echo "      docs/listing-copy.md word for word."
+            exit 1
+          fi
+          echo "No retired positioning in customer-facing strings."

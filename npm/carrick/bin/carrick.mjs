@@ -268,10 +268,12 @@ async function printVersion() {
  * spawned for that text and answers none of these names, so its groups are
  * repeated here as headings instead of being interleaved (carrick#976).
  *
- * `init` is named in the binary's own WORKSPACE block instead of here: it is
- * where the first run starts, and a help text a reader stops part-way through
- * must not be the reason they never find it (carrick#997 item 5). Its
- * arguments are still this package's.
+ * `init`, `doctor` and `remove` are named in the binary's own WORKSPACE block
+ * instead of here: `init` is where the first run starts, and a help text a
+ * reader stops part-way through must not be the reason they never find it
+ * (carrick#997 item 5). `doctor` and `remove` shipped named only in a sentence
+ * under this block, where nobody looking for them found them (carrick#1572).
+ * Their arguments are still this package's.
  */
 function extraHelp() {
   return [
@@ -302,9 +304,7 @@ function extraHelp() {
     "                                 background; it never installs anything.",
     "",
     "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
-    "prints its own arguments. `carrick doctor` re-checks that setup and exits",
-    "non-zero on anything it finds. `carrick remove` undoes what init wrote on",
-    "this machine and lists the files the scaffold added to the repository.",
+    "prints its own arguments.",
     "",
   ].join("\n");
 }
