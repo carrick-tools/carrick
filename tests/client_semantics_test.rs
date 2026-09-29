@@ -465,6 +465,73 @@ async fn a_map_is_never_read_as_the_client() {
     assert!(negatives.is_empty(), "{negatives:#?}");
 }
 
+/// The re-review's sites (carrick#1564 re-review, R1, R2 and R6), through
+/// the real sidecar. A base key written after every spread, beside a method
+/// or under a string key, or agreed by both branches of a conditional
+/// spread, is read. A key a later spread, a getter, a computed key, a
+/// disagreeing or possibly empty conditional spread, a written constant, a
+/// constructor branch or loop, a method, or a write through the client or
+/// an alias of it may change reads exactly as the tree does without the
+/// semantics.
+#[tokio::test]
+#[serial]
+async fn the_rereviews_sites_read_a_base_only_where_nothing_can_change_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    let get = ids(HTTP, &["factory:create", "verb:get"]);
+    let get: Vec<&str> = get.iter().map(String::as_str).collect();
+    for (file, line, target) in [
+        ("src/n1-spread-before.ts", 7, "/after/stated"),
+        ("src/n3-cond-spread.ts", 10, "/x/keep"),
+        ("src/n3-cond-spread.ts", 11, "/same/agree"),
+        ("src/n4-getter-computed.ts", 11, "/s1/string-key"),
+        ("src/n4-getter-computed.ts", 12, "/m1/method-prop"),
+    ] {
+        assert_library_row(&rows, file, line, "GET", target, &get);
+    }
+    let unread = |rows: &[DataFetchingCall], file: &str, lines: &[u32]| {
+        rendered(
+            rows.iter()
+                .filter(|row| {
+                    row.file_location.contains(file)
+                        && row.line.is_some_and(|line| lines.contains(&line))
+                })
+                .cloned()
+                .collect(),
+        )
+    };
+    for (file, lines) in [
+        ("src/n2-two-spreads.ts", &[8][..]),
+        ("src/n3-cond-spread.ts", &[9, 12][..]),
+        ("src/n4-getter-computed.ts", &[9, 10][..]),
+        ("src/n5-ctor-try-loop.ts", &[12, 23][..]),
+        ("src/n6-method-write.ts", &[8, 16][..]),
+        ("src/n7-mutated-spread-const.ts", &[10][..]),
+        ("src/n8-indirect-write.ts", &[10, 11][..]),
+        ("src/n9-phase1-fetch.ts", &[9, 10, 11, 12, 13][..]),
+    ] {
+        assert_eq!(
+            unread(&rows, file, lines),
+            unread(&without, file, lines),
+            "{file} {lines:?} reads as it does without the semantics"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| {
+                    row.file_location.contains(file)
+                        && row.line.is_some_and(|line| lines.contains(&line))
+                })
+                .all(|row| row.library_semantics.is_empty()),
+            "{file} {lines:?} is read through no claim"
+        );
+    }
+}
+
 /// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a
 /// base key written through the instance, a base named in the call's own
 /// options, options and a config open to a spread, a field a constructor

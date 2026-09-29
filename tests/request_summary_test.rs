@@ -90,6 +90,25 @@ fn assert_gateway_row(calls: &[serde_json::Value], file: &str, line: i64, action
     }
 }
 
+/// A known gap in the fixture's README: production sends `sent` as the
+/// action at `file:line`, and the scanner states the row with no action.
+/// Asserted as the scanner states it today, so closing the gap fails here
+/// and the README's Known gaps table is updated with it.
+fn assert_known_gap(calls: &[serde_json::Value], file: &str, line: i64, sent: &str, issue: &str) {
+    let rows = rows_at(calls, file, line);
+    let dispatch = rows
+        .first()
+        .map(|row| row["dispatch"]["value"].clone())
+        .unwrap_or_default();
+    assert!(
+        dispatch.is_null(),
+        "known gap {issue}: production sends action={sent} at {file}:{line}, and the scanner \
+         was expected to state no action, but states {dispatch}; if the gap is closed, move \
+         the row out of the README's Known gaps"
+    );
+    assert_gateway_row(calls, file, line, None);
+}
+
 #[test]
 fn the_clients_own_requests_are_stated_through_the_field_that_holds_the_url() {
     let calls = calls();
@@ -98,15 +117,20 @@ fn the_clients_own_requests_are_stated_through_the_field_that_holds_the_url() {
     assert_gateway_row(&calls, "api-client.ts", 147, Some("get-cross-repo-data"));
 }
 
-/// A key written before a spread of the caller's params is one the params may
-/// overwrite, so the source does not state it; written after, it does
-/// (carrick#1564 review, finding 1). The route and the method stay facts
-/// either way.
+/// A key written after a spread of the caller's params is stated. One
+/// written before it is what production sends too, but the scanner does
+/// not state it: a known gap (see the fixture's README).
 #[test]
 fn an_action_the_params_spread_may_overwrite_is_not_stated() {
     let calls = calls();
-    assert_gateway_row(&calls, "api-client.ts", 103, None);
     assert_gateway_row(&calls, "api-client.ts", 171, Some("refresh"));
+    assert_known_gap(
+        &calls,
+        "api-client.ts",
+        103,
+        "find-similar",
+        "#1585: the key is written before a spread whose declared type cannot carry it",
+    );
 }
 
 #[test]
@@ -147,10 +171,17 @@ fn an_invented_action_is_replaced_by_the_literal_the_body_writes() {
 
 /// Where the request line states no action, the row the source states
 /// carries none: the model's invented `findSimilar` is never kept on it
-/// (carrick#1564 review, finding 9).
+/// (carrick#1564 review, finding 9). Production sends `find-similar`
+/// there, which the scanner does not state: a known gap.
 #[test]
 fn a_fact_row_never_carries_the_models_action() {
-    assert_gateway_row(&calls(), "tools/find-similar.ts", 4, None);
+    assert_known_gap(
+        &calls(),
+        "tools/find-similar.ts",
+        4,
+        "find-similar",
+        "#1585: the request line writes the action before a typed spread",
+    );
 }
 
 #[test]

@@ -11709,6 +11709,141 @@ mod tests {
         );
     }
 
+    /// carrick#1564 re-review, R6: a client binding the file uses for
+    /// anything but calls through it, or exporting it, holds no client: an
+    /// alias, an argument, a member read that is not called, or a write
+    /// through a function-local instance may each change its base. A write
+    /// through the export before the factory runs reaches the instance too.
+    /// In a static arrow property `this` is the class, which holds no
+    /// instance field.
+    #[test]
+    fn a_client_used_other_than_to_call_through_it_holds_no_client() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/uses.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/v1\" });\n\
+                 const defaults = (api as any).defaults;\n\
+                 defaults.baseURL = \"/v2\";\n\
+                 \n\
+                 const api2 = http.create({ baseURL: \"/w1\" });\n\
+                 Object.assign((api2 as any).defaults, { baseURL: \"/w2\" });\n\
+                 \n\
+                 const passed = http.create({ baseURL: \"/p1\" });\n\
+                 configure(passed);\n\
+                 \n\
+                 const kept = http.create({ baseURL: \"/kept\" });\n\
+                 export default kept;\n\
+                 \n\
+                 declare function configure(client: unknown): void;\n\
+                 \n\
+                 export function n8a() { return api.get(\"/alias-write\"); }\n\
+                 export function n8b() { return api2.get(\"/assign-write\"); }\n\
+                 export function passedOn() { return passed.get(\"/passed\"); }\n\
+                 export function exported() { return kept.get(\"/exported\"); }\n\
+                 \n\
+                 export function local() {\n\
+                 \x20 const scoped = http.create({ baseURL: \"/local\" });\n\
+                 \x20 scoped.defaults.baseURL = \"/elsewhere\";\n\
+                 \x20 return scoped.get(\"/local-write\");\n\
+                 }\n\
+                 \n\
+                 export class Holder {\n\
+                 \x20 private api = http.create({ baseURL: \"/inst\" });\n\
+                 \x20 static load = () => this.api.get(\"/static-arrow\");\n\
+                 \x20 run() { return this.api.get(\"/ran\"); }\n\
+                 }\n",
+            ),
+            (
+                "src/export-defaults.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 http.defaults.baseURL = \"/configured\";\n\
+                 const built = http.create({ timeout: 5 });\n\
+                 \n\
+                 export function plain() { return http.get(\"/plain\"); }\n\
+                 export function fromBuilt() { return built.get(\"/built\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/uses.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(
+            stated,
+            vec![(21, "/kept/exported"), (32, "/inst/ran")],
+            "{rows:#?}"
+        );
+        let rows = library_rows_of(
+            &dir,
+            &discovery,
+            "src/export-defaults.ts",
+            &verified_sample(),
+        );
+        assert!(rows.is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#1564 re-review, R2: a spread of a constant puts in place
+    /// exactly the keys its object literal writes only while the file never
+    /// writes through it, passes it to a call or aliases it; otherwise it may
+    /// hold any key, on the library path and in a plain request alike.
+    #[test]
+    fn a_spread_constant_the_file_can_change_states_no_key() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/library.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 declare const prod: boolean;\n\
+                 const overrides: { baseURL?: string } = {};\n\
+                 if (prod) {\n\
+                 \x20 overrides.baseURL = \"/prod\";\n\
+                 }\n\
+                 const api = http.create({ baseURL: \"/dev\", ...overrides });\n\
+                 const FIXED = { timeout: 5 };\n\
+                 const fixed = http.create({ baseURL: \"/fixed\", ...FIXED });\n\
+                 \n\
+                 export function n7() { return api.get(\"/mutated-const\"); }\n\
+                 export function kept() { return fixed.get(\"/kept\"); }\n",
+            ),
+            (
+                "src/plain.ts",
+                "const KNOWN = \"/api/known\";\n\
+                 const SENT_URL = \"/api/sent\";\n\
+                 const ALIASED_URL = \"/api/aliased\";\n\
+                 const WRITTEN_URL = \"/api/written\";\n\
+                 const OPTS = { method: \"POST\" };\n\
+                 const SENT = { method: \"PUT\" };\n\
+                 const ALIASED = { method: \"PATCH\" };\n\
+                 const WRITTEN = { method: \"DELETE\" };\n\
+                 const alias = ALIASED;\n\
+                 WRITTEN.method = \"GET\";\n\
+                 declare function prepare(init: object): void;\n\
+                 prepare(SENT);\n\
+                 \n\
+                 export function known() { return fetch(KNOWN, { ...OPTS }); }\n\
+                 export function sent() { return fetch(SENT_URL, { ...SENT }); }\n\
+                 export function aliased() { return fetch(ALIASED_URL, { ...ALIASED }); }\n\
+                 export function written() { return fetch(WRITTEN_URL, { ...WRITTEN }); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/library.ts", &verified_sample());
+        let stated: Vec<(u32, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(13, "/fixed/kept")], "{rows:#?}");
+
+        let rows = summary_rows_of(&dir, &discovery, "src/plain.ts");
+        let stated: Vec<(u32, &str, &str)> = rows
+            .iter()
+            .map(|row| (row.line, row.method.as_str(), row.target.as_str()))
+            .collect();
+        assert_eq!(stated, vec![(14, "POST", "/api/known")], "{rows:#?}");
+    }
+
     /// carrick#1564 review, findings 2 and 4 on the library path: a field a
     /// constructor branch writes again, a field a subclass in the file
     /// declares again, and a static member reading `this` hold no instance;

@@ -275,11 +275,12 @@ struct ClientRef {
     export: String,
     /// Set when the binding holds an instance the export's factory built.
     instance: Option<ClientInstance>,
-    /// The last property of every assignment the file makes through this
-    /// binding (`api.defaults.baseURL = …` gives `baseURL`). A write to the
-    /// base key through the client changes where its requests go after the
-    /// factory ran, so a reading through it would state the old base.
-    assigned: BTreeSet<String>,
+    /// The file uses the binding, or for an instance the binding of the
+    /// export it was built from, other than to call through it or export it
+    /// ([`BindingUse::contests_client`]). Such a use can change where its
+    /// requests go (`const d = api.defaults; d.baseURL = …`), so nothing is
+    /// read through it.
+    contested: bool,
 }
 
 /// `export.factory({ ... })`: the factory member and the object literal it
@@ -385,18 +386,19 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
-    let mut writes = MemberWrites::default();
-    module.visit_with(&mut writes);
+    let mut uses = BindingUses::default();
+    module.visit_with(&mut uses);
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
         receivers: HashMap::new(),
-        member_writes: writes.by_root,
+        uses: uses.uses,
+        object_consts: object_consts(module),
         subclass_fields: subclass_fields(module),
     };
     module_scope.receivers = import_receivers(module)
         .into_iter()
         .map(|(name, client)| {
-            let client = module_scope.with_writes(client, &name);
+            let client = module_scope.with_uses(client, &name);
             (name, client)
         })
         .collect();
@@ -428,7 +430,7 @@ pub fn extract_file_ir(
                     if let Some(client) = client
                         && !redeclared.contains(&name)
                     {
-                        let client = module_scope.with_writes(client, &name);
+                        let client = module_scope.with_uses(client, &name);
                         module_scope.receivers.insert(name.clone(), client);
                     }
                     module_scope.consts.insert(name, value);
@@ -523,69 +525,340 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
 struct ModuleScope {
     consts: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
-    /// [`MemberWrites`] over the whole file.
-    member_writes: HashMap<String, BTreeSet<String>>,
+    /// [`BindingUses`] over the whole file.
+    uses: HashMap<String, BindingUse>,
+    /// Names declared once in the file, by `const <name> = { … }`.
+    object_consts: HashSet<String>,
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
 }
 
 impl ModuleScope {
-    /// `client`, with the properties the file assigns through `binding`.
-    fn with_writes(&self, mut client: ClientRef, binding: &str) -> ClientRef {
-        client.assigned = self.member_writes.get(binding).cloned().unwrap_or_default();
+    /// `client`, contested when the file uses `binding` other than to call
+    /// through it or export it (carrick#1564 re-review, R6).
+    fn with_uses(&self, mut client: ClientRef, binding: &str) -> ClientRef {
+        client.contested |= self
+            .uses
+            .get(binding)
+            .is_some_and(BindingUse::contests_client);
         client
     }
+
+    /// Whether a spread of `name` puts in place exactly the keys its object
+    /// literal writes (carrick#1564 re-review, R2): it is declared once, as a
+    /// `const` holding that literal, and the file never writes through it,
+    /// passes it to a call or aliases it.
+    fn spreadable(&self, name: &str) -> bool {
+        self.object_consts.contains(name)
+            && self.uses.get(name).is_none_or(BindingUse::keeps_object)
+    }
 }
 
-/// The last property of every member assignment in a subtree, keyed by the
-/// binding the member chain starts at: `api` for `api.defaults.baseURL = …`,
-/// `this.api` for `this.api.defaults.baseURL = …`.
+/// How one binding is used beyond its own declaration: an identifier, or a
+/// field of `this` keyed `this.<field>` ([`binding_key`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct BindingUse {
+    /// The root of a member assignment, update or `delete` target
+    /// (`api.defaults.baseURL = …`, `o.x++`).
+    written: bool,
+    /// The object of a member read that is not called (`api.defaults`).
+    member_read: bool,
+    /// Spread into an object or array literal.
+    spread: bool,
+    /// Anything else: an argument, an initialiser, a property value, a
+    /// returned value, an array element, an operand, a test.
+    other: bool,
+}
+
+impl BindingUse {
+    /// A client binding used for anything but calls through it (and being
+    /// exported) could have its base changed by code this pass does not
+    /// read, so nothing is read through it.
+    fn contests_client(&self) -> bool {
+        self.written || self.member_read || self.spread || self.other
+    }
+
+    /// An object constant never written through, passed to a call or
+    /// aliased holds exactly the keys its literal writes.
+    fn keeps_object(&self) -> bool {
+        !self.written && !self.other
+    }
+}
+
+/// Every binding's uses over a subtree ([`BindingUse`]). Calls through a
+/// binding (`api.get(…)`, `api(…)`) and `export default api` record nothing;
+/// a bare reassignment is left to the declaration rules.
 #[derive(Default)]
-struct MemberWrites {
-    by_root: HashMap<String, BTreeSet<String>>,
+struct BindingUses {
+    uses: HashMap<String, BindingUse>,
 }
 
-impl Visit for MemberWrites {
-    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left
-            && let Some(last) = written_key(&member.prop)
-            && let Some(root) = member_root(&member.obj)
-        {
-            self.by_root.entry(root).or_default().insert(last);
+impl BindingUses {
+    fn mark(&mut self, key: String, record: impl FnOnce(&mut BindingUse)) {
+        record(self.uses.entry(key).or_default());
+    }
+
+    /// `member` is read and not called: its chain's root is read.
+    fn read_member(&mut self, member: &MemberExpr) {
+        if let MemberProp::Computed(key) = &member.prop {
+            key.expr.visit_with(self);
         }
-        assign.visit_children_with(self);
+        let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
+        if let Some(key) = binding_key(obj) {
+            self.mark(key, |used| used.member_read = true);
+        } else if let Some(inner) = as_member(obj) {
+            self.read_member(inner);
+        } else {
+            obj.visit_with(self);
+        }
+    }
+
+    /// `member` is assigned: its chain's root is written through. A field of
+    /// `this` assigned itself is the field's own write, which the class's
+    /// field table reads.
+    fn write_member(&mut self, member: &MemberExpr) {
+        if let MemberProp::Computed(key) = &member.prop {
+            key.expr.visit_with(self);
+        }
+        if matches!(&*member.obj, Expr::This(_)) {
+            return;
+        }
+        let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
+        if let Some(key) = binding_key(obj) {
+            self.mark(key, |used| used.written = true);
+        } else if let Some(inner) = as_member(obj) {
+            self.write_member(inner);
+        } else {
+            obj.visit_with(self);
+        }
+    }
+
+    /// A call's callee: a binding called, or the direct receiver of the
+    /// member called, records nothing; a deeper receiver is read.
+    fn callee(&mut self, callee: &Expr) {
+        let callee = crate::graphql_document_sites::unwrap_expression(callee);
+        if binding_key(callee).is_some() {
+            return;
+        }
+        let Some(member) = as_member(callee) else {
+            callee.visit_with(self);
+            return;
+        };
+        if let MemberProp::Computed(key) = &member.prop {
+            key.expr.visit_with(self);
+        }
+        let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
+        if binding_key(obj).is_some() {
+            return;
+        }
+        match as_member(obj) {
+            Some(inner) => self.read_member(inner),
+            None => obj.visit_with(self),
+        }
     }
 }
 
-/// The property a member assignment writes, where the source names it.
-fn written_key(prop: &MemberProp) -> Option<String> {
-    match prop {
-        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
-        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
-        MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(key)) => Some(key.value.to_string()),
-            _ => None,
-        },
+impl Visit for BindingUses {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Some(key) = binding_key(expr) {
+            self.mark(key, |used| used.other = true);
+            return;
+        }
+        if let Expr::Member(member) = expr {
+            self.read_member(member);
+            return;
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        match &call.callee {
+            Callee::Expr(callee) => self.callee(callee),
+            other => other.visit_with(self),
+        }
+        call.args.visit_with(self);
+    }
+
+    fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
+        match &*chain.base {
+            OptChainBase::Call(call) => {
+                self.callee(&call.callee);
+                call.args.visit_with(self);
+            }
+            OptChainBase::Member(member) => self.read_member(member),
+        }
+    }
+
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        match &assign.left {
+            AssignTarget::Simple(SimpleAssignTarget::Ident(_)) => {}
+            AssignTarget::Simple(SimpleAssignTarget::Member(member)) => self.write_member(member),
+            other => other.visit_with(self),
+        }
+        // `module.exports = api`, `exports.api = api`: an export.
+        if is_commonjs_export(&assign.left)
+            && binding_key(crate::graphql_document_sites::unwrap_expression(
+                &assign.right,
+            ))
+            .is_some()
+        {
+            return;
+        }
+        assign.right.visit_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        match as_member(crate::graphql_document_sites::unwrap_expression(
+            &update.arg,
+        )) {
+            Some(member) => self.write_member(member),
+            None if binding_key(&update.arg).is_some() => {}
+            None => update.arg.visit_with(self),
+        }
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if unary.op == UnaryOp::Delete
+            && let Some(member) =
+                as_member(crate::graphql_document_sites::unwrap_expression(&unary.arg))
+        {
+            self.write_member(member);
+            return;
+        }
+        unary.arg.visit_with(self);
+    }
+
+    /// A member in a destructuring target (`({ a: o.x } = src)`) is written.
+    fn visit_pat(&mut self, pat: &Pat) {
+        if let Pat::Expr(expr) = pat
+            && let Some(member) = as_member(crate::graphql_document_sites::unwrap_expression(expr))
+        {
+            self.write_member(member);
+            return;
+        }
+        pat.visit_children_with(self);
+    }
+
+    fn visit_object_lit(&mut self, object: &ObjectLit) {
+        for prop in &object.props {
+            match prop {
+                PropOrSpread::Spread(spread) => self.spread(&spread.expr),
+                PropOrSpread::Prop(prop) => prop.visit_with(self),
+            }
+        }
+    }
+
+    fn visit_array_lit(&mut self, array: &ArrayLit) {
+        for element in array.elems.iter().flatten() {
+            match element.spread {
+                Some(_) => self.spread(&element.expr),
+                None => element.expr.visit_with(self),
+            }
+        }
+    }
+
+    fn visit_prop(&mut self, prop: &Prop) {
+        if let Prop::Shorthand(ident) = prop {
+            self.mark(ident.sym.to_string(), |used| used.other = true);
+            return;
+        }
+        prop.visit_children_with(self);
+    }
+
+    fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
+        if binding_key(crate::graphql_document_sites::unwrap_expression(
+            &export.expr,
+        ))
+        .is_none()
+        {
+            export.expr.visit_with(self);
+        }
     }
 }
 
-/// The binding a member chain starts at: an identifier, or a field of
-/// `this`.
-fn member_root(expr: &Expr) -> Option<String> {
+impl BindingUses {
+    fn spread(&mut self, expr: &Expr) {
+        match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
+            Some(key) => self.mark(key, |used| used.spread = true),
+            None => expr.visit_with(self),
+        }
+    }
+}
+
+/// The key a binding is tracked by: an identifier's name, or `this.<field>`.
+fn binding_key(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Paren(e) => member_root(&e.expr),
-        Expr::TsAs(e) => member_root(&e.expr),
-        Expr::TsNonNull(e) => member_root(&e.expr),
-        Expr::TsSatisfies(e) => member_root(&e.expr),
-        Expr::TsTypeAssertion(e) => member_root(&e.expr),
         Expr::Ident(ident) => Some(ident.sym.to_string()),
-        Expr::Member(member) => match member.obj.unwrap_parens() {
-            Expr::This(_) => written_key(&member.prop).map(|field| format!("this.{field}")),
-            _ => member_root(&member.obj),
+        Expr::Member(member) if matches!(&*member.obj, Expr::This(_)) => match &member.prop {
+            MemberProp::Ident(ident) => Some(format!("this.{}", ident.sym)),
+            MemberProp::PrivateName(private) => Some(format!("this.#{}", private.name)),
+            MemberProp::Computed(_) => None,
         },
         _ => None,
     }
+}
+
+/// A member access, plain or optional (`a.b`, `a?.b`).
+fn as_member(expr: &Expr) -> Option<&MemberExpr> {
+    match expr {
+        Expr::Member(member) => Some(member),
+        Expr::OptChain(chain) => match &*chain.base {
+            OptChainBase::Member(member) => Some(member),
+            OptChainBase::Call(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// `module.exports`, or a property of it or of `exports`.
+fn is_commonjs_export(target: &AssignTarget) -> bool {
+    let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = target else {
+        return false;
+    };
+    let is_module_exports = |expr: &Expr| {
+        matches!(expr, Expr::Member(inner)
+            if matches!(&*inner.obj, Expr::Ident(obj) if obj.sym == *"module")
+                && member_prop(inner).as_deref() == Some("exports"))
+    };
+    (matches!(&*member.obj, Expr::Ident(obj) if obj.sym == *"module")
+        && member_prop(member).as_deref() == Some("exports"))
+        || is_module_exports(&member.obj)
+        || matches!(&*member.obj, Expr::Ident(obj) if obj.sym == *"exports")
+}
+
+/// Every name declared exactly once in the module, by `const <name> = { … }`.
+fn object_consts(module: &Module) -> HashSet<String> {
+    #[derive(Default)]
+    struct ObjectConsts {
+        found: HashSet<String>,
+    }
+    impl Visit for ObjectConsts {
+        fn visit_var_decl(&mut self, decl: &VarDecl) {
+            if decl.kind == VarDeclKind::Const {
+                for declarator in &decl.decls {
+                    if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
+                        && matches!(
+                            crate::graphql_document_sites::unwrap_expression(init),
+                            Expr::Object(_)
+                        )
+                    {
+                        self.found.insert(ident.id.sym.to_string());
+                    }
+                }
+            }
+            decl.visit_children_with(self);
+        }
+    }
+    let mut consts = ObjectConsts::default();
+    module.visit_with(&mut consts);
+    let mut declared = DeclaredNames::default();
+    module.visit_with(&mut declared);
+    consts
+        .found
+        .into_iter()
+        .filter(|name| declared.counts.get(name) == Some(&1))
+        .collect()
 }
 
 /// Every class this file declares by name, with the class it extends (when
@@ -702,7 +975,7 @@ fn import_receivers(module: &Module) -> HashMap<String, ClientRef> {
                     package,
                     export,
                     instance: None,
-                    assigned: BTreeSet::new(),
+                    contested: false,
                 },
             );
         }
@@ -1092,7 +1365,7 @@ impl Reader<'_> {
         let receivers = receivers
             .into_iter()
             .map(|(name, client)| {
-                let client = module.with_writes(client, &format!("this.{name}"));
+                let client = module.with_uses(client, &format!("this.{name}"));
                 (name, client)
             })
             .collect();
@@ -1197,7 +1470,7 @@ impl Reader<'_> {
                                 names
                             });
                             if declared.counts.get(&name) == Some(&1) {
-                                let client = scope.module.with_writes(client, &name);
+                                let client = scope.module.with_uses(client, &name);
                                 scope.local_receivers.insert(name, client);
                             }
                         }
@@ -1457,10 +1730,16 @@ impl Reader<'_> {
                 branches.push(ObjValue::default());
                 Some(branches)
             }
-            other => match self.eval(other, scope) {
-                Value::Obj(value) => known(value),
-                _ => None,
-            },
+            // Only a constant holding one object literal that nothing else
+            // can reach (carrick#1564 re-review, R2). Any other value may
+            // hold keys the source does not state here.
+            Expr::Ident(ident) if scope.module.spreadable(ident.sym.as_ref()) => {
+                match self.eval(expr, scope) {
+                    Value::Obj(value) => known(value),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1571,7 +1850,14 @@ impl Reader<'_> {
             _ => None,
         };
 
-        let method = match bag.map(|(_, obj)| obj) {
+        // The options the request carries: the bag, or the object `fetch` is
+        // handed, whether or not its own keys are written at the call
+        // (`fetch(url, { ...INIT })` sends INIT's method).
+        let options = bag.map(|(_, obj)| obj).or(match (kind, args.get(1)) {
+            (RequestKind::Fetch, Some(Value::Obj(options))) => Some(options),
+            _ => None,
+        });
+        let method = match options {
             _ if options_param.is_some() => {
                 MethodValue::ParamKey(options_param.unwrap_or_default(), "method".to_string())
             }
@@ -1593,18 +1879,11 @@ impl Reader<'_> {
             },
             None => match &verb {
                 Some(verb) => MethodValue::Lit(verb.clone()),
-                // `fetch(url, { ...init })`: the options are an object whose
-                // method a spread may set.
-                None if kind == RequestKind::Fetch
-                    && matches!(args.get(1), Some(Value::Obj(options)) if options.open) =>
-                {
-                    MethodValue::Unknown
-                }
                 None => MethodValue::Lit("GET".to_string()),
             },
         };
 
-        let body = match bag.map(|(_, obj)| obj) {
+        let body = match options {
             _ if options_param.is_some() => {
                 BodyValue::ParamKey(options_param.unwrap_or_default(), "body".to_string())
             }
@@ -1687,8 +1966,9 @@ impl Reader<'_> {
                 factory,
                 options: self.object(options_literal, scope),
             }),
-            // Filled in by the caller, which knows the binding it goes to.
-            assigned: BTreeSet::new(),
+            // A write through the export before the factory ran reaches the
+            // instance; the caller adds the instance binding's own uses.
+            contested: client.contested,
         })
     }
 
@@ -2706,10 +2986,10 @@ fn library_shape(
         return None;
     }
     let client = &receiver.client;
-    let base_keys = semantics.claimed_base_keys(&client.package, &client.export);
-    if base_keys.iter().any(|key| client.assigned.contains(*key)) {
+    if client.contested {
         return None;
     }
+    let base_keys = semantics.claimed_base_keys(&client.package, &client.export);
     let mut used: BTreeSet<String> = BTreeSet::new();
     let (surface, base) = match &client.instance {
         None => (
