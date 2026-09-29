@@ -395,43 +395,16 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     );
 }
 
-/// The init line for a real `carrick status --json` payload, as the npm CLI
-/// renders it: the status is the only thing `carrick init` reads it from.
-fn init_line(root: &Path, status: &Value) -> String {
-    use std::io::Write;
-    let mut node = Command::new("node")
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/init-hosted-line.mjs"))
-        .env(
-            "CARRICK_CONSUMER_SOURCE",
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("npm/carrick"),
-        )
-        .env("XDG_CONFIG_HOME", root.join("empty-config"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    node.stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec(&json!({"status":status,"root":root})).unwrap())
-        .unwrap();
-    let output = node.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "init line: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
 /// A clone that does not hold the commit the hosted index was built at gets
 /// none of its rows, and the sentence that says so names the two commands that
 /// bring them: `git fetch` in the repo, then `carrick refresh` (carrick#1574).
 ///
 /// `carrick init` again is not one of them. Init reads the recorded hosted
-/// state and skips the re-read when the tree has not moved, and a fetch moves
-/// no file of the tree, so a second init answers from the same record.
+/// state and skips the re-read when the tree has not moved (`localIndexState`
+/// in `npm/carrick/src/init/hosted.ts`), and a fetch moves no file of the
+/// tree, so a second init answers from the same record. Init's own line is
+/// pinned by `npm/carrick/test/init.test.ts` from the status fields asserted
+/// here.
 #[test]
 fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     let temp = tempfile::tempdir().unwrap();
@@ -514,12 +487,16 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
         )),
         "{note}"
     );
-    let line = format!(
-        "Hosted index not read: it was built at commit {short}, which this clone does not have. \
-         Run `git fetch` in orders, then `carrick refresh`. Until then .carrick/ has only this \
-         machine's scan of 1 service; nothing was re-read."
+    // What `carrick init` builds its line from (`missingCommits` in the npm
+    // CLI): the full commit on the service's `hosted` row, the repo path, and
+    // no `source`, because the row stands for one written before the field.
+    let service = &status["services"][0];
+    assert_eq!(service["hosted"]["commit"], hosted_commit.as_str());
+    assert!(service["hosted"].get("source").is_none(), "{service:#}");
+    assert!(
+        service["repo"].as_str().unwrap().ends_with("orders"),
+        "{service:#}"
     );
-    assert_eq!(init_line(root, &status), line);
 
     // The fetch the sentence names, from the remote `origin` names. Only the
     // transport is redirected to the directory above; the remote itself stays
@@ -539,14 +516,16 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     // changed files.
     assert_ne!(git(&repo, &["rev-parse", "HEAD"]), hosted_commit);
     // Fetched, and not read yet: the state is the one the last refresh
-    // recorded, so `carrick init` again prints the same line, which still
-    // names the read that is owed.
+    // recorded and the tree has not moved, so `carrick init` again finds the
+    // index current and prints the same line, which still names the read that
+    // is owed.
     let fetched_only = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
     assert_eq!(
         fetched_only["services"][0]["hosted_state"],
         "commit_missing"
     );
-    assert_eq!(init_line(root, &fetched_only), line);
+    assert_eq!(fetched_only["services"][0]["changed_since_index"], 0);
+    assert_eq!(fetched_only["services"][0]["boundary_note"], note);
 
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let fetched = check(root, "orders/app.ts");

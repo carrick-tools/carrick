@@ -152,6 +152,8 @@ function executableInitFixture(
     indexed?: boolean;
     alsoInProject?: string[];
     hostedState?: string;
+    /** The hosted row each service's status names, as `carrick status --json` writes it. */
+    hosted?: { commit: string; source?: string; uploaded_by?: string };
     refreshFails?: boolean;
     localIndex?: "absent" | "stale" | "current";
   } = {},
@@ -217,6 +219,7 @@ if (indexed && argv[0] === "status") {
     indexed_at: "2026-09-12T00:00:00Z", routes: 3, calls: 2,
     changed_since_index: name === "api" ? changed : 0,
     hosted_state: state,
+    hosted: ${JSON.stringify(workspace.hosted ?? null)},
   });
   const state = ${JSON.stringify(workspace.hostedState ?? "enriched")};
   process.stdout.write(JSON.stringify({
@@ -1266,6 +1269,34 @@ test("a hosted index older than this CLI is reported as such, and no downgrade i
     assert.doesNotMatch(result.stdout, /npm i -g carrick@/);
     // And no claim that the hosted rows arrived, because they did not.
     assert.doesNotMatch(result.stdout, /downloaded into \.carrick/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#1574. A hosted commit this clone does not have: the run names the
+// commit and the repo from the status answer's `hosted` row, and the two
+// commands that bring the rows. The Rust side proves those two commands do
+// (`hosted_enrichment_test`), and that `hosted.commit` is where the commit is.
+test("a hosted commit this clone lacks names the commit, the repo, and git fetch then carrick refresh", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    hostedState: "commit_missing",
+    hosted: { commit: "4f2a1c9000000000000000000000000000000000" },
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(
+      result.stdout.includes(
+        `▲ Hosted index not read: it was built at commit 4f2a1c9, which this clone does not have. Run \`git fetch\` in ${path.basename(fixture.repo)}, then \`carrick refresh\`. Until then .carrick/ has only this machine's scan of 2 services.`,
+      ),
+      result.stdout,
+    );
   } finally {
     fixture.cleanup();
   }
