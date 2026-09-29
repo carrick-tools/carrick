@@ -36,7 +36,8 @@ second argument is the body. That is knowledge about the library.
    cached, because it depends on `node_modules`.
 
 Code: `src/client_semantics.rs` (wire shape, claims, the verified surface,
-the re-ask rule) and `src/request_summary.rs` (reading calls through it).
+the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
+(reading calls through it).
 
 ## How a call is read
 
@@ -65,18 +66,34 @@ call otherwise never does, and composes across functions and modules like
 any other summary.
 
 The summaries are composed after detection, not in discovery: the semantics
-exist only once detection has answered and the service's sidecar is up.
+exist only once detection has answered, any package it left `pending` has
+been asked about again (below), and the service's sidecar is up.
 
 ## Asking again
 
-There is no cache-version bump. A stored detection with no
-`client_semantics` is asked again on the next scan when one of its data
-fetchers is installed, and one with an entry still `pending` when that
-package is installed. The ask is one HTTP attempt, and a run retrying its
-own owed work does not send it. If the answer names the same packages in
-all four lists, the stored guidance stands and only the semantics are taken;
-if not, guidance is asked again from the new answer. A failed ask keeps the
-stored detection.
+**Within a scan.** When detection leaves an installed package `pending`, the
+scanner asks again after 5 s and, if one is still pending, after another
+15 s: at most three asks per service per scan
+(`PENDING_REASK_WAITS`). Each re-ask is one HTTP attempt bounded by 30 s
+(`PENDING_REASK_TIMEOUT`), and the schedule stops as soon as nothing
+installed is pending. It runs alongside the file analysis, which waits for
+it only before composing the summaries, so the most it can add to a scan is
+80 s. The first answer for a package stands, so the rows do not depend on
+which ask gave it. A failed ask, or one naming other packages, changes
+nothing. A `skipped` package is never asked about, and neither is a
+`pending` one that is not installed. The user reads one line while it waits
+and, if any remain, one saying the next scan asks again.
+
+**On the next scan.** There is no cache-version bump. A stored detection
+with no `client_semantics` is asked again when one of its data fetchers is
+installed, and one with an entry still `pending` when that package is
+installed. The ask is one HTTP attempt. If the answer names the same
+packages in all four lists, the stored guidance stands and only the
+semantics are taken; if not, guidance is asked again from the new answer. A
+failed ask keeps the stored detection.
+
+A run retrying its own owed work asks neither way: its detection is minutes
+old.
 
 ## Limits
 

@@ -152,68 +152,70 @@ impl FrameworkDetector {
         trace!("--- End of Response ---");
         debug!("Framework detection response: {} chars", response.len());
 
-        // Lambda returns Gemini's raw text — same JSON-extraction step.
-        let json_str = self.extract_json_from_response(&response)?;
+        detection_from_response(&response)
+    }
+}
 
-        let detection_result: DetectionResult = serde_json::from_str(&json_str).map_err(|e| {
-            format!(
-                "Failed to parse LLM response as JSON: {}. Response was: {}",
-                e, json_str
-            )
-        })?;
+/// The detection a `/framework-detect` answer's text holds.
+pub(crate) fn detection_from_response(
+    response: &str,
+) -> Result<DetectionResult, Box<dyn std::error::Error>> {
+    // Lambda returns Gemini's raw text — same JSON-extraction step.
+    let json_str = extract_json_from_response(response)?;
+    serde_json::from_str(&json_str).map_err(|e| {
+        format!(
+            "Failed to parse LLM response as JSON: {}. Response was: {}",
+            e, json_str
+        )
+        .into()
+    })
+}
 
-        Ok(detection_result)
+/// Extract JSON from LLM response that may contain extra text
+fn extract_json_from_response(response: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let response = response.trim();
+
+    // If response is pure JSON, return it
+    if response.starts_with('{') && response.ends_with('}') {
+        return Ok(response.to_string());
     }
 
-    /// Extract JSON from LLM response that may contain extra text
-    fn extract_json_from_response(
-        &self,
-        response: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let response = response.trim();
+    // Find JSON object boundaries
+    let mut brace_count = 0;
+    let mut start_idx = None;
+    let mut end_idx = None;
 
-        // If response is pure JSON, return it
-        if response.starts_with('{') && response.ends_with('}') {
-            return Ok(response.to_string());
-        }
-
-        // Find JSON object boundaries
-        let mut brace_count = 0;
-        let mut start_idx = None;
-        let mut end_idx = None;
-
-        for (i, ch) in response.char_indices() {
-            match ch {
-                '{' => {
-                    if start_idx.is_none() {
-                        start_idx = Some(i);
-                    }
-                    brace_count += 1;
+    for (i, ch) in response.char_indices() {
+        match ch {
+            '{' => {
+                if start_idx.is_none() {
+                    start_idx = Some(i);
                 }
-                '}' => {
-                    brace_count -= 1;
-                    if brace_count == 0 && start_idx.is_some() {
-                        end_idx = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
+                brace_count += 1;
             }
-        }
-
-        if let (Some(start), Some(end)) = (start_idx, end_idx) {
-            Ok(response[start..=end].to_string())
-        } else {
-            // Fallback: try to find JSON-like patterns
-            if let Some(start) = response.find('{') {
-                if let Some(end) = response.rfind('}') {
-                    Ok(response[start..=end].to_string())
-                } else {
-                    Err("Could not find valid JSON in LLM response".into())
+            '}' => {
+                brace_count -= 1;
+                if brace_count == 0 && start_idx.is_some() {
+                    end_idx = Some(i);
+                    break;
                 }
+            }
+            _ => {}
+        }
+    }
+
+    if let (Some(start), Some(end)) = (start_idx, end_idx) {
+        Ok(response[start..=end].to_string())
+    } else {
+        // Fallback: try to find JSON-like patterns
+        if let Some(start) = response.find('{') {
+            if let Some(end) = response.rfind('}') {
+                Ok(response[start..=end].to_string())
             } else {
-                Err("No JSON object found in LLM response".into())
+                Err("Could not find valid JSON in LLM response".into())
             }
+        } else {
+            Err("No JSON object found in LLM response".into())
         }
     }
 }

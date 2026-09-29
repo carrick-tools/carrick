@@ -6004,26 +6004,11 @@ async fn settle_semantics_and_summarize(
                 &crate::client_semantics::pending_reask_waits(),
                 || async {
                     let detector = FrameworkDetector::new(reask_agent());
-                    let ask = detector.detect_frameworks_and_libraries(packages, import_facts);
-                    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask)
-                        .await
-                    {
-                        Ok(Ok(fresh)) if fresh.same_lists(detection) => fresh.client_semantics,
-                        Ok(Ok(_)) => {
-                            debug!(
-                                "Asking again for library semantics answered other packages; the next scan settles them"
-                            );
-                            None
-                        }
-                        Ok(Err(error)) => {
-                            debug!("Asking again for library semantics failed ({error})");
-                            None
-                        }
-                        Err(_) => {
-                            debug!("Asking again for library semantics ran out of time");
-                            None
-                        }
-                    }
+                    semantics_from_reask(
+                        detector.detect_frameworks_and_libraries(packages, import_facts),
+                        detection,
+                    )
+                    .await
                 },
                 tokio::time::sleep,
                 |notice| crate::progress::announce(&notice.line()),
@@ -6037,6 +6022,33 @@ async fn settle_semantics_and_summarize(
         debug!("The analysis ended before its request summaries were composed");
     }
     settled
+}
+
+/// The library semantics one in-scan re-ask gives: what `ask` answered, when
+/// it answered within [`crate::client_semantics::PENDING_REASK_TIMEOUT`] and
+/// named the same packages as `detection`, whose guidance the scan is using.
+/// Anything else gives nothing, and the next scan asks again.
+pub(crate) async fn semantics_from_reask<E: std::fmt::Display>(
+    ask: impl std::future::Future<Output = Result<DetectionResult, E>>,
+    detection: &DetectionResult,
+) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask).await {
+        Ok(Ok(fresh)) if fresh.same_lists(detection) => fresh.client_semantics,
+        Ok(Ok(_)) => {
+            debug!(
+                "Asking again for library semantics answered other packages; the next scan settles them"
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            debug!("Asking again for library semantics failed ({error})");
+            None
+        }
+        Err(_) => {
+            debug!("Asking again for library semantics ran out of time");
+            None
+        }
+    }
 }
 
 /// Whether the in-scan schedule may ask about library semantics: a model is

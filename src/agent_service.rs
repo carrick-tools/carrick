@@ -3017,77 +3017,347 @@ pub(crate) mod tests {
         );
     }
 
-    /// carrick#1564 review, finding 5: the library-semantics re-ask is one
-    /// HTTP attempt. Every connection the server sees is counted, over a
-    /// window longer than the standard policy's first backoff, and a
-    /// retriable failure the standard policy would send again ends the call.
+    /// A stub `/framework-detect` that counts every connection it accepts
+    /// until told to stop: each is answered with the next canned response,
+    /// and any beyond them with a failure nothing sends again.
+    struct CountingStub {
+        api_base: String,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl CountingStub {
+        fn start(responses: Vec<(u16, String)>) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let api_base = format!("http://{}", listener.local_addr().unwrap());
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (counted, stopped) = (attempts.clone(), stop.clone());
+            let server = std::thread::spawn(move || {
+                let beyond = (
+                    500,
+                    r#"{"success":false,"error":{"code":"bad_request","message":"no more answers","retriable":false}}"#
+                        .to_string(),
+                );
+                while !stopped.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw).to_string();
+                        let complete = text.find("\r\n\r\n").is_some_and(|end| {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            raw.len() >= end + 4 + length
+                        });
+                        if n == 0 || complete {
+                            break;
+                        }
+                    }
+                    let (status, body) = responses
+                        .get(counted.fetch_add(1, Ordering::SeqCst))
+                        .unwrap_or(&beyond);
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                api_base,
+                attempts,
+                stop,
+                server,
+            }
+        }
+
+        /// Every connection the server accepted. Called once the calls under
+        /// test have returned, so any attempt they made has already arrived.
+        fn attempts(self) -> usize {
+            self.stop.store(true, Ordering::SeqCst);
+            self.server.join().unwrap();
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A retriable failure, which the standard policy would send again.
+    fn retriable_failure() -> (u16, String) {
+        (
+            503,
+            r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#
+                .to_string(),
+        )
+    }
+
+    /// carrick#1564 review, finding 5: a library-semantics re-ask is one HTTP
+    /// attempt. A retriable failure the standard policy would send again after
+    /// a backoff ends the call, and the call returns before the count is read.
     #[tokio::test]
     async fn the_library_semantics_reask_makes_one_http_attempt() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::atomic::AtomicUsize;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let counted = attempts.clone();
-        let window = Duration::from_secs(4);
-        let server = std::thread::spawn(move || {
-            let body = r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#;
-            let deadline = std::time::Instant::now() + window;
-            while std::time::Instant::now() < deadline {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                };
-                stream.set_nonblocking(false).unwrap();
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    raw.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&raw).to_string();
-                    let complete = text.find("\r\n\r\n").is_some_and(|end| {
-                        let length = text[..end]
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        raw.len() >= end + 4 + length
-                    });
-                    if n == 0 || complete {
-                        break;
-                    }
-                }
-                counted.fetch_add(1, Ordering::SeqCst);
-                let response = format!(
-                    "HTTP/1.1 503 X\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-
-        let result = tokio::time::timeout(
-            window,
-            crate::engine::reask_agent().post_with_retry(
+        let stub = CountingStub::start(vec![retriable_failure()]);
+        let result = crate::engine::reask_agent()
+            .post_with_retry(
                 &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
-                &format!("http://{addr}"),
+                &stub.api_base,
                 "/framework-detect",
                 &serde_json::json!({ "ask_client_semantics": true }),
-            ),
-        )
-        .await
-        .expect("one attempt answers without waiting out a backoff");
+            )
+            .await;
         assert!(result.is_err(), "the failure is the call's answer");
-        server.join().unwrap();
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.attempts(), 1);
+    }
+
+    /// The contract's sample detection (carrick#1564), as `/framework-detect`
+    /// answers it, after `edit`. The sample leaves `fixture-slow-http`
+    /// pending and `@fixture/internal-sdk` skipped.
+    fn detection_answer(edit: impl FnOnce(&mut serde_json::Value)) -> (u16, String) {
+        let mut detection: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        edit(&mut detection);
+        (
+            200,
+            serde_json::json!({ "success": true, "text": detection.to_string() }).to_string(),
+        )
+    }
+
+    /// The sample as it is: `fixture-slow-http` pending.
+    fn slow_pending() -> (u16, String) {
+        detection_answer(|_| {})
+    }
+
+    /// The sample with `fixture-slow-http` answered, as `@fixture/http` is.
+    fn answer_slow(detection: &mut serde_json::Value) {
+        let entries = detection["client_semantics"].as_array_mut().unwrap();
+        let clients = entries[0]["clients"].clone();
+        let slow = entries
+            .iter_mut()
+            .find(|entry| entry["package"] == "fixture-slow-http")
+            .unwrap();
+        slow["status"] = "answered".into();
+        slow["clients"] = clients;
+    }
+
+    /// What one scan's detection and its in-scan schedule did against a stub.
+    struct Settled {
+        entries: Vec<crate::client_semantics::ClientSemanticsEntry>,
+        first: Vec<crate::client_semantics::ClientSemanticsEntry>,
+        waits: Vec<Duration>,
+        lines: Vec<String>,
+        attempts: usize,
+    }
+
+    impl Settled {
+        fn entry(&self, package: &str) -> &crate::client_semantics::ClientSemanticsEntry {
+            self.entries
+                .iter()
+                .find(|entry| entry.package == package)
+                .unwrap()
+        }
+    }
+
+    /// Ask `/framework-detect` once, as a re-ask does: one attempt.
+    async fn ask_detection(
+        api_base: &str,
+    ) -> Result<crate::framework_detector::DetectionResult, Box<dyn std::error::Error>> {
+        let outcome = crate::engine::reask_agent()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                api_base,
+                "/framework-detect",
+                &serde_json::json!({ "ask_client_semantics": true }),
+            )
+            .await?;
+        crate::framework_detector::detection_from_response(&outcome.text)
+    }
+
+    /// A scan's detection, then the in-scan schedule over it with the real
+    /// waits recorded rather than slept, every ask going to one stub that
+    /// answers `responses` in turn.
+    async fn settle_against(
+        responses: Vec<(u16, String)>,
+        installed: impl Fn(&str) -> bool,
+    ) -> Settled {
+        let stub = CountingStub::start(responses);
+        let first = ask_detection(&stub.api_base)
+            .await
+            .expect("the scan's own detection answers");
+        let asked = first.client_semantics.clone().unwrap();
+        let mut waits = Vec::new();
+        let mut lines = Vec::new();
+        let entries = {
+            let (api_base, detection) = (stub.api_base.as_str(), &first);
+            crate::client_semantics::settle_pending(
+                asked.clone(),
+                installed,
+                &crate::client_semantics::PENDING_REASK_WAITS,
+                move || crate::engine::semantics_from_reask(ask_detection(api_base), detection),
+                |pause| {
+                    waits.push(pause);
+                    std::future::ready(())
+                },
+                |notice| lines.push(notice.line()),
+            )
+            .await
+        };
+        Settled {
+            entries,
+            first: asked,
+            waits,
+            lines,
+            attempts: stub.attempts(),
+        }
+    }
+
+    /// carrick#1564 schedule: a detection that answers every installed
+    /// package is not asked again.
+    #[tokio::test]
+    async fn a_detection_that_answers_every_package_is_asked_once() {
+        let settled = settle_against(vec![detection_answer(answer_slow)], |_| true).await;
+        assert_eq!(settled.attempts, 1);
+        assert!(settled.waits.is_empty() && settled.lines.is_empty());
+        assert_eq!(settled.entries, settled.first);
+    }
+
+    /// carrick#1564 schedule: a package the first ask leaves pending is
+    /// answered by the second, 5 s later, and the schedule stops there.
+    #[tokio::test]
+    async fn a_package_pending_on_the_first_ask_is_answered_by_the_second() {
+        let settled = settle_against(vec![slow_pending(), detection_answer(answer_slow)], |_| {
+            true
+        })
+        .await;
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(settled.waits, vec![Duration::from_secs(5)]);
+        assert_eq!(
+            settled.lines,
+            vec!["1 of 3 client libraries still being described, waiting up to 35 s"]
+        );
+        let slow = settled.entry("fixture-slow-http");
+        assert_eq!(
+            slow.status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
+        assert!(!slow.clients.is_empty());
+    }
+
+    /// carrick#1564 schedule: a package pending on every ask is asked three
+    /// times in all, 5 s and then 15 s apart, and stays pending: it states no
+    /// claim, so its sites stay candidates, and the user reads that the next
+    /// scan asks again.
+    #[tokio::test]
+    async fn a_package_pending_on_every_ask_is_asked_three_times_and_states_nothing() {
+        let settled = settle_against(vec![slow_pending(); 3], |_| true).await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(
+            settled.waits,
+            vec![Duration::from_secs(5), Duration::from_secs(15)]
+        );
+        assert_eq!(
+            settled.lines,
+            vec![
+                "1 of 3 client libraries still being described, waiting up to 35 s",
+                "1 of 3 client libraries still being described, waiting up to 45 s",
+                "1 client library not described yet; the next scan asks again",
+            ]
+        );
+        assert_eq!(settled.entries, settled.first);
+        assert!(
+            crate::client_semantics::derive_claims(&settled.entries)
+                .checks()
+                .iter()
+                .all(|check| check.package != "fixture-slow-http"),
+            "a pending package states no claim"
+        );
+    }
+
+    /// carrick#1564 schedule, and review finding 7: a pending package that is
+    /// not installed could not verify an answer, so it is not asked about.
+    #[tokio::test]
+    async fn a_pending_package_that_is_not_installed_is_not_asked_again() {
+        let settled = settle_against(vec![slow_pending()], |package| {
+            package != "fixture-slow-http"
+        })
+        .await;
+        assert_eq!(settled.attempts, 1);
+        assert!(settled.waits.is_empty() && settled.lines.is_empty());
+    }
+
+    /// carrick#1564 schedule: a re-ask that fails is one attempt and keeps
+    /// what the scan already has; the next ask still goes.
+    #[tokio::test]
+    async fn a_failed_reask_keeps_what_is_known_and_the_next_ask_answers() {
+        let settled = settle_against(
+            vec![
+                slow_pending(),
+                retriable_failure(),
+                detection_answer(answer_slow),
+            ],
+            |_| true,
+        )
+        .await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(
+            settled.entry("fixture-slow-http").status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
+    }
+
+    /// carrick#1564 schedule: a re-ask that names other packages than the
+    /// detection the scan's guidance came from changes nothing.
+    #[tokio::test]
+    async fn a_reask_that_names_other_packages_changes_nothing() {
+        let other_packages = detection_answer(|detection| {
+            answer_slow(detection);
+            detection["data_fetchers"]
+                .as_array_mut()
+                .unwrap()
+                .push("fixture-other-http".into());
+        });
+        let settled = settle_against(
+            vec![slow_pending(), other_packages.clone(), other_packages],
+            |_| true,
+        )
+        .await;
+        assert_eq!(settled.attempts, 3);
+        assert_eq!(settled.entries, settled.first);
+    }
+
+    /// carrick#1564 schedule: the first answer for a package stands, so the
+    /// rows cannot depend on which ask answered it.
+    #[tokio::test]
+    async fn a_later_answer_never_replaces_an_earlier_one() {
+        let changed = detection_answer(|detection| {
+            answer_slow(detection);
+            detection["client_semantics"][0]["clients"][0]["verbs"] = serde_json::json!([]);
+        });
+        let settled = settle_against(vec![slow_pending(), changed], |_| true).await;
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(settled.entry("@fixture/http"), &settled.first[0]);
+        assert_eq!(
+            settled.entry("fixture-slow-http").status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
     }
 
     /// The loop link end to end (carrick-cloud#875): the first request says it
