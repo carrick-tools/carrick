@@ -927,6 +927,39 @@ async fn a_package_pending_on_every_ask_is_asked_three_times_in_one_scan() {
     );
 }
 
+/// A package the scan's first ask leaves `pending` and a re-ask answers
+/// states its rows in that same scan: the summaries are composed only once
+/// the in-scan schedule has finished (owner ruling on carrick#1564).
+#[tokio::test]
+#[serial]
+async fn a_package_a_reask_answers_states_its_rows_in_the_same_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    // The first ask leaves `@fixture/http` pending; every later one answers
+    // the sample as it is.
+    let mut first: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(cassette.join("framework-detect/framework-detect.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = first["client_semantics"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["package"] == "@fixture/http")
+        .unwrap();
+    entry["status"] = "pending".into();
+    entry["clients"] = serde_json::json!([]);
+    carrick::agent_service::inject_mock_answer("/framework-detect", "", 1, &first.to_string());
+
+    let detect = requests_to("/framework-detect");
+    let data = scan(&StubStorage::default(), &repo, Some(&sidecar)).await;
+    assert_eq!(requests_to("/framework-detect") - detect, 2);
+    assert_answer_key(&rows(&data));
+}
+
 /// A `pending` package that is not installed is not asked about again,
 /// however many other data fetchers are: no answer about it could be
 /// verified (carrick#1564 review, finding 7).

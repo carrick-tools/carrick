@@ -682,8 +682,11 @@ impl AgentService {
         record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            if let Some(error) = take_mock_failure(task_path, body) {
-                return Err(error);
+            if let Some(outcome) = take_mock_override(task_path, body) {
+                return outcome.map(|text| LambdaOutcome {
+                    text,
+                    guidance_key: mock_guidance_key(task_path, body),
+                });
             }
             return Ok(LambdaOutcome {
                 text: generate_mock_for_task(task_path, body, mock_seed),
@@ -1169,29 +1172,44 @@ fn mock_guidance_key<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// A failure an offline run answers instead of the mock response, for the
-/// tests that prove a scan survives a call the cloud never answered.
-struct MockFailure {
+/// What an offline run answers instead of the mock response: a failure, for
+/// the tests that prove a scan survives a call the cloud never answered, or
+/// another answer, for the tests where one ask is answered differently from
+/// the next.
+struct MockOverride {
     task_path: String,
     body_contains: String,
     remaining: usize,
-    /// What the call returns: the error the retry loop hands back once it has
-    /// finished with the answer.
-    error: AgentCallError,
+    /// What the call returns: the answer's text, or the error the retry loop
+    /// hands back once it has finished with the answer.
+    outcome: Result<String, AgentCallError>,
 }
 
-fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
-    static FAILURES: OnceLock<Mutex<Vec<MockFailure>>> = OnceLock::new();
-    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+fn mock_overrides() -> &'static Mutex<Vec<MockOverride>> {
+    static OVERRIDES: OnceLock<Mutex<Vec<MockOverride>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn push_mock_failure(task_path: &str, body_contains: &str, times: usize, error: AgentCallError) {
-    mock_failures().lock().unwrap().push(MockFailure {
+fn push_mock_override(
+    task_path: &str,
+    body_contains: &str,
+    times: usize,
+    outcome: Result<String, AgentCallError>,
+) {
+    mock_overrides().lock().unwrap().push(MockOverride {
         task_path: task_path.to_string(),
         body_contains: body_contains.to_string(),
         remaining: times,
-        error,
+        outcome,
     });
+}
+
+/// Make the next `times` offline calls to `task_path` whose serialized body
+/// contains `body_contains` answer `text` instead of the mock response.
+/// Honoured only under `CARRICK_MOCK_ALL`, as [`inject_mock_failure`] is.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_answer(task_path: &str, body_contains: &str, times: usize, text: &str) {
+    push_mock_override(task_path, body_contains, times, Ok(text.to_string()));
 }
 
 /// Make the next `times` offline calls to `task_path` whose serialized body
@@ -1204,14 +1222,14 @@ fn push_mock_failure(task_path: &str, body_contains: &str, times: usize, error: 
 /// retry loop is not run: the error is what that loop returns once it is spent.
 #[allow(dead_code)] // Called by tests/ through the library, never by the binary.
 pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
-    push_mock_failure(
+    push_mock_override(
         task_path,
         body_contains,
         times,
-        AgentCallError::transient(
+        Err(AgentCallError::transient(
             "model_error",
             "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
-        ),
+        )),
     );
 }
 
@@ -1227,11 +1245,11 @@ pub fn inject_mock_envelope(task_path: &str, body_contains: &str, times: usize, 
         serde_json::from_str(envelope).expect("an injected envelope parses");
     assert!(!parsed.success, "an injected envelope is a failed one");
     let error = parsed.error.expect("an injected envelope carries an error");
-    push_mock_failure(
+    push_mock_override(
         task_path,
         body_contains,
         times,
-        call_error_from_envelope(error),
+        Err(call_error_from_envelope(error)),
     );
 }
 
@@ -1253,17 +1271,20 @@ pub fn inject_mock_budget_refusal(
     inject_mock_envelope(task_path, body_contains, times, &envelope.to_string());
 }
 
-fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<AgentCallError> {
-    let mut failures = mock_failures().lock().unwrap();
-    if failures.is_empty() {
+fn take_mock_override<B: Serialize + ?Sized>(
+    task_path: &str,
+    body: &B,
+) -> Option<Result<String, AgentCallError>> {
+    let mut overrides = mock_overrides().lock().unwrap();
+    if overrides.is_empty() {
         return None;
     }
     let serialized = serde_json::to_string(body).unwrap_or_default();
-    let failure = failures.iter_mut().find(|f| {
-        f.remaining > 0 && f.task_path == task_path && serialized.contains(&f.body_contains)
+    let found = overrides.iter_mut().find(|o| {
+        o.remaining > 0 && o.task_path == task_path && serialized.contains(&o.body_contains)
     })?;
-    failure.remaining -= 1;
-    Some(failure.error.clone())
+    found.remaining -= 1;
+    Some(found.outcome.clone())
 }
 
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
@@ -2818,7 +2839,7 @@ pub(crate) mod tests {
             .is_err();
         // SAFETY: serial test; leave the process as it was found.
         unsafe { env::remove_var("CARRICK_MOCK_ALL") };
-        mock_failures().lock().unwrap().clear();
+        mock_overrides().lock().unwrap().clear();
 
         assert!(
             sent,
