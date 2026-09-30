@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/renamed",
+      "method": "GET",
+      "pattern_matched": "shared.get(",
+      "call_expression_text": "shared.get(\"/renamed\")",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/barrel-default",
+      "method": "GET",
+      "pattern_matched": "svc.get(",
+      "call_expression_text": "svc.get(\"/barrel-default\")",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/default",
+      "method": "GET",
+      "pattern_matched": "direct.get(",
+      "call_expression_text": "direct.get(\"/default\")",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

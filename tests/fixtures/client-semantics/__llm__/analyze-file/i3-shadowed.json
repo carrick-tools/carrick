@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "/unshadowed",
+      "method": "GET",
+      "pattern_matched": "api.get(",
+      "call_expression_text": "api.get(\"/unshadowed\")",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

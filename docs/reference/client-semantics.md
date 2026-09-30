@@ -42,10 +42,16 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
 ## How a call is read
 
 - **The receiver is named by the syntax.** A binding imported from the
-  package (`import`, or `require`), or a binding or class field initialised
-  by the export's factory with one object literal and never reassigned. A
-  name the file declares again anywhere below module scope is no client in
-  that file. A field written anywhere but the constructor's own statements,
+  package (`import`, or `require`); a binding or class field initialised by
+  the export's factory with one object literal and never reassigned; or an
+  import of such a binding from another module of the service
+  (carrick#1568). The import is followed the way call edges follow one,
+  through barrels, renames, aliases and defaults, to the module-scope
+  `const` that holds the instance, or to an anonymous `export default
+  <factory call>`, and that module's options and claims are read. A module
+  that re-exports a binding it imports (`import { api } …; export { api }`)
+  is followed one hop at a time. A name the file declares again anywhere
+  below module scope is no client in that file. A field written anywhere but the constructor's own statements,
   or declared again by a subclass in the file, holds no client, and a static
   member reads no instance field. Nothing is inferred per site, so `new
   Map().get("/r")` reaches no claim.
@@ -53,11 +59,20 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   in any other way holds no client: a member read that is not called
   (`api.defaults`), a write through it, an argument, an alias, a spread, a
   shorthand property. Exporting it (`export default api`, `module.exports.api
-  = api`) is fine. An instance also holds no client when its export's
-  binding is used that way, since a write to the export's defaults before
-  the factory runs reaches the instance, or when the file calls a member of
-  the instance its verified surface does not name as a verb or request
-  member (`api.setBaseURL("/v2")`, `api[name]()`).
+  = api`) is fine, and so is reading it, or a member of it, as an operand of
+  `instanceof`, `typeof` or a comparison, which keeps nothing of it. An
+  instance also holds no client when its export's binding is used that way,
+  since a write to the export's defaults before the factory runs reaches the
+  instance, or when the file calls a member of the instance its verified
+  surface does not name as a verb or request member (`api.setBaseURL("/v2")`,
+  `api[name]()`).
+- **An instance is one object in every module.** Every module of the service
+  that imports it counts: a use that takes the client away in one module,
+  including a module that only imports it and never calls it, takes it away
+  in every module, the declaring module's own calls included. A namespace
+  import of the module (`import * as lib`) used any way but calling one of
+  its members directly (`lib.fn()`) takes away every instance the module
+  publishes.
 - **The base** is the factory options' value at the verified key, joined to
   the path with exactly one slash. A path that is an absolute URL ignores
   it. An empty base is no base, and a base holding `?` or `#` states no URL.
@@ -126,8 +141,15 @@ beside the analysis. The schedule adds only what outlasts the analysis.
 
 ## Limits
 
-- An instance exported from one module and imported by another is not read
-  as a client in the importing module (carrick#1568).
+- An instance is read in another module only when that module imports it
+  by name or as a default. Reached through a namespace import
+  (`lib.api.get()`), it is not read, and reaching it that way takes it away
+  everywhere. An instance a module publishes through `module.exports` or
+  `exports`, or one declared outside the service's own files, is read only in
+  its own module. A package's export re-exported through a module of the
+  service (`export { default as http } from "pkg"`) is not read as the
+  package's client in the modules that import it from there. Uses through a
+  dynamic `import()` or an inline `require("./m").api` are not seen.
 - A base that is an absolute URL written as a literal gives no library row,
   because a summary row states only a path behind an opaque base
   (carrick#1569). The call keeps the reading it has without the semantics,
@@ -139,8 +161,9 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   instance, any such call contests it.
 - Shapes that lose a reading to the rules above: a client whose defaults
   the file configures (`api.defaults.headers.common.X = …`, or through the
-  export), a client handed to a helper or kept in an object, one read by a
-  `typeof` or an `instanceof`; a spread of a constant the file also passes
+  export), a client handed to a helper or kept in an object, one read in any
+  position but a call, an export, or an operand of `instanceof`, `typeof` or
+  a comparison (`if (api.defaults)`); a spread of a constant the file also passes
   to a call (`fetch(URL, OPTS)` elsewhere in the file), exports as
   `module.exports = { OPTS }`, or declares again under the same name in
   another scope; a spread of anything but a plain identifier

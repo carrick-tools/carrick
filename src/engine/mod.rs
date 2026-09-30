@@ -5855,6 +5855,9 @@ fn discover_files_and_symbols(
     // What each file's functions send, read while the module is in hand and
     // composed once call resolution has run (carrick#1555).
     let mut request_irs: HashMap<PathBuf, crate::request_summary::FileIr> = HashMap::new();
+    // The imports those summaries read the value of, per file keyed like
+    // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
+    let mut bindings_wanted: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
@@ -5882,14 +5885,14 @@ fn discover_files_and_symbols(
                 .keys()
                 .cloned()
                 .collect();
-            request_irs.insert(
-                file_path.clone(),
-                crate::request_summary::extract_file_ir(&module, &cm, &definition_keys),
-            );
+            let request_ir =
+                crate::request_summary::extract_file_ir(&module, &cm, &definition_keys);
 
             let canonical = file_path
                 .canonicalize()
                 .unwrap_or_else(|_| file_path.clone());
+            bindings_wanted.insert(canonical.clone(), request_ir.imports_read());
+            request_irs.insert(file_path.clone(), request_ir);
             per_file_calls.insert(
                 canonical,
                 crate::call_graph::FileCallIndex {
@@ -5941,6 +5944,7 @@ fn discover_files_and_symbols(
         &keys,
         &workspace,
         repo_root,
+        &bindings_wanted,
     );
     report_unresolved_imports(&resolution.unresolved, &workspace.unfollowed_extends());
 
@@ -5950,6 +5954,7 @@ fn discover_files_and_symbols(
     let request_inputs = crate::request_summary::RequestSummaryInputs {
         files: request_irs,
         sites: resolution.sites,
+        bindings: resolution.bindings,
     };
 
     debug!(
@@ -12005,6 +12010,404 @@ mod tests {
             vec![(13, "PATCH", "/api/p4"), (14, "GET", "/api/p6")],
             "{rows:#?}"
         );
+    }
+
+    /// (line, method, target) of every library row the summaries state for
+    /// `file` with the contract sample verified.
+    fn library_stated(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+    ) -> Vec<(u32, String, String)> {
+        library_rows_of(dir, discovery, file, &verified_sample())
+            .into_iter()
+            .map(|row| {
+                assert!(
+                    !row.library_semantics.is_empty(),
+                    "{file}: only library rows are expected here: {row:#?}"
+                );
+                (row.line, row.method, row.target)
+            })
+            .collect()
+    }
+
+    fn stated(rows: &[(u32, &str, &str)]) -> Vec<(u32, String, String)> {
+        rows.iter()
+            .map(|(line, method, target)| (*line, method.to_string(), target.to_string()))
+            .collect()
+    }
+
+    /// The module the next tests import the instance from.
+    const SHARED_API: &str = "import http from \"@fixture/http\";\n\
+        \n\
+        export const api = http.create({ baseURL: \"/api/v1\" });\n\
+        \n\
+        export function health() { return api.get(\"/health\"); }\n";
+
+    /// carrick#1568: an instance one module builds and exports is the client
+    /// in every module that imports it, read with its declaring module's
+    /// options and claims.
+    #[test]
+    fn an_instance_imported_from_another_module_reads_through_its_declaration() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/orders.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function createOrder() {\n\
+                 \x20 return api.post(\"/orders\", { action: \"create\" });\n\
+                 }\n",
+            ),
+        ]);
+        let users = library_rows_of(&dir, &discovery, "src/users.ts", &verified_sample());
+        assert_eq!(users.len(), 1, "{users:#?}");
+        assert_eq!(
+            (
+                users[0].line,
+                users[0].method.as_str(),
+                users[0].target.as_str()
+            ),
+            (3, "GET", "/api/v1/users")
+        );
+        assert_eq!(
+            users[0].library_semantics,
+            vec![
+                "@fixture/http@1:default:factory:create",
+                "@fixture/http@1:default:verb:get",
+            ]
+        );
+        assert!(!users[0].own_site, "claims the site like any library row");
+        let orders = library_rows_of(&dir, &discovery, "src/orders.ts", &verified_sample());
+        assert_eq!(orders.len(), 1, "{orders:#?}");
+        assert_eq!(
+            (
+                orders[0].line,
+                orders[0].method.as_str(),
+                orders[0].target.as_str()
+            ),
+            (4, "POST", "/api/v1/orders")
+        );
+        assert_eq!(
+            orders[0].body_literals.get("action").map(String::as_str),
+            Some("create")
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/lib/api.ts"),
+            stated(&[(5, "GET", "/api/v1/health")]),
+            "the declaring module still reads its own calls"
+        );
+    }
+
+    /// carrick#1568: the resolver's own hops carry the instance through a
+    /// barrel (`export { default as svc } from`, `export *`), a renaming
+    /// import, a default import of an anonymous `export default <factory>`,
+    /// an `export { client as name }`, and a module that re-exports a binding
+    /// it imports.
+    #[test]
+    fn an_instance_reached_through_a_barrel_a_rename_or_a_default_reads_through_it() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/clients/svc.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export default http.create({ baseURL: \"/svc\" });\n",
+            ),
+            (
+                "src/clients/named.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const client = http.create({ baseURL: \"/named\" });\n\
+                 \n\
+                 export { client as namedClient };\n",
+            ),
+            (
+                "src/clients/index.ts",
+                "export { default as svc } from \"./svc\";\n\
+                 export * from \"./named\";\n",
+            ),
+            (
+                "src/reexport.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export { api };\n",
+            ),
+            (
+                "src/use.ts",
+                "import { svc, namedClient as nc } from \"./clients\";\n\
+                 import direct from \"./clients/svc\";\n\
+                 import { api as shared } from \"./reexport\";\n\
+                 \n\
+                 export const a = () => svc.get(\"/a\");\n\
+                 export const b = () => nc.get(\"/b\");\n\
+                 export const c = () => direct.get(\"/c\");\n\
+                 export const d = () => shared.get(\"/d\");\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/use.ts"),
+            stated(&[
+                (5, "GET", "/svc/a"),
+                (6, "GET", "/named/b"),
+                (7, "GET", "/svc/c"),
+                (8, "GET", "/api/v1/d"),
+            ])
+        );
+    }
+
+    /// carrick#1568, must not resolve: wherever any module may change the
+    /// instance, or the export may not hold it, no module reads through it.
+    /// A write after the export, a write in a module that only imports it, a
+    /// call outside its verified surface or a hand-off in another importer,
+    /// `export let`, an export its own module contests, and one published
+    /// through `exports`.
+    #[test]
+    fn an_instance_any_module_may_change_reads_nothing_in_any_module() {
+        let importer = |from: &str, path: &str| {
+            format!(
+                "import {{ api }} from \"{from}\";\n\
+                 \n\
+                 export function call() {{ return api.get(\"{path}\"); }}\n"
+            )
+        };
+        let (dir, discovery) = discover_sources(&[
+            // Written through after the export, in its own module.
+            (
+                "src/written/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/w\" });\n\
+                 (api as any).defaults.baseURL = \"/v2\";\n",
+            ),
+            ("src/written/use.ts", &importer("./api", "/written")),
+            // Written through in a module that never calls it: the
+            // declaring module's own call and the other importer's go too.
+            (
+                "src/elsewhere/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/e\" });\n\
+                 \n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            ("src/elsewhere/use.ts", &importer("./api", "/elsewhere")),
+            (
+                "src/elsewhere/configure.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 (api as any).defaults.baseURL = \"/v2\";\n",
+            ),
+            // A member outside the verified surface called by an importer.
+            (
+                "src/setter/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/s\" });\n",
+            ),
+            ("src/setter/use.ts", &importer("./api", "/setter")),
+            (
+                "src/setter/retarget.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 export function retarget() { (api as any).setBaseURL(\"/v2\"); }\n",
+            ),
+            // Handed to a helper by an importer.
+            (
+                "src/passed/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export const api = http.create({ baseURL: \"/p\" });\n",
+            ),
+            ("src/passed/use.ts", &importer("./api", "/passed")),
+            (
+                "src/passed/register.ts",
+                "import { api } from \"./api\";\n\
+                 \n\
+                 declare function register(client: unknown): void;\n\
+                 register(api);\n",
+            ),
+            // `export let`: the binding may hold something else by the time
+            // an importer calls through it.
+            (
+                "src/mutable/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 export let api = http.create({ baseURL: \"/m\" });\n",
+            ),
+            ("src/mutable/use.ts", &importer("./api", "/mutable")),
+            // Contested in its defining module: the export's nested member.
+            (
+                "src/contested/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 (http as any).interceptors.request.use((c: unknown) => c);\n\
+                 export const api = http.create({ baseURL: \"/c\" });\n",
+            ),
+            ("src/contested/use.ts", &importer("./api", "/contested")),
+            // Published through `exports`, which a write anywhere in the
+            // module may replace.
+            (
+                "src/commonjs/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/cjs\" });\n\
+                 module.exports.api = api;\n\
+                 \n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            ("src/commonjs/use.ts", &importer("./api", "/commonjs")),
+        ]);
+        for file in [
+            "src/written/use.ts",
+            "src/elsewhere/api.ts",
+            "src/elsewhere/use.ts",
+            "src/setter/use.ts",
+            "src/passed/use.ts",
+            "src/mutable/use.ts",
+            "src/contested/use.ts",
+            "src/commonjs/use.ts",
+        ] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/commonjs/api.ts"),
+            stated(&[(6, "GET", "/cjs/own")]),
+            "a module publishing through `exports` still reads its own calls"
+        );
+    }
+
+    /// carrick#1568: a file that declares the imported name again anywhere
+    /// below module scope reads no call through it, since nothing says which
+    /// binding a use means; the other importers are unaffected.
+    #[test]
+    fn an_imported_name_declared_again_reads_nothing_in_that_file() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/shadowed.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 interface Getter { get(path: string): unknown }\n\
+                 export function viaParam(api: Getter) { return api.get(\"/shadowed\"); }\n\
+                 export function viaImport() { return api.get(\"/import\"); }\n",
+            ),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/shadowed.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/users.ts"),
+            stated(&[(3, "GET", "/api/v1/users")])
+        );
+    }
+
+    /// carrick#1568, known gaps: a client reached through a namespace import
+    /// (`lib.api.get()`) is read through nothing, and reaching it that way
+    /// reads a member of the namespace that is not called, which may change
+    /// it: no module reads through it. Nor does a module outside the
+    /// service's own files, whose other importers the scan cannot see.
+    #[test]
+    fn a_client_reached_through_a_namespace_reads_nothing_anywhere() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/namespace.ts",
+                "import * as lib from \"./lib/api\";\n\
+                 \n\
+                 export function viaNamespace() { return lib.api.get(\"/ns\"); }\n",
+            ),
+        ]);
+        for file in ["src/namespace.ts", "src/users.ts", "src/lib/api.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+
+        // A namespace only called through (`lib.health()`) changes nothing.
+        let (dir, discovery) = discover_sources(&[
+            ("src/lib/api.ts", SHARED_API),
+            (
+                "src/users.ts",
+                "import { api } from \"./lib/api\";\n\
+                 \n\
+                 export function listUsers() { return api.get(\"/users\"); }\n",
+            ),
+            (
+                "src/namespace.ts",
+                "import * as lib from \"./lib/api\";\n\
+                 \n\
+                 export function ping() { return lib.health(); }\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/users.ts"),
+            stated(&[(3, "GET", "/api/v1/users")])
+        );
+    }
+
+    /// carrick#1568: an `instanceof`, `typeof` or comparison read of the
+    /// export, or of an instance, keeps nothing of it and contests nothing
+    /// (the #1571 review's `r4b-instanceof.ts`). A nested member call, a read
+    /// handed on and a write still do.
+    #[test]
+    fn a_compared_read_of_a_client_contests_nothing() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/compared.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/r4b\" });\n\
+                 \n\
+                 export function isHttpError(e: unknown): boolean { return e instanceof (http as any).HttpError; }\n\
+                 export function kind(): string { return typeof http; }\n\
+                 export function same(other: unknown): boolean { return api === other || (api as any).defaults !== other; }\n\
+                 export function r4b(): unknown { return api.get(\"/instanceof\"); }\n",
+            ),
+            (
+                "src/nested.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/nested\" });\n\
+                 (api as any).interceptors.request.use((c: unknown) => c);\n\
+                 \n\
+                 export function nested(): unknown { return api.get(\"/nested\"); }\n",
+            ),
+            (
+                "src/handed.ts",
+                "import http from \"@fixture/http\";\n\
+                 \n\
+                 const api = http.create({ baseURL: \"/handed\" });\n\
+                 console.log(typeof api, (api as any).defaults);\n\
+                 \n\
+                 export function handed(): unknown { return api.get(\"/handed\"); }\n",
+            ),
+        ]);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/compared.ts"),
+            stated(&[(8, "GET", "/r4b/instanceof")])
+        );
+        for file in ["src/nested.ts", "src/handed.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
     }
 
     /// carrick#1564 re-review, R2: a spread of a constant puts in place

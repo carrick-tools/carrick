@@ -53,6 +53,13 @@ The sources:
   its surface does not name (r5), with a header written (r6) or an
   interceptor added (r7), and a plain `fetch` handed constants the file
   writes through, passes to a call, or leaves alone (p).
+- `src/shared/` holds instances other modules import (carrick#1568):
+  `api.ts` exports one as a named `const`, `svc.ts` as an anonymous default,
+  and `index.ts` is a barrel re-exporting both. `src/i1-users.ts` and
+  `src/i2-orders.ts` import `api` and call a verb each; `src/i4-barrel.ts`
+  imports `api` renamed and `svc` through the barrel, and `svc` directly as a
+  default; `src/i3-shadowed.ts` imports `api` and declares the name again in a
+  function, as a `Map`.
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -64,7 +71,10 @@ to fail the factory claim. It is not part of the scanned tree.
 carrick#1564, byte for byte. The cloud holds the same bytes.
 
 The `analyze-file` answers are wrong the way a model's are for these calls:
-the verb the method name suggests, the path with no base, no body. Nothing a
+the verb the method name suggests, the path with no base, no body. The
+importing modules (`i1`, `i2`, `i3`, `i4`) have answers of their own, so a row
+read through an imported instance is proven to claim its site over the
+model's. Nothing a
 test asserts about a stated row can come from them; where a site must read as
 it does without the semantics, the test compares it with a scan of the same
 tree whose detection answers no semantics.
@@ -89,7 +99,13 @@ With the vendored declarations, through the real type sidecar:
 | `n4-getter-computed.ts:11` | `GET /s1/string-key` | factory, `verb:get` |
 | `n4-getter-computed.ts:12` | `GET /m1/method-prop` | factory, `verb:get` |
 | `r1-passed-const.ts:10` | `GET /r1b/passed-after` | factory, `verb:get` |
+| `r4b-instanceof.ts:6` | `GET /r4b/instanceof` | factory, `verb:get` |
 | `r4c-control.ts:5` | `GET /r4c/control` | factory, `verb:get` |
+| `i1-users.ts:3` | `GET /shared/v1/users` | factory, `verb:get` |
+| `i2-orders.ts:3` | `POST /shared/v1/orders` | factory, `verb:post`, `verb_body:post` |
+| `i4-barrel.ts:4` | `GET /shared/v1/renamed` | factory, `verb:get` |
+| `i4-barrel.ts:5` | `GET /svc/barrel-default` | factory, `verb:get` |
+| `i4-barrel.ts:6` | `GET /svc/default` | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
 
@@ -123,10 +139,11 @@ the reading cannot see:
 | `r2-stored.ts:9` | `GET /direct`, `receiver_type` |
 | `r3-returned.ts:6` | `GET /returned`, `receiver_type` |
 | `r4-export-read.ts:6` | `GET /const-read`, `receiver_type` |
-| `r4b-instanceof.ts:6` | `GET /instanceof`, `receiver_type` (carrick#1568 would recover it) |
 | `r5-setter.ts:6` | `GET /setter`, `receiver_type` |
 | `r6-header-write.ts:6` | `GET /header-write`, `receiver_type` |
 | `r7-interceptor.ts:6` | `GET /interceptor`, `receiver_type` |
+| `i3-shadowed.ts:5` | none: the name is a `Map` there |
+| `i3-shadowed.ts:8` | `GET /unshadowed`, the model's: a file declaring the imported name again reads no call through it |
 
 `n9-phase1-fetch.ts` has no library in it. Its request summaries state `POST
 /api/f2` at line 10 (the method written after the spread) and `GET /api/f5`

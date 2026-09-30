@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:3",
+      "line_number": 3,
+      "target": "/orders",
+      "method": "GET",
+      "pattern_matched": "api.post(",
+      "call_expression_text": "api.post(\"/orders\", { action: \"create\" })",
+      "call_expression_line": 3,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

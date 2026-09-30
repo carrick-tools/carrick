@@ -77,7 +77,7 @@ use crate::visitor::{
     ImportSymbolExtractor, ImportedSymbol, SymbolKind,
 };
 use crate::workspace_resolver::{Resolution, WorkspaceIndex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -345,12 +345,18 @@ pub fn merge_definitions(
 /// Returns the imports the pass could not follow (carrick#1104), for the
 /// caller to report: an edge that was not recorded because its specifier
 /// resolved to nothing must be counted, not silently absent.
+///
+/// `bindings_wanted` names, per file (keyed like `per_file`), the import
+/// bindings a later pass reads the VALUE of rather than calls a function
+/// through (carrick#1568). Each is resolved by the same resolver the edges
+/// used, after them, and answered in [`CallResolution::bindings`].
 pub fn resolve_call_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
     keys: &RekeyIndex,
     workspace: &WorkspaceIndex,
     repo_root: &Path,
+    bindings_wanted: &HashMap<PathBuf, BTreeSet<String>>,
 ) -> CallResolution {
     let mut resolver = CallResolver::new(per_file, workspace, repo_root);
     let mut sites = CallSiteTargets::default();
@@ -422,19 +428,87 @@ pub fn resolve_call_edges(
         "call_graph: package-surface origins resolved {} receiver(s), dropped {} on a member more than one class in the surface declares (carrick#781)",
         resolver.origin_resolved, resolver.origin_conflicts
     );
+
+    // The unresolved-import report counts imports a CALL needed; a binding
+    // read only for its value adds nothing to it.
+    let unresolved = std::mem::take(&mut resolver.unresolved);
+    let mut bindings = ImportedBindings::default();
+    let mut wanted: Vec<&PathBuf> = bindings_wanted.keys().collect();
+    wanted.sort();
+    for canonical in wanted {
+        let Some(index) = per_file.get(canonical) else {
+            continue;
+        };
+        for local in &bindings_wanted[canonical] {
+            if let Some(binding) = resolver.imported_binding(index, local) {
+                bindings
+                    .by_file
+                    .entry(index.path.clone())
+                    .or_default()
+                    .insert(local.clone(), binding);
+            }
+        }
+    }
+
     CallResolution {
-        unresolved: resolver.unresolved,
+        unresolved,
         sites,
+        bindings,
     }
 }
 
 /// What [`resolve_call_edges`] produces besides the edges it writes into the
-/// definitions: the imports it could not follow, and where each call site it
-/// DID follow lands.
+/// definitions: the imports it could not follow, where each call site it DID
+/// follow lands, and what each wanted import binding names.
 #[derive(Debug, Default)]
 pub struct CallResolution {
     pub unresolved: UnresolvedImports,
     pub sites: CallSiteTargets,
+    pub bindings: ImportedBindings,
+}
+
+/// What one import binding names in the service being scanned, for a pass
+/// that reads the value a module's binding HOLDS rather than a function it
+/// defines (carrick#1568): `import { api } from "./lib/api"` where `lib/api.ts`
+/// writes `export const api = http.create(...)`.
+///
+/// Resolved by the same walk call edges take (barrels, aliases, workspace
+/// packages), so the two can never disagree about which module an import
+/// means. Only a declaring module inside the service is named: a sibling's
+/// other importers are not in the scan, so nothing could say what they do to
+/// the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportedBinding {
+    /// One module-scope binding: the file that declares it (as walked) and
+    /// the name it is declared under there, `"default"` for an anonymous
+    /// default export.
+    Binding { file: PathBuf, name: String },
+    /// A whole module: `import * as lib`, or a name bound to `export * as lib
+    /// from`. Every binding it publishes, as a [`PublishedBinding`].
+    Module(Vec<PublishedBinding>),
+}
+
+/// One binding a module publishes, under the name it publishes it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedBinding {
+    pub published: String,
+    pub file: PathBuf,
+    pub name: String,
+}
+
+/// The answers to [`resolve_call_edges`]'s `bindings_wanted`, keyed by the
+/// importing file as walked (like [`FileCallIndex::path`]) and the local name.
+#[derive(Debug, Default)]
+pub struct ImportedBindings {
+    by_file: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
+}
+
+impl ImportedBindings {
+    /// What `local`, imported by `importer`, names, when resolution reached a
+    /// module of the service.
+    pub fn get(&self, importer: &Path, local: &str) -> Option<&ImportedBinding> {
+        self.by_file.get(importer)?.get(local)
+    }
 }
 
 /// The definition each resolved call site reaches, keyed by the file the site
@@ -1005,6 +1079,72 @@ impl<'a> CallResolver<'a> {
         self.lookup_in_file(&class_binding.file, member_keys(&declaring_class, name))
     }
 
+    /// What `local`, as `index`'s file imports it, names in the service
+    /// (carrick#1568): the module-scope binding it resolves to, or the whole
+    /// module a namespace import or a namespace re-export stands for. `None`
+    /// for anything that resolves outside the service or not at all.
+    ///
+    /// The same order [`resolve_imported_member`](Self::resolve_imported_member)
+    /// takes: a named import is tried as a namespace re-export first, because
+    /// the value walk answers `None` for one.
+    fn imported_binding(&mut self, index: &FileCallIndex, local: &str) -> Option<ImportedBinding> {
+        let symbol = index.imports.get(local)?.clone();
+        let module = match symbol.kind {
+            SymbolKind::Namespace => Some(self.resolve_specifier(&index.path, &symbol.source)?),
+            SymbolKind::Named => self
+                .resolve_specifier(&index.path, &symbol.source)
+                .and_then(|target| {
+                    self.bindings
+                        .resolve_namespace_export(&target, &symbol.imported_name)
+                }),
+            SymbolKind::Default => None,
+        };
+        if let Some(module) = module {
+            let mut seen = HashSet::from([module.clone()]);
+            return Some(ImportedBinding::Module(self.published(&module, &mut seen)));
+        }
+        let binding = self.resolve_import(&index.path, &symbol)?;
+        Some(ImportedBinding::Binding {
+            file: self.per_file.get(&binding.file)?.path.clone(),
+            name: binding
+                .local_name
+                .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
+        })
+    }
+
+    /// Every binding `module` publishes that a module of the service
+    /// declares, under the name `module` publishes it as. A namespace
+    /// re-export it publishes contributes the bindings of the module it
+    /// stands for, under its own name.
+    fn published(&mut self, module: &Path, seen: &mut HashSet<PathBuf>) -> Vec<PublishedBinding> {
+        let mut published = Vec::new();
+        for name in self.bindings.export_names(module) {
+            if let Some(binding) = self.bindings.resolve_export(module, &name) {
+                if let Some(index) = self.per_file.get(&binding.file) {
+                    published.push(PublishedBinding {
+                        published: name.clone(),
+                        file: index.path.clone(),
+                        name: binding
+                            .local_name
+                            .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
+                    });
+                }
+                continue;
+            }
+            if let Some(inner) = self.bindings.resolve_namespace_export(module, &name)
+                && seen.insert(inner.clone())
+            {
+                for binding in self.published(&inner, seen) {
+                    published.push(PublishedBinding {
+                        published: name.clone(),
+                        ..binding
+                    });
+                }
+            }
+        }
+        published
+    }
+
     /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export
     /// (`export * as ns from "./m"` in the module it comes from).
     ///
@@ -1166,6 +1306,17 @@ mod tests {
         HashMap<String, FunctionDefinition>,
         UnresolvedImports,
     ) {
+        let (dir, definitions, resolution) = scan_resolving(files, scope, &[]);
+        (dir, definitions, resolution.unresolved)
+    }
+
+    /// [`scan_service`], asking for the import bindings `wanted` names as
+    /// (file, local name), and returning the whole resolution.
+    fn scan_resolving(
+        files: &[(&str, &str)],
+        scope: &str,
+        wanted: &[(&str, &str)],
+    ) -> (TempDir, HashMap<String, FunctionDefinition>, CallResolution) {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
         let mut paths = Vec::new();
@@ -1227,9 +1378,98 @@ mod tests {
 
         // The index production builds for this pass, aliases included.
         let workspace = WorkspaceIndex::build_with_aliases(&root, None);
-        let unresolved =
-            resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root).unresolved;
-        (dir, definitions, unresolved)
+        let mut bindings_wanted: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
+        for (file, local) in wanted {
+            bindings_wanted
+                .entry(root.join(file))
+                .or_default()
+                .insert(local.to_string());
+        }
+        let resolution = resolve_call_edges(
+            &mut definitions,
+            &per_file,
+            &keys,
+            &workspace,
+            &root,
+            &bindings_wanted,
+        );
+        (dir, definitions, resolution)
+    }
+
+    /// carrick#1568: an import binding a pass reads the value of resolves,
+    /// by the walk call edges take, to the module-scope binding its module
+    /// declares: named, renamed, through a barrel's `export { default as x }`
+    /// and `export *`, and an anonymous default, which is named `default`. A
+    /// namespace import, and a name bound to `export * as`, is the whole module
+    /// with every binding it publishes. A package, and a module outside the
+    /// service, is nothing. Resolving a binding no call needed adds nothing to
+    /// the unresolved-import report.
+    #[test]
+    fn a_wanted_import_binding_resolves_to_the_binding_its_module_declares() {
+        let files = [
+            (
+                "svc/lib/api.ts",
+                "export const api = make();\nconst hidden = make();\nexport { hidden as renamed };\n",
+            ),
+            ("svc/lib/anon.ts", "export default make();\n"),
+            (
+                "svc/lib/index.ts",
+                "export { default as anon } from \"./anon\";\nexport * from \"./api\";\nexport * as grouped from \"./api\";\n",
+            ),
+            ("other/outside.ts", "export const far = make();\n"),
+            (
+                "svc/use.ts",
+                "import { api, renamed as r } from \"./lib/api\";\n\
+                 import { anon, grouped } from \"./lib\";\n\
+                 import * as whole from \"./lib/api\";\n\
+                 import pkg from \"some-package\";\n\
+                 import { far } from \"../other/outside\";\n\
+                 import { value } from \"@/unmapped\";\n\
+                 export const all = [api, r, anon, grouped, whole, pkg, far, value];\n",
+            ),
+        ];
+        let wanted: Vec<(&str, &str)> = [
+            "api", "r", "anon", "grouped", "whole", "pkg", "far", "value",
+        ]
+        .into_iter()
+        .map(|local| ("svc/use.ts", local))
+        .collect();
+        let (dir, _, resolution) = scan_resolving(&files, "svc/", &wanted);
+        let root = dir.path().canonicalize().unwrap();
+        let use_file = root.join("svc/use.ts");
+        let binding = |local: &str| resolution.bindings.get(&use_file, local).cloned();
+        let named = |file: &str, name: &str| {
+            Some(ImportedBinding::Binding {
+                file: root.join(file),
+                name: name.to_string(),
+            })
+        };
+        assert_eq!(binding("api"), named("svc/lib/api.ts", "api"));
+        assert_eq!(binding("r"), named("svc/lib/api.ts", "hidden"));
+        assert_eq!(binding("anon"), named("svc/lib/anon.ts", DEFAULT_EXPORT));
+        let module = |published: &[(&str, &str)]| {
+            Some(ImportedBinding::Module(
+                published
+                    .iter()
+                    .map(|(published, name)| PublishedBinding {
+                        published: published.to_string(),
+                        file: root.join("svc/lib/api.ts"),
+                        name: name.to_string(),
+                    })
+                    .collect(),
+            ))
+        };
+        let both = module(&[("api", "api"), ("renamed", "hidden")]);
+        assert_eq!(binding("grouped"), both);
+        assert_eq!(binding("whole"), both);
+        for outside in ["pkg", "far", "value"] {
+            assert_eq!(binding(outside), None, "{outside}");
+        }
+        assert_eq!(
+            resolution.unresolved,
+            UnresolvedImports::default(),
+            "no call needed any of these imports"
+        );
     }
 
     /// A barrel reached through a tsconfig alias that itself re-exports

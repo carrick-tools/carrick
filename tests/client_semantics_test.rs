@@ -536,8 +536,9 @@ async fn the_rereviews_sites_read_a_base_only_where_nothing_can_change_it() {
 /// client a file stores, returns, configures, reads a property of, or calls
 /// a member outside the verified surface of reads exactly as the tree does
 /// without the semantics, as does one built from options the file passes to
-/// a call before the base; a base written after that spread, and a client
-/// used only to call through it, are read. A plain `fetch` handed a constant
+/// a call before the base; a base written after that spread, a client used
+/// only to call through it, and one whose export is only tested with
+/// `instanceof` (carrick#1568), are read. A plain `fetch` handed a constant
 /// the file writes through states nothing, and one handed a clean constant
 /// states its method.
 #[tokio::test]
@@ -561,6 +562,14 @@ async fn the_third_reviews_sites_read_nothing_the_file_can_change() {
         &get,
     );
     assert_library_row(&rows, "src/r4c-control.ts", 5, "GET", "/r4c/control", &get);
+    assert_library_row(
+        &rows,
+        "src/r4b-instanceof.ts",
+        6,
+        "GET",
+        "/r4b/instanceof",
+        &get,
+    );
     let at = |rows: &[DataFetchingCall], file: &str, line: u32| {
         rendered(
             rows.iter()
@@ -574,7 +583,6 @@ async fn the_third_reviews_sites_read_nothing_the_file_can_change() {
         ("src/r2-stored.ts", 9),
         ("src/r3-returned.ts", 6),
         ("src/r4-export-read.ts", 6),
-        ("src/r4b-instanceof.ts", 6),
         ("src/r5-setter.ts", 6),
         ("src/r6-header-write.ts", 6),
         ("src/r7-interceptor.ts", 6),
@@ -608,6 +616,62 @@ async fn the_third_reviews_sites_read_nothing_the_file_can_change() {
     );
     assert_eq!(stated(18), [("PATCH".to_string(), "/api/p4".to_string())]);
     assert_eq!(stated(20), [("GET".to_string(), "/api/p6".to_string())]);
+}
+
+/// carrick#1568: an instance one module builds and exports states the joined
+/// row, with the claims it was read through, at each call in the modules
+/// that import it: directly, renamed through a barrel, and as an anonymous
+/// default through a barrel or directly. A call through a name the importing
+/// file declares again states none, and a call through the import in that
+/// file reads exactly as it does without the semantics.
+#[tokio::test]
+#[serial]
+async fn an_imported_instance_states_the_joined_row_at_each_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+
+    let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
+    let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
+    let get = ids(HTTP, &["factory:create", "verb:get"]);
+    let get: Vec<&str> = get.iter().map(String::as_str).collect();
+    let post = ids(HTTP, &["factory:create", "verb:post", "verb_body:post"]);
+    let post: Vec<&str> = post.iter().map(String::as_str).collect();
+
+    assert_library_row(&rows, "src/i1-users.ts", 3, "GET", "/shared/v1/users", &get);
+    assert_library_row(
+        &rows,
+        "src/i2-orders.ts",
+        3,
+        "POST",
+        "/shared/v1/orders",
+        &post,
+    );
+    for (line, target) in [
+        (4, "/shared/v1/renamed"),
+        (5, "/svc/barrel-default"),
+        (6, "/svc/default"),
+    ] {
+        assert_library_row(&rows, "src/i4-barrel.ts", line, "GET", target, &get);
+    }
+
+    assert!(
+        rows_at(&rows, "src/i3-shadowed.ts", 5).is_empty(),
+        "a call through the name declared again states nothing: {rows:#?}"
+    );
+    let at = |rows: &[DataFetchingCall]| rendered(rows_at(rows, "src/i3-shadowed.ts", 8));
+    assert_eq!(
+        at(&rows),
+        at(&without),
+        "the import in a file that declares its name again reads as it does without the semantics"
+    );
+    assert!(
+        rows_at(&rows, "src/i3-shadowed.ts", 8)
+            .iter()
+            .all(|row| row.library_semantics.is_empty()),
+        "{rows:#?}"
+    );
 }
 
 /// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a
@@ -756,6 +820,20 @@ async fn a_claimed_option_key_absent_from_the_declarations_stays_a_candidate() {
             rendered(rows_at(&rows, "src/http-client.ts", line)),
             rendered(rows_at(&without, "src/http-client.ts", line)),
             "src/http-client.ts:{line} must read as it does without the semantics"
+        );
+    }
+    // So do the calls in the modules that import an instance (carrick#1568).
+    for (file, line) in [("src/i1-users.ts", 3), ("src/i4-barrel.ts", 4)] {
+        assert_eq!(
+            rendered(rows_at(&rows, file, line)),
+            rendered(rows_at(&without, file, line)),
+            "{file}:{line} must read as it does without the semantics"
+        );
+        assert!(
+            rows_at(&rows, file, line)
+                .iter()
+                .all(|row| row.library_semantics.is_empty()),
+            "{file}:{line} is read through no claim"
         );
     }
     assert_unread_row(
