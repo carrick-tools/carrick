@@ -105,13 +105,17 @@ export function reposToScaffold(
  * no `repo` the response keeps its default ending and tells the agent to run
  * the scan — on a repo CI already indexes, which is the row the whole
  * workspace reads (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
- * So the names are in the sentence, one call per repo.
+ * So the names are in the sentence.
  *
  * One repo whose owner/repo is known is the value of `repo`, said once; the
  * sentence used to name it and then ask for it again (carrick#1574). A repo
  * known here only by its folder still needs the agent to find its owner/repo.
- * The several-repo sentence is carrick-cloud#1404's: the tool now takes them
- * all in one `repos` call.
+ *
+ * Several repos are one call with all of them in `repos`, which sends the
+ * shared instructions once rather than once per repo (carrick-cloud#1404).
+ * Every name is listed, uncapped: `repos` takes each owner/repo, and nothing
+ * else on disk holds them in that form. A folder name among them is called
+ * out, because one entry the server cannot resolve refuses the whole call.
  */
 export function scaffoldSentence(repos: RepoIdentity[]): string {
   const names = repos.map((repo) => repo.name ?? path.basename(repo.path));
@@ -120,8 +124,12 @@ export function scaffoldSentence(repos: RepoIdentity[]): string {
       ? `Run the carrick scaffold tool with \`repo\` set to ${names[0]}, and follow what it returns.`
       : `Run the carrick scaffold tool for ${names[0]}, passing its owner/repo as \`repo\`, and follow what it returns.`;
   }
-  const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-  return `Run the carrick scaffold tool for ${shown}, once each, passing that repo's owner/repo as \`repo\`, and follow what it returns.`;
+  const folders = repos.filter((repo) => repo.name === null).map((repo) => path.basename(repo.path));
+  const lookUp =
+    folders.length === 0
+      ? ""
+      : ` with the owner/repo of ${listed(folders, Infinity)} in place of ${folders.length === 1 ? "its folder name" : "their folder names"}`;
+  return `Run the carrick scaffold tool once for ${listed(names, Infinity)}, passing them as \`repos\`${lookUp}, and follow what it returns.`;
 }
 
 /** The title of the block a run closes on when there is scaffolding left to do. */
