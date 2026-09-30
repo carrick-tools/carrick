@@ -2941,27 +2941,10 @@ test("only a repo missing its config or its workflow is sent to the scaffold too
     scaffoldSentence([repos[1]!]),
     "Run the carrick scaffold tool with `repo` set to acme/web, and follow what it returns.",
   );
-  // Several repos: one call with all of them in `repos`, which reads the
-  // shared instructions once (carrick-cloud#1404). Every name is in the
-  // sentence, because `repos` needs each owner/repo and "and 1 more" is not
-  // one the agent can pass.
+  // Several repos: carrick-cloud#1404 moves this to one `repos` call.
   assert.equal(
     scaffoldSentence(owed),
-    "Run the carrick scaffold tool once for acme/web, acme/jobs, acme/docs and acme/site, passing them as `repos`, and follow what it returns.",
-  );
-  // A folder name in that list is not an owner/repo, and one entry the server
-  // cannot resolve refuses the whole call, so the sentence says which to look up.
-  assert.equal(
-    scaffoldSentence([repos[1]!, { path: "/w/local", name: null, remote: null, problem: "it has no origin remote" }]),
-    "Run the carrick scaffold tool once for acme/web and local, passing them as `repos` with the owner/repo of local in place of its folder name, and follow what it returns.",
-  );
-  assert.equal(
-    scaffoldSentence([
-      { path: "/w/local", name: null, remote: null, problem: "it has no origin remote" },
-      repos[1]!,
-      { path: "/w/scratch", name: null, remote: "git@work:acme/scratch.git", problem: "its origin git@work:acme/scratch.git is not a GitHub URL" },
-    ]),
-    "Run the carrick scaffold tool once for local, acme/web and scratch, passing them as `repos` with the owner/repo of local and scratch in place of their folder names, and follow what it returns.",
+    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
   );
   // A repo known here only by its folder: the agent still has to find the
   // owner/repo, and the sentence still asks it to.
