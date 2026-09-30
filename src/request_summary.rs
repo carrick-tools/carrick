@@ -101,7 +101,9 @@ use swc_common::{SourceMap, SourceMapper, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::call_graph::{CallSiteTargets, ImportedBinding, ImportedBindings};
+use crate::call_graph::{
+    BindingsWanted, CallSiteTargets, ImportedBinding, ImportedBindings, PublishedBinding,
+};
 use crate::client_semantics::{LibrarySemantics, instance_receiver};
 use crate::commonjs::{require_bound_names, require_specifier};
 use crate::import_bindings::DEFAULT_EXPORT;
@@ -267,6 +269,9 @@ struct RequestShape {
     /// A library client's base, joined to `url` only when the row is stated
     /// (see [`join_base`]). Empty for every other request.
     base: Vec<Piece>,
+    /// The file whose scope `base` was read in: the module that declares the
+    /// client (carrick#1568). A name in it means what that module binds.
+    base_scope: Option<PathBuf>,
     /// The library-semantics claim ids this reading used. Empty for every
     /// other request.
     semantics: BTreeSet<String>,
@@ -412,6 +417,9 @@ pub struct FileIr {
     /// Every import binding the file uses, with how it uses it. What a module
     /// that declares one of them holds is changed by these uses too.
     imported: HashMap<String, BindingUse>,
+    /// The modules the file loads other than through an import binding
+    /// ([`module_loads`]): everything each publishes may be changed here.
+    loads: BTreeSet<String>,
     /// The file names `module.exports` or `exports`. What it publishes that
     /// way is read only at module level, last write winning
     /// ([`crate::commonjs::export_assignments`]), so a write anywhere else can
@@ -420,10 +428,14 @@ pub struct FileIr {
 }
 
 impl FileIr {
-    /// The import bindings whose declaring module the summaries read
-    /// ([`crate::call_graph::resolve_call_edges`]'s `bindings_wanted`).
-    pub fn imports_read(&self) -> BTreeSet<String> {
-        self.imported.keys().cloned().collect()
+    /// The import bindings whose declaring module the summaries read, and
+    /// the modules the file loads ([`crate::call_graph::resolve_call_edges`]'s
+    /// `bindings_wanted`).
+    pub fn bindings_wanted(&self) -> BindingsWanted {
+        BindingsWanted {
+            locals: self.imported.keys().cloned().collect(),
+            loads: self.loads.clone(),
+        }
     }
 }
 
@@ -444,7 +456,7 @@ pub fn extract_file_ir(
 ) -> FileIr {
     let mut uses = BindingUses::default();
     module.visit_with(&mut uses);
-    let imports = import_bindings(module);
+    let (imports, bound_requires) = import_bindings(module);
     // Every import the file uses, however it uses it: a module that declares
     // one holds what these uses may change (carrick#1568). Kept whether or
     // not the name is declared again below, since nothing here says which
@@ -477,11 +489,14 @@ pub fn extract_file_ir(
         .retain(|name, _| !redeclared.contains(name));
     module_scope.imports = imports
         .iter()
-        .filter(|(name, import)| !import.namespace && !redeclared.contains(*name))
+        .filter(|(name, import)| {
+            !import.namespace && !import.reassignable && !redeclared.contains(*name)
+        })
         .map(|(name, _)| name.clone())
         .collect();
     let mut file = FileIr {
         imported,
+        loads: module_loads(module, &bound_requires),
         names_commonjs_exports: names_commonjs_exports(module),
         ..FileIr::default()
     };
@@ -776,6 +791,13 @@ impl BindingUses {
 }
 
 impl Visit for BindingUses {
+    // A type is no use of a value: a type literal's key (`{ api: T }`) and
+    // a type query (`typeof api` in a type) read nothing at run time
+    // (carrick#1568).
+    fn visit_ts_type(&mut self, _: &TsType) {}
+
+    fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+
     fn visit_expr(&mut self, expr: &Expr) {
         if let Some(key) = binding_key(expr) {
             self.mark(key, |used| used.other = true);
@@ -1167,24 +1189,36 @@ struct ImportBinding {
     export: String,
     /// `import * as ns`: the binding names the module, not an export.
     namespace: bool,
+    /// Bound by `let` or `var`, so the file may assign it something else:
+    /// its uses count against what it was bound to, and no call through it is
+    /// read as that (carrick#1568).
+    reassignable: bool,
 }
 
 /// Every module-scope binding an import introduces, with the export it names:
 /// `import x from "m"` and `const x = require("m")` name `default`; `import {
 /// a as x } from "m"`, `const { a: x } = require("m")` and `const x =
-/// require("m").a` name `a`; `import * as x` names the module.
-fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
+/// require("m").a` name `a`; `import * as x` names the module. A `require`
+/// bound by any declaration kind counts, exported or not, as it does for the
+/// call graph ([`crate::commonjs::require_bindings`]).
+///
+/// Also returns where each `require` call these bindings come from starts, so
+/// the module loads a file makes elsewhere ([`module_loads`]) leave them out.
+fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<u32>) {
     let mut bindings = HashMap::new();
-    let mut add = |local: String, specifier: String, export: String, namespace: bool| {
-        bindings.insert(
-            local,
-            ImportBinding {
-                specifier,
-                export,
-                namespace,
-            },
-        );
-    };
+    let mut require_calls = HashSet::new();
+    let mut add =
+        |local: String, specifier: String, export: String, namespace: bool, reassignable: bool| {
+            bindings.insert(
+                local,
+                ImportBinding {
+                    specifier,
+                    export,
+                    namespace,
+                    reassignable,
+                },
+            );
+        };
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) if !import.type_only => {
@@ -1196,6 +1230,7 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                                 default.local.sym.to_string(),
                                 specifier.clone(),
                                 DEFAULT_EXPORT.to_string(),
+                                false,
                                 false,
                             );
                         }
@@ -1210,6 +1245,7 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                                 specifier.clone(),
                                 export,
                                 false,
+                                false,
                             );
                         }
                         ImportSpecifier::Namespace(namespace) => {
@@ -1218,6 +1254,7 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                                 specifier.clone(),
                                 DEFAULT_EXPORT.to_string(),
                                 true,
+                                false,
                             );
                         }
                         _ => {}
@@ -1231,10 +1268,15 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                         external.expr.value.to_string(),
                         DEFAULT_EXPORT.to_string(),
                         false,
+                        false,
                     );
                 }
             }
-            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) if var.kind == VarDeclKind::Const => {
+            _ => {
+                let Some(var) = module_var_decl(item) else {
+                    continue;
+                };
+                let reassignable = var.kind != VarDeclKind::Const;
                 for declarator in &var.decls {
                     let Some(init) = declarator.init.as_deref() else {
                         continue;
@@ -1244,17 +1286,20 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                         && let MemberProp::Ident(property) = &member.prop
                         && let Pat::Ident(local) = &declarator.name
                     {
+                        require_calls.insert(member.obj.span().lo.0);
                         add(
                             local.id.sym.to_string(),
                             specifier,
                             property.sym.to_string(),
                             false,
+                            reassignable,
                         );
                         continue;
                     }
                     let Some(specifier) = require_specifier(init) else {
                         continue;
                     };
+                    require_calls.insert(init.span().lo.0);
                     for bound in require_bound_names(&declarator.name) {
                         let export = match bound.kind {
                             SymbolKind::Namespace => DEFAULT_EXPORT.to_string(),
@@ -1265,14 +1310,70 @@ fn import_bindings(module: &Module) -> HashMap<String, ImportBinding> {
                             specifier.clone(),
                             export,
                             false,
+                            reassignable,
                         );
                     }
                 }
             }
-            _ => {}
         }
     }
-    bindings
+    (bindings, require_calls)
+}
+
+/// The modules a file loads other than through a module-scope import
+/// binding, by specifier (carrick#1568): `import("./m")` and `require("./m")`
+/// anywhere, and any other call handed a relative specifier as its first
+/// argument (a `require` made by a factory, `req("./m")`). What such a load
+/// does with the module is not followed, so everything the module publishes
+/// counts as used in every way.
+///
+/// A specifier the source computes (`import(name)`, a template with a hole)
+/// names no module and is not here.
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
+    struct Loads<'a> {
+        bound_requires: &'a HashSet<u32>,
+        found: BTreeSet<String>,
+    }
+    impl Visit for Loads<'_> {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            let specifier = call
+                .args
+                .first()
+                .filter(|arg| arg.spread.is_none())
+                .and_then(|arg| literal_specifier(&arg.expr));
+            if let Some(specifier) = specifier {
+                let require = matches!(&call.callee, Callee::Expr(callee)
+                    if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
+                let bound = require && self.bound_requires.contains(&call.span.lo.0);
+                let relative = specifier.starts_with("./") || specifier.starts_with("../");
+                if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
+                    self.found.insert(specifier);
+                }
+            }
+            call.visit_children_with(self);
+        }
+    }
+    let mut loads = Loads {
+        bound_requires,
+        found: BTreeSet::new(),
+    };
+    module.visit_with(&mut loads);
+    loads.found
+}
+
+/// A string literal, or a template with no hole in it.
+fn literal_specifier(expr: &Expr) -> Option<String> {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {
+            quasi
+                .cooked
+                .as_ref()
+                .map(|cooked| cooked.to_string())
+                .unwrap_or_else(|| quasi.raw.to_string())
+        }),
+        _ => None,
+    }
 }
 
 /// The imports that name a package's export (carrick#1564). A namespace import
@@ -1380,6 +1481,22 @@ impl Visit for DeclaredNames {
     fn visit_class_decl(&mut self, decl: &ClassDecl) {
         self.declare(decl.ident.sym.to_string());
         decl.visit_children_with(self);
+    }
+
+    // `const h = function api() { … }`: the name is bound inside the
+    // function, where it is not the import (carrick#1568).
+    fn visit_fn_expr(&mut self, expr: &FnExpr) {
+        if let Some(ident) = &expr.ident {
+            self.declare(ident.sym.to_string());
+        }
+        expr.visit_children_with(self);
+    }
+
+    fn visit_class_expr(&mut self, expr: &ClassExpr) {
+        if let Some(ident) = &expr.ident {
+            self.declare(ident.sym.to_string());
+        }
+        expr.visit_children_with(self);
     }
 
     // A parameter named in a type (`(api: Api) => void`) binds nothing.
@@ -2234,6 +2351,7 @@ impl Reader<'_> {
                         )
                     })),
             base: Vec::new(),
+            base_scope: None,
             semantics: BTreeSet::new(),
         })
     }
@@ -2756,6 +2874,8 @@ struct Effect {
     /// stated, so a path a caller fills in is joined as it is finally
     /// written (carrick#1564).
     base: Vec<Piece>,
+    /// The file whose scope `base` was read in ([`RequestShape::base_scope`]).
+    base_scope: Option<PathBuf>,
     /// The library-semantics claim ids the request was read through.
     semantics: BTreeSet<String>,
 }
@@ -2779,6 +2899,7 @@ impl Effect {
             body_param,
             verb: shape.kind == RequestKind::Verb,
             base: shape.base.clone(),
+            base_scope: shape.base_scope.clone(),
             semantics: shape.semantics.clone(),
         }
     }
@@ -2887,6 +3008,7 @@ impl Effect {
             body_param,
             verb: self.verb,
             base: fill(&self.base),
+            base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
         }
     }
@@ -2959,7 +3081,7 @@ pub struct SummaryRow {
 
 /// What the summaries are composed from, as discovery leaves it: every
 /// file's functions, the call sites the call graph resolved, and the module
-/// each import the files read names ([`FileIr::imports_read`]). Held until
+/// each import the files read names ([`FileIr::bindings_wanted`]). Held until
 /// the service's library semantics are verified, which needs detection and
 /// the service's sidecar (carrick#1564).
 #[derive(Debug, Default)]
@@ -2981,14 +3103,36 @@ const MAX_REEXPORT_HOPS: usize = 8;
 /// One instance is one object wherever it is imported, so a use that may
 /// change its base in any module is a use of it in every module: the merge
 /// is what makes the declaring module's own calls, and every importer's, read
-/// nothing once any module writes through it, hands it on, or calls a member
-/// its verified surface does not name.
+/// nothing once any module writes through it, hands it on, calls a member its
+/// verified surface does not name, or loads its module some other way
+/// (`import("./api")`, a `require` inside a function).
+///
+/// Where a use cannot be followed to what it names, because the resolver
+/// stopped at a cap, the use may be of any instance: no import reads through
+/// one anywhere in the service. The declaring modules still read their own
+/// calls, as they did before an import was followed at all.
 #[derive(Debug, Default)]
 struct LinkedClients {
     clients: HashMap<(PathBuf, String), ClientRef>,
     /// (importer, local) -> the client it reads, for an import that reaches
     /// one only through modules that publish nothing through `exports`.
     imports: HashMap<(PathBuf, String), (PathBuf, String)>,
+    /// Some use could not be followed to what it names.
+    unfollowable: bool,
+}
+
+/// What an import, followed through the modules that re-export it, reaches.
+enum Declared {
+    /// A module-scope client, and whether every module on the way publishes
+    /// nothing through `exports` ([`FileIr::names_commonjs_exports`]), which
+    /// is when another module may read through it.
+    Client((PathBuf, String), bool),
+    /// A whole module, which a namespace re-exported by name stands for.
+    Module(Vec<PublishedBinding>),
+    /// Something that is not a client.
+    Nothing,
+    /// A cap stopped the walk.
+    Unfollowable,
 }
 
 impl LinkedClients {
@@ -3005,88 +3149,155 @@ impl LinkedClients {
             for (local, used) in &ir.imported {
                 match bindings.get(file, local) {
                     Some(ImportedBinding::Binding { file: at, name }) => {
-                        let Some((held, readable)) = declared_client(files, bindings, at, name)
-                        else {
-                            continue;
-                        };
-                        if let Some(client) = linked.clients.get_mut(&held) {
-                            client.contested |= used.contests_client();
-                            client.called.extend(used.called.iter().cloned());
-                            client.called_computed |= used.called_computed;
-                        }
-                        if readable {
-                            linked.imports.insert((file.clone(), local.clone()), held);
-                        }
-                    }
-                    // A namespace reads each binding its module publishes as
-                    // a member: used any way but calling one of them
-                    // directly, it may reach any of them.
-                    Some(ImportedBinding::Module(published)) => {
-                        let contests = used.contests_client() || used.called_computed;
-                        for binding in published {
-                            let Some((held, _)) =
-                                declared_client(files, bindings, &binding.file, &binding.name)
-                            else {
-                                continue;
-                            };
-                            if let Some(client) = linked.clients.get_mut(&held) {
-                                client.contested |= contests;
-                                if used.called.contains(&Some(binding.published.clone())) {
-                                    client.called.insert(None);
+                        match declared_client(files, bindings, at, name) {
+                            Declared::Client(held, readable) => {
+                                linked.merge(&held, used);
+                                if readable {
+                                    linked.imports.insert((file.clone(), local.clone()), held);
                                 }
                             }
+                            Declared::Module(published) => {
+                                linked.merge_namespace(files, bindings, &published, used);
+                            }
+                            Declared::Nothing => {}
+                            Declared::Unfollowable => linked.unfollowable = true,
                         }
                     }
+                    Some(ImportedBinding::Module(published)) => {
+                        linked.merge_namespace(files, bindings, published, used);
+                    }
+                    Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
                     None => {}
+                }
+            }
+            // A module loaded some other way: nothing says what is done with
+            // it, so every client it publishes is taken as changed.
+            for specifier in &ir.loads {
+                match bindings.load(file, specifier) {
+                    Some(ImportedBinding::Module(published)) => {
+                        linked.contest_published(files, bindings, published);
+                    }
+                    Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
+                    Some(ImportedBinding::Binding { .. }) | None => {}
                 }
             }
         }
         linked
     }
 
-    /// The client a call's receiver binding holds, with every module's uses.
-    fn client<'c>(&'c self, file: &Path, binding: &'c ClientBinding) -> Option<&'c ClientRef> {
+    /// Merge one module's uses of a binding into the client it names.
+    fn merge(&mut self, held: &(PathBuf, String), used: &BindingUse) {
+        if let Some(client) = self.clients.get_mut(held) {
+            client.contested |= used.contests_client();
+            client.called.extend(used.called.iter().cloned());
+            client.called_computed |= used.called_computed;
+        }
+    }
+
+    /// A namespace reads each binding its module publishes as a member: used
+    /// any way but calling one of them directly, it may reach any of them.
+    fn merge_namespace(
+        &mut self,
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        published: &[PublishedBinding],
+        used: &BindingUse,
+    ) {
+        let contests = used.contests_client() || used.called_computed;
+        for binding in published {
+            match declared_client(files, bindings, &binding.file, &binding.name) {
+                Declared::Client(held, _) => {
+                    if let Some(client) = self.clients.get_mut(&held) {
+                        client.contested |= contests;
+                        if used.called.contains(&Some(binding.published.clone())) {
+                            client.called.insert(None);
+                        }
+                    }
+                }
+                Declared::Module(inner) => {
+                    if contests {
+                        self.contest_published(files, bindings, &inner);
+                    }
+                }
+                Declared::Nothing => {}
+                Declared::Unfollowable => self.unfollowable = true,
+            }
+        }
+    }
+
+    /// Every client `published` reaches, taken as changed.
+    fn contest_published(
+        &mut self,
+        files: &HashMap<PathBuf, FileIr>,
+        bindings: &ImportedBindings,
+        published: &[PublishedBinding],
+    ) {
+        let contested = BindingUse {
+            other: true,
+            ..BindingUse::default()
+        };
+        self.merge_namespace(files, bindings, published, &contested);
+    }
+
+    /// The client a call's receiver binding holds, with every module's uses,
+    /// and the file whose scope its options were read in.
+    fn client_in_scope<'c>(
+        &'c self,
+        file: &'c Path,
+        binding: &'c ClientBinding,
+    ) -> Option<(&'c ClientRef, &'c Path)> {
         match binding {
-            ClientBinding::Own(client) => Some(client),
-            ClientBinding::Module(name) => self.clients.get(&(file.to_path_buf(), name.clone())),
+            ClientBinding::Own(client) => Some((client, file)),
+            ClientBinding::Module(name) => self
+                .clients
+                .get(&(file.to_path_buf(), name.clone()))
+                .map(|client| (client, file)),
             ClientBinding::Imported { local, package } => {
-                match self.imports.get(&(file.to_path_buf(), local.clone())) {
-                    Some(held) => self.clients.get(held),
-                    None => package.as_ref(),
+                let held = (!self.unfollowable)
+                    .then(|| self.imports.get(&(file.to_path_buf(), local.clone())))
+                    .flatten();
+                match held {
+                    Some(held) => self
+                        .clients
+                        .get(held)
+                        .map(|client| (client, held.0.as_path())),
+                    None => package.as_ref().map(|client| (client, file)),
                 }
             }
         }
     }
 }
 
-/// The module-scope client `name` in `file` is, following a module that
-/// re-exports a binding it imports (`import { api } from "./api"; export {
-/// api }`) to the module that declares it. Also whether every module on the
-/// way publishes nothing through `exports`, which is when another module may
-/// read through it ([`FileIr::names_commonjs_exports`]).
+/// What `name` in `file` reaches, following a module that re-exports a
+/// binding it imports (`import { api } from "./api"; export { api }`) to the
+/// module that declares it.
 fn declared_client(
     files: &HashMap<PathBuf, FileIr>,
     bindings: &ImportedBindings,
     file: &Path,
     name: &str,
-) -> Option<((PathBuf, String), bool)> {
+) -> Declared {
     let mut at = (file.to_path_buf(), name.to_string());
     let mut readable = true;
     for _ in 0..=MAX_REEXPORT_HOPS {
-        let ir = files.get(&at.0)?;
+        let Some(ir) = files.get(&at.0) else {
+            return Declared::Nothing;
+        };
         readable &= !ir.names_commonjs_exports;
         if ir.module_clients.contains_key(&at.1) {
-            return Some((at, readable));
+            return Declared::Client(at, readable);
         }
         if !ir.imported.contains_key(&at.1) {
-            return None;
+            return Declared::Nothing;
         }
-        match bindings.get(&at.0, &at.1)? {
-            ImportedBinding::Binding { file, name } => at = (file.clone(), name.clone()),
-            ImportedBinding::Module(_) => return None,
+        match bindings.get(&at.0, &at.1) {
+            Some(ImportedBinding::Binding { file, name }) => at = (file.clone(), name.clone()),
+            Some(ImportedBinding::Module(published)) => return Declared::Module(published.clone()),
+            Some(ImportedBinding::Unfollowable) => return Declared::Unfollowable,
+            None => return Declared::Nothing,
         }
     }
-    None
+    Declared::Unfollowable
 }
 
 /// Everything the pass states, per file (keyed by the file as walked).
@@ -3307,7 +3518,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(&instantiated, call, reaches, false) {
+                    match row(&instantiated, file, call, reaches, false) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -3338,7 +3549,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
                         if !effect.has_params() {
-                            match row(&effect, call, None, !library) {
+                            match row(&effect, file, call, None, !library) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -3366,6 +3577,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
 /// stated.
 fn row(
     effect: &Effect,
+    file: &Path,
     call: &CallIr,
     reaches_request: Option<String>,
     own_site: bool,
@@ -3374,6 +3586,9 @@ fn row(
     let MethodValue::Lit(method) = &effect.method else {
         return None;
     };
+    if !base_reads_the_same_in(effect, file) {
+        return None;
+    }
     let target = render_target(&join_base(&effect.base, &effect.url))?;
     let body_literals = effect
         .body
@@ -3397,6 +3612,59 @@ fn row(
     })
 }
 
+/// Whether a row stated in `file` states the base `effect` was read with
+/// (carrick#1568).
+///
+/// A row's target names an opaque base by the expression that holds it
+/// (`${config.apiUrl}`), and the passes after this one read that name in the
+/// file the row sits in. A base read in another module's scope, a client that
+/// module declares, would then be read as whatever the stating file binds to
+/// that name, or as nothing. So such a row is stated only where every piece
+/// of its base means the same in every file: text the source writes, or an
+/// environment read.
+fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
+    match &effect.base_scope {
+        Some(scope) if scope != file => effect.base.iter().all(|piece| match piece {
+            Piece::Lit(_) => true,
+            Piece::Opaque(text) => reads_the_environment(text),
+            Piece::Param(..) | Piece::Unknown => false,
+        }),
+        _ => true,
+    }
+}
+
+/// Whether `text` is exactly an environment read, in one of the spellings the
+/// runtimes give it (as [`crate::env_alias`] reads them): `process.env.NAME`,
+/// `import.meta.env.NAME`, either with a string index, or `Deno.env.get("NAME")`.
+fn reads_the_environment(text: &str) -> bool {
+    let name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let quoted = |inner: &str| {
+        [('"', '"'), ('\'', '\'')].iter().any(|(open, close)| {
+            inner
+                .strip_prefix(*open)
+                .and_then(|rest| rest.strip_suffix(*close))
+                .is_some_and(name)
+        })
+    };
+    ["process.env", "import.meta.env"].iter().any(|object| {
+        text.strip_prefix(object).is_some_and(|rest| {
+            rest.strip_prefix('.').is_some_and(name)
+                || rest
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .is_some_and(quoted)
+        })
+    }) || text
+        .strip_prefix("Deno.env.get(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(quoted)
+}
+
 /// What a call sends when the call graph resolves it to nothing of this
 /// service: through a verified library client, what the client's claims say
 /// (carrick#1564); otherwise the shape the call is written in.
@@ -3409,8 +3677,13 @@ fn shape_of<'c>(
     call.receiver
         .as_ref()
         .and_then(|receiver| {
-            let client = clients.client(file, &receiver.client)?;
-            library_shape(client, receiver.member.as_deref(), &call.args, semantics)
+            let (client, scope) = clients.client_in_scope(file, &receiver.client)?;
+            let mut shape =
+                library_shape(client, receiver.member.as_deref(), &call.args, semantics)?;
+            if !shape.base.is_empty() {
+                shape.base_scope = Some(scope.to_path_buf());
+            }
+            Some(shape)
         })
         .map(Cow::Owned)
         .or_else(|| call.request.as_ref().map(Cow::Borrowed))
@@ -3581,6 +3854,7 @@ fn library_shape(
         body,
         url_inline: false,
         base,
+        base_scope: None,
         semantics: used,
     })
 }

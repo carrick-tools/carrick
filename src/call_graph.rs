@@ -69,7 +69,7 @@
 //! overwriting the first.
 
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, ResolvedBinding};
+use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, Lookup, ResolvedBinding};
 use crate::parser::parse_file;
 use crate::receiver_type::{ReceiverTypes, module_scope_types};
 use crate::visitor::{
@@ -348,7 +348,8 @@ pub fn merge_definitions(
 ///
 /// `bindings_wanted` names, per file (keyed like `per_file`), the import
 /// bindings a later pass reads the VALUE of rather than calls a function
-/// through (carrick#1568). Each is resolved by the same resolver the edges
+/// through, and the modules the file loads other than through an import
+/// binding (carrick#1568). Each is resolved by the same resolver the edges
 /// used, after them, and answered in [`CallResolution::bindings`].
 pub fn resolve_call_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
@@ -356,7 +357,7 @@ pub fn resolve_call_edges(
     keys: &RekeyIndex,
     workspace: &WorkspaceIndex,
     repo_root: &Path,
-    bindings_wanted: &HashMap<PathBuf, BTreeSet<String>>,
+    bindings_wanted: &HashMap<PathBuf, BindingsWanted>,
 ) -> CallResolution {
     let mut resolver = CallResolver::new(per_file, workspace, repo_root);
     let mut sites = CallSiteTargets::default();
@@ -439,13 +440,23 @@ pub fn resolve_call_edges(
         let Some(index) = per_file.get(canonical) else {
             continue;
         };
-        for local in &bindings_wanted[canonical] {
+        let wanted = &bindings_wanted[canonical];
+        for local in &wanted.locals {
             if let Some(binding) = resolver.imported_binding(index, local) {
                 bindings
                     .by_file
                     .entry(index.path.clone())
                     .or_default()
                     .insert(local.clone(), binding);
+            }
+        }
+        for specifier in &wanted.loads {
+            if let Some(module) = resolver.loaded_module(index, specifier) {
+                bindings
+                    .loads
+                    .entry(index.path.clone())
+                    .or_default()
+                    .insert(specifier.clone(), module);
             }
         }
     }
@@ -486,6 +497,9 @@ pub enum ImportedBinding {
     /// A whole module: `import * as lib`, or a name bound to `export * as lib
     /// from`. Every binding it publishes, as a [`PublishedBinding`].
     Module(Vec<PublishedBinding>),
+    /// The walk stopped at one of the resolver's caps before it could say
+    /// what the import names. It may be anything in the service.
+    Unfollowable,
 }
 
 /// One binding a module publishes, under the name it publishes it as.
@@ -496,11 +510,23 @@ pub struct PublishedBinding {
     pub name: String,
 }
 
+/// What one file asks [`resolve_call_edges`] to resolve for it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BindingsWanted {
+    /// Import bindings, by local name.
+    pub locals: BTreeSet<String>,
+    /// Specifiers of modules the file loads other than through an import
+    /// binding.
+    pub loads: BTreeSet<String>,
+}
+
 /// The answers to [`resolve_call_edges`]'s `bindings_wanted`, keyed by the
-/// importing file as walked (like [`FileCallIndex::path`]) and the local name.
+/// importing file as walked (like [`FileCallIndex::path`]) and the local name
+/// or the specifier.
 #[derive(Debug, Default)]
 pub struct ImportedBindings {
     by_file: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
+    loads: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
 }
 
 impl ImportedBindings {
@@ -508,6 +534,12 @@ impl ImportedBindings {
     /// module of the service.
     pub fn get(&self, importer: &Path, local: &str) -> Option<&ImportedBinding> {
         self.by_file.get(importer)?.get(local)
+    }
+
+    /// What the module `importer` loads by `specifier` publishes, when it
+    /// resolved.
+    pub fn load(&self, importer: &Path, specifier: &str) -> Option<&ImportedBinding> {
+        self.loads.get(importer)?.get(specifier)
     }
 }
 
@@ -1082,67 +1114,103 @@ impl<'a> CallResolver<'a> {
     /// What `local`, as `index`'s file imports it, names in the service
     /// (carrick#1568): the module-scope binding it resolves to, or the whole
     /// module a namespace import or a namespace re-export stands for. `None`
-    /// for anything that resolves outside the service or not at all.
+    /// for anything that resolves outside the service or not at all, and
+    /// [`ImportedBinding::Unfollowable`] where a cap stopped the walk first.
     ///
     /// The same order [`resolve_imported_member`](Self::resolve_imported_member)
     /// takes: a named import is tried as a namespace re-export first, because
     /// the value walk answers `None` for one.
     fn imported_binding(&mut self, index: &FileCallIndex, local: &str) -> Option<ImportedBinding> {
         let symbol = index.imports.get(local)?.clone();
-        let module = match symbol.kind {
-            SymbolKind::Namespace => Some(self.resolve_specifier(&index.path, &symbol.source)?),
-            SymbolKind::Named => self
-                .resolve_specifier(&index.path, &symbol.source)
-                .and_then(|target| {
-                    self.bindings
-                        .resolve_namespace_export(&target, &symbol.imported_name)
-                }),
-            SymbolKind::Default => None,
+        let target = self.resolve_specifier(&index.path, &symbol.source)?;
+        let export = match symbol.kind {
+            SymbolKind::Namespace => return Some(self.module_binding(&target)),
+            SymbolKind::Named => {
+                match self
+                    .bindings
+                    .resolve_namespace_export_bounded(&target, &symbol.imported_name)
+                {
+                    Lookup::Found(module) => return Some(self.module_binding(&module)),
+                    Lookup::Capped => return Some(ImportedBinding::Unfollowable),
+                    Lookup::Absent => symbol.imported_name.as_str(),
+                }
+            }
+            SymbolKind::Default => DEFAULT_EXPORT,
         };
-        if let Some(module) = module {
-            let mut seen = HashSet::from([module.clone()]);
-            return Some(ImportedBinding::Module(self.published(&module, &mut seen)));
+        match self.bindings.resolve_export_bounded(&target, export) {
+            Lookup::Found(binding) => Some(ImportedBinding::Binding {
+                file: self.per_file.get(&binding.file)?.path.clone(),
+                name: binding
+                    .local_name
+                    .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
+            }),
+            Lookup::Capped => Some(ImportedBinding::Unfollowable),
+            Lookup::Absent => None,
         }
-        let binding = self.resolve_import(&index.path, &symbol)?;
-        Some(ImportedBinding::Binding {
-            file: self.per_file.get(&binding.file)?.path.clone(),
-            name: binding
-                .local_name
-                .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
-        })
+    }
+
+    /// What a module `index`'s file loads by `specifier` other than through an
+    /// import binding (`require("./m")` inside a function, `import("./m")`)
+    /// publishes: the whole module, as a namespace import sees it.
+    fn loaded_module(&mut self, index: &FileCallIndex, specifier: &str) -> Option<ImportedBinding> {
+        let target = self.resolve_specifier(&index.path, specifier)?;
+        Some(self.module_binding(&target))
+    }
+
+    /// Everything `module` publishes, or [`ImportedBinding::Unfollowable`]
+    /// when a cap stopped the walk before it could list it all.
+    fn module_binding(&mut self, module: &Path) -> ImportedBinding {
+        let mut seen = HashSet::from([module.to_path_buf()]);
+        match self.published(module, &mut seen) {
+            Some(published) => ImportedBinding::Module(published),
+            None => ImportedBinding::Unfollowable,
+        }
     }
 
     /// Every binding `module` publishes that a module of the service
     /// declares, under the name `module` publishes it as. A namespace
     /// re-export it publishes contributes the bindings of the module it
-    /// stands for, under its own name.
-    fn published(&mut self, module: &Path, seen: &mut HashSet<PathBuf>) -> Vec<PublishedBinding> {
+    /// stands for, under its own name. `None` when a cap stopped any walk.
+    fn published(
+        &mut self,
+        module: &Path,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Option<Vec<PublishedBinding>> {
         let mut published = Vec::new();
-        for name in self.bindings.export_names(module) {
-            if let Some(binding) = self.bindings.resolve_export(module, &name) {
-                if let Some(index) = self.per_file.get(&binding.file) {
-                    published.push(PublishedBinding {
-                        published: name.clone(),
-                        file: index.path.clone(),
-                        name: binding
-                            .local_name
-                            .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
-                    });
+        for name in self.bindings.export_names_bounded(module)? {
+            match self.bindings.resolve_export_bounded(module, &name) {
+                Lookup::Found(binding) => {
+                    if let Some(index) = self.per_file.get(&binding.file) {
+                        published.push(PublishedBinding {
+                            published: name.clone(),
+                            file: index.path.clone(),
+                            name: binding
+                                .local_name
+                                .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
+                        });
+                    }
+                    continue;
                 }
-                continue;
+                Lookup::Capped => return None,
+                Lookup::Absent => {}
             }
-            if let Some(inner) = self.bindings.resolve_namespace_export(module, &name)
-                && seen.insert(inner.clone())
+            match self
+                .bindings
+                .resolve_namespace_export_bounded(module, &name)
             {
-                for binding in self.published(&inner, seen) {
-                    published.push(PublishedBinding {
-                        published: name.clone(),
-                        ..binding
-                    });
+                Lookup::Found(inner) if seen.insert(inner.clone()) => {
+                    for binding in self.published(&inner, seen)? {
+                        published.push(PublishedBinding {
+                            published: name.clone(),
+                            ..binding
+                        });
+                    }
                 }
+                Lookup::Capped => return None,
+                _ => {}
             }
         }
-        published
+        Some(published)
     }
 
     /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export
@@ -1378,11 +1446,12 @@ mod tests {
 
         // The index production builds for this pass, aliases included.
         let workspace = WorkspaceIndex::build_with_aliases(&root, None);
-        let mut bindings_wanted: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
+        let mut bindings_wanted: HashMap<PathBuf, BindingsWanted> = HashMap::new();
         for (file, local) in wanted {
             bindings_wanted
                 .entry(root.join(file))
                 .or_default()
+                .locals
                 .insert(local.to_string());
         }
         let resolution = resolve_call_edges(

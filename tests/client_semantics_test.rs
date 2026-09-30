@@ -672,6 +672,18 @@ async fn an_imported_instance_states_the_joined_row_at_each_call() {
             .all(|row| row.library_semantics.is_empty()),
         "{rows:#?}"
     );
+
+    // A base that names a binding (`config.apiUrl`, from the declaring
+    // module's own import) is read in the declaring module's scope only. The
+    // importer binds a `config` of its own, and a row stated there would be
+    // read with the importer's environment variable: the call reads as it
+    // does without the semantics instead.
+    let at = |rows: &[DataFetchingCall]| rendered(rows_at(rows, "src/i5-own-config.ts", 5));
+    assert_eq!(at(&rows), at(&without), "{rows:#?}");
+    for row in rows_at(&rows, "src/i5-own-config.ts", 5) {
+        assert!(row.library_semantics.is_empty(), "{row:#?}");
+        assert!(!row.target_url.contains("BILLING"), "{row:#?}");
+    }
 }
 
 /// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a

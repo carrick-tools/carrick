@@ -123,6 +123,20 @@ pub struct BindingResolver {
     /// deterministic rows, reads them — the same split `new` and
     /// `with_workspace` already make for hops (carrick#1353).
     commonjs: bool,
+    /// Set when a walk stopped at [`MAX_HOPS`] or [`MAX_VISITS`] rather than
+    /// at an answer: what it looked for may exist beyond the cap. Read by the
+    /// `*_bounded` lookups, which reset it first (carrick#1568).
+    capped: bool,
+}
+
+/// What a bounded lookup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup<T> {
+    Found(T),
+    /// The walk ended without it.
+    Absent,
+    /// The walk stopped at a cap before it could say.
+    Capped,
 }
 
 impl Default for BindingResolver {
@@ -144,6 +158,7 @@ impl BindingResolver {
             exports: HashMap::new(),
             workspace: None,
             commonjs: false,
+            capped: false,
         }
     }
 
@@ -306,6 +321,7 @@ impl BindingResolver {
         names: &mut Vec<String>,
     ) {
         if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            self.capped = true;
             return;
         }
         let Some(exports) = self.exports_of(&file) else {
@@ -344,6 +360,7 @@ impl BindingResolver {
         visited: &mut HashSet<PathBuf>,
     ) -> Option<ResolvedBinding> {
         if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            self.capped = true;
             return None;
         }
 
@@ -403,6 +420,44 @@ impl BindingResolver {
         self.follow_namespace(file.to_path_buf(), export_name.to_string(), 0, &mut visited)
     }
 
+    /// [`resolve_export`](Self::resolve_export), telling a walk that ended
+    /// without the binding from one a cap stopped (carrick#1568).
+    pub fn resolve_export_bounded(
+        &mut self,
+        file: &Path,
+        export_name: &str,
+    ) -> Lookup<ResolvedBinding> {
+        self.capped = false;
+        match self.follow(file, export_name) {
+            Some(found) => Lookup::Found(found),
+            None if self.capped => Lookup::Capped,
+            None => Lookup::Absent,
+        }
+    }
+
+    /// [`resolve_namespace_export`](Self::resolve_namespace_export), telling
+    /// the two ways of finding nothing apart.
+    pub fn resolve_namespace_export_bounded(
+        &mut self,
+        file: &Path,
+        export_name: &str,
+    ) -> Lookup<PathBuf> {
+        self.capped = false;
+        match self.resolve_namespace_export(file, export_name) {
+            Some(found) => Lookup::Found(found),
+            None if self.capped => Lookup::Capped,
+            None => Lookup::Absent,
+        }
+    }
+
+    /// [`export_names`](Self::export_names), or `None` when a cap stopped
+    /// the walk before it listed everything.
+    pub fn export_names_bounded(&mut self, file: &Path) -> Option<Vec<String>> {
+        self.capped = false;
+        let names = self.export_names(file);
+        (!self.capped).then_some(names)
+    }
+
     fn follow_namespace(
         &mut self,
         file: PathBuf,
@@ -411,6 +466,7 @@ impl BindingResolver {
         visited: &mut HashSet<PathBuf>,
     ) -> Option<PathBuf> {
         if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            self.capped = true;
             return None;
         }
         let exports = self.exports_of(&file)?;

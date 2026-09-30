@@ -86,7 +86,13 @@ pub fn require_bindings(module: &Module) -> RequireBindings {
 
     for item in &module.body {
         match item {
-            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => {
+            // `export const { api } = require("./api")` binds as the plain
+            // declaration does (carrick#1568).
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var)))
+            | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+                decl: Decl::Var(var),
+                ..
+            })) => {
                 for declarator in &var.decls {
                     let Some(init) = declarator.init.as_deref() else {
                         continue;

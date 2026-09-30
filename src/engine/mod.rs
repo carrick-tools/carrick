@@ -5857,7 +5857,7 @@ fn discover_files_and_symbols(
     let mut request_irs: HashMap<PathBuf, crate::request_summary::FileIr> = HashMap::new();
     // The imports those summaries read the value of, per file keyed like
     // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
-    let mut bindings_wanted: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
+    let mut bindings_wanted: HashMap<PathBuf, crate::call_graph::BindingsWanted> = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
@@ -5891,7 +5891,7 @@ fn discover_files_and_symbols(
             let canonical = file_path
                 .canonicalize()
                 .unwrap_or_else(|_| file_path.clone());
-            bindings_wanted.insert(canonical.clone(), request_ir.imports_read());
+            bindings_wanted.insert(canonical.clone(), request_ir.bindings_wanted());
             request_irs.insert(file_path.clone(), request_ir);
             per_file_calls.insert(
                 canonical,
@@ -12408,6 +12408,362 @@ mod tests {
             let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
             assert!(rows.is_empty(), "{file}: {rows:#?}");
         }
+    }
+
+    /// A module that builds an instance for others to import, and one that
+    /// imports it and calls it, under `dir`.
+    fn api_and_reader(dir: &str, base: &str) -> [(String, String); 2] {
+        [
+            (
+                format!("src/{dir}/api.ts"),
+                format!(
+                    "import http from \"@fixture/http\";\n\
+                     export const api = http.create({{ baseURL: \"{base}\" }});\n\
+                     export function own() {{ return api.get(\"/own\"); }}\n"
+                ),
+            ),
+            (
+                format!("src/{dir}/reader.ts"),
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n"
+                    .to_string(),
+            ),
+        ]
+    }
+
+    /// Discovery over `files`, owned strings.
+    fn discover_owned(files: &[(String, String)]) -> (tempfile::TempDir, FileDiscovery) {
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        discover_sources(&borrowed)
+    }
+
+    /// carrick#1568 fix round 1, F2: a module loaded other than through an
+    /// import binding may do anything to what it publishes, so every client
+    /// it publishes reads nothing, in its own module and in every importer:
+    /// `import()` inside a function or chained, `require` inline, inside a
+    /// function, bound by `let`, `var` or `export const`, a no-hole template
+    /// specifier, and a `require` a factory made (`req("./api")`). A
+    /// specifier the source computes names no module and contests nothing,
+    /// a stated limit.
+    #[test]
+    fn a_module_loaded_other_than_by_an_import_binding_contests_what_it_publishes() {
+        let loaders: [(&str, &str); 8] = [
+            (
+                "g01",
+                "export async function boot() {\n  const m = await import(\"./api\");\n  (m.api as any).defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+            (
+                "g02",
+                "import(\"./api\").then((m) => { (m.api as any).defaults.baseURL = \"https://elsewhere.example\"; });\nexport {};\n",
+            ),
+            (
+                "g03",
+                "declare const require: (s: string) => any;\nrequire(\"./api\").api.defaults.baseURL = \"https://elsewhere.example\";\nexport {};\n",
+            ),
+            (
+                "g04",
+                "declare const require: (s: string) => any;\nexport function setup() {\n  const { api } = require(\"./api\");\n  api.defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+            (
+                "g35",
+                "let { api } = require(\"./api\");\napi.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g36",
+                "var m = require(\"./api\");\nm.api.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g37",
+                "declare const require: (s: string) => any;\nexport const { api } = require(\"./api\");\napi.defaults.baseURL = \"https://elsewhere.example\";\n",
+            ),
+            (
+                "g41",
+                "export async function boot() {\n  const { api } = await import(`./api`);\n  api.defaults.baseURL = \"https://elsewhere.example\";\n}\n",
+            ),
+        ];
+        let mut files: Vec<(String, String)> = Vec::new();
+        for (dir, boot) in loaders {
+            files.extend(api_and_reader(dir, &format!("/{dir}")));
+            let extension = if dir == "g35" || dir == "g36" {
+                "js"
+            } else {
+                "ts"
+            };
+            files.push((format!("src/{dir}/boot.{extension}"), boot.to_string()));
+        }
+        files.extend(api_and_reader("g42", "/g42"));
+        files.push((
+            "src/g42/boot.ts".to_string(),
+            "import { createRequire } from \"module\";\nconst req = createRequire(import.meta.url);\nreq(\"./api\").api.defaults.baseURL = \"https://elsewhere.example\";\n".to_string(),
+        ));
+        // Bound by `let` and only called through: its uses are followed like
+        // an import's, so it takes nothing away.
+        files.extend(api_and_reader("letcalls", "/letcalls"));
+        files.push((
+            "src/letcalls/boot.js".to_string(),
+            "let { api } = require(\"./api\");\napi.get(\"/boot\");\n".to_string(),
+        ));
+        files.extend(api_and_reader("computed", "/computed"));
+        files.push((
+            "src/computed/boot.ts".to_string(),
+            "export async function boot(name: string) {\n  const m = await import(name);\n  m.api.defaults.baseURL = \"https://elsewhere.example\";\n}\n".to_string(),
+        ));
+        let (dir, discovery) = discover_owned(&files);
+        for case in [
+            "g01", "g02", "g03", "g04", "g35", "g36", "g37", "g41", "g42",
+        ] {
+            for file in ["api", "reader"] {
+                let path = format!("src/{case}/{file}.ts");
+                let rows = library_rows_of(&dir, &discovery, &path, &verified_sample());
+                assert!(rows.is_empty(), "{path}: {rows:#?}");
+            }
+        }
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/computed/reader.ts"),
+            stated(&[(2, "GET", "/computed/read")]),
+            "a computed specifier names no module (a stated limit)"
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/letcalls/reader.ts"),
+            stated(&[(2, "GET", "/letcalls/read")]),
+            "a require bound by `let` and only called through changes nothing"
+        );
+    }
+
+    /// carrick#1568 fix round 1, F2: where the resolver stops at a cap
+    /// before it can say what a use names (a re-export chain past its hop
+    /// limit, a module re-exporting a binding it imports past this pass's
+    /// own limit, an `export *` fan-out past its visit limit), the use may be
+    /// of any instance, so no import in the service reads through one. The
+    /// declaring modules still read their own calls, as they did before any
+    /// import was followed.
+    #[test]
+    fn a_use_the_resolver_cannot_follow_turns_imported_reading_off() {
+        let chain = |dir: &str, hop: &dyn Fn(usize) -> String| -> Vec<(String, String)> {
+            let mut files: Vec<(String, String)> = api_and_reader(dir, &format!("/{dir}")).into();
+            for n in 1..=10 {
+                files.push((format!("src/{dir}/h{n}.ts"), hop(n)));
+            }
+            files.push((
+                format!("src/{dir}/boot.ts"),
+                "import { api } from \"./h10\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n".to_string(),
+            ));
+            files
+        };
+        let from = |n: usize| {
+            if n == 1 {
+                "./api".to_string()
+            } else {
+                format!("./h{}", n - 1)
+            }
+        };
+        let forwarded = chain("g10", &|n| {
+            format!("export {{ api }} from \"{}\";\n", from(n))
+        });
+        let reexported = chain("g11", &|n| {
+            format!(
+                "import {{ api }} from \"{}\";\nexport {{ api }};\n",
+                from(n)
+            )
+        });
+        // A default import takes the value walk alone, with no namespace
+        // probe ahead of it.
+        let mut defaulted: Vec<(String, String)> = api_and_reader("g10d", "/g10d").into();
+        for n in 1..=10 {
+            let hop = if n == 1 {
+                "export { api as default } from \"./api\";\n".to_string()
+            } else {
+                format!("export {{ default }} from \"./h{}\";\n", n - 1)
+            };
+            defaulted.push((format!("src/g10d/h{n}.ts"), hop));
+        }
+        defaulted.push((
+            "src/g10d/boot.ts".to_string(),
+            "import api from \"./h10\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n"
+                .to_string(),
+        ));
+        let mut fanned: Vec<(String, String)> = api_and_reader("g13", "/g13").into();
+        let mut index = String::new();
+        for n in 0..70 {
+            fanned.push((
+                format!("src/g13/f{n}.ts"),
+                format!("export const v{n} = {n};\n"),
+            ));
+            index.push_str(&format!("export * from \"./f{n}\";\n"));
+        }
+        index.push_str("export * from \"./api\";\n");
+        fanned.push(("src/g13/index.ts".to_string(), index));
+        let with_boot = |boot: &str| -> Vec<(String, String)> {
+            let mut files = fanned.clone();
+            files.push(("src/g13/boot.ts".to_string(), boot.to_string()));
+            files
+        };
+        let named = with_boot(
+            "import { api } from \"./index\";\n(api as any).defaults.baseURL = \"https://elsewhere.example\";\n",
+        );
+        let namespace = with_boot(
+            "import * as all from \"./index\";\n(all as any).api.defaults.baseURL = \"https://elsewhere.example\";\n",
+        );
+        let loaded = with_boot(
+            "import(\"./index\").then((m: any) => { m.api.defaults.baseURL = \"https://elsewhere.example\"; });\nexport {};\n",
+        );
+        for (case, mut files) in [
+            ("g10", forwarded),
+            ("g10d", defaulted),
+            ("g11", reexported),
+            ("g13", named),
+            ("g13", namespace),
+            ("g13", loaded),
+        ] {
+            // A clean importer beside it, in the same service.
+            files.extend(api_and_reader("clean", "/clean"));
+            let (dir, discovery) = discover_owned(&files);
+            for reader in [
+                format!("src/{case}/reader.ts"),
+                "src/clean/reader.ts".to_string(),
+            ] {
+                let rows = library_rows_of(&dir, &discovery, &reader, &verified_sample());
+                assert!(rows.is_empty(), "{case}: {reader}: {rows:#?}");
+            }
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/clean/api.ts"),
+                stated(&[(3, "GET", "/clean/own")]),
+                "{case}: a declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 1, F1: a row stated in an importing module
+    /// joins a base read in the declaring module's scope only where every
+    /// piece means the same in both: text the source writes, or an
+    /// environment read. A base naming a binding (an imported config, an
+    /// imported constant) would be read by the passes after this one as
+    /// whatever the importer binds to that name.
+    #[test]
+    fn an_imported_instance_states_only_a_base_that_means_the_same_in_the_importer() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/q06/config.ts",
+                "export const config = { apiUrl: process.env.ORDERS_API_URL };\n",
+            ),
+            (
+                "src/q06/feature-config.ts",
+                "export const config = { apiUrl: process.env.BILLING_API_URL };\n",
+            ),
+            (
+                "src/q06/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { config } from \"./config\";\n\
+                 export const api = http.create({ baseURL: config.apiUrl });\n\
+                 export function own() { return api.get(\"/own\"); }\n",
+            ),
+            (
+                "src/q06/reader.ts",
+                "import { api } from \"./api\";\n\
+                 import { config } from \"./feature-config\";\n\
+                 export const c = config;\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            ("src/q01/config.ts", "export const BASE = \"/q01right\";\n"),
+            (
+                "src/q01/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 import { BASE } from \"./config\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q01/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            (
+                "src/q04/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 const BASE = \"/q04right\";\n\
+                 export const api = http.create({ baseURL: BASE });\n",
+            ),
+            (
+                "src/q04/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+            (
+                "src/p12/api.ts",
+                "import http from \"@fixture/http\";\n\
+                 export const api = http.create({ baseURL: process.env.P12_URL });\n",
+            ),
+            (
+                "src/p12/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+        ]);
+        for file in ["src/q06/reader.ts", "src/q01/reader.ts"] {
+            let rows = library_rows_of(&dir, &discovery, file, &verified_sample());
+            assert!(rows.is_empty(), "{file}: {rows:#?}");
+        }
+        assert_eq!(
+            library_rows_of(&dir, &discovery, "src/q06/api.ts", &verified_sample())
+                .iter()
+                .map(|row| row.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["${config.apiUrl}/own"],
+            "the declaring module states its own base, which its own scope reads"
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/q04/reader.ts"),
+            stated(&[(2, "GET", "/q04right/read")])
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/p12/reader.ts"),
+            stated(&[(2, "GET", "${process.env.P12_URL}/read")])
+        );
+    }
+
+    /// carrick#1568 fix round 1, F3 and the type-position gap: a named
+    /// function expression's own name is a declaration of that name, so the
+    /// import is no client in that file; and a type literal's key named like
+    /// the import is no use of it, so it takes nothing away anywhere.
+    #[test]
+    fn a_function_expression_name_shadows_and_a_type_key_does_not_use() {
+        let (dir, discovery) = discover_sources(&[
+            ("src/p08/api.ts", SHARED_API),
+            (
+                "src/p08/shadow.ts",
+                "import { api } from \"./api\";\n\
+                 export function mk() {\n\
+                 \x20 const h = function api(): unknown {\n\
+                 \x20   // @ts-expect-error the function has no get\n\
+                 \x20   return api.get(\"/fnexpr\");\n\
+                 \x20 };\n\
+                 \x20 return h();\n\
+                 }\n",
+            ),
+            ("src/v02/api.ts", SHARED_API),
+            (
+                "src/v02/shadow.ts",
+                "import { api } from \"./api\";\n\
+                 export const f = ({ api }: { api: { get(p: string): string } }): unknown => api.get(\"/destructured\");\n",
+            ),
+            (
+                "src/v02/reader.ts",
+                "import { api } from \"./api\";\n\
+                 export function r() { return api.get(\"/read\"); }\n",
+            ),
+        ]);
+        let rows = library_rows_of(&dir, &discovery, "src/p08/shadow.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/v02/reader.ts"),
+            stated(&[(2, "GET", "/api/v1/read")])
+        );
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/v02/api.ts"),
+            stated(&[(5, "GET", "/api/v1/health")])
+        );
     }
 
     /// carrick#1564 re-review, R2: a spread of a constant puts in place

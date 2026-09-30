@@ -59,7 +59,10 @@ The sources:
   `src/i2-orders.ts` import `api` and call a verb each; `src/i4-barrel.ts`
   imports `api` renamed and `svc` through the barrel, and `svc` directly as a
   default; `src/i3-shadowed.ts` imports `api` and declares the name again in a
-  function, as a `Map`.
+  function, as a `Map`. `shared/configured.ts` builds an instance whose base
+  is `config.apiUrl`, from the `config` that `shared/config.ts` exports, and
+  `src/i5-own-config.ts` calls it while binding a `config` of its own
+  (`i5-config.ts`, another environment variable).
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -72,7 +75,7 @@ carrick#1564, byte for byte. The cloud holds the same bytes.
 
 The `analyze-file` answers are wrong the way a model's are for these calls:
 the verb the method name suggests, the path with no base, no body. The
-importing modules (`i1`, `i2`, `i3`, `i4`) have answers of their own, so a row
+importing modules (`i1` to `i5`) have answers of their own, so a row
 read through an imported instance is proven to claim its site over the
 model's. Nothing a
 test asserts about a stated row can come from them; where a site must read as
@@ -144,6 +147,7 @@ the reading cannot see:
 | `r7-interceptor.ts:6` | `GET /interceptor`, `receiver_type` |
 | `i3-shadowed.ts:5` | none: the name is a `Map` there |
 | `i3-shadowed.ts:8` | `GET /unshadowed`, the model's: a file declaring the imported name again reads no call through it |
+| `i5-own-config.ts:5` | `GET /read`, the model's: a base that names a binding is read in its own module only |
 
 `n9-phase1-fetch.ts` has no library in it. Its request summaries state `POST
 /api/f2` at line 10 (the method written after the spread) and `GET /api/f5`
