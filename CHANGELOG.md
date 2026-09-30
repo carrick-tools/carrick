@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.99](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.98...carrick-v0.3.99) (2026-09-30)
+
+
+### Bug Fixes
+
+* **init:** ask for one scaffold call with every repo in `repos` ([#1614](https://github.com/carrick-tools/carrick/issues/1614)) ([d61ced6](https://github.com/carrick-tools/carrick/commit/d61ced60d0a9c91d2a15abad941b6c4e8a6d0753))
+* **scanner:** wrapper_call_method no longer reads a GET from a spread or a payload bag ([#1625](https://github.com/carrick-tools/carrick/issues/1625)) ([8318b2f](https://github.com/carrick-tools/carrick/commit/8318b2f531c0839d14dbcfe6ee81adfb8dbe4462))
+* **sidecar:** follow a bundled symbol through the barrel it is named from ([#1623](https://github.com/carrick-tools/carrick/issues/1623)) ([03e0550](https://github.com/carrick-tools/carrick/commit/03e0550186b8839ff8be16dfd476c67029652e3f))
+* **sidecar:** resolve each import in its file's own module format ([#1628](https://github.com/carrick-tools/carrick/issues/1628)) ([f46ddf6](https://github.com/carrick-tools/carrick/commit/f46ddf64358b3bb1c61a1a4f3f55e4727efa7b83))
+* **sidecar:** type a solution tsconfig's service under the project that includes it ([#1622](https://github.com/carrick-tools/carrick/issues/1622)) ([fae4b54](https://github.com/carrick-tools/carrick/commit/fae4b54876c7f56552f15e804a5d5c72d84f8424))
+
 ## [0.3.98](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.97...carrick-v0.3.98) (2026-09-30)
 
 
