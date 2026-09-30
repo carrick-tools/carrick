@@ -85,14 +85,23 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   resolver stops at one of its limits before it can say what an import or a
   load names (a re-export chain or an `export *` fan-out too long to walk),
   the use may be of any instance, so no import in the service reads through
-  one. Each declaring module still reads its own calls.
+  one. The same holds for an import whose specifier resolves to no file (an
+  alias no config the scan reads maps, a mapping whose target is missing, an
+  undeclared package) when the file writes through it, hands it on, reads a
+  member of it without calling it, or calls it by a computed key, and for
+  `import()` or `require` of such a specifier. A runtime builtin (`fs`,
+  `node:fs`) and a package the manifests declare are never such an import,
+  and a call through one by name takes nothing away. Each declaring module
+  still reads its own calls.
 - **A base read in another module** is stated at an importer only where
   every piece of it means the same there: text the source writes, or an
   environment read (`process.env.API_URL`). A base that names a binding (an
   imported constant, `config.apiUrl`) is read in the declaring module's scope
   and nowhere else, so the importer's call reads as it does without the
   semantics. The same holds for a declaring module's request stated at a
-  caller in another module.
+  caller in another module. Such a row describes its base (the default an
+  environment variable falls back to, and whether that is a loopback URL)
+  from the declaring module's own declarations, never the importer's.
 - **The base** is the factory options' value at the verified key, joined to
   the path with exactly one slash. A path that is an absolute URL ignores
   it. An empty base is no base, and a base holding `?` or `#` states no URL.
@@ -169,7 +178,16 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   files, is read only in its own module. A package's export re-exported
   through a module of the service (`export { default as http } from "pkg"`)
   is not read as the package's client in the modules that import it from
-  there. An importer states no row for a base that names a binding.
+  there.
+- In a repo whose aliases the scan does not resolve (the Vite layout, whose
+  `tsconfig.json` only `references` the project that declares `paths`,
+  carrick#1595, or an alias only a bundler config declares), a use that
+  could take a client away through such an alias turns imported reading off
+  for the service. The service then reads as it did before imports were
+  followed. A call by name through an unresolved import, including a member
+  its verified surface does not name, is not seen.
+- An importer states no row for an instance whose base names a binding
+  (carrick#1596).
 - Uses the scan does not read are not seen: a module outside the service's
   directory, one under a test or fixture path the scan skips, one with an
   extension it does not read (`.mjs`, `.mts`), one that fails to parse, and a

@@ -1845,6 +1845,7 @@ impl FileOrchestrator {
                             // Its request summaries are emitted once they are
                             // composed ([`LateSummaryFile`]).
                             &BTreeMap::new(),
+                            &EnvSchemaIndex::default(),
                         ),
                         &mut stats.deterministic_rows_emitted,
                     );
@@ -2789,6 +2790,7 @@ impl FileOrchestrator {
                     &[],
                     &HashMap::new(),
                     summary_rows,
+                    &env_schema,
                 ),
                 &mut stats.deterministic_rows_emitted,
             );
@@ -2816,6 +2818,7 @@ impl FileOrchestrator {
                 &pf.decorator_endpoints,
                 receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
                 summaries.rows(file).unwrap_or(&no_summary_rows),
+                &env_schema,
             );
         }
 
@@ -6039,6 +6042,9 @@ impl FileOrchestrator {
         // (carrick#1555), keyed by span start. A site may reach more than
         // one request.
         summary_rows: &BTreeMap<u32, Vec<SummaryRow>>,
+        // What the service's validation schemas declare about each env var,
+        // for a summary row whose base another module's scope describes.
+        env_schema: &EnvSchemaIndex,
     ) -> Vec<Resolved> {
         // Keyed by the span START, which is the join key: a chained call
         // (`client.cancelRun(id).catch(fn)`) raises a candidate per link and
@@ -6098,13 +6104,13 @@ impl FileOrchestrator {
                 summary_own_sites.push((
                     *start,
                     rows.iter()
-                        .map(|row| Self::summary_resolved(row, candidate))
+                        .map(|row| Self::summary_resolved(row, candidate, env_schema))
                         .collect(),
                 ));
                 continue;
             }
             for (index, row) in rows.iter().enumerate() {
-                let resolved = Self::summary_resolved(row, candidate);
+                let resolved = Self::summary_resolved(row, candidate, env_schema);
                 if index == 0 {
                     claim(resolved);
                 } else {
@@ -6489,7 +6495,16 @@ impl FileOrchestrator {
     /// Candidate-backed where the scanner raised a candidate at the site, so
     /// the model's answer joins onto it by the same id; otherwise keyed by the
     /// site's own span, exactly as a same-file wrapper site is.
-    fn summary_resolved(row: &SummaryRow, candidate: Option<&CandidateTarget>) -> Resolved {
+    ///
+    /// A row whose base another module's scope read (carrick#1568) carries
+    /// that module's defaults, and its base is stated from them here, as
+    /// that module's own rows state it: [`Self::stamp_call_bases`] leaves a
+    /// stated base alone, so the file the row sits in never describes it.
+    fn summary_resolved(
+        row: &SummaryRow,
+        candidate: Option<&CandidateTarget>,
+        env_schema: &EnvSchemaIndex,
+    ) -> Resolved {
         let line = i32::try_from(row.line).unwrap_or(i32::MAX);
         let candidate_id = candidate
             .map(|candidate| candidate.candidate_id.clone())
@@ -6518,7 +6533,14 @@ impl FileOrchestrator {
                 primary_type_symbol: None,
                 type_import_source: None,
                 loopback_default_url: None,
-                base: None,
+                base: row.base_fallbacks.as_ref().and_then(|fallbacks| {
+                    resolve_call_base(
+                        &row.target,
+                        &EnvAliasMap::new(),
+                        &fallbacks.clone().into_iter().collect(),
+                        env_schema,
+                    )
+                }),
                 consumers_not_resolved: None,
                 // Settled once the field the target dispatches on is known:
                 // at the join, from the model's reading of which field that
@@ -15961,6 +15983,7 @@ export { routes };
             &[],
             receiver_roles,
             &BTreeMap::new(),
+            &EnvSchemaIndex::default(),
         );
         let mut result = FileAnalysisResult::default();
         let overrules = FileOrchestrator::emit_resolved_rows(

@@ -12636,6 +12636,126 @@ mod tests {
         }
     }
 
+    /// carrick#1568 fix round 2, W1: an import the scan cannot follow to a
+    /// file may name an instance under an alias it does not know. A use of
+    /// one that would take a client away turns imported reading off: a
+    /// tsconfig whose `paths` sit in a referenced project, a bundler-only
+    /// alias in a `.js` file, an alias nothing maps, a computed call through
+    /// one, and a `require` or `import()` of one. Each declaring module still
+    /// reads its own calls.
+    #[test]
+    fn a_use_through_an_import_the_scan_cannot_follow_turns_imported_reading_off() {
+        let write = "(api as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: [(&str, Vec<(String, String)>); 6] = [
+            (
+                "re-exported",
+                vec![
+                    (
+                        "src/w/barrel.ts".to_string(),
+                        "import { api } from \"@/w/api\";\nexport { api };\n".to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!("import {{ api }} from \"./barrel\";\n{write}"),
+                    ),
+                ],
+            ),
+            (
+                "references",
+                vec![
+                    (
+                        "tsconfig.json".to_string(),
+                        "{ \"files\": [], \"references\": [{ \"path\": \"./tsconfig.app.json\" }] }\n"
+                            .to_string(),
+                    ),
+                    (
+                        "tsconfig.app.json".to_string(),
+                        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } }, \"include\": [\"src\"] }\n"
+                            .to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!("import {{ api }} from \"@/w/api\";\n{write}"),
+                    ),
+                ],
+            ),
+            (
+                "bundler alias",
+                vec![(
+                    "src/w/boot.js".to_string(),
+                    "import { api } from \"~w/api\";\napi.defaults.baseURL = \"x\";\n".to_string(),
+                )],
+            ),
+            (
+                "unmapped alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("import {{ api }} from \"@/w/api\";\n{write}"),
+                )],
+            ),
+            (
+                "computed call",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\ndeclare const name: string;\n(api as any)[name]();\n"
+                        .to_string(),
+                )],
+            ),
+            (
+                "load",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("export async function boot() {{\n  const {{ api }} = await import(\"@/w/api\");\n  {write}}}\n"),
+                )],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            let rows = library_rows_of(&dir, &discovery, "src/w/reader.ts", &verified_sample());
+            assert!(rows.is_empty(), "{case}: {rows:#?}");
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/w/api.ts"),
+                stated(&[(3, "GET", "/w/own")]),
+                "{case}: the declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 2, W1: what an unfollowable import cannot
+    /// reach. A call through one by name takes nothing away, and neither does
+    /// any use of a runtime builtin or a declared package, a relative
+    /// specifier handed to a call that names no module, or an alias nothing
+    /// maps that is only called through.
+    #[test]
+    fn an_unfollowable_import_used_only_by_calls_or_naming_the_runtime_takes_nothing_away() {
+        let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+        files.push((
+            "package.json".to_string(),
+            "{ \"name\": \"w\", \"dependencies\": { \"declared-pkg\": \"^1.0.0\" } }\n".to_string(),
+        ));
+        files.push((
+            "src/w/boot.ts".to_string(),
+            "import { api } from \"@/w/api\";\n\
+             import { EventEmitter } from \"events\";\n\
+             import fs from \"node:fs\";\n\
+             import { promises } from \"fs/promises\";\n\
+             import * as declared from \"declared-pkg\";\n\
+             declare function serve(dir: string): void;\n\
+             export class Bus extends EventEmitter {}\n\
+             export const read = [fs.readFileSync, promises, declared.thing];\n\
+             serve(\"./public\");\n\
+             export function boot() { return api.get(\"/boot\"); }\n"
+                .to_string(),
+        ));
+        let (dir, discovery) = discover_owned(&files);
+        assert_eq!(
+            library_stated(&dir, &discovery, "src/w/reader.ts"),
+            stated(&[(2, "GET", "/w/read")])
+        );
+    }
+
     /// carrick#1568 fix round 1, F1: a row stated in an importing module
     /// joins a base read in the declaring module's scope only where every
     /// piece means the same in both: text the source writes, or an

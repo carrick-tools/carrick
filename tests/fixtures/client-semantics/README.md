@@ -62,7 +62,10 @@ The sources:
   function, as a `Map`. `shared/configured.ts` builds an instance whose base
   is `config.apiUrl`, from the `config` that `shared/config.ts` exports, and
   `src/i5-own-config.ts` calls it while binding a `config` of its own
-  (`i5-config.ts`, another environment variable).
+  (`i5-config.ts`, another environment variable). `shared/env-api.ts` builds
+  one on an environment read with a default of its own, and
+  `src/i6-env-fallback.ts` calls it while declaring a loopback default for the
+  same variable.
 
 `variants/http-without-base-key.d.ts` is `@fixture/http` as a release whose
 `create` takes `baseUrl`. The tests install it over the vendored declaration
@@ -75,7 +78,7 @@ carrick#1564, byte for byte. The cloud holds the same bytes.
 
 The `analyze-file` answers are wrong the way a model's are for these calls:
 the verb the method name suggests, the path with no base, no body. The
-importing modules (`i1` to `i5`) have answers of their own, so a row
+importing modules (`i1` to `i6`, and `env-api.ts`) have answers of their own, so a row
 read through an imported instance is proven to claim its site over the
 model's. Nothing a
 test asserts about a stated row can come from them; where a site must read as
@@ -109,6 +112,8 @@ With the vendored declarations, through the real type sidecar:
 | `i4-barrel.ts:4` | `GET /shared/v1/renamed` | factory, `verb:get` |
 | `i4-barrel.ts:5` | `GET /svc/barrel-default` | factory, `verb:get` |
 | `i4-barrel.ts:6` | `GET /svc/default` | factory, `verb:get` |
+| `shared/env-api.ts:5` | `GET ${process.env.SHARED_API_URL}/own` | factory, `verb:get` |
+| `i6-env-fallback.ts:5` | `GET ${process.env.SHARED_API_URL}/read`, its base described as `env-api.ts:5` describes it (default `https://shared.example`, not a loopback URL) | factory, `verb:get` |
 
 Every row above is `request_summary` and carries `library_semantics`.
 

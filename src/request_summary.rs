@@ -419,7 +419,12 @@ pub struct FileIr {
     imported: HashMap<String, BindingUse>,
     /// The modules the file loads other than through an import binding
     /// ([`module_loads`]): everything each publishes may be changed here.
-    loads: BTreeSet<String>,
+    loads: BTreeMap<String, LoadForm>,
+    /// The `??`/`||` defaults this module's environment reads are declared
+    /// with ([`crate::env_alias::UrlBindings::env_fallbacks`]), kept for a
+    /// module that holds a client: a row another module states through it
+    /// describes its base with them, as this module's own rows do.
+    env_fallbacks: BTreeMap<String, String>,
     /// The file names `module.exports` or `exports`. What it publishes that
     /// way is read only at module level, last write winning
     /// ([`crate::commonjs::export_assignments`]), so a write anywhere else can
@@ -434,7 +439,7 @@ impl FileIr {
     pub fn bindings_wanted(&self) -> BindingsWanted {
         BindingsWanted {
             locals: self.imported.keys().cloned().collect(),
-            loads: self.loads.clone(),
+            loads: self.loads.keys().cloned().collect(),
         }
     }
 }
@@ -599,6 +604,15 @@ pub fn extract_file_ir(
                 _ => {}
             }
         }
+    }
+    // What a row stated in another module needs to say about a client's
+    // base the way this module's own rows say it (carrick#1568). Any file
+    // that imports a package's client may build one.
+    if !module_scope.receivers.is_empty() || !file.module_clients.is_empty() {
+        file.env_fallbacks = crate::env_alias::EnvAliasExtractor::build_bindings(module)
+            .env_fallbacks
+            .into_iter()
+            .collect();
     }
     file
 }
@@ -1329,10 +1343,10 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
 ///
 /// A specifier the source computes (`import(name)`, a template with a hole)
 /// names no module and is not here.
-fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeMap<String, LoadForm> {
     struct Loads<'a> {
         bound_requires: &'a HashSet<u32>,
-        found: BTreeSet<String>,
+        found: BTreeMap<String, LoadForm>,
     }
     impl Visit for Loads<'_> {
         fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -1346,8 +1360,18 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
                     if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
                 let bound = require && self.bound_requires.contains(&call.span.lo.0);
                 let relative = specifier.starts_with("./") || specifier.starts_with("../");
-                if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
-                    self.found.insert(specifier);
+                let form = if matches!(call.callee, Callee::Import(_)) || require {
+                    Some(LoadForm::Named)
+                } else {
+                    relative.then_some(LoadForm::RelativeArgument)
+                };
+                if let Some(form) = form
+                    && !bound
+                {
+                    let held = self.found.entry(specifier).or_insert(form);
+                    if form == LoadForm::Named {
+                        *held = LoadForm::Named;
+                    }
                 }
             }
             call.visit_children_with(self);
@@ -1355,10 +1379,21 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
     }
     let mut loads = Loads {
         bound_requires,
-        found: BTreeSet::new(),
+        found: BTreeMap::new(),
     };
     module.visit_with(&mut loads);
     loads.found
+}
+
+/// How a file loads a module other than through an import binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadForm {
+    /// `import("./m")`, `require("./m")`: the specifier names a module.
+    Named,
+    /// Any other call handed a relative specifier (`req("./m")`), which names
+    /// a module only when one is there: `express.static("./public")` hands a
+    /// directory.
+    RelativeArgument,
 }
 
 /// A string literal, or a template with no hole in it.
@@ -3077,6 +3112,11 @@ pub struct SummaryRow {
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), sorted. Empty on every other row.
     pub library_semantics: Vec<String>,
+    /// For a row whose base was read in another module's scope (carrick#1568):
+    /// that module's environment-read defaults, which describe the base as
+    /// that module's own rows describe it. The file the row sits in has
+    /// defaults of its own that say nothing about this base.
+    pub base_fallbacks: Option<BTreeMap<String, String>>,
 }
 
 /// What the summaries are composed from, as discovery leaves it: every
@@ -3133,6 +3173,8 @@ enum Declared {
     Nothing,
     /// A cap stopped the walk.
     Unfollowable,
+    /// A module on the way re-exports an import nothing resolves.
+    Unresolved,
 }
 
 impl LinkedClients {
@@ -3161,28 +3203,48 @@ impl LinkedClients {
                             }
                             Declared::Nothing => {}
                             Declared::Unfollowable => linked.unfollowable = true,
+                            Declared::Unresolved => linked.unresolved_use(used),
                         }
                     }
                     Some(ImportedBinding::Module(published)) => {
                         linked.merge_namespace(files, bindings, published, used);
                     }
                     Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
+                    Some(ImportedBinding::Unresolved) => linked.unresolved_use(used),
                     None => {}
                 }
             }
             // A module loaded some other way: nothing says what is done with
             // it, so every client it publishes is taken as changed.
-            for specifier in &ir.loads {
+            for (specifier, form) in &ir.loads {
                 match bindings.load(file, specifier) {
                     Some(ImportedBinding::Module(published)) => {
                         linked.contest_published(files, bindings, published);
                     }
                     Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
-                    Some(ImportedBinding::Binding { .. }) | None => {}
+                    // A module named by a specifier nothing resolves may be
+                    // one of the service's, and what the load does with it
+                    // is not followed.
+                    Some(ImportedBinding::Unresolved) if *form == LoadForm::Named => {
+                        linked.unfollowable = true;
+                    }
+                    Some(ImportedBinding::Unresolved | ImportedBinding::Binding { .. }) | None => {}
                 }
             }
         }
         linked
+    }
+
+    /// An import the scan cannot follow to a file may name an instance under
+    /// an alias it does not know (carrick#1568, fix round 2). A use that
+    /// would take a client away (a write through it, a hand-off, a member
+    /// read that is not called, a call by a computed key) cannot be put
+    /// against the instance it may name, so no import reads through one. A
+    /// call through it by name takes nothing away.
+    fn unresolved_use(&mut self, used: &BindingUse) {
+        if used.contests_client() || used.called_computed {
+            self.unfollowable = true;
+        }
     }
 
     /// Merge one module's uses of a binding into the client it names.
@@ -3221,6 +3283,11 @@ impl LinkedClients {
                 }
                 Declared::Nothing => {}
                 Declared::Unfollowable => self.unfollowable = true,
+                Declared::Unresolved => {
+                    if contests {
+                        self.unfollowable = true;
+                    }
+                }
             }
         }
     }
@@ -3294,6 +3361,7 @@ fn declared_client(
             Some(ImportedBinding::Binding { file, name }) => at = (file.clone(), name.clone()),
             Some(ImportedBinding::Module(published)) => return Declared::Module(published.clone()),
             Some(ImportedBinding::Unfollowable) => return Declared::Unfollowable,
+            Some(ImportedBinding::Unresolved) => return Declared::Unresolved,
             None => return Declared::Nothing,
         }
     }
@@ -3518,7 +3586,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(&instantiated, file, call, reaches, false) {
+                    match row(&instantiated, file, composer.files, call, reaches, false) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -3549,7 +3617,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
                         if !effect.has_params() {
-                            match row(&effect, file, call, None, !library) {
+                            match row(&effect, file, composer.files, call, None, !library) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -3578,6 +3646,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
 fn row(
     effect: &Effect,
     file: &Path,
+    files: &HashMap<PathBuf, FileIr>,
     call: &CallIr,
     reaches_request: Option<String>,
     own_site: bool,
@@ -3609,6 +3678,16 @@ fn row(
         reaches_request,
         own_site,
         library_semantics: effect.semantics.iter().cloned().collect(),
+        base_fallbacks: effect
+            .base_scope
+            .as_ref()
+            .filter(|scope| scope.as_path() != file)
+            .map(|scope| {
+                files
+                    .get(scope)
+                    .map(|ir| ir.env_fallbacks.clone())
+                    .unwrap_or_default()
+            }),
     })
 }
 

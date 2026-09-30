@@ -684,6 +684,38 @@ async fn an_imported_instance_states_the_joined_row_at_each_call() {
         assert!(row.library_semantics.is_empty(), "{row:#?}");
         assert!(!row.target_url.contains("BILLING"), "{row:#?}");
     }
+
+    // An environment-read base reads the same in every module, and the
+    // importer's row describes it as the declaring module's own row does:
+    // the importer's own default for that variable (a loopback URL) says
+    // nothing about this base.
+    let env_get = ids(HTTP, &["factory:create", "verb:get"]);
+    let env_get: Vec<&str> = env_get.iter().map(String::as_str).collect();
+    assert_library_row(
+        &rows,
+        "src/shared/env-api.ts",
+        5,
+        "GET",
+        "${process.env.SHARED_API_URL}/own",
+        &env_get,
+    );
+    assert_library_row(
+        &rows,
+        "src/i6-env-fallback.ts",
+        5,
+        "GET",
+        "${process.env.SHARED_API_URL}/read",
+        &env_get,
+    );
+    let own = row_at(&rows, "src/shared/env-api.ts", 5).base;
+    let imported = row_at(&rows, "src/i6-env-fallback.ts", 5).base;
+    assert_eq!(
+        imported, own,
+        "the importer states the declaring module's base"
+    );
+    let own = own.expect("the base is stated");
+    assert_eq!(own.fallback.as_deref(), Some("https://shared.example"));
+    assert!(!own.fallback_is_loopback);
 }
 
 /// The review's adversarial sites (carrick#1564 review, findings 1 to 4): a

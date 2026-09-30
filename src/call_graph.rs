@@ -500,6 +500,12 @@ pub enum ImportedBinding {
     /// The walk stopped at one of the resolver's caps before it could say
     /// what the import names. It may be anything in the service.
     Unfollowable,
+    /// The specifier names a module nothing the scan reads can find: an
+    /// alias no config it reads maps, a mapping whose target is missing, an
+    /// undeclared package. Not a runtime builtin, and not a package the
+    /// manifests declare. It may be a module of the service under a name the
+    /// scan does not know.
+    Unresolved,
 }
 
 /// One binding a module publishes, under the name it publishes it as.
@@ -649,6 +655,60 @@ impl UnresolvedImports {
             SpecifierKind::Alias => *self.aliases.entry(specifier.to_string()).or_default() += 1,
         }
     }
+}
+
+/// The modules the Node runtime provides, by the name a `node:`-less import
+/// writes (`fs`, `fs/promises`). The runtime's own list, not a library's.
+const NODE_BUILTINS: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// A module the runtime supplies: a scheme (`node:fs`, `bun:test`) or a Node
+/// builtin written without one (`fs`, `fs/promises`).
+fn is_runtime_builtin(specifier: &str) -> bool {
+    matches!(specifier_kind(specifier), SpecifierKind::Scheme)
+        || NODE_BUILTINS.contains(&specifier.split('/').next().unwrap_or_default())
 }
 
 enum SpecifierKind {
@@ -1122,7 +1182,11 @@ impl<'a> CallResolver<'a> {
     /// the value walk answers `None` for one.
     fn imported_binding(&mut self, index: &FileCallIndex, local: &str) -> Option<ImportedBinding> {
         let symbol = index.imports.get(local)?.clone();
-        let target = self.resolve_specifier(&index.path, &symbol.source)?;
+        let Some(target) = self.resolve_specifier(&index.path, &symbol.source) else {
+            return self
+                .names_an_unknown_module(&index.path, &symbol.source)
+                .then_some(ImportedBinding::Unresolved);
+        };
         let export = match symbol.kind {
             SymbolKind::Namespace => return Some(self.module_binding(&target)),
             SymbolKind::Named => {
@@ -1153,8 +1217,28 @@ impl<'a> CallResolver<'a> {
     /// import binding (`require("./m")` inside a function, `import("./m")`)
     /// publishes: the whole module, as a namespace import sees it.
     fn loaded_module(&mut self, index: &FileCallIndex, specifier: &str) -> Option<ImportedBinding> {
-        let target = self.resolve_specifier(&index.path, specifier)?;
+        let Some(target) = self.resolve_specifier(&index.path, specifier) else {
+            return self
+                .names_an_unknown_module(&index.path, specifier)
+                .then_some(ImportedBinding::Unresolved);
+        };
         Some(self.module_binding(&target))
+    }
+
+    /// Whether `specifier`, which resolved to no file, may still name a module
+    /// of the service (carrick#1568): anything but a runtime builtin, a
+    /// runtime or registry scheme, and a package the manifests declare. An
+    /// alias the scan's config does not map and an undeclared package look
+    /// the same from here, and either may be a bundler alias for a source
+    /// file.
+    fn names_an_unknown_module(&self, importer: &Path, specifier: &str) -> bool {
+        if is_runtime_builtin(specifier) {
+            return false;
+        }
+        !matches!(
+            self.workspace.resolve(importer, specifier),
+            Resolution::External { .. }
+        )
     }
 
     /// Everything `module` publishes, or [`ImportedBinding::Unfollowable`]
@@ -1470,9 +1554,11 @@ mod tests {
     /// declares: named, renamed, through a barrel's `export { default as x }`
     /// and `export *`, and an anonymous default, which is named `default`. A
     /// namespace import, and a name bound to `export * as`, is the whole module
-    /// with every binding it publishes. A package, and a module outside the
-    /// service, is nothing. Resolving a binding no call needed adds nothing to
-    /// the unresolved-import report.
+    /// with every binding it publishes. A declared package, a runtime builtin
+    /// and a module outside the service are nothing; an undeclared package and
+    /// an alias nothing maps may be a module of the service under a name the
+    /// scan does not know, and say so. Resolving a binding no call needed adds
+    /// nothing to the unresolved-import report.
     #[test]
     fn a_wanted_import_binding_resolves_to_the_binding_its_module_declares() {
         let files = [
@@ -1487,6 +1573,10 @@ mod tests {
             ),
             ("other/outside.ts", "export const far = make();\n"),
             (
+                "package.json",
+                "{ \"name\": \"svc\", \"dependencies\": { \"declared-package\": \"^1.0.0\" } }\n",
+            ),
+            (
                 "svc/use.ts",
                 "import { api, renamed as r } from \"./lib/api\";\n\
                  import { anon, grouped } from \"./lib\";\n\
@@ -1494,11 +1584,15 @@ mod tests {
                  import pkg from \"some-package\";\n\
                  import { far } from \"../other/outside\";\n\
                  import { value } from \"@/unmapped\";\n\
-                 export const all = [api, r, anon, grouped, whole, pkg, far, value];\n",
+                 import declared from \"declared-package\";\n\
+                 import fs from \"fs\";\n\
+                 import { readFile } from \"node:fs/promises\";\n\
+                 export const all = [api, r, anon, grouped, whole, pkg, far, value, declared, fs, readFile];\n",
             ),
         ];
         let wanted: Vec<(&str, &str)> = [
-            "api", "r", "anon", "grouped", "whole", "pkg", "far", "value",
+            "api", "r", "anon", "grouped", "whole", "pkg", "far", "value", "declared", "fs",
+            "readFile",
         ]
         .into_iter()
         .map(|local| ("svc/use.ts", local))
@@ -1531,8 +1625,15 @@ mod tests {
         let both = module(&[("api", "api"), ("renamed", "hidden")]);
         assert_eq!(binding("grouped"), both);
         assert_eq!(binding("whole"), both);
-        for outside in ["pkg", "far", "value"] {
+        for outside in ["far", "declared", "fs", "readFile"] {
             assert_eq!(binding(outside), None, "{outside}");
+        }
+        for unknown in ["pkg", "value"] {
+            assert_eq!(
+                binding(unknown),
+                Some(ImportedBinding::Unresolved),
+                "{unknown}"
+            );
         }
         assert_eq!(
             resolution.unresolved,
