@@ -581,6 +581,8 @@ Response:
 
 Superseded by `capture_v2`, which emits through the compiler instead of reprinting declarations. Kept for the paths that still call it. Needs an init'd project.
 
+`source_file` may declare the symbol or re-export it (`export *` at any depth, `export { X } from`, `export { X as Y } from`); the bundle reads the declaration it resolves to. A name that two `export *` sources both provide is a symbol failure (carrick#1605).
+
 ```json
 {
   "request_id": "7",

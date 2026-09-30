@@ -791,8 +791,9 @@ export interface InferredType {
    * anchor symbol has a resolvable source declaration. Lets the scanner's
    * pub/sub two-anchor arbitration (carrick#413) re-aim a demoted explicit
    * `SymbolRequest` at the tsc-witnessed payload type: the bundler requires
-   * the symbol to be DECLARED in the request's `source_file`, and the
-   * inference is the only party that knows where that is. Reported only by
+   * the symbol to be declared in, or re-exported by, the request's
+   * `source_file`, and the inference is the only party that knows where that
+   * is. Reported only by
    * the pub/sub infer kinds (`function_param`, `expression`); other kinds
    * omit it.
    */

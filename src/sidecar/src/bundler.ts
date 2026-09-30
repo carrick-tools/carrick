@@ -17,6 +17,7 @@ import {
   SourceFile,
   Node,
   SyntaxKind,
+  ts,
   type ImportDeclaration,
   type ExportDeclaration,
   type ImportTypeNode,
@@ -49,6 +50,107 @@ import {
  * as any other symbol the bundler can't extract a type for.
  */
 const MAX_ARRAY_DEPTH = 10;
+
+/** Where a requested symbol is declared: the file and the name it has there. */
+interface DeclarationSite {
+  sourceFile: SourceFile;
+  name: string;
+}
+
+/** Whether `sourceFile` itself declares `name` in a form the bundle reads. */
+function declaresName(sourceFile: SourceFile, name: string): boolean {
+  return Boolean(
+    sourceFile.getInterface(name) ??
+      sourceFile.getTypeAlias(name) ??
+      sourceFile.getClass(name) ??
+      sourceFile.getEnum(name) ??
+      sourceFile.getVariableDeclaration(name) ??
+      sourceFile.getFunction(name)
+  );
+}
+
+/**
+ * The declarations `name` resolves to when imported from `sourceFile`
+ * (carrick#1605), or `ambiguous`.
+ *
+ * A name the module exports itself (declared there, `export { X }`, `export {
+ * X } from`, `export { X as Y } from`) wins over `export *`, and the checker
+ * follows it. Otherwise each `export *` is followed, at any depth. Two of them
+ * providing different declarations make the name ambiguous: TypeScript
+ * reports TS2308 and an ES module exports neither, while the checker's export
+ * table silently keeps the first, so the stars are walked here rather than
+ * read from it.
+ */
+function exportedDeclarations(
+  sourceFile: SourceFile,
+  name: string,
+  seen: Set<string>
+): Node[] | 'ambiguous' {
+  const key = sourceFile.getFilePath();
+  if (seen.has(key)) return [];
+  seen.add(key);
+  const ownExports = sourceFile.getSymbol()?.compilerSymbol.exports;
+  if (ownExports?.has(ts.escapeLeadingUnderscores(name))) {
+    return sourceFile.getExportedDeclarations().get(name) ?? [];
+  }
+  const found: Node[][] = [];
+  for (const declaration of sourceFile.getExportDeclarations()) {
+    // Only `export * from`: named and namespace re-exports are own exports.
+    if (declaration.hasNamedExports() || declaration.getNamespaceExport()) continue;
+    const target = declaration.getModuleSpecifierSourceFile();
+    if (!target) continue;
+    const declarations = exportedDeclarations(target, name, seen);
+    if (declarations === 'ambiguous') return declarations;
+    if (declarations.length > 0) found.push(declarations);
+  }
+  const distinct = new Set(
+    found.map(([first]) => `${first.getSourceFile().getFilePath()}:${first.getStart()}`)
+  );
+  if (distinct.size > 1) return 'ambiguous';
+  return found[0] ?? [];
+}
+
+/** The name a re-exported declaration carries where it is declared. */
+function declaredName(declaration: Node): string | undefined {
+  if (
+    Node.isInterfaceDeclaration(declaration) ||
+    Node.isTypeAliasDeclaration(declaration) ||
+    Node.isClassDeclaration(declaration) ||
+    Node.isEnumDeclaration(declaration) ||
+    Node.isVariableDeclaration(declaration) ||
+    Node.isFunctionDeclaration(declaration)
+  ) {
+    return declaration.getName();
+  }
+  return undefined;
+}
+
+/**
+ * Where `name`, as `sourceFile` exports it, is declared (carrick#1605). A name
+ * the file declares is its own. Otherwise it is followed the way an import of
+ * it is: a model names a type where the consumer imports it from, usually a
+ * barrel that only has `export *`.
+ */
+function declarationSite(
+  sourceFile: SourceFile,
+  name: string,
+  label: string
+): DeclarationSite | { reason: string } {
+  if (declaresName(sourceFile, name)) return { sourceFile, name };
+  const declarations = exportedDeclarations(sourceFile, name, new Set());
+  if (declarations === 'ambiguous') {
+    return {
+      reason: `Symbol '${name}' is exported by more than one \`export *\` in ${label}`,
+    };
+  }
+  for (const declaration of declarations) {
+    const declared = declaredName(declaration);
+    if (declared && declaresName(declaration.getSourceFile(), declared)) {
+      return { sourceFile: declaration.getSourceFile(), name: declared };
+    }
+  }
+  return { reason: `Symbol '${name}' not found in ${label}` };
+}
 
 /**
  * Options for SurfaceEmitter construction
@@ -550,32 +652,19 @@ export class TypeBundler {
       };
     }
 
-    // Look for the symbol in the file
-    const symbolName = symbol.symbol_name;
+    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file);
+    return 'reason' in site ? { valid: false, reason: site.reason } : { valid: true };
+  }
 
-    // Check interfaces
-    if (sourceFile.getInterface(symbolName)) return { valid: true };
-
-    // Check type aliases
-    if (sourceFile.getTypeAlias(symbolName)) return { valid: true };
-
-    // Check classes
-    if (sourceFile.getClass(symbolName)) return { valid: true };
-
-    // Check enums
-    if (sourceFile.getEnum(symbolName)) return { valid: true };
-
-    // Check exported variables
-    if (sourceFile.getVariableDeclaration(symbolName)) return { valid: true };
-
-    // Check functions
-    if (sourceFile.getFunction(symbolName)) return { valid: true };
-
-    // Symbol not found
-    return {
-      valid: false,
-      reason: `Symbol '${symbolName}' not found in ${symbol.source_file}`,
-    };
+  /** Where a requested symbol is declared, or undefined when it cannot be found. */
+  private siteOf(symbol: SymbolRequest): DeclarationSite | undefined {
+    const absolutePath = path.isAbsolute(symbol.source_file)
+      ? symbol.source_file
+      : path.resolve(this.repoRoot, symbol.source_file);
+    const sourceFile = this.project.getSourceFile(absolutePath);
+    if (!sourceFile) return undefined;
+    const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file);
+    return 'reason' in site ? undefined : site;
   }
 
   /**
@@ -650,12 +739,9 @@ export class TypeBundler {
   /// union/intersection/function that would misparse; those are re-resolved
   /// from the source Type here (this runs only on the rare array_depth path).
   private elementNeedsArrayParens(symbol: SymbolRequest): boolean {
-    const absolutePath = path.isAbsolute(symbol.source_file)
-      ? symbol.source_file
-      : path.resolve(this.repoRoot, symbol.source_file);
-    const sourceFile = this.project.getSourceFile(absolutePath);
-    if (!sourceFile) return false;
-    const name = symbol.symbol_name;
+    const site = this.siteOf(symbol);
+    if (!site) return false;
+    const { sourceFile, name } = site;
     const decl =
       sourceFile.getTypeAlias(name) ?? sourceFile.getVariableDeclaration(name);
     if (!decl) return false;
@@ -675,17 +761,16 @@ export class TypeBundler {
   private extractTypeDefinitionBase(
     symbol: SymbolRequest
   ): { definition: string; typeString: string; typeStringIsExpression: boolean } | null {
-    const absolutePath = path.isAbsolute(symbol.source_file)
-      ? symbol.source_file
-      : path.resolve(this.repoRoot, symbol.source_file);
-
-    const sourceFile = this.project.getSourceFile(absolutePath);
-    if (!sourceFile) {
+    const site = this.siteOf(symbol);
+    if (!site) {
       return null;
     }
 
-    const symbolName = symbol.symbol_name;
-    const alias = symbol.alias || symbolName;
+    // `symbolName` is the declaration's own name, which a renamed re-export
+    // (`export { Account as AccountView }`) does not share with the request;
+    // the bundle declares the name the symbol was requested under.
+    const { sourceFile, name: symbolName } = site;
+    const alias = symbol.alias || symbol.symbol_name;
 
     // Try interface
     const iface = sourceFile.getInterface(symbolName);
