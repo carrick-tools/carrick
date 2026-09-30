@@ -164,3 +164,135 @@ describe('carrick#1619: an import resolves in the mode of the file that imports 
     assert.ok(ret.any_provenance, 'an unresolved return must carry its provenance');
   });
 });
+
+// ---------------------------------------------------------------------------
+// One file importing one package in two modes (review of the first fix).
+// ---------------------------------------------------------------------------
+
+/** Each import resolves in its own mode: `resolution-mode` first, then plain. */
+const MIXED_TS = `import type { Shape as ReqShape } from "dual" with { "resolution-mode": "require" };
+import { v } from "dual";
+export function req(r: ReqShape) { return { ...r }; }
+export function imp() { return { ...v }; }
+`;
+/** The same two imports in the other order. */
+const MIXED_REV_TS = `import { v } from "dual";
+import type { Shape as ReqShape } from "dual" with { "resolution-mode": "require" };
+export function imp() { return { ...v }; }
+export function req(r: ReqShape) { return { ...r }; }
+`;
+/** A CommonJS file that requires the package and also imports it dynamically. */
+const MIXED_CTS = `import dualReq = require("dual");
+export function viaReq() { return { ...dualReq.v }; }
+export async function viaDyn() { const m = await import("dual"); return { ...m.v }; }
+`;
+
+const CJS_SHAPE = '{ id: number; cjs: true; }';
+const ESM_SHAPE = '{ id: string; esm: true; }';
+
+/** An ES module service over a package with separate import and require types. */
+function dualService(
+  compilerOptions: Record<string, unknown>,
+  withCts = true,
+  extra: Record<string, string> = {}
+): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1619-mixed-'));
+  tempRoots.push(root);
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'svc', version: '1.0.0', type: 'module' }),
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { strict: true, skipLibCheck: true, target: 'ES2022', ...compilerOptions },
+      include: ['src'],
+    }),
+    'node_modules/dual/package.json': JSON.stringify({
+      name: 'dual',
+      version: '1.0.0',
+      exports: { '.': { import: { types: './esm.d.mts' }, require: { types: './cjs.d.cts' } } },
+    }),
+    'node_modules/dual/esm.d.mts': 'export interface Shape { id: string; esm: true }\nexport declare const v: Shape;\n',
+    'node_modules/dual/cjs.d.cts': 'export interface Shape { id: number; cjs: true }\nexport declare const v: Shape;\n',
+    'src/mixed.ts': MIXED_TS,
+    'src/mixed-rev.ts': MIXED_REV_TS,
+    ...(withCts ? { 'src/mixed-cjs.cts': MIXED_CTS } : {}),
+    ...extra,
+  };
+  for (const [rel, text] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, text);
+  }
+  return root;
+}
+
+/** `function_return` of each named function, keyed `file:function`. */
+async function returns(service: string, probes: Array<[string, string, number]>): Promise<Map<string, string>> {
+  const client = new SidecarClient();
+  await client.start();
+  try {
+    await client.send({ action: 'init', request_id: 'init', repo_root: service, tsconfig_path: 'tsconfig.json' });
+    const res = await client.send<InferShape>(
+      {
+        action: 'infer',
+        request_id: 'mixed',
+        requests: probes.map(([file, fn, line]) => ({
+          file_path: path.join(service, 'src', file),
+          line_number: line,
+          infer_kind: 'function_return',
+          alias: `${file}:${fn}`,
+        })),
+      },
+      30000
+    );
+    return new Map((res.inferred_types ?? []).map((t) => [t.alias, collapse(t.type_string)]));
+  } finally {
+    await client.stop();
+  }
+}
+
+describe('carrick#1619: two imports of one package in one file keep their own modes', () => {
+  it('under NodeNext', async () => {
+    const got = await returns(dualService({ module: 'NodeNext', moduleResolution: 'NodeNext' }), [
+      ['mixed.ts', 'req', 3],
+      ['mixed.ts', 'imp', 4],
+      ['mixed-rev.ts', 'imp', 3],
+      ['mixed-rev.ts', 'req', 4],
+      ['mixed-cjs.cts', 'viaReq', 2],
+      ['mixed-cjs.cts', 'viaDyn', 3],
+    ]);
+    assert.strictEqual(got.get('mixed.ts:req'), CJS_SHAPE);
+    assert.strictEqual(got.get('mixed.ts:imp'), ESM_SHAPE);
+    assert.strictEqual(got.get('mixed-rev.ts:imp'), ESM_SHAPE);
+    assert.strictEqual(got.get('mixed-rev.ts:req'), CJS_SHAPE);
+    assert.strictEqual(got.get('mixed-cjs.cts:viaReq'), CJS_SHAPE);
+    assert.strictEqual(got.get('mixed-cjs.cts:viaDyn'), ESM_SHAPE);
+  });
+
+  it('under Bundler', async () => {
+    // No `.cts` file here: under Bundler this TypeScript copy keeps one cache
+    // entry per package across modes, so a `.cts` that requires the package
+    // first fixes the answer for every later file (carrick#1632).
+    const got = await returns(dualService({ module: 'ESNext', moduleResolution: 'Bundler' }, false), [
+      ['mixed.ts', 'req', 3],
+      ['mixed.ts', 'imp', 4],
+      ['mixed-rev.ts', 'imp', 3],
+      ['mixed-rev.ts', 'req', 4],
+    ]);
+    assert.strictEqual(got.get('mixed.ts:req'), CJS_SHAPE);
+    assert.strictEqual(got.get('mixed.ts:imp'), ESM_SHAPE);
+    assert.strictEqual(got.get('mixed-rev.ts:imp'), ESM_SHAPE);
+    assert.strictEqual(got.get('mixed-rev.ts:req'), CJS_SHAPE);
+  });
+
+  it('leaves a file format unset outside node16..nodenext', async () => {
+    // Under Bundler an `import` in a `.cts` file resolves in import mode when
+    // the file has no format, as before. Given its CommonJS format it would
+    // resolve in require mode first, and this TypeScript copy would then serve
+    // that answer to every later file (carrick#1632).
+    const PLAIN = 'import { v } from "dual";\nexport function dualV() { return { ...v }; }\n';
+    const got = await returns(
+      dualService({ module: 'ESNext', moduleResolution: 'Bundler' }, false, { 'src/a.cts': PLAIN, 'src/esm.ts': PLAIN }),
+      [['esm.ts', 'dualV', 2]]
+    );
+    assert.strictEqual(got.get('esm.ts:dualV'), ESM_SHAPE);
+  });
+});
