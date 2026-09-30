@@ -14,7 +14,7 @@ import { Project, type CompilerOptions } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
-import { DenoProject, findDenoConfig } from './capture/index.js';
+import { DenoProject, findDenoConfig, serviceConfigPath } from './capture/index.js';
 
 /**
  * Options for ProjectLoader construction
@@ -239,11 +239,23 @@ export class ProjectLoader {
           };
         } else if (tsconfigPath) {
           this.log(`Project will load with tsconfig: ${tsconfigPath}`);
-          this.buildProject = () =>
-            new Project({
-              tsConfigFilePath: tsconfigPath,
+          this.buildProject = () => {
+            // A solution config lists no files and carries no options of its
+            // own: build from the referenced project that includes the
+            // service's files (carrick#1604).
+            const chosen = serviceConfigPath(tsconfigPath, this.repoRoot);
+            for (const diagnostic of chosen.diagnostics) this.logError(diagnostic);
+            if (chosen.configPath !== tsconfigPath) {
+              this.log(
+                `${tsconfigPath} lists no files; building from ${chosen.configPath}, ` +
+                  'the project it references that includes the most of the service'
+              );
+            }
+            return new Project({
+              tsConfigFilePath: chosen.configPath,
               skipAddingFilesFromTsConfig: false,
             });
+          };
         } else {
           this.log('No tsconfig.json found, using default compiler options');
           this.buildProject = () => {

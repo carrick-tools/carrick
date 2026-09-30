@@ -49,9 +49,11 @@ import { typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
+import { parseNamedConfig, projectForFiles } from './project-references.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
+export { serviceConfigPath } from './project-references.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
@@ -152,6 +154,9 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     : path.join(repoRoot, 'tsconfig.json');
 
   let parsed: ts.ParsedCommandLine | undefined;
+  // The config the options came from: the named one, or the project it
+  // references that includes the anchors' files (carrick#1604).
+  let projectConfigPath = configPath;
   let deno: DenoProject | undefined;
   try {
     const config = findDenoConfig(repoRoot, opts.tsconfigPath);
@@ -188,14 +193,16 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       repoRoot
     );
   } else {
-    const configHost: ts.ParseConfigFileHost = {
-      ...ts.sys,
-      onUnRecoverableConfigFileDiagnostic: (d) => {
-        throw new Error(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
-      },
-    };
+    // A solution config lists no files and carries no options of its own:
+    // type the anchors under the referenced project that includes them.
+    const anchorFiles = opts.anchors
+      .flatMap((a) => (a.source_file ? [path.resolve(repoRoot, a.source_file)] : []))
+      .filter((f) => fs.existsSync(f));
     try {
-      parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, configHost) ?? undefined;
+      const choice = projectForFiles(parseNamedConfig(configPath), anchorFiles);
+      parsed = choice.project.parsed;
+      projectConfigPath = choice.project.configPath;
+      errors.push(...choice.diagnostics);
     } catch (err) {
       return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
     }
@@ -207,7 +214,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // The surface entry must live inside the effective rootDir (design doc
   // Capture step 1: an entry at repo root with rootDir "src" fails TS6059).
   const entryDir = parsed.options.rootDir
-    ? path.resolve(path.dirname(configPath), parsed.options.rootDir)
+    ? path.resolve(path.dirname(projectConfigPath), parsed.options.rootDir)
     : repoRoot;
   const surfaceEntry = surfaceEntryFileName();
   const surfaceDeclaration = `${surfaceEntry}.d.ts`;
@@ -375,7 +382,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     typesDir,
     files: emittedFiles,
     options: parsed.options,
-    configPath,
+    configPath: projectConfigPath,
     entryDir,
   });
   const specifierRewrites = denoRewrites + rewritten.rewrites;
