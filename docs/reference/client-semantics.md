@@ -163,8 +163,8 @@ included, bounded by 30 s (`PENDING_REASK_TIMEOUT`), and the schedule stops
 as soon as nothing installed is pending. It is started as soon as the
 service's detection is known and runs beside the file analysis, which waits
 for it only before composing the summaries. The first answer for a package
-stands, so the rows do not depend on which ask gave it. A failed ask, or
-one naming other packages, changes nothing. A `skipped` package is never
+stands, so the rows do not depend on which ask gave it. A failed ask
+changes nothing. A `skipped` package is never
 asked about, and neither is a `pending` one that is not installed. The user
 reads one line before each re-ask and, if any remain, one with how many are
 not described yet.
@@ -173,10 +173,10 @@ not described yet.
 with no `client_semantics` is asked again when one of its data fetchers is
 installed, and one with an entry still `pending` when that package is
 installed. The ask comes before the analysis, is one HTTP attempt bounded by
-30 s, and prints its line first. If the answer names the same packages in
-all four lists, the stored guidance stands and only the semantics are
-taken; if not, guidance is asked again from the new answer. A failed or
-unanswered ask keeps the stored detection. That ask counts as the scan's
+30 s, and prints its line first. Only the answer's semantics are taken:
+the stored lists, notes, guidance and extraction config stand whatever
+lists the answer names, because they move only when a manifest does
+(carrick#1606). A failed or unanswered ask keeps the stored detection. That ask counts as the scan's
 first, so the schedule after it makes at most two more.
 
 A run retrying its own owed work asks neither way: its detection is minutes

@@ -1116,12 +1116,48 @@ async fn a_failed_reask_keeps_the_cached_detection() {
     );
 }
 
-/// An answer that names other packages than the cached detection changes
-/// what guidance and the analysis are keyed on, so guidance is asked again,
-/// from the answer already in hand: no second detection request.
+/// The stored blob's cached detection and guidance, as JSON.
+fn stored_setup(storage: &StubStorage) -> (serde_json::Value, serde_json::Value) {
+    let repos = storage.repos.lock().unwrap();
+    let previous = repos.last().expect("a previous scan uploaded");
+    (
+        serde_json::to_value(&previous.cached_detection).unwrap(),
+        serde_json::to_value(&previous.cached_guidance).unwrap(),
+    )
+}
+
+/// The sample's `client_semantics`, as the cassette answers them and a blob
+/// keeps them.
+fn sample_semantics(cassette: &Path) -> serde_json::Value {
+    let sample: carrick::framework_detector::DetectionResult = serde_json::from_str(
+        &std::fs::read_to_string(cassette.join("framework-detect/framework-detect.json")).unwrap(),
+    )
+    .unwrap();
+    serde_json::to_value(sample.client_semantics.expect("the sample answers")).unwrap()
+}
+
+/// Install a package the sample never names, and commit it with the tree.
+fn install_committed(repo: &Path, package: &str) {
+    let manifest = repo.join("node_modules").join(package).join("package.json");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(
+        manifest,
+        format!(r#"{{ "name": "{package}", "version": "1.0.0" }}"#),
+    )
+    .unwrap();
+    run_git(repo, &["add", "-A", "-f"]);
+    run_git(repo, &["commit", "-q", "-m", "install"]);
+}
+
+/// carrick#1606: the re-ask asks for library semantics, not for a detection.
+/// An answer that names other packages than the stored detection gives its
+/// semantics and nothing else: the stored lists and notes stand, because
+/// they move only when a manifest moves, so guidance and the extraction
+/// config are not asked again and stay as they were. The next scan asks
+/// nothing.
 #[tokio::test]
 #[serial]
-async fn a_reask_that_names_other_packages_asks_for_guidance_again() {
+async fn a_reask_that_names_other_packages_keeps_the_stored_lists() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
     mock_env(&cassette);
@@ -1132,14 +1168,100 @@ async fn a_reask_that_names_other_packages_asks_for_guidance_again() {
         detection
             .data_fetchers
             .retain(|package| package != "fixture-slow-http");
+        detection.notes = "the stored notes".to_string();
     });
+    let (mut stored, guidance_before) = stored_setup(&storage);
 
-    let (data, detect, guidance) = scan_counting(&storage, &repo).await;
-    assert_eq!(detect, 1, "detection is asked once");
-    assert!(guidance > 0, "guidance is asked again for the new lists");
-    let detection = data.cached_detection.expect("the new detection is kept");
-    assert_eq!(detection.data_fetchers.len(), 4);
-    assert!(detection.client_semantics.is_some());
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!(
+        (detect, guidance),
+        (1, 0),
+        "detection is asked once, and guidance and the extraction config not at all"
+    );
+    let (kept, guidance_after) = stored_setup(&storage);
+    stored["client_semantics"] = sample_semantics(&cassette);
+    assert_eq!(
+        kept, stored,
+        "the stored lists and notes, with the answer's semantics"
+    );
+    assert_eq!(guidance_after, guidance_before);
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (0, 0), "the next scan asks nothing");
+}
+
+/// carrick#1606: a package the stored detection lists and the answer omits
+/// stays listed, and gets no entry: the answer describes the packages it
+/// names. An installed package with no entry is not `pending`, so no later
+/// scan asks about it again.
+#[tokio::test]
+#[serial]
+async fn a_listed_package_the_reask_omits_stays_listed_without_an_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    install_committed(&repo, "fixture-stored-only-http");
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+    scan(&storage, &repo, None).await;
+    age_cached_detection(&storage, |detection| {
+        detection.client_semantics = None;
+        detection
+            .data_fetchers
+            .push("fixture-stored-only-http".to_string());
+    });
+    let (mut stored, _) = stored_setup(&storage);
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (1, 0));
+    let (kept, _) = stored_setup(&storage);
+    stored["client_semantics"] = sample_semantics(&cassette);
+    assert_eq!(kept, stored);
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (0, 0), "no later scan asks about it");
+}
+
+/// carrick#1606: a stored entry left `pending` for a package the answer no
+/// longer names is replaced with the answer's semantics like every other
+/// entry, so it is dropped. Its package stays listed, and no later scan asks
+/// about it: the answer describes only the packages it names, so keeping
+/// the entry would ask about it on every scan for an answer that never
+/// comes.
+#[tokio::test]
+#[serial]
+async fn a_pending_entry_the_reask_no_longer_names_is_not_asked_about_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), Install::Vendored);
+    install_committed(&repo, "fixture-stored-only-http");
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+    scan(&storage, &repo, None).await;
+    age_cached_detection(&storage, |detection| {
+        detection
+            .data_fetchers
+            .push("fixture-stored-only-http".to_string());
+        let entries = detection
+            .client_semantics
+            .as_mut()
+            .expect("the first scan kept the sample's semantics");
+        let mut pending = entries
+            .iter()
+            .find(|entry| entry.status == SemanticsStatus::Pending)
+            .expect("the sample leaves one package pending")
+            .clone();
+        pending.package = "fixture-stored-only-http".to_string();
+        entries.push(pending);
+    });
+    let (mut stored, _) = stored_setup(&storage);
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (1, 0));
+    let (kept, _) = stored_setup(&storage);
+    stored["client_semantics"] = sample_semantics(&cassette);
+    assert_eq!(kept, stored);
+
+    let (_, detect, guidance) = scan_counting(&storage, &repo).await;
+    assert_eq!((detect, guidance), (0, 0), "no later scan asks about it");
 }
 
 /// An entry still `pending` for a package that is installed is asked again

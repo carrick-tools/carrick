@@ -3260,12 +3260,12 @@ pub(crate) mod tests {
         let mut waits = Vec::new();
         let mut lines = Vec::new();
         let entries = {
-            let (api_base, detection) = (stub.api_base.as_str(), &first);
+            let api_base = stub.api_base.as_str();
             crate::client_semantics::settle_pending(
                 asked.clone(),
                 installed,
                 &crate::client_semantics::PENDING_REASK_WAITS,
-                move || crate::engine::semantics_from_reask(ask_detection(api_base), detection),
+                move || crate::engine::semantics_from_reask(ask_detection(api_base)),
                 |pause| {
                     waits.push(pause);
                     std::future::ready(())
@@ -3377,24 +3377,48 @@ pub(crate) mod tests {
         );
     }
 
-    /// carrick#1564 schedule: a re-ask that names other packages than the
-    /// detection the scan's guidance came from changes nothing.
+    /// carrick#1606: a re-ask that names other packages than the detection
+    /// the scan's guidance came from still answers the package left pending,
+    /// and the schedule stops there. A package only the answer names gets no
+    /// entry: the scan's entries are filled, never added to.
     #[tokio::test]
-    async fn a_reask_that_names_other_packages_changes_nothing() {
+    async fn a_reask_that_names_other_packages_still_answers_the_pending_one() {
         let other_packages = detection_answer(|detection| {
             answer_slow(detection);
             detection["data_fetchers"]
                 .as_array_mut()
                 .unwrap()
                 .push("fixture-other-http".into());
+            let mut other = detection["client_semantics"][0].clone();
+            other["package"] = "fixture-other-http".into();
+            detection["client_semantics"]
+                .as_array_mut()
+                .unwrap()
+                .push(other);
         });
         let settled = settle_against(
             vec![slow_pending(), other_packages.clone(), other_packages],
             |_| true,
         )
         .await;
-        assert_eq!(settled.attempts, 3);
-        assert_eq!(settled.entries, settled.first);
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(
+            settled.entry("fixture-slow-http").status,
+            crate::client_semantics::SemanticsStatus::Answered
+        );
+        assert_eq!(settled.entry("@fixture/http"), &settled.first[0]);
+        assert_eq!(
+            settled
+                .entries
+                .iter()
+                .map(|entry| entry.package.as_str())
+                .collect::<Vec<_>>(),
+            settled
+                .first
+                .iter()
+                .map(|entry| entry.package.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// carrick#1564 schedule: the first answer for a package stands, so the

@@ -2900,7 +2900,7 @@ async fn analyze_current_repo_incremental(
                         .filter(|g| guidance_is_keyed(g)),
                 ) {
                     debug!("Reusing cached framework detection and guidance");
-                    match reask_client_semantics(
+                    let det = reask_client_semantics(
                         det,
                         generation,
                         &service_scan_root(repo_path, config),
@@ -2912,39 +2912,17 @@ async fn analyze_current_repo_incremental(
                         },
                         |notice| crate::progress::announce(&notice.line()),
                     )
-                    .await
-                    {
-                        // The answer names other packages than the cached
-                        // one: everything keyed on those lists is asked
-                        // again, from the answer already in hand.
-                        Reask::Changed(fresh) => {
-                            debug!(
-                                "The detection asked again for its library semantics names other packages; asking for guidance again"
-                            );
-                            model_setup(
-                                packages,
-                                &all_import_facts,
-                                Some(SettledDetection {
-                                    detection: fresh,
-                                    extraction_config: None,
-                                }),
-                            )
-                            .await
+                    .await;
+                    // A missing cached config (older cache entry, or an
+                    // earlier failed generation) is regenerated on its own.
+                    let extraction = match &prev.cached_extraction_config {
+                        Some(config) => Some(config.clone()),
+                        None => {
+                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
+                            generate_extraction_config(&agent, &det, packages).await
                         }
-                        Reask::Kept(det) => {
-                            // A missing cached config (older cache entry, or an
-                            // earlier failed generation) is regenerated on its
-                            // own.
-                            let extraction = match &prev.cached_extraction_config {
-                                Some(config) => Some(config.clone()),
-                                None => {
-                                    let agent = FrameworkGuidanceAgent::new(AgentService::new());
-                                    generate_extraction_config(&agent, &det, packages).await
-                                }
-                            };
-                            ModelSetup::ready(det, guid.clone(), extraction)
-                        }
-                    }
+                    };
+                    ModelSetup::ready(det, guid.clone(), extraction)
                 } else {
                     // Something is missing: a first scan's cache entry, the
                     // service a previous scan deferred, or a blob whose
@@ -3385,29 +3363,22 @@ async fn analyze_current_repo_incremental(
     Ok(analysis)
 }
 
-/// What asking a cached detection again for its library semantics gave.
-#[derive(Debug)]
-enum Reask {
-    /// The detection to use with the cached guidance: the cached one, with
-    /// the new semantics when the ask answered.
-    Kept(DetectionResult),
-    /// The answer names other packages than the cached detection did.
-    Changed(DetectionResult),
-}
-
 /// Ask `/framework-detect` again for a cached detection that has no library
 /// semantics yet, or has one still `pending` (carrick#1564), when one of its
 /// data fetchers is installed and could verify an answer. This replaces a
 /// `CACHE_VERSION` bump, which would re-analyse every repo cold.
 ///
+/// Returns the cached detection with the answer's semantics, whatever lists
+/// the answer names (carrick#1606). The lists and notes, and the guidance and
+/// extraction config keyed on them, move only when a manifest moves (the
+/// `package_json_hash` gate); an ask for semantics is not that.
+///
 /// Best-effort: `ask` is one HTTP attempt ([`reask_agent`]) bounded by
 /// [`crate::client_semantics::PENDING_REASK_TIMEOUT`], announced to the user
 /// through `notice` first, and made at most once a run, never when the
 /// cached detection is this run's own (a retry of owed work). A failure, or
-/// no answer in time, keeps the cached detection and never defers the
-/// service. When the answer names the same packages in all four lists, the
-/// cached guidance and extraction config stand and only the semantics are
-/// taken.
+/// no answer in time, keeps the cached detection as it is and never defers
+/// the service.
 async fn reask_client_semantics<Ask, AskFut>(
     cached: &DetectionResult,
     generation: PreviousGeneration,
@@ -3415,7 +3386,7 @@ async fn reask_client_semantics<Ask, AskFut>(
     repo_root: &Path,
     ask: Ask,
     notice: impl FnOnce(crate::client_semantics::ScheduleNotice),
-) -> Reask
+) -> DetectionResult
 where
     Ask: FnOnce() -> AskFut,
     AskFut: std::future::Future<Output = Result<DetectionResult, Box<dyn std::error::Error>>>,
@@ -3429,7 +3400,7 @@ where
             repo_root,
         )
     {
-        return Reask::Kept(cached.clone());
+        return cached.clone();
     }
     debug!("Asking framework detection again for this service's library semantics");
     notice(crate::client_semantics::reask_notice(
@@ -3439,23 +3410,29 @@ where
         repo_root,
     ));
     match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask()).await {
-        Ok(Ok(fresh)) if fresh.same_lists(cached) => Reask::Kept(DetectionResult {
-            client_semantics: fresh.client_semantics,
-            ..cached.clone()
-        }),
-        Ok(Ok(fresh)) => Reask::Changed(fresh),
+        Ok(Ok(fresh)) => {
+            if !fresh.same_lists(cached) {
+                debug!(
+                    "Asking framework detection again for library semantics answered other packages than the cached detection; keeping the cached lists and taking only the semantics"
+                );
+            }
+            DetectionResult {
+                client_semantics: fresh.client_semantics,
+                ..cached.clone()
+            }
+        }
         // Nothing for the user to act on: the next scan asks again.
         Ok(Err(error)) => {
             debug!(
                 "Asking framework detection again for library semantics failed ({error}); keeping the cached detection"
             );
-            Reask::Kept(cached.clone())
+            cached.clone()
         }
         Err(_) => {
             debug!(
                 "Asking framework detection again for library semantics ran out of time; keeping the cached detection"
             );
-            Reask::Kept(cached.clone())
+            cached.clone()
         }
     }
 }
@@ -6060,9 +6037,9 @@ impl SettlingSemantics {
 /// installed package is still `pending`: every such package is asked about
 /// again on [`crate::client_semantics::settle_pending`]'s schedule, one HTTP
 /// attempt per ask, each bounded by
-/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An ask that fails, or
-/// answers different lists than the ones the guidance was built from,
-/// changes nothing; the next scan asks again.
+/// [`crate::client_semantics::PENDING_REASK_TIMEOUT`]. An answer gives its
+/// semantics whatever lists it names, and nothing else ([`semantics_from_reask`]);
+/// an ask that fails changes nothing, and the next scan asks again.
 fn start_semantics_schedule(
     detection: &DetectionResult,
     schedule: bool,
@@ -6084,7 +6061,6 @@ fn start_semantics_schedule(
     {
         return SettlingSemantics::Known(Some(asked));
     }
-    let detection = std::sync::Arc::new(detection.clone());
     let packages = std::sync::Arc::new(packages.clone());
     let import_facts = std::sync::Arc::new(import_facts.clone());
     spawn_schedule(
@@ -6092,13 +6068,11 @@ fn start_semantics_schedule(
         crate::client_semantics::installed_for(service_root, repo_root),
         crate::client_semantics::pending_reask_waits(),
         move || {
-            let (detection, packages, import_facts) =
-                (detection.clone(), packages.clone(), import_facts.clone());
+            let (packages, import_facts) = (packages.clone(), import_facts.clone());
             async move {
                 let detector = FrameworkDetector::new(reask_agent());
                 semantics_from_reask(
                     detector.detect_frameworks_and_libraries(&packages, &import_facts),
-                    &detection,
                 )
                 .await
             }
@@ -6163,21 +6137,15 @@ async fn compose_summaries(
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
-/// it answered within [`crate::client_semantics::PENDING_REASK_TIMEOUT`] and
-/// named the same packages as `detection`, whose guidance the scan is using.
-/// Anything else gives nothing, and the next scan asks again.
+/// it answered within [`crate::client_semantics::PENDING_REASK_TIMEOUT`],
+/// whatever lists it names (carrick#1606): the schedule fills only entries
+/// still `pending`, by package name. A failure or no answer in time gives
+/// nothing, and the next scan asks again.
 pub(crate) async fn semantics_from_reask<E: std::fmt::Display>(
     ask: impl std::future::Future<Output = Result<DetectionResult, E>>,
-    detection: &DetectionResult,
 ) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
     match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask).await {
-        Ok(Ok(fresh)) if fresh.same_lists(detection) => fresh.client_semantics,
-        Ok(Ok(_)) => {
-            debug!(
-                "Asking again for library semantics answered other packages; the next scan settles them"
-            );
-            None
-        }
+        Ok(Ok(fresh)) => fresh.client_semantics,
         Ok(Err(error)) => {
             debug!("Asking again for library semantics failed ({error})");
             None
@@ -13521,7 +13489,7 @@ mod tests {
 
         let mut lines = Vec::new();
         let started = tokio::time::Instant::now();
-        let reask = tokio::time::timeout(
+        let kept = tokio::time::timeout(
             crate::client_semantics::PENDING_REASK_TIMEOUT * 2,
             reask_client_semantics(
                 &cached,
@@ -13538,9 +13506,6 @@ mod tests {
             started.elapsed(),
             crate::client_semantics::PENDING_REASK_TIMEOUT
         );
-        let Reask::Kept(kept) = reask else {
-            panic!("an unanswered re-ask keeps the stored detection");
-        };
         assert_eq!(
             serde_json::to_value(&kept).unwrap(),
             serde_json::to_value(&cached).unwrap()
@@ -13572,6 +13537,81 @@ mod tests {
             lines,
             vec!["2 client libraries being described, waiting up to 30 s"]
         );
+    }
+
+    /// A stored detection and an answer that names other packages in its
+    /// lists and says something else in its notes, both from the contract
+    /// sample.
+    fn stored_and_other_answer() -> (DetectionResult, DetectionResult) {
+        let answer: DetectionResult = serde_json::from_str(include_str!(
+            "../../tests/fixtures/client-semantics/__llm__/framework-detect/framework-detect.json"
+        ))
+        .unwrap();
+        let stored = DetectionResult {
+            frameworks: vec!["fixture-server".to_string()],
+            data_fetchers: vec![
+                "@fixture/http".to_string(),
+                "fixture-stored-only-http".to_string(),
+            ],
+            messaging_clients: vec!["fixture-queue".to_string()],
+            socket_clients: Vec::new(),
+            notes: "the stored notes".to_string(),
+            client_semantics: None,
+        };
+        let answer = DetectionResult {
+            notes: "the fresh notes".to_string(),
+            ..answer
+        };
+        assert!(!answer.same_lists(&stored), "the premise: other lists");
+        (stored, answer)
+    }
+
+    /// carrick#1606: the re-ask asks for library semantics, so it takes the
+    /// answer's semantics and nothing else. The stored lists and notes stand
+    /// whatever lists the answer names: they move only when a manifest moves
+    /// (the `package_json_hash` gate), and so nothing keyed on them is asked
+    /// again.
+    #[tokio::test]
+    async fn a_reask_naming_other_lists_keeps_the_stored_detection_and_takes_its_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root
+            .path()
+            .join("node_modules/@fixture/http")
+            .join("package.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "{}").unwrap();
+        let (stored, answer) = stored_and_other_answer();
+        let asked = answer.clone();
+
+        let kept = reask_client_semantics(
+            &stored,
+            PreviousGeneration::Stored,
+            root.path(),
+            root.path(),
+            || async move { Ok(asked) },
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap(),
+            serde_json::to_value(DetectionResult {
+                client_semantics: answer.client_semantics.clone(),
+                ..stored
+            })
+            .unwrap()
+        );
+    }
+
+    /// carrick#1606: an in-scan re-ask whose answer names other lists still
+    /// gives its semantics. `settle_pending` fills only entries still
+    /// `pending`, by package name, so nothing the answer adds or omits moves
+    /// anything else.
+    #[tokio::test]
+    async fn an_in_scan_reask_naming_other_lists_gives_its_semantics() {
+        let (_, answer) = stored_and_other_answer();
+        let semantics =
+            semantics_from_reask(std::future::ready(Ok::<_, String>(answer.clone()))).await;
+        assert_eq!(semantics, answer.client_semantics);
     }
 
     /// carrick#1564: an instance is read only when its factory's own claim

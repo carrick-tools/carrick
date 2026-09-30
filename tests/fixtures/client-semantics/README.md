@@ -185,8 +185,9 @@ cache: every check is `unchecked` and the scan completes (carrick#1570).
 The re-ask rules run over the same tree without the sidecar: a stored
 detection with no semantics is asked once more on the next scan, and one with
 a `pending` entry only when the test installs that package too; a failed ask
-keeps the stored detection; an answer naming other packages asks for
-guidance again; a fully answered detection asks nothing; and a run retrying
+keeps the stored detection; an answer naming other packages gives only its
+semantics, and the stored lists and guidance stand; a fully answered
+detection asks nothing; and a run retrying
 the work it still owes does not ask again in the same run. When the test
 installs `fixture-slow-http`, which this sample always answers `pending`, one
 scan asks `/framework-detect` three times, the first ask and the in-scan
