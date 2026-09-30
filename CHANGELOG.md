@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.98](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.97...carrick-v0.3.98) (2026-09-30)
+
+
+### Features
+
+* **cli:** split remove (this folder) from uninstall (this machine), each behind a typed answer ([#1581](https://github.com/carrick-tools/carrick/issues/1581)) ([333bba4](https://github.com/carrick-tools/carrick/commit/333bba4453d8d72f1ff2400394a54ffba7be597d)), closes [#1573](https://github.com/carrick-tools/carrick/issues/1573)
+* **scanner:** read a library client instance imported from another module ([#1568](https://github.com/carrick-tools/carrick/issues/1568)) ([#1591](https://github.com/carrick-tools/carrick/issues/1591)) ([681d4c1](https://github.com/carrick-tools/carrick/commit/681d4c17e6aa200c57c5d007a3a11288f4393ba8))
+* **scanner:** read calls through library clients with verified client semantics ([#1571](https://github.com/carrick-tools/carrick/issues/1571)) ([77b81c1](https://github.com/carrick-tools/carrick/commit/77b81c14b8da8edf816d6b0e0658ec26652b8dd9))
+* **sidecar:** verify_client_semantics checks library claims against declarations ([#1567](https://github.com/carrick-tools/carrick/issues/1567)) ([a2181e0](https://github.com/carrick-tools/carrick/commit/a2181e09e30c8e36402990a6fb2250ba773d6bab))
+
+
+### Bug Fixes
+
+* **cli:** --help opens with the agreed headline and lists doctor and remove ([#1575](https://github.com/carrick-tools/carrick/issues/1575)) ([28c3c32](https://github.com/carrick-tools/carrick/commit/28c3c32856dc25485cf24c282723bb8fb4dfa99a))
+* **init:** commit_missing names git fetch then carrick refresh; CLI copy sweep ([#1579](https://github.com/carrick-tools/carrick/issues/1579)) ([9ac8d38](https://github.com/carrick-tools/carrick/commit/9ac8d38b85c2d709e2f5f8fe6a97964f29498a1d))
+* **scanner:** a client-semantics re-ask keeps the stored detection's lists ([#1610](https://github.com/carrick-tools/carrick/issues/1610)) ([f928717](https://github.com/carrick-tools/carrick/commit/f92871760dae06736aa0229437741a92ff34e6c0)), closes [#1606](https://github.com/carrick-tools/carrick/issues/1606)
+* **sidecar:** a client-semantics claim ignores what the service declares for a package ([#1586](https://github.com/carrick-tools/carrick/issues/1586)) ([04bca0c](https://github.com/carrick-tools/carrick/commit/04bca0c775ec70e9ddcdb6bfe36a9130a05dd3f7))
+
 ## [0.3.97](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.96...carrick-v0.3.97) (2026-09-29)
 
 

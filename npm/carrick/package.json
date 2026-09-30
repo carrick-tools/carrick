@@ -1,6 +1,6 @@
 {
   "name": "carrick",
-  "version": "0.3.97",
+  "version": "0.3.98",
   "description": "Maps your entire TypeScript codebase across services and repositories, giving AI agents full context on existing types, routes, and function behaviours over MCP before they write duplicate or breaking code.",
   "keywords": [
     "typescript",
@@ -58,11 +58,11 @@
     "zod": "^3.23.0"
   },
   "optionalDependencies": {
-    "@carrick-tools/cli-darwin-arm64": "0.3.97",
-    "@carrick-tools/cli-darwin-x64": "0.3.97",
-    "@carrick-tools/cli-linux-arm64": "0.3.97",
-    "@carrick-tools/cli-linux-x64": "0.3.97",
-    "@carrick-tools/cli-win32-x64": "0.3.97"
+    "@carrick-tools/cli-darwin-arm64": "0.3.98",
+    "@carrick-tools/cli-darwin-x64": "0.3.98",
+    "@carrick-tools/cli-linux-arm64": "0.3.98",
+    "@carrick-tools/cli-linux-x64": "0.3.98",
+    "@carrick-tools/cli-win32-x64": "0.3.98"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
