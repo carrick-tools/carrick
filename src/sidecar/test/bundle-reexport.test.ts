@@ -35,7 +35,7 @@ const FILES: Record<string, string> = {
   }),
   'src/core/api.ts': [
     'export type Me = { id: string; email: string };',
-    'export interface Account { id: string; plan: "free" | "paid" }',
+    'export interface Account { id: string; plan: "basic" | "pro" }',
     'export type Status = "active" | "suspended";',
     '',
   ].join('\n'),
@@ -123,7 +123,7 @@ describe('carrick#1605: the bundle follows a name through its re-exports', () =>
     const res = await bundle('AccountView', 'src/core/index.ts');
     assert.strictEqual(res.symbol_failures, undefined, JSON.stringify(res.symbol_failures));
     const dts = collapse(res.dts_content ?? '');
-    assert.match(dts, /export interface AccountView \{ id: string; plan: "free" \| "paid"; \}/);
+    assert.match(dts, /export interface AccountView \{ id: string; plan: "basic" \| "pro"; \}/);
     assert.doesNotMatch(dts, /\bAccount\b(?!View)/);
   });
 
