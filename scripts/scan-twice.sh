@@ -92,6 +92,7 @@ fixture_targets=(
   socket-namespace-monorepo
   socket-service
   socket-type-alias-monorepo
+  spread-options-verb
   workspace-package-client
   xrepo-corpus-3
 )

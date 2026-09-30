@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "${apiUrl}/api/v1/status/${id}",
+      "method": "POST",
+      "pattern_matched": "readStatus(",
+      "call_expression_text": "readStatus(`${apiUrl}/api/v1/status/${id}`)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": null
+    }
+  ]
+}

@@ -642,6 +642,197 @@ export function PanelRoute() {
         assert_eq!(corrections, WrapperMethodCorrections::default());
     }
 
+    /// carrick#1603's client: it passes its verb to a stream helper one
+    /// property deep, in the request options the helper forwards.
+    const STREAM_SITE: &str = r#"import { openStream } from "./stream";
+
+export class BuildClient {
+  constructor(private apiUrl: string) {}
+
+  complete(id: string, body: { note: string }) {
+    return openStream({
+      url: `${this.apiUrl}/api/v1/builds/${id}/complete`,
+      request: { method: "PATCH", body: JSON.stringify(body) },
+    });
+  }
+}
+"#;
+
+    /// The stream helper, with `init` as the second argument of its `fetch`.
+    fn stream_helper(init: &str) -> String {
+        format!(
+            "export type StreamOptions = {{ url: string; request?: RequestInit; key?: string }};\n\n\
+             export function openStream(options: StreamOptions): Promise<Response> {{\n  \
+             return fetch(options.url, {init});\n}}\n"
+        )
+    }
+
+    /// What the site's verb is once the pass has read the helper written with
+    /// `init`, when the model answered the site with PATCH.
+    fn site_verb_through(helper: &str) -> (Option<String>, WrapperMethodCorrections) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "src/stream.ts", helper);
+        let site = write(root, "src/build-client.ts", STREAM_SITE);
+        let (results, corrections) = correct(vec![(
+            site.clone(),
+            vec![row(
+                STREAM_SITE,
+                "openStream({",
+                "PATCH",
+                "${apiUrl}/api/v1/builds/${id}/complete",
+            )],
+        )]);
+        (method(&results, &site), corrections)
+    }
+
+    /// The row keeps the model's verb, and the scan counts one site whose
+    /// declaration states no verb it could read.
+    fn kept(verb: (Option<String>, WrapperMethodCorrections), shape: &str) {
+        assert_eq!(
+            verb,
+            (
+                Some("PATCH".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 0,
+                    declaration_unreadable: 1
+                }
+            ),
+            "{shape}: the helper's request states no verb the source proves, so the row keeps \
+             the model's and is counted"
+        );
+    }
+
+    /// The row takes the helper's verb.
+    fn corrected_to_get(verb: (Option<String>, WrapperMethodCorrections), shape: &str) {
+        assert_eq!(
+            verb,
+            (
+                Some("GET".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            ),
+            "{shape}: the helper's request states GET whatever its caller passes"
+        );
+    }
+
+    /// carrick#1603: the helper spreads the caller's options and adds a header.
+    /// A spread of a `RequestInit` can carry `method`, so the helper states no
+    /// verb, and the one literal key beside the spread does not make it a GET.
+    #[test]
+    fn a_spread_of_the_caller_s_options_states_no_verb() {
+        kept(
+            site_verb_through(&stream_helper(
+                "{ ...options.request, headers: { Accept: \"text/event-stream\" } }",
+            )),
+            "spread, then headers",
+        );
+    }
+
+    /// A spread written AFTER the helper's own `method` overwrites it.
+    #[test]
+    fn a_spread_after_the_method_overwrites_it() {
+        kept(
+            site_verb_through(&stream_helper("{ method: \"GET\", ...options.request }")),
+            "method, then spread",
+        );
+    }
+
+    /// A `method` written after every spread is the one the request sends,
+    /// whatever the spread held.
+    #[test]
+    fn a_method_after_every_spread_is_the_verb_sent() {
+        corrected_to_get(
+            site_verb_through(&stream_helper("{ ...options.request, method: \"GET\" }")),
+            "spread, then method",
+        );
+    }
+
+    /// The helper forwards nothing of its caller's: its bag names no method
+    /// and holds no spread, so every request it sends is a GET.
+    #[test]
+    fn a_helper_that_forwards_nothing_still_states_get() {
+        corrected_to_get(
+            site_verb_through(&stream_helper(
+                "{ headers: { Accept: \"text/event-stream\" } }",
+            )),
+            "headers only",
+        );
+    }
+
+    /// The method comes in through a parameter of the helper: written as a
+    /// shorthand, and as a spread of the parameter.
+    #[test]
+    fn a_method_passed_through_a_parameter_states_no_verb() {
+        for (helper, shape) in [
+            (
+                "export function openStream(options: { url: string }, method: string) {\n  \
+                 return fetch(options.url, { method, headers: {} });\n}\n",
+                "shorthand method parameter",
+            ),
+            (
+                "export function openStream(options: { url: string }, init?: RequestInit) {\n  \
+                 return fetch(options.url, { ...init, headers: {} });\n}\n",
+                "spread of an init parameter",
+            ),
+        ] {
+            kept(site_verb_through(helper), shape);
+        }
+    }
+
+    /// The method is read one property deep in the caller's options.
+    #[test]
+    fn a_method_read_one_property_deep_states_no_verb() {
+        kept(
+            site_verb_through(&stream_helper(
+                "{ method: options.request?.method ?? \"GET\", headers: {} }",
+            )),
+            "method read off options.request",
+        );
+    }
+
+    /// The method is set under a condition: a conditional expression, and a
+    /// conditional spread.
+    #[test]
+    fn a_method_set_conditionally_states_no_verb() {
+        for (init, shape) in [
+            (
+                "{ method: options.request ? \"POST\" : \"GET\", headers: {} }",
+                "conditional method",
+            ),
+            (
+                "{ headers: {}, ...(options.request?.body ? { method: \"POST\" } : {}) }",
+                "conditional spread",
+            ),
+        ] {
+            kept(site_verb_through(&stream_helper(init)), shape);
+        }
+    }
+
+    /// A computed key may be `method`, the same as a spread.
+    #[test]
+    fn a_computed_key_after_the_method_states_no_verb() {
+        kept(
+            site_verb_through(&stream_helper(
+                "{ headers: {}, [options.key ?? \"cache\"]: \"POST\" }",
+            )),
+            "computed key",
+        );
+    }
+
+    /// A call spelled with its verb states that verb, and a spread in its
+    /// options does not take it away: the request reader that replaces this
+    /// pass reads it the same way (`request_summary`).
+    #[test]
+    fn a_verb_spelled_request_keeps_its_verb_beside_a_spread() {
+        let helper = "import { api } from \"./api\";\n\n\
+                      export function openStream(options: { url: string; request?: object }) {\n  \
+                      return api.get(options.url, { ...options.request, headers: {} });\n}\n";
+        corrected_to_get(site_verb_through(helper), "verb-spelled call with a spread");
+    }
+
     #[test]
     fn a_call_on_a_binding_this_file_declares_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();

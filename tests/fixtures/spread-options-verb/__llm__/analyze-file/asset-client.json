@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "${apiUrl}/api/v1/assets/${id}",
+      "method": "PUT",
+      "pattern_matched": "sendUpload(",
+      "call_expression_text": "sendUpload({ url: `${apiUrl}/api/v1/assets/${id}`, request: { method: \"PUT\", body: file }, })",
+      "call_expression_line": 4,
+      "payload_expression_text": "file",
+      "payload_expression_line": 6,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": null
+    }
+  ]
+}
