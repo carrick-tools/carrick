@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A client whose requests go through local helper modules."
+}

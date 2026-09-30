@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/v1/refunds",
+      "method": "POST",
+      "pattern_matched": "refunds.issue(",
+      "call_expression_text": "refunds.issue({ orderId, amount })",
+      "call_expression_line": 4,
+      "payload_expression_text": "{ orderId, amount }",
+      "payload_expression_line": 4,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": null
+    }
+  ]
+}

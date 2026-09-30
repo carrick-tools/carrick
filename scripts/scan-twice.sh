@@ -81,6 +81,7 @@ fixture_targets=(
   new-url-target
   nextjs-app
   nextjs-app-monorepo
+  payload-without-method
   pubsub-wrapper-monorepo
   remix-flat
   request-summary

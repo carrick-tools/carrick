@@ -833,6 +833,176 @@ export class BuildClient {
         corrected_to_get(site_verb_through(helper), "verb-spelled call with a spread");
     }
 
+    /// carrick#1624's site: a call through a member of an imported object,
+    /// stating no verb of its own.
+    const ORDER_SITE: &str = "import { orders } from \"../lib/orders\";\n\n\
+                              export function checkout() {\n  \
+                              return orders.place({ sku: \"a1\" });\n}\n";
+
+    /// What the site's verb is once the pass has read `declaration` as the
+    /// module `orders` comes from, when the model answered the site `model`.
+    fn order_verb_through(
+        declaration: &str,
+        model: &str,
+    ) -> (Option<String>, WrapperMethodCorrections) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "src/lib/orders.ts", declaration);
+        let site = write(root, "src/routes/checkout.ts", ORDER_SITE);
+        let (results, corrections) = correct(vec![(
+            site.clone(),
+            vec![row(ORDER_SITE, "orders.place(", model, "/v1/orders")],
+        )]);
+        (method(&results, &site), corrections)
+    }
+
+    /// The row keeps the model's POST, counted as a site whose declaration
+    /// states no verb.
+    fn kept_post(verb: (Option<String>, WrapperMethodCorrections), shape: &str) {
+        assert_eq!(
+            verb,
+            (
+                Some("POST".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 0,
+                    declaration_unreadable: 1
+                }
+            ),
+            "{shape}: nothing in the module proves the verb its requests send, so the row \
+             keeps the model's and is counted"
+        );
+    }
+
+    /// carrick#1624: the module's real request is a client member the reader
+    /// cannot see, and the one call it reads as a request is a decode helper
+    /// handed `{ data }`. A bag carrying a payload and no method states no GET.
+    #[test]
+    fn a_decode_helper_taking_data_states_no_verb() {
+        kept_post(
+            order_verb_through(
+                "import { decodeEnvelope } from \"./envelope\";\n\n\
+                 export const orders = {\n  \
+                 place(body: { sku: string }) {\n    \
+                 return client.createOrder(body);\n  },\n  \
+                 async decode(output: unknown) {\n    \
+                 return decodeEnvelope({ data: output, format: \"json\" }, client);\n  },\n};\n",
+                "POST",
+            ),
+            "decode helper with data",
+        );
+    }
+
+    #[test]
+    fn a_logger_call_with_a_body_key_states_no_verb() {
+        kept_post(
+            order_verb_through(
+                "import { logger } from \"./logger\";\n\n\
+                 export const orders = {\n  \
+                 async place(body: { sku: string }) {\n    \
+                 logger.info({ body, event: \"order.place\" });\n    \
+                 return client.createOrder(body);\n  },\n};\n",
+                "POST",
+            ),
+            "logger call with body",
+        );
+    }
+
+    #[test]
+    fn a_form_helper_taking_data_states_no_verb() {
+        kept_post(
+            order_verb_through(
+                "import { useForm } from \"./form\";\n\n\
+                 export const orders = {\n  \
+                 place(body: { sku: string }) {\n    \
+                 const form = useForm({ data: body, validateOn: \"submit\" });\n    \
+                 return client.createOrder(form.values);\n  },\n};\n",
+                "POST",
+            ),
+            "form helper with data",
+        );
+    }
+
+    /// Failing closed: a module that issues a GET and also hands `{ data }` to
+    /// a call that may be a request with a verb of its own does not prove
+    /// that every request it sends is a GET.
+    #[test]
+    fn a_get_request_beside_a_payload_call_states_no_verb() {
+        kept_post(
+            order_verb_through(
+                "import { decodeEnvelope } from \"./envelope\";\n\n\
+                 export const orders = {\n  \
+                 async place(body: { sku: string }) {\n    \
+                 const response = await fetch(`/v1/orders?sku=${body.sku}`, { headers: {} });\n    \
+                 return decodeEnvelope({ data: await response.json() }, client);\n  },\n};\n",
+                "POST",
+            ),
+            "GET beside a payload call",
+        );
+    }
+
+    /// A module whose only request is a GET still states it.
+    #[test]
+    fn a_genuine_get_wrapper_still_states_get() {
+        assert_eq!(
+            order_verb_through(
+                "export const orders = {\n  \
+                 async place(body: { sku: string }) {\n    \
+                 const response = await fetch(`/v1/orders?sku=${body.sku}`, {\n      \
+                 headers: { accept: \"application/json\" },\n    });\n    \
+                 return response.json();\n  },\n};\n",
+                "POST",
+            ),
+            (
+                Some("GET".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// A payload with a method written beside it is a request stating its
+    /// verb: the payload rule does not reach it.
+    #[test]
+    fn a_payload_with_an_explicit_method_states_that_method() {
+        assert_eq!(
+            order_verb_through(
+                "export const orders = {\n  \
+                 place(body: { sku: string }) {\n    \
+                 return client.request({ method: \"POST\", url: \"/v1/orders\", data: body });\n  },\n};\n",
+                "GET",
+            ),
+            (
+                Some("POST".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
+    /// A call spelled with its verb states it, payload or not.
+    #[test]
+    fn a_verb_spelled_payload_states_its_verb() {
+        assert_eq!(
+            order_verb_through(
+                "export const orders = {\n  \
+                 place(body: { sku: string }) {\n    \
+                 return client.post(\"/v1/orders\", { data: body });\n  },\n};\n",
+                "GET",
+            ),
+            (
+                Some("POST".to_string()),
+                WrapperMethodCorrections {
+                    corrected: 1,
+                    declaration_unreadable: 0
+                }
+            )
+        );
+    }
+
     #[test]
     fn a_call_on_a_binding_this_file_declares_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();

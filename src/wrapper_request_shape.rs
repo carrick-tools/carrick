@@ -297,7 +297,17 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
 /// anchors, so a wrong `GET` would delete a real one. This reader corrects only
 /// the VERB, and only at a site that states none of its own, so the same
 /// absence is read the way [`crate::imported_request_member`] reads it — a
-/// request-options bag with no `method` is a GET.
+/// request-options bag with no `method` and no payload is a GET.
+///
+/// A bag carrying a payload (`body`, `data`) and no method states no GET. A
+/// body sent with no method is a verb something else supplies, and the same
+/// keys are handed to calls that are not requests at all (`decode({ data })`,
+/// `logger.info({ body })`), which the key alone cannot tell apart
+/// (carrick#1624). Such a call reads as `Unreadable`, so a module holding one
+/// states no verb: the pass fails closed rather than read the call as nothing
+/// and take a verb from the module's other calls or its imports.
+/// `imported_request_member` and `request_summary` read a payload with no
+/// method the same way.
 ///
 /// Everything else is identical, including which calls are requests at all: a
 /// non-literal `method` is still the parameterized wrapper, and a call with
@@ -312,9 +322,10 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
     }
     let method = match options {
         // The difference from `call_request_shape`, and the whole reason this
-        // exists: a bag that names no method sends a GET.
+        // exists: a bag that names no method and carries no payload sends a
+        // GET.
         Some((_, obj)) => bag_verb(obj, verb, |verb| {
-            Some(verb.unwrap_or_else(|| "GET".to_string()))
+            verb.or_else(|| (!carries_payload(obj)).then(|| "GET".to_string()))
         }),
         None => verb,
     };
@@ -327,6 +338,11 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
     })
 }
 
+/// Whether a request-options bag names a payload.
+fn carries_payload(obj: &ObjectLit) -> bool {
+    prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some()
+}
+
 /// Whether the call carries a request body.
 ///
 /// `Some(true)` when an options bag names one, or when a verb-spelled call
@@ -336,7 +352,7 @@ pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> Requ
 fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Option<bool> {
     let positional = call.args.len();
     if let Some((index, obj)) = options {
-        if prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some() {
+        if carries_payload(obj) {
             return Some(true);
         }
         // Another object literal beside the bag is a payload or a parameter

@@ -181,6 +181,7 @@ jobs:
           --test llm_cassette_hard_gate_test
           --test method_per_site_test
           --test one_row_per_request_test
+          --test payload_without_method_test
           --test pubsub_wrapper_type_capture_test
           --test run_log_isolation_test
           --test spread_options_verb_test
