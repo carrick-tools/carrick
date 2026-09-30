@@ -419,7 +419,10 @@ pub struct FileIr {
     imported: HashMap<String, BindingUse>,
     /// The modules the file loads other than through an import binding
     /// ([`module_loads`]): everything each publishes may be changed here.
-    loads: BTreeMap<String, LoadForm>,
+    loads: BTreeSet<String>,
+    /// Every specifier this file loads a module by at run time
+    /// ([`value_specifiers`]).
+    value_specifiers: BTreeSet<String>,
     /// The `??`/`||` defaults this module's environment reads are declared
     /// with ([`crate::env_alias::UrlBindings::env_fallbacks`]), kept for a
     /// module that holds a client: a row another module states through it
@@ -433,14 +436,27 @@ pub struct FileIr {
 }
 
 impl FileIr {
-    /// The import bindings whose declaring module the summaries read, and
-    /// the modules the file loads ([`crate::call_graph::resolve_call_edges`]'s
+    /// The import bindings whose declaring module the summaries read, the
+    /// modules the file loads, and, when `every_specifier`, every specifier
+    /// it loads a module by ([`crate::call_graph::resolve_call_edges`]'s
     /// `bindings_wanted`).
-    pub fn bindings_wanted(&self) -> BindingsWanted {
+    pub fn bindings_wanted(&self, every_specifier: bool) -> BindingsWanted {
         BindingsWanted {
             locals: self.imported.keys().cloned().collect(),
-            loads: self.loads.keys().cloned().collect(),
+            loads: self.loads.clone(),
+            specifiers: if every_specifier {
+                self.value_specifiers.clone()
+            } else {
+                BTreeSet::new()
+            },
         }
+    }
+
+    /// Whether this module holds a client another module may import. Only
+    /// then does a specifier that names nothing matter
+    /// ([`LinkedClients`]).
+    pub fn holds_instances(&self) -> bool {
+        !self.module_clients.is_empty()
     }
 }
 
@@ -499,8 +515,13 @@ pub fn extract_file_ir(
         })
         .map(|(name, _)| name.clone())
         .collect();
+    let jsx = jsx_names(module);
+    let value_specifiers = value_specifiers(module, |name| {
+        module_scope.uses.contains_key(name) || jsx.contains(name)
+    });
     let mut file = FileIr {
         imported,
+        value_specifiers,
         loads: module_loads(module, &bound_requires),
         names_commonjs_exports: names_commonjs_exports(module),
         ..FileIr::default()
@@ -704,6 +725,9 @@ struct BindingUse {
     /// `module.exports.api = api`). Not a use that changes anything; it says
     /// another module may import the binding (carrick#1568).
     exported: bool,
+    /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
+    /// use, which keeps an import at run time, that changes nothing.
+    read: bool,
 }
 
 impl BindingUse {
@@ -984,7 +1008,8 @@ impl BindingUses {
     /// other operand is visited as usual.
     fn compared(&mut self, expr: &Expr) {
         let expr = crate::graphql_document_sites::unwrap_expression(expr);
-        if binding_key(expr).is_some() {
+        if let Some(key) = binding_key(expr) {
+            self.mark(key, |used| used.read = true);
             return;
         }
         let Some(mut member) = as_member(expr) else {
@@ -996,7 +1021,8 @@ impl BindingUses {
                 key.expr.visit_with(self);
             }
             let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
-            if binding_key(obj).is_some() {
+            if let Some(key) = binding_key(obj) {
+                self.mark(key, |used| used.read = true);
                 return;
             }
             match as_member(obj) {
@@ -1343,10 +1369,10 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
 ///
 /// A specifier the source computes (`import(name)`, a template with a hole)
 /// names no module and is not here.
-fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeMap<String, LoadForm> {
+fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<String> {
     struct Loads<'a> {
         bound_requires: &'a HashSet<u32>,
-        found: BTreeMap<String, LoadForm>,
+        found: BTreeSet<String>,
     }
     impl Visit for Loads<'_> {
         fn visit_call_expr(&mut self, call: &CallExpr) {
@@ -1360,18 +1386,8 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeMap<Stri
                     if matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require"));
                 let bound = require && self.bound_requires.contains(&call.span.lo.0);
                 let relative = specifier.starts_with("./") || specifier.starts_with("../");
-                let form = if matches!(call.callee, Callee::Import(_)) || require {
-                    Some(LoadForm::Named)
-                } else {
-                    relative.then_some(LoadForm::RelativeArgument)
-                };
-                if let Some(form) = form
-                    && !bound
-                {
-                    let held = self.found.entry(specifier).or_insert(form);
-                    if form == LoadForm::Named {
-                        *held = LoadForm::Named;
-                    }
+                if !bound && (matches!(call.callee, Callee::Import(_)) || require || relative) {
+                    self.found.insert(specifier);
                 }
             }
             call.visit_children_with(self);
@@ -1379,21 +1395,125 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeMap<Stri
     }
     let mut loads = Loads {
         bound_requires,
-        found: BTreeMap::new(),
+        found: BTreeSet::new(),
     };
     module.visit_with(&mut loads);
     loads.found
 }
 
-/// How a file loads a module other than through an import binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadForm {
-    /// `import("./m")`, `require("./m")`: the specifier names a module.
-    Named,
-    /// Any other call handed a relative specifier (`req("./m")`), which names
-    /// a module only when one is there: `express.static("./public")` hands a
-    /// directory.
-    RelativeArgument,
+/// Every specifier `module` loads a module by at run time (carrick#1568): a
+/// static import, a side-effect import, a re-export (`export { x } from`,
+/// `export * from`, `export * as ns from`), `import x = require()`, and
+/// `import()` or `require` with a literal specifier anywhere.
+///
+/// Only what TypeScript erases is left out: an import none of whose bindings
+/// is used as a value (`used`), which the compiler drops (`import type` and
+/// `{ type x }` among them), and `export type`, or a re-export whose every
+/// specifier is `type`.
+fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            // A binding `import type` or `{ type x }` brings can only be used
+            // as a type, so the one rule covers it.
+            ModuleDecl::Import(import) => {
+                let kept = import.specifiers.is_empty()
+                    || import.specifiers.iter().any(|specifier| match specifier {
+                        ImportSpecifier::Named(named) => used(named.local.sym.as_ref()),
+                        ImportSpecifier::Default(default) => used(default.local.sym.as_ref()),
+                        ImportSpecifier::Namespace(namespace) => {
+                            used(namespace.local.sym.as_ref())
+                        }
+                    });
+                if kept {
+                    found.insert(import.src.value.to_string());
+                }
+            }
+            ModuleDecl::ExportAll(export) if !export.type_only => {
+                found.insert(export.src.value.to_string());
+            }
+            ModuleDecl::ExportNamed(export) if !export.type_only => {
+                if let Some(src) = &export.src
+                    && (export.specifiers.is_empty()
+                        || export.specifiers.iter().any(|specifier| {
+                            !matches!(specifier, ExportSpecifier::Named(named) if named.is_type_only)
+                        }))
+                {
+                    found.insert(src.value.to_string());
+                }
+            }
+            ModuleDecl::TsImportEquals(decl) if !decl.is_type_only => {
+                if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref
+                    && used(decl.id.sym.as_ref())
+                {
+                    found.insert(external.expr.value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    struct Loads {
+        found: BTreeSet<String>,
+    }
+    impl Visit for Loads {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            let loads = match &call.callee {
+                Callee::Import(_) => true,
+                Callee::Expr(callee) => {
+                    matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+                }
+                Callee::Super(_) => false,
+            };
+            if loads
+                && let Some(specifier) = call
+                    .args
+                    .first()
+                    .filter(|arg| arg.spread.is_none())
+                    .and_then(|arg| literal_specifier(&arg.expr))
+            {
+                self.found.insert(specifier);
+            }
+            call.visit_children_with(self);
+        }
+    }
+    let mut loads = Loads { found };
+    module.visit_with(&mut loads);
+    loads.found
+}
+
+/// Every name a JSX element uses as its tag (`<Button />`, the `ui` of
+/// `<ui.Button />`): a use of the binding as a value that no expression
+/// states.
+fn jsx_names(module: &Module) -> HashSet<String> {
+    #[derive(Default)]
+    struct Names {
+        found: HashSet<String>,
+    }
+    impl Visit for Names {
+        fn visit_jsx_element_name(&mut self, name: &JSXElementName) {
+            match name {
+                JSXElementName::Ident(ident) => {
+                    self.found.insert(ident.sym.to_string());
+                }
+                JSXElementName::JSXMemberExpr(member) => {
+                    let mut object = &member.obj;
+                    while let JSXObject::JSXMemberExpr(inner) = object {
+                        object = &inner.obj;
+                    }
+                    if let JSXObject::Ident(ident) = object {
+                        self.found.insert(ident.sym.to_string());
+                    }
+                }
+                JSXElementName::JSXNamespacedName(_) => {}
+            }
+        }
+    }
+    let mut names = Names::default();
+    module.visit_with(&mut names);
+    names.found
 }
 
 /// A string literal, or a template with no hole in it.
@@ -3171,10 +3291,8 @@ enum Declared {
     Module(Vec<PublishedBinding>),
     /// Something that is not a client.
     Nothing,
-    /// A cap stopped the walk.
+    /// A cap, or a hop to a module nothing resolves, stopped the walk.
     Unfollowable,
-    /// A module on the way re-exports an import nothing resolves.
-    Unresolved,
 }
 
 impl LinkedClients {
@@ -3203,48 +3321,38 @@ impl LinkedClients {
                             }
                             Declared::Nothing => {}
                             Declared::Unfollowable => linked.unfollowable = true,
-                            Declared::Unresolved => linked.unresolved_use(used),
                         }
                     }
                     Some(ImportedBinding::Module(published)) => {
                         linked.merge_namespace(files, bindings, published, used);
                     }
-                    Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
-                    Some(ImportedBinding::Unresolved) => linked.unresolved_use(used),
+                    Some(ImportedBinding::Unfollowable | ImportedBinding::Unresolved) => {
+                        linked.unfollowable = true;
+                    }
                     None => {}
                 }
             }
             // A module loaded some other way: nothing says what is done with
             // it, so every client it publishes is taken as changed.
-            for (specifier, form) in &ir.loads {
+            for specifier in &ir.loads {
                 match bindings.load(file, specifier) {
                     Some(ImportedBinding::Module(published)) => {
                         linked.contest_published(files, bindings, published);
                     }
                     Some(ImportedBinding::Unfollowable) => linked.unfollowable = true,
-                    // A module named by a specifier nothing resolves may be
-                    // one of the service's, and what the load does with it
-                    // is not followed.
-                    Some(ImportedBinding::Unresolved) if *form == LoadForm::Named => {
-                        linked.unfollowable = true;
-                    }
+                    // A load by `import()` or `require` of a specifier that
+                    // names nothing is among the file's unresolved
+                    // specifiers below; any other call handed one names a
+                    // file or a directory, not a module.
                     Some(ImportedBinding::Unresolved | ImportedBinding::Binding { .. }) | None => {}
                 }
             }
         }
+        // A module some file loads by a specifier that names nothing the
+        // scan can find may be any module of the service, and may do
+        // anything to what it publishes, however the file then uses it.
+        linked.unfollowable |= !bindings.unresolved_in().is_empty();
         linked
-    }
-
-    /// An import the scan cannot follow to a file may name an instance under
-    /// an alias it does not know (carrick#1568, fix round 2). A use that
-    /// would take a client away (a write through it, a hand-off, a member
-    /// read that is not called, a call by a computed key) cannot be put
-    /// against the instance it may name, so no import reads through one. A
-    /// call through it by name takes nothing away.
-    fn unresolved_use(&mut self, used: &BindingUse) {
-        if used.contests_client() || used.called_computed {
-            self.unfollowable = true;
-        }
     }
 
     /// Merge one module's uses of a binding into the client it names.
@@ -3283,11 +3391,6 @@ impl LinkedClients {
                 }
                 Declared::Nothing => {}
                 Declared::Unfollowable => self.unfollowable = true,
-                Declared::Unresolved => {
-                    if contests {
-                        self.unfollowable = true;
-                    }
-                }
             }
         }
     }
@@ -3360,8 +3463,9 @@ fn declared_client(
         match bindings.get(&at.0, &at.1) {
             Some(ImportedBinding::Binding { file, name }) => at = (file.clone(), name.clone()),
             Some(ImportedBinding::Module(published)) => return Declared::Module(published.clone()),
-            Some(ImportedBinding::Unfollowable) => return Declared::Unfollowable,
-            Some(ImportedBinding::Unresolved) => return Declared::Unresolved,
+            Some(ImportedBinding::Unfollowable | ImportedBinding::Unresolved) => {
+                return Declared::Unfollowable;
+            }
             None => return Declared::Nothing,
         }
     }

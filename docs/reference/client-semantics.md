@@ -81,18 +81,31 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   `require("./api")` anywhere, or any call handed a relative specifier as its
   first argument (a `require` a factory made, `req("./api")`), since nothing
   says what is done with it.
-- **A use that cannot be followed** turns imported reading off. Where the
-  resolver stops at one of its limits before it can say what an import or a
-  load names (a re-export chain or an `export *` fan-out too long to walk),
-  the use may be of any instance, so no import in the service reads through
-  one. The same holds for an import whose specifier resolves to no file (an
-  alias no config the scan reads maps, a mapping whose target is missing, an
-  undeclared package) when the file writes through it, hands it on, reads a
-  member of it without calling it, or calls it by a computed key, and for
-  `import()` or `require` of such a specifier. A runtime builtin (`fs`,
-  `node:fs`) and a package the manifests declare are never such an import,
-  and a call through one by name takes nothing away. Each declaring module
-  still reads its own calls.
+- **A module the scan cannot follow** turns imported reading off: no import
+  in the service reads through an instance. That is so when any module of
+  the service names a specifier that resolves to no file, in any position
+  that loads a module at run time: a static import of any binding, a
+  side-effect import, a re-export (`export { x } from`, `export * from`,
+  `export * as ns from`), `import x = require()`, or `import()` or `require`
+  with a literal specifier. How the binding is then used does not matter.
+  - Such a specifier is an alias no config the scan reads maps, a mapping
+    whose target is missing, or an undeclared package; any of these may be
+    a bundler alias for a source file.
+  - What TypeScript erases does not count: an import none of whose bindings
+    is used as a value (`import type`, `{ type x }`, and a binding used only
+    in types), `export type`, and a re-export whose every specifier is
+    `type`. A JSX tag, and an `instanceof` or `typeof` operand, are value
+    uses.
+  - Neither does a module the runtime supplies, named exactly as Node lists
+    it with or without `node:` (`fs`, `node:fs`, `fs/promises`,
+    `node:sqlite`; not `http/client`, not `node:w-api`), nor a package the
+    manifests declare. A query or fragment names the file before it
+    (`./view.css?inline`).
+  - The same holds where the resolver stops at one of its limits (a
+    re-export chain or an `export *` fan-out too long to walk), or passes a
+    re-export hop to such a specifier in a module outside the service.
+
+  Each declaring module still reads its own calls.
 - **A base read in another module** is stated at an importer only where
   every piece of it means the same there: text the source writes, or an
   environment read (`process.env.API_URL`). A base that names a binding (an
@@ -179,13 +192,17 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   through a module of the service (`export { default as http } from "pkg"`)
   is not read as the package's client in the modules that import it from
   there.
-- In a repo whose aliases the scan does not resolve (the Vite layout, whose
+- In a service where any module names a specifier that resolves to no file
+  (an alias the scan cannot map, such as the Vite layout whose
   `tsconfig.json` only `references` the project that declares `paths`,
-  carrick#1595, or an alias only a bundler config declares), a use that
-  could take a client away through such an alias turns imported reading off
-  for the service. The service then reads as it did before imports were
-  followed. A call by name through an unresolved import, including a member
-  its verified surface does not name, is not seen.
+  carrick#1595; a bundler-only alias; an undeclared package), imported
+  instances read as they did before imports were followed. Registry and
+  remote specifiers (`npm:`, `jsr:`, a URL) and runtime modules other than
+  Node's (`bun:`) count the same way, so a Deno or Bun service that uses
+  them reads that way too.
+- A package the manifests declare that a bundler aliases to one of the
+  service's own modules is taken to be the package, so a module that writes
+  through the instance under that name is not seen.
 - An importer states no row for an instance whose base names a binding
   (carrick#1596).
 - Uses the scan does not read are not seen: a module outside the service's

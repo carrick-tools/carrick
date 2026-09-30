@@ -77,7 +77,7 @@ use crate::visitor::{
     ImportSymbolExtractor, ImportedSymbol, SymbolKind,
 };
 use crate::workspace_resolver::{Resolution, WorkspaceIndex};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -459,6 +459,15 @@ pub fn resolve_call_edges(
                     .insert(specifier.clone(), module);
             }
         }
+        for specifier in &wanted.specifiers {
+            if resolver.names_nothing_found(&index.path, specifier) {
+                bindings
+                    .unresolved
+                    .entry(index.path.clone())
+                    .or_default()
+                    .insert(specifier.clone());
+            }
+        }
     }
 
     CallResolution {
@@ -524,6 +533,10 @@ pub struct BindingsWanted {
     /// Specifiers of modules the file loads other than through an import
     /// binding.
     pub loads: BTreeSet<String>,
+    /// Every specifier the file names in a position that loads a module at
+    /// run time: those that name a module nothing here can find are
+    /// answered in [`ImportedBindings::unresolved_in`].
+    pub specifiers: BTreeSet<String>,
 }
 
 /// The answers to [`resolve_call_edges`]'s `bindings_wanted`, keyed by the
@@ -533,6 +546,7 @@ pub struct BindingsWanted {
 pub struct ImportedBindings {
     by_file: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
     loads: HashMap<PathBuf, HashMap<String, ImportedBinding>>,
+    unresolved: BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 impl ImportedBindings {
@@ -546,6 +560,13 @@ impl ImportedBindings {
     /// resolved.
     pub fn load(&self, importer: &Path, specifier: &str) -> Option<&ImportedBinding> {
         self.loads.get(importer)?.get(specifier)
+    }
+
+    /// Every file that loads a module by a specifier that names nothing the
+    /// scan can find ([`WorkspaceIndex::names_an_unknown_module`]), with those
+    /// specifiers.
+    pub fn unresolved_in(&self) -> &BTreeMap<PathBuf, BTreeSet<String>> {
+        &self.unresolved
     }
 }
 
@@ -657,60 +678,6 @@ impl UnresolvedImports {
     }
 }
 
-/// The modules the Node runtime provides, by the name a `node:`-less import
-/// writes (`fs`, `fs/promises`). The runtime's own list, not a library's.
-const NODE_BUILTINS: &[&str] = &[
-    "assert",
-    "async_hooks",
-    "buffer",
-    "child_process",
-    "cluster",
-    "console",
-    "constants",
-    "crypto",
-    "dgram",
-    "diagnostics_channel",
-    "dns",
-    "domain",
-    "events",
-    "fs",
-    "http",
-    "http2",
-    "https",
-    "inspector",
-    "module",
-    "net",
-    "os",
-    "path",
-    "perf_hooks",
-    "process",
-    "punycode",
-    "querystring",
-    "readline",
-    "repl",
-    "stream",
-    "string_decoder",
-    "sys",
-    "timers",
-    "tls",
-    "trace_events",
-    "tty",
-    "url",
-    "util",
-    "v8",
-    "vm",
-    "wasi",
-    "worker_threads",
-    "zlib",
-];
-
-/// A module the runtime supplies: a scheme (`node:fs`, `bun:test`) or a Node
-/// builtin written without one (`fs`, `fs/promises`).
-fn is_runtime_builtin(specifier: &str) -> bool {
-    matches!(specifier_kind(specifier), SpecifierKind::Scheme)
-        || NODE_BUILTINS.contains(&specifier.split('/').next().unwrap_or_default())
-}
-
 enum SpecifierKind {
     /// `node:fs`, `npm:x`, `jsr:@std/x`, `https://…`: a runtime or registry
     /// specifier, resolved outside the repo by design.
@@ -806,6 +773,9 @@ struct CallResolver<'a> {
     origin_conflicts: usize,
     /// Imports a call needed that resolved to nothing (carrick#1104).
     unresolved: UnresolvedImports,
+    /// (importer directory, specifier) -> whether it names a module nothing
+    /// the scan can find ([`CallResolver::names_nothing_found`]).
+    unresolved_specifiers: HashMap<(PathBuf, String), bool>,
 }
 
 impl<'a> CallResolver<'a> {
@@ -837,6 +807,7 @@ impl<'a> CallResolver<'a> {
             origin_resolved: 0,
             origin_conflicts: 0,
             unresolved: UnresolvedImports::default(),
+            unresolved_specifiers: HashMap::new(),
         }
     }
 
@@ -1175,7 +1146,8 @@ impl<'a> CallResolver<'a> {
     /// (carrick#1568): the module-scope binding it resolves to, or the whole
     /// module a namespace import or a namespace re-export stands for. `None`
     /// for anything that resolves outside the service or not at all, and
-    /// [`ImportedBinding::Unfollowable`] where a cap stopped the walk first.
+    /// [`ImportedBinding::Unfollowable`] or [`ImportedBinding::Unresolved`]
+    /// where a cap, or a hop to a module nothing resolves, stopped the walk.
     ///
     /// The same order [`resolve_imported_member`](Self::resolve_imported_member)
     /// takes: a named import is tried as a namespace re-export first, because
@@ -1184,6 +1156,7 @@ impl<'a> CallResolver<'a> {
         let symbol = index.imports.get(local)?.clone();
         let Some(target) = self.resolve_specifier(&index.path, &symbol.source) else {
             return self
+                .workspace
                 .names_an_unknown_module(&index.path, &symbol.source)
                 .then_some(ImportedBinding::Unresolved);
         };
@@ -1196,6 +1169,7 @@ impl<'a> CallResolver<'a> {
                 {
                     Lookup::Found(module) => return Some(self.module_binding(&module)),
                     Lookup::Capped => return Some(ImportedBinding::Unfollowable),
+                    Lookup::Unresolved => return Some(ImportedBinding::Unresolved),
                     Lookup::Absent => symbol.imported_name.as_str(),
                 }
             }
@@ -1209,6 +1183,7 @@ impl<'a> CallResolver<'a> {
                     .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
             }),
             Lookup::Capped => Some(ImportedBinding::Unfollowable),
+            Lookup::Unresolved => Some(ImportedBinding::Unresolved),
             Lookup::Absent => None,
         }
     }
@@ -1219,82 +1194,95 @@ impl<'a> CallResolver<'a> {
     fn loaded_module(&mut self, index: &FileCallIndex, specifier: &str) -> Option<ImportedBinding> {
         let Some(target) = self.resolve_specifier(&index.path, specifier) else {
             return self
+                .workspace
                 .names_an_unknown_module(&index.path, specifier)
                 .then_some(ImportedBinding::Unresolved);
         };
         Some(self.module_binding(&target))
     }
 
-    /// Whether `specifier`, which resolved to no file, may still name a module
-    /// of the service (carrick#1568): anything but a runtime builtin, a
-    /// runtime or registry scheme, and a package the manifests declare. An
-    /// alias the scan's config does not map and an undeclared package look
-    /// the same from here, and either may be a bundler alias for a source
-    /// file.
-    fn names_an_unknown_module(&self, importer: &Path, specifier: &str) -> bool {
-        if is_runtime_builtin(specifier) {
-            return false;
+    /// Whether `specifier`, as `importer` writes it, names a module nothing
+    /// the scan can find. Answered once per directory and specifier: every
+    /// file of a directory resolves a specifier the same way.
+    fn names_nothing_found(&mut self, importer: &Path, specifier: &str) -> bool {
+        let key = (
+            importer.parent().map(Path::to_path_buf).unwrap_or_default(),
+            specifier.to_string(),
+        );
+        if let Some(known) = self.unresolved_specifiers.get(&key) {
+            return *known;
         }
-        !matches!(
-            self.workspace.resolve(importer, specifier),
-            Resolution::External { .. }
-        )
+        let unknown = self.workspace.names_an_unknown_module(importer, specifier);
+        self.unresolved_specifiers.insert(key, unknown);
+        unknown
     }
 
-    /// Everything `module` publishes, or [`ImportedBinding::Unfollowable`]
-    /// when a cap stopped the walk before it could list it all.
+    /// Everything `module` publishes, or why the walk could not list it all.
     fn module_binding(&mut self, module: &Path) -> ImportedBinding {
         let mut seen = HashSet::from([module.to_path_buf()]);
         match self.published(module, &mut seen) {
-            Some(published) => ImportedBinding::Module(published),
-            None => ImportedBinding::Unfollowable,
+            Ok(published) => ImportedBinding::Module(published),
+            Err(stopped) => stopped,
         }
     }
 
     /// Every binding `module` publishes that a module of the service
     /// declares, under the name `module` publishes it as. A namespace
     /// re-export it publishes contributes the bindings of the module it
-    /// stands for, under its own name. `None` when a cap stopped any walk.
+    /// stands for, under its own name. The error is why a walk stopped:
+    /// [`ImportedBinding::Unfollowable`] or [`ImportedBinding::Unresolved`].
     fn published(
         &mut self,
         module: &Path,
         seen: &mut HashSet<PathBuf>,
-    ) -> Option<Vec<PublishedBinding>> {
-        let mut published = Vec::new();
-        for name in self.bindings.export_names_bounded(module)? {
-            match self.bindings.resolve_export_bounded(module, &name) {
-                Lookup::Found(binding) => {
-                    if let Some(index) = self.per_file.get(&binding.file) {
-                        published.push(PublishedBinding {
-                            published: name.clone(),
-                            file: index.path.clone(),
-                            name: binding
-                                .local_name
-                                .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
-                        });
-                    }
-                    continue;
-                }
-                Lookup::Capped => return None,
-                Lookup::Absent => {}
-            }
-            match self
-                .bindings
-                .resolve_namespace_export_bounded(module, &name)
-            {
-                Lookup::Found(inner) if seen.insert(inner.clone()) => {
-                    for binding in self.published(&inner, seen)? {
-                        published.push(PublishedBinding {
-                            published: name.clone(),
-                            ..binding
-                        });
-                    }
-                }
-                Lookup::Capped => return None,
-                _ => {}
+    ) -> Result<Vec<PublishedBinding>, ImportedBinding> {
+        fn stopped<T>(lookup: &Lookup<T>) -> Option<ImportedBinding> {
+            match lookup {
+                Lookup::Capped => Some(ImportedBinding::Unfollowable),
+                Lookup::Unresolved => Some(ImportedBinding::Unresolved),
+                Lookup::Found(_) | Lookup::Absent => None,
             }
         }
-        Some(published)
+        let names = match self.bindings.export_names_bounded(module) {
+            Lookup::Found(names) => names,
+            other => return Err(stopped(&other).unwrap_or(ImportedBinding::Unfollowable)),
+        };
+        let mut published = Vec::new();
+        for name in names {
+            let value = self.bindings.resolve_export_bounded(module, &name);
+            if let Some(stop) = stopped(&value) {
+                return Err(stop);
+            }
+            if let Lookup::Found(binding) = value {
+                if let Some(index) = self.per_file.get(&binding.file) {
+                    published.push(PublishedBinding {
+                        published: name.clone(),
+                        file: index.path.clone(),
+                        name: binding
+                            .local_name
+                            .unwrap_or_else(|| DEFAULT_EXPORT.to_string()),
+                    });
+                }
+                continue;
+            }
+            let namespace = self
+                .bindings
+                .resolve_namespace_export_bounded(module, &name);
+            if let Some(stop) = stopped(&namespace) {
+                return Err(stop);
+            }
+            if let Lookup::Found(inner) = namespace
+                && seen.insert(inner.clone())
+            {
+                for binding in self.published(&inner, seen)? {
+                    published.push(PublishedBinding {
+                        published: name.clone(),
+                        ..binding
+                    });
+                }
+            }
+        }
+        Ok(published)
     }
 
     /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export

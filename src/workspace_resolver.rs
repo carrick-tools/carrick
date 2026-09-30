@@ -95,6 +95,94 @@ pub struct MissingAliasTarget {
 
 /// The answer for a specifier no package accounted for: the mapping that
 /// claimed it, when one did.
+/// The modules the Node runtime provides, exactly as `require("module")
+/// .builtinModules` lists them (Node 24): each may be written with or without
+/// `node:`.
+const NODE_BUILTINS: &[&str] = &[
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_stream_duplex",
+    "_stream_passthrough",
+    "_stream_readable",
+    "_stream_transform",
+    "_stream_wrap",
+    "_stream_writable",
+    "_tls_common",
+    "_tls_wrap",
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// The Node builtins that exist only under `node:`.
+const NODE_PREFIXED_BUILTINS: &[&str] = &["sea", "sqlite", "test", "test/reporters"];
+
+/// Whether `specifier` names a module the Node runtime provides: one of its
+/// builtins, exactly, with or without `node:` (carrick#1568). A subpath the
+/// runtime does not list (`http/client`) is not one, whatever its first
+/// segment: a bundler or a `baseUrl` may map it to a source file.
+pub fn is_runtime_builtin(specifier: &str) -> bool {
+    match specifier.strip_prefix("node:") {
+        Some(name) => NODE_BUILTINS.contains(&name) || NODE_PREFIXED_BUILTINS.contains(&name),
+        None => NODE_BUILTINS.contains(&specifier),
+    }
+}
+
 fn unclaimed_or_missing(claimed: Option<MissingAliasTarget>) -> Resolution {
     match claimed {
         Some(missing) => Resolution::AliasTargetMissing(missing),
@@ -331,6 +419,35 @@ impl WorkspaceIndex {
     /// package names because that is the order the compiler and Deno apply
     /// them in: `paths` and an import map are consulted before any package
     /// lookup.
+    /// Whether `specifier`, as `from_file` writes it, may name a module of
+    /// the repo that nothing here can find (carrick#1568): anything that
+    /// resolves to no file, other than a runtime builtin
+    /// ([`is_runtime_builtin`]) and a package the manifests declare. An alias
+    /// no config the scan reads maps and an undeclared package look the same
+    /// from here, and either may be a bundler alias for a source file. A
+    /// query or fragment (`./styles.css?inline`) names the file before it.
+    pub fn names_an_unknown_module(&self, from_file: &Path, specifier: &str) -> bool {
+        let specifier = specifier.split(['?', '#']).next().unwrap_or(specifier);
+        if specifier.is_empty() || is_runtime_builtin(specifier) {
+            return false;
+        }
+        // The relative resolver call edges use, which also reads `./x.js` as
+        // the `./x.ts` beside it.
+        if (specifier.starts_with("./") || specifier.starts_with("../"))
+            && crate::agents::file_orchestrator::FileOrchestrator::resolve_relative_import(
+                from_file, specifier,
+            )
+            .is_some()
+        {
+            return false;
+        }
+        match self.resolve(from_file, specifier) {
+            Resolution::External { .. } => false,
+            Resolution::Internal(relative) => self.source_path(&relative).is_none(),
+            Resolution::AliasTargetMissing(_) | Resolution::Unresolved => true,
+        }
+    }
+
     pub fn resolve(&self, from_file: &Path, specifier: &str) -> Resolution {
         if specifier.starts_with("./") || specifier.starts_with("../") {
             let base = match from_file.parent() {

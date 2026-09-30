@@ -127,6 +127,10 @@ pub struct BindingResolver {
     /// at an answer: what it looked for may exist beyond the cap. Read by the
     /// `*_bounded` lookups, which reset it first (carrick#1568).
     capped: bool,
+    /// Set when a walk passed a hop whose specifier names a module the
+    /// resolver cannot find ([`WorkspaceIndex::names_an_unknown_module`]):
+    /// what it looked for may be behind it.
+    unresolved_hop: bool,
 }
 
 /// What a bounded lookup found.
@@ -137,6 +141,8 @@ pub enum Lookup<T> {
     Absent,
     /// The walk stopped at a cap before it could say.
     Capped,
+    /// The walk passed a hop to a module nothing resolves, so it cannot say.
+    Unresolved,
 }
 
 impl Default for BindingResolver {
@@ -159,6 +165,7 @@ impl BindingResolver {
             workspace: None,
             commonjs: false,
             capped: false,
+            unresolved_hop: false,
         }
     }
 
@@ -190,6 +197,20 @@ impl BindingResolver {
             Some(workspace) => workspace.resolve_module_path(importer, specifier),
             None => FileOrchestrator::resolve_relative_import(importer, specifier),
         }
+    }
+
+    /// [`resolve_module`](Self::resolve_module) for a hop a value walk takes,
+    /// noting a specifier that names a module nothing the resolver can find
+    /// (carrick#1568): what the walk looks for may be behind it.
+    fn hop(&mut self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        let next = self.resolve_module(importer, specifier);
+        if next.is_none()
+            && let Some(workspace) = &self.workspace
+            && workspace.names_an_unknown_module(importer, specifier)
+        {
+            self.unresolved_hop = true;
+        }
+        next
     }
 
     /// Resolve the binding `local_binding` that `importer` imports from
@@ -331,7 +352,7 @@ impl BindingResolver {
         names.extend(exports.forwarded.keys().cloned());
         names.extend(exports.namespaces.keys().cloned());
         for specifier in exports.stars.clone() {
-            let Some(next) = self.resolve_module(&file, &specifier) else {
+            let Some(next) = self.hop(&file, &specifier) else {
                 continue;
             };
             if !visited.insert(next.clone()) {
@@ -368,7 +389,7 @@ impl BindingResolver {
 
         // `export { x as y } from "./m"` — the binding lives one hop away.
         if let Some((specifier, upstream_name)) = exports.forwarded.get(&export_name).cloned() {
-            let next = self.resolve_module(&file, &specifier)?;
+            let next = self.hop(&file, &specifier)?;
             if !visited.insert(next.clone()) {
                 return None; // circular re-export
             }
@@ -384,7 +405,7 @@ impl BindingResolver {
         // but never its default, so a default lookup stops here.
         if export_name != DEFAULT_EXPORT {
             for specifier in exports.stars.clone() {
-                let Some(next) = self.resolve_module(&file, &specifier) else {
+                let Some(next) = self.hop(&file, &specifier) else {
                     continue;
                 };
                 if !visited.insert(next.clone()) {
@@ -427,12 +448,9 @@ impl BindingResolver {
         file: &Path,
         export_name: &str,
     ) -> Lookup<ResolvedBinding> {
-        self.capped = false;
-        match self.follow(file, export_name) {
-            Some(found) => Lookup::Found(found),
-            None if self.capped => Lookup::Capped,
-            None => Lookup::Absent,
-        }
+        self.reset_bounds();
+        let found = self.follow(file, export_name);
+        self.bounded(found)
     }
 
     /// [`resolve_namespace_export`](Self::resolve_namespace_export), telling
@@ -442,20 +460,38 @@ impl BindingResolver {
         file: &Path,
         export_name: &str,
     ) -> Lookup<PathBuf> {
-        self.capped = false;
-        match self.resolve_namespace_export(file, export_name) {
-            Some(found) => Lookup::Found(found),
-            None if self.capped => Lookup::Capped,
-            None => Lookup::Absent,
+        self.reset_bounds();
+        let found = self.resolve_namespace_export(file, export_name);
+        self.bounded(found)
+    }
+
+    /// [`export_names`](Self::export_names), or why the walk could not list
+    /// everything.
+    pub fn export_names_bounded(&mut self, file: &Path) -> Lookup<Vec<String>> {
+        self.reset_bounds();
+        let names = self.export_names(file);
+        if self.capped {
+            Lookup::Capped
+        } else if self.unresolved_hop {
+            Lookup::Unresolved
+        } else {
+            Lookup::Found(names)
         }
     }
 
-    /// [`export_names`](Self::export_names), or `None` when a cap stopped
-    /// the walk before it listed everything.
-    pub fn export_names_bounded(&mut self, file: &Path) -> Option<Vec<String>> {
+    fn reset_bounds(&mut self) {
         self.capped = false;
-        let names = self.export_names(file);
-        (!self.capped).then_some(names)
+        self.unresolved_hop = false;
+    }
+
+    /// What a bounded walk that answered `found` knows.
+    fn bounded<T>(&self, found: Option<T>) -> Lookup<T> {
+        match found {
+            Some(found) => Lookup::Found(found),
+            None if self.capped => Lookup::Capped,
+            None if self.unresolved_hop => Lookup::Unresolved,
+            None => Lookup::Absent,
+        }
     }
 
     fn follow_namespace(
@@ -473,12 +509,12 @@ impl BindingResolver {
 
         // Declared here: `export * as ns from "./m"`.
         if let Some(specifier) = exports.namespaces.get(&export_name).cloned() {
-            return self.resolve_module(&file, &specifier);
+            return self.hop(&file, &specifier);
         }
 
         // `export { ns as alias } from "./m"` forwards the binding one hop.
         if let Some((specifier, upstream)) = exports.forwarded.get(&export_name).cloned() {
-            let next = self.resolve_module(&file, &specifier)?;
+            let next = self.hop(&file, &specifier)?;
             if !visited.insert(next.clone()) {
                 return None; // circular re-export
             }
@@ -492,7 +528,7 @@ impl BindingResolver {
         }
 
         for specifier in exports.stars.clone() {
-            let Some(next) = self.resolve_module(&file, &specifier) else {
+            let Some(next) = self.hop(&file, &specifier) else {
                 continue;
             };
             if !visited.insert(next.clone()) {

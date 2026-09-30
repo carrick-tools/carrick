@@ -5857,7 +5857,7 @@ fn discover_files_and_symbols(
     let mut request_irs: HashMap<PathBuf, crate::request_summary::FileIr> = HashMap::new();
     // The imports those summaries read the value of, per file keyed like
     // `per_file_calls`: resolved by the call graph's own walk (carrick#1568).
-    let mut bindings_wanted: HashMap<PathBuf, crate::call_graph::BindingsWanted> = HashMap::new();
+    let mut wanted_from: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
@@ -5891,7 +5891,7 @@ fn discover_files_and_symbols(
             let canonical = file_path
                 .canonicalize()
                 .unwrap_or_else(|_| file_path.clone());
-            bindings_wanted.insert(canonical.clone(), request_ir.bindings_wanted());
+            wanted_from.push((canonical.clone(), file_path.clone()));
             request_irs.insert(file_path.clone(), request_ir);
             per_file_calls.insert(
                 canonical,
@@ -5938,6 +5938,18 @@ fn discover_files_and_symbols(
             .as_ref()
             .map(|(directory, config)| (directory.as_path(), config.as_path())),
     );
+    // Every specifier matters only where some module holds an instance
+    // another may import: that is the only reading it can turn off.
+    let every_specifier = request_irs
+        .values()
+        .any(crate::request_summary::FileIr::holds_instances);
+    let bindings_wanted: HashMap<PathBuf, crate::call_graph::BindingsWanted> = wanted_from
+        .into_iter()
+        .map(|(canonical, walked)| {
+            let wanted = request_irs[&walked].bindings_wanted(every_specifier);
+            (canonical, wanted)
+        })
+        .collect();
     let resolution = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
         &per_file_calls,
@@ -12049,7 +12061,7 @@ mod tests {
     /// options and claims.
     #[test]
     fn an_instance_imported_from_another_module_reads_through_its_declaration() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/lib/api.ts", SHARED_API),
             (
                 "src/users.ts",
@@ -12112,7 +12124,7 @@ mod tests {
     /// it imports.
     #[test]
     fn an_instance_reached_through_a_barrel_a_rename_or_a_default_reads_through_it() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/lib/api.ts", SHARED_API),
             (
                 "src/clients/svc.ts",
@@ -12177,7 +12189,7 @@ mod tests {
                  export function call() {{ return api.get(\"{path}\"); }}\n"
             )
         };
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             // Written through after the export, in its own module.
             (
                 "src/written/api.ts",
@@ -12289,7 +12301,7 @@ mod tests {
     /// binding a use means; the other importers are unaffected.
     #[test]
     fn an_imported_name_declared_again_reads_nothing_in_that_file() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/lib/api.ts", SHARED_API),
             (
                 "src/shadowed.ts",
@@ -12321,7 +12333,7 @@ mod tests {
     /// service's own files, whose other importers the scan cannot see.
     #[test]
     fn a_client_reached_through_a_namespace_reads_nothing_anywhere() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/lib/api.ts", SHARED_API),
             (
                 "src/users.ts",
@@ -12342,7 +12354,7 @@ mod tests {
         }
 
         // A namespace only called through (`lib.health()`) changes nothing.
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/lib/api.ts", SHARED_API),
             (
                 "src/users.ts",
@@ -12431,13 +12443,31 @@ mod tests {
         ]
     }
 
-    /// Discovery over `files`, owned strings.
+    /// The manifest a service using the contract sample's packages declares
+    /// them in. Without it they are undeclared packages, which name nothing
+    /// the scan can find and turn imported reading off (carrick#1568).
+    const SAMPLE_MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"fixture-prefix-http\": \"^2.1.0\" } }\n";
+
+    /// Discovery over `files`, owned strings, in a service whose manifest
+    /// declares the contract sample's packages unless `files` bring one.
     fn discover_owned(files: &[(String, String)]) -> (tempfile::TempDir, FileDiscovery) {
-        let borrowed: Vec<(&str, &str)> = files
+        let mut borrowed: Vec<(&str, &str)> = files
             .iter()
             .map(|(name, source)| (name.as_str(), source.as_str()))
             .collect();
+        if !borrowed.iter().any(|(name, _)| *name == "package.json") {
+            borrowed.push(("package.json", SAMPLE_MANIFEST));
+        }
         discover_sources(&borrowed)
+    }
+
+    /// [`discover_owned`] over borrowed sources.
+    fn discover_service(files: &[(&str, &str)]) -> (tempfile::TempDir, FileDiscovery) {
+        let owned: Vec<(String, String)> = files
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect();
+        discover_owned(&owned)
     }
 
     /// carrick#1568 fix round 1, F2: a module loaded other than through an
@@ -12723,37 +12753,203 @@ mod tests {
         }
     }
 
-    /// carrick#1568 fix round 2, W1: what an unfollowable import cannot
-    /// reach. A call through one by name takes nothing away, and neither does
-    /// any use of a runtime builtin or a declared package, a relative
-    /// specifier handed to a call that names no module, or an alias nothing
-    /// maps that is only called through.
+    /// carrick#1568 fix round 3: a module that names a specifier nothing
+    /// resolves, in any position that loads a module at run time, turns
+    /// imported reading off, however the binding is then used: each
+    /// re-export form through a barrel, a side-effect import, a call by name
+    /// (on or off the verified surface), an `instanceof` read, a JSX tag, a
+    /// subpath of a builtin's name the runtime does not list (`http/client`)
+    /// and a `node:` name that is no builtin. A clean importer beside it
+    /// reads nothing either; the declaring module keeps its own calls.
     #[test]
-    fn an_unfollowable_import_used_only_by_calls_or_naming_the_runtime_takes_nothing_away() {
+    fn a_module_naming_a_specifier_nothing_resolves_turns_imported_reading_off() {
+        let write = "(api as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "export from",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export { api } from \"@/w/api\";\n".to_string()),
+                    ("src/w/boot.ts".to_string(), format!("import {{ api }} from \"./barrel\";\n{write}")),
+                ],
+            ),
+            (
+                "export star",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export * from \"@/w/api\";\n".to_string()),
+                    ("src/w/boot.ts".to_string(), format!("import {{ api }} from \"./barrel\";\n{write}")),
+                ],
+            ),
+            (
+                "export star as",
+                vec![
+                    ("src/w/barrel.ts".to_string(), "export * as ns from \"@/w/api\";\n".to_string()),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        "import { ns } from \"./barrel\";\n(ns.api as any).defaults.baseURL = \"x\";\n".to_string(),
+                    ),
+                ],
+            ),
+            // A barrel no file imports through: only the specifier it names
+            // can say anything.
+            (
+                "export renamed, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export { api as client } from \"@/w/api\";\n".to_string())],
+            ),
+            (
+                "export star, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export * from \"@/w/api\";\n".to_string())],
+            ),
+            (
+                "export star as, barrel alone",
+                vec![("src/w/barrel.ts".to_string(), "export * as ns from \"@/w/api\";\n".to_string())],
+            ),
+            ("side effect", vec![("src/w/boot.ts".to_string(), "import \"@/w/setup\";\n".to_string())]),
+            (
+                "call by name off the surface",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\n(api as any).setBaseURL(\"https://elsewhere.example\");\n".to_string(),
+                )],
+            ),
+            (
+                "call by name on the surface",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\nexport function f() { return api.get(\"/boot\"); }\n".to_string(),
+                )],
+            ),
+            (
+                "instanceof",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { HttpError } from \"@/w/errors\";\nexport const isErr = (e: unknown): boolean => e instanceof HttpError;\n".to_string(),
+                )],
+            ),
+            (
+                "jsx",
+                vec![(
+                    "src/w/view.tsx".to_string(),
+                    "import { Button } from \"@/w/button\";\nexport const v = <Button />;\n".to_string(),
+                )],
+            ),
+            (
+                "builtin-named subpath",
+                vec![("src/w/boot.ts".to_string(), format!("import {{ api }} from \"http/client\";\n{write}"))],
+            ),
+            (
+                "node: name that is no builtin",
+                vec![("src/w/boot.ts".to_string(), format!("import {{ api }} from \"node:w-api\";\n{write}"))],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(api_and_reader("ctl", "/ctl"));
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            for reader in ["src/w/reader.ts", "src/ctl/reader.ts"] {
+                let rows = library_rows_of(&dir, &discovery, reader, &verified_sample());
+                assert!(rows.is_empty(), "{case}: {reader}: {rows:#?}");
+            }
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/ctl/api.ts"),
+                stated(&[(3, "GET", "/ctl/own")]),
+                "{case}: the declaring module still reads its own calls"
+            );
+        }
+    }
+
+    /// carrick#1568 fix round 3: what loads nothing, or loads only what the
+    /// runtime or a declared package supplies, turns nothing off. `import
+    /// type`, `type`-only specifiers, an import used only as a type (which
+    /// the compiler erases), exact runtime builtins with and without `node:`
+    /// (`fs`, `node:fs`, `fs/promises`, `node:sqlite`), a declared package,
+    /// a relative specifier handed to a call that names a directory, an
+    /// asset import with a query (`./view.css?inline`), and `./helper.js`
+    /// naming the `helper.ts` beside it.
+    #[test]
+    fn a_module_naming_only_erased_imports_builtins_or_declared_packages_turns_nothing_off() {
         let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
         files.push((
             "package.json".to_string(),
-            "{ \"name\": \"w\", \"dependencies\": { \"declared-pkg\": \"^1.0.0\" } }\n".to_string(),
+            "{ \"name\": \"w\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"declared-package\": \"^1.0.0\" } }\n".to_string(),
         ));
         files.push((
             "src/w/boot.ts".to_string(),
-            "import { api } from \"@/w/api\";\n\
+            "import type { Api } from \"@/types\";\n\
+             import { type Api as A2 } from \"@/types\";\n\
+             import { Api as A3 } from \"@/types\";\n\
+             export type { Api as A4 } from \"@/types\";\n\
+             export { type Api as A5 } from \"@/types\";\n\
              import { EventEmitter } from \"events\";\n\
              import fs from \"node:fs\";\n\
-             import { promises } from \"fs/promises\";\n\
-             import * as declared from \"declared-pkg\";\n\
+             import { readFile } from \"fs/promises\";\n\
+             import { DatabaseSync } from \"node:sqlite\";\n\
+             import * as declared from \"declared-package\";\n\
+             import styles from \"./view.css?inline\";\n\
+             import { helper } from \"./helper.js\";\n\
              declare function serve(dir: string): void;\n\
+             export const x: Api | A2 | A3 | undefined = undefined;\n\
              export class Bus extends EventEmitter {}\n\
-             export const read = [fs.readFileSync, promises, declared.thing];\n\
-             serve(\"./public\");\n\
-             export function boot() { return api.get(\"/boot\"); }\n"
+             export const read = [fs.readFileSync, readFile, DatabaseSync, declared.thing, styles, helper];\n\
+             serve(\"./public\");\n"
                 .to_string(),
+        ));
+        files.push((
+            "src/w/view.css".to_string(),
+            ".a { color: red; }\n".to_string(),
+        ));
+        files.push((
+            "src/w/helper.ts".to_string(),
+            "export const helper = 1;\n".to_string(),
         ));
         let (dir, discovery) = discover_owned(&files);
         assert_eq!(
             library_stated(&dir, &discovery, "src/w/reader.ts"),
             stated(&[(2, "GET", "/w/read")])
         );
+    }
+
+    /// carrick#1568 fix round 3: a barrel outside the service that re-exports
+    /// through a specifier nothing resolves answers "unresolved", not
+    /// "absent", so an import through it turns imported reading off where no
+    /// file of the service names that specifier itself.
+    #[test]
+    fn an_import_through_an_outside_barrel_that_resolves_nothing_turns_imported_reading_off() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let files: Vec<(String, String)> = [
+            ("package.json".to_string(), SAMPLE_MANIFEST.to_string()),
+            (
+                "other/barrel.ts".to_string(),
+                "export { api } from \"@/svc/lib/api\";\n".to_string(),
+            ),
+            (
+                "svc/boot.ts".to_string(),
+                "import { api } from \"../other/barrel\";\n(api as any).defaults.baseURL = \"x\";\n"
+                    .to_string(),
+            ),
+        ]
+        .into_iter()
+        .chain(api_and_reader("lib", "/svc").map(|(name, source)| {
+            (
+                name.replace("src/lib/", "svc/lib/"),
+                source,
+            )
+        }))
+        .collect();
+        for (name, source) in &files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(&path, source).expect("write");
+        }
+        let service = Config {
+            directory: Some("svc".to_string()),
+            ..Config::default()
+        };
+        let cm: Lrc<SourceMap> = Default::default();
+        let discovery =
+            discover_files_and_symbols(&dir.path().to_string_lossy(), &service, cm).unwrap();
+        let rows = library_rows_of(&dir, &discovery, "svc/lib/reader.ts", &verified_sample());
+        assert!(rows.is_empty(), "{rows:#?}");
     }
 
     /// carrick#1568 fix round 1, F1: a row stated in an importing module
@@ -12764,7 +12960,7 @@ mod tests {
     /// whatever the importer binds to that name.
     #[test]
     fn an_imported_instance_states_only_a_base_that_means_the_same_in_the_importer() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             (
                 "src/q06/config.ts",
                 "export const config = { apiUrl: process.env.ORDERS_API_URL };\n",
@@ -12849,7 +13045,7 @@ mod tests {
     /// the import is no use of it, so it takes nothing away anywhere.
     #[test]
     fn a_function_expression_name_shadows_and_a_type_key_does_not_use() {
-        let (dir, discovery) = discover_sources(&[
+        let (dir, discovery) = discover_service(&[
             ("src/p08/api.ts", SHARED_API),
             (
                 "src/p08/shadow.ts",
