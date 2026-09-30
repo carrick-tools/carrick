@@ -475,8 +475,10 @@ pub fn extract_file_ir(
     source_map: &Lrc<SourceMap>,
     definition_keys: &HashSet<String>,
 ) -> FileIr {
+    let jsx = jsx_names(module);
     let mut uses = BindingUses::default();
     module.visit_with(&mut uses);
+    uses.settle_aliases(&jsx);
     let (imports, bound_requires) = import_bindings(module);
     // Every import the file uses, however it uses it: a module that declares
     // one holds what these uses may change (carrick#1568). Kept whether or
@@ -515,7 +517,6 @@ pub fn extract_file_ir(
         })
         .map(|(name, _)| name.clone())
         .collect();
-    let jsx = jsx_names(module);
     let value_specifiers = value_specifiers(module, |name| {
         module_scope.uses.contains_key(name) || jsx.contains(name)
     });
@@ -751,6 +752,15 @@ impl BindingUse {
 #[derive(Default)]
 struct BindingUses {
     uses: HashMap<String, BindingUse>,
+    /// `import alias = root.a.b` declarations, settled after the walk.
+    aliases: Vec<EntityAlias>,
+}
+
+/// `import alias = root.a.b` (`export import` when `exported`).
+struct EntityAlias {
+    alias: String,
+    root: String,
+    exported: bool,
 }
 
 impl BindingUses {
@@ -835,6 +845,30 @@ impl Visit for BindingUses {
     fn visit_ts_type(&mut self, _: &TsType) {}
 
     fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+
+    // A class's `implements` and an interface's `extends` name types, which
+    // the compiler erases.
+    fn visit_ts_expr_with_type_args(&mut self, _: &TsExprWithTypeArgs) {}
+
+    // `import client = lib.api` names `lib` in no expression. Whether that is
+    // a use depends on whether `client` is used as a value, which is known
+    // only once the whole file is read ([`BindingUses::settle_aliases`]).
+    // `import type x = …` binds a type, which no value use can reach.
+    fn visit_ts_import_equals_decl(&mut self, decl: &TsImportEqualsDecl) {
+        if let TsModuleRef::TsEntityName(entity) = &decl.module_ref {
+            let mut root = entity;
+            while let TsEntityName::TsQualifiedName(qualified) = root {
+                root = &qualified.left;
+            }
+            if let TsEntityName::Ident(ident) = root {
+                self.aliases.push(EntityAlias {
+                    alias: decl.id.sym.to_string(),
+                    root: ident.sym.to_string(),
+                    exported: decl.is_export,
+                });
+            }
+        }
+    }
 
     fn visit_expr(&mut self, expr: &Expr) {
         if let Some(key) = binding_key(expr) {
@@ -995,6 +1029,37 @@ impl Visit for BindingUses {
 }
 
 impl BindingUses {
+    /// An `import alias = root.a.b` whose alias is exported or used as a value
+    /// (`uses`, or a JSX tag in `jsx`) hands `root` on: what it reaches may be
+    /// changed through the alias (carrick#1568). One used only as a type is
+    /// erased, and names nothing. Settled to a fixed point, so an alias of an
+    /// alias reaches the first root.
+    fn settle_aliases(&mut self, jsx: &HashSet<String>) {
+        let mut settled: HashSet<usize> = HashSet::new();
+        loop {
+            let ready: Vec<usize> = self
+                .aliases
+                .iter()
+                .enumerate()
+                .filter(|(index, alias)| {
+                    !settled.contains(index)
+                        && (alias.exported
+                            || self.uses.contains_key(&alias.alias)
+                            || jsx.contains(&alias.alias))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if ready.is_empty() {
+                return;
+            }
+            for index in ready {
+                settled.insert(index);
+                let root = self.aliases[index].root.clone();
+                self.mark(root, |used| used.other = true);
+            }
+        }
+    }
+
     fn spread(&mut self, expr: &Expr) {
         match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
             Some(key) => self.mark(key, |used| used.spread = true),

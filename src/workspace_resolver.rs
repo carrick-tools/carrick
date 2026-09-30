@@ -229,6 +229,10 @@ pub struct WorkspaceIndex {
     /// Every package name any manifest declares as a runtime dependency, minus
     /// the workspace's own package names.
     external_packages: BTreeSet<String>,
+    /// Every package name any manifest declares in `devDependencies`. Not
+    /// egress, so not in `external_packages`; still a package, not one of the
+    /// repo's own modules ([`WorkspaceIndex::names_an_unknown_module`]).
+    dev_packages: BTreeSet<String>,
     /// Workspace package name -> its directory.
     internal_packages: BTreeMap<String, InternalPackage>,
     /// The aliases the repo's config declares. `None` for an index built by
@@ -269,6 +273,7 @@ impl WorkspaceIndex {
 
     fn build_inner(repo_root: &Path, aliases: Option<Option<(&Path, &Path)>>) -> Self {
         let mut declared: BTreeSet<String> = BTreeSet::new();
+        let mut dev_declared: BTreeSet<String> = BTreeSet::new();
         let mut internal_names: BTreeSet<String> = BTreeSet::new();
         let mut internal_packages: BTreeMap<String, InternalPackage> = BTreeMap::new();
 
@@ -286,6 +291,7 @@ impl WorkspaceIndex {
             declared.extend(facts.package.dependencies.keys().cloned());
             declared.extend(facts.package.peer_dependencies.keys().cloned());
             declared.extend(facts.package.optional_dependencies.keys().cloned());
+            dev_declared.extend(facts.package.dev_dependencies.keys().cloned());
             let Some(name) = facts.package.name.as_deref() else {
                 continue;
             };
@@ -337,6 +343,7 @@ impl WorkspaceIndex {
                 .canonicalize()
                 .unwrap_or_else(|_| repo_root.to_path_buf()),
             external_packages: declared,
+            dev_packages: dev_declared,
             internal_packages,
             aliases,
         }
@@ -444,8 +451,30 @@ impl WorkspaceIndex {
         match self.resolve(from_file, specifier) {
             Resolution::External { .. } => false,
             Resolution::Internal(relative) => self.source_path(&relative).is_none(),
-            Resolution::AliasTargetMissing(_) | Resolution::Unresolved => true,
+            Resolution::AliasTargetMissing(_) | Resolution::Unresolved => {
+                longest_match(specifier, self.dev_packages.iter()).is_none()
+                    && !self.alias_names_a_file(from_file, specifier)
+            }
         }
+    }
+
+    /// Whether an alias the repo's config declares maps `specifier` onto a
+    /// file that is there, whatever its extension (`@/styles/globals.css`).
+    /// The module resolver itself reads source files only.
+    fn alias_names_a_file(&self, from_file: &Path, specifier: &str) -> bool {
+        let Some(aliases) = self.aliases.as_ref() else {
+            return false;
+        };
+        let from_file = self.repo_relative(from_file);
+        aliases
+            .resolve(&from_file, specifier)
+            .iter()
+            .any(|matched| match &matched.target {
+                AliasTarget::Paths(candidates) => {
+                    candidates.iter().any(|candidate| self.exists(candidate))
+                }
+                AliasTarget::Leaves { .. } => false,
+            })
     }
 
     pub fn resolve(&self, from_file: &Path, specifier: &str) -> Resolution {

@@ -77,7 +77,8 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   in every module, the declaring module's own calls included. A namespace
   import of the module (`import * as lib`) used any way but calling one of
   its members directly (`lib.fn()`) takes away every instance the module
-  publishes. So does loading the module any other way: `import("./api")` or
+  publishes, and so does an `import client = lib.api` alias of it that is
+  used as a value or exported. So does loading the module any other way: `import("./api")` or
   `require("./api")` anywhere, or any call handed a relative specifier as its
   first argument (a `require` a factory made, `req("./api")`), since nothing
   says what is done with it.
@@ -87,19 +88,28 @@ the re-ask rules and the in-scan schedule) and `src/request_summary.rs`
   that loads a module at run time: a static import of any binding, a
   side-effect import, a re-export (`export { x } from`, `export * from`,
   `export * as ns from`), `import x = require()`, or `import()` or `require`
-  with a literal specifier. How the binding is then used does not matter.
+  with a literal specifier. How the binding is then used does not matter:
+  a named call to a function that writes through the instance (its own
+  module's `setBase`, or one a third module exports) and a side-effect
+  import of a setup module that writes through it are as able to change it
+  as a write in plain sight.
   - Such a specifier is an alias no config the scan reads maps, a mapping
     whose target is missing, or an undeclared package; any of these may be
-    a bundler alias for a source file.
+    a bundler alias for a source file. An alias the config maps onto a file
+    that is there names that file, whatever its extension
+    (`@/styles/globals.css`, `@/data/x.json`).
   - What TypeScript erases does not count: an import none of whose bindings
     is used as a value (`import type`, `{ type x }`, and a binding used only
     in types), `export type`, and a re-export whose every specifier is
-    `type`. A JSX tag, and an `instanceof` or `typeof` operand, are value
-    uses.
+    `type`. A class's `implements` and an interface's `extends` are type
+    positions. A JSX tag (including the root of `<ui.Button />`), and an
+    `instanceof` or `typeof` operand, are value uses. `import client =
+    lib.api` used as a value, or exported, is a value use of `lib` that
+    hands it on; one used only as a type (`import T = lib.Api`) is erased.
   - Neither does a module the runtime supplies, named exactly as Node lists
     it with or without `node:` (`fs`, `node:fs`, `fs/promises`,
     `node:sqlite`; not `http/client`, not `node:w-api`), nor a package the
-    manifests declare. A query or fragment names the file before it
+    manifests declare, `devDependencies` included. A query or fragment names the file before it
     (`./view.css?inline`).
   - The same holds where the resolver stops at one of its limits (a
     re-export chain or an `export *` fan-out too long to walk), or passes a

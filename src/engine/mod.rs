@@ -12448,6 +12448,10 @@ mod tests {
     /// the scan can find and turn imported reading off (carrick#1568).
     const SAMPLE_MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"fixture-prefix-http\": \"^2.1.0\" } }\n";
 
+    /// A tsconfig mapping `@/*` onto `src/`.
+    const PATHS_TSCONFIG: &str =
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"./src/*\"] } } }\n";
+
     /// Discovery over `files`, owned strings, in a service whose manifest
     /// declares the contract sample's packages unless `files` bring one.
     fn discover_owned(files: &[(String, String)]) -> (tempfile::TempDir, FileDiscovery) {
@@ -12840,6 +12844,56 @@ mod tests {
                 "node: name that is no builtin",
                 vec![("src/w/boot.ts".to_string(), format!("import {{ api }} from \"node:w-api\";\n{write}"))],
             ),
+            // Positions that name a binding in no expression of their own.
+            (
+                "import-equals alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/api\";\nimport client = lib.api;\n(client as any).defaults.baseURL = \"x\";\n".to_string(),
+                )],
+            ),
+            (
+                "export import alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/api\";\nexport import client = lib.api;\n".to_string(),
+                )],
+            ),
+            (
+                "class extends a member",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/base\";\nexport class S extends lib.Base {}\n".to_string(),
+                )],
+            ),
+            (
+                "decorator member chain",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import * as lib from \"@/w/decorators\";\n@lib.tag()\nexport class S {}\n".to_string(),
+                )],
+            ),
+            (
+                "jsx member root",
+                vec![(
+                    "src/w/view.tsx".to_string(),
+                    "import * as ui from \"@/w/ui\";\nexport const v = <ui.Button />;\n".to_string(),
+                )],
+            ),
+            (
+                "export =",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    "import { api } from \"@/w/api\";\nexport = api;\n".to_string(),
+                )],
+            ),
+            (
+                "an alias onto a file that is not there",
+                vec![
+                    ("tsconfig.json".to_string(), PATHS_TSCONFIG.to_string()),
+                    ("src/w/boot.ts".to_string(), "import \"@/styles/missing.css\";\n".to_string()),
+                ],
+            ),
         ];
         for (case, extra) in cases {
             let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
@@ -12864,14 +12918,43 @@ mod tests {
     /// the compiler erases), exact runtime builtins with and without `node:`
     /// (`fs`, `node:fs`, `fs/promises`, `node:sqlite`), a declared package,
     /// a relative specifier handed to a call that names a directory, an
-    /// asset import with a query (`./view.css?inline`), and `./helper.js`
-    /// naming the `helper.ts` beside it.
+    /// asset import with a query (`./view.css?inline`), `./helper.js`
+    /// naming the `helper.ts` beside it, `import T = ns.Type` used only as a
+    /// type, `implements` and an interface's `extends` (types), a package
+    /// declared in `devDependencies`, and a `paths` alias that lands on a
+    /// `.css` or `.json` file that is there.
     #[test]
     fn a_module_naming_only_erased_imports_builtins_or_declared_packages_turns_nothing_off() {
         let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
         files.push((
             "package.json".to_string(),
-            "{ \"name\": \"w\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"declared-package\": \"^1.0.0\" } }\n".to_string(),
+            "{ \"name\": \"w\", \"dependencies\": { \"@fixture/http\": \"^1.4.0\", \"declared-package\": \"^1.0.0\" }, \"devDependencies\": { \"dev-only\": \"^1.0.0\" } }\n".to_string(),
+        ));
+        files.push(("tsconfig.json".to_string(), PATHS_TSCONFIG.to_string()));
+        files.push((
+            "src/styles/globals.css".to_string(),
+            "body {}\n".to_string(),
+        ));
+        files.push(("src/data/x.json".to_string(), "{ \"a\": 1 }\n".to_string()));
+        files.push((
+            "src/w/types-only.ts".to_string(),
+            "import * as unmapped from \"~unmapped/api\";\n\
+             import T = unmapped.Api;\n\
+             import { Shape } from \"~unmapped/types\";\n\
+             import { Base } from \"~unmapped/base\";\n\
+             export let t: T | undefined;\n\
+             export class S implements Shape { get(p: string): unknown { return p; } }\n\
+             export interface Mine extends Base { y: number }\n"
+                .to_string(),
+        ));
+        files.push((
+            "src/w/assets.ts".to_string(),
+            "import \"@/styles/globals.css\";\n\
+             import data from \"@/data/x.json\";\n\
+             import { api as devApi } from \"dev-only\";\n\
+             (devApi as any).defaults.baseURL = \"x\";\n\
+             export const d = data;\n"
+                .to_string(),
         ));
         files.push((
             "src/w/boot.ts".to_string(),
@@ -12907,6 +12990,62 @@ mod tests {
             library_stated(&dir, &discovery, "src/w/reader.ts"),
             stated(&[(2, "GET", "/w/read")])
         );
+    }
+
+    /// carrick#1568 fix round 4, Z1: `import client = lib.api` names `lib` in
+    /// no expression, and a write through `client` changes what `lib`
+    /// publishes. An alias used as a value, or exported, hands its root on,
+    /// through a namespace import or a namespace re-export, so no module
+    /// reads through the instance; a clean importer beside it still does.
+    #[test]
+    fn an_import_equals_alias_used_as_a_value_hands_its_root_on() {
+        let write = "(client as any).defaults.baseURL = \"https://elsewhere.example\";\n";
+        let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "namespace import",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!("import * as lib from \"./api\";\nimport client = lib.api;\n{write}"),
+                )],
+            ),
+            (
+                "namespace re-export",
+                vec![
+                    (
+                        "src/w/barrel.ts".to_string(),
+                        "export * as ns from \"./api\";\n".to_string(),
+                    ),
+                    (
+                        "src/w/boot.ts".to_string(),
+                        format!(
+                            "import {{ ns }} from \"./barrel\";\nimport client = ns.api;\n{write}"
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "alias of an alias",
+                vec![(
+                    "src/w/boot.ts".to_string(),
+                    format!(
+                        "import * as lib from \"./api\";\nimport inner = lib;\nimport client = inner.api;\n{write}"
+                    ),
+                )],
+            ),
+        ];
+        for (case, extra) in cases {
+            let mut files: Vec<(String, String)> = api_and_reader("w", "/w").into();
+            files.extend(api_and_reader("ctl", "/ctl"));
+            files.extend(extra);
+            let (dir, discovery) = discover_owned(&files);
+            let rows = library_rows_of(&dir, &discovery, "src/w/reader.ts", &verified_sample());
+            assert!(rows.is_empty(), "{case}: {rows:#?}");
+            assert_eq!(
+                library_stated(&dir, &discovery, "src/ctl/reader.ts"),
+                stated(&[(2, "GET", "/ctl/read")]),
+                "{case}: a clean importer still reads"
+            );
+        }
     }
 
     /// carrick#1568 fix round 3: a barrel outside the service that re-exports
