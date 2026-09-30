@@ -29,6 +29,8 @@ import {
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { ClientSemanticsVerifier } from './client-semantics.js';
 import type {
+  BundleResult,
+  RetypeOutcome,
   SidecarRequest,
   SidecarResponse,
   InitResponse,
@@ -69,7 +71,12 @@ interface ProjectComponents {
   semanticsVerifier: ClientSemanticsVerifier;
 }
 
-let components: ProjectComponents | null = null;
+/**
+ * Components by project key (`ProjectLoader.projectKeyFor`): `''` is the
+ * default project, any other key the program of a project that owns some of
+ * the service's files (carrick#1604).
+ */
+let components = new Map<string, ProjectComponents>();
 
 /**
  * Get the project-backed components, building the project if this is the
@@ -77,16 +84,17 @@ let components: ProjectComponents | null = null;
  *
  * @throws if init has not run, or if the project cannot be built
  */
-function projectComponents(): ProjectComponents {
+function projectComponents(key = ''): ProjectComponents {
   if (!projectLoader?.isInitialized()) {
     throw new Error('Sidecar not initialized. Call init first.');
   }
-  if (!components) {
+  let built = components.get(key);
+  if (!built) {
     // Bound here rather than read from the module slot inside the components:
     // a re-init drops `components` and points the slot at another service, and
     // nothing built over this project may follow it there.
     const loader = projectLoader;
-    const project = loader.getProject();
+    const project = loader.getProjectFor(key);
     const repoRoot = loader.getRepoRoot();
     // The module graph, where the project resolved through one, is the only
     // thing that can name the package a file belongs to: a Deno service
@@ -96,7 +104,7 @@ function projectComponents(): ProjectComponents {
       repoRoot,
       packageOf: (filePath) => loader.packageOf(filePath),
     });
-    components = {
+    built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
       typeInferrer,
@@ -117,8 +125,43 @@ function projectComponents(): ProjectComponents {
       ),
       semanticsVerifier: new ClientSemanticsVerifier(project),
     };
+    components.set(key, built);
   }
-  return components;
+  return built;
+}
+
+/** One bundle answer from the answers of several programs. */
+function mergeBundles(results: BundleResult[]): BundleResult {
+  const symbol_failures = results.flatMap((r) => r.symbol_failures ?? []);
+  const answered = results.filter((r) => r.success);
+  if (answered.length === 0) {
+    return {
+      success: false,
+      symbol_failures,
+      errors: [...new Set(results.flatMap((r) => r.errors ?? []))],
+    };
+  }
+  return {
+    success: true,
+    dts_content: answered.map((r) => r.dts_content ?? '').join('\n'),
+    manifest: answered.flatMap((r) => r.manifest ?? []),
+    symbol_failures: symbol_failures.length > 0 ? symbol_failures : undefined,
+  };
+}
+
+/**
+ * Split a request's items by the project that types their file, keeping each
+ * group in request order. One group, the default project's, for a service
+ * whose tsconfig references nothing.
+ */
+function byProject<T>(items: T[], fileOf: (item: T) => string | undefined): Map<string, T[]> {
+  // An empty request is still answered by the default project, as before.
+  const groups = new Map<string, T[]>(items.length === 0 ? [['', []]] : []);
+  for (const item of items) {
+    const key = projectLoader?.projectKeyFor(fileOf(item)) ?? '';
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  return groups;
 }
 
 // ===========================================================================
@@ -136,7 +179,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
 
     // Re-init re-scopes the sidecar to another root: drop everything built
     // over the previous project before resolving the new one.
-    components = null;
+    components = new Map();
     projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
@@ -191,7 +234,12 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
   try {
     log(`Bundling ${request.symbols.length} symbol(s)`);
 
-    const result = projectComponents().typeBundler.bundle(request.symbols);
+    // A symbol named by a path is bundled from the program of the project
+    // that owns that file (carrick#1604).
+    const results = [...byProject(request.symbols, (symbol) => symbol.source_file)].map(
+      ([key, symbols]) => projectComponents(key).typeBundler.bundle(symbols)
+    );
+    const result = results.length === 1 ? results[0] : mergeBundles(results);
 
     if (!result.success) {
       return {
@@ -354,10 +402,21 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
-    const result = projectComponents().typeInferrer.infer(
-      request.requests,
-      request.extraction_config
+    const results = [...byProject(request.requests, (item) => item.file_path)].map(
+      ([key, items]) => projectComponents(key).typeInferrer.infer(items, request.extraction_config)
     );
+    const result =
+      results.length === 1
+        ? results[0]
+        : (() => {
+            const inferred_types = results.flatMap((r) => r.inferred_types ?? []);
+            const errors = results.flatMap((r) => r.errors ?? []);
+            return {
+              success: errors.length === 0 || inferred_types.length > 0,
+              inferred_types,
+              errors: errors.length > 0 ? errors : undefined,
+            };
+          })();
 
     return {
       request_id: request.request_id,
@@ -392,10 +451,22 @@ function handleRetypeCheck(
 ): RetypeCheckResponse {
   try {
     log(`Retyping ${request.items.length} consumer call(s)`);
-    const outcomes = projectComponents().retyper.run(
-      request.items,
-      request.budget_ms ?? RETYPE_BUDGET_MS
+    const budget = request.budget_ms ?? RETYPE_BUDGET_MS;
+    const groups = byProject(
+      request.items.map((item, index) => ({ item, index })),
+      ({ item }) => item.file_path
     );
+    const deadline = performance.now() + budget;
+    const outcomes = new Array<RetypeOutcome>(request.items.length);
+    for (const [key, entries] of groups) {
+      // One budget for the request, whichever programs it spans.
+      const remaining = groups.size === 1 ? budget : Math.max(0, deadline - performance.now());
+      projectComponents(key)
+        .retyper.run(entries.map(({ item }) => item), remaining)
+        .forEach((outcome, position) => {
+          outcomes[entries[position].index] = outcome;
+        });
+    }
     return { request_id: request.request_id, status: 'success', outcomes };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);

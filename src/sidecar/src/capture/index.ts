@@ -49,7 +49,7 @@ import { typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
-import { parseNamedConfig, projectForFiles } from './project-references.js';
+import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
@@ -154,9 +154,13 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     : path.join(repoRoot, 'tsconfig.json');
 
   let parsed: ts.ParsedCommandLine | undefined;
-  // The config the options came from: the named one, or the project it
-  // references that includes the anchors' files (carrick#1604).
+  // The config the emit's options came from: the named one, or the project
+  // that owns the most anchors' files (carrick#1604).
   let projectConfigPath = configPath;
+  // Anchor indexes by the project that owns their file, when the named config
+  // references others and the anchors' files do not all belong to one project.
+  let ownerGroups: Map<ServiceProject, number[]> | undefined;
+  let emitProject: ServiceProject | undefined;
   let deno: DenoProject | undefined;
   try {
     const config = findDenoConfig(repoRoot, opts.tsconfigPath);
@@ -193,19 +197,41 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       repoRoot
     );
   } else {
-    // A solution config lists no files and carries no options of its own:
-    // type the anchors under the referenced project that includes them.
-    const anchorFiles = opts.anchors
-      .flatMap((a) => (a.source_file ? [path.resolve(repoRoot, a.source_file)] : []))
-      .filter((f) => fs.existsSync(f));
+    // Each anchor is typed under the project that owns its file: the named
+    // config when it lists the file, else the first project it references
+    // (depth-first, in declared order) that does, else the named config.
+    let graph: ProjectGraph;
     try {
-      const choice = projectForFiles(parseNamedConfig(configPath), anchorFiles);
-      parsed = choice.project.parsed;
-      projectConfigPath = choice.project.configPath;
-      errors.push(...choice.diagnostics);
+      graph = new ProjectGraph(configPath);
     } catch (err) {
       return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
     }
+    const groups = new Map<ServiceProject, number[]>();
+    const unfiled: number[] = [];
+    opts.anchors.forEach((anchor, index) => {
+      const file = anchor.source_file ? path.resolve(repoRoot, anchor.source_file) : undefined;
+      if (!file || !fs.existsSync(file)) {
+        unfiled.push(index);
+        return;
+      }
+      const owner = graph.ownerOf(file);
+      groups.set(owner, [...(groups.get(owner) ?? []), index]);
+    });
+    // One emit: under the owner of the most anchors, ties to search order.
+    let emit = graph.named;
+    let most = 0;
+    for (const [owner, indexes] of groups) {
+      if (indexes.length > most || (indexes.length === most && graph.rank(owner) < graph.rank(emit))) {
+        emit = owner;
+        most = indexes.length;
+      }
+    }
+    if (unfiled.length > 0) groups.set(emit, [...(groups.get(emit) ?? []), ...unfiled]);
+    errors.push(...graph.diagnostics);
+    parsed = emit.parsed;
+    projectConfigPath = emit.configPath;
+    emitProject = emit;
+    if (groups.size > 1) ownerGroups = groups;
   }
   if (!parsed) {
     return fail(stubDir, packageName, [`failed to parse ${configPath}`]);
@@ -225,8 +251,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
+  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath };
   try {
-    resolved = resolveAnchors(opts, parsed, { repoRoot, entryDir: path.dirname(entryPath), entryPath }, deno);
+    resolved = ownerGroups && emitProject
+      ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
+      : resolveAnchors(opts, parsed, analysisCtx, deno);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
@@ -592,6 +621,60 @@ function rewriteSurfaceAliasesToUnknown(text: string, demoted: Set<string>): str
       out.slice(span.end);
   }
   return out;
+}
+
+/**
+ * Phase A when the anchors' files belong to different projects (carrick#1604):
+ * each owner's anchors are resolved in a program built from that owner's
+ * options, so a file is never typed under a project that does not own it.
+ *
+ * The surface is emitted once, under `emit`'s options. An anchor from another
+ * project keeps its text when the text stands alone, or when the two projects
+ * would emit a declaration the same way. Otherwise its text names a module the
+ * emit would declare under the wrong options (a symbol or handler anchor, or
+ * a print that imports a module), so it is demoted with the reason, and cannot
+ * self-check clean.
+ */
+function resolveAnchorsByOwner(
+  opts: CaptureStubOptions,
+  groups: Map<ServiceProject, number[]>,
+  emit: ServiceProject,
+  ctx: { repoRoot: string; entryDir: string; entryPath: string },
+  errors: string[]
+): ResolvedAnchor[] {
+  const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
+  for (const [owner, indexes] of groups) {
+    const anchors = indexes.map((index) => opts.anchors[index]);
+    const group = resolveAnchors({ ...opts, anchors }, owner.parsed, ctx);
+    let demoted = 0;
+    group.forEach((anchor, position) => {
+      const index = indexes[position];
+      const namesModule =
+        anchor.request.kind === 'symbol' ||
+        anchor.request.kind === 'handler_return' ||
+        collectSpecifiers(anchor.aliasText).size > 0;
+      if (owner === emit || anchor.failureReason !== undefined || !namesModule || emitsAlike(owner, emit)) {
+        resolved[index] = anchor;
+        return;
+      }
+      demoted += 1;
+      resolved[index] = {
+        request: anchor.request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        failureReason:
+          `typed under ${owner.configPath}, the project that owns its file, whose options differ ` +
+          `from ${emit.configPath}, which emits the surface; the module it names would be declared under the wrong options`,
+      };
+    });
+    if (owner !== emit) {
+      errors.push(
+        `${indexes.length} anchor(s) typed under ${owner.configPath}, the project that owns their files` +
+          (demoted > 0 ? `; ${demoted} demoted because the surface is emitted under ${emit.configPath}` : '')
+      );
+    }
+  }
+  return resolved;
 }
 
 /** Phase A: build the placeholder entry, then resolve every anchor. */
