@@ -144,6 +144,13 @@ function declarationSite(
     };
   }
   for (const declaration of declarations) {
+    const file = declaration.getSourceFile();
+    // An installed package's declaration names types from the package's own
+    // files, which the bundle does not carry, so its text would dangle. The
+    // failure is what it was before the walk, and inference keeps the row.
+    if (file.isInNodeModules() || file.isFromExternalLibrary()) {
+      return { reason: `Symbol '${name}' is re-exported from an installed package in ${label}` };
+    }
     const declared = declaredName(declaration);
     if (declared && declaresName(declaration.getSourceFile(), declared)) {
       return { sourceFile: declaration.getSourceFile(), name: declared };

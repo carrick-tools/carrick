@@ -50,6 +50,14 @@ const FILES: Record<string, string> = {
   'src/clash/a.ts': 'export type Clash = { a: number };\n',
   'src/clash/b.ts': 'export type Clash = { b: string };\n',
   'src/clash/index.ts': 'export * from "./a.js";\nexport * from "./b.js";\n',
+  // An installed package re-exported by the service: its declarations name
+  // types from the package's own files, which the bundle does not carry.
+  'node_modules/extpkg/package.json': JSON.stringify({ name: 'extpkg', version: '1.0.0', types: './index.d.ts' }),
+  'node_modules/extpkg/inner.d.ts': 'export interface Inner { deep: number }\n',
+  'node_modules/extpkg/index.d.ts':
+    "import type { Inner } from './inner';\nexport interface Ext { inner: Inner; tag: 'ext' }\n",
+  'src/ext/index.ts': "export * from 'extpkg';\n",
+  'src/ext/named.ts': "export { Ext as Renamed } from 'extpkg';\n",
   'src/client.ts': [
     'import type { Me } from "./core/index.js";',
     '',
@@ -139,6 +147,21 @@ describe('carrick#1605: the bundle follows a name through its re-exports', () =>
     const failure = res.symbol_failures?.find((f) => f.symbol_name === 'Clash');
     assert.ok(failure, `expected a symbol failure: ${JSON.stringify(res)}`);
     assert.match(failure.reason, /more than one/);
+  });
+
+  it('keeps a name re-exported from an installed package a failure, as before', async () => {
+    // Following it would print the package's declaration with its own
+    // imports dangling (`inner: Inner`); the failure lets inference keep the row.
+    for (const [symbol, file] of [
+      ['Ext', 'src/ext/index.ts'],
+      ['Renamed', 'src/ext/named.ts'],
+    ]) {
+      const res = await bundle(symbol, file);
+      assert.strictEqual(res.dts_content, undefined, `${symbol}: ${res.dts_content}`);
+      const failure = res.symbol_failures?.find((f) => f.symbol_name === symbol);
+      assert.ok(failure, `expected a symbol failure for ${symbol}: ${JSON.stringify(res)}`);
+      assert.match(failure.reason, /installed package/);
+    }
   });
 
   it('still fails a name the barrel does not export', async () => {
