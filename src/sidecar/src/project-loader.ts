@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
 import { DenoProject, findDenoConfig, serviceConfigPath } from './capture/index.js';
+import { moduleFormatResolutionHost } from './module-format.js';
 
 /**
  * Options for ProjectLoader construction
@@ -354,6 +355,8 @@ export class ProjectLoader {
     return new Project({
       tsConfigFilePath: configPath,
       skipAddingFilesFromTsConfig: false,
+      // Each import resolves in its file's own module format (carrick#1619).
+      resolutionHost: moduleFormatResolutionHost,
     });
   }
 
