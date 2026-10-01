@@ -365,9 +365,13 @@ impl ClientInstance {
     /// (carrick#1564). Every other form builds an instance only a message
     /// role reads (carrick#1661), so an HTTP call through it reads as it
     /// would through no client at all.
+    ///
+    /// `new export.member({ … })` needs no check of its own here: the
+    /// construction contests the export's binding for HTTP
+    /// ([`BindingUse::contests_client`]), and the instance inherits that.
     fn http_factory(&self) -> Option<(&str, &ObjValue)> {
-        match (self.form, &self.member, &self.options) {
-            (MakerForm::Call, Some(member), Some(options)) => Some((member, options)),
+        match (&self.member, &self.options) {
+            (Some(member), Some(options)) => Some((member, options)),
             _ => None,
         }
     }

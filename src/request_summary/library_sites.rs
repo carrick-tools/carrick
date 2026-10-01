@@ -979,7 +979,7 @@ mod tests {
             "src/orders.ts",
             "import { bus } from \"@fixture/bus\";\n\
              const ORDER_CREATED = \"order.created\";\n\
-             const TOPICS = { paid: \"order.paid\" };\n\
+             const TOPICS = { shipped: \"order.shipped\" };\n\
              export function a(ORDER_CREATED: string) { bus.publish(ORDER_CREATED, {}); }\n\
              export function b() { bus.publish(ORDER_CREATED, {}); }\n\
              export function c(flag: boolean) {\n\
@@ -989,7 +989,7 @@ mod tests {
              \x20 }\n\
              }\n\
              export function d() { const local = `${ORDER_CREATED}.v2`; bus.publish(local, {}); }\n\
-             export function e() { bus.publish(TOPICS.paid, {}); }\n\
+             export function e() { bus.publish(TOPICS.shipped, {}); }\n\
              export function f() { let topic = \"order.x\"; topic = \"order.y\"; bus.publish(topic, {}); }\n\
              bus.publish(ORDER_CREATED + \".audit\", {});\n",
         )]);
