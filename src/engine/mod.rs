@@ -6161,7 +6161,12 @@ fn write_slice_record(
         .collect();
     let surfaces = match sidecar {
         Some(sidecar) if !packages.is_empty() => {
-            match sidecar.list_library_surface(service_root, &packages, None) {
+            // The sidecar's default cap lists 2 of about 120 exports for a
+            // large SDK; the record wants the whole surface.
+            let max_entries = std::env::var("CARRICK_SLICE_SURFACE_MAX")
+                .ok()
+                .and_then(|max| max.parse::<u32>().ok());
+            match sidecar.list_library_surface(service_root, &packages, max_entries) {
                 Ok(surfaces) => serde_json::Value::Array(surfaces),
                 Err(error) => serde_json::json!({ "error": error.to_string() }),
             }
