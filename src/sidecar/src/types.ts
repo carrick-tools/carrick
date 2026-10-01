@@ -528,7 +528,17 @@ export interface VerifyLibraryClaimsRequest extends BaseRequest {
   from_dir: string;
   checks: LibraryCheck[];
   budget_ms?: number;
+  /** Readings to measure against the strict default (prototype; see `ClaimVariant`). */
+  variants?: ClaimVariant[];
 }
+
+/**
+ * A reading of the message checks that a slice run can switch on to measure
+ * it against the strict default (carrick#1616 prototype; never the default):
+ * - `d2_required_siblings`: only a REQUIRED string sibling makes a name
+ *   ambiguous; an optional one (`description?: string`) does not.
+ */
+export type ClaimVariant = 'd2_required_siblings';
 
 /**
  * List each package's declared surface, the way the verifier reads it, for a
