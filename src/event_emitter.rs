@@ -53,7 +53,7 @@ use crate::socket_io::{RESERVED_EVENTS, SocketExtraction};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use swc_common::errors::{ColorConfig, Handler};
-use swc_common::{GLOBALS, Globals, SourceMap, Span, Spanned, sync::Lrc};
+use swc_common::{GLOBALS, Globals, SourceMap, sync::Lrc};
 use swc_ecma_ast::{Callee, Expr, ExprOrSpread, Lit, MemberExpr, OptChainBase, OptChainExpr};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -199,6 +199,11 @@ pub fn scan_files(service_files: &[PathBuf], sockets: &SocketExtraction) -> BusE
 /// Spans the socket pass already recorded, as (file, line, event). Keyed on the
 /// event as well as the span so two calls sharing a line — `bus.on("a", () =>
 /// socket.emit("b", x))` — are told apart.
+///
+/// Both passes place an op on the line of its method name, not the line its
+/// receiver chain starts on (carrick#1626), so a chained socket call written
+/// across lines is still the span this pass skips. A change to where either
+/// pass puts its line is a change to this join.
 fn claimed_spans(sockets: &SocketExtraction) -> HashSet<(PathBuf, u32, String)> {
     sockets
         .listeners
@@ -247,7 +252,7 @@ impl Visit for BusCollector<'_> {
         if let Callee::Expr(callee) = &node.callee
             && let Expr::Member(member) = &**callee
         {
-            self.record_member_call(member, &node.args, node.span());
+            self.record_member_call(member, &node.args);
         }
         node.visit_children_with(self);
     }
@@ -257,10 +262,10 @@ impl Visit for BusCollector<'_> {
         // its own arm or the op is silently lost.
         if let OptChainBase::Call(call) = &*node.base {
             match &*call.callee {
-                Expr::Member(member) => self.record_member_call(member, &call.args, node.span()),
+                Expr::Member(member) => self.record_member_call(member, &call.args),
                 Expr::OptChain(inner) => {
                     if let OptChainBase::Member(member) = &*inner.base {
-                        self.record_member_call(member, &call.args, node.span());
+                        self.record_member_call(member, &call.args);
                     }
                 }
                 _ => {}
@@ -274,7 +279,7 @@ impl BusCollector<'_> {
     /// Record the bus op a `<receiver>.<method>("event", …)` call site carries,
     /// if any. The receiver is deliberately unconstrained: what makes this an
     /// event bus is the protocol it answers, not what it was built from.
-    fn record_member_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread], span: Span) {
+    fn record_member_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) {
         let Some(prop) = member.prop.as_ident() else {
             return;
         };
@@ -297,7 +302,9 @@ impl BusCollector<'_> {
         if is_reserved(&event) {
             return;
         }
-        let line = self.cm.lookup_char_pos(span.lo).line as u32;
+        // The method name's line, as the socket pass places its ops
+        // (`claimed_spans`), not the line the receiver chain starts on.
+        let line = self.cm.lookup_char_pos(prop.span.lo).line as u32;
         if self
             .claimed
             .contains(&(self.file_path.to_path_buf(), line, event.clone()))
@@ -450,6 +457,61 @@ mod tests {
             "#,
         );
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// carrick#1626: a registration or emission written across lines sits on
+    /// the line of its method name, not the line its receiver chain starts on.
+    #[test]
+    fn a_chained_op_sits_on_its_method_line() {
+        let found = scan(
+            r#"
+queueEvents
+  .on("jobDone", onDone)
+  .on("jobStalled", onStalled);
+bus
+  .emit("jobRetried", { id: 1 });
+"#,
+        );
+        let lines = |ops: &[BusOp]| -> Vec<(String, u32)> {
+            ops.iter().map(|op| (op.event.clone(), op.line)).collect()
+        };
+        let mut subscribers = lines(&found.subscribers);
+        subscribers.sort();
+        assert_eq!(
+            subscribers,
+            vec![("jobDone".to_string(), 3), ("jobStalled".to_string(), 4)]
+        );
+        assert_eq!(
+            lines(&found.publishers),
+            vec![("jobRetried".to_string(), 6)]
+        );
+    }
+
+    /// The socket pass and this one place a chained call on the same line, so
+    /// the span the socket pass claims is still the one this pass skips: a
+    /// chained Socket.IO listener is one socket row, never a pub/sub row too.
+    #[test]
+    fn a_chained_socket_listener_stays_claimed() {
+        let source = r#"
+import { io } from "socket.io-client";
+const client = io("https://example.test");
+client
+  .on("orderPlaced", handleOrder);
+"#;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("client.ts");
+        fs::write(&file, source).unwrap();
+        let files = vec![file.clone()];
+
+        let sockets = crate::socket_io::scan_files(&files, &[]);
+        let socket_lines: Vec<u32> = sockets.listeners.iter().map(|op| op.line).collect();
+        assert_eq!(socket_lines, vec![5], "the socket row is on `.on(`");
+
+        let found = scan_files(&files, &sockets);
+        assert!(
+            found.is_empty(),
+            "the socket-claimed span must not also become a pub/sub row: {found:?}"
+        );
     }
 
     /// A span the socket pass recorded stays on the socket channel: one call

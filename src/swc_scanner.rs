@@ -3251,7 +3251,9 @@ impl Visit for CandidateVisitor {
             self.pubsub_anchor_ops.push(PubsubAnchorOp {
                 topic,
                 role: PubsubRole::Subscriber,
-                line_number: self.get_line_number(node.span),
+                // The constructor name's line, as a method call's row sits on
+                // its method name (carrick#1626).
+                line_number: self.get_line_number(node.callee.span()),
                 handler_param: None,
                 handler_param_line: None,
             });
@@ -3582,7 +3584,10 @@ impl Visit for CandidateVisitor {
                 // payload-carrying calls stay LLM-owned (locator judgment,
                 // envelope unwrapping).
                 if let Some(role) = role {
-                    let line_number = self.get_line_number(call.span);
+                    // The method name's line: a call written across lines
+                    // starts on its receiver's, which names nothing
+                    // (carrick#1626).
+                    let line_number = self.get_line_number(member.prop.span());
                     if let Some(topics) = &object_topics {
                         // Options-object shape (#402 a): every resolvable
                         // topic anchors, payload-less — the message handler is
@@ -6125,6 +6130,50 @@ export class PollController {
                 && op.role == PubsubRole::Subscriber
                 && op.line_number == 12),
             "const-ref topic in initializer position must resolve, got {ops:?}"
+        );
+    }
+
+    /// carrick#1626: a pub/sub call written across lines sits on the line of
+    /// its method (or constructor) name, not the line its receiver chain
+    /// starts on, so a row and anything joined to it by line name the call.
+    #[test]
+    fn pubsub_anchor_ops_sit_on_the_method_line() {
+        use crate::operation::PubsubRole;
+
+        let src = r#"
+import { connect, Worker } from "fakebus";
+const client = connect();
+export async function start() {
+  await client
+    .subscribe("feed.updated");
+  client
+    .publish(
+      "feed.refreshed",
+    );
+  const worker = new
+    Worker("resize-images", async () => {});
+}
+"#;
+        let scanner = SwcScanner::new();
+        let result = scanner.scan_content(
+            &PathBuf::from("feed.ts"),
+            src,
+            &[],
+            &["fakebus".to_string()],
+        );
+        let mut ops: Vec<(String, PubsubRole, usize)> = result
+            .pubsub_anchor_ops
+            .iter()
+            .map(|op| (op.topic.clone(), op.role, op.line_number))
+            .collect();
+        ops.sort_by_key(|op| op.2);
+        assert_eq!(
+            ops,
+            vec![
+                ("feed.updated".to_string(), PubsubRole::Subscriber, 6),
+                ("feed.refreshed".to_string(), PubsubRole::Publisher, 8),
+                ("resize-images".to_string(), PubsubRole::Subscriber, 12),
+            ]
         );
     }
 

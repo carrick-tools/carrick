@@ -1510,7 +1510,7 @@ impl Visit for OpCollector<'_> {
         if let Callee::Expr(callee) = &node.callee
             && let Expr::Member(member) = &**callee
         {
-            self.record_member_call(member, &node.args, node.span());
+            self.record_member_call(member, &node.args);
         }
         node.visit_children_with(self);
     }
@@ -1520,10 +1520,10 @@ impl Visit for OpCollector<'_> {
         // so it needs its own arm or the op is silently lost.
         if let OptChainBase::Call(call) = &*node.base {
             match &*call.callee {
-                Expr::Member(member) => self.record_member_call(member, &call.args, node.span()),
+                Expr::Member(member) => self.record_member_call(member, &call.args),
                 Expr::OptChain(inner) => {
                     if let OptChainBase::Member(member) = &*inner.base {
-                        self.record_member_call(member, &call.args, node.span());
+                        self.record_member_call(member, &call.args);
                     }
                 }
                 _ => {}
@@ -1536,7 +1536,12 @@ impl Visit for OpCollector<'_> {
 impl OpCollector<'_> {
     /// Record the socket op a `<root>.<method>(...)` call site carries, if any.
     /// Shared by plain and optional calls so both spellings resolve.
-    fn record_member_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread], span: Span) {
+    ///
+    /// The op sits on the line of the method name: a call written across
+    /// lines (`socket\n  .on("x", h)`) starts on its receiver's line, which
+    /// names nothing (carrick#1626). The in-process event pass places its ops
+    /// the same way, which is what lets it skip the spans claimed here.
+    fn record_member_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) {
         let Some(prop) = member.prop.as_ident() else {
             return;
         };
@@ -1547,6 +1552,7 @@ impl OpCollector<'_> {
             return;
         };
         let method = prop.sym.as_ref();
+        let line = self.cm.lookup_char_pos(prop.span.lo).line as u32;
 
         // The vocabulary a root answers to. Socket.IO's two words are the
         // directional half; an unknown-direction root reads the protocol
@@ -1581,7 +1587,7 @@ impl OpCollector<'_> {
                 self.extraction.emitters.push(SocketOp {
                     key: OperationKey::socket(event, SocketDirection::Unknown),
                     file_path: self.file_path.to_path_buf(),
-                    line: self.cm.lookup_char_pos(span.lo).line as u32,
+                    line,
                     payload_type_symbol: None,
                     payload_type_source: None,
                 });
@@ -1640,7 +1646,7 @@ impl OpCollector<'_> {
             let op = SocketOp {
                 key: OperationKey::socket(event.value.to_string(), direction),
                 file_path: self.file_path.to_path_buf(),
-                line: self.cm.lookup_char_pos(span.lo).line as u32,
+                line,
                 payload_type_symbol,
                 payload_type_source,
             };
@@ -1824,6 +1830,70 @@ io.on("connection", (socket) => {
                 "socket|SERVER->CLIENT|welcome",
             ],
             "server emits (incl. broadcast/to chains) are consumers of server->client"
+        );
+    }
+
+    /// carrick#1626: an op written across lines sits on the line of its
+    /// method name, not the line its receiver chain starts on, for every
+    /// rule of the pass: a Socket.IO listener and emitter, an
+    /// unknown-direction client's chained registration and send, and a raw
+    /// socket's envelope send.
+    #[test]
+    fn a_chained_op_sits_on_its_method_line() {
+        let lines = |ops: &[SocketOp]| -> Vec<(String, u32)> {
+            let mut lines: Vec<(String, u32)> =
+                ops.iter().map(|op| (op.key.canonical(), op.line)).collect();
+            lines.sort();
+            lines
+        };
+
+        let socket_io = extract(
+            r#"
+import { Server } from "socket.io";
+const io = new Server(httpServer);
+io.on("connection", (socket) => {
+  socket
+    .on("chat:send", (msg: string) => void msg);
+  socket
+    .emit("chat:ack", { ok: true });
+});
+"#,
+        );
+        assert_eq!(
+            lines(&socket_io.listeners),
+            vec![("socket|CLIENT->SERVER|chat:send".to_string(), 6)]
+        );
+        assert_eq!(
+            lines(&socket_io.emitters),
+            vec![("socket|SERVER->CLIENT|chat:ack".to_string(), 8)]
+        );
+
+        let unknown = extract_with_clients(
+            r#"
+import { ChannelClient } from "realtime-channels";
+const client = new ChannelClient({ key: "k" });
+client
+  .subscribe("orders")
+  .bind("order.created", (p: unknown) => void p);
+client
+  .channel("orders")
+  .trigger("client-order.viewed", { id: 1 });
+const raw = new ChannelClient({ key: "k" });
+raw
+  .send(JSON.stringify({ type: "order.cancelled" }));
+"#,
+            &["realtime-channels"],
+        );
+        assert_eq!(
+            lines(&unknown.listeners),
+            vec![("socket|UNKNOWN|order.created".to_string(), 6)]
+        );
+        assert_eq!(
+            lines(&unknown.emitters),
+            vec![
+                ("socket|UNKNOWN|client-order.viewed".to_string(), 9),
+                ("socket|UNKNOWN|order.cancelled".to_string(), 12),
+            ]
         );
     }
 
