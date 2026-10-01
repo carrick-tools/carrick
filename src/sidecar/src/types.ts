@@ -424,11 +424,173 @@ export interface VerifyClientSemanticsRequest extends BaseRequest {
 }
 
 /**
+ * Where one part of a library call sits: argument `arg` (0-based), or, with
+ * `key`, the property `key` of the object passed there (carrick#1616).
+ */
+export interface ClaimSlot {
+  arg: number;
+  key?: string;
+}
+
+/**
+ * A name the call does not carry: the one the maker's `name_key` bound to
+ * the instance (`maker`), or the one the scope member bound (`scope`).
+ */
+export interface BoundName {
+  bound: 'maker' | 'scope';
+}
+
+/** The closed role list; the role alone picks the checks a claim needs. */
+export type LibraryRole =
+  | 'http_client'
+  | 'graphql_client'
+  | 'broker'
+  | 'in_process_bus'
+  | 'socket'
+  | 'server_framework'
+  | 'none';
+
+/** What an `op` claim does on the wire. */
+export type LibraryOp = 'request' | 'send' | 'receive' | 'execute';
+
+/** Which receivers an op, scope or reserved name is claimed on. */
+export type ClaimOn = 'export' | 'instance' | 'both';
+
+/**
+ * Whether a string-accepting key of an options type is the name (design D2).
+ * Which key is the name is the picker's answer; the verifier checks only that
+ * every string-accepting key at the call is accounted for.
+ */
+export type KeyLabel = 'name' | 'not_name';
+
+/** Where a name means something. Carried for the scanner; the verifier never reads it. */
+export interface NameScope {
+  scope: 'global' | 'service';
+  namespace: string | null;
+}
+
+/**
+ * One claim element, in the shape the store answers (contract on
+ * carrick#1564, comment 5937606126, sections 2 and 3), tagged by `kind`.
+ * `picker` and `name_scope` are carried and never read. A maker's keys
+ * (`base_key`, `prefix_key`, `name_key`, `handler_key`) are keys of the
+ * options object at argument 0.
+ */
+export type LibraryClaim =
+  | {
+      /** How an instance is made: `member(...)` (`call`) or `new member(...)`; `member` null is the export itself. */
+      kind: 'make';
+      form: 'call' | 'new';
+      member: string | null;
+      /** An HTTP base URL. */
+      base_key?: string;
+      /** A prefix every name the instance sends gets. */
+      prefix_key?: string;
+      /** A definition's id: bound to every op that names `{ bound: 'maker' }`. */
+      name_key?: string;
+      handler_key?: string;
+      key_labels?: Record<string, KeyLabel>;
+      name_scope?: NameScope;
+      picker?: string;
+    }
+  | {
+      /** A member that returns a receiver bound to a name (a channel, room or queue). */
+      kind: 'scope';
+      member: string;
+      name: ClaimSlot;
+      path?: string[];
+      on?: ClaimOn;
+      of?: string;
+      key_labels?: Record<string, KeyLabel>;
+      name_scope?: NameScope;
+      picker?: string;
+    }
+  | {
+      kind: 'op';
+      op: LibraryOp;
+      /** null: the receiver itself (after `path`) is called. */
+      member: string | null;
+      /** The members walked from the receiver to the object `member` sits on (`client.tasks.trigger`). */
+      path?: string[];
+      on?: ClaimOn;
+      /** The maker member whose instances the op acts on. */
+      of?: string;
+      name?: ClaimSlot | BoundName;
+      payload?: ClaimSlot;
+      handler?: ClaimSlot;
+      ack?: ClaimSlot;
+      key_labels?: Record<string, KeyLabel>;
+      name_scope?: NameScope;
+      picker?: string;
+      /** HTTP: an options object sits at `arg` (no `key`). */
+      options?: ClaimSlot;
+      /** HTTP: the method the member always sends. */
+      method?: string;
+      /** HTTP: where the method sits. */
+      method_key?: ClaimSlot;
+    }
+  | {
+      /** A name the library emits itself, spelled in one of `member`'s parameters. */
+      kind: 'reserved';
+      member: string;
+      name: string;
+      path?: string[];
+      on?: ClaimOn;
+      of?: string;
+      picker?: string;
+    };
+
+/**
+ * One claim to check against the package's own declarations, on one receiver.
+ * The receiver is `export`, `instance:<member>` (what `export.member(...)`
+ * returns), `instance:()` (what calling the export returns), `instance:new`
+ * (what `new export(...)` builds) or `instance:new:<member>` (what
+ * `new export.member(...)` builds), optionally followed by
+ * `>scope:<path.member>` (what that scope member returns). The unit is
+ * `(claim_id, receiver)`.
+ */
+export interface LibraryCheck {
+  claim_id: string;
+  /** The module specifier as the service imports it (`pkg` or `pkg/sub`). */
+  package: string;
+  export: string;
+  role: LibraryRole;
+  receiver: string;
+  claim: LibraryClaim;
+}
+
+/**
+ * Check library claims of every role against each package's own
+ * declarations (carrick#1616). `verify_client_semantics` answers HTTP claims
+ * through the same verifier.
+ */
+export interface VerifyLibraryClaimsRequest extends BaseRequest {
+  action: 'verify_library_claims';
+  from_dir: string;
+  checks: LibraryCheck[];
+  /** Checks not reached in time come back `unchecked` with reason `budget`; null or absent is the default. */
+  budget_ms?: number | null;
+  /** Readings switched on for this request; none is the strict default (see `ClaimVariant`). */
+  variants?: ClaimVariant[];
+}
+
+/**
+ * A reading of the message checks a request can switch on; never the default.
+ * - `index_key_generic_map`: a name slot typed as a key of an event map the
+ *   receiver takes as a type parameter (defaulting to an index signature)
+ *   reads as a string slot; a key of a concrete index-signature map is still
+ *   refused. The strict default refuses both, because only the service's own
+ *   type argument says what the map holds (carrick#1563 part 1).
+ */
+export type ClaimVariant = 'index_key_generic_map';
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
   | RetypeCheckRequest
   | VerifyClientSemanticsRequest
+  | VerifyLibraryClaimsRequest
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
@@ -703,12 +865,23 @@ export interface VerifyClientSemanticsResponse extends BaseResponse {
   errors?: string[];
 }
 
+/** Library-claim verdicts (carrick#1616): the same objects, under the contract's names. */
+export interface VerifyLibraryClaimsResponse extends BaseResponse {
+  /** Exactly one per check, in request order. */
+  verdicts?: SemanticsResult[];
+  modules?: SemanticsModule[];
+  /** Wall time of the verification, program build included. */
+  duration_ms?: number;
+  errors?: string[];
+}
+
 /**
  * Union type for all possible sidecar responses
  */
 export type SidecarResponse =
   | RetypeCheckResponse
   | VerifyClientSemanticsResponse
+  | VerifyLibraryClaimsResponse
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse

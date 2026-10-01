@@ -27,7 +27,7 @@ import {
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
-import { ClientSemanticsVerifier } from './client-semantics.js';
+import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -44,6 +44,7 @@ import type {
   ResolveDefinitionsResponse,
   RetypeCheckResponse,
   VerifyClientSemanticsResponse,
+  VerifyLibraryClaimsResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -68,7 +69,7 @@ interface ProjectComponents {
   typeInferrer: TypeInferrer;
   definitionResolver: DefinitionResolver;
   retyper: Retyper;
-  semanticsVerifier: ClientSemanticsVerifier;
+  claimsVerifier: LibraryClaimsVerifier;
 }
 
 /**
@@ -123,7 +124,7 @@ function projectComponents(key = ''): ProjectComponents {
         jsonWireDeclarations,
         findDisqualifyingTopTypes as unknown as TopTypeWalk
       ),
-      semanticsVerifier: new ClientSemanticsVerifier(project),
+      claimsVerifier: new LibraryClaimsVerifier(project),
     };
     components.set(key, built);
   }
@@ -476,27 +477,30 @@ function handleRetypeCheck(
 }
 
 /**
- * How long one verify_client_semantics request may spend before the checks it
- * has not reached come back `unchecked` with reason `budget`. The first request
- * on a service may pay the program build, which counts against it; the checks
- * themselves are cheap. Well inside the scanner's 900s read deadline.
+ * How long one verify_client_semantics or verify_library_claims request may
+ * spend before the checks it has not reached come back `unchecked` with reason
+ * `budget`. The first request on a service may pay the program build, which
+ * counts against it; the checks themselves are cheap. Well inside the
+ * scanner's 900s read deadline.
  */
 const SEMANTICS_BUDGET_MS = 600_000;
 
 /**
- * Handle the 'verify_client_semantics' action - check library-semantics
- * claims against each package's type declarations (carrick#1564)
+ * Handle the 'verify_client_semantics' action - check HTTP client-library
+ * claims against each package's type declarations (carrick#1564). Each check
+ * is converted into the shared claim shape and answered by the same verifier
+ * as `verify_library_claims`, with the #1564 checks and reasons.
  */
 function handleVerifyClientSemantics(
   request: SidecarRequest & { action: 'verify_client_semantics' }
 ): VerifyClientSemanticsResponse {
   try {
-    const { semanticsVerifier } = projectComponents();
+    const { claimsVerifier } = projectComponents();
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
-    const { semantics, modules } = semanticsVerifier.run(
+    const { semantics, modules } = claimsVerifier.run(
       fromDir,
-      request.checks,
+      request.checks.map(httpCheck),
       request.budget_ms ?? SEMANTICS_BUDGET_MS
     );
     return {
@@ -508,6 +512,39 @@ function handleVerifyClientSemantics(
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logError(`Client-semantics check failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
+ * Handle the 'verify_library_claims' action - check library claims of every
+ * role against each package's own declarations (carrick#1616). One verdict
+ * per check, in request order.
+ */
+function handleVerifyLibraryClaims(
+  request: SidecarRequest & { action: 'verify_library_claims' }
+): VerifyLibraryClaimsResponse {
+  const started = performance.now();
+  try {
+    const { claimsVerifier } = projectComponents();
+    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
+    const { semantics, modules } = claimsVerifier.run(
+      fromDir,
+      request.checks,
+      request.budget_ms ?? SEMANTICS_BUDGET_MS,
+      new Set(request.variants ?? [])
+    );
+    return {
+      request_id: request.request_id,
+      status: 'success',
+      verdicts: semantics,
+      modules,
+      duration_ms: Math.round(performance.now() - started),
+    };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Library-claims check failed: ${error}`);
     return { request_id: request.request_id, status: 'error', errors: [error] };
   }
 }
@@ -691,6 +728,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleRetypeCheck(request);
     case 'verify_client_semantics':
       return handleVerifyClientSemantics(request);
+    case 'verify_library_claims':
+      return handleVerifyLibraryClaims(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

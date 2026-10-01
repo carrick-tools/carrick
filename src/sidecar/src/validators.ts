@@ -404,6 +404,118 @@ export const VerifyClientSemanticsRequestSchema = BaseRequestSchema.extend({
   budget_ms: z.number().int().nonnegative().optional(),
 });
 
+/** Where one part of a library call sits (carrick#1616). */
+const ClaimSlotSchema = z
+  .object({
+    arg: z.number().int().nonnegative(),
+    key: z.string().min(1).optional(),
+  })
+  .strict();
+
+const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope']) }).strict();
+
+const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
+const MemberPathSchema = z.array(z.string().min(1));
+const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
+/** Carried for the scanner, never read. */
+const NameScopeSchema = z
+  .object({ scope: z.enum(['global', 'service']), namespace: z.string().min(1).nullable() })
+  .strict();
+
+/**
+ * One claim element in the shape the store answers, tagged by `kind`
+ * (contract on carrick#1564, sections 2 and 3).
+ */
+const LibraryClaimSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('make'),
+      form: z.enum(['call', 'new']),
+      member: z.string().min(1).nullable(),
+      base_key: z.string().min(1).optional(),
+      prefix_key: z.string().min(1).optional(),
+      name_key: z.string().min(1).optional(),
+      handler_key: z.string().min(1).optional(),
+      key_labels: KeyLabelsSchema.optional(),
+      name_scope: NameScopeSchema.optional(),
+      picker: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('scope'),
+      member: z.string().min(1),
+      name: ClaimSlotSchema,
+      path: MemberPathSchema.optional(),
+      on: ClaimOnSchema.optional(),
+      of: z.string().min(1).optional(),
+      key_labels: KeyLabelsSchema.optional(),
+      name_scope: NameScopeSchema.optional(),
+      picker: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('op'),
+      op: z.enum(['request', 'send', 'receive', 'execute']),
+      member: z.string().min(1).nullable(),
+      path: MemberPathSchema.optional(),
+      on: ClaimOnSchema.optional(),
+      of: z.string().min(1).optional(),
+      name: z.union([BoundNameSchema, ClaimSlotSchema]).optional(),
+      payload: ClaimSlotSchema.optional(),
+      handler: ClaimSlotSchema.optional(),
+      ack: ClaimSlotSchema.optional(),
+      key_labels: KeyLabelsSchema.optional(),
+      name_scope: NameScopeSchema.optional(),
+      picker: z.string().optional(),
+      options: ClaimSlotSchema.optional(),
+      method: z.string().min(1).optional(),
+      method_key: ClaimSlotSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('reserved'),
+      member: z.string().min(1),
+      name: z.string().min(1),
+      path: MemberPathSchema.optional(),
+      on: ClaimOnSchema.optional(),
+      of: z.string().min(1).optional(),
+      picker: z.string().optional(),
+    })
+    .strict(),
+]);
+
+const LibraryCheckSchema = z
+  .object({
+    claim_id: z.string().min(1),
+    package: z.string().min(1),
+    export: z.string().min(1),
+    role: z.enum([
+      'http_client',
+      'graphql_client',
+      'broker',
+      'in_process_bus',
+      'socket',
+      'server_framework',
+      'none',
+    ]),
+    // Any other receiver answers `unchecked` (`receiver_invalid`) on its own.
+    receiver: z.string().min(1),
+    claim: LibraryClaimSchema,
+  })
+  .strict();
+
+export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('verify_library_claims'),
+  from_dir: z.string().min(1),
+  checks: z.array(LibraryCheckSchema),
+  // The contract's sample sends `null` for "no budget of the request's own".
+  budget_ms: z.number().int().nonnegative().nullable().optional(),
+  variants: z.array(z.enum(['index_key_generic_map'])).optional(),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -423,6 +535,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ResolveDefinitionsRequestSchema,
   RetypeCheckRequestSchema,
   VerifyClientSemanticsRequestSchema,
+  VerifyLibraryClaimsRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

@@ -66,7 +66,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check` and `verify_client_semantics` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics` and `verify_library_claims` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
 `capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -80,6 +80,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `infer` | yes | Resolve the type at a set of locators |
 | `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
+| `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
 | `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
@@ -455,6 +456,105 @@ The resolver and the checker must land on the same installed file. With two inst
 
 When no overload satisfies a claim, the reason is the one from the overload that got furthest, and at the same depth `unchecked` wins. A `request_body` claim reads the signatures its `request` claim selects. `semantics_modules` says how each package resolved, for logs.
 
+#### `verify_library_claims` - Check library claims of every role (carrick#1616)
+
+The wire is pinned on carrick#1564 (comment 5937606126, section 3); where this section and the contract disagree, the contract wins. A claim says what a package's export does (its role, from a closed list) and where each part of a call through it sits, and the role alone picks which checks it needs. Same probe file, module resolution rules and definitions ("declared property", "accepts string", "says nothing") as `verify_client_semantics`, which converts each of its checks into this shape and answers through the same code (`http_client` keeps the #1564 checks and reasons exactly).
+
+```json
+{
+  "request_id": "7",
+  "action": "verify_library_claims",
+  "from_dir": "/abs/worker",
+  "budget_ms": null,
+  "checks": [
+    {
+      "claim_id": "@fixture/queue@2:default:make:task",
+      "package": "@fixture/queue",
+      "export": "default",
+      "role": "broker",
+      "receiver": "export",
+      "claim": { "kind": "make", "form": "call", "member": "task", "name_key": "id", "handler_key": "run",
+                 "key_labels": { "id": "name", "description": "not_name" },
+                 "name_scope": { "scope": "service", "namespace": "task" }, "picker": "<model>/<question set>" }
+    },
+    {
+      "claim_id": "@fixture/queue@2:default:op:send:trigger:instance",
+      "package": "@fixture/queue",
+      "export": "default",
+      "role": "broker",
+      "receiver": "instance:task",
+      "claim": { "kind": "op", "op": "send", "member": "trigger", "on": "instance", "of": "task",
+                 "name": { "bound": "maker" }, "payload": { "arg": 0 } }
+    },
+    {
+      "claim_id": "@fixture/queue/v2@2:default:op:send:trigger:export",
+      "package": "@fixture/queue/v2",
+      "export": "default",
+      "role": "broker",
+      "receiver": "export",
+      "claim": { "kind": "op", "op": "send", "member": "trigger", "path": ["tasks"], "on": "export",
+                 "name": { "arg": 0 }, "payload": { "arg": 1 } }
+    }
+  ]
+}
+```
+
+A slot is `{ "arg": n }` (argument `n`, 0-based) or `{ "arg": n, "key": "k" }` (property `k` of the object passed there). An op's `name` may instead be `{ "bound": "maker" }` (the maker's `name_key` bound it to the instance) or `{ "bound": "scope" }` (the scope member bound it). `picker` and `name_scope` travel with the claim and are never read.
+
+| `kind` | Fields | Says |
+|---|---|---|
+| `make` | `form` (`call` or `new`), `member` (null: the export itself), `base_key?`, `prefix_key?`, `name_key?`, `handler_key?`, `key_labels?` | How an instance is made. The keys are keys of the options object at argument 0. A definition (`task({ id, run })`) is a maker with a `name_key` and a `handler_key`. |
+| `scope` | `member`, `name`, `path?`, `on?`, `of?`, `key_labels?` | A member that returns a receiver bound to a name (a channel, room or queue) |
+| `op` | `op` (`request`, `send`, `receive`, `execute`), `member` (null: the object itself), `path?`, `on?`, `of?`, `name?`, `payload?`, `handler?`, `ack?`, `key_labels?`; HTTP only: `method?`, `method_key?`, `options?` | A member that acts on the wire |
+| `reserved` | `member`, `name`, `path?`, `on?`, `of?` | A name the library emits itself, spelled in one of that member's parameters |
+
+`path` is the member path from the receiver to the object `member` sits on (`client.tasks.trigger`). `on` (`export`, `instance` or `both`) and `of` (the maker member) say which receivers the claim is for.
+
+The receiver is `export`, `instance:<member>` (what `export.member(...)` returns), `instance:()` (what calling the export returns), `instance:new` (what `new export(...)` builds) or `instance:new:<member>` (what `new export.member(...)` builds), optionally followed by `>scope:<path.member>` (what that scope member returns on it, its `path` joined by `.`).
+
+Rules for the message roles (`broker`, `in_process_bus`, `socket`):
+
+| Rule | Reason when it does not hold |
+|---|---|
+| A maker is checked on the receiver `export`; an op, scope or reserved name claimed `on` the export only there, `on` instances only on an instance, and `of` a maker only on that maker's instances | `unchecked receiver_invalid` |
+| A member (and each `path` hop) is declared by the receiver's home packages: the named package and its `@types` package, the packages its export is re-exported from, and the package that declares the receiver's type (a hop adds the package that declares its type). Never the runtime's type packages, never only another package's base. A base the class binds with a concrete type its home packages declare (`extends Emitter<L, E, OwnReservedEvents>`) counts as declared. | `failed member_inherited` |
+| A hop typed `any`, `unknown` or `{}` | `unchecked member_untyped` |
+| The name slot accepts a string and is not a key of an index-signature map | `failed name_not_string` / `failed name_index_key` |
+| Strict D2: every other string-accepting argument or key at the call is assigned a part by the claim or labelled `not_name` in `key_labels`; at most one key is labelled `name`, and only the claim's own name key. A positional string cannot be labelled, so it always competes. A `not_name` label for a key the overload does not declare is ignored. | `failed name_ambiguous` |
+| A `send` carries a payload slot; the name alone, or no name, describes no call | `unchecked claim_invalid` |
+| A callback is not a payload; name and payload never share an argument | `failed payload_is_function` / `failed slots_overlap` |
+| Handler and ack slots are functions with a declared signature (`Function`, `any`, `unknown`, `(...args: any[])` say nothing) | `unchecked handler_untyped` / `failed handler_not_function` |
+| Keys at one argument come from one union member | `failed key_missing` |
+| A maker is read on every overload that holds (across every maker claim of the request for it); each instance op must hold on every instance type those overloads return; a maker returning `any` or an unconstrained generic builds nothing | `unchecked maker_unresolved` |
+| Instance and scope ops travel in the same request as a maker or scope claim that verifies | `unchecked maker_unverified` / `unchecked scope_unverified` |
+| A name `{ "bound": ... }` needs a maker with a `name_key`, or a scope | `failed name_unbound` |
+| An export given two roles in one request | `unchecked role_conflict` |
+| A `workspace:`, `file:`, `link:` or `portal:` dependency (until its own source is verified, #1666) | `unchecked module_workspace` |
+| `graphql_client`, `server_framework` and `none`, and an `execute` op on a message role | `unchecked role_unsupported` |
+
+`variants` (optional; not in the contract) switches on a reading that is never the default. `index_key_generic_map`: a name slot typed as a key of an event map the receiver takes as a type parameter reads as a string slot; a key of a concrete index-signature map stays refused. It stays off because only the service's own type argument says what the map holds (carrick#1563 part 1).
+
+Not refusable by shape (carrick#1653): an in-process emitter classified as a socket, a raw `send(data, options)` with a wrong name-at-0 claim, and a generic event map defaulting to an index signature.
+
+Response: `verdicts` (exactly one per check, in request order, the same objects as `verify_client_semantics` answers in `semantics`), `modules` (how each package resolved) and `duration_ms`.
+
+```json
+{
+  "request_id": "7",
+  "status": "success",
+  "verdicts": [
+    { "claim_id": "@fixture/queue@2:default:make:task", "receiver": "export", "verdict": "verified" },
+    { "claim_id": "@fixture/queue@2:default:op:send:trigger:instance", "receiver": "instance:task", "verdict": "verified" },
+    { "claim_id": "@fixture/queue/v2@2:default:op:send:trigger:export", "receiver": "export", "verdict": "failed", "reason": "member_missing" }
+  ],
+  "modules": [
+    { "package": "@fixture/queue", "resolved_file": "/abs/worker/node_modules/@fixture/queue/index.d.ts", "installed_version": "2.4.1" },
+    { "package": "@fixture/queue/v2", "resolved_file": "/abs/worker/node_modules/@fixture/queue/v2/index.d.ts", "installed_version": "2.4.1" }
+  ],
+  "duration_ms": 412
+}
+```
+
 #### `infer` - Resolve the type at a locator
 
 Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
@@ -731,7 +831,7 @@ Response, written before the process exits:
 | `src/bundler.ts` | Legacy symbol bundling and surface emission |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
-| `src/client-semantics.ts` | `verify_client_semantics`: library claims against a package's declarations |
+| `src/library-claims.ts` | `verify_library_claims` and `verify_client_semantics`: library claims against a package's own declarations |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
 | `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |
