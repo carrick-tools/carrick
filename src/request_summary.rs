@@ -294,6 +294,10 @@ struct ClientRef {
     /// requests go (`const d = api.defaults; d.baseURL = …`), so nothing is
     /// read through it.
     contested: bool,
+    /// The same for a library-claims reading (carrick#1616), where a `new`
+    /// on the export is its maker and contests nothing
+    /// ([`BindingUse::contests_library`]).
+    contested_library: bool,
     /// The members the file calls through the binding (`None`: the binding
     /// itself called). An instance with a call outside its verified surface
     /// is read through nothing: the call may change its base
@@ -552,6 +556,11 @@ impl FileIr {
     /// ([`LinkedClients`]).
     pub fn holds_instances(&self) -> bool {
         !self.module_clients.is_empty()
+    }
+
+    /// Every package specifier the file imports from, as written.
+    pub fn package_specifiers(&self) -> &BTreeSet<String> {
+        &self.package_specifiers
     }
 }
 
@@ -893,6 +902,7 @@ impl ModuleScope {
     fn with_uses(&self, mut client: ClientRef, binding: &str) -> ClientRef {
         if let Some(used) = self.uses.get(binding) {
             client.contested |= used.contests_client();
+            client.contested_library |= used.contests_library();
             client.called = used.called.clone();
             client.called_computed = used.called_computed;
         }
@@ -943,6 +953,11 @@ struct BindingUse {
     /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
     /// use, which keeps an import at run time, that changes nothing.
     read: bool,
+    /// Constructed with `new` (carrick#1616). Before library claims a
+    /// constructed binding was an operand like any other, and the HTTP
+    /// reading still counts it as one; a library maker of the `new` form is
+    /// exactly this use.
+    constructed: bool,
 }
 
 impl BindingUse {
@@ -950,6 +965,12 @@ impl BindingUse {
     /// exported) could have its base changed by code this pass does not
     /// read, so nothing is read through it.
     fn contests_client(&self) -> bool {
+        self.written || self.member_read || self.spread || self.other || self.constructed
+    }
+
+    /// The same for a library-claims reading (carrick#1616): constructing
+    /// the export is what its `new` maker does, so it contests nothing.
+    fn contests_library(&self) -> bool {
         self.written || self.member_read || self.spread || self.other
     }
 
@@ -1102,6 +1123,18 @@ impl Visit for BindingUses {
             other => other.visit_with(self),
         }
         call.args.visit_with(self);
+    }
+
+    /// `new Client(…)`: the binding is constructed (carrick#1616). Any
+    /// other callee is read as before.
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        match binding_key(crate::graphql_document_sites::unwrap_expression(
+            &new.callee,
+        )) {
+            Some(key) => self.mark(key, |used| used.constructed = true),
+            None => new.callee.visit_with(self),
+        }
+        new.args.visit_with(self);
     }
 
     fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
@@ -1863,6 +1896,7 @@ fn import_receivers(imports: &HashMap<String, ImportBinding>) -> HashMap<String,
                     export: import.export.clone(),
                     instance: None,
                     contested: false,
+                    contested_library: false,
                     called: BTreeSet::new(),
                     called_computed: false,
                 },
@@ -2894,6 +2928,7 @@ impl Reader<'_> {
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
             contested: client.contested,
+            contested_library: client.contested_library,
             called: BTreeSet::new(),
             called_computed: false,
         })
@@ -3712,6 +3747,7 @@ impl LinkedClients {
     fn merge(&mut self, held: &(PathBuf, String), used: &BindingUse) {
         if let Some(client) = self.clients.get_mut(held) {
             client.contested |= used.contests_client();
+            client.contested_library |= used.contests_library();
             client.called.extend(used.called.iter().cloned());
             client.called_computed |= used.called_computed;
         }
@@ -3727,11 +3763,13 @@ impl LinkedClients {
         used: &BindingUse,
     ) {
         let contests = used.contests_client() || used.called_computed;
+        let contests_library = used.contests_library() || used.called_computed;
         for binding in published {
             match declared_client(files, bindings, &binding.file, &binding.name) {
                 Declared::Client(held, _) => {
                     if let Some(client) = self.clients.get_mut(&held) {
                         client.contested |= contests;
+                        client.contested_library |= contests_library;
                         if used.called.contains(&Some(binding.published.clone())) {
                             client.called.insert(None);
                         }
@@ -3832,6 +3870,9 @@ pub struct RequestSummaryIndex {
     silent: HashMap<PathBuf, BTreeSet<u32>>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
+    /// The pub/sub and socket rows library claims state (carrick#1616,
+    /// prototype), composed beside the summaries.
+    pub library: LibraryRowIndex,
 }
 
 impl RequestSummaryIndex {
@@ -4740,7 +4781,7 @@ impl LibraryReader<'_> {
         if self.mock {
             return Err("test_or_mock_path");
         }
-        if client.contested {
+        if client.contested_library {
             return Err("contested");
         }
         // An instance is read only through the maker that verified, and only

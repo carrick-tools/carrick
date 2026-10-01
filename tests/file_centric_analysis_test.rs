@@ -316,6 +316,7 @@ fn test_processing_stats_tracking() {
         files_skipped_unrouted_protocol: 0,
         deterministic_rows_emitted: Default::default(),
         summary_rows_withdrawn: 0,
+        library_routes_withdrawn: 0,
         summary_dispatch_settled: 0,
         model_rows_joined: 0,
         model_rows_reconciled: 0,

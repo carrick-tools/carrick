@@ -36,7 +36,11 @@ use crate::client_semantics::{
     VerbSemantics,
 };
 use crate::request_summary::{MakerForm, maker_receiver};
-use crate::services::type_sidecar::{SemanticsRequestArgs, SemanticsVerbArgs};
+use crate::services::type_sidecar::{
+    BoundName, ClaimSlot, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakesForm, OpName,
+    SemanticsRequestArgs, SemanticsResult, SemanticsVerbArgs, SemanticsVerdict, SocketSide,
+    TypeSidecar,
+};
 
 /// The longest member, export or key the shape admits.
 const MAX_NAME: usize = 64;
@@ -748,8 +752,9 @@ pub struct SurfaceExport {
     pub makes: Vec<VerifiedMakes>,
     /// Receiver -> its verified ops.
     pub ops: BTreeMap<String, Vec<VerifiedOp>>,
-    /// Every (receiver, member) a maker or an op is claimed on, verified or
-    /// not: the calls a reading reaches, whatever it then states.
+    /// Every (receiver, member) an op or a definition (a maker with a name
+    /// and a handler) is claimed on, verified or not: the calls a reading
+    /// reaches, whatever it then states.
     pub claimed: BTreeSet<(String, Option<String>)>,
 }
 
@@ -853,12 +858,16 @@ impl ClaimSurface {
                         op: op.clone(),
                     });
             }
+            // A maker is a row site only when it is a definition: it makes
+            // under a name and registers a handler.
             let claimed = checks
                 .iter()
                 .filter_map(|check| match &check.claim {
-                    Claim::Makes(makes) => Some((check.receiver.clone(), makes.member.clone())),
+                    Claim::Makes(makes) if makes.name.is_some() && makes.handler.is_some() => {
+                        Some((check.receiver.clone(), makes.member.clone()))
+                    }
                     Claim::Op(op) => Some((check.receiver.clone(), op.member.clone())),
-                    Claim::Reserved(_) => None,
+                    Claim::Makes(_) | Claim::Reserved(_) => None,
                 })
                 .collect();
             surface.exports.insert(
@@ -879,6 +888,178 @@ impl ClaimSurface {
     pub fn all_verified(derived: &DerivedClaims) -> Self {
         Self::build(derived, |_, _| true)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+/// Set to `1` to read every derived claim as verified, skipping the sidecar:
+/// what the reader reaches apart from verification (prototype only, for the
+/// slice's report). Never set in a real scan.
+pub const ASSUME_VERIFIED_ENV: &str = "CARRICK_SLICE_ASSUME_VERIFIED";
+
+/// What one service's verification came to.
+#[derive(Debug, Clone, Default)]
+pub struct Verification {
+    pub surface: ClaimSurface,
+    /// One verdict per check, in check order; empty when nothing was asked
+    /// or the sidecar failed.
+    pub verdicts: Vec<SemanticsResult>,
+    pub checks: Vec<DerivedCheck>,
+    /// Wall time of the sidecar call.
+    pub elapsed: std::time::Duration,
+    /// The sidecar failed outright, and why.
+    pub error: Option<String>,
+}
+
+impl Verification {
+    /// The verdicts, by `verified` or `<verdict> (<reason>)`.
+    pub fn by_reason(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for result in &self.verdicts {
+            let label = match (&result.verdict, &result.reason) {
+                (SemanticsVerdict::Verified, _) => "verified".to_string(),
+                (verdict, reason) => format!(
+                    "{} ({})",
+                    format!("{verdict:?}").to_lowercase(),
+                    reason.as_deref().unwrap_or("no reason")
+                ),
+            };
+            *counts.entry(label).or_default() += 1;
+        }
+        counts
+    }
+}
+
+/// The sidecar's wire form of one derived check.
+pub fn wire_check(check: &DerivedCheck) -> LibraryCheck {
+    let slot = |slot: &Option<Slot>| {
+        slot.as_ref().map(|slot| ClaimSlot {
+            arg: slot.arg,
+            key: slot.key.clone(),
+        })
+    };
+    let claim = match &check.claim {
+        Claim::Makes(makes) => LibraryClaim::Makes {
+            form: match makes.form {
+                MakerForm::Call => MakesForm::Call,
+                MakerForm::New => MakesForm::New,
+            },
+            member: makes.member.clone(),
+            base: slot(&makes.base),
+            name: slot(&makes.name),
+            handler: slot(&makes.handler),
+        },
+        Claim::Op(op) => LibraryClaim::Ops {
+            op: match op.op {
+                OpKind::Request => LibraryOp::Request,
+                OpKind::Send => LibraryOp::Send,
+                OpKind::Receive => LibraryOp::Receive,
+                OpKind::Execute => LibraryOp::Execute,
+                OpKind::Define => LibraryOp::Define,
+                OpKind::Mount => LibraryOp::Mount,
+            },
+            member: op.member.clone(),
+            name: op.name.as_ref().map(|name| match name {
+                NameSource::Slot(at) => OpName::Slot(ClaimSlot {
+                    arg: at.arg,
+                    key: at.key.clone(),
+                }),
+                NameSource::Maker => OpName::Bound {
+                    bound: BoundName::Maker,
+                },
+                NameSource::Scope => OpName::Bound {
+                    bound: BoundName::Scope,
+                },
+            }),
+            payload: slot(&op.payload),
+            handler: slot(&op.handler),
+            ack: slot(&op.ack),
+            options: slot(&op.options),
+            method: op.method.clone(),
+            method_key: slot(&op.method_key),
+        },
+        Claim::Reserved(reserved) => LibraryClaim::Reserved {
+            name: reserved.name.clone(),
+            member: reserved.member.clone(),
+            at: ClaimSlot {
+                arg: reserved.at.arg,
+                key: reserved.at.key.clone(),
+            },
+        },
+    };
+    LibraryCheck {
+        claim_id: check.claim_id.clone(),
+        package: check.specifier.clone(),
+        export: check.export.clone(),
+        role: match check.role {
+            Role::HttpClient => LibraryRole::HttpClient,
+            Role::GraphqlClient => LibraryRole::GraphqlClient,
+            Role::Broker => LibraryRole::Broker,
+            Role::InProcessBus => LibraryRole::InProcessBus,
+            Role::Socket => LibraryRole::Socket,
+            Role::ServerFramework => LibraryRole::ServerFramework,
+            Role::None => LibraryRole::None,
+        },
+        side: check.side.map(|side| match side {
+            Side::Client => SocketSide::Client,
+            Side::Server => SocketSide::Server,
+            Side::Both => SocketSide::Both,
+        }),
+        receiver: check.receiver.clone(),
+        claim,
+    }
+}
+
+/// Check every non-HTTP claim `entries` make for the modules the service
+/// imports (`specifiers`), in one request, and return the surface the
+/// verified ones support. Never cached; any sidecar failure verifies
+/// nothing, so every site stays what it is without the claims.
+pub fn verify(
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &std::path::Path,
+    entries: &[LibraryClaimsEntry],
+    specifiers: &BTreeSet<String>,
+) -> Verification {
+    let derived = derive(entries, specifiers);
+    let mut verification = Verification {
+        checks: derived.checks.clone(),
+        ..Verification::default()
+    };
+    if derived.is_empty() {
+        return verification;
+    }
+    if std::env::var(ASSUME_VERIFIED_ENV).as_deref() == Ok("1") {
+        verification.surface = ClaimSurface::all_verified(&derived);
+        return verification;
+    }
+    let Some(sidecar) = sidecar else {
+        verification.error = Some("no sidecar".to_string());
+        return verification;
+    };
+    let checks: Vec<LibraryCheck> = derived.checks.iter().map(wire_check).collect();
+    let started = std::time::Instant::now();
+    let results = sidecar.verify_library_claims(from_dir, &checks);
+    verification.elapsed = started.elapsed();
+    match results {
+        Ok(results) => {
+            let verified: BTreeSet<(String, String)> = results
+                .iter()
+                .filter(|result| result.verdict == SemanticsVerdict::Verified)
+                .map(|result| (result.claim_id.clone(), result.receiver.clone()))
+                .collect();
+            verification.surface = ClaimSurface::build(&derived, |claim_id, receiver| {
+                verified.contains(&(claim_id.to_string(), receiver.to_string()))
+            });
+            verification.verdicts = results;
+        }
+        Err(error) => {
+            debug!("library claims could not be checked ({error}); nothing is verified");
+            verification.error = Some(error.to_string());
+        }
+    }
+    verification
 }
 
 #[cfg(test)]

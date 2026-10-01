@@ -3012,7 +3012,8 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
-            let (analysis, settled) = tokio::join!(
+            let library_claims = setup.detection.library_claims.clone();
+            let (analysis, (settled, library)) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3030,6 +3031,7 @@ async fn analyze_current_repo_incremental(
                 compose_summaries(
                     &request_inputs,
                     settling,
+                    library_claims,
                     sidecar,
                     &semantics_root,
                     summaries_sender,
@@ -3131,6 +3133,8 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
                 &in_process_pubsub,
+                &library,
+                Path::new(repo_path),
             );
             attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
             attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -3843,6 +3847,8 @@ fn append_deterministic_protocol_operations(
     extractions: &ProtocolExtractions,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
+    library: &crate::request_summary::LibraryRowIndex,
+    repo_root: &Path,
 ) {
     // Same "{file}:{line}" convention the mount-graph conversions use
     let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
@@ -3927,11 +3933,19 @@ fn append_deterministic_protocol_operations(
         );
     }
 
+    // Rows read through verified library claims (carrick#1616, prototype).
+    // Each claims its own site: a model pub/sub row at the same file, line,
+    // topic and role, and an event-bus row at the same file, line and name,
+    // are the same call read again, and are left out. A model row for the
+    // same topic at any other line stands.
+    let library_sites = append_library_operations(cloud_data, library, repo_root, &to_details);
     append_event_bus_operations(
         cloud_data,
         &extractions.event_bus,
         file_results,
         &to_details,
+        &library_sites,
+        repo_root,
     );
     append_pubsub_operations(
         cloud_data,
@@ -3939,7 +3953,75 @@ fn append_deterministic_protocol_operations(
         &extractions.sockets,
         in_process,
         &to_details,
+        &library_sites,
+        repo_root,
     );
+}
+
+/// The sites library rows were stated at, as (repo-relative file, line,
+/// name), with the pub/sub role where the row has one.
+#[derive(Default)]
+struct LibrarySites {
+    named: HashSet<(PathBuf, u32, String)>,
+    pubsub: HashSet<(PathBuf, u32, String, crate::operation::PubsubRole)>,
+}
+
+/// A protocol row's file, repo-relative, so walked and keyed paths compare.
+fn protocol_rel(path: &Path, repo_root: &Path) -> PathBuf {
+    normalize_protocol_file(path.strip_prefix(repo_root).unwrap_or(path))
+}
+
+/// Fold the library rows into `cloud_data` (carrick#1616, prototype): a
+/// pub/sub subscriber or a socket listener is a producer, a publisher or an
+/// emitter a consumer, each stated as a `library_claim` row.
+fn append_library_operations(
+    cloud_data: &mut CloudRepoData,
+    library: &crate::request_summary::LibraryRowIndex,
+    repo_root: &Path,
+    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+) -> LibrarySites {
+    use crate::operation::PubsubRole;
+    use crate::request_summary::LibraryRowKind;
+    let mut sites = LibrarySites::default();
+    let mut stated = 0usize;
+    for (file, row) in library.rows() {
+        let rel = protocol_rel(file, repo_root);
+        sites
+            .named
+            .insert((rel.clone(), row.line, row.name.clone()));
+        let details = |key: OperationKey| ApiEndpointDetails {
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim,
+            ),
+            ..to_details(key, file, row.line)
+        };
+        match row.kind {
+            LibraryRowKind::Pubsub(role) => {
+                sites.pubsub.insert((rel, row.line, row.name.clone(), role));
+                let key = OperationKey::pubsub(row.name.clone());
+                match role {
+                    PubsubRole::Subscriber => cloud_data.endpoints.push(details(key)),
+                    PubsubRole::Publisher => cloud_data.calls.push(details(key)),
+                }
+            }
+            LibraryRowKind::Socket {
+                direction,
+                listener,
+            } => {
+                let key = OperationKey::socket(row.name.clone(), direction);
+                if listener {
+                    cloud_data.endpoints.push(details(key));
+                } else {
+                    cloud_data.calls.push(details(key));
+                }
+            }
+        }
+        stated += 1;
+    }
+    if stated > 0 {
+        debug!(stated, "Indexing library-claim operations (carrick#1616)");
+    }
+    sites
 }
 
 /// The model's pub/sub rows that are calls into an in-process wrapper with
@@ -4020,6 +4102,8 @@ fn append_event_bus_operations(
     event_bus: &crate::event_emitter::BusExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    library: &LibrarySites,
+    repo_root: &Path,
 ) {
     use crate::operation::PubsubRole;
 
@@ -4035,6 +4119,15 @@ fn append_event_bus_operations(
                     into: &mut Vec<ApiEndpointDetails>,
                     counter: &mut usize| {
         for op in ops {
+            // A library row stated this call (carrick#1616).
+            if library.named.contains(&(
+                protocol_rel(&op.file_path, repo_root),
+                op.line,
+                op.event.clone(),
+            )) {
+                deferred += 1;
+                continue;
+            }
             let site = (
                 normalize_protocol_file(&op.file_path),
                 op.event.clone(),
@@ -4175,6 +4268,8 @@ fn append_pubsub_operations(
     sockets: &crate::socket_io::SocketExtraction,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
     to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    library: &LibrarySites,
+    repo_root: &Path,
 ) {
     use crate::operation::PubsubRole;
 
@@ -4211,6 +4306,19 @@ fn append_pubsub_operations(
                 continue;
             }
             let line = u32::try_from(op.line_number).unwrap_or(0);
+            // A library row stated this call: same file, line, topic and
+            // role (carrick#1616).
+            if let Some(role) = op.role
+                && library.pubsub.contains(&(
+                    protocol_rel(Path::new(path), repo_root),
+                    line,
+                    op.topic.clone(),
+                    role,
+                ))
+            {
+                folded += 1;
+                continue;
+            }
             let file_path = PathBuf::from(path);
             let key = OperationKey::pubsub(op.topic.clone());
             match op.role {
@@ -5972,16 +6080,25 @@ fn discover_files_and_symbols(
 fn summarize_requests(
     inputs: &crate::request_summary::RequestSummaryInputs,
     entries: Option<&[crate::client_semantics::ClientSemanticsEntry]>,
+    claims: Option<&[crate::library_claims::LibraryClaimsEntry]>,
     sidecar: Option<&TypeSidecar>,
     service_root: &Path,
 ) -> crate::request_summary::RequestSummaryIndex {
+    // Library claims in the shared shape replace `client_semantics` for HTTP
+    // where a detection carries them (carrick#1616, prototype): their HTTP
+    // exports convert to the shape the HTTP reader reads.
+    let converted = claims.map(crate::library_claims::http_entries);
+    let entries = converted.as_deref().or(entries);
     let semantics = match (entries, sidecar) {
         (Some(entries), Some(sidecar)) if !entries.is_empty() => {
             crate::client_semantics::verify(sidecar, service_root, entries)
         }
         _ => crate::client_semantics::LibrarySemantics::default(),
     };
-    let summaries = crate::request_summary::summarize(inputs, &semantics);
+    let mut summaries = crate::request_summary::summarize(inputs, &semantics);
+    if let Some(claims) = claims {
+        summaries.library = library_rows(inputs, claims, sidecar, service_root);
+    }
     debug!(
         "request summaries: {} row(s) at call sites ({} through library semantics), {} site(s) whose callee sends nothing, {} request(s) with no statable URL",
         summaries.row_count(),
@@ -5990,6 +6107,144 @@ fn summarize_requests(
         summaries.undetermined
     );
     summaries
+}
+
+/// Where the prototype writes each service's library-claims record: every
+/// check, verdict, row and silent call, with the verification time and the
+/// listed package surfaces (carrick#1616 slice). Never set in a real scan.
+const SLICE_DUMP_DIR_ENV: &str = "CARRICK_SLICE_DUMP_DIR";
+
+/// Verify a service's non-HTTP library claims and read its calls through
+/// the ones that verified (carrick#1616, prototype).
+fn library_rows(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    claims: &[crate::library_claims::LibraryClaimsEntry],
+    sidecar: Option<&TypeSidecar>,
+    service_root: &Path,
+) -> crate::request_summary::LibraryRowIndex {
+    let specifiers: BTreeSet<String> = inputs
+        .files
+        .values()
+        .flat_map(|file| file.package_specifiers().iter().cloned())
+        .collect();
+    let verification = crate::library_claims::verify(sidecar, service_root, claims, &specifiers);
+    let rows = crate::request_summary::library_rows(inputs, &verification.surface, service_root);
+    debug!(
+        "library claims: {} check(s) in {} ms ({:?}); {} row(s); silent {:?}",
+        verification.checks.len(),
+        verification.elapsed.as_millis(),
+        verification.by_reason(),
+        rows.row_count(),
+        rows.silent_by_reason()
+    );
+    if let Ok(dir) = std::env::var(SLICE_DUMP_DIR_ENV) {
+        write_slice_record(Path::new(&dir), service_root, &verification, &rows, sidecar);
+    }
+    rows
+}
+
+/// The prototype's per-service record ([`SLICE_DUMP_DIR_ENV`]).
+fn write_slice_record(
+    dir: &Path,
+    service_root: &Path,
+    verification: &crate::library_claims::Verification,
+    rows: &crate::request_summary::LibraryRowIndex,
+    sidecar: Option<&TypeSidecar>,
+) {
+    use crate::request_summary::{LibraryOutcome, LibraryRowKind};
+    let packages: Vec<String> = verification
+        .checks
+        .iter()
+        .map(|check| check.specifier.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let surfaces = match sidecar {
+        Some(sidecar) if !packages.is_empty() => {
+            match sidecar.list_library_surface(service_root, &packages, None) {
+                Ok(surfaces) => serde_json::Value::Array(surfaces),
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            }
+        }
+        _ => serde_json::Value::Null,
+    };
+    let row_json = |row: &crate::request_summary::LibraryRow| {
+        let (protocol, side) = match row.kind {
+            LibraryRowKind::Pubsub(role) => ("pubsub", format!("{role:?}").to_lowercase()),
+            LibraryRowKind::Socket {
+                direction,
+                listener,
+            } => (
+                "socket",
+                format!(
+                    "{}:{}",
+                    direction.label(),
+                    if listener { "listener" } else { "emitter" }
+                ),
+            ),
+        };
+        serde_json::json!({
+            "protocol": protocol,
+            "side": side,
+            "name": row.name,
+            "line": row.line,
+            "span": [row.span_start, row.span_end],
+            "claim_ids": row.claim_ids,
+            "definition": row.definition,
+        })
+    };
+    let calls: Vec<serde_json::Value> = rows
+        .calls
+        .iter()
+        .map(|call| {
+            let outcome = match &call.outcome {
+                LibraryOutcome::Stated(rows) => {
+                    serde_json::json!({ "stated": rows.iter().map(row_json).collect::<Vec<_>>() })
+                }
+                LibraryOutcome::Silent(reason) => serde_json::json!({ "silent": reason }),
+            };
+            serde_json::json!({
+                "file": call.file.display().to_string(),
+                "line": call.line,
+                "span_start": call.span_start,
+                "specifier": call.specifier,
+                "export": call.export,
+                "receiver": call.receiver,
+                "member": call.member,
+                "outcome": outcome,
+            })
+        })
+        .collect();
+    let checks: Vec<serde_json::Value> = verification
+        .checks
+        .iter()
+        .map(|check| {
+            serde_json::to_value(crate::library_claims::wire_check(check))
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    let record = serde_json::json!({
+        "service_root": service_root.display().to_string(),
+        "elapsed_ms": verification.elapsed.as_millis() as u64,
+        "error": verification.error,
+        "verdicts_by_reason": verification.by_reason(),
+        "checks": checks,
+        "verdicts": verification.verdicts,
+        "silent_by_reason": rows.silent_by_reason(),
+        "calls": calls,
+        "surfaces": surfaces,
+    });
+    let name: String = service_root
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        dir.join(format!("{name}.json")),
+        serde_json::to_string_pretty(&record).unwrap_or_default(),
+    );
 }
 
 /// A service's library semantics while the in-scan schedule settles them
@@ -6124,16 +6379,27 @@ where
 async fn compose_summaries(
     inputs: &crate::request_summary::RequestSummaryInputs,
     settling: SettlingSemantics,
+    claims: Option<Vec<crate::library_claims::LibraryClaimsEntry>>,
     sidecar: Option<&TypeSidecar>,
     service_root: &Path,
     summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
-) -> Option<Vec<crate::client_semantics::ClientSemanticsEntry>> {
+) -> (
+    Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+    crate::request_summary::LibraryRowIndex,
+) {
     let settled = settling.settled().await;
-    let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
+    let index = summarize_requests(
+        inputs,
+        settled.as_deref(),
+        claims.as_deref(),
+        sidecar,
+        service_root,
+    );
+    let library = index.library.clone();
     if summaries.send(index).is_err() {
         debug!("The analysis ended before its request summaries were composed");
     }
-    settled
+    (settled, library)
 }
 
 /// The library semantics one in-scan re-ask gives: what `ask` answered, when
@@ -7081,7 +7347,8 @@ async fn analyze_current_repo(
     // settled; the analysis reads them only once the model has been asked
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
-    let (analysis_result, settled) = tokio::join!(
+    let library_claims = setup.detection.library_claims.clone();
+    let (analysis_result, (settled, library)) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -7098,6 +7365,7 @@ async fn analyze_current_repo(
         compose_summaries(
             &request_inputs,
             settling,
+            library_claims,
             sidecar,
             &service_root,
             summaries_sender,
@@ -7188,6 +7456,8 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
         &in_process_pubsub,
+        &library,
+        Path::new(repo_path),
     );
     attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
     attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -16138,6 +16408,8 @@ mod tests {
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &to_details,
+            &LibrarySites::default(),
+            Path::new(""),
         );
         assert_eq!(
             cloud_data
@@ -16268,6 +16540,8 @@ mod tests {
             &extractions,
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &Default::default(),
+            Path::new(""),
         );
 
         // The socket emit is indexed exactly once, as the socket op.
@@ -16392,6 +16666,8 @@ mod tests {
             &extractions,
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &Default::default(),
+            Path::new(""),
         );
 
         // The subscription is the gap #676 was filed for: nothing else reports
