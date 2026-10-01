@@ -703,7 +703,7 @@ pub fn extract_file_ir(
             }
             Some(Decl::Class(class)) => {
                 reader.class(
-                    class.ident.sym.as_ref(),
+                    &class.ident,
                     &class.class,
                     module_scope,
                     definition_keys,
@@ -727,13 +727,7 @@ pub fn extract_file_ir(
                     ident: Some(ident),
                     class,
                 }) => {
-                    reader.class(
-                        ident.sym.as_ref(),
-                        class,
-                        module_scope,
-                        definition_keys,
-                        &mut file,
-                    );
+                    reader.class(ident, class, module_scope, definition_keys, &mut file);
                 }
                 _ => {}
             }
@@ -837,9 +831,9 @@ struct ModuleScope {
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
-    /// Class name -> what the class does with `this`, for the message-role
-    /// field rule (carrick#1665).
-    class_this: HashMap<String, ClassThis>,
+    /// Each class the file declares, by its binding -> what the class does
+    /// with `this`, for the message-role field rule (carrick#1665).
+    class_this: HashMap<BindingKey, ClassThis>,
     /// Every declaration below module scope ([`redeclared_names`]): what a
     /// function, a block or a parameter binds.
     declared_below: Declarations,
@@ -2146,12 +2140,13 @@ impl Reader<'_> {
     /// keys it.
     fn class(
         &self,
-        name: &str,
+        ident: &Ident,
         class: &Class,
         module: &ModuleScope,
         definition_keys: &HashSet<String>,
         file: &mut FileIr,
     ) {
+        let name = ident.sym.as_ref();
         let redeclared = module.subclass_fields.get(name);
         let fields = self.class_fields(class, module, redeclared);
         let none = Captured::default();
@@ -2213,9 +2208,9 @@ impl Reader<'_> {
                 _ => {}
             }
         }
-        for (field, client) in
-            library_sites::field_receivers(name, &module.class_this, field_writes)
-        {
+        let receivers =
+            library_sites::field_receivers(&ident_key(ident), &module.class_this, field_writes);
+        for (field, client) in receivers {
             file.field_receivers.insert((fields.class, field), client);
         }
     }
