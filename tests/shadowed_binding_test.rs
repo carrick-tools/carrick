@@ -170,6 +170,22 @@ fn a_member_shadowing_its_modules_url_states_nothing_at_its_callers() {
     );
 }
 
+/// A call through a namespace import raises a candidate, so the
+/// imported-member join reads the member's URL too, through the same
+/// bindings as `new_url`. Before the fix it stated the module's path here as
+/// `imported_member`.
+#[test]
+fn the_imported_member_join_reads_a_members_url_in_its_own_scope() {
+    assert_no_row("member-namespace.ts", 4);
+    assert_row(
+        "member-namespace.ts",
+        5,
+        "request_summary",
+        "GET",
+        "/api/member-module",
+    );
+}
+
 #[test]
 fn an_env_base_is_read_only_through_the_binding_the_alias_table_describes() {
     assert_no_row("env-base.ts", 6);
