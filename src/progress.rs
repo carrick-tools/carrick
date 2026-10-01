@@ -444,6 +444,32 @@ fn readable_size(bytes: usize) -> String {
 #[derive(Serialize, Deserialize)]
 struct Notice {
     text: String,
+    /// The wait `text` described is over (carrick#1674). A reader takes the
+    /// notice off its line only while it is still the one showing there, so
+    /// the end of one wait never clears another notice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ended: bool,
+}
+
+/// What a notice line from a scan says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeLine {
+    /// Show this beside the counts until something replaces it.
+    Shown(String),
+    /// The wait this notice described is over.
+    Ended(String),
+}
+
+impl NoticeLine {
+    /// The notice a line carries after this one, given the one it carries
+    /// now: a new notice replaces it, and an end takes it off only while it
+    /// is still the one showing.
+    pub fn apply(&self, showing: Option<String>) -> Option<String> {
+        match self {
+            Self::Shown(text) => Some(text.clone()),
+            Self::Ended(text) => showing.filter(|showing| showing != text),
+        }
+    }
 }
 
 /// Say something a person watching the scan should know about why it is
@@ -456,22 +482,56 @@ struct Notice {
 /// the indexer puts it beside the progress it shows (carrick#1122).
 pub fn announce(text: &str) {
     tracing::info!("{text}");
+    state_notice(text, false);
+}
+
+/// Cross a notice, or its end, to a parent that is reading.
+fn state_notice(text: &str, ended: bool) {
     if !enabled() {
         return;
     }
     if let Ok(line) = serde_json::to_string(&Notice {
         text: text.to_string(),
+        ended,
     }) {
         crate::errln!("{NOTICE_MARKER}{line}");
     }
 }
 
+/// A notice about a wait that is running: announced when it is made, and
+/// ended when it is dropped, however the wait finished — answered, failed,
+/// timed out, or abandoned with the task that was waiting (carrick#1674).
+///
+/// Only a wait still running is worth a line: "waiting up to 30 s" sat
+/// beside the counts for minutes after a re-ask that answered in under three.
+#[must_use = "the notice ends when this is dropped"]
+pub struct WaitNotice {
+    text: String,
+}
+
+/// Announce `text` for as long as the returned [`WaitNotice`] lives.
+pub fn announce_wait(text: String) -> WaitNotice {
+    announce(&text);
+    WaitNotice { text }
+}
+
+impl Drop for WaitNotice {
+    fn drop(&mut self) {
+        tracing::debug!("no longer: {}", self.text);
+        state_notice(&self.text, true);
+    }
+}
+
 /// Read a notice out of a line of a scan's stderr, if that is what it is.
-pub fn parse_notice(line: &str) -> Option<String> {
+pub fn parse_notice(line: &str) -> Option<NoticeLine> {
     let payload = line.trim_start().strip_prefix(NOTICE_MARKER)?;
-    serde_json::from_str::<Notice>(payload)
-        .ok()
-        .map(|notice| notice.text)
+    serde_json::from_str::<Notice>(payload).ok().map(|notice| {
+        if notice.ended {
+            NoticeLine::Ended(notice.text)
+        } else {
+            NoticeLine::Shown(notice.text)
+        }
+    })
 }
 
 /// The prefix of the line a failing scan states its reason on.
@@ -592,17 +652,54 @@ mod tests {
         let line = format!(
             "{NOTICE_MARKER}{}",
             serde_json::to_string(&Notice {
-                text: "model busy: slowing analyze-file to 4 requests at a time".to_string()
+                text: "model busy: slowing analyze-file to 4 requests at a time".to_string(),
+                ended: false,
             })
             .unwrap()
         );
+        // A notice that is shown carries no `ended` key: the line is what it
+        // was before the end existed.
         assert_eq!(
-            parse_notice(&line).as_deref(),
-            Some("model busy: slowing analyze-file to 4 requests at a time")
+            line,
+            r#"@carrick-notice {"text":"model busy: slowing analyze-file to 4 requests at a time"}"#
+        );
+        assert_eq!(
+            parse_notice(&line),
+            Some(NoticeLine::Shown(
+                "model busy: slowing analyze-file to 4 requests at a time".to_string()
+            ))
         );
         assert!(parse_notice("@carrick-progress {}").is_none());
         assert!(parse(&line).is_none());
         assert!(parse_failure(&line).is_none());
+    }
+
+    /// The end of a notice crosses as the same marker, and takes the notice
+    /// off only while it is still the one showing (carrick#1674).
+    #[test]
+    fn a_notice_end_crosses_and_clears_only_its_own_notice() {
+        let waiting = "2 client libraries being described, waiting up to 30 s";
+        let line = format!(
+            "{NOTICE_MARKER}{}",
+            serde_json::to_string(&Notice {
+                text: waiting.to_string(),
+                ended: true,
+            })
+            .unwrap()
+        );
+        let end = parse_notice(&line).unwrap();
+        assert_eq!(end, NoticeLine::Ended(waiting.to_string()));
+        assert_eq!(end.apply(Some(waiting.to_string())), None);
+        assert_eq!(
+            end.apply(Some("model busy".to_string())),
+            Some("model busy".to_string()),
+            "another notice is not cleared by this one's end"
+        );
+        assert_eq!(end.apply(None), None);
+        assert_eq!(
+            NoticeLine::Shown("model busy".to_string()).apply(Some(waiting.to_string())),
+            Some("model busy".to_string())
+        );
     }
 
     /// A dispatch that did not happen crosses the process boundary the same

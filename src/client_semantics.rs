@@ -869,6 +869,13 @@ pub enum ScheduleNotice {
 }
 
 impl ScheduleNotice {
+    /// Whether this describes a wait that is running, and so holds only until
+    /// that wait is over (carrick#1674). `Remaining` is where the schedule
+    /// ended, and stands until something replaces it.
+    pub fn is_wait(&self) -> bool {
+        !matches!(self, Self::Remaining { .. })
+    }
+
     /// The line the user reads.
     pub fn line(&self) -> String {
         match self {
@@ -945,13 +952,20 @@ pub fn reask_notice(
 /// an answer the scan cannot use. A later answer fills only entries still
 /// pending, so the first answer for a package stands whichever ask gave it,
 /// and the rows cannot depend on which ask that was.
-pub async fn settle_pending<Ask, AskFut, Wait, WaitFut>(
+///
+/// What `notice` returns for a notice is held until the next notice, the end
+/// of the schedule, or the schedule being dropped, and is dropped first of
+/// those, before the next notice is made (carrick#1674). A caller that ends a
+/// wait's notice on drop ([`crate::progress::WaitNotice`]) therefore never
+/// leaves "waiting up to N s" up once the schedule has stopped waiting, and
+/// never ends a notice that a same-worded one has just replaced.
+pub async fn settle_pending<Ask, AskFut, Wait, WaitFut, Shown>(
     mut entries: Vec<ClientSemanticsEntry>,
     installed: impl Fn(&str) -> bool,
     waits: &[std::time::Duration],
     mut ask: Ask,
     mut wait: Wait,
-    mut notice: impl FnMut(ScheduleNotice),
+    mut notice: impl FnMut(ScheduleNotice) -> Shown,
 ) -> Vec<ClientSemanticsEntry>
 where
     Ask: FnMut() -> AskFut,
@@ -959,6 +973,11 @@ where
     Wait: FnMut(std::time::Duration) -> WaitFut,
     WaitFut: std::future::Future<Output = ()>,
 {
+    let mut showing: Option<Shown> = None;
+    let mut say = |said: ScheduleNotice| {
+        drop(showing.take());
+        showing = Some(notice(said));
+    };
     let waiting = |entries: &[ClientSemanticsEntry]| {
         entries
             .iter()
@@ -974,7 +993,7 @@ where
         if still == 0 {
             return entries;
         }
-        notice(ScheduleNotice::Waiting {
+        say(ScheduleNotice::Waiting {
             waiting: still,
             described,
             wait: *pause + PENDING_REASK_TIMEOUT,
@@ -986,7 +1005,7 @@ where
     }
     let remaining = waiting(&entries);
     if remaining > 0 {
-        notice(ScheduleNotice::Remaining { remaining });
+        say(ScheduleNotice::Remaining { remaining });
     }
     entries
 }
@@ -1480,5 +1499,105 @@ mod tests {
             &service,
             repo.path()
         ));
+    }
+
+    /// carrick#1674: each "still being described" notice ends before the
+    /// next is shown, and once the schedule stops waiting, whichever way it
+    /// stopped. Where it ended (`Remaining`) is not a wait and stands.
+    #[tokio::test]
+    async fn the_schedule_ends_each_wait_notice_once_it_stops_waiting() {
+        type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+        /// A held wait notice, recording its end when dropped.
+        struct Held(Log, String);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(format!("ended: {}", self.1));
+            }
+        }
+        let say = |log: &Log| {
+            let log = log.clone();
+            move |notice: ScheduleNotice| {
+                log.borrow_mut().push(format!("shown: {}", notice.line()));
+                notice.is_wait().then(|| Held(log.clone(), notice.line()))
+            }
+        };
+        let waits = [std::time::Duration::ZERO, std::time::Duration::ZERO];
+        let waiting = "1 of 3 client libraries still being described, waiting up to 30 s";
+        let answered: Vec<ClientSemanticsEntry> = sample_entries()
+            .into_iter()
+            .map(|mut entry| {
+                if entry.status == SemanticsStatus::Pending {
+                    entry.status = SemanticsStatus::Answered;
+                }
+                entry
+            })
+            .collect();
+
+        // The waits and the asks are logged beside the notices, so a notice
+        // that ended before its wait ran reads differently from one that
+        // ended when the wait was over.
+        let waited = |log: &Log| {
+            let log = log.clone();
+            move |_: std::time::Duration| {
+                log.borrow_mut().push("waited".to_string());
+                std::future::ready(())
+            }
+        };
+
+        // The second ask answers: two waits, each ended once its ask is
+        // back, and nothing after.
+        let log = Log::default();
+        let asked = log.clone();
+        let mut asks = 0;
+        settle_pending(
+            sample_entries(),
+            |_| true,
+            &waits,
+            || {
+                asks += 1;
+                asked.borrow_mut().push(format!("ask {asks}"));
+                std::future::ready((asks == 2).then(|| answered.clone()))
+            },
+            waited(&log),
+            say(&log),
+        )
+        .await;
+        assert_eq!(
+            log.borrow().clone(),
+            vec![
+                format!("shown: {waiting}"),
+                "waited".to_string(),
+                "ask 1".to_string(),
+                format!("ended: {waiting}"),
+                format!("shown: {waiting}"),
+                "waited".to_string(),
+                "ask 2".to_string(),
+                format!("ended: {waiting}"),
+            ]
+        );
+
+        // No ask answers: the last wait ends, and where it ended stands.
+        let log = Log::default();
+        settle_pending(
+            sample_entries(),
+            |_| true,
+            &waits,
+            || std::future::ready(None),
+            waited(&log),
+            say(&log),
+        )
+        .await;
+        assert_eq!(
+            log.borrow().clone(),
+            vec![
+                format!("shown: {waiting}"),
+                "waited".to_string(),
+                format!("ended: {waiting}"),
+                format!("shown: {waiting}"),
+                "waited".to_string(),
+                format!("ended: {waiting}"),
+                "shown: 1 client library not described yet".to_string(),
+            ]
+        );
     }
 }

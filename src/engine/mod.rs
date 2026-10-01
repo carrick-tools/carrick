@@ -2910,7 +2910,7 @@ async fn analyze_current_repo_incremental(
                                 .detect_frameworks_and_libraries(packages, &all_import_facts)
                                 .await
                         },
-                        |notice| crate::progress::announce(&notice.line()),
+                        say_schedule,
                     )
                     .await;
                     // A missing cached config (older cache entry, or an
@@ -3381,13 +3381,17 @@ async fn analyze_current_repo_incremental(
 /// cached detection is this run's own (a retry of owed work). A failure, or
 /// no answer in time, keeps the cached detection as it is and never defers
 /// the service.
-async fn reask_client_semantics<Ask, AskFut>(
+///
+/// What `notice` returns is held until the ask has returned, failed or run
+/// out of time, and then dropped: [`say_schedule`]'s guard ends the notice
+/// there (carrick#1674).
+async fn reask_client_semantics<Ask, AskFut, Shown>(
     cached: &DetectionResult,
     generation: PreviousGeneration,
     service_root: &Path,
     repo_root: &Path,
     ask: Ask,
-    notice: impl FnOnce(crate::client_semantics::ScheduleNotice),
+    notice: impl FnOnce(crate::client_semantics::ScheduleNotice) -> Shown,
 ) -> DetectionResult
 where
     Ask: FnOnce() -> AskFut,
@@ -3405,13 +3409,17 @@ where
         return cached.clone();
     }
     debug!("Asking framework detection again for this service's library semantics");
-    notice(crate::client_semantics::reask_notice(
+    let shown = notice(crate::client_semantics::reask_notice(
         cached.client_semantics.as_deref(),
         &cached.data_fetchers,
         service_root,
         repo_root,
     ));
-    match tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask()).await {
+    let answered =
+        tokio::time::timeout(crate::client_semantics::PENDING_REASK_TIMEOUT, ask()).await;
+    // The wait is over whichever way it went.
+    drop(shown);
+    match answered {
         Ok(Ok(fresh)) => {
             if !fresh.same_lists(cached) {
                 debug!(
@@ -3443,6 +3451,21 @@ where
 /// no retry, because a failure costs nothing the next scan does not fix.
 pub(crate) fn reask_agent() -> AgentService {
     AgentService::new().with_retry_policy(crate::agent_service::RetryPolicy::ONCE)
+}
+
+/// Say a library-semantics notice to the person watching the scan. A wait
+/// holds its notice only while the returned guard lives, so the line stops
+/// saying "waiting up to 30 s" once the ask has come back (carrick#1674);
+/// where a schedule ended stands until something replaces it.
+fn say_schedule(
+    notice: crate::client_semantics::ScheduleNotice,
+) -> Option<crate::progress::WaitNotice> {
+    if notice.is_wait() {
+        Some(crate::progress::announce_wait(notice.line()))
+    } else {
+        crate::progress::announce(&notice.line());
+        None
+    }
 }
 
 /// A detection an earlier pass of this service already has, with the
@@ -6140,7 +6163,7 @@ fn start_semantics_schedule(
                 .await
             }
         },
-        |notice| crate::progress::announce(&notice.line()),
+        say_schedule,
     )
 }
 
@@ -6150,17 +6173,18 @@ fn start_semantics_schedule(
 /// panics ([`crate::panic_report::quiet`]): the schedule is best effort, so
 /// a failure inside it keeps what the first ask gave and never reports the
 /// scan as failed.
-fn spawn_schedule<Ask, AskFut>(
+fn spawn_schedule<Ask, AskFut, Shown>(
     asked: Vec<crate::client_semantics::ClientSemanticsEntry>,
     installed: impl Fn(&str) -> bool + Send + Sync + 'static,
     waits: Vec<std::time::Duration>,
     ask: Ask,
-    notice: impl FnMut(crate::client_semantics::ScheduleNotice) + Send + 'static,
+    notice: impl FnMut(crate::client_semantics::ScheduleNotice) -> Shown + Send + 'static,
 ) -> SettlingSemantics
 where
     Ask: FnMut() -> AskFut + Send + 'static,
     AskFut: std::future::Future<Output = Option<Vec<crate::client_semantics::ClientSemanticsEntry>>>
         + Send,
+    Shown: Send + 'static,
 {
     let entries = asked.clone();
     let task = tokio::spawn(crate::panic_report::quiet(async move {
@@ -13647,6 +13671,117 @@ mod tests {
         assert_eq!(
             lines,
             vec!["2 client libraries being described, waiting up to 30 s"]
+        );
+    }
+
+    /// What a re-ask said and did, in order.
+    #[derive(Clone, Default)]
+    struct Said(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    /// A notice that records its own end when it is dropped, which is how
+    /// [`crate::progress::WaitNotice`] states it.
+    struct SaidUntilDropped(Said, String);
+
+    impl Drop for SaidUntilDropped {
+        fn drop(&mut self) {
+            self.0.push(format!("ended: {}", self.1));
+        }
+    }
+
+    impl Said {
+        fn push(&self, line: String) {
+            self.0.borrow_mut().push(line);
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+
+        fn notice(&self, notice: crate::client_semantics::ScheduleNotice) -> SaidUntilDropped {
+            self.push(format!("shown: {}", notice.line()));
+            SaidUntilDropped(self.clone(), notice.line())
+        }
+    }
+
+    /// carrick#1674: the re-ask's notice ends once the ask is over, whether
+    /// it answered, failed or ran out of time, and not before. It used to
+    /// stay beside the counts until the next service's notice replaced it.
+    #[tokio::test(start_paused = true)]
+    async fn the_reask_notice_ends_once_the_ask_is_over() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root
+            .path()
+            .join("node_modules/@fixture/http")
+            .join("package.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "{}").unwrap();
+        let (stored, answer) = stored_and_other_answer();
+        let waiting = "1 client library being described, waiting up to 30 s";
+
+        let said = Said::default();
+        let (asked, fresh) = (said.clone(), answer.clone());
+        reask_client_semantics(
+            &stored,
+            PreviousGeneration::Stored,
+            root.path(),
+            root.path(),
+            || async move {
+                asked.push("answered".to_string());
+                Ok(fresh)
+            },
+            |notice| said.notice(notice),
+        )
+        .await;
+        assert_eq!(
+            said.lines(),
+            vec![
+                format!("shown: {waiting}"),
+                "answered".to_string(),
+                format!("ended: {waiting}")
+            ]
+        );
+
+        let said = Said::default();
+        let asked = said.clone();
+        reask_client_semantics(
+            &stored,
+            PreviousGeneration::Stored,
+            root.path(),
+            root.path(),
+            || async move {
+                asked.push("failed".to_string());
+                Err::<DetectionResult, Box<dyn std::error::Error>>("unreachable".into())
+            },
+            |notice| said.notice(notice),
+        )
+        .await;
+        assert_eq!(
+            said.lines(),
+            vec![
+                format!("shown: {waiting}"),
+                "failed".to_string(),
+                format!("ended: {waiting}")
+            ]
+        );
+
+        let said = Said::default();
+        let started = tokio::time::Instant::now();
+        reask_client_semantics(
+            &stored,
+            PreviousGeneration::Stored,
+            root.path(),
+            root.path(),
+            std::future::pending::<Result<DetectionResult, Box<dyn std::error::Error>>>,
+            |notice| said.notice(notice),
+        )
+        .await;
+        assert_eq!(
+            started.elapsed(),
+            crate::client_semantics::PENDING_REASK_TIMEOUT
+        );
+        assert_eq!(
+            said.lines(),
+            vec![format!("shown: {waiting}"), format!("ended: {waiting}")]
         );
     }
 

@@ -101,7 +101,8 @@ pub struct ScanState {
     pub progress: Option<Update>,
     /// Why the scan is slow right now, in the words the scan used: the model
     /// refusing work, the gateway throttling, requests being retried
-    /// (carrick#1122). Cleared by the next phase.
+    /// (carrick#1122). Cleared by the next phase, or when the wait it
+    /// described is over (carrick#1674).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,6 +496,26 @@ pub fn notice(text: &str) {
     active.last_write = Some(now);
     let age = human_duration(now.duration_since(active.started).as_secs() as i64);
     log_line(&format!("carrick: {age} {text}"));
+}
+
+/// The wait `text` described is over (carrick#1674): take it out of the
+/// state `carrick status` reads, if it is still the notice there. Another
+/// notice that replaced it stays. The log keeps the line it wrote; a log is
+/// what happened.
+pub fn notice_ended(text: &str) {
+    let Ok(mut guard) = ACTIVE.lock() else {
+        return;
+    };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    if active.state.notice.as_deref() != Some(text) {
+        return;
+    }
+    active.state.notice = None;
+    active.state.updated_at = timestamp();
+    write(&active.file, &active.state);
+    active.last_write = Some(Instant::now());
 }
 
 /// A line for whoever reads this scan's output as text: a detached scan's log,

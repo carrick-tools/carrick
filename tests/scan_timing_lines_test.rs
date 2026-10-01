@@ -133,12 +133,16 @@ fn capturing_stderr<T>(work: impl FnOnce() -> T) -> (T, String) {
 }
 
 /// The notices the scan stated, in the order it stated them, with the line
-/// each was on so an ordering assertion can name it.
+/// each was on so an ordering assertion can name it. The end of a notice
+/// (carrick#1674) is not one.
 fn notices(stream: &str) -> Vec<(usize, String)> {
     stream
         .lines()
         .enumerate()
-        .filter_map(|(at, line)| carrick::progress::parse_notice(line).map(|text| (at, text)))
+        .filter_map(|(at, line)| match carrick::progress::parse_notice(line)? {
+            carrick::progress::NoticeLine::Shown(text) => Some((at, text)),
+            carrick::progress::NoticeLine::Ended(_) => None,
+        })
         .collect()
 }
 

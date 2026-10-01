@@ -217,6 +217,40 @@ test("a marker is read by its prefix, and nothing else is read as one", () => {
     kind: "notice",
     text: "model busy",
   });
+  assert.deepEqual(parseMarker('@carrick-notice {"text":"model busy","ended":true}'), {
+    kind: "noticeEnded",
+    text: "model busy",
+  });
+});
+
+test("a notice comes off the line once its wait is over, and only its own", async () => {
+  // carrick#1674: "waiting up to 30 s" stayed beside the counts for minutes
+  // after a wait that ended in under three.
+  const written: string[] = [];
+  const render = new ScanRender(plainOutput((text) => written.push(text)), "0.3.81");
+  const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const waiting = "2 client libraries being described, waiting up to 30 s";
+  render.stderr('@carrick-phase {"label":"indexing api","state":"started"}');
+  await turn();
+  render.stderr(
+    '@carrick-progress {"service":"api","service_index":1,"service_total":1,"phase":"files","done":1,"total":2}',
+  );
+  render.stderr(`@carrick-notice {"text":"${waiting}"}`);
+  render.stderr(`@carrick-notice {"text":"${waiting}","ended":true}`);
+  render.stderr('@carrick-notice {"text":"model busy"}');
+  // Not the notice showing: nothing moves, so nothing is drawn.
+  render.stderr(`@carrick-notice {"text":"${waiting}","ended":true}`);
+  render.stderr('@carrick-phase {"label":"indexed api","state":"done"}');
+  await render.finish(false);
+  assert.deepEqual(
+    written.filter((line) => line.startsWith("indexing api:")),
+    [
+      "indexing api: 1 of 2 files\n",
+      `indexing api: 1 of 2 files (${waiting})\n`,
+      "indexing api: 1 of 2 files\n",
+      "indexing api: 1 of 2 files (model busy)\n",
+    ],
+  );
 });
 
 test("counts and durations read the way the line says them", () => {

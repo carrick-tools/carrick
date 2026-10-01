@@ -909,16 +909,20 @@ fn run_scan(
             continue;
         }
         // Why the scan is slow, said by the scan (carrick#1122). It rides
-        // beside the counts until the next one replaces it.
-        if let Some(text) = crate::progress::parse_notice(&line) {
+        // beside the counts until the next one replaces it, or until the wait
+        // it described is over (carrick#1674).
+        if let Some(said) = crate::progress::parse_notice(&line) {
             forward(&line);
+            notice = said.apply(notice);
+            match &said {
+                crate::progress::NoticeLine::Shown(text) => super::scan_state::notice(text),
+                crate::progress::NoticeLine::Ended(text) => super::scan_state::notice_ended(text),
+            }
             bar.set_message(bar_message(
                 &reporting.working,
                 last_update.as_ref(),
-                Some(&text),
+                notice.as_deref(),
             ));
-            super::scan_state::notice(&text);
-            notice = Some(text);
             continue;
         }
         if let Some(reported) = crate::scan_spend::parse(&line) {
@@ -2668,6 +2672,57 @@ mod tests {
         // to, which is the only count a reader has.
         assert_eq!(read.progress, Some(update));
         super::super::scan_state::finish(None);
+    }
+
+    /// carrick#1674: a notice about a wait comes off the line once the scan
+    /// says the wait is over, and the end of one wait never takes off a
+    /// notice that replaced it. Driven through [`run_scan`]'s own line
+    /// handling, which sets the bar and the state `carrick status` reads from
+    /// the same notice.
+    #[test]
+    fn a_notice_comes_off_the_line_when_its_wait_is_over() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting = "2 client libraries being described, waiting up to 30 s";
+        let busy = "model busy: slowing analyze-file to 4 requests at a time";
+        let shown = |text: &str| format!(r#"@carrick-notice {{"text":"{text}"}}"#);
+        let ended = |text: &str| format!(r#"@carrick-notice {{"text":"{text}","ended":true}}"#);
+        for (lines, left) in [
+            // The control: a notice nothing ends stays, so the state can be
+            // read and the cases below are not vacuous.
+            (vec![shown(waiting)], Some(waiting)),
+            (vec![shown(waiting), ended(waiting)], None),
+            (
+                vec![shown(waiting), shown(busy), ended(waiting)],
+                Some(busy),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            super::super::scan_state::begin(dir.path(), "notices1", dir.path(), true);
+            let script = lines
+                .iter()
+                .map(|line| format!("echo '{line}' >&2"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            run_scan(
+                command,
+                "scan of /repos/ledger",
+                Reporting {
+                    working: "indexing ledger".to_string(),
+                    done: "indexed ledger".to_string(),
+                },
+                HEARTBEAT,
+            )
+            .unwrap();
+            let state = super::super::scan_state::state_file(dir.path(), "notices1");
+            let read: super::super::scan_state::ScanState =
+                serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(read.notice.as_deref(), left, "{lines:?}");
+            super::super::scan_state::finish(None);
+        }
     }
 
     /// A first `carrick index` in the foreground records its scan before

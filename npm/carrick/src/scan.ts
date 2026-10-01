@@ -93,7 +93,9 @@ export type Marker =
   | { kind: "phase"; phase: PhaseUpdate }
   | { kind: "progress"; update: ProgressUpdate }
   | { kind: "summary"; summary: Summary }
-  | { kind: "notice"; text: string };
+  | { kind: "notice"; text: string }
+  /** The wait a notice described is over (carrick#1674). */
+  | { kind: "noticeEnded"; text: string };
 
 const PREFIXES = {
   phase: "@carrick-phase ",
@@ -136,8 +138,9 @@ export function parseMarker(line: string): Marker | null {
       if (!Array.isArray(summary.services)) return null;
       return { kind: "summary", summary };
     }
-    const notice = payload as { text?: unknown };
+    const notice = payload as { text?: unknown; ended?: unknown };
     if (typeof notice.text !== "string") return null;
+    if (notice.ended === true) return { kind: "noticeEnded", text: notice.text };
     return { kind: "notice", text: notice.text };
   }
   return null;
@@ -313,6 +316,7 @@ export class ScanRender {
     if (marker.kind === "phase") this.phase(marker.phase);
     else if (marker.kind === "progress") this.progress(marker.update);
     else if (marker.kind === "notice") this.notice(marker.text);
+    else if (marker.kind === "noticeEnded") this.noticeEnded(marker.text);
     else this.summary(marker.summary);
     return true;
   }
@@ -403,6 +407,17 @@ export class ScanRender {
       return;
     }
     this.open.notice = text;
+    this.redraw();
+  }
+
+  /**
+   * The wait a notice described is over: take it off the line, but only while
+   * it is still the notice showing, so one wait's end never clears another
+   * notice (carrick#1674). An end with no open phase says nothing.
+   */
+  private noticeEnded(text: string): void {
+    if (!this.open || this.open.notice !== text) return;
+    this.open.notice = null;
     this.redraw();
   }
 
