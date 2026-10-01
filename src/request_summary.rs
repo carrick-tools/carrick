@@ -535,6 +535,9 @@ pub struct FileIr {
     module_level: FnIr,
     /// Every package specifier the file imports from, as written.
     package_specifiers: BTreeSet<String>,
+    /// The exports the file imports from each package specifier (`*` for a
+    /// namespace import): what a listed package surface is cut to.
+    package_imports: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl FileIr {
@@ -564,6 +567,11 @@ impl FileIr {
     /// Every package specifier the file imports from, as written.
     pub fn package_specifiers(&self) -> &BTreeSet<String> {
         &self.package_specifiers
+    }
+
+    /// The exports the file imports from each package specifier.
+    pub fn package_imports(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.package_imports
     }
 }
 
@@ -633,12 +641,28 @@ pub fn extract_file_ir(
         .map(|import| import.specifier.clone())
         .filter(|specifier| !specifier.starts_with('.') && !specifier.starts_with('/'))
         .collect();
+    let mut package_imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for import in imports.values() {
+        if import.specifier.starts_with('.') || import.specifier.starts_with('/') {
+            continue;
+        }
+        let export = if import.namespace {
+            "*".to_string()
+        } else {
+            import.export.clone()
+        };
+        package_imports
+            .entry(import.specifier.clone())
+            .or_default()
+            .insert(export);
+    }
     let mut file = FileIr {
         imported,
         value_specifiers,
         loads: module_loads(module, &bound_requires),
         names_commonjs_exports: names_commonjs_exports(module),
         package_specifiers,
+        package_imports,
         ..FileIr::default()
     };
     let reader = Reader { source_map };

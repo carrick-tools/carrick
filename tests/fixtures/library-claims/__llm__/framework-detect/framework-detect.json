@@ -263,7 +263,10 @@
               "name": {
                 "arg": 0
               },
-              "on": "instance"
+              "on": "instance",
+              "payload": {
+                "arg": 1
+              }
             },
             {
               "op": "receive",

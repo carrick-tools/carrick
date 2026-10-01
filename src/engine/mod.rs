@@ -33,7 +33,7 @@ use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymb
 pub use durability::ModelSetup;
 use durability::ServiceAnalysis;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -6148,7 +6148,23 @@ fn library_rows(
         rows.silent_by_reason()
     );
     if let Ok(dir) = std::env::var(SLICE_DUMP_DIR_ENV) {
-        write_slice_record(Path::new(&dir), service_root, &verification, &rows, sidecar);
+        let mut imported: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for file in inputs.files.values() {
+            for (specifier, exports) in file.package_imports() {
+                let entry = imported.entry(specifier.clone()).or_default();
+                entry.extend(exports.iter().cloned());
+                entry.sort();
+                entry.dedup();
+            }
+        }
+        write_slice_record(
+            Path::new(&dir),
+            service_root,
+            &verification,
+            &rows,
+            sidecar,
+            &imported,
+        );
     }
     rows
 }
@@ -6160,6 +6176,7 @@ fn write_slice_record(
     verification: &crate::library_claims::Verification,
     rows: &crate::request_summary::LibraryRowIndex,
     sidecar: Option<&TypeSidecar>,
+    imported: &BTreeMap<String, Vec<String>>,
 ) {
     use crate::request_summary::{LibraryOutcome, LibraryRowKind};
     let packages: Vec<String> = verification
@@ -6176,7 +6193,13 @@ fn write_slice_record(
             let max_entries = std::env::var("CARRICK_SLICE_SURFACE_MAX")
                 .ok()
                 .and_then(|max| max.parse::<u32>().ok());
-            match sidecar.list_library_surface(service_root, &packages, max_entries) {
+            // Only the exports the service imports (the unfiltered listing
+            // hits the cap on a large package).
+            let exports: BTreeMap<String, Vec<String>> = packages
+                .iter()
+                .filter_map(|package| Some((package.clone(), imported.get(package)?.clone())))
+                .collect();
+            match sidecar.list_library_surface_of(service_root, &packages, &exports, max_entries) {
                 Ok(surfaces) => serde_json::Value::Array(surfaces),
                 Err(error) => serde_json::json!({ "error": error.to_string() }),
             }
