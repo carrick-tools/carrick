@@ -1168,6 +1168,33 @@ mod tests {
         site(&sites, "src/queue.ts", 3, Some("add"));
     }
 
+    /// A key a later spread may overwrite holds nothing the source states,
+    /// and a spread argument moves every position, so it is no site.
+    #[test]
+    fn a_key_a_later_spread_may_overwrite_is_not_read() {
+        let sites = sites_of(&[(
+            "src/tasks.ts",
+            "import { task } from \"@fixture/jobs\";\n\
+             import { bus } from \"@fixture/bus\";\n\
+             const defaults = { queue: \"main\" };\n\
+             export const before = task({ id: \"before\", ...defaults });\n\
+             export const after = task({ ...defaults, id: \"after\" });\n\
+             export function send(args: [string, unknown]) { bus.publish(...args); }\n",
+        )]);
+        assert_eq!(
+            site(&sites, "src/tasks.ts", 4, None).literal(0, Some("id")),
+            None
+        );
+        assert_eq!(
+            site(&sites, "src/tasks.ts", 5, None).literal(0, Some("id")),
+            Some("after")
+        );
+        assert!(
+            sites.iter().all(|site| site.line != 6),
+            "a spread argument is no site: {sites:#?}"
+        );
+    }
+
     /// A call the call graph resolves to a function of this service is that
     /// function's, and so is what it returns: a package of the repo's own
     /// (carrick#1666) is read through its source, never as a library.
