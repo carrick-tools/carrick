@@ -435,10 +435,11 @@ impl Reader {
         struct Entry {
             metadata: CloudRepoData,
             /// The stored row's `updatedAt`. Optional in the cloud's own type,
-            /// and a blob answered without it is one the next read cannot
-            /// compare, so it downloads again (carrick#1673).
+            /// and a blob answered without it, or with anything but a string,
+            /// is one the next read cannot compare, so it downloads again
+            /// (carrick#1673). It never costs the blob itself.
             #[serde(default, rename = "lastUpdated")]
-            last_updated: Option<String>,
+            last_updated: Option<serde_json::Value>,
         }
         #[derive(Deserialize)]
         struct Response {
@@ -453,7 +454,11 @@ impl Reader {
                 repo: entry.metadata.repo_name.to_ascii_lowercase(),
                 service: service_of(&entry.metadata),
                 hash: entry.metadata.commit_hash.clone(),
-                updated_at: entry.last_updated.clone(),
+                updated_at: entry
+                    .last_updated
+                    .as_ref()
+                    .and_then(|at| at.as_str())
+                    .map(str::to_string),
             })
             .collect();
         Ok(DownloadedProject {
@@ -1536,6 +1541,27 @@ mod tests {
             body,
             json!({"action":"get-cross-repo-data","project_id":"authorised-project"})
         );
+    }
+
+    /// A blob answered with no stored time, or with one that is not a string,
+    /// is still read; only the record of it says "cannot compare".
+    #[tokio::test]
+    async fn a_stored_time_that_is_missing_or_not_a_string_still_reads_the_blob() {
+        let (url, request) = serve(
+            "200 OK",
+            "",
+            serde_json::to_vec(&json!({"repos":[
+                {"metadata": named_blob("api","api","abcdef"), "lastUpdated": 1_727_800_000},
+                {"metadata": named_blob("api","worker","fedcba")}]}))
+            .unwrap(),
+        );
+        let project = reader(url)
+            .project(&credential("test-secret"), "p")
+            .await
+            .unwrap();
+        request.join().unwrap();
+        assert_eq!(project.blobs.len(), 2);
+        assert!(project.rows.iter().all(|row| row.updated_at.is_none()));
     }
 
     #[tokio::test]
