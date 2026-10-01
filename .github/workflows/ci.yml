@@ -110,6 +110,7 @@ jobs:
           --test mock_storage_test
           --test module_resolution_parity_test
           --test new_url_target_test
+          --test nonhttp_source_labels_test
           --test object_export_surface_test
           --test output_contract_test
           --test pr_on_main_test
