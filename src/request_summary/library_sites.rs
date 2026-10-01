@@ -27,9 +27,10 @@
 //!   nothing here; HTTP keeps its contest.
 //! - **Literals are read by scope** ([`literal_text`]): a string or a template
 //!   written at the call, or an identifier the resolver says names a constant
-//!   (module or function scope) that holds one. A parameter, a block's own
-//!   binding of the same name, an import and a member of a constant object are
-//!   not literals here.
+//!   (module or function scope) that holds one. A block's own binding of the
+//!   same name is not; a parameter is a hole a caller fills, and an import or
+//!   an entry of a constant object is read through the module's bindings
+//!   (value flow, below).
 //! - **The line is the member name's**, so a chain written over several lines
 //!   states its row where the member is named.
 //! - **Sub-object hops** (`client.tasks.trigger(…)`) are a member path, not a
@@ -54,18 +55,29 @@
 //!   a base, or one the surface does not list, contests. HTTP's rule, "any
 //!   call outside the verified surface", stays HTTP's.
 //!
+//! - **Value flow** (carrick#1562). What a holder is set to is read in one
+//!   place ([`super::Reader::written_instance`]), a receiver in one
+//!   ([`super::Reader::library_receiver`]) and a name in one
+//!   ([`text_pieces`], under [`literal_text`]). Each reads through the
+//!   service's own code:
+//!   - an own factory's return ([`super::FnIr::returned`]), followed where
+//!     the call graph resolves the call (`SiteReader::made`), so
+//!     `this.queue = createQueue("emails")` holds the factory's maker's
+//!     instance, handed `"emails"` ([`SiteMaker::factory`]);
+//!   - a name taken from a parameter, stated again at each call that fills
+//!     it with text ([`LibrarySite::origin`]);
+//!   - an entry of a constant object, an imported constant, and what a
+//!     builder returns for its arguments, read once every module's uses are
+//!     known ([`LinkedNames`]).
+//!
 //! Seams left for later tickets:
 //!
-//! - **Value flow** (carrick#1562): [`literal_text`],
-//!   [`super::Reader::library_receiver`] and
-//!   [`super::Reader::written_instance`] are the only three places a name, a
-//!   receiver or what a class field is set to is read. Name builders, names
-//!   passed as parameters, imported constants, own-module factories (a field
-//!   set by `createRedisClient(…)` or `this.#connect()`) and injected clients
-//!   extend those three.
 //! - **In-repo packages** (carrick#1666): a call the call graph resolves to a
 //!   function of this service is that function's, and is no site here, which
 //!   is where a workspace package's calls go today.
+//! - **A factory that builds one of two makers' instances** (carrick#1689)
+//!   and **a client handed in as a parameter** (carrick#1693) are read as
+//!   nothing.
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
@@ -77,8 +89,9 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use super::{
-    BindingUse, BindingUses, ClassFields, ClientBinding, ClientRef, FileIr, FnIr, LinkedClients,
-    ModuleScope, Reader, RequestSummaryInputs, Scope, Site, member_prop, prop_name, this_field,
+    BindingUse, BindingUses, ClassFields, ClientBinding, ClientInstance, ClientRef, FileIr, FnIr,
+    LinkedClients, MadeBy, ModuleScope, OwnCallee, Reader, RequestSummaryInputs, Scope, Site,
+    member_prop, prop_name, this_field,
 };
 use crate::binding_scope::{BindingKey, ident_key, pat_key};
 use crate::graphql_document_sites::unwrap_expression;
@@ -94,12 +107,18 @@ pub enum MakerForm {
 /// One argument, as a library claim's slot reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SiteArg {
-    /// The argument's text, when it is a literal ([`literal_text`]).
+    /// The argument's text, when it is a literal ([`literal_text`]). On a
+    /// site a caller fills ([`LibrarySite::origin`]), only the text this call
+    /// filled in.
     pub text: Option<String>,
     /// The argument's keys, when it is an object literal.
     pub object: Option<SiteObject>,
     /// The argument is a function expression written at the call.
     pub function: bool,
+    /// Text with a parameter of the enclosing function in it
+    /// ([`text_pieces`]): a hole each caller fills with its own argument
+    /// (carrick#1562). `text` is `None` while a hole is open.
+    pub(super) holes: Option<Vec<TextPiece>>,
 }
 
 /// An object literal's keys, each with its literal text when the value is
@@ -113,6 +132,167 @@ pub struct SiteObject {
     /// A spread or a computed key is in the object, so it may hold keys the
     /// source does not state.
     pub open: bool,
+    /// The keys whose value is text with a parameter in it, as
+    /// [`SiteArg::holes`].
+    pub(super) holes: BTreeMap<String, Vec<TextPiece>>,
+}
+
+impl SiteArg {
+    /// Whether a parameter is in the argument's text, or in one of its
+    /// keys' (carrick#1562).
+    pub(super) fn has_holes(&self) -> bool {
+        self.holes.is_some()
+            || self
+                .object
+                .as_ref()
+                .is_some_and(|object| !object.holes.is_empty())
+    }
+
+    /// This argument at a call passing `passed` to the function it is
+    /// written in (carrick#1562): each hole filled with the text the call
+    /// passes there, or left open with the call's own parameters in it, and
+    /// holding nothing where the call passes anything else. An argument that
+    /// is one parameter is what the call passes, object and all.
+    ///
+    /// With `keep`, the text the argument states itself stays (a maker's
+    /// argument, read through a factory). Without it, only what this call
+    /// filled in is text, so a site a caller fills never states again what
+    /// the library call states itself. The flag says whether a hole became
+    /// text at this call.
+    pub(super) fn filled(&self, passed: &[SiteArg], keep: bool) -> (SiteArg, bool) {
+        if let Some([TextPiece::Param(index)]) = self.holes.as_deref() {
+            let Some(arg) = passed.get(*index) else {
+                return (SiteArg::default(), false);
+            };
+            let filled = arg.text.is_some()
+                || arg
+                    .object
+                    .as_ref()
+                    .is_some_and(|object| object.fields.values().any(Option::is_some));
+            return (arg.clone(), filled);
+        }
+        let mut filled = false;
+        let mut fill = |pieces: &[TextPiece]| {
+            let (text, holes) = split_text(fill_pieces(pieces, passed));
+            filled |= text.is_some();
+            (text, holes)
+        };
+        let (text, holes) = match &self.holes {
+            Some(pieces) => fill(pieces),
+            None => (self.text.clone().filter(|_| keep), None),
+        };
+        let object = self.object.as_ref().map(|object| {
+            let mut out = SiteObject {
+                fields: BTreeMap::new(),
+                open: object.open,
+                holes: BTreeMap::new(),
+            };
+            for (key, value) in &object.fields {
+                let (text, holes) = match object.holes.get(key) {
+                    Some(pieces) => fill(pieces),
+                    None => (value.clone().filter(|_| keep), None),
+                };
+                if let Some(holes) = holes {
+                    out.holes.insert(key.clone(), holes);
+                }
+                out.fields.insert(key.clone(), text);
+            }
+            out
+        });
+        (
+            SiteArg {
+                text,
+                object,
+                function: self.function,
+                holes,
+            },
+            filled,
+        )
+    }
+}
+
+/// `pieces` with each parameter replaced by what `passed` holds at its
+/// position: its text, or its own holes. `None` when the call passes
+/// anything else there, or nothing.
+fn fill_pieces(pieces: &[TextPiece], passed: &[SiteArg]) -> Option<Vec<TextPiece>> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        match piece {
+            TextPiece::Param(index) => {
+                let arg = passed.get(*index)?;
+                match (&arg.text, &arg.holes) {
+                    (Some(text), _) => push_pieces(&mut out, vec![TextPiece::Lit(text.clone())]),
+                    (None, Some(holes)) => push_pieces(&mut out, holes.clone()),
+                    (None, None) => return None,
+                }
+            }
+            other => push_pieces(&mut out, vec![other.clone()]),
+        }
+    }
+    Some(out)
+}
+
+/// One piece of a name: text the source writes, a parameter of the function
+/// the name is written in, by position, or what a module-scope binding holds
+/// (carrick#1562).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum TextPiece {
+    Lit(String),
+    Param(usize),
+    /// A constant, an entry of a constant object (`TOPICS.orders`), or what
+    /// a builder returns for the arguments it is handed
+    /// (`topicFor("created")`, `ENDPOINTS.users.byId(id)`), read once every
+    /// module's uses of the binding are known ([`LinkedNames`]).
+    Named(Box<NamedRef>),
+}
+
+/// A module-scope binding a name is read through (carrick#1562).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct NamedRef {
+    /// The file's own name for the binding: a module-scope `const` or
+    /// function of the file, or an import binding.
+    binding: String,
+    /// The entries walked into it (`["users", "byId"]`).
+    path: Vec<String>,
+    /// The builder's arguments, each as text pieces, when it is called.
+    args: Option<Vec<Vec<TextPiece>>>,
+}
+
+/// What a module-scope binding holds, as a name reads it (carrick#1562): a
+/// constant's text, a constant object's entries, or a builder's returned
+/// text with its parameters in it. Kept per module by name
+/// ([`super::FileIr::names`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NameValue {
+    Text(Vec<TextPiece>),
+    Map(BTreeMap<String, NameValue>),
+    Builder(Vec<TextPiece>),
+}
+
+impl NameValue {
+    /// The entry `path` walks to: the value itself for an empty path.
+    pub(super) fn entry(&self, path: &[String]) -> Option<&NameValue> {
+        let mut at = self;
+        for key in path {
+            match at {
+                NameValue::Map(entries) => at = entries.get(key)?,
+                _ => return None,
+            }
+        }
+        Some(at)
+    }
+}
+
+/// A call written in the service, where a reading came through it
+/// (carrick#1562): the own factory call that returned an instance
+/// ([`SiteMaker::factory`]), or the library call whose name a caller fills
+/// ([`LibrarySite::origin`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SiteCall {
+    pub file: PathBuf,
+    /// The call's span start, in SWC numbering.
+    pub span_start: u32,
+    pub line: u32,
 }
 
 /// A member called or constructed through a receiver binding: `client.m(…)`
@@ -138,6 +318,10 @@ pub enum Holder {
     /// maker's instance, read in the class's instance members
     /// (carrick#1665, [`field_receivers`]).
     Field,
+    /// No binding: the call is made on the instance an own factory call
+    /// before it returns (`createQueue("emails").add(…)`, carrick#1562). One
+    /// made on what a package's maker returns is no site.
+    Chained,
 }
 
 /// The maker call that built an instance, read where it was written.
@@ -146,15 +330,23 @@ pub struct SiteMaker {
     pub form: MakerForm,
     /// The export's member the maker is (`None`: the export itself).
     pub member: Option<String>,
-    /// What the maker was handed, read in the declaring module's scope.
+    /// What the maker was handed, read in the scope of the module that
+    /// writes the maker call. Through an own factory, each parameter the
+    /// factory handed the maker holds what the factory's caller passed.
     pub args: Vec<SiteArg>,
-    /// The module that declares the instance.
+    /// The module that writes the maker call: the declaring module, or the
+    /// own factory's.
     pub file: PathBuf,
     /// The maker call's span start (SWC numbering) and line: the definition a
     /// name the maker binds resolves to.
     pub span_start: u32,
     pub line: u32,
     pub holder: Holder,
+    /// The own factory call the holder was set by, when the instance came
+    /// out of one of the service's functions (carrick#1562): the call
+    /// written where the instance is held, whatever factories it went
+    /// through.
+    pub factory: Option<SiteCall>,
 }
 
 impl SiteMaker {
@@ -262,6 +454,15 @@ pub struct LibrarySite {
     /// For an instance: every member called or constructed through the
     /// export's binding in the module that made it.
     pub export_uses: BTreeSet<MemberUse>,
+    /// Set on a site a caller fills (carrick#1562): a call to one of the
+    /// service's functions whose library call takes a name from a
+    /// parameter (`publish(topic, data)` calling `bus.publish(topic, data)`)
+    /// is that library call again, at the caller, with the caller's
+    /// arguments in the holes. `origin` is the library call. Everything but
+    /// the arguments is the library call's; an argument's text is only what
+    /// this call filled in, so what the library call states itself is never
+    /// stated again here.
+    pub origin: Option<SiteCall>,
 }
 
 impl LibrarySite {
@@ -381,10 +582,19 @@ pub fn package_name(specifier: &str) -> &str {
     end.map_or(specifier, |end| &specifier[..end])
 }
 
+/// How many own factory calls an instance is followed through, and how many
+/// callers up a name's hole is filled through (carrick#1562): the call
+/// graph's re-export cap, for the same reason.
+const MAX_VALUE_HOPS: usize = super::MAX_REEXPORT_HOPS;
+
 /// Every call and construction the service makes through a package export or
-/// an instance of one ([`LibrarySite`]).
+/// an instance of one ([`LibrarySite`]), with every call to one of the
+/// service's functions that fills a name that function's library call takes
+/// from a parameter ([`LibrarySite::origin`]).
 pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
     let clients = LinkedClients::link(&inputs.files, &inputs.bindings);
+    let names = LinkedNames::link(&inputs.files, &inputs.bindings);
+    let callers = Callers::index(inputs);
     let mut sites = Vec::new();
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -396,19 +606,22 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
             file: path,
             ir: file,
             clients: &clients,
+            names: &names,
             inputs,
+            callers: &callers,
         };
         for key in keys {
-            reader.collect(&file.functions[key], &mut sites);
+            reader.collect(&file.functions[key], Some(key), &mut sites);
         }
-        reader.collect(&file.module_level, &mut sites);
+        reader.collect(&file.module_level, None, &mut sites);
     }
     sites.sort_by(|a, b| {
-        (&a.file, a.span_start, a.form, a.span_end).cmp(&(
+        (&a.file, a.span_start, a.form, a.span_end, &a.origin).cmp(&(
             &b.file,
             b.span_start,
             b.form,
             b.span_end,
+            &b.origin,
         ))
     });
     LibrarySites { sites }
@@ -418,17 +631,41 @@ struct SiteReader<'a> {
     file: &'a Path,
     ir: &'a FileIr,
     clients: &'a LinkedClients,
+    names: &'a LinkedNames<'a>,
     inputs: &'a RequestSummaryInputs,
+    callers: &'a Callers<'a>,
+}
+
+/// The instance a holder holds, read where its package maker is written:
+/// through every own factory it came out of (carrick#1562).
+struct Made {
+    package: String,
+    export: String,
+    /// The package maker's call, with each factory parameter it was handed
+    /// filled with what the factory's caller passed.
+    instance: ClientInstance,
+    /// The module that writes the maker call.
+    file: PathBuf,
+    /// The own call the holder was set by.
+    factory: Option<SiteCall>,
+    /// A factory's binding of the instance is used in a way that may change
+    /// it, or returned anywhere but by the factory itself.
+    contested: bool,
+    /// The members each factory calls through its binding of the instance.
+    uses: BTreeSet<MemberUse>,
+    /// The export's binding's member uses where the maker is written.
+    export_uses: BTreeSet<MemberUse>,
 }
 
 impl SiteReader<'_> {
-    fn collect(&self, ir: &FnIr, out: &mut Vec<LibrarySite>) {
+    /// Every library site `ir` writes, and those its callers fill. `key` is
+    /// the function's definition key when `ir` is a keyed function's own
+    /// body: only its parameters are what a call of that key passes.
+    fn collect(&self, ir: &FnIr, key: Option<&str>, out: &mut Vec<LibrarySite>) {
         for site in &ir.library {
             // A call the call graph resolves to a function of this service is
             // that function's, whatever its receiver's name.
-            if site.form == MakerForm::Call
-                && self.inputs.sites.target(self.file, site.site.lo).is_some()
-            {
+            if site.form == MakerForm::Call && self.resolves(self.file, &site.site).is_some() {
                 continue;
             }
             let (client, declared_in, holder) = match &site.binding {
@@ -450,51 +687,497 @@ impl SiteReader<'_> {
                     };
                     (client, self.file, Holder::Field)
                 }
+                SiteBinding::Chained(client) => (&**client, self.file, Holder::Chained),
             };
-            // So is an instance such a call made: what it holds is that
-            // function's return, not a package's.
-            if let Some(instance) = &client.instance
-                && instance.form == MakerForm::Call
-                && self
-                    .inputs
-                    .sites
-                    .target(declared_in, instance.site.lo)
-                    .is_some()
+            // A return hands the receiver to whoever called the function
+            // that returned it.
+            let contested = client.contested_message || !client.returned.is_empty();
+            let args = self.names.resolved_all(self.file, &site.args);
+            let library = match &client.instance {
+                None => LibrarySite {
+                    file: self.file.to_path_buf(),
+                    span_start: site.site.span_start,
+                    span_end: site.site.span_end,
+                    line: site.op_line,
+                    form: site.form,
+                    specifier: client.package.clone(),
+                    export: client.export.clone(),
+                    receiver: SiteReceiver::Export,
+                    path: site.path.clone(),
+                    member: site.member.clone(),
+                    args,
+                    contested,
+                    uses: client.member_uses.clone(),
+                    export_uses: client.export_uses.clone(),
+                    origin: None,
+                },
+                Some(_) => {
+                    // What an own call holds is what the function returns,
+                    // and a call to one that is no own factory holds nothing
+                    // a package made.
+                    let Some(made) = self.made(declared_in, client, 0) else {
+                        continue;
+                    };
+                    // A call made on what a package's maker returns
+                    // (`z.string().min(1)`) is no receiver form the contract
+                    // names; one made on what an own factory returns is
+                    // (carrick#1562).
+                    if holder == Holder::Chained && made.factory.is_none() {
+                        continue;
+                    }
+                    let mut uses = client.member_uses.clone();
+                    uses.extend(made.uses);
+                    LibrarySite {
+                        file: self.file.to_path_buf(),
+                        span_start: site.site.span_start,
+                        span_end: site.site.span_end,
+                        line: site.op_line,
+                        form: site.form,
+                        specifier: made.package,
+                        export: made.export,
+                        receiver: SiteReceiver::Instance(SiteMaker {
+                            form: made.instance.form,
+                            member: made.instance.member.clone(),
+                            args: made.instance.args.clone(),
+                            file: made.file,
+                            span_start: made.instance.site.span_start,
+                            line: made.instance.site.line,
+                            holder,
+                            factory: made.factory,
+                        }),
+                        path: site.path.clone(),
+                        member: site.member.clone(),
+                        args,
+                        contested: contested || made.contested,
+                        uses,
+                        export_uses: made.export_uses,
+                        origin: None,
+                    }
+                }
+            };
+            // A name taken from a parameter is filled where the function is
+            // called (carrick#1562).
+            if let Some(key) = key
+                && library.args.iter().any(SiteArg::has_holes)
             {
-                continue;
+                let mut chain = Vec::new();
+                self.fill_from_callers(&library, &library.args, (self.file, key), &mut chain, out);
             }
-            let receiver = match &client.instance {
-                None => SiteReceiver::Export,
-                Some(instance) => SiteReceiver::Instance(SiteMaker {
-                    form: instance.form,
-                    member: instance.member.clone(),
-                    args: instance.args.clone(),
-                    file: declared_in.to_path_buf(),
-                    span_start: instance.site.span_start,
-                    line: instance.site.line,
-                    holder,
-                }),
-            };
-            out.push(LibrarySite {
-                file: self.file.to_path_buf(),
-                span_start: site.site.span_start,
-                span_end: site.site.span_end,
-                line: site.op_line,
-                form: site.form,
-                specifier: client.package.clone(),
-                export: client.export.clone(),
-                receiver,
-                path: site.path.clone(),
-                member: site.member.clone(),
-                args: site.args.clone(),
-                contested: client.contested_message,
-                uses: client.member_uses.clone(),
-                export_uses: client.export_uses.clone(),
-            });
+            out.push(library);
         }
         for nested in ir.nested.iter().chain(&ir.detached) {
-            self.collect(nested, out);
+            self.collect(nested, None, out);
         }
+    }
+
+    /// The function of the service the call at `site` in `file` reaches,
+    /// when the call graph resolved it: this call's, never the one before it
+    /// in a chain, which starts where it does.
+    fn resolves(&self, file: &Path, site: &Site) -> Option<&(PathBuf, String)> {
+        self.inputs.sites.target_at(file, site.lo, site.hi)
+    }
+
+    /// The instance `client` (held in `file`) holds, where a package's maker
+    /// made it (carrick#1562). A maker call the call graph resolves to a
+    /// function of the service is an own call: what it holds is what that
+    /// function returns ([`super::FnIr::returned`]), with the function's
+    /// parameters filled by this call's arguments, through as many own
+    /// factories as it took. An own call to anything else, an async factory
+    /// called without `await`, and one past the hop cap hold nothing.
+    fn made(&self, file: &Path, client: &ClientRef, depth: usize) -> Option<Made> {
+        let instance = client.instance.as_ref()?;
+        let target = match instance.form {
+            MakerForm::Call => self.resolves(file, &instance.site),
+            MakerForm::New => None,
+        };
+        let Some((target_file, key)) = target else {
+            return match instance.made_by {
+                MadeBy::Export => Some(Made {
+                    package: client.package.clone(),
+                    export: client.export.clone(),
+                    instance: ClientInstance {
+                        args: self.names.resolved_all(file, &instance.args),
+                        ..instance.clone()
+                    },
+                    file: file.to_path_buf(),
+                    factory: None,
+                    contested: false,
+                    uses: BTreeSet::new(),
+                    export_uses: client.export_uses.clone(),
+                }),
+                MadeBy::Call(_) => None,
+            };
+        };
+        if depth >= MAX_VALUE_HOPS {
+            return None;
+        }
+        let returned = self
+            .inputs
+            .files
+            .get(target_file)?
+            .functions
+            .get(key)?
+            .returned
+            .as_ref()?;
+        if returned.is_async && !instance.awaited {
+            return None;
+        }
+        let product = &returned.client;
+        let mut made = self.made(target_file, product, depth + 1)?;
+        let passed = self.names.resolved_all(file, &instance.args);
+        made.instance.args = made
+            .instance
+            .args
+            .iter()
+            .map(|arg| arg.filled(&passed, true).0)
+            .collect();
+        // The factory's binding is used to change the instance, or returned
+        // somewhere the factory's own returns are not: a caller of that
+        // other function may hold it too.
+        made.contested |= product.contested_message || !product.returned.is_subset(&returned.at);
+        made.uses.extend(product.member_uses.iter().cloned());
+        made.factory = Some(SiteCall {
+            file: file.to_path_buf(),
+            span_start: instance.site.span_start,
+            line: instance.site.line,
+        });
+        Some(made)
+    }
+
+    /// Every call of `function` that fills a hole in `args` (the arguments of
+    /// `origin`'s library call, as far as the callers between have filled
+    /// them), stated as `origin` again at the call (carrick#1562). A call
+    /// that fills a hole with text states it; one that passes its own
+    /// parameter on leaves the hole open for its own callers, up to the hop
+    /// cap. A spread argument at a call fills nothing.
+    fn fill_from_callers(
+        &self,
+        origin: &LibrarySite,
+        args: &[SiteArg],
+        function: (&Path, &str),
+        chain: &mut Vec<(PathBuf, String)>,
+        out: &mut Vec<LibrarySite>,
+    ) {
+        if chain.len() >= MAX_VALUE_HOPS {
+            return;
+        }
+        chain.push((function.0.to_path_buf(), function.1.to_string()));
+        for caller in self.callers.of(function.0, function.1) {
+            let Some(passed) = &caller.call.site_args else {
+                continue;
+            };
+            let passed = self.names.resolved_all(caller.file, passed);
+            let mut filled = false;
+            let derived: Vec<SiteArg> = args
+                .iter()
+                .map(|arg| {
+                    let (arg, any) = arg.filled(&passed, false);
+                    filled |= any;
+                    arg
+                })
+                .collect();
+            if filled {
+                out.push(LibrarySite {
+                    file: caller.file.to_path_buf(),
+                    span_start: caller.call.site.span_start,
+                    span_end: caller.call.site.span_end,
+                    line: caller.call.name_line,
+                    args: derived.clone(),
+                    origin: Some(SiteCall {
+                        file: origin.file.clone(),
+                        span_start: origin.span_start,
+                        line: origin.line,
+                    }),
+                    ..origin.clone()
+                });
+            }
+            if let Some(key) = caller.key
+                && derived.iter().any(SiteArg::has_holes)
+                && !chain
+                    .iter()
+                    .any(|(file, at)| file.as_path() == caller.file && at == key)
+            {
+                self.fill_from_callers(origin, &derived, (caller.file, key), chain, out);
+            }
+        }
+        chain.pop();
+    }
+}
+
+/// What every module-scope binding a name reads through holds, with every
+/// module's uses of it known (carrick#1562): a constant's text, a constant
+/// object's entry, or what a builder returns.
+///
+/// A constant's text cannot change. A constant object can, through any
+/// module that reaches it, so one is read only where every module that
+/// imports it keeps it ([`super::BindingUse::keeps_entries`]), no module
+/// reaches its module through a namespace import or loads it some other way,
+/// and, read in another module, where the scan can follow every module of
+/// the service (as for an imported instance, [`LinkedClients`]).
+pub(super) struct LinkedNames<'a> {
+    files: &'a HashMap<PathBuf, FileIr>,
+    bindings: &'a super::ImportedBindings,
+    /// Constant objects some module's use may change, by declaring module
+    /// and name.
+    contested: HashSet<(PathBuf, String)>,
+    /// Some module names a specifier the scan cannot follow.
+    unfollowable: bool,
+}
+
+impl<'a> LinkedNames<'a> {
+    pub(super) fn link(
+        files: &'a HashMap<PathBuf, FileIr>,
+        bindings: &'a super::ImportedBindings,
+    ) -> Self {
+        let mut linked = LinkedNames {
+            files,
+            bindings,
+            contested: HashSet::new(),
+            unfollowable: !bindings.unresolved_in().is_empty(),
+        };
+        let mut every: Vec<(PathBuf, String)> = Vec::new();
+        for (file, ir) in files {
+            for (local, used) in &ir.imported {
+                match bindings.get(file, local) {
+                    Some(super::ImportedBinding::Binding { file: at, name }) => {
+                        match linked.declared(at, name, 0) {
+                            // Only an object can be changed: text and a
+                            // builder's return cannot.
+                            Some((declared, value)) => {
+                                if matches!(value, NameValue::Map(_)) && !used.keeps_entries(value)
+                                {
+                                    linked.contested.insert(declared);
+                                }
+                            }
+                            None => linked.unfollowable |= linked.unfollowed(at, name, 0),
+                        }
+                    }
+                    Some(super::ImportedBinding::Module(published)) => {
+                        every.extend(
+                            published
+                                .iter()
+                                .map(|binding| (binding.file.clone(), binding.name.clone())),
+                        );
+                    }
+                    Some(
+                        super::ImportedBinding::Unfollowable | super::ImportedBinding::Unresolved,
+                    ) => linked.unfollowable = true,
+                    None => {}
+                }
+            }
+            for specifier in &ir.loads {
+                if let Some(super::ImportedBinding::Module(published)) =
+                    bindings.load(file, specifier)
+                {
+                    every.extend(
+                        published
+                            .iter()
+                            .map(|binding| (binding.file.clone(), binding.name.clone())),
+                    );
+                }
+            }
+        }
+        // A namespace import, or a module loaded some other way, may reach
+        // any object its module publishes in any way.
+        for (file, name) in every {
+            if let Some((declared, NameValue::Map(_))) = linked.declared(&file, &name, 0) {
+                linked.contested.insert(declared);
+            }
+        }
+        linked
+    }
+
+    /// What `name` in `file` holds, following a module that re-exports an
+    /// import, with the module and name that declare it.
+    fn declared(
+        &self,
+        file: &Path,
+        name: &str,
+        depth: usize,
+    ) -> Option<((PathBuf, String), &'a NameValue)> {
+        let ir = self.files.get(file)?;
+        if let Some(value) = ir.names.get(name) {
+            return Some(((file.to_path_buf(), name.to_string()), value));
+        }
+        if depth >= super::MAX_REEXPORT_HOPS || !ir.imported.contains_key(name) {
+            return None;
+        }
+        match self.bindings.get(file, name)? {
+            super::ImportedBinding::Binding { file, name } => self.declared(file, name, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// Whether following `name` in `file` stopped where the scan cannot see
+    /// what is there, rather than at something that is no name.
+    fn unfollowed(&self, file: &Path, name: &str, depth: usize) -> bool {
+        let Some(ir) = self.files.get(file) else {
+            return false;
+        };
+        if ir.names.contains_key(name) || !ir.imported.contains_key(name) {
+            return false;
+        }
+        if depth >= super::MAX_REEXPORT_HOPS {
+            return true;
+        }
+        match self.bindings.get(file, name) {
+            Some(super::ImportedBinding::Binding { file, name }) => {
+                self.unfollowed(file, name, depth + 1)
+            }
+            Some(super::ImportedBinding::Unfollowable | super::ImportedBinding::Unresolved) => true,
+            _ => false,
+        }
+    }
+
+    /// `pieces`, read in `file`, with every named piece read through the
+    /// binding it names: text, or a parameter of the function `pieces` is
+    /// written in. `None` when one names nothing this can read.
+    fn resolve(&self, file: &Path, pieces: &[TextPiece], depth: usize) -> Option<Vec<TextPiece>> {
+        let mut out = Vec::new();
+        for piece in pieces {
+            let TextPiece::Named(named) = piece else {
+                push_pieces(&mut out, vec![piece.clone()]);
+                continue;
+            };
+            if depth >= MAX_VALUE_HOPS {
+                return None;
+            }
+            let ir = self.files.get(file)?;
+            let own = ir.names.contains_key(&named.binding);
+            if !own && self.unfollowable {
+                return None;
+            }
+            let ((declared_in, declared), value) = self.declared(file, &named.binding, 0)?;
+            if self
+                .contested
+                .contains(&(declared_in.clone(), declared.clone()))
+            {
+                return None;
+            }
+            let value = value.entry(&named.path)?;
+            let read = match (value, &named.args) {
+                (NameValue::Text(text), None) => self.resolve(&declared_in, text, depth + 1)?,
+                (NameValue::Builder(body), Some(args)) => {
+                    // The arguments are read where the builder is called,
+                    // then handed to its parameters.
+                    let args: Vec<SiteArg> = args
+                        .iter()
+                        .map(|arg| {
+                            let (text, holes) = split_text(self.resolve(file, arg, depth + 1));
+                            SiteArg {
+                                text,
+                                holes,
+                                ..SiteArg::default()
+                            }
+                        })
+                        .collect();
+                    let body = self.resolve(&declared_in, body, depth + 1)?;
+                    fill_pieces(&body, &args)?
+                }
+                _ => return None,
+            };
+            push_pieces(&mut out, read);
+        }
+        Some(out)
+    }
+
+    /// `arg`, read in `file`, with every named piece read
+    /// ([`Self::resolve`]).
+    fn resolved(&self, file: &Path, arg: &SiteArg) -> SiteArg {
+        let read = |pieces: &Vec<TextPiece>| split_text(self.resolve(file, pieces, 0));
+        let (text, holes) = match &arg.holes {
+            Some(pieces) => read(pieces),
+            None => (arg.text.clone(), None),
+        };
+        let object = arg.object.as_ref().map(|object| {
+            let mut out = object.clone();
+            for (key, pieces) in &object.holes {
+                let (text, holes) = read(pieces);
+                out.fields.insert(key.clone(), text);
+                match holes {
+                    Some(holes) => out.holes.insert(key.clone(), holes),
+                    None => out.holes.remove(key),
+                };
+            }
+            out
+        });
+        SiteArg {
+            text,
+            object,
+            function: arg.function,
+            holes,
+        }
+    }
+
+    fn resolved_all(&self, file: &Path, args: &[SiteArg]) -> Vec<SiteArg> {
+        args.iter().map(|arg| self.resolved(file, arg)).collect()
+    }
+}
+
+/// Every call the call graph resolves to a function of the service, by the
+/// function it reaches (carrick#1562).
+struct Callers<'a> {
+    by_target: HashMap<(PathBuf, String), Vec<Caller<'a>>>,
+}
+
+/// One call of a function of the service.
+struct Caller<'a> {
+    /// The file the call is written in.
+    file: &'a Path,
+    call: &'a super::CallIr,
+    /// The definition key of the function whose own body writes the call:
+    /// its parameters are what its own callers pass. `None` for a call at
+    /// module level or in a function written inside another.
+    key: Option<&'a str>,
+}
+
+impl<'a> Callers<'a> {
+    fn index(inputs: &'a RequestSummaryInputs) -> Self {
+        fn walk<'a>(
+            inputs: &'a RequestSummaryInputs,
+            file: &'a Path,
+            ir: &'a FnIr,
+            key: Option<&'a str>,
+            by_target: &mut HashMap<(PathBuf, String), Vec<Caller<'a>>>,
+        ) {
+            for call in &ir.calls {
+                if let Some(target) = inputs.sites.target_at(file, call.site.lo, call.site.hi) {
+                    by_target
+                        .entry(target.clone())
+                        .or_default()
+                        .push(Caller { file, call, key });
+                }
+            }
+            for nested in ir.nested.iter().chain(&ir.detached) {
+                walk(inputs, file, nested, None, by_target);
+            }
+        }
+        let mut by_target = HashMap::new();
+        let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
+        paths.sort();
+        for path in paths {
+            let file = &inputs.files[path];
+            let mut keys: Vec<&String> = file.functions.keys().collect();
+            keys.sort();
+            for key in keys {
+                walk(
+                    inputs,
+                    path,
+                    &file.functions[key],
+                    Some(key.as_str()),
+                    &mut by_target,
+                );
+            }
+            walk(inputs, path, &file.module_level, None, &mut by_target);
+        }
+        Callers { by_target }
+    }
+
+    /// The calls of the function `key` in `file`.
+    fn of(&self, file: &Path, key: &str) -> &[Caller<'a>] {
+        self.by_target
+            .get(&(file.to_path_buf(), key.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 }
 
@@ -522,6 +1205,10 @@ pub(super) enum SiteBinding {
     /// span start: what it holds is settled once every member of the class
     /// is read ([`field_receivers`]).
     Field { class: u32, field: String },
+    /// The instance the expression before the member returns
+    /// (`createQueue("emails").add(…)`, carrick#1562), read as a holder's
+    /// value is ([`Reader::written_instance`]). Nothing else uses it.
+    Chained(Box<ClientRef>),
 }
 
 /// The receiver a library site names: the binding, the sub-object hops, the
@@ -557,12 +1244,12 @@ impl Reader<'_> {
 
     /// The client a library site's callee names, by the same scope rules as
     /// an HTTP client's ([`Scope::call_binding`]): `client(…)`,
-    /// `client.member(…)`, `client.a.b.member(…)`, and the same on a class
-    /// field ([`field_binding`]). Every hop is a plain name; anything
-    /// computed is no site.
+    /// `client.member(…)`, `client.a.b.member(…)`, the same on a class
+    /// field ([`field_binding`]), and the same on what a maker call or an
+    /// own call returns (`createQueue("emails").add(…)`, carrick#1562).
+    /// Every hop is a plain name; anything computed is no site.
     ///
-    /// The one place a library receiver is identified: value flow
-    /// (carrick#1562) extends it, never a second resolver.
+    /// The one place a library receiver is identified.
     fn library_receiver(&self, callee: &Expr, scope: &Scope<'_>) -> Option<LibraryReceiver> {
         let callee = unwrap_expression(callee);
         let outer = match callee {
@@ -604,6 +1291,16 @@ impl Reader<'_> {
                     path.push(member_prop(inner)?);
                     obj = unwrap_expression(&inner.obj);
                 }
+                Expr::Call(_) | Expr::New(_) | Expr::Await(_) => {
+                    path.reverse();
+                    let client = self.written_instance(obj, scope)?;
+                    return Some((
+                        SiteBinding::Chained(Box::new(client)),
+                        path,
+                        Some(member),
+                        named,
+                    ));
+                }
                 _ => return None,
             }
         }
@@ -613,14 +1310,83 @@ impl Reader<'_> {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
-    /// The instance a write to a class field sets, when the source states
-    /// one: a maker call on a package export ([`Reader::factory_call`]).
+    /// The instance a binding or a class field is set to, when the source
+    /// states one: a maker call on a package export
+    /// ([`Reader::factory_call`]), or a call to a function the service may
+    /// declare, whose return is read once the call graph says which function
+    /// it is (carrick#1562, [`Reader::own_call`]).
     ///
-    /// The one place what a field is set to is read: value flow
-    /// (carrick#1562) extends it to an own-module factory
-    /// (`this.redis = createRedisClient(…)`) and an injected client.
-    fn written_instance(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+    /// The one place what a holder is set to is read: a module or a
+    /// function's `const`, a class field, and a call made on what a call
+    /// returns.
+    pub(super) fn written_instance(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
         self.factory_call(expr, scope)
+            .or_else(|| self.own_call(expr, scope))
+    }
+
+    /// What a `return` hands its caller, when it is an instance each call
+    /// builds anew (carrick#1562): one [`Reader::written_instance`] reads, or
+    /// a local that holds one. A parameter, a module's instance and a class
+    /// field are shared by every call, and are none. Only a function the
+    /// call graph keys is followed as a factory, and such a function is
+    /// never written inside another, so every local it holds is its own.
+    pub(super) fn returned_instance(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+        if let Expr::Ident(ident) = unwrap_expression(expr) {
+            return scope.local_receivers.get(&ident_key(ident)).cloned();
+        }
+        self.written_instance(expr, scope)
+    }
+
+    /// A call to a function the service may declare, as a holder's value
+    /// (carrick#1562): `make(…)`, `this.make(…)`, `this.#make(…)` or
+    /// `ns.a.make(…)`, awaited or not. What it holds is the instance the
+    /// function returns ([`super::FnIr::returned`]) when the call graph
+    /// resolves the call to an own factory, and nothing otherwise. A spread
+    /// argument moves every position, and a parameter or a computed member
+    /// names no function, so neither is one.
+    fn own_call(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+        let (awaited, expr) = match unwrap_expression(expr) {
+            Expr::Await(awaited) => (true, unwrap_expression(&awaited.arg)),
+            other => (false, other),
+        };
+        let Expr::Call(call) = expr else {
+            return None;
+        };
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        // `require("pkg")` loads a module: the binding is the import it is
+        // read as ([`super::import_bindings`]), never a function's return.
+        if call.args.iter().any(|arg| arg.spread.is_some())
+            || matches!(unwrap_expression(callee), Expr::Ident(ident) if ident.sym == *"require")
+        {
+            return None;
+        }
+        let callee = own_callee(callee, scope)?;
+        Some(ClientRef {
+            package: String::new(),
+            export: String::new(),
+            instance: Some(ClientInstance {
+                form: MakerForm::Call,
+                member: None,
+                options: None,
+                args: call
+                    .args
+                    .iter()
+                    .map(|arg| site_arg(&arg.expr, scope))
+                    .collect(),
+                site: self.site(call.span),
+                made_by: MadeBy::Call(callee),
+                awaited,
+            }),
+            contested: false,
+            called: BTreeSet::new(),
+            called_computed: false,
+            contested_message: false,
+            member_uses: BTreeSet::new(),
+            export_uses: BTreeSet::new(),
+            returned: BTreeSet::new(),
+        })
     }
 
     /// The maker write `this.<field> = <maker>(…)` an assignment is, in an
@@ -688,6 +1454,40 @@ impl Reader<'_> {
             }
         }
         writes
+    }
+}
+
+/// The function an own call's callee names, as the source writes it
+/// ([`OwnCallee`]): a binding that is not a parameter, or a chain of plain
+/// members on one or on `this`.
+fn own_callee(callee: &Expr, scope: &Scope<'_>) -> Option<OwnCallee> {
+    let mut path: Vec<String> = Vec::new();
+    let mut at = unwrap_expression(callee);
+    loop {
+        match at {
+            Expr::Ident(ident) if path.is_empty() => {
+                if scope.param_index(ident).is_some() {
+                    return None;
+                }
+                return Some(OwnCallee::Binding(ident_key(ident)));
+            }
+            Expr::Ident(ident) => {
+                if scope.param_index(ident).is_some() {
+                    return None;
+                }
+                path.reverse();
+                return Some(OwnCallee::Member(Some(ident_key(ident)), path));
+            }
+            Expr::This(_) if !path.is_empty() => {
+                path.reverse();
+                return Some(OwnCallee::Member(None, path));
+            }
+            Expr::Member(member) => {
+                path.push(this_field(member)?);
+                at = unwrap_expression(&member.obj);
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -784,12 +1584,20 @@ pub(super) fn field_receivers(
     out
 }
 
-/// Whether two instances are one maker's, handed the same arguments.
-fn same_maker(a: &ClientRef, b: &ClientRef) -> bool {
+/// Whether two instances are one maker's, handed the same arguments: the
+/// same export's maker, or a call to the same binding (carrick#1562),
+/// awaited alike.
+pub(super) fn same_maker(a: &ClientRef, b: &ClientRef) -> bool {
     a.package == b.package
         && a.export == b.export
         && match (&a.instance, &b.instance) {
-            (Some(a), Some(b)) => a.form == b.form && a.member == b.member && a.args == b.args,
+            (Some(a), Some(b)) => {
+                a.form == b.form
+                    && a.member == b.member
+                    && a.args == b.args
+                    && a.made_by == b.made_by
+                    && a.awaited == b.awaited
+            }
             _ => false,
         }
 }
@@ -1174,14 +1982,42 @@ fn simple_member(target: &SimpleAssignTarget) -> Option<&MemberExpr> {
 /// One argument's reading ([`SiteArg`]), in `scope`.
 pub(super) fn site_arg(expr: &Expr, scope: &Scope<'_>) -> SiteArg {
     let expr = unwrap_expression(expr);
+    let (text, holes) = split_text(text_pieces(expr, scope));
     SiteArg {
-        text: literal_text(expr, scope),
+        text,
         object: match expr {
             Expr::Object(object) => Some(site_object(object, scope)),
             _ => None,
         },
         function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
+        holes,
     }
+}
+
+/// Text pieces as literal text when no parameter is among them, and as
+/// holes otherwise.
+fn split_text(pieces: Option<Vec<TextPiece>>) -> (Option<String>, Option<Vec<TextPiece>>) {
+    match pieces {
+        Some(pieces)
+            if pieces
+                .iter()
+                .all(|piece| matches!(piece, TextPiece::Lit(_))) =>
+        {
+            (Some(joined(&pieces)), None)
+        }
+        holes => (None, holes),
+    }
+}
+
+/// Literal pieces as one text.
+fn joined(pieces: &[TextPiece]) -> String {
+    pieces
+        .iter()
+        .map(|piece| match piece {
+            TextPiece::Lit(text) => text.as_str(),
+            TextPiece::Param(_) | TextPiece::Named(_) => "",
+        })
+        .collect()
 }
 
 /// An object literal's keys ([`SiteObject`]). A spread or a computed key can
@@ -1191,7 +2027,16 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
     let mut out = SiteObject::default();
     let open = |out: &mut SiteObject| {
         out.fields.clear();
+        out.holes.clear();
         out.open = true;
+    };
+    let put = |out: &mut SiteObject, key: String, pieces: Option<Vec<TextPiece>>| {
+        let (text, holes) = split_text(pieces);
+        match holes {
+            Some(holes) => out.holes.insert(key.clone(), holes),
+            None => out.holes.remove(&key),
+        };
+        out.fields.insert(key, text);
     };
     for prop in &object.props {
         let prop = match prop {
@@ -1203,23 +2048,18 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
         };
         match &**prop {
             Prop::KeyValue(kv) => match prop_name(&kv.key) {
-                Some(key) => {
-                    out.fields.insert(key, literal_text(&kv.value, scope));
-                }
+                Some(key) => put(&mut out, key, text_pieces(&kv.value, scope)),
                 None => open(&mut out),
             },
-            Prop::Shorthand(ident) => {
-                out.fields.insert(
-                    ident.sym.to_string(),
-                    literal_text(&Expr::Ident(ident.clone()), scope),
-                );
-            }
+            Prop::Shorthand(ident) => put(
+                &mut out,
+                ident.sym.to_string(),
+                text_pieces(&Expr::Ident(ident.clone()), scope),
+            ),
             Prop::Method(MethodProp { key, .. })
             | Prop::Getter(GetterProp { key, .. })
             | Prop::Setter(SetterProp { key, .. }) => match prop_name(key) {
-                Some(key) => {
-                    out.fields.insert(key, None);
-                }
+                Some(key) => put(&mut out, key, None),
                 None => open(&mut out),
             },
             Prop::Assign(_) => open(&mut out),
@@ -1228,44 +2068,134 @@ fn site_object(object: &ObjectLit, scope: &Scope<'_>) -> SiteObject {
     out
 }
 
-/// The text `expr` is, when the source states it at compile time: a string,
-/// a template whose every hole is one, a `+` of two, or an identifier the
-/// resolver says names a binding [`Scope::text`] holds (a `const`, or a
-/// function's own settled binding, whose initialiser is one). A parameter,
-/// a binding a nested block declares, an import, a member of a constant
-/// object, a call and any operator but `+` are not.
+/// The text `expr` is, when the source states it here: [`text_pieces`] with
+/// no hole in it. A parameter, and anything read through a module-scope
+/// binding (an entry of a constant object, an imported constant, a
+/// builder's return), is a hole until a caller or the link step fills it; a
+/// binding a nested block declares, any other call and any operator but `+`
+/// are never text.
 ///
-/// The one place a name is read: value flow (carrick#1562) extends it.
+/// The one place a name is read, with [`text_pieces`].
 pub(super) fn literal_text(expr: &Expr, scope: &Scope<'_>) -> Option<String> {
+    match split_text(text_pieces(expr, scope)) {
+        (Some(text), _) => Some(text),
+        (None, _) => None,
+    }
+}
+
+/// The text `expr` is as [`literal_text`] reads it, with two kinds of hole
+/// (carrick#1562):
+///
+/// - a parameter of the function it is written in: the parameter itself, or
+///   a template, a `+` or a settled local built from it. A caller that
+///   passes literal text fills it; nothing else does.
+/// - a module-scope binding of the file, or an import, that is not literal
+///   text here: an entry of a constant object (`TOPICS.orders`), a builder
+///   called with text (`topicFor("created")`, `ENDPOINTS.users.byId(id)`),
+///   or an imported constant. It is read once every module's uses of the
+///   binding are known ([`LinkedNames`]).
+///
+/// Every hop of an entry's path is a plain name, and a builder's every
+/// argument is text, or nothing is read.
+pub(super) fn text_pieces(expr: &Expr, scope: &Scope<'_>) -> Option<Vec<TextPiece>> {
     match unwrap_expression(expr) {
-        Expr::Lit(Lit::Str(text)) => Some(text.value.to_string()),
+        Expr::Lit(Lit::Str(text)) => Some(vec![TextPiece::Lit(text.value.to_string())]),
         Expr::Tpl(tpl) => {
-            let mut out = String::new();
+            let mut out = Vec::new();
             for (index, quasi) in tpl.quasis.iter().enumerate() {
-                match &quasi.cooked {
-                    Some(cooked) => out.push_str(cooked.as_ref()),
-                    None => out.push_str(&quasi.raw),
-                }
+                let text = match &quasi.cooked {
+                    Some(cooked) => cooked.to_string(),
+                    None => quasi.raw.to_string(),
+                };
+                push_pieces(&mut out, vec![TextPiece::Lit(text)]);
                 if let Some(hole) = tpl.exprs.get(index) {
-                    out.push_str(&literal_text(hole, scope)?);
+                    push_pieces(&mut out, text_pieces(hole, scope)?);
                 }
             }
             Some(out)
         }
         Expr::Bin(bin) if bin.op == BinaryOp::Add => {
-            let left = literal_text(&bin.left, scope)?;
-            let right = literal_text(&bin.right, scope)?;
-            Some(left + right.as_str())
+            let mut out = text_pieces(&bin.left, scope)?;
+            push_pieces(&mut out, text_pieces(&bin.right, scope)?);
+            Some(out)
         }
-        Expr::Ident(ident) => scope.text(ident).map(str::to_string),
+        Expr::Ident(ident) => {
+            if let Some(index) = scope.param_index(ident) {
+                return Some(vec![TextPiece::Param(index)]);
+            }
+            scope
+                .text(ident)
+                .or_else(|| Some(vec![named(scope.named_binding(ident)?, Vec::new(), None)]))
+        }
+        Expr::Member(member) => {
+            let (root, path) = named_path(member)?;
+            Some(vec![named(scope.named_binding(root)?, path, None)])
+        }
+        Expr::Call(call) => {
+            let Callee::Expr(callee) = &call.callee else {
+                return None;
+            };
+            let (root, path) = match unwrap_expression(callee) {
+                Expr::Ident(ident) => (ident, Vec::new()),
+                Expr::Member(member) => named_path(member)?,
+                _ => return None,
+            };
+            let binding = scope.named_binding(root)?;
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                if arg.spread.is_some() {
+                    return None;
+                }
+                args.push(text_pieces(&arg.expr, scope)?);
+            }
+            Some(vec![named(binding, path, Some(args))])
+        }
         _ => None,
     }
 }
 
+fn named(binding: String, path: Vec<String>, args: Option<Vec<Vec<TextPiece>>>) -> TextPiece {
+    TextPiece::Named(Box::new(NamedRef {
+        binding,
+        path,
+        args,
+    }))
+}
+
+/// `root.a.b`, every hop a plain name: the root and the hops in order.
+pub(super) fn named_path(member: &MemberExpr) -> Option<(&Ident, Vec<String>)> {
+    let mut path = vec![member_prop(member)?];
+    let mut at = unwrap_expression(&member.obj);
+    loop {
+        match at {
+            Expr::Ident(root) => {
+                path.reverse();
+                return Some((root, path));
+            }
+            Expr::Member(inner) => {
+                path.push(member_prop(inner)?);
+                at = unwrap_expression(&inner.obj);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Append `pieces` to `out`, joining adjacent literal text.
+pub(super) fn push_pieces(out: &mut Vec<TextPiece>, pieces: Vec<TextPiece>) {
+    for piece in pieces {
+        match (out.last_mut(), piece) {
+            (Some(TextPiece::Lit(prev)), TextPiece::Lit(next)) => prev.push_str(&next),
+            (_, TextPiece::Lit(next)) if next.is_empty() => {}
+            (_, piece) => out.push(piece),
+        }
+    }
+}
+
 impl Scope<'_> {
-    /// The literal text the binding `ident` resolves to holds, by its key
+    /// The text the binding `ident` resolves to holds, by its key
     /// ([`crate::binding_scope`]): never another binding of the same name.
-    fn text(&self, ident: &Ident) -> Option<&str> {
+    fn text(&self, ident: &Ident) -> Option<Vec<TextPiece>> {
         if self.param_index(ident).is_some() {
             return None;
         }
@@ -1273,8 +2203,63 @@ impl Scope<'_> {
         self.texts
             .get(&key)
             .or_else(|| self.module.texts.get(&key))
-            .map(String::as_str)
+            .cloned()
     }
+
+    /// The module-scope binding `ident` names, when a name may be read
+    /// through it at link time (carrick#1562): one of the module's own
+    /// constant objects or builders, by its key, or an import no scope
+    /// below declares again. A parameter or a local of the same name is
+    /// neither.
+    fn named_binding(&self, ident: &Ident) -> Option<String> {
+        if self.param_index(ident).is_some() {
+            return None;
+        }
+        let key = ident_key(ident);
+        if self.locals.contains_key(&key) || self.texts.contains_key(&key) {
+            return None;
+        }
+        let name = ident.sym.as_ref();
+        (self.module.named.contains(&key) || self.module.imports.contains(name))
+            .then(|| name.to_string())
+    }
+}
+
+/// What a module-scope `const` (or function) initialiser holds as a name
+/// reads it ([`NameValue`]), in the module's scope (carrick#1562): text, an
+/// object literal whose every entry is text, another such object or a
+/// builder, or a builder: an arrow or a function whose body only returns
+/// text built from its parameters. An object with a spread, a computed key,
+/// a method or an accessor may hold, or be handed, anything: it is none.
+pub(super) fn name_value(expr: &Expr, module: &ModuleScope) -> Option<NameValue> {
+    match unwrap_expression(expr) {
+        Expr::Object(object) => {
+            let mut entries = BTreeMap::new();
+            for prop in &object.props {
+                let PropOrSpread::Prop(prop) = prop else {
+                    return None;
+                };
+                let (key, value) = match &**prop {
+                    Prop::KeyValue(kv) => (prop_name(&kv.key)?, &*kv.value),
+                    _ => return None,
+                };
+                if let Some(value) = name_value(value, module) {
+                    entries.insert(key, value);
+                }
+            }
+            Some(NameValue::Map(entries))
+        }
+        Expr::Arrow(_) | Expr::Fn(_) => builder(&super::Builder::of(expr)?, module),
+        other => Some(NameValue::Text(text_pieces(other, &Scope::module(module))?)),
+    }
+}
+
+/// What a builder ([`super::Builder`]) returns as a name reads it
+/// ([`NameValue::Builder`]): text built from its parameters.
+pub(super) fn builder(builder: &super::Builder, module: &ModuleScope) -> Option<NameValue> {
+    let mut scope = Scope::module(module);
+    scope.params = builder.params.clone();
+    Some(NameValue::Builder(text_pieces(&builder.returned, &scope)?))
 }
 
 fn arg_literal<'a>(args: &'a [SiteArg], arg: usize, key: Option<&str>) -> Option<&'a str> {
@@ -1304,7 +2289,7 @@ mod tests {
 
     /// A manifest declaring every package the tests import, so no specifier
     /// reads as one the scan cannot follow unless a test means it to.
-    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"fixture-bus\": \"^1.0.0\" } }\n";
+    const MANIFEST: &str = "{ \"name\": \"service\", \"dependencies\": { \"@fixture/jobs\": \"^1.0.0\", \"@fixture/queue\": \"^2.0.0\", \"@fixture/bus\": \"^1.0.0\", \"fixture-bus\": \"^1.0.0\", \"@fixture/socket\": \"^1.0.0\" } }\n";
 
     /// The library sites discovery reads in a service of `files`.
     fn sites_of(files: &[(&str, &str)]) -> Vec<LibrarySite> {
@@ -1552,8 +2537,8 @@ mod tests {
     /// A name is the binding the identifier resolves to: a module constant
     /// where the module's binding is meant, never where a parameter or a
     /// block's own binding of the name is, and a constant built from
-    /// constants. A member of a constant object, and a binding assigned
-    /// again, are not literals here.
+    /// constants. A binding assigned again is not a literal here; an entry
+    /// of a constant object is (carrick#1562).
     #[test]
     fn a_name_is_read_in_its_own_scope() {
         let sites = sites_of(&[(
@@ -1584,9 +2569,9 @@ mod tests {
         assert_eq!(name(9), None, "a block's own binding is never the module's");
         assert_eq!(name(12).as_deref(), Some("order.created.v2"));
         assert_eq!(
-            name(13),
-            None,
-            "a member of a constant object (carrick#1562)"
+            name(13).as_deref(),
+            Some("order.shipped"),
+            "an entry of a constant object (carrick#1562)"
         );
         assert_eq!(name(14), None, "a binding assigned again");
         assert_eq!(name(15).as_deref(), Some("order.created.audit"));
@@ -1705,6 +2690,11 @@ mod tests {
                 "a namespace call through a member",
                 "import * as queue from \"./queue\";\n\
                  export function send() { return queue.emails.add(\"later\", {}); }\n",
+            ),
+            (
+                "a return in another module (carrick#1562)",
+                "import { emails } from \"./queue\";\n\
+                 export function get() { return emails; }\n",
             ),
         ] {
             let sites = sites_of(&[
@@ -2260,6 +3250,651 @@ mod tests {
             reports.contest(on_wire),
             Some(Contest::Used),
             "a member read in a subclass"
+        );
+    }
+
+    /// The service's own queue factory, for the factory tests (carrick#1562).
+    const QUEUE_FACTORY: &str = "import { Queue } from \"@fixture/queue\";\n\
+         export function createQueue(name: string) {\n\
+         \x20 const queue = new Queue(name);\n\
+         \x20 queue.on(\"error\", () => {});\n\
+         \x20 return queue;\n\
+         }\n\
+         export async function connectQueue(name: string) {\n\
+         \x20 return new Queue(`${name}.v2`);\n\
+         }\n\
+         export function namedQueue(name: string) {\n\
+         \x20 return createQueue(name);\n\
+         }\n\
+         export const arrowQueue = (name: string) => new Queue(name);\n";
+
+    /// The one site at `line` of `file` that calls `member` through an
+    /// instance, with its maker.
+    fn through<'s>(
+        sites: &'s [LibrarySite],
+        file: &str,
+        line: u32,
+        member: &str,
+    ) -> (&'s LibrarySite, &'s SiteMaker) {
+        let found = site(sites, file, line, Some(member));
+        (found, maker(found))
+    }
+
+    /// An instance a function of the service returns is read at every call
+    /// that holds it (carrick#1562): in a module `const` (and in the modules
+    /// that import it), a function's `const`, a class field, and a call made
+    /// on the returned instance itself. The maker is the factory's, handed
+    /// what the caller passed; the factory's own calls through its binding
+    /// count among the uses; an `async` factory is read through `await`; a
+    /// factory that returns another's instance is followed to it.
+    #[test]
+    fn an_instance_an_own_factory_returns_is_read_where_it_is_held() {
+        let sites = sites_of(&[
+            ("src/queues.ts", QUEUE_FACTORY),
+            (
+                "src/use.ts",
+                "import { createQueue, connectQueue, namedQueue, arrowQueue } from \"./queues\";\n\
+                 export const emails = createQueue(\"emails\");\n\
+                 export async function local() {\n\
+                 \x20 const jobs = createQueue(\"jobs\");\n\
+                 \x20 await jobs.add(\"tick\", {});\n\
+                 }\n\
+                 export async function chained() {\n\
+                 \x20 await createQueue(\"chained\").add(\"once\", {});\n\
+                 }\n\
+                 export async function awaited() {\n\
+                 \x20 const late = await connectQueue(\"late\");\n\
+                 \x20 await late.add(\"ping\", {});\n\
+                 }\n\
+                 export class Mailer {\n\
+                 \x20 private q = createQueue(\"mailer\");\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n\
+                 export async function welcome() { await emails.add(\"welcome\", {}); }\n\
+                 export async function named() { await namedQueue(\"named\").add(\"x\", {}); }\n\
+                 export async function arrow() { await arrowQueue(\"arrow\").add(\"a\", {}); }\n",
+            ),
+            (
+                "src/other.ts",
+                "import { emails } from \"./use\";\n\
+                 export function again() { return emails.add(\"again\", {}); }\n",
+            ),
+        ]);
+        let on_error = MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("on".to_string()),
+        };
+        for (file, line, name, holder, called_at) in [
+            ("src/use.ts", 5, "jobs", Holder::Local, 4),
+            ("src/use.ts", 8, "chained", Holder::Chained, 8),
+            ("src/use.ts", 16, "mailer", Holder::Field, 15),
+            ("src/use.ts", 18, "emails", Holder::Module, 2),
+            ("src/other.ts", 2, "emails", Holder::Module, 2),
+            ("src/use.ts", 19, "named", Holder::Chained, 19),
+        ] {
+            let (add, made) = through(&sites, file, line, "add");
+            assert_eq!(add.receiver_id(), "instance:new", "{file}:{line}");
+            assert_eq!(add.specifier, "@fixture/queue", "{file}:{line}");
+            assert_eq!(add.export, "Queue", "{file}:{line}");
+            assert!(made.file.ends_with("src/queues.ts"), "{file}:{line}");
+            assert_eq!(made.line, 3, "the factory's maker: {file}:{line}");
+            assert_eq!(made.args[0].text.as_deref(), Some(name), "{file}:{line}");
+            assert_eq!(made.holder, holder, "{file}:{line}");
+            let factory = made.factory.as_ref().expect("the own call");
+            assert!(factory.file.ends_with("src/use.ts"), "{file}:{line}");
+            assert_eq!(factory.line, called_at, "{file}:{line}");
+            assert!(add.uses.contains(&on_error), "{file}:{line}: {add:#?}");
+            assert_eq!(add.contest(on_wire), None, "{file}:{line}");
+        }
+
+        let (late, made) = through(&sites, "src/use.ts", 12, "add");
+        assert_eq!(made.line, 8, "the async factory's maker");
+        assert_eq!(made.args[0].text.as_deref(), Some("late.v2"));
+        assert_eq!(late.contest(on_wire), None);
+
+        let (arrow, made) = through(&sites, "src/use.ts", 20, "add");
+        assert_eq!(
+            made.line, 13,
+            "an arrow's expression body is what it returns"
+        );
+        assert_eq!(made.args[0].text.as_deref(), Some("arrow"));
+        assert_eq!(arrow.contest(on_wire), None);
+
+        // The factory's own call through the binding it returns is a hand-off
+        // to every caller, as any return is.
+        let inside = site(&sites, "src/queues.ts", 4, Some("on"));
+        assert_eq!(inside.contest(on_wire), Some(Contest::Used));
+
+        // The factory's maker takes its name from a parameter, so it is a
+        // maker again at every call of the factory, with the name there.
+        let maker_site = |file: &str, line: u32| {
+            sites
+                .iter()
+                .find(|site| {
+                    site.file.ends_with(file)
+                        && site.line == line
+                        && site.makes(MakerForm::New, None)
+                })
+                .unwrap_or_else(|| panic!("a maker at {file}:{line}: {sites:#?}"))
+        };
+        assert_eq!(maker_site("src/queues.ts", 3).literal(0, None), None);
+        let defined = maker_site("src/use.ts", 2);
+        assert_eq!(defined.literal(0, None), Some("emails"));
+        let origin = defined
+            .origin
+            .as_ref()
+            .expect("filled by the factory's caller");
+        assert!(origin.file.ends_with("src/queues.ts"));
+        assert_eq!(origin.line, 3);
+        // A call made on what the factory returns starts where the factory
+        // call does: only the factory call fills the factory's maker.
+        let chained: Vec<Option<&str>> = sites
+            .iter()
+            .filter(|site| {
+                site.file.ends_with("src/use.ts")
+                    && site.line == 8
+                    && site.makes(MakerForm::New, None)
+            })
+            .map(|site| site.literal(0, None))
+            .collect();
+        assert_eq!(chained, vec![Some("chained")], "{sites:#?}");
+    }
+
+    /// An export's binding returned from a function hands it to whoever
+    /// calls that function, which may configure what its makers build, so
+    /// every instance the module makes from it is taken away, as when the
+    /// return was an operand before carrick#1562 split it out.
+    #[test]
+    fn a_returned_export_takes_its_instances_away() {
+        let source = |extra: &str| {
+            format!(
+                "import {{ Queue }} from \"@fixture/queue\";\n\
+                 const emails = new Queue(\"emails\");\n\
+                 export function send() {{ return emails.add(\"welcome\", {{}}); }}\n\
+                 {extra}"
+            )
+        };
+        let control = source("");
+        let sites = sites_of(&[("src/mail.ts", control.as_str())]);
+        assert_eq!(
+            site(&sites, "src/mail.ts", 3, Some("add")).contest(on_wire),
+            None
+        );
+        let returned = source("export function queueClass() { return Queue; }\n");
+        let sites = sites_of(&[("src/mail.ts", returned.as_str())]);
+        assert_eq!(
+            site(&sites, "src/mail.ts", 3, Some("add")).contest(on_wire),
+            Some(Contest::Used)
+        );
+    }
+
+    /// A call made on what a package's maker returns, with no binding in
+    /// between, is no receiver form the contract names: only one made on what
+    /// an own factory returns is a site (carrick#1562).
+    #[test]
+    fn a_call_on_what_a_package_maker_returns_is_no_site() {
+        let sites = sites_of(&[
+            ("src/queues.ts", QUEUE_FACTORY),
+            (
+                "src/use.ts",
+                "import { Queue } from \"@fixture/queue\";\n\
+                 import { createQueue } from \"./queues\";\n\
+                 export async function go() {\n\
+                 \x20 await new Queue(\"temp\").add(\"t\", {});\n\
+                 \x20 await createQueue(\"own\").add(\"o\", {});\n\
+                 }\n",
+            ),
+        ]);
+        let adds: Vec<u32> = sites
+            .iter()
+            .filter(|site| {
+                site.file.ends_with("src/use.ts") && site.member.as_deref() == Some("add")
+            })
+            .map(|site| site.line)
+            .collect();
+        assert_eq!(adds, vec![5], "{sites:#?}");
+    }
+
+    /// A module `require` loads is the package it names, never a function's
+    /// return (carrick#1562): the binding is the import, and its calls are
+    /// sites through the export.
+    #[test]
+    fn a_module_a_require_loads_is_no_own_call() {
+        let sites = sites_of(&[(
+            "src/legacy.ts",
+            "const jobs = require(\"@fixture/jobs\");\n\
+             export function run() { return jobs.trigger(\"nightly\", {}); }\n",
+        )]);
+        let trigger = site(&sites, "src/legacy.ts", 2, Some("trigger"));
+        assert_eq!(trigger.receiver, SiteReceiver::Export);
+        assert_eq!(trigger.specifier, "@fixture/jobs");
+        assert_eq!(trigger.literal(0, None), Some("nightly"));
+    }
+
+    /// What is not one fresh instance of one maker is no factory's
+    /// (carrick#1562), and a call holding it reads nothing: two makers, or
+    /// one maker handed other arguments, on two paths; a binding assigned on
+    /// each path; a module's instance or a field, which every call shares; a
+    /// path that returns something else; a generator; an `async` factory
+    /// called without `await`. A factory that hands its instance on, or
+    /// returns it from anywhere but its own body, leaves the instance taken
+    /// away. Uses are kept by name across a file, so each factory names its
+    /// binding apart from every other.
+    #[test]
+    fn what_is_not_one_fresh_instance_is_no_factory_s() {
+        let factories = "import { Queue, Worker } from \"@fixture/queue\";\n\
+             import { register } from \"./registry\";\n\
+             export function perBranch(flag: boolean) { if (flag) { return new Queue(\"a\"); } return new Worker(\"a\"); }\n\
+             export function perArgs(flag: boolean) { if (flag) { return new Queue(\"a\"); } return new Queue(\"b\"); }\n\
+             export function assigned(flag: boolean) { let picked; if (flag) { picked = new Queue(\"a\"); } else { picked = new Queue(\"a\"); } return picked; }\n\
+             const shared = new Queue(\"shared\");\n\
+             export function getShared() { return shared; }\n\
+             export function sendShared() { return shared.add(\"s\", {}); }\n\
+             export function maybe(flag: boolean) { if (!flag) { return null; } return new Queue(\"m\"); }\n\
+             export function* generated() { return new Queue(\"g\"); }\n\
+             export async function later() { return new Queue(\"later\"); }\n\
+             export function handedOff() { const handed = new Queue(\"h\"); register(handed); return handed; }\n\
+             export function escapes() { const escaping = new Queue(\"e\"); register(() => escaping); return escaping; }\n\
+             export function fresh() { return new Queue(\"control\"); }\n\
+             export function other() { return new Queue(\"other\"); }\n";
+        let use_of = |factory: &str| {
+            format!(
+                "import {{ {factory} }} from \"./factories\";\n\
+                 export async function go() {{\n\
+                 \x20 const q = {factory}(true);\n\
+                 \x20 await q.add(\"tick\", {{}});\n\
+                 }}\n"
+            )
+        };
+        let sites_with = |factory: &str| {
+            let user = use_of(factory);
+            sites_of(&[
+                ("src/factories.ts", factories),
+                ("src/use.ts", user.as_str()),
+                (
+                    "src/registry.ts",
+                    "export function register(value: unknown) {}\n",
+                ),
+            ])
+        };
+        let add_in_use = |sites: &[LibrarySite]| {
+            sites
+                .iter()
+                .find(|site| site.file.ends_with("src/use.ts") && site.line == 4)
+                .cloned()
+        };
+
+        let control = sites_with("fresh");
+        let read = add_in_use(&control).expect("the control reads through its factory");
+        assert_eq!(read.contest(on_wire), None);
+
+        for factory in [
+            "perBranch",
+            "perArgs",
+            "assigned",
+            "getShared",
+            "maybe",
+            "generated",
+            "later",
+        ] {
+            let sites = sites_with(factory);
+            assert!(add_in_use(&sites).is_none(), "{factory}: {sites:#?}");
+        }
+        for factory in ["handedOff", "escapes"] {
+            let sites = sites_with(factory);
+            let add = add_in_use(&sites).expect(factory);
+            assert_eq!(add.contest(on_wire), Some(Contest::Used), "{factory}");
+        }
+
+        // A field two own factories write holds either one's instance, and
+        // a parameter that shadows a factory's name calls no factory.
+        let held = sites_of(&[
+            ("src/factories.ts", factories),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+            (
+                "src/two.ts",
+                "import { fresh, other } from \"./factories\";\n\
+                 export class Mailer {\n\
+                 \x20 private q = fresh();\n\
+                 \x20 swap() { this.q = other(); }\n\
+                 \x20 send() { return this.q.add(\"x\", {}); }\n\
+                 }\n\
+                 export function run(fresh: () => unknown) {\n\
+                 \x20 const q = fresh();\n\
+                 \x20 return (q as any).add(\"p\", {});\n\
+                 }\n",
+            ),
+        ]);
+        assert!(
+            held.iter().all(|site| !site.file.ends_with("src/two.ts")),
+            "{held:#?}"
+        );
+        assert_eq!(
+            site(&control, "src/factories.ts", 8, Some("add")).contest(on_wire),
+            Some(Contest::Used),
+            "`return shared` hands the module's instance on"
+        );
+    }
+
+    /// A name a function takes as a parameter and hands its library call is
+    /// filled where the function is called (carrick#1562): a topic passed to
+    /// a publish wrapper, an event passed to an emit wrapper, a name built
+    /// into a template, and a parameter passed on through another wrapper.
+    /// The library call itself states nothing for the hole, a caller states
+    /// only what it fills, and a caller that passes anything but text, or
+    /// spreads its arguments, fills nothing.
+    #[test]
+    fn a_name_passed_as_a_parameter_is_read_where_the_caller_writes_it() {
+        let sites = sites_of(&[
+            (
+                "src/bus.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { io } from \"@fixture/socket\";\n\
+                 export async function publish(topic: string, data: unknown) {\n\
+                 \x20 await bus.publish(topic, data);\n\
+                 }\n\
+                 export async function publishOrder(kind: string, data: unknown) {\n\
+                 \x20 await publish(`orders.${kind}`, data);\n\
+                 }\n\
+                 export async function audit(data: string) {\n\
+                 \x20 await bus.publish(\"audit\", data);\n\
+                 }\n\
+                 export function emitTo(event: string, payload: unknown) {\n\
+                 \x20 io.emit(event, payload);\n\
+                 }\n\
+                 export function enqueue(job: { name: string }) {\n\
+                 \x20 bus.add(job);\n\
+                 }\n",
+            ),
+            (
+                "src/use.ts",
+                "import { publish, publishOrder, audit, emitTo, enqueue } from \"./bus\";\n\
+                 const TOPIC = \"users.created\";\n\
+                 export async function a(x: unknown, dynamic: string) {\n\
+                 \x20 await publish(\"users.deleted\", x);\n\
+                 \x20 await publish(TOPIC, x);\n\
+                 \x20 await publishOrder(\"shipped\", x);\n\
+                 \x20 await audit(\"payload\");\n\
+                 \x20 await publish(dynamic, x);\n\
+                 \x20 const args: [string] = [\"spread\"];\n\
+                 \x20 await publish(...args, \"late\");\n\
+                 \x20 emitTo(\"joined\", x);\n\
+                 \x20 enqueue({ name: \"welcome\" });\n\
+                 }\n",
+            ),
+        ]);
+        let wrapper = site(&sites, "src/bus.ts", 4, Some("publish"));
+        assert_eq!(wrapper.literal(0, None), None, "a hole states nothing");
+        assert!(wrapper.origin.is_none());
+
+        let filled = |line: u32| {
+            sites
+                .iter()
+                .find(|site| site.file.ends_with("src/use.ts") && site.line == line)
+                .unwrap_or_else(|| panic!("a site at use.ts:{line}: {sites:#?}"))
+        };
+        for (line, name, origin_line) in [
+            (4, "users.deleted", 4),
+            (5, "users.created", 4),
+            (6, "orders.shipped", 4),
+            (11, "joined", 13),
+        ] {
+            let at = filled(line);
+            assert_eq!(at.literal(0, None), Some(name), "use.ts:{line}");
+            let origin = at.origin.as_ref().expect("filled by a caller");
+            assert!(origin.file.ends_with("src/bus.ts"), "use.ts:{line}");
+            assert_eq!(origin.line, origin_line, "use.ts:{line}");
+            assert_eq!(at.receiver, SiteReceiver::Export, "use.ts:{line}");
+        }
+        assert_eq!(filled(11).specifier, "@fixture/socket");
+        assert_eq!(filled(11).member.as_deref(), Some("emit"));
+        // An argument that is one parameter is what the caller passes,
+        // object and all.
+        assert_eq!(filled(12).literal(0, Some("name")), Some("welcome"));
+
+        let payload = filled(7);
+        assert_eq!(
+            payload.literal(0, None),
+            None,
+            "the name the library call states is not stated again"
+        );
+        assert_eq!(payload.literal(1, None), Some("payload"));
+
+        for line in [8, 10] {
+            assert!(
+                sites
+                    .iter()
+                    .all(|site| !(site.file.ends_with("src/use.ts") && site.line == line)),
+                "use.ts:{line} fills nothing: {sites:#?}"
+            );
+        }
+        assert!(
+            sites
+                .iter()
+                .all(|site| !(site.file.ends_with("src/bus.ts") && site.line == 7)),
+            "a parameter passed on fills nothing where it is passed: {sites:#?}"
+        );
+    }
+
+    /// The constants module the name tests read (carrick#1562).
+    const TOPICS_MODULE: &str = "export const TOPICS = { orders: { created: \"orders.created\" }, users: \"users\" } as const;\n\
+         export const PREFIX = \"svc\";\n\
+         export const topicFor = (kind: string) => `${PREFIX}.${kind}`;\n\
+         export function auditTopic(name: string) { return `audit.${name}`; }\n\
+         export const ROUTES = { byId: (id: string) => `jobs.${id}` };\n\
+         export const MUTABLE = { a: \"mutable.a\" };\n\
+         export function twoSteps(name: string) { const topic = `two.${name}`; return topic; }\n";
+
+    /// A name read through a binding the service declares (carrick#1562):
+    /// an entry of a constant object, an imported constant, and what a
+    /// builder returns, a builder in an object included, read wherever the
+    /// binding is declared. A builder called with a parameter leaves a hole
+    /// its callers fill. An object some module changes, or whose inner
+    /// object is aliased, and a function that does more than return text
+    /// are read as nothing.
+    #[test]
+    fn a_name_read_through_a_map_a_constant_or_a_builder_is_its_text() {
+        let sites = sites_of(&[
+            ("src/topics.ts", TOPICS_MODULE),
+            (
+                "src/other.ts",
+                "import { MUTABLE } from \"./topics\";\n\
+                 MUTABLE.a = \"changed\";\n",
+            ),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { TOPICS, PREFIX, topicFor, auditTopic, ROUTES, MUTABLE, twoSteps } from \"./topics\";\n\
+                 const LOCAL = { shipped: \"orders.shipped\" };\n\
+                 const NESTED = { inner: { x: \"nested.x\" } };\n\
+                 const alias = NESTED.inner;\n\
+                 export function a(kind: string) {\n\
+                 \x20 bus.publish(TOPICS.orders.created, {});\n\
+                 \x20 bus.publish(PREFIX, {});\n\
+                 \x20 bus.publish(topicFor(\"x\"), {});\n\
+                 \x20 bus.publish(auditTopic(\"y\"), {});\n\
+                 \x20 bus.publish(ROUTES.byId(\"7\"), {});\n\
+                 \x20 bus.publish(LOCAL.shipped, {});\n\
+                 \x20 bus.publish(MUTABLE.a, {});\n\
+                 \x20 bus.publish(NESTED.inner.x, {});\n\
+                 \x20 bus.publish(topicFor(kind), {});\n\
+                 \x20 bus.publish(twoSteps(\"z\"), {});\n\
+                 \x20 bus.publish(TOPICS.users, alias);\n\
+                 }\n",
+            ),
+            (
+                "src/caller.ts",
+                "import { a } from \"./use\";\n\
+                 export function go() { a(\"filled\"); }\n",
+            ),
+        ]);
+        let name = |line: u32| {
+            site(&sites, "src/use.ts", line, Some("publish"))
+                .literal(0, None)
+                .map(str::to_string)
+        };
+        assert_eq!(name(7).as_deref(), Some("orders.created"), "a nested entry");
+        assert_eq!(name(8).as_deref(), Some("svc"), "an imported constant");
+        assert_eq!(name(9).as_deref(), Some("svc.x"), "an imported builder");
+        assert_eq!(name(10).as_deref(), Some("audit.y"), "a builder function");
+        assert_eq!(
+            name(11).as_deref(),
+            Some("jobs.7"),
+            "a builder in an object"
+        );
+        assert_eq!(name(12).as_deref(), Some("orders.shipped"), "an own object");
+        assert_eq!(name(13), None, "an object another module writes through");
+        assert_eq!(name(14), None, "an object whose inner object is aliased");
+        assert_eq!(name(15), None, "a builder handed a parameter");
+        assert_eq!(name(16), None, "a function that does more than return");
+        assert_eq!(name(17).as_deref(), Some("users"));
+        let filled = site(&sites, "src/caller.ts", 2, Some("publish"));
+        assert_eq!(filled.literal(0, None), Some("svc.filled"));
+    }
+
+    /// A constant object used any way but to read an entry holds nothing a
+    /// name reads (carrick#1562): handed to a call, spread (a copy shares its
+    /// inner objects), returned, read by a key the source does not state, or
+    /// read through an optional chain.
+    #[test]
+    fn an_object_used_any_way_but_read_holds_no_name() {
+        let sites = sites_of(&[
+            (
+                "src/topics.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { register } from \"./registry\";\n\
+                 const HANDED = { a: \"handed.a\" };\n\
+                 const SPREAD = { a: \"spread.a\" };\n\
+                 const RETURNED = { a: \"returned.a\" };\n\
+                 const COMPUTED = { a: \"computed.a\" };\n\
+                 const OPTIONAL = { inner: { a: \"optional.a\" } };\n\
+                 const KEPT = { a: \"kept.a\" };\n\
+                 register(HANDED);\n\
+                 export const copy = { ...SPREAD };\n\
+                 export function give() { return RETURNED; }\n\
+                 export function pick(key: \"a\") { return COMPUTED[key]; }\n\
+                 export function maybe() { return OPTIONAL?.inner; }\n\
+                 export function send() {\n\
+                 \x20 bus.publish(HANDED.a, {});\n\
+                 \x20 bus.publish(SPREAD.a, {});\n\
+                 \x20 bus.publish(RETURNED.a, {});\n\
+                 \x20 bus.publish(COMPUTED.a, {});\n\
+                 \x20 bus.publish(OPTIONAL.inner.a, {});\n\
+                 \x20 bus.publish(KEPT.a, {});\n\
+                 }\n",
+            ),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+        ]);
+        let name = |line: u32| {
+            site(&sites, "src/topics.ts", line, Some("publish"))
+                .literal(0, None)
+                .map(str::to_string)
+        };
+        assert_eq!(name(15), None, "handed to a call");
+        assert_eq!(name(16), None, "spread");
+        assert_eq!(name(17), None, "returned");
+        assert_eq!(name(18), None, "read by a computed key");
+        assert_eq!(name(19), None, "read through an optional chain");
+        assert_eq!(name(20).as_deref(), Some("kept.a"), "the control");
+    }
+
+    /// A constant object is read only where every module that reaches it
+    /// leaves it as it is (carrick#1562): a namespace import of its module
+    /// may change it unseen, though not its text constants. A module the
+    /// scan cannot follow turns every imported name off, as it does every
+    /// imported instance.
+    #[test]
+    fn a_constant_object_any_module_may_change_is_read_as_nothing() {
+        let user = "import { bus } from \"@fixture/bus\";\n\
+                    import { TOPICS, PREFIX } from \"./topics\";\n\
+                    export function a() {\n\
+                    \x20 bus.publish(TOPICS.users, {});\n\
+                    \x20 bus.publish(PREFIX, {});\n\
+                    }\n";
+        let name = |sites: &[LibrarySite], line: u32| {
+            site(sites, "src/use.ts", line, Some("publish"))
+                .literal(0, None)
+                .map(str::to_string)
+        };
+        let control = sites_of(&[("src/topics.ts", TOPICS_MODULE), ("src/use.ts", user)]);
+        assert_eq!(name(&control, 4).as_deref(), Some("users"));
+
+        let namespaced = sites_of(&[
+            ("src/topics.ts", TOPICS_MODULE),
+            ("src/use.ts", user),
+            (
+                "src/all.ts",
+                "import * as topics from \"./topics\";\n\
+                 export const every = topics;\n",
+            ),
+        ]);
+        assert_eq!(name(&namespaced, 4), None, "a namespace import");
+        assert_eq!(name(&namespaced, 5).as_deref(), Some("svc"));
+
+        let unfollowable = sites_of(&[
+            ("src/topics.ts", TOPICS_MODULE),
+            ("src/use.ts", user),
+            (
+                "src/setup.ts",
+                "import { setup } from \"~/nowhere\";\n\
+                 setup();\n",
+            ),
+        ]);
+        assert_eq!(
+            name(&unfollowable, 4),
+            None,
+            "a module the scan cannot follow"
+        );
+        assert_eq!(name(&unfollowable, 5), None, "an imported constant too");
+    }
+
+    /// A caller-filled site carries the library call's contest: a receiver
+    /// taken away is taken away at every caller (carrick#1562). A hole in a
+    /// function written inside the wrapper is that function's parameter,
+    /// which no caller of the wrapper passes.
+    #[test]
+    fn a_filled_site_is_contested_as_its_library_call_is() {
+        let sites = sites_of(&[
+            (
+                "src/bus.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { register } from \"./registry\";\n\
+                 register(bus);\n\
+                 export async function publish(topic: string) {\n\
+                 \x20 await bus.publish(topic, {});\n\
+                 }\n\
+                 export function each(prefix: string) {\n\
+                 \x20 [prefix].forEach((topic) => bus.publish(topic, {}));\n\
+                 }\n",
+            ),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+            (
+                "src/use.ts",
+                "import { publish, each } from \"./bus\";\n\
+                 export async function a() {\n\
+                 \x20 await publish(\"orders\");\n\
+                 \x20 each(\"one\");\n\
+                 }\n",
+            ),
+        ]);
+        let at = site(&sites, "src/use.ts", 3, Some("publish"));
+        assert_eq!(at.literal(0, None), Some("orders"));
+        assert_eq!(at.contest(on_wire), Some(Contest::Used));
+        assert!(
+            sites
+                .iter()
+                .all(|site| !(site.file.ends_with("src/use.ts") && site.line == 4)),
+            "{sites:#?}"
         );
     }
 }

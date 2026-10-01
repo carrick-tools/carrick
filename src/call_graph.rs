@@ -580,24 +580,47 @@ impl ImportedBindings {
 /// site with that site's own arguments (carrick#1555), so it needs the site.
 #[derive(Debug, Default)]
 pub struct CallSiteTargets {
-    by_file: HashMap<PathBuf, HashMap<u32, (PathBuf, String)>>,
+    /// Span start -> the site's span end and the definition it reaches.
+    by_file: HashMap<PathBuf, HashMap<u32, ReachedAt>>,
 }
+
+/// A resolved call site's span end, and the definition (file as walked,
+/// definition key) it reaches.
+type ReachedAt = (u32, (PathBuf, String));
 
 impl CallSiteTargets {
     fn record(&mut self, file: &Path, span: swc_common::Span, target: &Target) {
         if span.is_dummy() {
             return;
         }
-        self.by_file
-            .entry(file.to_path_buf())
-            .or_default()
-            .insert(span.lo.0, (target.file.clone(), target.key.clone()));
+        self.by_file.entry(file.to_path_buf()).or_default().insert(
+            span.lo.0,
+            (span.hi.0, (target.file.clone(), target.key.clone())),
+        );
     }
 
     /// The definition (file as walked, definition key) the call whose span
     /// starts at `span_lo` in `file` reaches, if resolution followed it.
+    ///
+    /// A call made on what another call returns (`make().send()`) starts
+    /// where that call does, so this names the inner call's definition for
+    /// both; [`Self::target_at`] tells them apart. The request summaries
+    /// still read this one (carrick#1695).
     pub fn target(&self, file: &Path, span_lo: u32) -> Option<&(PathBuf, String)> {
-        self.by_file.get(file)?.get(&span_lo)
+        self.by_file
+            .get(file)?
+            .get(&span_lo)
+            .map(|(_, target)| target)
+    }
+
+    /// The definition the call spanning exactly `span_lo..span_hi` reaches
+    /// (carrick#1562): never the call before it in a chain.
+    pub fn target_at(&self, file: &Path, span_lo: u32, span_hi: u32) -> Option<&(PathBuf, String)> {
+        self.by_file
+            .get(file)?
+            .get(&span_lo)
+            .filter(|(hi, _)| *hi == span_hi)
+            .map(|(_, target)| target)
     }
 }
 

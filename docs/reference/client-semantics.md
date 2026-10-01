@@ -172,8 +172,10 @@ an HTTP row.
 - **A literal is read by scope.** A name is a string or a template written
   at the call, or an identifier whose binding (by the resolver's scope, never
   by name) is a `const`, or a function's own binding that nothing assigns
-  again, holding one. A parameter, a block's own binding of the same name,
-  an import and a member of a constant object are not literals here.
+  again, holding one. A block's own binding of the same name is not a
+  literal here; a parameter is a hole its callers fill, and an import or an
+  entry of a constant object is read through the module's bindings (both
+  below).
 - **The line is the member's.** A chain written over several lines is
   placed on the line that names the member.
 - **Sub-object hops are a path.** `client.tasks.trigger(…)` is the member
@@ -220,11 +222,50 @@ an HTTP row.
   nothing, and a member that can change a name, a prefix or a base, or one
   the surface does not list, does. The HTTP rule "any call outside the
   verified surface" stays HTTP's.
-- **Not read yet.** Names and instances that flow through parameters,
-  builders, imported constants or own-module factories wait for
-  carrick#1562, including a field set by the service's own factory
-  (`this.redis = createRedisClient(…)`). A call the call graph resolves to
-  a function of the service (an in-repo package) is that function's.
+- **Own factories** (carrick#1562). A function of the service is a factory
+  when every `return` hands back a fresh instance of one maker, handed the
+  same arguments: a maker call, a local `const` holding one, or a call of
+  another factory. A call of it that the call graph resolves holds that
+  instance, read where the maker is written, with each parameter the factory
+  handed the maker filled with what the call passes. The instance is held as
+  any is: a module's or a function's `const` (and the modules that import
+  it), a class field, or a call made on the returned instance itself
+  (`createQueue("emails").add(…)`). A call made directly on what a package's
+  maker returns (`z.string().min(1)`) is no site. An `async` factory's
+  instance is reached only through `await`. None of these is a factory: two
+  makers, or one maker handed other arguments, on two paths; a binding
+  assigned on each path; a module's instance or a field, which every call
+  shares; a path that returns anything else; a generator. The factory's own
+  calls through its binding count among the uses. Its binding handed on, or
+  returned by anything but the factory itself, takes the instance away; its
+  own calls through the binding it returns are contested, as a returned
+  receiver's are anywhere.
+- **Names a caller fills** (carrick#1562). A library call whose argument
+  holds a parameter of the function it is written in (`bus.publish(topic,
+  data)` inside `publish(topic, data)`, or a template built from one) states
+  nothing for that argument. Each call of the function the call graph
+  resolves that passes literal text there is the library call again, placed
+  at the call, with only the text it filled in (`LibrarySite::origin`); a
+  call that passes its own parameter on leaves the hole to its own callers,
+  up to eight hops. A maker whose name is a factory's parameter is a maker
+  again at each call of the factory. A spread argument fills nothing, and a
+  parameter of a function written inside another is never filled.
+- **Names read through the module's bindings** (carrick#1562). An entry of
+  a constant object (`TOPICS.orders.created`), an imported constant, and
+  what a builder returns for its arguments (`topicFor("created")`,
+  `ENDPOINTS.users.byId(id)`) are text. A builder is a `const` arrow or
+  function, or a function declaration nothing assigns again, whose body only
+  returns text. A constant object is read only where every module that
+  reaches it leaves it as it is: none writes through it, hands it on,
+  spreads, returns or constructs it, or reads it by a computed key or through
+  an optional chain, and no module reaches its module through a namespace
+  import or another load. A module the scan cannot follow turns every
+  imported name off.
+- **Not read yet.** A factory that builds one of two makers' instances by a
+  flag (carrick#1689), a client handed in as a parameter or a constructor
+  argument (carrick#1693), and a builder that picks its return by a
+  parameter (carrick#1694). A call the call graph resolves to a function of
+  the service (an in-repo package) is that function's (carrick#1666).
 
 ## Asking again
 

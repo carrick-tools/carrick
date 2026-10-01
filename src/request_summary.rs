@@ -49,6 +49,16 @@
 //!   carrying exactly one request-options bag (`method`/`headers`/`body`/
 //!   `data`). A call the call graph resolves to a function in this service is
 //!   never read as a request: it is composed instead.
+//! - **A `fetch` handed in is `fetch`** (carrick#1562). A parameter whose
+//!   default is the platform's `fetch` (`fetchImpl = fetch`, `{ fetchImpl =
+//!   fetch } = {}`) and that the body never assigns again, and a field the
+//!   field table reads as set once to the global, to such a constructor
+//!   parameter, or to `options.fetch ?? fetch`, are the platform's `fetch`,
+//!   whatever a caller hands in instead.
+//! - **A builder's return is a value** (carrick#1562). A call to a
+//!   module-scope builder (an arrow or a function whose body only returns an
+//!   expression, or one held in a constant object nothing writes through) is
+//!   what it returns, with the call's arguments in its parameters.
 //! - **A callback counts only where it is invoked.** A function passed to a
 //!   callee this service defines contributes its requests when that callee
 //!   calls the parameter it arrives in. Passed to anything else, nothing says
@@ -103,7 +113,10 @@
 //! library-claim readers of brokers, sockets and buses ([`library_sites`]).
 //! What it reads beyond the HTTP reading (module-level calls, `new` makers,
 //! sub-object hops, literal arguments) is kept apart from what the summaries
-//! read, so no HTTP row moves.
+//! read, so no HTTP row moves. It also reads through the service's own code
+//! (carrick#1562): the instance an own factory returns, a name a caller
+//! passes in, and a name an object constant, an imported constant or a
+//! builder holds. Only the message roles read an own factory's instance.
 
 // Read by the message-role row writers (carrick#1662) and the library-store
 // reader (carrick#1664). Until they land, only tests call it, so the binary
@@ -337,6 +350,11 @@ struct ClientRef {
     /// For an instance: the member uses of the export's binding in the module
     /// that made it, which may configure what the maker built.
     export_uses: BTreeSet<MemberUse>,
+    /// Where the binding, or for an instance the export's binding, is
+    /// returned ([`BindingUse::returned_at`]). A message role reads a return
+    /// as a hand-off, except the one an own factory makes of the instance it
+    /// builds, which is followed to the factory's callers (carrick#1562).
+    returned: BTreeSet<u32>,
 }
 
 impl ClientRef {
@@ -347,6 +365,7 @@ impl ClientRef {
         self.called_computed = used.called_computed;
         self.contested_message |= used.contests_message();
         self.member_uses = used.member_uses().collect();
+        self.returned.extend(used.returned_at.iter().copied());
         self
     }
 }
@@ -369,6 +388,36 @@ struct ClientInstance {
     /// Where the maker call is written, in the module that declares the
     /// instance.
     site: Site,
+    /// What made it: the export's maker, or a call to a function the
+    /// service may declare (carrick#1562).
+    made_by: MadeBy,
+    /// The call is awaited where the instance is held (`await connect()`).
+    awaited: bool,
+}
+
+/// What made an instance (carrick#1562).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MadeBy {
+    /// A maker of the package export the [`ClientRef`] names. Where the call
+    /// graph resolves the maker call to a function of the service (an alias
+    /// import of one), it is an own call after all.
+    Export,
+    /// A call to a function the service may declare: the instance is what
+    /// that function returns ([`FnIr::returned`]), read once the call graph
+    /// says which function it is. Its [`ClientRef`] names no package. The
+    /// callee is kept as the source names it, so two writes of a field are
+    /// one maker's only when they call the same binding.
+    Call(OwnCallee),
+}
+
+/// The function an own call names (carrick#1562).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnCallee {
+    /// `make(…)`.
+    Binding(BindingKey),
+    /// `this.make(…)`, `this.#make(…)` (`None`), or `ns.a.make(…)`: the
+    /// root binding and every member after it.
+    Member(Option<BindingKey>, Vec<String>),
 }
 
 impl ClientInstance {
@@ -381,6 +430,8 @@ impl ClientInstance {
     /// `new export.member({ … })` needs no check of its own here: the
     /// construction contests the export's binding for HTTP
     /// ([`BindingUse::contests_client`]), and the instance inherits that.
+    /// An instance an own call returns (carrick#1562) names no member and
+    /// reads no options, so it is no HTTP factory's.
     fn http_factory(&self) -> Option<(&str, &ObjValue)> {
         match (&self.member, &self.options) {
             (Some(member), Some(options)) => Some((member, options)),
@@ -423,6 +474,9 @@ pub struct Site {
     /// Span start in the discovery source map, which is the key
     /// [`CallSiteTargets`] is read with.
     lo: u32,
+    /// Span end in the discovery source map: with `lo`, the one call
+    /// [`CallSiteTargets::target_at`] names.
+    hi: u32,
     /// Span start and end within the file, in SWC's own numbering (see
     /// [`SWC_SPAN_BASE`]): the key every candidate and row carries.
     pub span_start: u32,
@@ -453,6 +507,14 @@ struct CallIr {
     /// one. What it sends is read through the client's verified semantics,
     /// which are known only when the summaries are composed.
     receiver: Option<CallReceiver>,
+    /// The arguments as a library claim's slot reads them
+    /// ([`library_sites::site_arg`]), for a callee whose library call takes
+    /// a name from a parameter (carrick#1562). `None` when an argument is
+    /// spread: it moves every position after it.
+    site_args: Option<Vec<SiteArg>>,
+    /// The line of the member the call names, or of the callee: where a
+    /// library call a caller fills is placed ([`LibrarySite::line`]).
+    name_line: u32,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -487,6 +549,56 @@ struct FnIr {
     /// time. It may still send what it is read to send; it is never proven to
     /// send only that.
     unfollowed: bool,
+    /// Every `return` the body makes (an arrow's expression body included),
+    /// by where it starts, with the instance it returns when it returns one
+    /// built here ([`Reader::returned_instance`]). Settled into `returned`.
+    returns: Vec<(u32, Option<ClientRef>)>,
+    /// What a call of this function returns, when it is an own factory
+    /// (carrick#1562): every `return` returns an instance of one maker,
+    /// handed the same arguments, that the call builds anew.
+    returned: Option<Returned>,
+}
+
+/// The instance an own factory returns (carrick#1562).
+#[derive(Debug, Clone)]
+struct Returned {
+    /// The instance, as the factory's body holds it: its maker (or the
+    /// own call it came from), what it was handed in the factory's scope,
+    /// and the factory's own uses of the binding that holds it.
+    client: ClientRef,
+    /// Where each `return` starts ([`BindingUse::returned_at`]): a return
+    /// of the holder anywhere else hands the instance on unseen.
+    at: BTreeSet<u32>,
+    /// The function is `async`: its call returns a promise, so the instance
+    /// is reached only through `await`.
+    is_async: bool,
+}
+
+impl FnIr {
+    /// Settle `returns` into `returned`: one maker's instance on every
+    /// `return`, handed the same arguments. A generator returns no instance
+    /// to its caller.
+    fn settle_returned(&mut self, is_async: bool, is_generator: bool) {
+        let returns = std::mem::take(&mut self.returns);
+        if is_generator {
+            return;
+        }
+        let Some(first) = returns.first().and_then(|(_, client)| client.clone()) else {
+            return;
+        };
+        let every = returns.iter().all(|(_, client)| {
+            client
+                .as_ref()
+                .is_some_and(|client| library_sites::same_maker(client, &first))
+        });
+        if every {
+            self.returned = Some(Returned {
+                client: first,
+                at: returns.iter().map(|(at, _)| *at).collect(),
+                is_async,
+            });
+        }
+    }
 }
 
 /// Everything one file contributes: its functions, keyed exactly as
@@ -528,6 +640,11 @@ pub struct FileIr {
     /// reads it (carrick#1665), keyed by its class (the class's span start)
     /// and the field. An HTTP reading reads the class's own field table.
     field_receivers: HashMap<(u32, String), ClientRef>,
+    /// What each module-scope binding a name may read through holds
+    /// (carrick#1562): a `const` whose initialiser is text, a constant
+    /// object this module keeps ([`BindingUse::keeps_entries`]), or a
+    /// builder. Read by name, for this module's names and every importer's.
+    names: HashMap<String, library_sites::NameValue>,
 }
 
 impl FileIr {
@@ -549,7 +666,10 @@ impl FileIr {
 
     /// Whether this module holds a client another module may import. Only
     /// then does a specifier that names nothing matter
-    /// ([`LinkedClients`]).
+    /// ([`LinkedClients`]). What an own call returns counts (carrick#1562),
+    /// so most modules with a module-scope call hold one; an HTTP reading
+    /// reads no such instance ([`ClientInstance::http_factory`]), so a
+    /// service with no HTTP factory instance loses no HTTP row to it.
     pub fn holds_instances(&self) -> bool {
         !self.module_clients.is_empty()
     }
@@ -586,6 +706,8 @@ pub fn extract_file_ir(
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
         texts: HashMap::new(),
+        named: HashSet::new(),
+        builders: HashMap::new(),
         receivers: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
@@ -625,7 +747,10 @@ pub fn extract_file_ir(
         names_commonjs_exports: names_commonjs_exports(module),
         ..FileIr::default()
     };
-    let reader = Reader { source_map };
+    let reader = Reader {
+        source_map,
+        builder_depth: std::cell::Cell::new(0),
+    };
 
     // Module constants first, in source order, so a later one can read an
     // earlier one (`const BASE = ...; const USERS = `${BASE}/users``).
@@ -634,19 +759,56 @@ pub fn extract_file_ir(
             && decl.kind == VarDeclKind::Const
         {
             for declarator in &decl.decls {
-                if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
-                    && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
+                let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) else {
+                    continue;
+                };
+                let name = ident.id.sym.to_string();
+                // What a name may read through it at link time
+                // (carrick#1562): a builder, a constant object this module
+                // keeps, or text.
+                let named = library_sites::name_value(init, &module_scope).filter(|value| {
+                    !matches!(value, library_sites::NameValue::Map(_))
+                        || module_scope
+                            .uses
+                            .get(&name)
+                            .is_none_or(|used| used.keeps_entries(value))
+                });
+                if let Some(value) = named {
+                    if !matches!(value, library_sites::NameValue::Text(_)) {
+                        module_scope.named.insert(ident_key(&ident.id));
+                    }
+                    file.names.insert(name.clone(), value);
+                }
+                // What a request's value may be built by: the builder
+                // itself, or one an object holds that nothing writes through.
+                if let Some(builder) = Builder::of(init) {
+                    module_scope
+                        .builders
+                        .insert((ident_key(&ident.id), Vec::new()), builder);
+                } else if let Expr::Object(object) =
+                    crate::graphql_document_sites::unwrap_expression(init)
+                    && module_scope.object_consts.contains(&name)
+                    && !module_scope.written_through(&name)
                 {
-                    let name = ident.id.sym.to_string();
+                    let mut found = Vec::new();
+                    Builder::in_object(object, &mut Vec::new(), &mut found);
+                    for (path, builder) in found {
+                        module_scope
+                            .builders
+                            .insert((ident_key(&ident.id), path), builder);
+                    }
+                }
+                if !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_)) {
                     let (value, client, text) = {
                         let scope = Scope::module(&module_scope);
                         (
                             reader.eval(init, &scope),
-                            reader.factory_call(init, &scope),
-                            library_sites::literal_text(init, &scope),
+                            reader.written_instance(init, &scope),
+                            library_sites::text_pieces(init, &scope),
                         )
                     };
                     // Every maker form is an instance here (carrick#1661),
+                    // and so is what an own call returns (carrick#1562),
                     // and a module holding one asks for every specifier
                     // ([`FileIr::holds_instances`]). An HTTP reading still
                     // reads only an HTTP factory's instance
@@ -670,10 +832,31 @@ pub fn extract_file_ir(
         // `export default http.create({ ... })`: an instance no name in this
         // file holds, which a module importing the default reads.
         if let ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) = item
-            && let Some(client) = reader.factory_call(&export.expr, &Scope::module(&module_scope))
+            && let Some(client) =
+                reader.written_instance(&export.expr, &Scope::module(&module_scope))
         {
             file.module_clients
                 .insert(DEFAULT_EXPORT.to_string(), client);
+        }
+    }
+    // A function declared at module scope whose body only returns text is a
+    // builder a name may read through (carrick#1562), unless the module
+    // assigns its binding again. Read once every constant is known, since a
+    // declaration is hoisted.
+    let mut reassigned = Reassigned::default();
+    module.visit_with(&mut reassigned);
+    for item in &module.body {
+        if let Some(Decl::Fn(fn_decl)) = module_decl(item)
+            && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
+            && let Some(builder) = Builder::of_function(&fn_decl.function)
+        {
+            if let Some(value) = library_sites::builder(&builder, &module_scope) {
+                module_scope.named.insert(ident_key(&fn_decl.ident));
+                file.names.insert(fn_decl.ident.sym.to_string(), value);
+            }
+            module_scope
+                .builders
+                .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
         }
     }
     let module_scope = &module_scope;
@@ -815,10 +998,23 @@ struct ModuleScope {
     /// declares the name again holds a binding of its own, which is not this
     /// one (carrick#1648).
     consts: HashMap<BindingKey, Value>,
-    /// Each module-scope `const` whose initialiser is literal text, by
-    /// binding ([`library_sites::literal_text`]): what a library claim's name
-    /// slot reads through an identifier (carrick#1661).
-    texts: HashMap<BindingKey, String>,
+    /// Each module-scope `const` whose initialiser is text, by binding
+    /// ([`library_sites::text_pieces`]): what a library claim's name slot
+    /// reads through an identifier (carrick#1661). Its text may name a
+    /// constant object's entry, a builder's return or an import, read at
+    /// link time (carrick#1562).
+    texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
+    /// The module-scope constant objects and builders a name may read
+    /// through at link time ([`FileIr::names`]), by binding (carrick#1562).
+    named: HashSet<BindingKey>,
+    /// Each module-scope builder a request's value may be built by
+    /// (carrick#1562), by its binding and the path of entries to it inside a
+    /// constant object (empty for the binding itself): a `const` arrow or
+    /// function expression, a function declaration nothing assigns again,
+    /// or one held in a constant object nothing writes through. Each only
+    /// returns an expression ([`Reader::eval`] reads it with the call's
+    /// arguments in its parameters).
+    builders: HashMap<(BindingKey, Vec<String>), Builder>,
     receivers: HashMap<String, ClientRef>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
@@ -865,6 +1061,79 @@ impl ModuleScope {
     }
 }
 
+/// A function whose body only returns an expression, as a request's value
+/// reads a call to it (carrick#1562): its parameters and what it returns.
+struct Builder {
+    params: Vec<Option<BindingKey>>,
+    returned: Box<Expr>,
+}
+
+impl Builder {
+    /// The builder `expr` is: an arrow, or a function expression, that only
+    /// returns an expression.
+    fn of(expr: &Expr) -> Option<Self> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Arrow(arrow) => Some(Builder {
+                params: arrow.params.iter().map(pat_key).collect(),
+                returned: Box::new(match &*arrow.body {
+                    BlockStmtOrExpr::Expr(expr) => (**expr).clone(),
+                    BlockStmtOrExpr::BlockStmt(block) => only_return(&block.stmts)?.clone(),
+                }),
+            }),
+            Expr::Fn(function) => Self::of_function(&function.function),
+            _ => None,
+        }
+    }
+
+    fn of_function(function: &Function) -> Option<Self> {
+        Some(Builder {
+            params: function
+                .params
+                .iter()
+                .map(|param| pat_key(&param.pat))
+                .collect(),
+            returned: Box::new(only_return(&function.body.as_ref()?.stmts)?.clone()),
+        })
+    }
+
+    /// Every builder an object literal holds, by the path of entries to it.
+    fn in_object(
+        object: &ObjectLit,
+        path: &mut Vec<String>,
+        out: &mut Vec<(Vec<String>, Builder)>,
+    ) {
+        for prop in &object.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            let Some(key) = prop_name(&kv.key) else {
+                continue;
+            };
+            path.push(key);
+            match crate::graphql_document_sites::unwrap_expression(&kv.value) {
+                Expr::Object(inner) => Self::in_object(inner, path, out),
+                value => {
+                    if let Some(builder) = Self::of(value) {
+                        out.push((path.clone(), builder));
+                    }
+                }
+            }
+            path.pop();
+        }
+    }
+}
+
+/// The expression a body of exactly one `return <expr>;` returns.
+fn only_return(stmts: &[Stmt]) -> Option<&Expr> {
+    match stmts {
+        [Stmt::Return(ReturnStmt { arg: Some(arg), .. })] => Some(arg),
+        _ => None,
+    }
+}
+
 /// How one binding is used beyond its own declaration: an identifier, or a
 /// field of `this` keyed `this.<field>` ([`binding_key`]).
 #[derive(Debug, Default, Clone)]
@@ -904,6 +1173,19 @@ struct BindingUse {
     /// Before, each was the member read or the operand it is to an HTTP
     /// reading, which still contests on it ([`Self::contests_client`]).
     library_calls: BTreeSet<MemberUse>,
+    /// Where it is returned: a `return <binding>` statement, or an arrow
+    /// whose expression body is the binding, by the span start of the
+    /// returned expression's statement (discovery numbering). A message
+    /// role follows a return an own factory makes to the factory's callers
+    /// (carrick#1562, [`FnIr::returned`]) and takes the binding away for any
+    /// other ([`ClientRef::returned`]); before, it was the operand it is to
+    /// an HTTP reading, which still contests on it.
+    returned_at: BTreeSet<u32>,
+    /// The member chains read off it as values, every hop a plain name
+    /// (`TOPICS.orders` is `["orders"]`): among the [`Self::member_read`]s,
+    /// the entries of a constant object a name may read (carrick#1562,
+    /// [`Self::keeps_entries`]).
+    entry_reads: BTreeSet<Vec<String>>,
 }
 
 impl BindingUse {
@@ -913,8 +1195,8 @@ impl BindingUse {
     ///
     /// A call through a sub-object and a construction contest exactly as
     /// the member read and the operand they were recorded as before
-    /// carrick#1661, and a truthiness test as the operand it was before
-    /// carrick#1665.
+    /// carrick#1661, a truthiness test as the operand it was before
+    /// carrick#1665, and a return as the operand it was before carrick#1562.
     fn contests_client(&self) -> bool {
         self.written
             || self.member_read
@@ -922,6 +1204,7 @@ impl BindingUse {
             || self.other
             || self.tested
             || !self.library_calls.is_empty()
+            || !self.returned_at.is_empty()
     }
 
     /// The same for a message role (carrick#1661): a hand-off, a write, a
@@ -929,7 +1212,9 @@ impl BindingUse {
     /// the source does not state. Constructing the binding is what a `new`
     /// maker does, and a call through a sub-object is a call; both are among
     /// [`Self::member_uses`], which the caller classifies. A truthiness test
-    /// keeps nothing of the binding.
+    /// keeps nothing of the binding. A return is the reader's to judge
+    /// ([`BindingUse::returned_at`]): followed to an own factory's callers,
+    /// or a hand-off.
     fn contests_message(&self) -> bool {
         self.written || self.member_read || self.spread || self.other || self.called_computed
     }
@@ -948,6 +1233,31 @@ impl BindingUse {
         self.tested |= other.tested;
         self.library_calls
             .extend(other.library_calls.iter().cloned());
+        self.returned_at.extend(other.returned_at.iter().copied());
+        self.entry_reads.extend(other.entry_reads.iter().cloned());
+    }
+
+    /// Whether a constant object holding `entries` holds them still, for a
+    /// name read through one (carrick#1562): nothing writes through it,
+    /// hands it on, aliases, spreads (a copy shares its inner objects),
+    /// returns or constructs it, or calls a member by a key the source does
+    /// not state; and every entry read off it as a value is text or a
+    /// builder, never an inner object a holder could change. Reading an
+    /// entry, testing it and calling a builder through it keep it.
+    fn keeps_entries(&self, entries: &library_sites::NameValue) -> bool {
+        !self.written
+            && !self.other
+            && !self.spread
+            && !self.called_computed
+            && self.returned_at.is_empty()
+            && !self
+                .library_calls
+                .iter()
+                .any(|used| used.form == MakerForm::New)
+            && self
+                .entry_reads
+                .iter()
+                .all(|path| !matches!(entries.entry(path), Some(library_sites::NameValue::Map(_))))
     }
 
     /// Every member called or constructed through the binding.
@@ -964,12 +1274,14 @@ impl BindingUse {
 
     /// An object constant never written through, passed to a call or
     /// aliased holds exactly the keys its literal writes. Constructing the
-    /// binding itself was an operand use before carrick#1661, and so was a
-    /// truthiness test before carrick#1665; each counts as one here.
+    /// binding itself was an operand use before carrick#1661, a truthiness
+    /// test before carrick#1665 and a return before carrick#1562; each counts
+    /// as one here.
     fn keeps_object(&self) -> bool {
         !self.written
             && !self.other
             && !self.tested
+            && self.returned_at.is_empty()
             && !self.library_calls.contains(&MemberUse {
                 form: MakerForm::New,
                 path: Vec::new(),
@@ -1120,6 +1432,18 @@ impl BindingUses {
     }
 }
 
+/// The binding a member chain is read off, through any hops, plain,
+/// computed or optional.
+fn chain_root(expr: &Expr) -> Option<String> {
+    let mut at = crate::graphql_document_sites::unwrap_expression(expr);
+    loop {
+        if let Some(key) = binding_key(at) {
+            return Some(key);
+        }
+        at = crate::graphql_document_sites::unwrap_expression(&as_member(at)?.obj);
+    }
+}
+
 /// `root.a.b`, with every hop a plain name and `root` a binding
 /// ([`binding_key`]): the root's key and the hops in order.
 fn member_path(expr: &Expr) -> Option<(String, Vec<String>)> {
@@ -1180,6 +1504,21 @@ impl Visit for BindingUses {
             return;
         }
         if let Expr::Member(member) = expr {
+            // `TOPICS.orders` as a value: an entry read (carrick#1562). One
+            // by a key the source does not state may read any entry, the
+            // object itself as far as a name is concerned.
+            match member_path(expr) {
+                Some((key, path)) => self.mark(key, |used| {
+                    used.entry_reads.insert(path);
+                }),
+                None => {
+                    if let Some(key) = chain_root(expr) {
+                        self.mark(key, |used| {
+                            used.entry_reads.insert(Vec::new());
+                        });
+                    }
+                }
+            }
             self.read_member(member);
             return;
         }
@@ -1205,7 +1544,15 @@ impl Visit for BindingUses {
                 self.callee(&call.callee);
                 call.args.visit_with(self);
             }
-            OptChainBase::Member(member) => self.read_member(member),
+            OptChainBase::Member(member) => {
+                // Read as the whole object, as a computed read is.
+                if let Some(key) = chain_root(&Expr::Member(member.clone())) {
+                    self.mark(key, |used| {
+                        used.entry_reads.insert(Vec::new());
+                    });
+                }
+                self.read_member(member);
+            }
         }
     }
 
@@ -1368,6 +1715,38 @@ impl Visit for BindingUses {
         )) {
             Some(key) => self.mark(key, |used| used.exported = true),
             None => export.expr.visit_with(self),
+        }
+    }
+
+    /// `return client`: the binding is returned ([`BindingUse::returned_at`]).
+    fn visit_return_stmt(&mut self, ret: &ReturnStmt) {
+        let returned = ret
+            .arg
+            .as_deref()
+            .and_then(|arg| binding_key(crate::graphql_document_sites::unwrap_expression(arg)));
+        match returned {
+            Some(key) => self.mark(key, |used| {
+                used.returned_at.insert(ret.span.lo.0);
+            }),
+            None => ret.visit_children_with(self),
+        }
+    }
+
+    /// `() => client`: an arrow whose expression body is a binding returns
+    /// it, as `return client` does.
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let BlockStmtOrExpr::Expr(body) = &*arrow.body else {
+            arrow.visit_children_with(self);
+            return;
+        };
+        match binding_key(crate::graphql_document_sites::unwrap_expression(body)) {
+            Some(key) => {
+                arrow.params.visit_with(self);
+                self.mark(key, |used| {
+                    used.returned_at.insert(body.span().lo.0);
+                });
+            }
+            None => arrow.visit_children_with(self),
         }
     }
 }
@@ -1631,14 +2010,23 @@ struct ClassFields {
     class: u32,
     values: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
+    /// Fields that hold the platform's `fetch` unless the class is handed
+    /// another (carrick#1562): set once, where the field table reads a
+    /// write, to the global or to a constructor parameter whose default it
+    /// is ([`platform_fetch`]).
+    fetches: HashSet<String>,
 }
 
 /// What a function written inside another can read of it, by binding.
 #[derive(Default)]
 struct Captured {
     values: HashMap<BindingKey, Value>,
-    texts: HashMap<BindingKey, String>,
+    /// Literal text only: a hole is a parameter of the enclosing function,
+    /// which the function written inside it is not called with.
+    texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
     receivers: HashMap<BindingKey, ClientRef>,
+    /// [`Scope::fetches`].
+    fetches: HashSet<BindingKey>,
 }
 
 /// One module-scope binding an import introduces.
@@ -1976,6 +2364,7 @@ fn import_receivers(imports: &HashMap<String, ImportBinding>) -> HashMap<String,
                     contested_message: false,
                     member_uses: BTreeSet::new(),
                     export_uses: BTreeSet::new(),
+                    returned: BTreeSet::new(),
                 },
             )
         })
@@ -2038,12 +2427,19 @@ fn redeclared_names(module: &Module) -> Declarations {
 struct Scope<'a> {
     params: Vec<Option<BindingKey>>,
     locals: HashMap<BindingKey, Value>,
-    /// The locals whose initialiser is literal text and that nothing assigns
-    /// again ([`library_sites::literal_text`], carrick#1661), the enclosing
-    /// function's included.
-    texts: HashMap<BindingKey, String>,
+    /// The locals whose initialiser is text and that nothing assigns again
+    /// ([`library_sites::text_pieces`], carrick#1661), the enclosing
+    /// function's included. A local of this function may hold one of its
+    /// parameters (carrick#1562); one of the enclosing function's never
+    /// does.
+    texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
     /// Locals holding a library client's instance (carrick#1564).
     local_receivers: HashMap<BindingKey, ClientRef>,
+    /// Parameters, the enclosing function's included, that hold the
+    /// platform's `fetch` unless a caller hands another (`fetchImpl =
+    /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
+    /// assigns again: a call through one is a `fetch` (carrick#1562).
+    fetches: HashSet<BindingKey>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -2055,6 +2451,7 @@ impl<'a> Scope<'a> {
             locals: HashMap::new(),
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
+            fetches: HashSet::new(),
             fields: None,
             module,
         }
@@ -2115,6 +2512,9 @@ impl<'a> Scope<'a> {
 
 struct Reader<'a> {
     source_map: &'a Lrc<SourceMap>,
+    /// How many builder calls deep [`Reader::eval`] is reading
+    /// (carrick#1562): a builder that calls itself stops at the cap.
+    builder_depth: std::cell::Cell<usize>,
 }
 
 impl Reader<'_> {
@@ -2130,6 +2530,7 @@ impl Reader<'_> {
         let local_hi = self.source_map.lookup_byte_offset(span.hi).pos.0;
         Site {
             lo: span.lo.0,
+            hi: span.hi.0,
             span_start: local + SWC_SPAN_BASE,
             span_end: local_hi + SWC_SPAN_BASE,
             line: self.source_map.lookup_char_pos(span.lo).line as u32,
@@ -2237,6 +2638,9 @@ impl Reader<'_> {
         let mut receivers: HashMap<String, ClientRef> = HashMap::new();
         let mut contested: HashSet<String> = HashSet::new();
         let mut nested_writes: HashSet<String> = HashSet::new();
+        // Fields set to the platform's `fetch`, or to a constructor parameter
+        // whose default it is (carrick#1562).
+        let mut fetches: HashSet<String> = HashSet::new();
         let mut assign = |name: String,
                           value: Value,
                           client: Option<ClientRef>,
@@ -2255,6 +2659,9 @@ impl Reader<'_> {
                     if let (Some(name), Some(init)) = (prop_name(&prop.key), &prop.value)
                         && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
                     {
+                        if platform_fetch(init, module) {
+                            fetches.insert(name.clone());
+                        }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
                         let client = self.factory_call(init, &scope);
@@ -2263,23 +2670,38 @@ impl Reader<'_> {
                 }
                 ClassMember::PrivateProp(prop) if !prop.is_static => {
                     if let Some(init) = &prop.value {
+                        let name = format!("#{}", prop.key.name);
+                        if platform_fetch(init, module) {
+                            fetches.insert(name.clone());
+                        }
                         let scope = Scope::module(module);
                         let value = self.eval(init, &scope);
                         let client = self.factory_call(init, &scope);
-                        assign(format!("#{}", prop.key.name), value, client, &mut fields);
+                        assign(name, value, client, &mut fields);
                     }
                 }
                 ClassMember::Constructor(ctor) => {
                     let mut scope = Scope::module(module);
+                    let mut fetch_params: HashSet<BindingKey> = HashSet::new();
                     for param in &ctor.params {
                         match param {
-                            ParamOrTsParamProp::TsParamProp(prop) => {
-                                if let TsParamPropParam::Ident(ident) = &prop.param {
+                            ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
+                                TsParamPropParam::Ident(ident) => {
                                     let name = ident.id.sym.to_string();
                                     assign(name.clone(), Value::opaque(name), None, &mut fields);
                                 }
+                                // `private fetchImpl = fetch`.
+                                TsParamPropParam::Assign(param) => {
+                                    if let Pat::Ident(ident) = &*param.left
+                                        && platform_fetch(&param.right, module)
+                                    {
+                                        fetches.insert(ident.id.sym.to_string());
+                                    }
+                                }
+                            },
+                            ParamOrTsParamProp::Param(param) => {
+                                fetch_bindings(&param.pat, module, &mut fetch_params);
                             }
-                            ParamOrTsParamProp::Param(_) => {}
                         }
                     }
                     let Some(body) = &ctor.body else {
@@ -2307,6 +2729,13 @@ impl Reader<'_> {
                         match this_assignment(stmt) {
                             Some((name, value)) => {
                                 value.visit_with(&mut nested);
+                                let handed = matches!(
+                                    crate::graphql_document_sites::unwrap_expression(value),
+                                    Expr::Ident(ident) if fetch_params.contains(&ident_key(ident))
+                                );
+                                if handed || platform_fetch(value, module) {
+                                    fetches.insert(name.clone());
+                                }
                                 let client = self.factory_call(value, &scope);
                                 let value = self.eval(value, &scope);
                                 assign(name, value, client, &mut fields);
@@ -2336,6 +2765,7 @@ impl Reader<'_> {
         }
         contested.extend(writes.fields);
         contested.extend(redeclared.into_iter().flatten().cloned());
+        fetches.retain(|name| !contested.contains(name));
         for name in contested {
             receivers.remove(&name);
             fields.insert(name.clone(), Value::opaque(format!("this.{name}")));
@@ -2361,6 +2791,7 @@ impl Reader<'_> {
             class: class.span.lo.0,
             values,
             receivers,
+            fetches,
         }
     }
 
@@ -2372,11 +2803,16 @@ impl Reader<'_> {
         captured: &Captured,
     ) -> FnIr {
         let params = function.params.iter().map(|p| pat_key(&p.pat)).collect();
+        let mut fetches = captured.fetches.clone();
+        for param in &function.params {
+            fetch_bindings(&param.pat, module, &mut fetches);
+        }
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
+            fetches,
             fields,
             module,
         };
@@ -2385,6 +2821,7 @@ impl Reader<'_> {
             Some(body) => self.body(&body.stmts, &mut scope, &mut ir),
             None => ir.bodyless = true,
         }
+        ir.settle_returned(function.is_async, function.is_generator);
         ir
     }
 
@@ -2396,19 +2833,31 @@ impl Reader<'_> {
         captured: &Captured,
     ) -> FnIr {
         let params = arrow.params.iter().map(pat_key).collect();
+        let mut fetches = captured.fetches.clone();
+        for param in &arrow.params {
+            fetch_bindings(param, module, &mut fetches);
+        }
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
+            fetches,
             fields,
             module,
         };
         let mut ir = FnIr::default();
         match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => self.body(&block.stmts, &mut scope, &mut ir),
-            BlockStmtOrExpr::Expr(expr) => self.walk(expr, &scope, &mut ir),
+            // The expression body is what the arrow returns, where it starts
+            // ([`BindingUses::visit_arrow_expr`] keys it the same way).
+            BlockStmtOrExpr::Expr(expr) => {
+                let returned = self.returned_instance(expr, &scope);
+                ir.returns.push((expr.span().lo.0, returned));
+                self.walk(expr, &scope, &mut ir);
+            }
         }
+        ir.settle_returned(arrow.is_async, arrow.is_generator);
         ir
     }
 
@@ -2427,6 +2876,10 @@ impl Reader<'_> {
             stmt.visit_with(&mut reassigned);
             stmt.visit_with(&mut declared);
         }
+        // A parameter the body assigns again may hold anything.
+        scope
+            .fetches
+            .retain(|(name, _)| !reassigned.names.contains(name));
         for stmt in stmts {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
@@ -2438,18 +2891,22 @@ impl Reader<'_> {
                         let key = ident_key(&ident.id);
                         let unsettled =
                             reassigned.names.contains(&name) || declared.binding_count(&key) > 1;
+                        // A package maker's instance, or what an own call
+                        // returns (carrick#1562): an HTTP reading reads only
+                        // the first ([`ClientInstance::http_factory`]).
                         let client = if unsettled {
                             None
                         } else {
-                            self.factory_call(init, scope)
+                            self.written_instance(init, scope)
                         };
                         let value = if unsettled {
                             Value::opaque(name.clone())
                         } else {
                             bound(name.clone(), self.eval(init, scope))
                         };
-                        if !unsettled && let Some(text) = library_sites::literal_text(init, scope) {
-                            scope.texts.insert(key.clone(), text);
+                        if !unsettled && let Some(pieces) = library_sites::text_pieces(init, scope)
+                        {
+                            scope.texts.insert(key.clone(), pieces);
                         }
                         scope.locals.insert(key.clone(), value);
                         scope.local_receivers.remove(&key);
@@ -2545,6 +3002,12 @@ impl Reader<'_> {
                 {
                     return self.eval(&arg.expr, scope);
                 }
+                // `usersPath(id)`, `ENDPOINTS.users.byId(id)`: what the
+                // builder returns, with the call's arguments in its
+                // parameters (carrick#1562).
+                if let Some(value) = self.builder_call(call, scope) {
+                    return value;
+                }
                 // `url.toString()` is the URL.
                 if let Callee::Expr(callee) = &call.callee
                     && let Expr::Member(member) = &**callee
@@ -2616,6 +3079,47 @@ impl Reader<'_> {
             return value.clone();
         }
         Value::opaque(self.text(member.span))
+    }
+
+    /// A call to a module-scope builder ([`ModuleScope::builders`]), read
+    /// as what it returns with each parameter holding what the call passes
+    /// (carrick#1562). The callee is the builder's binding, read by its
+    /// scope, or a path of plain entries into a constant object. A spread
+    /// argument moves every position, so such a call reads as no builder's;
+    /// a missing argument holds nothing the source states.
+    fn builder_call(&self, call: &CallExpr, scope: &Scope<'_>) -> Option<Value> {
+        const MAX_BUILDER_DEPTH: usize = 8;
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let (root, path) = match crate::graphql_document_sites::unwrap_expression(callee) {
+            Expr::Ident(ident) => (ident, Vec::new()),
+            Expr::Member(member) => library_sites::named_path(member)?,
+            _ => return None,
+        };
+        if scope.param_index(root).is_some() {
+            return None;
+        }
+        let builder = scope.module.builders.get(&(ident_key(root), path))?;
+        let depth = self.builder_depth.get();
+        if depth >= MAX_BUILDER_DEPTH || call.args.iter().any(|arg| arg.spread.is_some()) {
+            return None;
+        }
+        let mut inner = Scope::module(scope.module);
+        for (index, param) in builder.params.iter().enumerate() {
+            let Some(param) = param else {
+                continue;
+            };
+            let value = match call.args.get(index) {
+                Some(arg) => self.eval(&arg.expr, scope),
+                None => Value::Str(vec![Piece::Unknown]),
+            };
+            inner.locals.insert(param.clone(), value);
+        }
+        self.builder_depth.set(depth + 1);
+        let value = self.eval(&builder.returned, &inner);
+        self.builder_depth.set(depth);
+        Some(value)
     }
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
@@ -2753,15 +3257,24 @@ impl Reader<'_> {
         };
         let is_fetch = match &**callee {
             // Only the global: a parameter, a local or a block's own binding
-            // named `fetch` is someone's own function (carrick#1648).
+            // named `fetch` is someone's own function (carrick#1648). A
+            // parameter that holds the global unless a caller hands another,
+            // and a field set to one, are the global too (carrick#1562).
             Expr::Ident(ident) => {
-                ident.sym == *"fetch"
-                    && scope.module.declared_below.binding_count(&ident_key(ident)) == 0
+                (ident.sym == *"fetch"
+                    && scope.module.declared_below.binding_count(&ident_key(ident)) == 0)
+                    || scope.fetches.contains(&ident_key(ident))
             }
             Expr::Member(member) => {
-                member_prop(member).as_deref() == Some("fetch")
+                (member_prop(member).as_deref() == Some("fetch")
                     && matches!(&*member.obj, Expr::Ident(obj)
-                        if obj.sym == *"window" || obj.sym == *"globalThis")
+                        if obj.sym == *"window" || obj.sym == *"globalThis"))
+                    || (matches!(&*member.obj, Expr::This(_))
+                        && this_field(member).is_some_and(|field| {
+                            scope
+                                .fields
+                                .is_some_and(|fields| fields.fetches.contains(&field))
+                        }))
             }
             _ => false,
         };
@@ -2981,6 +3494,8 @@ impl Reader<'_> {
                     .map(|arg| library_sites::site_arg(&arg.expr, scope))
                     .collect(),
                 site: self.site(expr.span()),
+                made_by: MadeBy::Export,
+                awaited: false,
             }),
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
@@ -2990,6 +3505,7 @@ impl Reader<'_> {
             contested_message: client.contested_message,
             member_uses: BTreeSet::new(),
             export_uses: client.member_uses.clone(),
+            returned: client.returned.clone(),
         })
     }
 
@@ -3113,6 +3629,69 @@ fn this_field(member: &MemberExpr) -> Option<String> {
     }
 }
 
+/// Every binding `pat` introduces whose default is the platform's `fetch`
+/// ([`platform_fetch`]): `fetchImpl = fetch`, `{ fetchImpl = fetch }`,
+/// `{ fetch: impl = fetch } = {}` (carrick#1562).
+fn fetch_bindings(pat: &Pat, module: &ModuleScope, out: &mut HashSet<BindingKey>) {
+    match pat {
+        Pat::Assign(assign) => match &*assign.left {
+            Pat::Ident(ident) if platform_fetch(&assign.right, module) => {
+                out.insert(ident_key(&ident.id));
+            }
+            other => fetch_bindings(other, module, out),
+        },
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::Assign(assign)
+                        if assign
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| platform_fetch(value, module)) =>
+                    {
+                        out.insert(ident_key(&assign.key.id));
+                    }
+                    ObjectPatProp::KeyValue(kv) => fetch_bindings(&kv.value, module, out),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `expr` is the platform's `fetch`, as a default or a fallback
+/// names it (carrick#1562): the global (no binding of the module or below
+/// it is named `fetch`), `globalThis.fetch` or `window.fetch`, either bound
+/// to the global object, or a `??`/`||` falling back to one.
+fn platform_fetch(expr: &Expr, module: &ModuleScope) -> bool {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Ident(ident) => {
+            ident.sym == *"fetch" && module.declared_below.binding_count(&ident_key(ident)) == 0
+        }
+        Expr::Member(member) => {
+            member_prop(member).as_deref() == Some("fetch")
+                && matches!(&*member.obj, Expr::Ident(obj)
+                    if obj.sym == *"window" || obj.sym == *"globalThis")
+        }
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => {
+                match crate::graphql_document_sites::unwrap_expression(callee) {
+                    Expr::Member(bind) if member_prop(bind).as_deref() == Some("bind") => {
+                        platform_fetch(&bind.obj, module)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
+            platform_fetch(&bin.right, module)
+        }
+        _ => false,
+    }
+}
+
 /// The library instances a function written inside another can read: the
 /// enclosing function's, less any name it declares again itself.
 fn inherited_receivers<N>(captured: &Captured, node: &N) -> HashMap<BindingKey, ClientRef>
@@ -3156,10 +3735,14 @@ struct CallWalker<'r, 's, 'i> {
 
 impl Visit for CallWalker<'_, '_, '_> {
     fn visit_call_expr(&mut self, call: &CallExpr) {
-        // `produce()`: the body invokes a parameter.
+        // `produce()`: the body invokes a parameter. One that holds the
+        // platform's `fetch` unless a caller hands another is a `fetch`
+        // (carrick#1562).
         let invokes_param = match &call.callee {
             Callee::Expr(callee) => match &**callee {
-                Expr::Ident(ident) => self.scope.param_index(ident),
+                Expr::Ident(ident) if !self.scope.fetches.contains(&ident_key(ident)) => {
+                    self.scope.param_index(ident)
+                }
                 _ => None,
             },
             _ => None,
@@ -3243,6 +3826,21 @@ impl Visit for CallWalker<'_, '_, '_> {
             },
             _ => String::new(),
         };
+        let name_line = match &call.callee {
+            Callee::Expr(callee) => {
+                match crate::graphql_document_sites::unwrap_expression(callee) {
+                    Expr::Member(member) => self.reader.line(member.prop.span()),
+                    other => self.reader.line(other.span()),
+                }
+            }
+            _ => self.reader.line(call.span),
+        };
+        let site_args = (!spread).then(|| {
+            call.args
+                .iter()
+                .map(|arg| library_sites::site_arg(&arg.expr, self.scope))
+                .collect()
+        });
         self.ir.calls.push(CallIr {
             site: self.reader.site(call.span),
             callee,
@@ -3251,6 +3849,8 @@ impl Visit for CallWalker<'_, '_, '_> {
             inert,
             invokes_param,
             receiver,
+            site_args,
+            name_line,
         });
     }
 
@@ -3320,6 +3920,17 @@ impl Visit for CallWalker<'_, '_, '_> {
         new.visit_children_with(self);
     }
 
+    // `return queue`: what the body returns, for the own-factory rule
+    // (carrick#1562). Never a summary's.
+    fn visit_return_stmt(&mut self, ret: &ReturnStmt) {
+        let returned = ret
+            .arg
+            .as_deref()
+            .and_then(|arg| self.reader.returned_instance(arg, self.scope));
+        self.ir.returns.push((ret.span.lo.0, returned));
+        ret.visit_children_with(self);
+    }
+
     // `this.queue = new Queue("emails")`: a maker write, as the message-role
     // field rule reads it (carrick#1665). Never a summary's.
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
@@ -3351,8 +3962,19 @@ impl CallWalker<'_, '_, '_> {
         }
         Captured {
             values,
-            texts: self.scope.texts.clone(),
+            texts: self
+                .scope
+                .texts
+                .iter()
+                .filter(|(_, pieces)| {
+                    !pieces
+                        .iter()
+                        .any(|piece| matches!(piece, library_sites::TextPiece::Param(_)))
+                })
+                .map(|(key, pieces)| (key.clone(), pieces.clone()))
+                .collect(),
             receivers: self.scope.local_receivers.clone(),
+            fetches: self.scope.fetches.clone(),
         }
     }
 }
@@ -3817,6 +4439,7 @@ impl LinkedClients {
             client.called_computed |= used.called_computed;
             client.contested_message |= used.contests_message();
             client.member_uses.extend(used.member_uses());
+            client.returned.extend(used.returned_at.iter().copied());
         }
     }
 
@@ -4871,5 +5494,49 @@ mod tests {
                 "{name} is no object constant's key set"
             );
         }
+    }
+
+    /// carrick#1562 split a returned binding out of the operand it was: a
+    /// message role follows an own factory's `return client` to its callers,
+    /// and an HTTP client and an object constant are contested by it exactly
+    /// as before, an arrow's expression body included.
+    #[test]
+    fn a_returned_client_still_contests_an_http_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(
+            &path,
+            "function a() { return api; }\n\
+             function b() { return (this.client as Client); }\n\
+             const c = () => opts;\n\
+             const d = () => (lib!);\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut uses = BindingUses::default();
+        module.visit_with(&mut uses);
+        for name in ["api", "this.client", "opts", "lib"] {
+            let used = &uses.uses[name];
+            assert_eq!(used.returned_at.len(), 1, "{name} is returned once");
+            assert!(used.contests_client(), "{name} contests an HTTP client");
+            assert!(
+                !used.contests_message(),
+                "{name} is followed, not handed off, for a message role"
+            );
+            assert!(
+                !used.keeps_object(),
+                "{name} is no object constant's key set"
+            );
+        }
+        let mut merged = BindingUse::default();
+        merged.merge(&uses.uses["api"]);
+        assert_eq!(merged.returned_at, uses.uses["api"].returned_at);
     }
 }

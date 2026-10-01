@@ -11623,6 +11623,128 @@ mod tests {
         );
     }
 
+    /// The (line, method, target) of every summary row `file` states.
+    fn rows_by_line(
+        dir: &tempfile::TempDir,
+        discovery: &FileDiscovery,
+        file: &str,
+    ) -> Vec<(u32, String, String)> {
+        summary_rows_of(dir, discovery, file)
+            .into_iter()
+            .map(|row| (row.line, row.method, row.target))
+            .collect()
+    }
+
+    /// carrick#1562: a parameter or a field that holds the platform's
+    /// `fetch` unless a caller hands another is `fetch`: a positional or a
+    /// destructured default, a constructor parameter's default kept in a
+    /// field, and a `??` falling back to it. One the function assigns again,
+    /// one written in a method, and a parameter with no default (the
+    /// caller's own function, composed where the caller writes it) are not.
+    /// No call here carries an options bag, which reads as a request
+    /// whatever its callee.
+    #[test]
+    fn an_injected_fetch_is_the_platform_s_fetch() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/client.ts",
+            "declare function wrap(f: typeof fetch): typeof fetch;\n\
+             const BASE = process.env.API_BASE;\n\
+             export async function post(owner: string, { fetchImpl = fetch }: { fetchImpl?: typeof fetch }) {\n\
+             \x20 const url = `${BASE}/repos/${owner}/comments`;\n\
+             \x20 return fetchImpl(url);\n\
+             }\n\
+             export async function get(id: string, fetchFn: typeof fetch = fetch) {\n\
+             \x20 const url = `${BASE}/items/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export async function swapped(id: string, fetchFn: typeof fetch = fetch) {\n\
+             \x20 fetchFn = wrap(fetchFn);\n\
+             \x20 const url = `${BASE}/swapped/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export async function handed(id: string, fetchFn: typeof fetch) {\n\
+             \x20 const url = `${BASE}/handed/${id}`;\n\
+             \x20 return fetchFn(url);\n\
+             }\n\
+             export class Client {\n\
+             \x20 #fetch: typeof fetch;\n\
+             \x20 private fetchFn: typeof fetch;\n\
+             \x20 constructor(fetcher: typeof fetch = fetch, options: { fetch?: typeof fetch } = {}) {\n\
+             \x20   this.#fetch = fetcher;\n\
+             \x20   this.fetchFn = options.fetch ?? fetch;\n\
+             \x20 }\n\
+             \x20 ping() { const url = `${BASE}/ping`; return this.#fetch(url); }\n\
+             \x20 pong() { const url = `${BASE}/pong`; return this.fetchFn(url); }\n\
+             }\n\
+             export class Swapped {\n\
+             \x20 #fetch: typeof fetch = fetch;\n\
+             \x20 swap(other: typeof fetch) { this.#fetch = other; }\n\
+             \x20 ping() { const url = `${BASE}/moved`; return this.#fetch(url); }\n\
+             }\n",
+        )]);
+        let get = |target: &str| (String::from("GET"), target.to_string());
+        let rows: Vec<(u32, (String, String))> = rows_by_line(&dir, &discovery, "src/client.ts")
+            .into_iter()
+            .map(|(line, method, target)| (line, (method, target)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (5, get("${process.env.API_BASE}/repos/${owner}/comments")),
+                (9, get("${process.env.API_BASE}/items/${id}")),
+                (27, get("${process.env.API_BASE}/ping")),
+                (28, get("${process.env.API_BASE}/pong")),
+            ]
+        );
+    }
+
+    /// carrick#1562: a call to a module-scope builder is what the builder
+    /// returns, with the call's arguments in its parameters: an arrow, a
+    /// function declaration, and one held in a constant object. A function
+    /// that does more than return, a builder in an object the module writes
+    /// through, and one that picks its return by a `switch` (alternatives,
+    /// carrick#1694) state nothing.
+    #[test]
+    fn a_builder_s_return_is_the_request_s_url() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/api.ts",
+            "const BASE = process.env.API_BASE;\n\
+             const ENDPOINTS = { users: { list: \"/api/users\", byId: (id: string) => `/api/users/${id}` } };\n\
+             const ordersPath = (id: string) => `/api/orders/${id}`;\n\
+             function teamPath(team: string) { return `/api/teams/${team}`; }\n\
+             function notABuilder(x: string) { const p = `/api/x/${x}`; return p; }\n\
+             const MOVED = { path: (id: string) => `/api/m/${id}` };\n\
+             MOVED.path = (id: string) => `/elsewhere/${id}`;\n\
+             function pathFor(kind: string) {\n\
+             \x20 switch (kind) {\n\
+             \x20   case \"a\": return \"/api/a\";\n\
+             \x20   default: return \"/api/b\";\n\
+             \x20 }\n\
+             }\n\
+             export async function a(id: string) { return fetch(ENDPOINTS.users.byId(id), { method: \"GET\" }); }\n\
+             export async function b(id: string) { const url = `${BASE}${ordersPath(id)}`; return fetch(url, { method: \"GET\" }); }\n\
+             export async function c() { return fetch(teamPath(\"core\"), { method: \"DELETE\" }); }\n\
+             export async function d(x: string) { return fetch(notABuilder(x), { method: \"GET\" }); }\n\
+             export async function e(id: string) { return fetch(MOVED.path(id), { method: \"GET\" }); }\n\
+             export async function f() { return fetch(pathFor(\"a\"), { method: \"GET\" }); }\n\
+             function swappedPath(id: string) { return `/api/swapped/${id}`; }\n\
+             export async function g() { return fetch(swappedPath(\"1\"), { method: \"GET\" }); }\n\
+             swappedPath = (id: string) => `/elsewhere/${id}`;\n",
+        )]);
+        assert_eq!(
+            rows_by_line(&dir, &discovery, "src/api.ts"),
+            vec![
+                (14, "GET".to_string(), "/api/users/${id}".to_string()),
+                (
+                    15,
+                    "GET".to_string(),
+                    "${process.env.API_BASE}/api/orders/${id}".to_string()
+                ),
+                (16, "DELETE".to_string(), "/api/teams/core".to_string()),
+            ]
+        );
+    }
+
     /// The contract sample's semantics (carrick#1564), every claim verified.
     fn verified_sample() -> crate::client_semantics::LibrarySemantics {
         let detection: DetectionResult = serde_json::from_str(include_str!(
@@ -11800,6 +11922,54 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    /// carrick#1562: an instance an own factory returns is read by the
+    /// message roles ([`crate::request_summary::library_sites`]); an HTTP
+    /// reading reads nothing through it, whatever the semantics verify, held
+    /// in a module's `const` or a function's. The control beside it is the
+    /// same factory call written where it is held.
+    #[test]
+    fn an_instance_an_own_factory_returns_states_no_http_row() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/factory.ts",
+                "import http from \"@fixture/http\";\n\
+                 export function makeApi() {\n\
+                 \x20 return http.create({ baseURL: \"/v1\" });\n\
+                 }\n\
+                 const api = makeApi();\n\
+                 export function load() { return api.get(\"/users\"); }\n\
+                 export function local() { const inner = makeApi(); return inner.get(\"/teams\"); }\n",
+            ),
+            (
+                "src/control.ts",
+                "import http from \"@fixture/http\";\n\
+                 const direct = http.create({ baseURL: \"/v0\" });\n\
+                 export function load() { return direct.get(\"/users\"); }\n",
+            ),
+        ]);
+        let control = library_rows_of(&dir, &discovery, "src/control.ts", &verified_sample());
+        assert!(
+            control
+                .iter()
+                .any(|row| row.target == "/v0/users" && !row.library_semantics.is_empty()),
+            "the control reads through the semantics: {control:#?}"
+        );
+        let verified = library_rows_of(&dir, &discovery, "src/factory.ts", &verified_sample());
+        assert!(
+            verified.iter().all(|row| row.library_semantics.is_empty()),
+            "{verified:#?}"
+        );
+        assert_eq!(
+            verified,
+            library_rows_of(
+                &dir,
+                &discovery,
+                "src/factory.ts",
+                &crate::client_semantics::LibrarySemantics::default()
+            )
+        );
     }
 
     /// carrick#1564: a wrapper handed the path is stated at the call that
