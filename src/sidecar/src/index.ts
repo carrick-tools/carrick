@@ -691,6 +691,14 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleRetypeCheck(request);
     case 'verify_client_semantics':
       return handleVerifyClientSemantics(request);
+    case 'verify_library_claims':
+    case 'list_library_surface':
+      // Contract pinned first (carrick#1616); the checks land next.
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: [`${request.action} is not built yet`],
+      };
     case 'health':
       return handleHealth(request);
     case 'shutdown':
