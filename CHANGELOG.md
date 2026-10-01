@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.100](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.99...carrick-v0.3.100) (2026-10-01)
+
+
+### Bug Fixes
+
+* non-HTTP row sources, provenance and lines; one fact/candidate rule ([#1647](https://github.com/carrick-tools/carrick/issues/1647)) ([bad1669](https://github.com/carrick-tools/carrick/commit/bad1669c1667bb7690f61b2f331d2bcc5b823547))
+* **scanner:** read a binding by its scope, never by its name alone ([#1657](https://github.com/carrick-tools/carrick/issues/1657)) ([6e555f4](https://github.com/carrick-tools/carrick/commit/6e555f4c3300fb39d2ea7d06a015d7d7b8bd3658))
+
 ## [0.3.99](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.98...carrick-v0.3.99) (2026-09-30)
 
 
