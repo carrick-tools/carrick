@@ -1308,6 +1308,11 @@ mod tests {
                     Err(e) => panic!("{e}"),
                 }
             };
+            // On macOS an accepted socket inherits the listener's
+            // non-blocking flag, and a read before the request has arrived
+            // then fails with WouldBlock (carrick#1633). The read timeout
+            // below is the bound.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -1375,6 +1380,8 @@ mod tests {
                         Err(e) => panic!("{e}"),
                     }
                 };
+                // As in `serve` (carrick#1633).
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
