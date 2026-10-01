@@ -6025,6 +6025,17 @@ fn discover_files_and_symbols(
     })
 }
 
+/// What discovery hands the request summaries and the library sites for the
+/// service rooted at `root`, read with the default config: for tests of the
+/// receiver core (carrick#1661).
+#[cfg(test)]
+pub(crate) fn discover_request_inputs(root: &Path) -> crate::request_summary::RequestSummaryInputs {
+    let cm: Lrc<SourceMap> = Default::default();
+    discover_files_and_symbols(&root.to_string_lossy(), &Config::default(), cm)
+        .expect("discovery reads the service")
+        .request_inputs
+}
+
 /// The service's request summaries (carrick#1555), composed with the library
 /// semantics its installed packages verify (carrick#1564).
 ///
@@ -11707,6 +11718,38 @@ mod tests {
         assert!(at(27).is_empty(), "{rows:#?}");
         // A path the caller fills is stated where it is filled, not here.
         assert!(at(19).is_empty(), "{rows:#?}");
+    }
+
+    /// carrick#1661: the receiver core reads makers of every form for the
+    /// message roles. An instance built any way but `export.member({ … })`
+    /// was no client before, and an HTTP reading still reads nothing through
+    /// it, whatever the semantics verify.
+    #[test]
+    fn a_maker_only_a_message_role_reads_states_no_http_row() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/api.ts",
+            "import http from \"@fixture/http\";\n\
+             const constructed = new http.create({ baseURL: \"/v1\" });\n\
+             const called = http({ baseURL: \"/v2\" });\n\
+             const handed = http.create({ baseURL: \"/v3\" }, { retries: 2 });\n\
+             export function a() { return constructed.get(\"/users\"); }\n\
+             export function b() { return called.get(\"/users\"); }\n\
+             export function c() { return handed.get(\"/users\"); }\n",
+        )]);
+        let verified = library_rows_of(&dir, &discovery, "src/api.ts", &verified_sample());
+        assert!(
+            verified.iter().all(|row| row.library_semantics.is_empty()),
+            "{verified:#?}"
+        );
+        assert_eq!(
+            verified,
+            library_rows_of(
+                &dir,
+                &discovery,
+                "src/api.ts",
+                &crate::client_semantics::LibrarySemantics::default()
+            )
+        );
     }
 
     /// carrick#1564: a wrapper handed the path is stated at the call that

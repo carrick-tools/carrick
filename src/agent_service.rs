@@ -1435,14 +1435,33 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
 /// realistic agent output — including its known imperfections — through the
 /// full sanitize/validate/mount-graph pipeline. Falls back to the schema-based
 /// generated mocks when no fixture exists for the task/file.
+///
+/// Two analysed files of a real repo often share a stem (`route.ts`,
+/// `index.ts`), so an answer may also be keyed by a trailing part of the
+/// file's path, its components joined with `__` (`api__route.ts.json` for
+/// `…/app/api/route.ts`). The longest trailing part with an answer wins, and
+/// the stem key is the fallback (carrick#1661).
 fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
     let dir = env::var("CARRICK_MOCK_FIXTURE_DIR").ok()?;
+    fixture_mock_response_in(std::path::Path::new(&dir), task_path, mock_seed)
+}
+
+/// [`fixture_mock_response`] with the fixture directory given.
+fn fixture_mock_response_in(
+    dir: &std::path::Path,
+    task_path: &str,
+    mock_seed: &str,
+) -> Option<String> {
     let task = task_path.trim_start_matches('/');
     let marker = "### FILE CONTENT (Path: ";
     let key = match mock_seed.find(marker) {
         Some(idx) => {
             let rest = &mock_seed[idx + marker.len()..];
             let path = rest.split(')').next()?;
+            if let Some((keyed, canned)) = path_keyed_fixture(dir, task, path) {
+                debug!("Mock fixture hit for {}: {}", task_path, keyed.display());
+                return Some(substitute_candidate_placeholders(&canned, mock_seed));
+            }
             std::path::Path::new(path)
                 .file_stem()?
                 .to_string_lossy()
@@ -1454,9 +1473,7 @@ fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
         None if is_fixture_key_token(mock_seed) => mock_seed.to_string(),
         None => "default".to_string(),
     };
-    let fixture_path = std::path::Path::new(&dir)
-        .join(task)
-        .join(format!("{}.json", key));
+    let fixture_path = dir.join(task).join(format!("{}.json", key));
     let canned = std::fs::read_to_string(&fixture_path).ok()?;
     debug!(
         "Mock fixture hit for {}: {}",
@@ -1464,6 +1481,29 @@ fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
         fixture_path.display()
     );
     Some(substitute_candidate_placeholders(&canned, mock_seed))
+}
+
+/// The answer keyed by the longest trailing part of `path` that has one
+/// (`a__b__c.ts.json` for `…/a/b/c.ts`), with the file it was read from.
+fn path_keyed_fixture(
+    dir: &std::path::Path,
+    task: &str,
+    path: &str,
+) -> Option<(std::path::PathBuf, String)> {
+    let components: Vec<String> = std::path::Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    (0..components.len()).find_map(|start| {
+        let keyed = dir
+            .join(task)
+            .join(format!("{}.json", components[start..].join("__")));
+        let canned = std::fs::read_to_string(&keyed).ok()?;
+        Some((keyed, canned))
+    })
 }
 
 /// A mock seed usable directly as a fixture file stem: short and free of
@@ -2524,6 +2564,35 @@ pub(crate) mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::atomic::AtomicBool;
+
+    /// carrick#1661: two analysed files of one repo share a stem, so a
+    /// replay keys each answer by a trailing part of its path. The longest
+    /// part with an answer wins, and a file with none falls back to the stem
+    /// key, as before.
+    #[test]
+    fn a_mock_answer_keyed_by_path_tells_two_files_of_one_stem_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = dir.path().join("analyze-file");
+        std::fs::create_dir_all(&task).expect("mkdir");
+        std::fs::write(task.join("orders__route.ts.json"), "{\"from\":\"orders\"}").expect("write");
+        std::fs::write(
+            task.join("api__users__route.ts.json"),
+            "{\"from\":\"users, longer key\"}",
+        )
+        .expect("write");
+        std::fs::write(task.join("users__route.ts.json"), "{\"from\":\"users\"}").expect("write");
+        std::fs::write(task.join("route.json"), "{\"from\":\"stem\"}").expect("write");
+        let seed = |path: &str| format!("### FILE CONTENT (Path: {path})\nexport {{}}\n");
+        let answer = |path: &str| {
+            fixture_mock_response_in(dir.path(), "/analyze-file", &seed(path)).expect("an answer")
+        };
+        assert_eq!(answer("/repo/app/orders/route.ts"), "{\"from\":\"orders\"}");
+        assert_eq!(
+            answer("/repo/app/api/users/route.ts"),
+            "{\"from\":\"users, longer key\"}"
+        );
+        assert_eq!(answer("/repo/app/billing/route.ts"), "{\"from\":\"stem\"}");
+    }
 
     /// The terminal hears about retries on the first one and then once per
     /// gap, however many attempts happen in between (carrick#1103).

@@ -97,6 +97,25 @@
 //! it is declared, with every module's uses of it merged ([`LinkedClients`]):
 //! one object, so a use that may change it anywhere changes it everywhere.
 //! The receiver rules are in `docs/reference/client-semantics.md`.
+//!
+//! **Message roles** (carrick#1661). The same receiver core reads every call
+//! through a package export or an instance of one, role-neutrally, for the
+//! library-claim readers of brokers, sockets and buses ([`library_sites`]).
+//! What it reads beyond the HTTP reading (module-level calls, `new` makers,
+//! sub-object hops, literal arguments) is kept apart from what the summaries
+//! read, so no HTTP row moves.
+
+// Read by the message-role row writers (carrick#1662) and the library-store
+// reader (carrick#1664). Until they land, only tests call it, so the binary
+// sees it as unused.
+#[allow(dead_code)]
+mod library_sites;
+
+#[allow(unused_imports)]
+pub use library_sites::{
+    Contest, Holder, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector,
+    SiteArg, SiteMaker, SiteObject, SiteReceiver, library_sites, package_name,
+};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -118,6 +137,7 @@ use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::is_http_method;
 use crate::visitor::SymbolKind;
 use crate::wrapper_request_shape::{is_request_options, verb_from_callee_property};
+use library_sites::LibrarySiteIr;
 
 /// One piece of a URL or a body value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -307,14 +327,50 @@ struct ClientRef {
     called: BTreeSet<Option<String>>,
     /// A member called by a key the source does not state.
     called_computed: bool,
+    /// The same contest for a message role (carrick#1661,
+    /// [`BindingUse::contests_message`]): a `new` of the export and a call
+    /// through a sub-object of it contest nothing there.
+    contested_message: bool,
+    /// Every member called or constructed through the binding, for a
+    /// message role to classify against the package's surface (carrick#1661).
+    member_uses: BTreeSet<MemberUse>,
+    /// For an instance: the member uses of the export's binding in the module
+    /// that made it, which may configure what the maker built.
+    export_uses: BTreeSet<MemberUse>,
 }
 
-/// `export.factory({ ... })`: the factory member and the object literal it
-/// was handed, read where the instance is built.
+/// How an instance was made from a package export (carrick#1564,
+/// carrick#1661): called (`export.member(…)`, `export(…)`) or constructed
+/// (`new export(…)`, `new export.member(…)`), with what the maker was handed,
+/// read where the instance is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientInstance {
-    factory: String,
-    options: ObjValue,
+    form: MakerForm,
+    /// The export's member the maker is, or `None` for the export itself.
+    member: Option<String>,
+    /// The one object literal the maker was handed, read as a request reads
+    /// it: what an HTTP factory's base comes from. `None` unless the maker
+    /// is handed exactly that.
+    options: Option<ObjValue>,
+    /// Every argument, as a library claim's slot reads it.
+    args: Vec<SiteArg>,
+    /// Where the maker call is written, in the module that declares the
+    /// instance.
+    site: Site,
+}
+
+impl ClientInstance {
+    /// The HTTP factory call this is, when it is one: `export.member({ … })`
+    /// with exactly one object literal, the only maker an HTTP reading reads
+    /// (carrick#1564). Every other form builds an instance only a message
+    /// role reads (carrick#1661), so an HTTP call through it reads as it
+    /// would through no client at all.
+    fn http_factory(&self) -> Option<(&str, &ObjValue)> {
+        match (self.form, &self.member, &self.options) {
+            (MakerForm::Call, Some(member), Some(options)) => Some((member, options)),
+            _ => None,
+        }
+    }
 }
 
 /// A call made through a library client: on one of its members, or on the
@@ -387,6 +443,10 @@ struct CallIr {
 #[derive(Debug, Clone, Default)]
 struct FnIr {
     calls: Vec<CallIr>,
+    /// The calls and constructions made through a library client, for the
+    /// message-role readers (carrick#1661). Kept apart from `calls`, which
+    /// the summaries compose: a `new` there would make a body incomplete.
+    library: Vec<LibrarySiteIr>,
     /// Parameters the body calls (`produce()`), by position.
     invoked_params: BTreeSet<usize>,
     /// Function expressions passed as call arguments, referenced from a
@@ -439,6 +499,11 @@ pub struct FileIr {
     /// ([`crate::commonjs::export_assignments`]), so a write anywhere else can
     /// replace it unseen: nothing it holds is read in another module.
     names_commonjs_exports: bool,
+    /// The calls written at module level, outside every function the file
+    /// declares: a definition made where the module is loaded (`export const
+    /// t = task({ … })`) is one. Read for the message-role readers only
+    /// (carrick#1661); the summaries are composed from the functions alone.
+    module_level: FnIr,
 }
 
 impl FileIr {
@@ -496,6 +561,7 @@ pub fn extract_file_ir(
         .collect();
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
+        texts: HashMap::new(),
         receivers: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
@@ -547,16 +613,30 @@ pub fn extract_file_ir(
                     && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
                 {
                     let name = ident.id.sym.to_string();
-                    let (value, client) = {
+                    let (value, client, text) = {
                         let scope = Scope::module(&module_scope);
-                        (reader.eval(init, &scope), reader.factory_call(init, &scope))
+                        (
+                            reader.eval(init, &scope),
+                            reader.factory_call(init, &scope),
+                            library_sites::literal_text(init, &scope),
+                        )
                     };
+                    // Every maker form is an instance here (carrick#1661),
+                    // and a module holding one asks for every specifier
+                    // ([`FileIr::holds_instances`]). An HTTP reading still
+                    // reads only an HTTP factory's instance
+                    // ([`ClientInstance::http_factory`]), and a service that
+                    // held none before held no HTTP instance a specifier
+                    // could take away.
                     if let Some(client) = client
                         && !redeclared.declares_name(&name)
                     {
                         let client = module_scope.with_uses(client, &name);
                         file.module_clients.insert(name.clone(), client.clone());
                         module_scope.receivers.insert(name, client);
+                    }
+                    if let Some(text) = text {
+                        module_scope.texts.insert(ident_key(&ident.id), text);
                     }
                     module_scope.consts.insert(ident_key(&ident.id), value);
                 }
@@ -634,6 +714,53 @@ pub fn extract_file_ir(
             }
         }
     }
+    // The calls made where the module is loaded (carrick#1661): every
+    // statement and initialiser outside the functions read above. A function
+    // written inside one is read where it is written, as a callback or a
+    // detached function, exactly as inside a body.
+    {
+        let scope = Scope::module(module_scope);
+        let mut module_level = FnIr::default();
+        for item in &module.body {
+            match item {
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                    reader.walk(&*export.expr, &scope, &mut module_level);
+                }
+                // `export default function () {}`: no name keys it, so it is
+                // read here, as a detached function.
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(ExportDefaultDecl {
+                    decl:
+                        DefaultDecl::Fn(FnExpr {
+                            ident: None,
+                            function,
+                        }),
+                    ..
+                })) => reader.walk(&**function, &scope, &mut module_level),
+                ModuleItem::ModuleDecl(ModuleDecl::TsExportAssignment(assign)) => {
+                    reader.walk(&*assign.expr, &scope, &mut module_level);
+                }
+                _ => match module_decl(item) {
+                    Some(Decl::Var(var)) => {
+                        for declarator in &var.decls {
+                            if let Some(init) = &declarator.init
+                                && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
+                            {
+                                reader.walk(&**init, &scope, &mut module_level);
+                            }
+                        }
+                    }
+                    // A function or a class is read above.
+                    Some(_) => {}
+                    None => {
+                        if let ModuleItem::Stmt(stmt) = item {
+                            reader.walk(stmt, &scope, &mut module_level);
+                        }
+                    }
+                },
+            }
+        }
+        file.module_level = module_level;
+    }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
     // that imports a package's client may build one.
@@ -669,6 +796,10 @@ struct ModuleScope {
     /// declares the name again holds a binding of its own, which is not this
     /// one (carrick#1648).
     consts: HashMap<BindingKey, Value>,
+    /// Each module-scope `const` whose initialiser is literal text, by
+    /// binding ([`library_sites::literal_text`]): what a library claim's name
+    /// slot reads through an identifier (carrick#1661).
+    texts: HashMap<BindingKey, String>,
     receivers: HashMap<String, ClientRef>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
@@ -694,6 +825,8 @@ impl ModuleScope {
             client.contested |= used.contests_client();
             client.called = used.called.clone();
             client.called_computed = used.called_computed;
+            client.contested_message |= used.contests_message();
+            client.member_uses = used.member_uses().collect();
         }
         client
     }
@@ -742,20 +875,63 @@ struct BindingUse {
     /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
     /// use, which keeps an import at run time, that changes nothing.
     read: bool,
+    /// Calls through a sub-object of it (`client.tasks.trigger(…)`, every hop
+    /// a plain name) and constructions of it or of a member (`new Queue(…)`,
+    /// `new lib.Worker(…)`), as the message roles read them (carrick#1661).
+    /// Before, each was the member read or the operand it is to an HTTP
+    /// reading, which still contests on it ([`Self::contests_client`]).
+    library_calls: BTreeSet<MemberUse>,
 }
 
 impl BindingUse {
     /// A client binding used for anything but calls through it (and being
     /// exported) could have its base changed by code this pass does not
     /// read, so nothing is read through it.
+    ///
+    /// A call through a sub-object and a construction contest exactly as
+    /// the member read and the operand they were recorded as before
+    /// carrick#1661.
     fn contests_client(&self) -> bool {
-        self.written || self.member_read || self.spread || self.other
+        self.written
+            || self.member_read
+            || self.spread
+            || self.other
+            || !self.library_calls.is_empty()
+    }
+
+    /// The same for a message role (carrick#1661): a hand-off, a write, a
+    /// member read that is not called, a spread, or a member called by a key
+    /// the source does not state. Constructing the binding is what a `new`
+    /// maker does, and a call through a sub-object is a call; both are among
+    /// [`Self::member_uses`], which the caller classifies.
+    fn contests_message(&self) -> bool {
+        self.written || self.member_read || self.spread || self.other || self.called_computed
+    }
+
+    /// Every member called or constructed through the binding.
+    fn member_uses(&self) -> impl Iterator<Item = MemberUse> + '_ {
+        self.called
+            .iter()
+            .map(|member| MemberUse {
+                form: MakerForm::Call,
+                path: Vec::new(),
+                member: member.clone(),
+            })
+            .chain(self.library_calls.iter().cloned())
     }
 
     /// An object constant never written through, passed to a call or
-    /// aliased holds exactly the keys its literal writes.
+    /// aliased holds exactly the keys its literal writes. Constructing the
+    /// binding itself was an operand use before carrick#1661, and counts as
+    /// one here.
     fn keeps_object(&self) -> bool {
-        !self.written && !self.other
+        !self.written
+            && !self.other
+            && !self.library_calls.contains(&MemberUse {
+                form: MakerForm::New,
+                path: Vec::new(),
+                member: None,
+            })
     }
 }
 
@@ -844,10 +1020,82 @@ impl BindingUses {
             });
             return;
         }
+        // `client.tasks.trigger(…)`: a call through a sub-object, every hop a
+        // plain name (carrick#1661).
+        if let Some(called) = called_member(&member.prop)
+            && let Some((key, path)) = member_path(obj)
+        {
+            self.mark(key, |used| {
+                used.library_calls.insert(MemberUse {
+                    form: MakerForm::Call,
+                    path,
+                    member: Some(called),
+                });
+            });
+            return;
+        }
         match as_member(obj) {
             Some(inner) => self.read_member(inner),
             None => obj.visit_with(self),
         }
+    }
+
+    /// `new Client(…)`, `new lib.Worker(…)`, `new lib.a.Worker(…)`: the
+    /// binding is constructed (carrick#1661). Any other callee is read as
+    /// before.
+    fn constructed(&mut self, callee: &Expr) {
+        let callee = crate::graphql_document_sites::unwrap_expression(callee);
+        if let Some(key) = binding_key(callee) {
+            self.mark(key, |used| {
+                used.library_calls.insert(MemberUse {
+                    form: MakerForm::New,
+                    path: Vec::new(),
+                    member: None,
+                });
+            });
+            return;
+        }
+        if let Some(member) = as_member(callee)
+            && let MemberProp::Ident(name) = &member.prop
+        {
+            let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
+            let held = binding_key(obj)
+                .map(|key| (key, Vec::new()))
+                .or_else(|| member_path(obj));
+            if let Some((key, path)) = held {
+                self.mark(key, |used| {
+                    used.library_calls.insert(MemberUse {
+                        form: MakerForm::New,
+                        path,
+                        member: Some(name.sym.to_string()),
+                    });
+                });
+                return;
+            }
+        }
+        callee.visit_with(self);
+    }
+}
+
+/// `root.a.b`, with every hop a plain name and `root` a binding
+/// ([`binding_key`]): the root's key and the hops in order.
+fn member_path(expr: &Expr) -> Option<(String, Vec<String>)> {
+    let mut path: Vec<String> = Vec::new();
+    let mut at = crate::graphql_document_sites::unwrap_expression(expr);
+    loop {
+        if let Some(key) = binding_key(at) {
+            if path.is_empty() {
+                return None;
+            }
+            path.reverse();
+            return Some((key, path));
+        }
+        let member = as_member(at)?;
+        let MemberProp::Ident(name) = &member.prop else {
+            return None;
+        };
+        path.push(name.sym.to_string());
+        at = crate::graphql_document_sites::unwrap_expression(&member.obj);
     }
 }
 
@@ -901,6 +1149,11 @@ impl Visit for BindingUses {
             other => other.visit_with(self),
         }
         call.args.visit_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        self.constructed(&new.callee);
+        new.args.visit_with(self);
     }
 
     fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
@@ -1294,6 +1547,7 @@ struct ClassFields {
 #[derive(Default)]
 struct Captured {
     values: HashMap<BindingKey, Value>,
+    texts: HashMap<BindingKey, String>,
     receivers: HashMap<BindingKey, ClientRef>,
 }
 
@@ -1629,6 +1883,9 @@ fn import_receivers(imports: &HashMap<String, ImportBinding>) -> HashMap<String,
                     contested: false,
                     called: BTreeSet::new(),
                     called_computed: false,
+                    contested_message: false,
+                    member_uses: BTreeSet::new(),
+                    export_uses: BTreeSet::new(),
                 },
             )
         })
@@ -1691,6 +1948,10 @@ fn redeclared_names(module: &Module) -> Declarations {
 struct Scope<'a> {
     params: Vec<Option<BindingKey>>,
     locals: HashMap<BindingKey, Value>,
+    /// The locals whose initialiser is literal text and that nothing assigns
+    /// again ([`library_sites::literal_text`], carrick#1661), the enclosing
+    /// function's included.
+    texts: HashMap<BindingKey, String>,
     /// Locals holding a library client's instance (carrick#1564).
     local_receivers: HashMap<BindingKey, ClientRef>,
     fields: Option<&'a ClassFields>,
@@ -1702,6 +1963,7 @@ impl<'a> Scope<'a> {
         Self {
             params: Vec::new(),
             locals: HashMap::new(),
+            texts: HashMap::new(),
             local_receivers: HashMap::new(),
             fields: None,
             module,
@@ -2006,6 +2268,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
+            texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
             fields,
             module,
@@ -2029,6 +2292,7 @@ impl Reader<'_> {
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
+            texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
             fields,
             module,
@@ -2077,6 +2341,9 @@ impl Reader<'_> {
                         } else {
                             bound(name.clone(), self.eval(init, scope))
                         };
+                        if !unsettled && let Some(text) = library_sites::literal_text(init, scope) {
+                            scope.texts.insert(key.clone(), text);
+                        }
                         scope.locals.insert(key.clone(), value);
                         scope.local_receivers.remove(&key);
                         if let Some(client) = client
@@ -2543,11 +2810,15 @@ impl Reader<'_> {
         })
     }
 
-    /// `<client>.<factory>({ ... })`, where `<client>` is a binding imported
-    /// from a package (carrick#1564): the instance it builds, with the object
-    /// literal it was handed. Anything else — an instance's own factory call,
-    /// options that are not written as one literal — builds nothing this pass
-    /// reads.
+    /// A maker call on a binding imported from a package: `<client>.<member>(…)`
+    /// or `<client>(…)`, or the same constructed with `new` (carrick#1564,
+    /// carrick#1661). The instance it builds, with what it was handed.
+    /// Anything else — an instance's own maker call, an argument spread that
+    /// moves every position — builds nothing this pass reads.
+    ///
+    /// Which of these is a maker at all is the package's claims' to say, read
+    /// once the summaries or the library sites are composed: an HTTP reading
+    /// reads only `<client>.<member>({ … })` ([`ClientInstance::http_factory`]).
     fn factory_call(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
         let expr = match expr {
             Expr::TsAs(e) => &*e.expr,
@@ -2555,46 +2826,63 @@ impl Reader<'_> {
             Expr::TsSatisfies(e) => &*e.expr,
             other => other,
         };
-        let Expr::Call(call) = expr.unwrap_parens() else {
-            return None;
+        let expr = expr.unwrap_parens();
+        let (form, callee, args): (MakerForm, &Expr, &[ExprOrSpread]) = match expr {
+            Expr::Call(call) => match &call.callee {
+                Callee::Expr(callee) => (MakerForm::Call, &**callee, call.args.as_slice()),
+                _ => return None,
+            },
+            Expr::New(new) => (
+                MakerForm::New,
+                &*new.callee,
+                new.args.as_deref().unwrap_or_default(),
+            ),
+            _ => return None,
         };
-        let Callee::Expr(callee) = &call.callee else {
-            return None;
+        let (binding, member) = match callee {
+            Expr::Ident(binding) => (binding, None),
+            Expr::Member(member) => match &*member.obj {
+                Expr::Ident(binding) => (binding, Some(member_prop(member)?)),
+                _ => return None,
+            },
+            _ => return None,
         };
-        let Expr::Member(member) = &**callee else {
-            return None;
-        };
-        let Expr::Ident(binding) = &*member.obj else {
-            return None;
-        };
-        let factory = member_prop(member)?;
         let client = scope.receiver(binding)?;
         if client.instance.is_some() {
             return None;
         }
-        let [options] = call.args.as_slice() else {
-            return None;
-        };
-        if options.spread.is_some() {
+        if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        let Expr::Object(options_literal) =
-            crate::graphql_document_sites::unwrap_expression(&options.expr)
-        else {
-            return None;
+        // An HTTP factory's options: exactly one object literal, as before.
+        let options = match args {
+            [options] => match crate::graphql_document_sites::unwrap_expression(&options.expr) {
+                Expr::Object(literal) => Some(self.object(literal, scope)),
+                _ => None,
+            },
+            _ => None,
         };
         Some(ClientRef {
             package: client.package.clone(),
             export: client.export.clone(),
             instance: Some(ClientInstance {
-                factory,
-                options: self.object(options_literal, scope),
+                form,
+                member,
+                options,
+                args: args
+                    .iter()
+                    .map(|arg| library_sites::site_arg(&arg.expr, scope))
+                    .collect(),
+                site: self.site(expr.span()),
             }),
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
             contested: client.contested,
             called: BTreeSet::new(),
             called_computed: false,
+            contested_message: client.contested_message,
+            member_uses: BTreeSet::new(),
+            export_uses: client.member_uses.clone(),
         })
     }
 
@@ -2826,6 +3114,15 @@ impl Visit for CallWalker<'_, '_, '_> {
             },
             _ => false,
         };
+        // The same call as a message role reads it (carrick#1661), kept apart
+        // from what the summaries compose.
+        if let Callee::Expr(callee) = &call.callee
+            && let Some(site) =
+                self.reader
+                    .library_site(call.span, MakerForm::Call, callee, &call.args, self.scope)
+        {
+            self.ir.library.push(site);
+        }
         let callee = match &call.callee {
             Callee::Expr(callee) => match &**callee {
                 Expr::Ident(ident) => ident.sym.to_string(),
@@ -2896,6 +3193,18 @@ impl Visit for CallWalker<'_, '_, '_> {
         if !builtin {
             self.ir.unfollowed = true;
         }
+        // A construction through a library client (`new Queue("emails")`):
+        // a maker, or a definition, as a message role reads it
+        // (carrick#1661). Never a summary's call.
+        if let Some(site) = self.reader.library_site(
+            new.span,
+            MakerForm::New,
+            &new.callee,
+            new.args.as_deref().unwrap_or_default(),
+            self.scope,
+        ) {
+            self.ir.library.push(site);
+        }
         new.visit_children_with(self);
     }
 
@@ -2921,6 +3230,7 @@ impl CallWalker<'_, '_, '_> {
         }
         Captured {
             values,
+            texts: self.scope.texts.clone(),
             receivers: self.scope.local_receivers.clone(),
         }
     }
@@ -3384,6 +3694,8 @@ impl LinkedClients {
             client.contested |= used.contests_client();
             client.called.extend(used.called.iter().cloned());
             client.called_computed |= used.called_computed;
+            client.contested_message |= used.contests_message();
+            client.member_uses.extend(used.member_uses());
         }
     }
 
@@ -3396,14 +3708,23 @@ impl LinkedClients {
         published: &[PublishedBinding],
         used: &BindingUse,
     ) {
+        // A call through a member of the namespace (`lib.api.send(…)`) is a
+        // use of the namespace other than calling a binding it publishes, for
+        // a message role as for HTTP (carrick#1661).
         let contests = used.contests_client() || used.called_computed;
         for binding in published {
             match declared_client(files, bindings, &binding.file, &binding.name) {
                 Declared::Client(held, _) => {
                     if let Some(client) = self.clients.get_mut(&held) {
                         client.contested |= contests;
+                        client.contested_message |= contests;
                         if used.called.contains(&Some(binding.published.clone())) {
                             client.called.insert(None);
+                            client.member_uses.insert(MemberUse {
+                                form: MakerForm::Call,
+                                path: Vec::new(),
+                                member: None,
+                            });
                         }
                     }
                 }
@@ -3931,11 +4252,14 @@ fn library_shape(
             Vec::new(),
         ),
         Some(instance) => {
-            let factory = semantics.factory(&client.package, &client.export, &instance.factory)?;
+            // Only `export.member({ … })` is an HTTP factory's instance; any
+            // other maker's reads as no client (carrick#1661).
+            let (factory_member, options) = instance.http_factory()?;
+            let factory = semantics.factory(&client.package, &client.export, factory_member)?;
             let surface = semantics.surface(
                 &client.package,
                 &client.export,
-                &instance_receiver(&instance.factory),
+                &instance_receiver(factory_member),
             )?;
             if client.called_computed
                 || client
@@ -3951,10 +4275,10 @@ fn library_shape(
             // ([`Reader::object`] drops the rest), so it stands even in open
             // options; a key missing from open options may be in the part the
             // source does not state.
-            let base = match instance.options.fields.get(&factory.base_url_key) {
+            let base = match options.fields.get(&factory.base_url_key) {
                 Some(Value::Str(pieces)) => pieces.clone(),
                 Some(_) => return None,
-                None if instance.options.open => return None,
+                None if options.open => return None,
                 None => Vec::new(),
             };
             used.insert(factory.claim_id.clone());
@@ -4341,5 +4665,46 @@ mod tests {
             concat([vec![lit("/a")], vec![lit("/b"), opaque("x")], vec![lit("")]]),
             vec![lit("/a/b"), opaque("x")]
         );
+    }
+
+    /// carrick#1661 split two uses out of the member read and the operand
+    /// they were: a call through a sub-object and a construction. A message
+    /// role reads both as calls; an HTTP client is contested by each exactly
+    /// as before, and an object constant that is constructed still holds no
+    /// known keys.
+    #[test]
+    fn a_construction_or_a_sub_object_call_still_contests_an_http_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(
+            &path,
+            "new Bare();\n\
+             new lib.Worker();\n\
+             new lib2.jobs.Worker();\n\
+             api.tasks.trigger(\"x\");\n\
+             this.client.tasks.trigger(\"y\");\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut uses = BindingUses::default();
+        module.visit_with(&mut uses);
+        for name in ["Bare", "lib", "lib2", "api", "this.client"] {
+            let used = &uses.uses[name];
+            assert!(used.contests_client(), "{name} contests an HTTP client");
+            assert!(
+                !used.contests_message(),
+                "{name} is a call to a message role"
+            );
+            assert!(!used.library_calls.is_empty(), "{name}");
+        }
+        assert!(!uses.uses["Bare"].keeps_object());
+        assert!(uses.uses["lib"].keeps_object());
     }
 }

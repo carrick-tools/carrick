@@ -153,6 +153,52 @@ The summaries are composed after detection, not in discovery: the semantics
 exist only once detection has answered, any package it left `pending` has
 been asked about again (below), and the service's sidecar is up.
 
+## Message roles
+
+Brokers, sockets and in-process buses are read through the same receiver
+core (carrick#1661, `src/request_summary/library_sites.rs`). It is
+role-neutral: it lists every call made through a package export or an
+instance of one, and the library-claim readers decide what each states.
+It differs from the HTTP reading above in these ways. None of them changes
+an HTTP row.
+
+- **Module-level calls count.** A definition is usually written where its
+  module loads (`export const t = task({ id, run })`), so calls outside every
+  function are read too.
+- **Every maker form counts.** `export.member(…)`, `export(…)`, `new
+  export(…)` and `new export.member(…)` build an instance, with whatever
+  they are handed. Constructing the export does not contest it. An HTTP
+  reading still reads only `export.member({ … })` with one object literal.
+- **A literal is read by scope.** A name is a string or a template written
+  at the call, or an identifier whose binding (by the resolver's scope, never
+  by name) is a `const`, or a function's own binding that nothing assigns
+  again, holding one. A parameter, a block's own binding of the same name,
+  an import and a member of a constant object are not literals here.
+- **The line is the member's.** A chain written over several lines is
+  placed on the line that names the member.
+- **Sub-object hops are a path.** `client.tasks.trigger(…)` is the member
+  `trigger` through the path `tasks`, not a member read that takes the
+  client away. Claims select a site by `on` (the export, its instances, or
+  both), `of` (the maker, by member), the path and the member.
+- **Specifiers stay as imported.** A subpath (`pkg/v3`) is kept, and names
+  the package `pkg`.
+- **The contest set.** A hand-off, a write, a member read that is not
+  called, a spread, a member called by a key the source does not state, a
+  namespace import of the module that holds an instance, and loading that
+  module any other way still take the receiver away. A module the scan
+  cannot follow still turns imported reading off. Every member called or
+  constructed through the receiver is kept, along with the export's own
+  uses where an instance was made. The reader classifies each against the
+  package's surface: a member the surface lists as off the wire contests
+  nothing, and a member that can change a name, a prefix or a base, or one
+  the surface does not list, does. The HTTP rule "any call outside the
+  verified surface" stays HTTP's.
+- **Not read yet.** Class-field receivers (`this.<field>`) wait for
+  carrick#1665. Names that flow through parameters, builders, imported
+  constants or own-module factories wait for carrick#1562. A call the call
+  graph resolves to a function of the service (an in-repo package) is that
+  function's.
+
 ## Asking again
 
 **Within a scan.** When detection leaves an installed package `pending`, the
