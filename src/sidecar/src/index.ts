@@ -534,7 +534,8 @@ function handleVerifyLibraryClaims(
     const { semantics, modules } = claimsVerifier.run(
       fromDir,
       request.checks,
-      request.budget_ms ?? SEMANTICS_BUDGET_MS
+      request.budget_ms ?? SEMANTICS_BUDGET_MS,
+      new Set(request.variants ?? [])
     );
     return {
       request_id: request.request_id,

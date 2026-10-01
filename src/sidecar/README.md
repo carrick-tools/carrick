@@ -517,6 +517,8 @@ The receiver is `export`, `instance:<member>` (what `export.member(...)` returns
 
 Response: the same `semantics` (one result per check, in request order) and `semantics_modules` as `verify_client_semantics`.
 
+`variants` (optional) switches on readings a slice run measures against the strict default; none is ever the default. `d2_required_siblings`: only a required string sibling makes a name ambiguous, so an optional `description?: string` beside a definition's `id` does not.
+
 ```json
 {
   "request_id": "7",

@@ -826,6 +826,15 @@ pub struct LibraryCheck {
     pub claim: LibraryClaim,
 }
 
+/// A reading of the message checks a slice run can switch on, to measure it
+/// against the strict default (carrick#1616 prototype; never the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimVariant {
+    /// Only a required string sibling makes a name ambiguous (design D2).
+    D2RequiredSiblings,
+}
+
 /// A service whose pairs are degraded wholesale (install failure or poison).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DegradedService {
@@ -924,6 +933,8 @@ enum SidecarRequest {
         checks: Vec<LibraryCheck>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        variants: Vec<ClaimVariant>,
     },
     #[serde(rename = "list_library_surface")]
     ListLibrarySurface {
@@ -1825,6 +1836,17 @@ impl TypeSidecar {
         from_dir: &Path,
         checks: &[LibraryCheck],
     ) -> Result<Vec<SemanticsResult>, SidecarError> {
+        self.verify_library_claims_with(from_dir, checks, &[])
+    }
+
+    /// `verify_library_claims` under the readings `variants` switches on, to
+    /// measure each against the strict default (carrick#1616 prototype).
+    pub fn verify_library_claims_with(
+        &self,
+        from_dir: &Path,
+        checks: &[LibraryCheck],
+        variants: &[ClaimVariant],
+    ) -> Result<Vec<SemanticsResult>, SidecarError> {
         self.ensure_ready()?;
         if checks.is_empty() {
             return Ok(Vec::new());
@@ -1834,6 +1856,7 @@ impl TypeSidecar {
             from_dir: from_dir.to_string_lossy().into_owned(),
             checks: checks.to_vec(),
             budget_ms: None,
+            variants: variants.to_vec(),
         };
         self.send_request(&request)?;
         let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
@@ -3123,10 +3146,13 @@ mod tests {
                 socket,
             ],
             budget_ms: Some(500),
+            variants: vec![],
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["action"], "verify_library_claims");
         assert_eq!(value["budget_ms"], 500);
+        // No reading switched on: the field is absent, and the sidecar is strict.
+        assert!(value.get("variants").is_none());
         let checks = value["checks"].as_array().unwrap();
         assert_eq!(
             checks[0],
@@ -3179,6 +3205,23 @@ mod tests {
             ),
             other => panic!("read back {other:?}"),
         }
+    }
+
+    /// The readings a slice run switches on travel as snake_case names.
+    #[test]
+    fn verify_library_claims_variants_wire_shape() {
+        let request = SidecarRequest::VerifyLibraryClaims {
+            request_id: "req-12".into(),
+            from_dir: "/svc".into(),
+            checks: vec![],
+            budget_ms: None,
+            variants: vec![ClaimVariant::D2RequiredSiblings],
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["variants"],
+            serde_json::json!(["d2_required_siblings"])
+        );
     }
 
     /// A `verify_library_claims` answer is read by the same rule as a

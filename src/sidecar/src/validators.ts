@@ -481,6 +481,9 @@ export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   from_dir: z.string().min(1),
   checks: z.array(LibraryCheckSchema),
   budget_ms: z.number().int().nonnegative().optional(),
+  variants: z
+    .array(z.enum(['d2_required_siblings']))
+    .optional(),
 });
 
 export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({

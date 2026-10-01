@@ -243,9 +243,15 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
   let client: SidecarClient;
   let requestId = 0;
 
-  const verify = (checks: Check[]) =>
+  const verify = (checks: Check[], variants?: string[]) =>
     client.send<Response>(
-      { request_id: `claims-${requestId++}`, action: 'verify_library_claims', from_dir: root, checks },
+      {
+        request_id: `claims-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks,
+        ...(variants === undefined ? {} : { variants }),
+      },
       60_000
     );
 
@@ -605,5 +611,30 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       checks.map(c => `${c.claim_id} @ ${c.receiver}`)
     );
     assert.deepStrictEqual(verdicts(response), ['unchecked receiver_invalid', 'unchecked receiver_invalid', 'verified']);
+  });
+
+  // --------------------------------------------------------------------------
+  // Readings a slice run can switch on to measure (never the default)
+  // --------------------------------------------------------------------------
+
+  it('d2_required_siblings: only a required string sibling makes a name ambiguous', async () => {
+    const R = 'fixture-rules';
+    const checks = [
+      check(R, 'channel', 'broker', 'export', makes('call', 'defineDescribed', { name: { arg: 0, key: 'id' }, handler: { arg: 0, key: 'run' } })),
+      check(R, 'channel', 'broker', 'export', op('send', 'publishWithMeta', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // A required sibling still competes, and so does a rest that holds the name.
+      check(R, 'channel', 'broker', 'export', op('send', 'trigger', { name: { arg: 1 }, payload: { arg: 2 } })),
+      check(R, 'channel', 'broker', 'export', op('receive', 'subscribeAll', { name: { arg: 0 } })),
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'subscribeMany', { name: { arg: 0 }, handler: { arg: 1 } })),
+    ];
+    const strict = ['failed name_ambiguous', 'failed name_ambiguous', 'failed name_ambiguous', 'failed name_ambiguous', 'failed name_ambiguous'];
+    assert.deepStrictEqual(verdicts(await verify(checks)), strict);
+    assert.deepStrictEqual(verdicts(await verify(checks, ['d2_required_siblings'])), [
+      'verified',
+      'verified',
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+    ]);
   });
 });

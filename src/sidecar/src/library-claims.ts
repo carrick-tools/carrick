@@ -37,6 +37,7 @@ import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
 import type {
   ClaimSlot,
+  ClaimVariant,
   LibraryCheck,
   LibraryClaim,
   LibraryRole,
@@ -320,7 +321,12 @@ export class LibraryClaimsVerifier {
    * A check on an instance or a scope reads the maker or scope claims of the
    * same request first, whatever their place in it.
    */
-  run(fromDir: string, checks: LibraryCheck[], budgetMs: number): VerifyResult {
+  run(
+    fromDir: string,
+    checks: LibraryCheck[],
+    budgetMs: number,
+    variants: ReadonlySet<ClaimVariant> = new Set()
+  ): VerifyResult {
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
@@ -372,7 +378,7 @@ export class LibraryClaimsVerifier {
       const program = this.project.getProgram().compilerObject;
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
+      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir, variants);
       const localRanges = readLocalRanges(fromDir);
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -695,7 +701,9 @@ class DeclarationReader {
     private readonly program: ts.Program,
     private readonly probe: ts.SourceFile,
     private readonly host: ts.ModuleResolutionHost,
-    serviceRoot: string
+    serviceRoot: string,
+    /** Readings switched on for this request; none is the strict default. */
+    private readonly variants: ReadonlySet<ClaimVariant> = new Set()
   ) {
     this.checker = program.getTypeChecker();
     this.root = this.realpath(serviceRoot);
@@ -1426,9 +1434,20 @@ class DeclarationReader {
     const fixed = restIndex === -1 ? parameters.length : restIndex;
     const ambiguous = failed('name_ambiguous');
     const takesString = (slot: Slot | undefined) => slot !== undefined && slot !== VARIADIC && this.acceptsString(slot);
+    // `d2_required_siblings`: a sibling the caller may leave out does not compete.
+    const requiredOnly = this.variants.has('d2_required_siblings');
+    const isOptional = (parameter: ts.Symbol) => {
+      const declaration = parameter.valueDeclaration;
+      return (
+        declaration !== undefined &&
+        ts.isParameter(declaration) &&
+        (declaration.questionToken !== undefined || declaration.initializer !== undefined || declaration.dotDotDotToken !== undefined)
+      );
+    };
 
     for (let i = 0; i < fixed; i++) {
       if (layout.positional.has(i) || layout.keyed.has(i)) continue;
+      if (requiredOnly && isOptional(parameters[i])) continue;
       if (takesString(this.keyParameterAt(signature, i))) return ambiguous;
     }
     if (restIndex !== -1) {
@@ -1442,6 +1461,7 @@ class DeclarationReader {
         const fixedLength = variable === -1 ? elements.length : variable;
         for (let i = restIndex; i < restIndex + fixedLength; i++) {
           if (layout.positional.has(i) || layout.keyed.has(i)) continue;
+          if (requiredOnly && (flags[i - restIndex] & ts.ElementFlags.Optional) !== 0) continue;
           if (takesString(this.keyParameterAt(signature, i))) return ambiguous;
         }
         if (variable !== -1) {
@@ -1453,14 +1473,16 @@ class DeclarationReader {
             (this.checker.isArrayType(element)
               ? takesString(this.checker.getTypeArguments(element as ts.TypeReference)[0])
               : takesString(element));
-          if (unfixed.length === 0 && elementTakesString) return ambiguous;
+          if (unfixed.length === 0 && elementTakesString && !requiredOnly) return ambiguous;
         }
       } else {
         const inRest = [...layout.positional].filter(([arg]) => arg >= restIndex).map(([, part]) => part);
         // A rest the claim puts a payload or handler in is that part's; one
         // that holds the name holds other names too.
         const ownedByOtherPart = inRest.length > 0 && !inRest.includes('name');
-        if (!ownedByOtherPart && takesString(this.keyParameterAt(signature, restIndex))) return ambiguous;
+        // A rest may be empty, so under `d2_required_siblings` only a rest that holds the name competes.
+        const competes = inRest.includes('name') || (!ownedByOtherPart && !requiredOnly);
+        if (competes && takesString(this.keyParameterAt(signature, restIndex))) return ambiguous;
       }
     }
     if (keyedName) {
@@ -1469,6 +1491,7 @@ class DeclarationReader {
       if (view) {
         for (const property of this.declaredProperties(view)) {
           if (keys.has(property.getName())) continue;
+          if (requiredOnly && property.flags & ts.SymbolFlags.Optional) continue;
           if (this.acceptsString(this.checker.getTypeOfSymbol(property))) return ambiguous;
         }
       }
