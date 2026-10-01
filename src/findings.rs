@@ -86,14 +86,19 @@ impl EdgeSource {
     ///
     /// [`ResolutionSource`]: crate::agents::file_analyzer_agent::ResolutionSource
     ///
-    /// - any row the model alone stated -> `Candidate`, a positive statement;
+    /// - any row whose source is a candidate
+    ///   ([`ResolutionSource::is_candidate`]: the model stated it) ->
+    ///   `Candidate`, a positive statement;
     /// - otherwise, every row stated by a deterministic pass (and at least one
     ///   row) -> `Fact`;
     /// - otherwise `None`: a row that recorded no source at all (an older
-    ///   peer blob, or a row built outside the emit/join phase — every
-    ///   non-HTTP protocol's rows are in that set today) leaves the fold
-    ///   unable to claim `Fact`, and claiming `Candidate` off a silence would
-    ///   demote deterministic rows that simply do not carry the field.
+    ///   peer blob, or a row built outside the emit/join phase — the GraphQL,
+    ///   socket and scanner-read pub/sub rows are in that set today) leaves
+    ///   the fold unable to claim `Fact`, and claiming `Candidate` off a
+    ///   silence would demote deterministic rows that simply do not carry the
+    ///   field.
+    ///
+    /// [`ResolutionSource::is_candidate`]: crate::agents::file_analyzer_agent::ResolutionSource::is_candidate
     pub fn fold(
         sources: impl IntoIterator<Item = Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
     ) -> Option<Self> {
@@ -102,7 +107,7 @@ impl EdgeSource {
         for source in sources {
             any_row = true;
             match source {
-                Some(crate::agents::file_analyzer_agent::ResolutionSource::Model) => {
+                Some(source) if source.is_candidate() => {
                     return Some(EdgeSource::Candidate);
                 }
                 Some(_) => {}
@@ -1554,11 +1559,12 @@ mod tests {
             EdgeSource::fold([Some(FileBasedRoute), Some(ImportedMember)]),
             Some(EdgeSource::Fact)
         );
-        // The literal states the path; the role behind it is the model's, and
-        // the brief counts every non-`Model` source as deterministic.
+        // The literal states the path; whether the row exists at all is the
+        // model's answer (#332), so the pairing is a candidate, as the cloud
+        // reads it (carrick#1642).
         assert_eq!(
             EdgeSource::fold([Some(FileBasedRoute), Some(InlineLiteral)]),
-            Some(EdgeSource::Fact)
+            Some(EdgeSource::Candidate)
         );
         assert_eq!(
             EdgeSource::fold([Some(FileBasedRoute), Some(Model)]),

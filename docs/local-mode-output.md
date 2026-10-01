@@ -229,7 +229,7 @@ than silently overwritten.
 | `path` | string | route path, GraphQL field, socket event, or pub/sub topic |
 | `line` | int \| null | 1-based line, when the index recorded one |
 | `col` | int \| null | 1-based column, when the index recorded one |
-| `source` | `"fact"` \| `"candidate"` | `fact` = a deterministic pass stated it; `candidate` = a model answer from the scan that built the index, or a replayed hosted one. Local facts remain authoritative when a model answer contradicts them. |
+| `source` | `"fact"` \| `"candidate"` \| `"not_stated"` | `fact` = a deterministic pass stated it; `candidate` = a model answer (`resolution_source` `model`, or `inline_literal`: a model row whose path is a literal in the source) from the scan that built the index, or a replayed hosted one; `not_stated` = the row recorded no source. Local facts remain authoritative when a model answer contradicts them. |
 | `resolution_source` | string \| null | the wire value from the index blob: `file_based_route`, `imported_member`, `model`, … `null` = this row does not state it |
 | `evidence` | string \| null | one line naming what the row was read off |
 | `counterparts` | array | the other side of the contract, across every repo in the workspace |

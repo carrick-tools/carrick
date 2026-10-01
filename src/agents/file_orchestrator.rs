@@ -5917,6 +5917,9 @@ impl FileOrchestrator {
                 payload_expression_line: anchor
                     .handler_param_line
                     .and_then(|l| i32::try_from(l).ok()),
+                // The scanner's row, not the model's: it states no source
+                // (carrick#1626).
+                backfilled: true,
             });
             added += 1;
         }
@@ -13683,6 +13686,7 @@ export * from "./aFetch.js";"#,
                     broker: None,
                     payload_expression_text: None,
                     payload_expression_line: None,
+                    backfilled: false,
                 },
                 // (b) scoped-package source (no extension) -> untouched (canary safety).
                 PubsubOperation {
@@ -13694,6 +13698,7 @@ export * from "./aFetch.js";"#,
                     broker: None,
                     payload_expression_text: None,
                     payload_expression_line: None,
+                    backfilled: false,
                 },
                 // (c) `.ts` whose stripped form does not match the import-table
                 //     entry -> extension normalization leaves it alone, then the
@@ -13708,6 +13713,7 @@ export * from "./aFetch.js";"#,
                     broker: None,
                     payload_expression_text: None,
                     payload_expression_line: None,
+                    backfilled: false,
                 },
             ],
             dispatch_tables: Vec::new(),
@@ -13789,6 +13795,7 @@ export * from "./aFetch.js";"#,
             broker: None,
             payload_expression_text: locator.map(str::to_string),
             payload_expression_line: locator.map(|_| 21),
+            backfilled: false,
         }
     }
 
@@ -18438,6 +18445,7 @@ export { routes };
             broker: None,
             payload_expression_text: None,
             payload_expression_line: None,
+            backfilled: false,
         };
 
         // Three files, each contributing a typed op. The HashMap insertion order
@@ -19054,6 +19062,7 @@ const ESCALATE_MUTATION = gql`
             broker: None,
             payload_expression_text: None,
             payload_expression_line: None,
+            backfilled: false,
         };
 
         let mut result = FileAnalysisResult {
@@ -19111,6 +19120,17 @@ const ESCALATE_MUTATION = gql`
         assert_eq!(backfilled.broker, None);
         assert_eq!(backfilled.payload_expression_text, None);
         assert_eq!(backfilled.payload_expression_line, None);
+        // The backfilled op is marked as the scanner's, and the two the model
+        // stated are not (carrick#1626).
+        assert!(backfilled.backfilled);
+        assert_eq!(
+            result
+                .pubsub_operations
+                .iter()
+                .filter(|op| op.backfilled)
+                .count(),
+            1
+        );
     }
 
     /// Copilot review on #389: an extracted op on the same LINE must not mask
@@ -19135,6 +19155,7 @@ const ESCALATE_MUTATION = gql`
                 broker: None,
                 payload_expression_text: None,
                 payload_expression_line: None,
+                backfilled: false,
             }],
             ..Default::default()
         };
@@ -19209,6 +19230,7 @@ const ESCALATE_MUTATION = gql`
                 broker: None,
                 payload_expression_text: None,
                 payload_expression_line: None,
+                backfilled: false,
             }],
             ..Default::default()
         };
@@ -19277,6 +19299,7 @@ const ESCALATE_MUTATION = gql`
             broker: None,
             payload_expression_text: None,
             payload_expression_line: None,
+            backfilled: false,
         }
     }
 

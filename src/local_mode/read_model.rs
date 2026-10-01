@@ -21,7 +21,10 @@ use crate::boundary::ServiceBoundary;
 /// Bumped whenever this file's shape changes. A mismatch makes every read-only
 /// command answer `index_unreadable`, which tells the user to re-index instead
 /// of showing them rows in a shape the reader half-understands.
-pub const READ_MODEL_VERSION: u32 = 4;
+///
+/// 5: a row that recorded no source reads `not_stated`, where 4 read `fact`
+/// (carrick#1642).
+pub const READ_MODEL_VERSION: u32 = 5;
 
 /// A route the service serves, or a call it makes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,7 @@ impl ItemKind {
 pub enum Source {
     Fact,
     Candidate,
+    NotStated,
 }
 
 impl Source {
@@ -54,17 +58,19 @@ impl Source {
         match self {
             Source::Fact => "fact",
             Source::Candidate => "candidate",
+            Source::NotStated => "not_stated",
         }
     }
 
-    /// A row is the model's alone when the only layer that stated it is the
-    /// model. Everything else — a deterministic pass, or a row with no source
-    /// recorded because its protocol has no emit/join phase — is a fact of the
-    /// source.
+    /// The same split the pull-request fold reads
+    /// ([`ResolutionSource::is_candidate`], carrick#1642): a row the model
+    /// stated is a candidate, a row a deterministic pass stated is a fact, and
+    /// a row that recorded no source states neither.
     pub fn of(resolution_source: Option<ResolutionSource>) -> Self {
         match resolution_source {
-            Some(ResolutionSource::Model) => Source::Candidate,
-            _ => Source::Fact,
+            Some(source) if source.is_candidate() => Source::Candidate,
+            Some(_) => Source::Fact,
+            None => Source::NotStated,
         }
     }
 }
@@ -497,14 +503,81 @@ mod tests {
     }
 
     #[test]
-    fn only_a_model_row_is_a_candidate() {
+    fn a_row_with_no_source_is_not_stated() {
         assert_eq!(Source::of(Some(ResolutionSource::Model)), Source::Candidate);
+        assert_eq!(
+            Source::of(Some(ResolutionSource::InlineLiteral)),
+            Source::Candidate
+        );
         assert_eq!(
             Source::of(Some(ResolutionSource::FileBasedRoute)),
             Source::Fact
         );
-        // A protocol with no emit/join phase records no source; that is not
-        // the model speaking.
-        assert_eq!(Source::of(None), Source::Fact);
+        // A row that recorded no source states nothing: neither the model nor
+        // a pass spoke for it (carrick#1642).
+        assert_eq!(Source::of(None), Source::NotStated);
+        assert_eq!(Source::NotStated.as_str(), "not_stated");
+        assert_eq!(
+            serde_json::to_value(Source::NotStated).unwrap(),
+            "not_stated"
+        );
+    }
+
+    /// Every variant, written so that adding one fails to compile here until
+    /// it is listed.
+    fn every_resolution_source() -> Vec<ResolutionSource> {
+        use ResolutionSource::*;
+        let all = vec![
+            RequestSpec,
+            SameFileWrapper,
+            ImportedMember,
+            RequestSummary,
+            WholeUrlEnv,
+            EnvBasePath,
+            LiteralBasePath,
+            NewUrl,
+            FileBasedRoute,
+            DescriptorRoute,
+            ClassController,
+            DecoratorRoute,
+            ReceiverType,
+            InlineLiteral,
+            Model,
+            DeclaredOperation,
+        ];
+        for source in &all {
+            match source {
+                RequestSpec | SameFileWrapper | ImportedMember | RequestSummary | WholeUrlEnv
+                | EnvBasePath | LiteralBasePath | NewUrl | FileBasedRoute | DescriptorRoute
+                | ClassController | DecoratorRoute | ReceiverType | InlineLiteral | Model
+                | DeclaredOperation => {}
+            }
+        }
+        all
+    }
+
+    /// The pull-request fold and the local index decide fact against
+    /// candidate with one rule, the one `is_candidate` states (carrick#1642).
+    #[test]
+    fn the_pr_fold_and_the_local_index_read_one_split() {
+        use crate::findings::EdgeSource;
+        let mut candidates = Vec::new();
+        for source in every_resolution_source() {
+            let fold = EdgeSource::fold([Some(source)]);
+            let local = Source::of(Some(source));
+            if source.is_candidate() {
+                candidates.push(source);
+                assert_eq!(fold, Some(EdgeSource::Candidate), "{source:?}");
+                assert_eq!(local, Source::Candidate, "{source:?}");
+            } else {
+                assert_eq!(fold, Some(EdgeSource::Fact), "{source:?}");
+                assert_eq!(local, Source::Fact, "{source:?}");
+            }
+        }
+        // The cloud's `isCandidateSource` names exactly these two.
+        assert_eq!(
+            candidates,
+            vec![ResolutionSource::InlineLiteral, ResolutionSource::Model]
+        );
     }
 }

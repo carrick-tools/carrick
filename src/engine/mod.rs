@@ -3863,7 +3863,8 @@ fn append_deterministic_protocol_operations(
         provenance: Default::default(),
         // These ops come from the deterministic protocol extractions, not from
         // the HTTP emit/join phase, so no pass stated them in the sense
-        // `resolution_source` records (carrick#660).
+        // `resolution_source` records (carrick#660). The model's pub/sub rows
+        // say `model` (`append_pubsub_operations`, carrick#1626).
         resolution_source: None,
         // A file-router module is an HTTP concept; non-HTTP ops carry the
         // default.
@@ -4169,6 +4170,11 @@ fn has_socket_twin(
 /// An op `in_process` withdrew is a call into this repo's own in-process
 /// wrapper with no counterpart in the service (carrick#1513): it is not a
 /// cross-service event, so it is counted and not indexed.
+///
+/// A row the model stated carries `resolution_source: model`, so it reads as a
+/// candidate everywhere a source is read (carrick#1626). An op the scanner's
+/// pass backfilled into the same list (`PubsubOperation::backfilled`) states
+/// no source.
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
@@ -4213,13 +4219,21 @@ fn append_pubsub_operations(
             let line = u32::try_from(op.line_number).unwrap_or(0);
             let file_path = PathBuf::from(path);
             let key = OperationKey::pubsub(op.topic.clone());
+            // The model's row says so (carrick#1626). A row the scanner's own
+            // pass backfilled into the model's list is not the model's, and no
+            // pass here is a labelled source yet, so it states none.
+            let row = ApiEndpointDetails {
+                resolution_source: (!op.backfilled)
+                    .then_some(crate::agents::file_analyzer_agent::ResolutionSource::Model),
+                ..to_details(key, &file_path, line)
+            };
             match op.role {
                 Some(PubsubRole::Subscriber) => {
-                    cloud_data.endpoints.push(to_details(key, &file_path, line));
+                    cloud_data.endpoints.push(row);
                     subscribers += 1;
                 }
                 Some(PubsubRole::Publisher) => {
-                    cloud_data.calls.push(to_details(key, &file_path, line));
+                    cloud_data.calls.push(row);
                     publishers += 1;
                 }
                 None => {
@@ -14826,7 +14840,59 @@ mod tests {
             broker: Some("redis".to_string()),
             payload_expression_text: None,
             payload_expression_line: None,
+            backfilled: false,
         }
+    }
+
+    /// carrick#1626, on the wire: a pub/sub row the model stated is uploaded
+    /// with `resolution_source: "model"`, and one the scanner backfilled into
+    /// the model's list states no source, so the key is absent.
+    #[test]
+    fn model_pubsub_rows_are_stamped_model_and_backfilled_rows_state_nothing() {
+        use crate::operation::PubsubRole;
+
+        let mut backfilled = pubsub_op("orders.cancelled", PubsubRole::Subscriber, None, None);
+        backfilled.backfilled = true;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![
+                    pubsub_op("orders.created", PubsubRole::Publisher, None, None),
+                    pubsub_op("orders.shipped", PubsubRole::Subscriber, None, None),
+                    backfilled,
+                ],
+                ..Default::default()
+            },
+        );
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &ProtocolExtractions::default(),
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+        );
+
+        let wire = serde_json::to_value(&cloud_data).expect("the repo data serializes");
+        let row = |side: &str, topic: &str| -> serde_json::Value {
+            wire[side]
+                .as_array()
+                .expect("an operations array")
+                .iter()
+                .find(|row| row["key"]["topic"] == topic)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {side} row for {topic}: {wire}"))
+        };
+        assert_eq!(row("calls", "orders.created")["resolution_source"], "model");
+        assert_eq!(
+            row("endpoints", "orders.shipped")["resolution_source"],
+            "model"
+        );
+        let scanner_row = row("endpoints", "orders.cancelled");
+        assert!(
+            scanner_row.get("resolution_source").is_none(),
+            "a backfilled row is not the model's: {scanner_row}"
+        );
     }
 
     /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
@@ -15905,6 +15971,7 @@ mod tests {
                 broker: None,
                 payload_expression_text: Some(text.to_string()),
                 payload_expression_line: Some(line),
+                backfilled: false,
             }
         };
 
@@ -15940,6 +16007,7 @@ mod tests {
                         broker: None,
                         payload_expression_text: Some("order".to_string()),
                         payload_expression_line: Some(30),
+                        backfilled: false,
                     },
                     // Envelope-copy guard: the locator text contains the op's
                     // own topic literal (the model copied the whole enqueue
@@ -16051,6 +16119,7 @@ mod tests {
                     broker: None,
                     payload_expression_text: Some("event".to_string()),
                     payload_expression_line: None,
+                    backfilled: false,
                 }],
                 ..Default::default()
             },
@@ -16474,6 +16543,7 @@ mod tests {
                         broker: None,
                         payload_expression_text: None,
                         payload_expression_line: None,
+                        backfilled: false,
                     },
                 ],
                 ..Default::default()

@@ -290,6 +290,26 @@ pub enum ResolutionSource {
     DeclaredOperation,
 }
 
+impl ResolutionSource {
+    /// Whether a row with this source is a candidate rather than a fact: the
+    /// one place the scanner decides it, read by the pull-request fold
+    /// ([`crate::findings::EdgeSource::fold`]) and the local index
+    /// (`local_mode::read_model::Source::of`) (carrick#1642).
+    ///
+    /// `InlineLiteral` is a candidate: the literal fixes the path of a row the
+    /// model returned (#332), so the row exists because the model stated it.
+    ///
+    /// The cloud's `isCandidateSource` (carrick-cloud
+    /// `lambdas/mcp-server/src/utils/resolution-source.ts`) states the same
+    /// split, and `lambdas/mcp-server/scripts/check-resolution-sources.mjs`
+    /// parses this body at the pinned sha to compare the two. Keep it one
+    /// `matches!` over the candidate variants; any other shape fails that
+    /// check.
+    pub fn is_candidate(self) -> bool {
+        matches!(self, Self::Model | Self::InlineLiteral)
+    }
+}
+
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
@@ -639,6 +659,20 @@ pub struct PubsubOperation {
     /// `payload_expression_text` is null.
     #[serde(default)]
     pub payload_expression_line: Option<i32>,
+    /// Whether the scanner's own pub/sub pass put this op on the list, where
+    /// the model's answer missed it (`FileOrchestrator::merge_pubsub_anchor_ops`,
+    /// carrick#387/#402), rather than the model stating it.
+    ///
+    /// A row the model stated is labelled `model` on the wire; one the scanner
+    /// backfilled is not the model's and states no source (carrick#1626).
+    ///
+    /// Never read from or written to JSON: every op that is deserialized is
+    /// the model's answer (the analyzer response, the analysis cache, a
+    /// resumed job), and the backfill runs again on each of them in the same
+    /// process. Skipping it keeps the extraction response type and the cached
+    /// answer byte-identical, so nothing outside this process can set it.
+    #[serde(skip)]
+    pub backfilled: bool,
 }
 
 /// Complete analysis result for a single file
@@ -2028,6 +2062,7 @@ mod tests {
             broker: None,
             payload_expression_text: text.map(String::from),
             payload_expression_line: line,
+            backfilled: false,
         };
         let mut result = FileAnalysisResult {
             pubsub_operations: vec![
@@ -2069,6 +2104,24 @@ mod tests {
         assert_eq!(lines, vec![Some(36), Some(13), Some(1), None, None, None]);
     }
 
+    /// carrick#1626: every op read from JSON is the model's (the analyzer's
+    /// answer, the analysis cache, a resumed job). The scanner's backfill
+    /// marker is never read from the payload nor written to it, so a cached
+    /// answer stays byte-identical and cannot claim a row is the scanner's.
+    #[test]
+    fn a_pubsub_op_read_from_json_is_the_models() {
+        let op: PubsubOperation = serde_json::from_value(serde_json::json!({
+            "topic": "orders.created",
+            "role": "publisher",
+            "line_number": 3,
+            "backfilled": true
+        }))
+        .expect("a pub/sub op reads");
+        assert!(!op.backfilled);
+        let written = serde_json::to_value(&op).expect("a pub/sub op writes");
+        assert!(written.get("backfilled").is_none(), "{written}");
+    }
+
     #[test]
     fn sanitize_drops_pubsub_ops_with_null_like_topic() {
         let pubsub_op = |topic: &str| PubsubOperation {
@@ -2080,6 +2133,7 @@ mod tests {
             broker: None,
             payload_expression_text: None,
             payload_expression_line: None,
+            backfilled: false,
         };
 
         let mut result = FileAnalysisResult {
