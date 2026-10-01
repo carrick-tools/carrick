@@ -23,6 +23,7 @@ The TypeSidecar is a warm-standby Node.js process that gives the Carrick analysi
 ```bash
 cd src/sidecar
 npm install
+npm ci --prefix lister   # the bundler the lister artifact test builds with
 npm run build   # tsc, output in dist/
 npm test        # node --test over dist/test
 ```

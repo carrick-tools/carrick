@@ -105,6 +105,7 @@ cargo clippy
 # Type sidecar (Node)
 cd src/sidecar
 npm install
+npm ci --prefix lister   # bundler for the surface lister artifact test
 npm run build
 npm test
 ```
