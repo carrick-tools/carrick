@@ -131,6 +131,33 @@ export declare class Relay extends Emitter {
 }
 `;
 
+// A typed emitter package, and a socket package whose class extends it,
+// binding it with its own reserved-event map; and one that binds it only
+// through its own type parameters.
+const TYPED_EMITTER = `export interface EventsMap {
+  [event: string]: any;
+}
+export interface DefaultEventsMap {
+  [event: string]: (...args: any[]) => void;
+}
+export declare class Emitter<Listen extends EventsMap, Emit extends EventsMap, Reserved extends EventsMap = {}> {
+  on<Ev extends keyof Listen | keyof Reserved>(ev: Ev, listener: (payload: unknown) => void): this;
+  emitReserved<Ev extends keyof Reserved>(ev: Ev, payload?: unknown): boolean;
+}
+`;
+const TYPED_SOCKET = `import { Emitter, DefaultEventsMap, EventsMap } from '@fixture/typed-emitter';
+interface ReservedEvents {
+  connect: () => void;
+  disconnect: (reason: string) => void;
+}
+export declare class Socket<Listen extends EventsMap = DefaultEventsMap, Emit extends EventsMap = Listen> extends Emitter<Listen, Emit, ReservedEvents> {
+  emit<Ev extends keyof Emit>(ev: Ev, payload?: unknown): this;
+}
+export declare class PassThrough<Listen extends EventsMap = DefaultEventsMap> extends Emitter<Listen, Listen> {}
+export declare function io(url: string): Socket;
+export declare function passThrough(): PassThrough;
+`;
+
 // One member per name-slot, handler and maker rule.
 const RULES = `export type Handler = (message: string) => void;
 export interface EventMap {
@@ -152,6 +179,7 @@ export interface Channel<Events extends EventMap = EventMap> {
   onRest(topic: string, handler: (...args: any[]) => void): void;
   onOptions(topic: string, options: { retry?: number }): void;
   onTyped(topic: string, handler: Handler): void;
+  onDeferred<K extends string>(topic: K, handler: K extends 'error' ? (error: Error) => void : any): void;
   define(options: { id: string; run: Handler }): void;
   defineDescribed(options: { id: string; description?: string; run: Handler }): void;
   defineSplit(options: { id: string } | { run: Handler }): void;
@@ -284,6 +312,10 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'node_modules/@fixture/base-emitter/index.d.ts': BASE_EMITTER,
       'node_modules/fixture-derived/package.json': packageJson('fixture-derived', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-derived/index.d.ts': DERIVED,
+      'node_modules/@fixture/typed-emitter/package.json': packageJson('@fixture/typed-emitter', '3.0.0', { types: 'index.d.ts' }),
+      'node_modules/@fixture/typed-emitter/index.d.ts': TYPED_EMITTER,
+      'node_modules/fixture-typed-socket/package.json': packageJson('fixture-typed-socket', '4.0.0', { types: 'index.d.ts' }),
+      'node_modules/fixture-typed-socket/index.d.ts': TYPED_SOCKET,
       'node_modules/fixture-rules/package.json': packageJson('fixture-rules', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-rules/index.d.ts': RULES,
       'node_modules/fixture-any-bus/package.json': packageJson('fixture-any-bus', '1.0.0', { types: 'index.d.ts' }),
@@ -465,7 +497,7 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
   it('refuses a handler typed Function, any, unknown or (...args: any[]), and an options object as a handler', async () => {
     const R = 'fixture-rules';
     const on = (member: string) => check(R, 'channel', 'broker', 'export', op('receive', member, { name: { arg: 0 }, handler: { arg: 1 } }));
-    const checks = ['onTyped', 'onAny', 'onUnknown', 'onFunction', 'onRest', 'onOptions'].map(on);
+    const checks = ['onTyped', 'onAny', 'onUnknown', 'onFunction', 'onRest', 'onOptions', 'onDeferred'].map(on);
     assert.deepStrictEqual(verdicts(await verify(checks)), [
       'verified',
       'unchecked handler_untyped',
@@ -473,6 +505,8 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'unchecked handler_untyped',
       'unchecked handler_untyped',
       'failed handler_not_function',
+      // Conditional machinery with an any branch says nothing.
+      'unchecked handler_untyped',
     ]);
   });
 
@@ -635,6 +669,64 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'failed name_ambiguous',
       'failed name_ambiguous',
       'failed name_ambiguous',
+    ]);
+  });
+
+  it('inherited_bound_emitter and index_key_generic_map: a typed emitter base, measured apart and together', async () => {
+    const S = 'fixture-typed-socket';
+    const on = op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 } });
+    const checks = [
+      check(S, 'io', 'socket', 'export', makes('call', null, { base: { arg: 0 } })),
+      check(S, 'io', 'socket', 'instance:()', on),
+      check(S, 'io', 'socket', 'instance:()', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // Bound only through its own type parameters: still another package's member.
+      check(S, 'passThrough', 'socket', 'export', makes('call', null)),
+      check(S, 'passThrough', 'socket', 'instance:()', on),
+      // The runtime's emitter, extended with nothing of the package's own.
+      check('fixture-bus', 'Bus', 'broker', 'export', makes('new', null)),
+      check('fixture-bus', 'Bus', 'broker', 'instance:new', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // A key of a concrete index-signature map.
+      check('fixture-rules', 'channel', 'broker', 'export', op('send', 'sendKey', { name: { arg: 0 }, payload: { arg: 1 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await verify(checks)), [
+      'verified',
+      'failed member_inherited',
+      'failed name_index_key',
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'failed member_inherited',
+      'failed name_index_key',
+    ]);
+    assert.deepStrictEqual(verdicts(await verify(checks, ['inherited_bound_emitter'])), [
+      'verified',
+      'failed name_index_key',
+      'failed name_index_key',
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'failed member_inherited',
+      'failed name_index_key',
+    ]);
+    assert.deepStrictEqual(verdicts(await verify(checks, ['index_key_generic_map'])), [
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'failed member_inherited',
+      'failed name_index_key',
+    ]);
+    assert.deepStrictEqual(verdicts(await verify(checks, ['inherited_bound_emitter', 'index_key_generic_map'])), [
+      'verified',
+      'verified',
+      'verified',
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'failed member_inherited',
+      'failed name_index_key',
     ]);
   });
 });

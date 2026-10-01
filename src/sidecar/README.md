@@ -517,7 +517,7 @@ The receiver is `export`, `instance:<member>` (what `export.member(...)` returns
 
 Response: the same `semantics` (one result per check, in request order) and `semantics_modules` as `verify_client_semantics`.
 
-`variants` (optional) switches on readings a slice run measures against the strict default; none is ever the default. `d2_required_siblings`: only a required string sibling makes a name ambiguous, so an optional `description?: string` beside a definition's `id` does not.
+`variants` (optional) switches on readings a slice run measures against the strict default; none is ever the default. `d2_required_siblings`: only a required string sibling makes a name ambiguous, so an optional `description?: string` beside a definition's `id` does not. `inherited_bound_emitter`: a member inherited from another package's base type counts when the receiver's class binds that base with a concrete type its own packages declare (`extends Emitter<L, E, OwnReservedEvents>`); the runtime's emitter extended with nothing of the package's own, and a base bound only through type parameters, stay refused. `index_key_generic_map`: a name slot typed as a key of an event map the receiver takes as a type parameter reads as a string slot; a key of a concrete index-signature map stays refused.
 
 ```json
 {
