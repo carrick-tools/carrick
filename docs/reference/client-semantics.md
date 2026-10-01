@@ -182,22 +182,48 @@ an HTTP row.
   both), `of` (the maker, by member), the path and the member.
 - **Specifiers stay as imported.** A subpath (`pkg/v3`) is kept, and names
   the package `pkg`.
+- **A class field is read wherever its class writes it** (carrick#1665). A
+  `this.<field>` is a receiver in the class's instance members when every
+  write to it in the class sets an instance of the same maker, handed the
+  same arguments: an initialiser, the constructor, a method, or a branch or
+  callback inside one. The instance is the first write's. The field is no
+  receiver when anything else may set it:
+  - another value, another maker, or the same maker with other arguments;
+  - any operator but `=`, an update, a `delete`, or a destructuring target;
+  - a write where `this` may not be the instance (a `function` expression,
+    a setter, a static member);
+  - a decorator, a parameter property, an accessor of its name, or a
+    property by a computed key;
+  - a class of the file that it extends, or that extends it, declaring or
+    writing the field;
+  - `this` handed to a call or `new`, aliased, destructured, spread, or
+    read or written by a computed key, in the class or such a class.
+
+  Returning `this`, or putting it in an object or an array, hands it out as
+  `new` does, and binding one of the class's own methods to it changes
+  nothing. A field's uses are its class's and those related classes', so a
+  field of the same name in another class of the file is another field.
+  Classes are told apart by their binding, not their name. A static member
+  reads no instance field. HTTP keeps its rule above: a field written
+  anywhere but the constructor's own statements holds no client.
 - **The contest set.** A hand-off, a write, a member read that is not
   called, a spread, a member called by a key the source does not state, a
   namespace import of the module that holds an instance, and loading that
-  module any other way still take the receiver away. A module the scan
-  cannot follow still turns imported reading off. Every member called or
-  constructed through the receiver is kept, along with the export's own
+  module any other way still take the receiver away. A test for truth
+  (`if (!this.client)`) reads the receiver and keeps nothing of it, so it
+  contests nothing here; it still takes an HTTP client away. A module the
+  scan cannot follow still turns imported reading off. Every member called
+  or constructed through the receiver is kept, along with the export's own
   uses where an instance was made. The reader classifies each against the
   package's surface: a member the surface lists as off the wire contests
   nothing, and a member that can change a name, a prefix or a base, or one
   the surface does not list, does. The HTTP rule "any call outside the
   verified surface" stays HTTP's.
-- **Not read yet.** Class-field receivers (`this.<field>`) wait for
-  carrick#1665. Names that flow through parameters, builders, imported
-  constants or own-module factories wait for carrick#1562. A call the call
-  graph resolves to a function of the service (an in-repo package) is that
-  function's.
+- **Not read yet.** Names and instances that flow through parameters,
+  builders, imported constants or own-module factories wait for
+  carrick#1562, including a field set by the service's own factory
+  (`this.redis = createRedisClient(…)`). A call the call graph resolves to
+  a function of the service (an in-repo package) is that function's.
 
 ## Asking again
 
@@ -269,6 +295,11 @@ beside the analysis. The schedule adds only what outlasts the analysis.
   or `import()`.
 - A write to the package export's defaults in a module other than the one
   that builds the instance is not seen (carrick#1593).
+- A class field is followed only inside its file's classes. A write through
+  another reference to the instance (where it was constructed, or where it
+  was returned or handed in an object), one in a class of another file that
+  extends it, and one a package makes without naming the field are not
+  seen. This holds for an HTTP client in a field too.
 - A declaring module whose instance another module takes away reads its own
   calls as it would without the semantics, which can be the base-less
   receiver-type fact (carrick#1583).
