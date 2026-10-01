@@ -1,0 +1,102 @@
+{
+  "frameworks": [],
+  "data_fetchers": ["@fixture/tasks"],
+  "messaging_clients": ["@fixture/tasks", "@fixture/kv"],
+  "socket_clients": [],
+  "notes": "",
+  "library_claims": [
+    {
+      "package": "@fixture/tasks",
+      "major": 1,
+      "status": "answered",
+      "exports": [
+        {
+          "export": "task",
+          "role": "broker",
+          "makes": [
+            { "form": "call", "member": null, "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" } }
+          ],
+          "ops": [
+            { "op": "send", "member": "trigger", "name": { "bound": "maker" }, "payload": { "arg": 0 } },
+            { "op": "send", "member": "triggerAndWait", "name": { "bound": "maker" }, "payload": { "arg": 0 } }
+          ]
+        },
+        {
+          "export": "job",
+          "role": "broker",
+          "makes": [
+            { "form": "call", "member": null, "name": { "arg": 0, "key": "name" }, "handler": { "arg": 0, "key": "run" } }
+          ],
+          "ops": [{ "op": "send", "member": "enqueue", "name": { "bound": "maker" } }]
+        },
+        {
+          "export": "tasks",
+          "role": "broker",
+          "ops": [{ "op": "send", "member": "trigger", "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+        }
+      ]
+    },
+    {
+      "package": "@fixture/kv",
+      "major": 2,
+      "status": "answered",
+      "exports": [
+        {
+          "export": "KvClient",
+          "role": "broker",
+          "makes": [{ "form": "new", "member": null }],
+          "ops": [
+            { "op": "send", "member": "publish", "name": { "arg": 0 }, "payload": { "arg": 1 }, "on": "instance" },
+            { "op": "receive", "member": "subscribe", "name": { "arg": 0 }, "handler": { "arg": 1 }, "on": "instance" },
+            { "op": "receive", "member": "psubscribe", "name": { "arg": 0 }, "handler": { "arg": 1 }, "on": "instance" }
+          ],
+          "patterns": ["*", "?"]
+        }
+      ]
+    },
+    {
+      "package": "@fixture/socket",
+      "major": 3,
+      "status": "answered",
+      "exports": [
+        {
+          "export": "connect",
+          "role": "socket",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null }],
+          "ops": [
+            { "op": "send", "member": "emit", "name": { "arg": 0 }, "payload": { "arg": 1 }, "on": "instance" },
+            { "op": "receive", "member": "on", "name": { "arg": 0 }, "handler": { "arg": 1 }, "on": "instance" }
+          ],
+          "reserved": [{ "name": "connect", "member": "on", "at": { "arg": 0 } }]
+        },
+        {
+          "export": "Hub",
+          "role": "socket",
+          "side": "server",
+          "makes": [{ "form": "new", "member": null }],
+          "ops": [
+            { "op": "send", "member": "emit", "name": { "arg": 0 }, "payload": { "arg": 1 }, "on": "instance" },
+            { "op": "receive", "member": "on", "name": { "arg": 0 }, "handler": { "arg": 1 }, "on": "instance" }
+          ]
+        }
+      ]
+    },
+    {
+      "package": "@fixture/bus",
+      "major": 1,
+      "status": "answered",
+      "exports": [
+        {
+          "export": "Bus",
+          "role": "broker",
+          "makes": [{ "form": "new", "member": null }],
+          "ops": [
+            { "op": "send", "member": "emit", "name": { "arg": 0 }, "on": "instance" },
+            { "op": "receive", "member": "on", "name": { "arg": 0 }, "handler": { "arg": 1 }, "on": "instance" }
+          ]
+        }
+      ]
+    }
+  ]
+}

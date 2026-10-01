@@ -1,0 +1,14 @@
+{
+  "name": "library-claims-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/bus": "^1.0.0",
+    "@fixture/kv": "^2.0.0",
+    "@fixture/socket": "^3.0.0",
+    "@fixture/tasks": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

@@ -424,11 +424,132 @@ export interface VerifyClientSemanticsRequest extends BaseRequest {
 }
 
 /**
+ * Where one part of a library call sits: argument `arg` (0-based), or, with
+ * `key`, the property `key` of the object passed there (carrick#1616).
+ */
+export interface ClaimSlot {
+  arg: number;
+  key?: string;
+}
+
+/**
+ * A name the call does not carry: the one the maker's `name` slot bound to
+ * the instance (`maker`), or the one the scope member bound (`scope`).
+ */
+export interface BoundName {
+  bound: 'maker' | 'scope';
+}
+
+/** The closed role list; the role alone picks the checks a claim needs. */
+export type LibraryRole =
+  | 'http_client'
+  | 'graphql_client'
+  | 'broker'
+  | 'in_process_bus'
+  | 'socket'
+  | 'server_framework'
+  | 'none';
+
+/** What acts on the wire: an `ops` entry's kind. */
+export type LibraryOp = 'request' | 'send' | 'receive' | 'execute' | 'define' | 'mount';
+
+/**
+ * One entry of a package's claim, in the shared shape (design record
+ * 2026-10-01, section 4). `patterns` never reaches the verifier: nothing in
+ * the types checks a wildcard, so it only ever excludes rows.
+ */
+export type LibraryClaim =
+  | {
+      /** How an instance is made: `member(...)` (`call`) or `new member(...)`; `member` null is the receiver itself. */
+      list: 'makes';
+      form: 'call' | 'new';
+      member: string | null;
+      /** An HTTP base or URL prefix. */
+      base?: ClaimSlot;
+      /** A definition's id: bound to every op that names `{ bound: 'maker' }`. */
+      name?: ClaimSlot;
+      handler?: ClaimSlot;
+    }
+  | {
+      /** A member that returns a receiver bound to a name (a channel, room or queue). */
+      list: 'scopes';
+      member: string;
+      name: ClaimSlot;
+    }
+  | {
+      list: 'ops';
+      op: LibraryOp;
+      /** null: the receiver itself is called. */
+      member: string | null;
+      name?: ClaimSlot | BoundName;
+      payload?: ClaimSlot;
+      handler?: ClaimSlot;
+      ack?: ClaimSlot;
+      /** HTTP: an options object sits at `arg` (no `key`). */
+      options?: ClaimSlot;
+      /** HTTP: the method the member always sends. */
+      method?: string;
+      /** HTTP: where the method sits. */
+      method_key?: ClaimSlot;
+    }
+  | {
+      /** A name the library emits itself, spelled in `member`'s name slot at `at`. */
+      list: 'reserved';
+      name: string;
+      member: string;
+      at: ClaimSlot;
+    };
+
+/**
+ * One claim to check against the package's own declarations, on one receiver.
+ * The receiver is `export`, `instance:<member>` (what `export.member(...)`
+ * returns), `instance:()` (what calling the export returns), `instance:new`
+ * (what `new export(...)` builds) or `instance:new:<member>` (what
+ * `new export.member(...)` builds), optionally followed by `>scope:<member>`
+ * (what that scope member returns). The unit is `(claim_id, receiver)`.
+ */
+export interface LibraryCheck {
+  claim_id: string;
+  package: string;
+  export: string;
+  role: LibraryRole;
+  /** Socket only; a behaviour claim the verifier does not read. */
+  side?: 'client' | 'server' | 'both';
+  receiver: string;
+  claim: LibraryClaim;
+}
+
+/**
+ * Check library claims, in the shared shape, against each package's own
+ * declarations. Answers in the same fields as `verify_client_semantics`.
+ */
+export interface VerifyLibraryClaimsRequest extends BaseRequest {
+  action: 'verify_library_claims';
+  from_dir: string;
+  checks: LibraryCheck[];
+  budget_ms?: number;
+}
+
+/**
+ * List each package's declared surface, the way the verifier reads it, for a
+ * model that chooses from it (saved for the Jev arm of the design's section 7).
+ */
+export interface ListLibrarySurfaceRequest extends BaseRequest {
+  action: 'list_library_surface';
+  from_dir: string;
+  packages: string[];
+  /** Entries kept per package (members, signatures, parameters, keys and literals each count one); default 400. */
+  max_entries?: number;
+}
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
   | RetypeCheckRequest
   | VerifyClientSemanticsRequest
+  | VerifyLibraryClaimsRequest
+  | ListLibrarySurfaceRequest
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
@@ -696,10 +817,76 @@ export interface SemanticsModule {
   reason?: string;
 }
 
+/** `verify_client_semantics` and `verify_library_claims` answer alike. */
 export interface VerifyClientSemanticsResponse extends BaseResponse {
   /** Exactly one per check, in request order. */
   semantics?: SemanticsResult[];
   semantics_modules?: SemanticsModule[];
+  errors?: string[];
+}
+
+/** What one parameter position takes, read with the verifier's predicates. */
+export interface SurfaceParam {
+  name: string;
+  optional: boolean;
+  rest: boolean;
+  /** The parameter's type as the declarations print it, truncated. */
+  type: string;
+  accepts_string: boolean;
+  /** A function type with a declared signature. */
+  function: boolean;
+  /** Declared keys, when it is an object type. */
+  keys?: SurfaceKey[];
+  /** String literals the slot spells (an overload's literal, a `keyof` map's keys). */
+  literals?: string[];
+}
+
+export interface SurfaceKey {
+  name: string;
+  accepts_string: boolean;
+  function: boolean;
+}
+
+export interface SurfaceSignature {
+  params: SurfaceParam[];
+  returns: string;
+}
+
+export interface SurfaceMember {
+  name: string;
+  /** Declared in the package's own declarations (not inherited from another package). */
+  own: boolean;
+  signatures: SurfaceSignature[];
+}
+
+/** One receiver the verifier can read claims on, with what it declares. */
+export interface SurfaceReceiver {
+  receiver: string;
+  call?: SurfaceSignature[];
+  construct?: SurfaceSignature[];
+  members: SurfaceMember[];
+}
+
+export interface SurfaceExport {
+  export: string;
+  receivers: SurfaceReceiver[];
+}
+
+export interface LibrarySurface {
+  package: string;
+  resolved_file?: string;
+  installed_version?: string;
+  /** Why nothing was listed (the verifier's module reasons). */
+  reason?: string;
+  /** sha256 of the canonical JSON of `exports`, the cache key for answers chosen from it. */
+  sha256?: string;
+  /** Entries dropped by `max_entries`. */
+  truncated: number;
+  exports: SurfaceExport[];
+}
+
+export interface ListLibrarySurfaceResponse extends BaseResponse {
+  surfaces?: LibrarySurface[];
   errors?: string[];
 }
 
@@ -709,6 +896,7 @@ export interface VerifyClientSemanticsResponse extends BaseResponse {
 export type SidecarResponse =
   | RetypeCheckResponse
   | VerifyClientSemanticsResponse
+  | ListLibrarySurfaceResponse
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse

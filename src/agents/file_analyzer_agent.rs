@@ -278,6 +278,10 @@ pub enum ResolutionSource {
     InlineLiteral,
     /// The row is the model's, with no deterministic twin at its span.
     Model,
+    /// A pub/sub or socket row read through a library claim the package's
+    /// own declarations verified (carrick#1616, PROTOTYPE: the cloud does not
+    /// know this value).
+    LibraryClaim,
     /// An operation the REPO declares, in the `operations` block of
     /// `carrick.json` (carrick#831): a case of a body-dispatching handler,
     /// stated rather than read.

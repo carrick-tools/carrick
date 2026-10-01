@@ -96,6 +96,7 @@ fn detection() -> DetectionResult {
         socket_clients: vec![],
         notes: String::new(),
         client_semantics: None,
+        library_claims: None,
     }
 }
 

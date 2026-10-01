@@ -689,6 +689,143 @@ pub struct SemanticsModule {
     pub reason: Option<String>,
 }
 
+/// The closed role list a package's export is classified into (carrick#1616).
+/// The role alone picks the checks a claim needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryRole {
+    HttpClient,
+    GraphqlClient,
+    Broker,
+    InProcessBus,
+    Socket,
+    ServerFramework,
+    None,
+}
+
+/// Which end of a socket an export makes. A behaviour claim: the verifier
+/// carries it and reads nothing from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketSide {
+    Client,
+    Server,
+    Both,
+}
+
+/// Where one part of a library call sits: argument `arg` (0-based), or,
+/// with `key`, the property `key` of the object passed there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimSlot {
+    pub arg: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// A name the call does not carry itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundName {
+    /// The maker's `name` slot bound it to the instance.
+    Maker,
+    /// The scope member bound it to the receiver.
+    Scope,
+}
+
+/// Where an op's name comes from: a slot of the call, or a bound name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpName {
+    Bound { bound: BoundName },
+    Slot(ClaimSlot),
+}
+
+/// What an `ops` entry does on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryOp {
+    Request,
+    Send,
+    Receive,
+    Execute,
+    Define,
+    Mount,
+}
+
+/// How an instance is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MakesForm {
+    Call,
+    New,
+}
+
+/// One entry of a package's claim in the shared shape (carrick#1616; design
+/// record 2026-10-01, section 4). `patterns` is not here: nothing in the
+/// types checks a wildcard, so it only ever excludes rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "list", rename_all = "snake_case")]
+pub enum LibraryClaim {
+    /// `member(...)` or `new member(...)` makes an instance; `member: None`
+    /// is the receiver itself.
+    Makes {
+        form: MakesForm,
+        member: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler: Option<ClaimSlot>,
+    },
+    /// `member(name)` returns a receiver bound to that name.
+    Scopes { member: String, name: ClaimSlot },
+    /// A member that acts on the wire; `member: None` is the receiver itself.
+    Ops {
+        op: LibraryOp,
+        member: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<OpName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler: Option<ClaimSlot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<ClaimSlot>,
+        /// HTTP: an options object sits at this argument (no key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<ClaimSlot>,
+        /// HTTP: the method the member always sends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
+        /// HTTP: where the method sits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method_key: Option<ClaimSlot>,
+    },
+    /// A name the library emits itself, spelled in `member`'s name slot.
+    Reserved {
+        name: String,
+        member: String,
+        at: ClaimSlot,
+    },
+}
+
+/// One claim to check on one receiver: `export`, `instance:<member>`,
+/// `instance:()`, `instance:new`, `instance:new:<member>`, each optionally
+/// followed by `>scope:<member>`. The unit of verification is
+/// `(claim_id, receiver)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryCheck {
+    pub claim_id: String,
+    pub package: String,
+    pub export: String,
+    pub role: LibraryRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<SocketSide>,
+    pub receiver: String,
+    pub claim: LibraryClaim,
+}
+
 /// A service whose pairs are degraded wholesale (install failure or poison).
 #[derive(Debug, Clone, Deserialize)]
 pub struct DegradedService {
@@ -779,6 +916,22 @@ enum SidecarRequest {
         checks: Vec<SemanticsCheck>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
+    },
+    #[serde(rename = "verify_library_claims")]
+    VerifyLibraryClaims {
+        request_id: String,
+        from_dir: String,
+        checks: Vec<LibraryCheck>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_ms: Option<u64>,
+    },
+    #[serde(rename = "list_library_surface")]
+    ListLibrarySurface {
+        request_id: String,
+        from_dir: String,
+        packages: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_entries: Option<u32>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -929,9 +1082,14 @@ pub struct SidecarResponse {
     /// Claim verdicts (for verify_client_semantics), one per check in order
     #[serde(default)]
     pub semantics: Option<Vec<SemanticsResult>>,
-    /// How each package resolved (for verify_client_semantics)
+    /// How each package resolved (for verify_client_semantics and
+    /// verify_library_claims)
     #[serde(default)]
     pub semantics_modules: Option<Vec<SemanticsModule>>,
+    /// Each package's declared surface (for list_library_surface), kept as
+    /// JSON: the scanner saves it, it never reads into it.
+    #[serde(default)]
+    pub surfaces: Option<Vec<serde_json::Value>>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
@@ -1499,6 +1657,7 @@ impl TypeSidecar {
                 outcomes: None,
                 semantics: None,
                 semantics_modules: None,
+                surfaces: None,
                 errors: None,
             });
         }
@@ -1540,6 +1699,7 @@ impl TypeSidecar {
                 outcomes: None,
                 semantics: None,
                 semantics_modules: None,
+                surfaces: None,
                 errors: None,
             });
         }
@@ -1651,6 +1811,73 @@ impl TypeSidecar {
         self.send_request(&request)?;
         let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
         read_semantics(response, checks)
+    }
+
+    /// Check library claims in the shared shape against each package's own
+    /// declarations, resolved from `from_dir` (carrick#1616). Same scoping,
+    /// timeout and answer rules as `verify_client_semantics`: one result per
+    /// check, in request order, `failed` and `unchecked` both meaning "drop".
+    /// Send every check of one `(package, export)` in ONE request: two roles
+    /// for one export, and an instance whose maker claim is not in the same
+    /// request, are judged across the request.
+    pub fn verify_library_claims(
+        &self,
+        from_dir: &Path,
+        checks: &[LibraryCheck],
+    ) -> Result<Vec<SemanticsResult>, SidecarError> {
+        self.ensure_ready()?;
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = SidecarRequest::VerifyLibraryClaims {
+            request_id: self.next_request_id(),
+            from_dir: from_dir.to_string_lossy().into_owned(),
+            checks: checks.to_vec(),
+            budget_ms: None,
+        };
+        self.send_request(&request)?;
+        let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
+        let asked: Vec<(&str, &str)> = checks
+            .iter()
+            .map(|check| (check.claim_id.as_str(), check.receiver.as_str()))
+            .collect();
+        read_verdicts("verify_library_claims", response, &asked)
+    }
+
+    /// Each package's declared surface as the verifier reads it, resolved
+    /// from `from_dir` (carrick#1616): saved for a model that chooses claims
+    /// from the declarations. One entry per package, in request order.
+    pub fn list_library_surface(
+        &self,
+        from_dir: &Path,
+        packages: &[String],
+        max_entries: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, SidecarError> {
+        self.ensure_ready()?;
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = SidecarRequest::ListLibrarySurface {
+            request_id: self.next_request_id(),
+            from_dir: from_dir.to_string_lossy().into_owned(),
+            packages: packages.to_vec(),
+            max_entries,
+        };
+        self.send_request(&request)?;
+        let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::CheckFailed(errors.join("; ")));
+        }
+        let surfaces = response.surfaces.unwrap_or_default();
+        if surfaces.len() != packages.len() {
+            return Err(SidecarError::CheckFailed(format!(
+                "list_library_surface answered {} of {} packages",
+                surfaces.len(),
+                packages.len()
+            )));
+        }
+        Ok(surfaces)
     }
 
     /// Run the v2 "tsc as serializer" capture for one service, producing a
@@ -2378,30 +2605,49 @@ fn read_semantics(
     response: SidecarResponse,
     checks: &[SemanticsCheck],
 ) -> Result<Vec<SemanticsResult>, SidecarError> {
+    let asked: Vec<(&str, &str)> = checks
+        .iter()
+        .map(|check| (check.claim_id.as_str(), check.receiver.as_str()))
+        .collect();
+    read_verdicts("verify_client_semantics", response, &asked)
+}
+
+/// One verdict per asked `(claim_id, receiver)`, in order, or an error.
+fn read_verdicts(
+    action: &str,
+    response: SidecarResponse,
+    asked: &[(&str, &str)],
+) -> Result<Vec<SemanticsResult>, SidecarError> {
     if response.status != "success" {
         let errors = response.errors.unwrap_or_default();
         return Err(SidecarError::CheckFailed(errors.join("; ")));
     }
     for module in response.semantics_modules.unwrap_or_default() {
         debug!(
-            "[type_sidecar] client semantics module {}: file {:?}, version {:?}, reason {:?}",
-            module.package, module.resolved_file, module.installed_version, module.reason
+            "[type_sidecar] {} module {}: file {:?}, version {:?}, reason {:?}",
+            action, module.package, module.resolved_file, module.installed_version, module.reason
         );
     }
     let semantics = response.semantics.unwrap_or_default();
-    if semantics.len() != checks.len() {
+    if semantics.len() != asked.len() {
         return Err(SidecarError::CheckFailed(format!(
-            "verify_client_semantics answered {} of {} checks",
+            "{} answered {} of {} checks",
+            action,
             semantics.len(),
-            checks.len()
+            asked.len()
         )));
     }
-    if let Some((result, check)) = semantics.iter().zip(checks).find(|(result, check)| {
-        result.claim_id != check.claim_id || result.receiver != check.receiver
-    }) {
+    if let Some((result, (claim_id, receiver))) =
+        semantics
+            .iter()
+            .zip(asked)
+            .find(|(result, (claim_id, receiver))| {
+                result.claim_id != *claim_id || result.receiver != *receiver
+            })
+    {
         return Err(SidecarError::CheckFailed(format!(
-            "verify_client_semantics answered {} @ {} where {} @ {} was asked",
-            result.claim_id, result.receiver, check.claim_id, check.receiver
+            "{} answered {} @ {} where {} @ {} was asked",
+            action, result.claim_id, result.receiver, claim_id, receiver
         )));
     }
     Ok(semantics)
@@ -2777,6 +3023,186 @@ mod tests {
         let response: SidecarResponse = serde_json::from_str(bare).unwrap();
         assert_eq!(response.semantics.unwrap_or_default(), Vec::new());
         assert!(response.semantics_modules.is_none());
+    }
+
+    /// The `verify_library_claims` wire names must match the sidecar's
+    /// `LibraryCheck` union exactly (carrick#1616): the claim tagged by
+    /// `list`, slots as `{ arg, key? }`, a bound name as `{ bound }`, and the
+    /// optional parts omitted rather than sent as null.
+    #[test]
+    fn verify_library_claims_request_wire_shape() {
+        let check =
+            |claim_id: &str, export: &str, role: LibraryRole, receiver: &str, claim| LibraryCheck {
+                claim_id: claim_id.into(),
+                package: "@fixture/tasks".into(),
+                export: export.into(),
+                role,
+                side: None,
+                receiver: receiver.into(),
+                claim,
+            };
+        let slot = |arg: u32, key: Option<&str>| ClaimSlot {
+            arg,
+            key: key.map(str::to_string),
+        };
+        let mut socket = check(
+            "s",
+            "io",
+            LibraryRole::Socket,
+            "instance:()",
+            LibraryClaim::Reserved {
+                name: "connect".into(),
+                member: "on".into(),
+                at: slot(0, None),
+            },
+        );
+        socket.side = Some(SocketSide::Client);
+        let request = SidecarRequest::VerifyLibraryClaims {
+            request_id: "req-11".into(),
+            from_dir: "/svc".into(),
+            checks: vec![
+                check(
+                    "m",
+                    "task",
+                    LibraryRole::Broker,
+                    "export",
+                    LibraryClaim::Makes {
+                        form: MakesForm::Call,
+                        member: None,
+                        base: None,
+                        name: Some(slot(0, Some("id"))),
+                        handler: Some(slot(0, Some("run"))),
+                    },
+                ),
+                check(
+                    "o",
+                    "task",
+                    LibraryRole::Broker,
+                    "instance:()",
+                    LibraryClaim::Ops {
+                        op: LibraryOp::Send,
+                        member: Some("trigger".into()),
+                        name: Some(OpName::Bound {
+                            bound: BoundName::Maker,
+                        }),
+                        payload: Some(slot(0, None)),
+                        handler: None,
+                        ack: None,
+                        options: None,
+                        method: None,
+                        method_key: None,
+                    },
+                ),
+                check(
+                    "h",
+                    "default",
+                    LibraryRole::HttpClient,
+                    "export",
+                    LibraryClaim::Ops {
+                        op: LibraryOp::Request,
+                        member: None,
+                        name: Some(OpName::Slot(slot(0, Some("url")))),
+                        payload: None,
+                        handler: None,
+                        ack: None,
+                        options: None,
+                        method: None,
+                        method_key: Some(slot(0, Some("method"))),
+                    },
+                ),
+                check(
+                    "c",
+                    "client",
+                    LibraryRole::Broker,
+                    "instance:new",
+                    LibraryClaim::Scopes {
+                        member: "channel".into(),
+                        name: slot(0, None),
+                    },
+                ),
+                socket,
+            ],
+            budget_ms: Some(500),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["action"], "verify_library_claims");
+        assert_eq!(value["budget_ms"], 500);
+        let checks = value["checks"].as_array().unwrap();
+        assert_eq!(
+            checks[0],
+            serde_json::json!({
+                "claim_id": "m",
+                "package": "@fixture/tasks",
+                "export": "task",
+                "role": "broker",
+                "receiver": "export",
+                "claim": {
+                    "list": "makes", "form": "call", "member": null,
+                    "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" }
+                }
+            })
+        );
+        assert_eq!(
+            checks[1]["claim"],
+            serde_json::json!({
+                "list": "ops", "op": "send", "member": "trigger",
+                "name": { "bound": "maker" }, "payload": { "arg": 0 }
+            })
+        );
+        assert_eq!(checks[2]["role"], "http_client");
+        assert_eq!(
+            checks[2]["claim"],
+            serde_json::json!({
+                "list": "ops", "op": "request", "member": null,
+                "name": { "arg": 0, "key": "url" }, "method_key": { "arg": 0, "key": "method" }
+            })
+        );
+        assert_eq!(
+            checks[3]["claim"],
+            serde_json::json!({ "list": "scopes", "member": "channel", "name": { "arg": 0 } })
+        );
+        assert_eq!(checks[4]["side"], "client");
+        assert_eq!(
+            checks[4]["claim"],
+            serde_json::json!({
+                "list": "reserved", "name": "connect", "member": "on", "at": { "arg": 0 }
+            })
+        );
+        // The bound name and the slot read back apart.
+        let back: LibraryCheck = serde_json::from_value(checks[1].clone()).unwrap();
+        match back.claim {
+            LibraryClaim::Ops { name, .. } => assert_eq!(
+                name,
+                Some(OpName::Bound {
+                    bound: BoundName::Maker
+                })
+            ),
+            other => panic!("read back {other:?}"),
+        }
+    }
+
+    /// A `verify_library_claims` answer is read by the same rule as a
+    /// `verify_client_semantics` one, and names its own action when it fails.
+    #[test]
+    fn read_verdicts_names_the_action() {
+        let response: SidecarResponse = serde_json::from_value(serde_json::json!({
+            "request_id": "r",
+            "status": "success",
+            "semantics": [{ "claim_id": "a", "receiver": "export", "verdict": "verified" }]
+        }))
+        .unwrap();
+        let error = read_verdicts(
+            "verify_library_claims",
+            response,
+            &[("a", "export"), ("b", "export")],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("verify_library_claims answered 1 of 2 checks"),
+            "{error}"
+        );
     }
 
     /// The scanner pairs verdicts with claims by position, so a response that

@@ -193,6 +193,9 @@ pub struct ProcessingStats {
     /// Model rows withdrawn at call sites whose callee provably sends nothing
     /// (carrick#1555).
     pub summary_rows_withdrawn: usize,
+    /// Model HTTP routes withdrawn at the exact span of a verified library
+    /// definition (carrick#1616, prototype).
+    pub library_routes_withdrawn: usize,
     /// Summary rows whose dispatch value was settled from their own body
     /// under the field the request line's row names (carrick#1555).
     pub summary_dispatch_settled: usize,
@@ -1048,6 +1051,9 @@ impl ResolutionSource {
             // Ranked at the top so this arm reads as "nothing outranks the
             // repo's own declaration" rather than as an unexamined default.
             Self::DeclaredOperation => u8::MAX,
+            // A library claim states pub/sub and socket rows, which never
+            // compete for an HTTP call site (carrick#1616, prototype).
+            Self::LibraryClaim => 0,
         }
     }
 
@@ -1346,6 +1352,10 @@ impl FileOrchestrator {
             /// Call sites whose callee provably sends nothing (carrick#1555),
             /// by span start: a model row at one is withdrawn after the join.
             silent_sites: BTreeSet<u32>,
+            /// The exact spans of the verified library definitions in this
+            /// file (carrick#1616): a model route at one is the model reading
+            /// the definition as a route.
+            library_definitions: BTreeSet<(u32, u32)>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1406,6 +1416,15 @@ impl FileOrchestrator {
             // the model reading a request into a name (carrick#1555).
             stats.summary_rows_withdrawn +=
                 FileOrchestrator::withdraw_silent_sites(adjusted, &pf.silent_sites);
+            // A model route at exactly the span of a verified library
+            // definition is the model reading the definition as a route
+            // (carrick#1616, prototype). Withdrawn only on that exact span:
+            // anything else stands.
+            stats.library_routes_withdrawn += FileOrchestrator::withdraw_library_definitions(
+                adjusted,
+                &pf.library_definitions,
+                &pf.path_str,
+            );
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
             // passes over the joined rows, because it tells a
@@ -1977,6 +1996,7 @@ impl FileOrchestrator {
                 dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
+                library_definitions: BTreeSet::new(),
             });
         }
 
@@ -2396,6 +2416,7 @@ impl FileOrchestrator {
                 dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
                 silent_sites: BTreeSet::new(),
+                library_definitions: BTreeSet::new(),
             });
         }
 
@@ -2805,6 +2826,7 @@ impl FileOrchestrator {
             if let Some(silent) = summaries.silent(file) {
                 pf.silent_sites = silent.clone();
             }
+            pf.library_definitions = summaries.library.definition_spans(file);
             pf.resolved = Self::resolve_candidates(
                 &pf.candidate_map,
                 &pf.resolved_members,
@@ -6597,6 +6619,42 @@ impl FileOrchestrator {
     /// nothing (carrick#1555): the summary composed every call the callee
     /// makes and found no request. A model row there is the model reading a
     /// request into a name.
+    /// Drop the model's route rows whose candidate span is exactly a
+    /// verified library definition's call span (carrick#1616, prototype).
+    /// Fails closed: a candidate id that does not parse, or names any other
+    /// span, keeps its row.
+    fn withdraw_library_definitions(
+        result: &mut FileAnalysisResult,
+        definitions: &BTreeSet<(u32, u32)>,
+        path: &str,
+    ) -> usize {
+        if definitions.is_empty() {
+            return 0;
+        }
+        let before = result.endpoints.len();
+        result.endpoints.retain(|endpoint| {
+            let span = endpoint
+                .candidate_id
+                .strip_prefix("span:")
+                .and_then(|span| span.split_once('-'))
+                .and_then(|(lo, hi)| Some((lo.parse::<u32>().ok()?, hi.parse::<u32>().ok()?)));
+            let withdrawn = endpoint.resolution_source == Some(ResolutionSource::Model)
+                && span.is_some_and(|span| definitions.contains(&span));
+            if withdrawn {
+                tracing::info!(
+                    "library definition withdrew model route {} {} at {}:{} ({})",
+                    endpoint.method,
+                    endpoint.path,
+                    path,
+                    endpoint.line_number,
+                    endpoint.candidate_id
+                );
+            }
+            !withdrawn
+        });
+        before - result.endpoints.len()
+    }
+
     fn withdraw_silent_sites(result: &mut FileAnalysisResult, silent: &BTreeSet<u32>) -> usize {
         if silent.is_empty() {
             return 0;

@@ -1443,6 +1443,25 @@ fn fixture_mock_response(task_path: &str, mock_seed: &str) -> Option<String> {
         Some(idx) => {
             let rest = &mock_seed[idx + marker.len()..];
             let path = rest.split(')').next()?;
+            // A fixture keyed by the file's path, for a replay where two
+            // analysed files share a stem (carrick#1616 slice, prototype):
+            // `a__b__c.ts.json` for any trailing part `a/b/c.ts` of the path.
+            let components: Vec<String> = std::path::Path::new(path)
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            for start in 0..components.len() {
+                let keyed = std::path::Path::new(&dir)
+                    .join(task)
+                    .join(format!("{}.json", components[start..].join("__")));
+                if let Ok(canned) = std::fs::read_to_string(&keyed) {
+                    debug!("Mock fixture hit for {}: {}", task_path, keyed.display());
+                    return Some(substitute_candidate_placeholders(&canned, mock_seed));
+                }
+            }
             std::path::Path::new(path)
                 .file_stem()?
                 .to_string_lossy()

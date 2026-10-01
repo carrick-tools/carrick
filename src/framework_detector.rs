@@ -52,6 +52,18 @@ pub struct DetectionResult {
         skip_serializing_if = "Option::is_none"
     )]
     pub client_semantics: Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
+    /// Every listed package's claims in the one shape every protocol shares
+    /// (carrick#1616, prototype): per export a role, a side, and the makes,
+    /// ops, reserved and patterns lists ([`crate::library_claims`]). Read
+    /// leniently, one element at a time. Its HTTP exports replace
+    /// `client_semantics` when present. Never serialized: the prototype
+    /// reads it only from a hand-written detection cassette.
+    #[serde(
+        default,
+        deserialize_with = "crate::library_claims::deserialize_entries",
+        skip_serializing
+    )]
+    pub library_claims: Option<Vec<crate::library_claims::LibraryClaimsEntry>>,
 }
 
 impl DetectionResult {

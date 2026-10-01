@@ -1,0 +1,47 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "pubsub_operations": [
+    {
+      "topic": "send-email",
+      "role": "publisher",
+      "line_number": 5,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    },
+    {
+      "topic": "send-email",
+      "role": "publisher",
+      "line_number": 6,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    },
+    {
+      "topic": "send-email",
+      "role": "publisher",
+      "line_number": 9,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    },
+    {
+      "topic": "not-a-task",
+      "role": "publisher",
+      "line_number": 18,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "broker": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    }
+  ]
+}
