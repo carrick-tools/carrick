@@ -219,8 +219,46 @@ pub struct ServiceEnrichment {
 struct Snapshot {
     identity: String,
     checked_at: String,
+    /// The `resolve-repos` answer of the LAST read. It is rewritten on every
+    /// refresh, including one that reused a project's blobs, so it says
+    /// nothing about which generation those blobs are; `stored_rows` does.
     resolution: Resolution,
     projects: BTreeMap<String, Vec<CloudRepoData>>,
+    /// Per project, the stored row each cached blob was downloaded as. Written
+    /// only when a project is downloaded, and carried unchanged when it is
+    /// reused or its download fails, because it describes the blobs and not
+    /// the read (carrick#1673).
+    ///
+    /// Absent on a snapshot written before the field existed, which reads as
+    /// "never compared": every project in it downloads once.
+    #[serde(default)]
+    stored_rows: BTreeMap<String, Vec<StoredRow>>,
+}
+
+/// The stored row a cached blob was downloaded as, in the same four fields a
+/// `resolve-repos` service row names.
+///
+/// `updated_at` is the row's `updatedAt` exactly as the cloud stores it:
+/// `get-cross-repo-data` answers it beside each blob as `lastUpdated`, and
+/// `resolve-repos` answers the same attribute as `updated_at`. Every write of
+/// an index blob is followed by a row write with a fresh `updatedAt` (carrick-cloud
+/// `lambdas/check-or-upload/cross_repo_staged.js`), so a row whose `updatedAt`
+/// has not moved still has the same blob behind it. The two strings are
+/// compared for equality only, never parsed or ordered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct StoredRow {
+    repo: String,
+    service: String,
+    hash: String,
+    updated_at: Option<String>,
+}
+
+/// One project as `get-cross-repo-data` answered it: the blobs, and the stored
+/// row each was answered as.
+#[derive(Debug)]
+struct DownloadedProject {
+    blobs: Vec<CloudRepoData>,
+    rows: Vec<StoredRow>,
 }
 
 /// What one hosted read did about downloading, counted in LOCAL SERVICE ROWS —
@@ -351,7 +389,7 @@ impl Reader {
         &self,
         credential: &Credential,
         id: &str,
-    ) -> Result<Vec<CloudRepoData>, String> {
+    ) -> Result<DownloadedProject, String> {
         let mut value = self
             .post(
                 credential,
@@ -396,6 +434,11 @@ impl Reader {
         #[derive(Deserialize)]
         struct Entry {
             metadata: CloudRepoData,
+            /// The stored row's `updatedAt`. Optional in the cloud's own type,
+            /// and a blob answered without it is one the next read cannot
+            /// compare, so it downloads again (carrick#1673).
+            #[serde(default, rename = "lastUpdated")]
+            last_updated: Option<String>,
         }
         #[derive(Deserialize)]
         struct Response {
@@ -403,7 +446,20 @@ impl Reader {
         }
         let response: Response =
             serde_json::from_value(value).map_err(|_| "Invalid hosted project schema")?;
-        Ok(response.repos.into_iter().map(|r| r.metadata).collect())
+        let rows = response
+            .repos
+            .iter()
+            .map(|entry| StoredRow {
+                repo: entry.metadata.repo_name.to_ascii_lowercase(),
+                service: service_of(&entry.metadata),
+                hash: entry.metadata.commit_hash.clone(),
+                updated_at: entry.last_updated.clone(),
+            })
+            .collect();
+        Ok(DownloadedProject {
+            blobs: response.repos.into_iter().map(|r| r.metadata).collect(),
+            rows,
+        })
     }
 
     async fn refresh(
@@ -447,31 +503,43 @@ impl Reader {
             .filter_map(|r| r.project_id.clone())
             .collect();
         let mut projects = BTreeMap::new();
+        let mut stored_rows = BTreeMap::new();
         let mut failure = None;
         let mut downloads = Downloads::default();
         for id in ids {
             let rows = service_rows(&resolution, &id).count();
+            // The blobs held for this project and the rows they were
+            // downloaded as travel together: kept, they keep their rows.
+            let held = old.as_ref().and_then(|s| {
+                Some((
+                    s.projects.get(&id)?,
+                    s.stored_rows.get(&id).map(Vec::as_slice).unwrap_or(&[]),
+                ))
+            });
             // `get-cross-repo-data` answers with every repo under one project
             // and takes no filter, so a project is the smallest thing that can
             // be skipped. The count stays in service rows because that is what
             // the user recognises and what `resolve-repos` gave hashes for.
-            if let Some(cached) = old.as_ref().and_then(|s| s.projects.get(&id))
-                && project_is_unchanged(&resolution, &id, cached, &requested)
+            if let Some((cached, read_as)) = held
+                && project_is_unchanged(&resolution, &id, cached, read_as, &requested)
             {
-                projects.insert(id, cached.clone());
+                projects.insert(id.clone(), cached.clone());
+                stored_rows.insert(id, read_as.to_vec());
                 downloads.reused += rows;
                 continue;
             }
             match self.project(credential, &id).await {
-                Ok(blobs) => {
-                    projects.insert(id, blobs);
+                Ok(downloaded) => {
+                    projects.insert(id.clone(), downloaded.blobs);
+                    stored_rows.insert(id, downloaded.rows);
                     downloads.fetched += rows;
                 }
                 Err(error) => {
                     failure = Some(error);
                     downloads.unread += rows;
-                    if let Some(blobs) = old.as_ref().and_then(|s| s.projects.get(&id)) {
-                        projects.insert(id, blobs.clone());
+                    if let Some((blobs, read_as)) = held {
+                        projects.insert(id.clone(), blobs.clone());
+                        stored_rows.insert(id, read_as.to_vec());
                     }
                 }
             }
@@ -482,6 +550,7 @@ impl Reader {
                 checked_at: chrono::Utc::now().to_rfc3339(),
                 resolution,
                 projects,
+                stored_rows,
             },
             failure,
             downloads,
@@ -514,15 +583,25 @@ fn service_rows<'a>(
         })
 }
 
-/// Whether the blobs already cached for one project still describe every
-/// service the hosted metadata names, so this run can skip its download.
+/// The service a blob is stored under: its `service_name`, or the repo name
+/// for a single-service repo.
+fn service_of(blob: &CloudRepoData) -> String {
+    blob.service_name
+        .clone()
+        .unwrap_or_else(|| blob.repo_name.clone())
+}
+
+/// Whether the blobs already cached for one project are still the generation
+/// the cloud stores for every service the hosted metadata names, so this run
+/// can skip its download.
 ///
 /// The stored row's `hash` IS the blob's `commit_hash` (the scanner uploads
-/// `hash: data.commit_hash`), so the two are comparable directly. Three things
-/// must all hold, and the second is the one the ticket's wording does not
-/// imply:
+/// `hash: data.commit_hash`), so the two are comparable directly. Four things
+/// must all hold, and the second and fourth are the ones a commit comparison
+/// does not imply:
 ///
-/// 1. Every row carries a hash. `None` means "cannot compare", never "same".
+/// 1. Every row carries a hash and an `updated_at`. `None` means "cannot
+///    compare", never "same".
 /// 2. Every repo in the project is on this machine. `resolve-repos` answers
 ///    `services` for the repos the request named, so a sibling repo that is
 ///    only in the cloud has no hash here at all — its blob could have moved
@@ -530,10 +609,17 @@ fn service_rows<'a>(
 ///    project since the snapshot would be invisible in a set comparison.
 /// 3. The (repo, service, hash) rows equal the (repo, service, commit) blobs
 ///    already held, so a removed service or an extra blob also downloads.
+/// 4. The (repo, service, hash, updated_at) rows equal the rows the held blobs
+///    were downloaded as (`read_as`). A rescan at the same commit — a new
+///    release, a CI run, another machine, or this laptop's own last scan —
+///    stores a new generation under the same hash, and only `updated_at`
+///    says so (carrick#1673). The row's `scanner_version` cannot stand in for
+///    it: a CI write supersedes a laptop row at the same commit and release.
 fn project_is_unchanged(
     resolution: &Resolution,
     id: &str,
     cached: &[CloudRepoData],
+    read_as: &[StoredRow],
     requested: &std::collections::BTreeSet<String>,
 ) -> bool {
     let Some(slug) = resolution
@@ -558,13 +644,20 @@ fn project_is_unchanged(
     {
         return false;
     }
-    let mut named: Vec<(String, String, String)> = Vec::new();
+    let mut named: Vec<StoredRow> = Vec::new();
     for (basename, service) in service_rows(resolution, id) {
-        let Some(hash) = service.hash.clone() else {
+        let (Some(hash), Some(updated_at)) = (service.hash.clone(), service.updated_at.clone())
+        else {
             return false;
         };
-        named.push((basename, service.service.clone(), hash));
+        named.push(StoredRow {
+            repo: basename,
+            service: service.service.clone(),
+            hash,
+            updated_at: Some(updated_at),
+        });
     }
+    named.sort();
     // The blobs are read straight off the snapshot, never through
     // `local_blobs`, which rewrites `repo_name` to the local directory label
     // and would never match a basename from the hosted metadata.
@@ -573,16 +666,22 @@ fn project_is_unchanged(
         .map(|blob| {
             (
                 blob.repo_name.to_ascii_lowercase(),
-                blob.service_name
-                    .clone()
-                    .unwrap_or_else(|| blob.repo_name.clone()),
+                service_of(blob),
                 blob.commit_hash.clone(),
             )
         })
         .collect();
-    named.sort();
     held.sort();
-    named == held
+    let identities: Vec<(String, String, String)> = named
+        .iter()
+        .map(|row| (row.repo.clone(), row.service.clone(), row.hash.clone()))
+        .collect();
+    if identities != held {
+        return false;
+    }
+    let mut read_as = read_as.to_vec();
+    read_as.sort();
+    named == read_as
 }
 
 /// The remotes and the cached snapshot, with no network request of any kind.
@@ -1310,8 +1409,36 @@ mod tests {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
     }
 
+    /// When every fixture row was stored, unless a test moves one.
+    const STORED_AT: &str = "2026-10-01T10:00:00.000Z";
+
     fn service_row(service: &str, hash: &str) -> serde_json::Value {
-        json!({"service":service,"hash":hash,"updated_at":null,"scanner_version":null})
+        json!({"service":service,"hash":hash,"updated_at":STORED_AT,"scanner_version":null})
+    }
+
+    /// A `get-cross-repo-data` body answering `blobs`, each beside the
+    /// `updatedAt` of the row it is stored under.
+    fn answered(blobs: &[(CloudRepoData, &str)]) -> Vec<u8> {
+        serde_json::to_vec(&json!({"repos": blobs
+            .iter()
+            .map(|(blob, at)| json!({"repo": blob.repo_name, "hash": blob.commit_hash,
+                "metadata": blob, "lastUpdated": at}))
+            .collect::<Vec<_>>()}))
+        .unwrap()
+    }
+
+    /// The rows `blobs` were downloaded as when every one was answered beside
+    /// `at`: what a refresh records for them.
+    fn read_as(blobs: &[CloudRepoData], at: &str) -> Vec<StoredRow> {
+        blobs
+            .iter()
+            .map(|blob| StoredRow {
+                repo: blob.repo_name.to_ascii_lowercase(),
+                service: service_of(blob),
+                hash: blob.commit_hash.clone(),
+                updated_at: Some(at.to_string()),
+            })
+            .collect()
     }
 
     /// Two connected repos in two projects: `example/api` (project `pa`, two
@@ -1337,6 +1464,8 @@ mod tests {
         blob
     }
 
+    /// A snapshot holding `projects`, every blob downloaded as a row stored at
+    /// [`STORED_AT`].
     fn snapshot(
         resolution: serde_json::Value,
         projects: BTreeMap<String, Vec<CloudRepoData>>,
@@ -1345,6 +1474,10 @@ mod tests {
             identity: credential("test").identity(),
             checked_at: "old".into(),
             resolution: Resolution::parse(resolution).unwrap(),
+            stored_rows: projects
+                .iter()
+                .map(|(id, blobs)| (id.clone(), read_as(blobs, STORED_AT)))
+                .collect(),
             projects,
         }
     }
@@ -1394,7 +1527,7 @@ mod tests {
             .project(&credential("test-secret"), "authorised-project")
             .await
             .unwrap();
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.blobs.len(), 1);
         let request = request.join().unwrap();
         assert!(request.contains("authorization: Bearer test-secret"));
         let body: serde_json::Value =
@@ -1407,20 +1540,16 @@ mod tests {
 
     #[tokio::test]
     async fn staged_get_has_no_bearer_or_api_body() {
-        let (staged, staged_request) = serve(
-            "200 OK",
-            "",
-            serde_json::to_vec(&json!({"repos":[{"metadata":blob()}]})).unwrap(),
-        );
+        let (staged, staged_request) = serve("200 OK", "", answered(&[(blob(), STORED_AT)]));
         let (url, api_request) = serve("200 OK", "", serde_json::to_vec(&json!({"staged":true,"staged_url":format!("{staged}/signed?signature=fixture"),"raw_bytes":1,"repo_count":1})).unwrap());
-        assert_eq!(
-            reader(url)
-                .project(&credential("test-secret"), "p")
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let project = reader(url)
+            .project(&credential("test-secret"), "p")
+            .await
+            .unwrap();
+        assert_eq!(project.blobs.len(), 1);
+        // The staged body is the inline body, so it carries each row's stored
+        // time too, and that is what the blob is recorded as (carrick#1673).
+        assert_eq!(project.rows, read_as(&project.blobs, STORED_AT));
         assert!(api_request.join().unwrap().contains("Bearer test-secret"));
         let request = staged_request.join().unwrap();
         assert!(request.starts_with("GET /signed?signature=fixture HTTP/1.1"));
@@ -1523,6 +1652,7 @@ mod tests {
             checked_at: "old".into(),
             resolution: Resolution::parse(resolution()).unwrap(),
             projects: BTreeMap::from([("p".into(), vec![blob()])]),
+            stored_rows: BTreeMap::new(),
         };
         let (url, request) = serve("200 OK", "", serde_json::to_vec(&metadata).unwrap());
         let (new, failure, _) = reader(url)
@@ -1718,6 +1848,276 @@ mod tests {
         assert_eq!(requests.join().unwrap().len(), 2);
     }
 
+    /// The live rows of [`two_projects`] after the `api` service of
+    /// `example/api` was stored again at the SAME commit by another writer: a
+    /// CI run, another machine, or this laptop's own last scan. Its hash and
+    /// its scanner version are what they were; only `updated_at` moved.
+    fn api_rewritten_at_the_same_commit(at: &str) -> serde_json::Value {
+        let mut metadata = two_projects("old-web");
+        metadata["repos"][0]["services"][0]["updated_at"] = json!(at);
+        metadata["repos"][0]["services"][0]["source"] = json!("ci");
+        metadata
+    }
+
+    /// A rescan at an unchanged commit stores a new generation under the same
+    /// hash, and the next read downloads it rather than keeping the first
+    /// copy this machine ever downloaded there (carrick#1673). That copy is
+    /// what the laptop scan reads as its previous generation, so keeping it
+    /// re-asked semantics and wrote its old detection back over the newer one.
+    ///
+    /// The generation that moved is the one handed to the next scan as its
+    /// previous one, and a second read of the same rows downloads nothing.
+    #[tokio::test]
+    async fn a_rewrite_at_the_same_commit_is_downloaded_and_becomes_the_previous_generation() {
+        let later = "2026-10-01T18:10:50.769Z";
+        let first = named_blob("api", "api", "abcdef");
+        let mut rewritten = named_blob("api", "api", "abcdef");
+        rewritten.last_updated = "2026-10-01T18:09:00Z".parse().unwrap();
+        let worker = named_blob("api", "worker", "fedcba");
+        let old = snapshot(two_projects("old-web"), matching_cache());
+        assert_eq!(
+            serde_json::to_value(&old.projects["pa"][0]).unwrap(),
+            serde_json::to_value(&first).unwrap(),
+            "the cached copy is the first one"
+        );
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&api_rewritten_at_the_same_commit(later)).unwrap(),
+            ),
+            (
+                "200 OK",
+                answered(&[(rewritten.clone(), later), (worker.clone(), STORED_AT)]),
+            ),
+        ]);
+        let (new, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 2,
+                reused: 1,
+                unread: 0
+            }
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the rewritten project was not downloaded"
+        );
+        assert_eq!(
+            action(&requests[1]),
+            json!({"action":"get-cross-repo-data","project_id":"pa"})
+        );
+        let mut recorded = new.stored_rows["pa"].clone();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            vec![
+                StoredRow {
+                    repo: "api".into(),
+                    service: "api".into(),
+                    hash: "abcdef".into(),
+                    updated_at: Some(later.into()),
+                },
+                StoredRow {
+                    repo: "api".into(),
+                    service: "worker".into(),
+                    hash: "fedcba".into(),
+                    updated_at: Some(STORED_AT.into()),
+                },
+            ],
+            "the rows the new blobs were answered as are what the next read compares"
+        );
+
+        // What `index` hands the laptop scan as its previous generation.
+        let input = HostedInput {
+            snapshot: Some(new.clone()),
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            ..Default::default()
+        };
+        let previous = input
+            .local_blobs(Path::new("/w/api"))
+            .into_iter()
+            .find(|blob| blob.service_name.as_deref() == Some("api"))
+            .expect("the api service is handed over");
+        assert_eq!(previous.last_updated, rewritten.last_updated);
+
+        // Read again with nothing stored since: nothing is downloaded.
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&api_rewritten_at_the_same_commit(later)).unwrap(),
+        )]);
+        let (again, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(new))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 0,
+                reused: 3,
+                unread: 0
+            }
+        );
+        assert_eq!(requests.join().unwrap().len(), 1);
+        assert_eq!(again.projects["pa"][0].last_updated, rewritten.last_updated);
+    }
+
+    /// The snapshot a laptop holds when this ships: written before blobs
+    /// recorded the row they were downloaded as, with a `resolution` that a
+    /// later read already rewrote to the newest rows while its blobs stayed
+    /// the first ones downloaded. Nothing says which generation those blobs
+    /// are, so the project downloads.
+    #[tokio::test]
+    async fn a_snapshot_whose_blobs_never_recorded_their_rows_is_downloaded() {
+        let later = "2026-10-01T18:10:50.769Z";
+        let current = api_rewritten_at_the_same_commit(later);
+        let mut written =
+            serde_json::to_value(snapshot(current.clone(), matching_cache())).unwrap();
+        written.as_object_mut().unwrap().remove("stored_rows");
+        let old: Snapshot = serde_json::from_value(written).unwrap();
+        assert!(old.stored_rows.is_empty());
+        let (url, requests) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&current).unwrap()),
+            (
+                "200 OK",
+                answered(&[
+                    (named_blob("api", "api", "abcdef"), later),
+                    (named_blob("api", "worker", "fedcba"), STORED_AT),
+                ]),
+            ),
+            (
+                "200 OK",
+                answered(&[(named_blob("web", "web", "old-web"), STORED_AT)]),
+            ),
+        ]);
+        let (new, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 3,
+                reused: 0,
+                unread: 0
+            }
+        );
+        assert_eq!(requests.join().unwrap().len(), 3);
+        assert_eq!(
+            new.stored_rows.len(),
+            2,
+            "both projects now record their rows"
+        );
+    }
+
+    /// A row with no `updated_at`, or a blob answered without its row's
+    /// `lastUpdated`, cannot be compared, and "cannot compare" downloads.
+    #[tokio::test]
+    async fn a_row_or_a_blob_without_a_stored_time_is_downloaded() {
+        // `example/web`'s row carries no stored time.
+        let mut rows = two_projects("old-web");
+        rows["repos"][1]["services"][0]["updated_at"] = json!(null);
+        // `example/api`'s blob was answered without one.
+        let mut unstamped = snapshot(two_projects("old-web"), matching_cache());
+        unstamped.stored_rows.get_mut("pa").unwrap()[0].updated_at = None;
+        for (live, old, project, body, fetched) in [
+            (
+                rows,
+                snapshot(two_projects("old-web"), matching_cache()),
+                "pb",
+                answered(&[(named_blob("web", "web", "old-web"), STORED_AT)]),
+                1,
+            ),
+            (
+                two_projects("old-web"),
+                unstamped,
+                "pa",
+                answered(&[
+                    (named_blob("api", "api", "abcdef"), STORED_AT),
+                    (named_blob("api", "worker", "fedcba"), STORED_AT),
+                ]),
+                2,
+            ),
+        ] {
+            let (url, requests) = serve_sequence(vec![
+                ("200 OK", serde_json::to_vec(&live).unwrap()),
+                ("200 OK", body),
+            ]);
+            let (_, failure, downloads) = reader(url)
+                .refresh(&credential("test"), both_repos(), Some(old))
+                .await
+                .unwrap();
+            assert!(failure.is_none());
+            assert_eq!(
+                downloads,
+                Downloads {
+                    fetched,
+                    reused: 3 - fetched,
+                    unread: 0
+                }
+            );
+            let requests = requests.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                action(&requests[1]),
+                json!({"action":"get-cross-repo-data","project_id":project})
+            );
+        }
+    }
+
+    /// A download that fails keeps the blobs it had AND the rows they were
+    /// read as, so the next read still sees that they are behind and tries
+    /// again, instead of taking the newer rows as describing the old blobs.
+    #[tokio::test]
+    async fn a_failed_download_keeps_the_rows_its_blobs_were_read_as() {
+        let later = "2026-10-01T18:10:50.769Z";
+        let old = snapshot(two_projects("old-web"), matching_cache());
+        let kept = old.stored_rows["pa"].clone();
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&api_rewritten_at_the_same_commit(later)).unwrap(),
+            ),
+            ("500 Internal Server Error", Vec::new()),
+        ]);
+        let (new, failure, _) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_some());
+        assert_eq!(requests.join().unwrap().len(), 2);
+        assert_eq!(new.stored_rows["pa"], kept);
+
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&api_rewritten_at_the_same_commit(later)).unwrap(),
+            ),
+            (
+                "200 OK",
+                answered(&[
+                    (named_blob("api", "api", "abcdef"), later),
+                    (named_blob("api", "worker", "fedcba"), STORED_AT),
+                ]),
+            ),
+        ]);
+        let (_, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(new))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(downloads.fetched, 2, "the next read tries again");
+        assert_eq!(requests.join().unwrap().len(), 2);
+    }
+
     #[test]
     fn local_seeding_requires_unambiguous_full_repository_identity() {
         let mut metadata = resolution();
@@ -1729,6 +2129,7 @@ mod tests {
                 checked_at: "now".into(),
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![blob()])]),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1756,6 +2157,7 @@ mod tests {
                 // No services: this repo had no hosted index when the run began.
                 resolution: Resolution::parse(resolution()).unwrap(),
                 projects: BTreeMap::new(),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1811,6 +2213,7 @@ mod tests {
                     "p".into(),
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1851,6 +2254,7 @@ mod tests {
                     checked_at: "now".into(),
                     resolution: Resolution::parse(metadata).unwrap(),
                     projects: BTreeMap::from([("p".into(), vec![blob_from(version)])]),
+                    stored_rows: BTreeMap::new(),
                 }),
                 failure: None,
                 remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1890,6 +2294,7 @@ mod tests {
                     "p".into(),
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1929,6 +2334,7 @@ mod tests {
                 checked_at: "now".into(),
                 resolution: Resolution::parse(metadata).unwrap(),
                 projects: BTreeMap::from([("p".into(), vec![stored])]),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
@@ -1966,6 +2372,7 @@ mod tests {
                     "p".into(),
                     vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
                 )]),
+                stored_rows: BTreeMap::new(),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1999,6 +2406,7 @@ mod tests {
                     checked_at: "now".into(),
                     resolution: Resolution::parse(resolution()).unwrap(),
                     projects: BTreeMap::new(),
+                    stored_rows: BTreeMap::new(),
                 }),
                 failure: None,
                 remotes,
