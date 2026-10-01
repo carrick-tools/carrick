@@ -642,7 +642,7 @@ impl Reader<'_> {
             return None;
         }
         Some(FieldWriteIr {
-            field: written_field(&member.prop)?,
+            field: this_field(member)?,
             at: assign.span.lo.0,
             client: self.written_instance(&assign.right, scope)?,
         })
@@ -992,9 +992,10 @@ struct ThisWalker<'f> {
 }
 
 impl ThisWalker<'_> {
-    /// A write at `at` to the member `target` of `this`.
+    /// A write at `at` to the member `target` of `this`. One by a computed
+    /// key may write any field.
     fn write(&mut self, target: &MemberExpr, at: u32) {
-        match written_field(&target.prop) {
+        match this_field(target) {
             Some(field) => self.facts.write(field, at),
             None => self.facts.escapes = true,
         }
@@ -1167,19 +1168,6 @@ fn simple_member(target: &SimpleAssignTarget) -> Option<&MemberExpr> {
     match unwrap_expression(inner) {
         Expr::Member(member) => Some(member),
         _ => None,
-    }
-}
-
-/// The field a written member of `this` names: a name, a private name, or a
-/// string key. `None`: a key the source does not state.
-fn written_field(prop: &MemberProp) -> Option<String> {
-    match prop {
-        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
-        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
-        MemberProp::Computed(key) => match unwrap_expression(&key.expr) {
-            Expr::Lit(Lit::Str(text)) => Some(text.value.to_string()),
-            _ => None,
-        },
     }
 }
 
@@ -1893,17 +1881,22 @@ mod tests {
              }\n\
              export class Lazy {\n\
              \x20 private q: Queue | undefined;\n\
-             \x20 constructor() { this.q = new Queue(\"jobs\"); }\n\
              \x20 reset() {\n\
              \x20   if (!this.q) {\n\
              \x20     this.q = new Queue(\"jobs\");\n\
              \x20   }\n\
              \x20 }\n\
+             \x20 constructor() { this.q = new Queue(\"jobs\"); }\n\
              \x20 send() { return this.q.add(\"tick\", {}); }\n\
              }\n\
              export class Held {\n\
              \x20 #q = new Queue(\"held\");\n\
              \x20 send() { return this.#q.add(\"ping\", {}); }\n\
+             }\n\
+             export class Deferred {\n\
+             \x20 private q?: Queue;\n\
+             \x20 start() { setTimeout(() => { this.q = new Queue(\"later\"); }, 10); }\n\
+             \x20 send() { return this.q.add(\"tock\", {}); }\n\
              }\n",
         );
 
@@ -1916,7 +1909,11 @@ mod tests {
         assert_eq!(in_method.contest(on_wire), None);
 
         let guarded = add_at(&sites, 19).expect("a field the class writes twice");
-        assert_eq!(maker(guarded).line, 13, "the first write's instance");
+        assert_eq!(
+            maker(guarded).line,
+            15,
+            "the first write's instance, whichever member it is in"
+        );
         assert_eq!(maker(guarded).args[0].text.as_deref(), Some("jobs"));
         assert_eq!(
             guarded.contest(on_wire),
@@ -1927,6 +1924,9 @@ mod tests {
         let private = add_at(&sites, 23).expect("a private field");
         assert_eq!(maker(private).args[0].text.as_deref(), Some("held"));
         assert_eq!(private.contest(on_wire), None);
+
+        let deferred = add_at(&sites, 28).expect("a field written in a callback");
+        assert_eq!(maker(deferred).args[0].text.as_deref(), Some("later"));
     }
 
     /// A field is no receiver when anything but one maker's instance may be
@@ -1998,6 +1998,33 @@ mod tests {
                  \x20 send() { return this.q.add(\"welcome\", {}); }\n\
                  \x20 swap(next: Queue) { ({ q: this.q } = { q: next }); }\n\
                  }\n",
+            ),
+            (
+                "an update",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 bump() { this.q++; }\n\
+                 }\n",
+            ),
+            (
+                "a property by a computed key",
+                "const KEY = \"q\"; export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 [KEY] = new Worker(\"emails\");\n\
+                 }\n",
+            ),
+            (
+                "a subclass that hands this to a call",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n\
+                 export class Special extends Mailer { init(options: object) { Object.assign(this, options); } }\n",
             ),
             (
                 "a delete",
