@@ -11515,6 +11515,52 @@ mod tests {
         assert!(rows[0].own_site);
     }
 
+    /// carrick#1648: a name is read as the binding the identifier resolves
+    /// to. A block that declares a module constant, a local or a parameter
+    /// again holds a value of its own, which this pass does not read, so the
+    /// call there states nothing; the outer binding is still read where it is
+    /// the one named.
+    #[test]
+    fn a_name_a_block_declares_again_is_never_read_as_the_outer_binding() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/load.ts",
+                "const USERS = \"/api/users\";\n\nexport async function load(admin: boolean) {\n  if (admin) {\n    const USERS = \"/api/admins\";\n    return fetch(USERS, { method: \"POST\" });\n  }\n  return null;\n}\n\nexport async function loadAll() {\n  return fetch(USERS, { method: \"PUT\" });\n}\n",
+            ),
+            (
+                "src/local.ts",
+                "export async function local(admin: boolean, path: string) {\n  const ITEMS = \"/api/items\";\n  if (admin) {\n    const ITEMS = \"/api/admin-items\";\n    const path = \"/api/admin-path\";\n    await fetch(path, { method: \"DELETE\" });\n    return fetch(ITEMS, { method: \"POST\" });\n  }\n  return fetch(ITEMS, { method: \"GET\" });\n}\n",
+            ),
+            (
+                "src/use.ts",
+                "import { local } from \"./local\";\n\nexport async function go() {\n  return local(true, \"/api/caller-path\");\n}\n",
+            ),
+        ]);
+
+        let rows = |file: &str| -> Vec<(u32, String, String)> {
+            summary_rows_of(&dir, &discovery, file)
+                .into_iter()
+                .map(|row| (row.line, row.method, row.target))
+                .collect()
+        };
+        assert_eq!(
+            rows("src/load.ts"),
+            vec![(12, "PUT".to_string(), "/api/users".to_string())],
+            "the module constant only where it is the binding named"
+        );
+        assert_eq!(
+            rows("src/local.ts"),
+            vec![(9, "GET".to_string(), "/api/items".to_string())],
+            "the function's local only where it is the binding named"
+        );
+        assert_eq!(
+            rows("src/use.ts"),
+            vec![(4, "GET".to_string(), "/api/items".to_string())],
+            "the request the callee states, and none filled by the caller's \
+             argument: the block declared that parameter again"
+        );
+    }
+
     /// carrick#1555: a site is recorded as sending nothing only when its callee
     /// provably sends nothing. A body with no call is proof; a declaration with
     /// no body, or a construction, is not.

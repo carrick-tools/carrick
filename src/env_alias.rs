@@ -263,9 +263,11 @@ impl Visit for EnvAliasExtractor {
                 }
                 // SWC resolver gives each binding a unique SyntaxContext, but the
                 // call target the LLM emits is just the bare symbol text. Key on
-                // the symbol so `${ORDERS_BASE}` resolves. A name shadowed in a
-                // nested scope would collide here, but that is vanishingly rare
-                // for a base-URL const and far better than not resolving at all.
+                // the symbol so `${ORDERS_BASE}` resolves. A name declared in two
+                // scopes collides here, so a row the scanner states as a fact
+                // reads this table only for a call whose binding is the file's
+                // one declaration of the name (carrick#1648,
+                // `CandidateTarget::url_binding`).
                 self.aliases.insert(binding.id.sym.to_string(), env_name);
             } else if let Expr::Object(obj) = unwrap_transparent(init) {
                 // Config-object pattern (#218 cross-file scope): record each
@@ -1040,6 +1042,33 @@ fn schema_chain_declaration(expr: &Expr) -> Option<EnvSchemaDeclaration> {
     })
 }
 
+/// The name a whole-URL target states: `url` for `url`, `${url}` or `"url"`,
+/// `config.url` for `${config.url}`, `process.env.NAME` for
+/// `${process.env.NAME}`. `${NAME}` and a bare `NAME` are the same statement
+/// here.
+fn whole_url_name(target: &str) -> &str {
+    let trimmed = target.trim().trim_matches(['`', '"', '\'']).trim();
+    trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(trimmed)
+        .trim()
+}
+
+/// The binding [`resolve_whole_url_target`] reads `target` through: `url` for
+/// `url`, `config` for `config.url`. `None` for a target that reads the
+/// environment itself (`${process.env.NAME}`), which names no binding.
+///
+/// The tables it reads are keyed by name alone, so a caller that knows which
+/// binding the source names checks it against this first (carrick#1648).
+pub fn whole_url_target_binding(target: &str) -> Option<&str> {
+    let name = whole_url_name(target);
+    if name.starts_with("process.env.") {
+        return None;
+    }
+    name.split('.').next()
+}
+
 /// The `(env var name, fallback URL literal)` behind a target that is nothing
 /// but an env-var-backed binding.
 fn whole_url_binding<'a>(
@@ -1050,13 +1079,7 @@ fn whole_url_binding<'a>(
     if fallbacks.is_empty() {
         return None;
     }
-    let trimmed = target.trim().trim_matches(['`', '"', '\'']).trim();
-    // `${NAME}` and a bare `NAME` are the same statement here.
-    let name = trimmed
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .unwrap_or(trimmed)
-        .trim();
+    let name = whole_url_name(target);
     let env_name = match name.strip_prefix("process.env.") {
         Some(env_name) => env_name,
         None => aliases.get(name).map(String::as_str)?,
@@ -1364,6 +1387,21 @@ mod tests {
                 Some("${process.env.HELPDESK_URL}/api/answer"),
                 "target {target} states nothing but the binding"
             );
+        }
+    }
+
+    /// carrick#1648: the binding a whole-URL target is read through, for a
+    /// caller that checks it is the one the tables describe.
+    #[test]
+    fn whole_url_target_names_the_binding_it_reads() {
+        for (target, binding) in [
+            ("url", Some("url")),
+            ("${url}", Some("url")),
+            ("`${url}`", Some("url")),
+            ("config.url", Some("config")),
+            ("${process.env.HELPDESK_URL}", None),
+        ] {
+            assert_eq!(whole_url_target_binding(target), binding, "{target}");
         }
     }
 

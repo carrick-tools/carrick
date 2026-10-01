@@ -39,6 +39,11 @@
 //! - **A field is read where it is written.** `this.url` is the value the
 //!   constructor or the field initialiser assigns, and only when nothing else
 //!   in the class assigns it. A field written anywhere else is opaque.
+//! - **A name is read in its own scope** (carrick#1648). A constant, a local
+//!   or a parameter is the binding the identifier resolves to
+//!   ([`crate::binding_scope`]), so a block that declares the name again is
+//!   never read as the outer value. Only a function's own top-level
+//!   declarations are read; a name a nested block declares is opaque.
 //! - **A request is the shape the rest of the scanner reads.** A `fetch`
 //!   call, an HTTP-verb member call with one route-shaped argument, or a call
 //!   carrying exactly one request-options bag (`method`/`headers`/`body`/
@@ -101,6 +106,7 @@ use swc_common::{SourceMap, SourceMapper, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::binding_scope::{BindingKey, Declarations, ident_key, pat_key};
 use crate::call_graph::{
     BindingsWanted, CallSiteTargets, ImportedBinding, ImportedBindings, PublishedBinding,
 };
@@ -495,6 +501,7 @@ pub fn extract_file_ir(
         uses: uses.uses,
         object_consts: object_consts(module),
         subclass_fields: subclass_fields(module),
+        declared_below: redeclared_names(module),
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -504,16 +511,16 @@ pub fn extract_file_ir(
         })
         .collect();
     // A name some function or block declares again means something else
-    // there, and nothing here tracks which scope a use sits in, so it is no
+    // there, and a client is held by name across the file, so it is no
     // client anywhere in the file.
-    let redeclared = redeclared_names(module);
+    let redeclared = &module_scope.declared_below;
     module_scope
         .receivers
-        .retain(|name, _| !redeclared.contains(name));
+        .retain(|name, _| !redeclared.declares_name(name));
     module_scope.imports = imports
         .iter()
         .filter(|(name, import)| {
-            !import.namespace && !import.reassignable && !redeclared.contains(*name)
+            !import.namespace && !import.reassignable && !redeclared.declares_name(name)
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -545,13 +552,13 @@ pub fn extract_file_ir(
                         (reader.eval(init, &scope), reader.factory_call(init, &scope))
                     };
                     if let Some(client) = client
-                        && !redeclared.contains(&name)
+                        && !redeclared.declares_name(&name)
                     {
                         let client = module_scope.with_uses(client, &name);
                         file.module_clients.insert(name.clone(), client.clone());
-                        module_scope.receivers.insert(name.clone(), client);
+                        module_scope.receivers.insert(name, client);
                     }
-                    module_scope.consts.insert(name, value);
+                    module_scope.consts.insert(ident_key(&ident.id), value);
                 }
             }
         }
@@ -658,7 +665,10 @@ fn module_var_decl(item: &ModuleItem) -> Option<&VarDecl> {
 /// and the bindings that name a library client (carrick#1564).
 #[derive(Default)]
 struct ModuleScope {
-    consts: HashMap<String, Value>,
+    /// Each module-scope `const`, by binding: a block or a function that
+    /// declares the name again holds a binding of its own, which is not this
+    /// one (carrick#1648).
+    consts: HashMap<BindingKey, Value>,
     receivers: HashMap<String, ClientRef>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
@@ -671,6 +681,9 @@ struct ModuleScope {
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
+    /// Every declaration below module scope ([`redeclared_names`]): what a
+    /// function, a block or a parameter binds.
+    declared_below: Declarations,
 }
 
 impl ModuleScope {
@@ -1179,12 +1192,11 @@ fn object_consts(module: &Module) -> HashSet<String> {
     }
     let mut consts = ObjectConsts::default();
     module.visit_with(&mut consts);
-    let mut declared = DeclaredNames::default();
-    module.visit_with(&mut declared);
+    let declared = Declarations::of(module);
     consts
         .found
         .into_iter()
-        .filter(|name| declared.counts.get(name) == Some(&1))
+        .filter(|name| declared.name_count(name) == 1)
         .collect()
 }
 
@@ -1278,11 +1290,11 @@ struct ClassFields {
     receivers: HashMap<String, ClientRef>,
 }
 
-/// What a function written inside another can read of it.
+/// What a function written inside another can read of it, by binding.
 #[derive(Default)]
 struct Captured {
-    values: HashMap<String, Value>,
-    receivers: HashMap<String, ClientRef>,
+    values: HashMap<BindingKey, Value>,
+    receivers: HashMap<BindingKey, ClientRef>,
 }
 
 /// One module-scope binding an import introduces.
@@ -1648,10 +1660,10 @@ fn names_commonjs_exports(module: &Module) -> bool {
     names.found
 }
 
-/// Every name declared below module scope: in a function (its parameters
+/// Every declaration below module scope: in a function (its parameters
 /// included), a class, or a block.
-fn redeclared_names(module: &Module) -> HashSet<String> {
-    let mut names = DeclaredNames::default();
+fn redeclared_names(module: &Module) -> Declarations {
+    let mut names = Declarations::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(_) | ModuleDecl::TsImportEquals(_)) => {}
@@ -1670,68 +1682,17 @@ fn redeclared_names(module: &Module) -> HashSet<String> {
             },
         }
     }
-    names.names
-}
-
-/// Every binding a subtree declares.
-#[derive(Default)]
-struct DeclaredNames {
-    names: HashSet<String>,
-    /// How many times each is declared, for [`Reader::body`].
-    counts: HashMap<String, usize>,
-}
-
-impl DeclaredNames {
-    fn declare(&mut self, name: String) {
-        *self.counts.entry(name.clone()).or_default() += 1;
-        self.names.insert(name);
-    }
-}
-
-impl Visit for DeclaredNames {
-    fn visit_binding_ident(&mut self, ident: &BindingIdent) {
-        self.declare(ident.id.sym.to_string());
-    }
-
-    fn visit_fn_decl(&mut self, decl: &FnDecl) {
-        self.declare(decl.ident.sym.to_string());
-        decl.visit_children_with(self);
-    }
-
-    fn visit_class_decl(&mut self, decl: &ClassDecl) {
-        self.declare(decl.ident.sym.to_string());
-        decl.visit_children_with(self);
-    }
-
-    // `const h = function api() { … }`: the name is bound inside the
-    // function, where it is not the import (carrick#1568).
-    fn visit_fn_expr(&mut self, expr: &FnExpr) {
-        if let Some(ident) = &expr.ident {
-            self.declare(ident.sym.to_string());
-        }
-        expr.visit_children_with(self);
-    }
-
-    fn visit_class_expr(&mut self, expr: &ClassExpr) {
-        if let Some(ident) = &expr.ident {
-            self.declare(ident.sym.to_string());
-        }
-        expr.visit_children_with(self);
-    }
-
-    // A parameter named in a type (`(api: Api) => void`) binds nothing.
-    fn visit_ts_type(&mut self, _: &TsType) {}
-
-    fn visit_ts_interface_body(&mut self, _: &TsInterfaceBody) {}
+    names
 }
 
 /// What an expression can read: the function's parameters and constants, the
-/// enclosing class's fields, and the module's constants.
+/// enclosing class's fields, and the module's constants, each by the binding
+/// an identifier resolves to (carrick#1648).
 struct Scope<'a> {
-    params: Vec<Option<String>>,
-    locals: HashMap<String, Value>,
+    params: Vec<Option<BindingKey>>,
+    locals: HashMap<BindingKey, Value>,
     /// Locals holding a library client's instance (carrick#1564).
-    local_receivers: HashMap<String, ClientRef>,
+    local_receivers: HashMap<BindingKey, ClientRef>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -1747,38 +1708,43 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn param_index(&self, name: &str) -> Option<usize> {
-        self.params.iter().position(|p| p.as_deref() == Some(name))
+    /// The position of the parameter `ident` names, when it names one.
+    fn param_index(&self, ident: &Ident) -> Option<usize> {
+        let key = ident_key(ident);
+        self.params.iter().position(|p| p.as_ref() == Some(&key))
     }
 
-    /// The library client `name` holds here, if it holds one. A parameter or
+    /// The library client `ident` holds here, if it holds one. A parameter or
     /// a local of the same name is not the module's binding.
-    fn receiver(&self, name: &str) -> Option<&ClientRef> {
-        if self.param_index(name).is_some() {
+    fn receiver(&self, ident: &Ident) -> Option<&ClientRef> {
+        if self.param_index(ident).is_some() {
             return None;
         }
-        if let Some(client) = self.local_receivers.get(name) {
+        let key = ident_key(ident);
+        if let Some(client) = self.local_receivers.get(&key) {
             return Some(client);
         }
-        if self.locals.contains_key(name) {
+        if self.locals.contains_key(&key) {
             return None;
         }
-        self.module.receivers.get(name)
+        self.module.receivers.get(ident.sym.as_ref())
     }
 
-    /// The binding a call through `name` names as its client, by the same
+    /// The binding a call through `ident` names as its client, by the same
     /// scope rules as [`receiver`](Self::receiver), with an import of another
     /// module read as whatever that module declares (carrick#1568).
-    fn call_binding(&self, name: &str) -> Option<ClientBinding> {
-        if self.param_index(name).is_some() {
+    fn call_binding(&self, ident: &Ident) -> Option<ClientBinding> {
+        if self.param_index(ident).is_some() {
             return None;
         }
-        if let Some(client) = self.local_receivers.get(name) {
+        let key = ident_key(ident);
+        if let Some(client) = self.local_receivers.get(&key) {
             return Some(ClientBinding::Own(client.clone()));
         }
-        if self.locals.contains_key(name) {
+        if self.locals.contains_key(&key) {
             return None;
         }
+        let name = ident.sym.as_ref();
         match self.module.receivers.get(name) {
             Some(client) if client.instance.is_some() => {
                 Some(ClientBinding::Module(name.to_string()))
@@ -1969,7 +1935,7 @@ impl Reader<'_> {
                                     (&declarator.name, &declarator.init)
                                 {
                                     let value = self.eval(init, &scope);
-                                    scope.locals.insert(ident.id.sym.to_string(), value);
+                                    scope.locals.insert(ident_key(&ident.id), value);
                                 }
                             }
                         }
@@ -2036,7 +2002,7 @@ impl Reader<'_> {
         module: &ModuleScope,
         captured: &Captured,
     ) -> FnIr {
-        let params = function.params.iter().map(|p| pat_name(&p.pat)).collect();
+        let params = function.params.iter().map(|p| pat_key(&p.pat)).collect();
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
@@ -2059,7 +2025,7 @@ impl Reader<'_> {
         module: &ModuleScope,
         captured: &Captured,
     ) -> FnIr {
-        let params = arrow.params.iter().map(pat_name).collect();
+        let params = arrow.params.iter().map(pat_key).collect();
         let mut scope = Scope {
             params,
             locals: captured.values.clone(),
@@ -2077,17 +2043,19 @@ impl Reader<'_> {
 
     /// A function body, statement by statement, so a constant is readable
     /// by the statements after it. A binding assigned again anywhere in the
-    /// body is opaque everywhere.
+    /// body is opaque everywhere, and so is one the body declares twice (a
+    /// `var` written again inside a block is the same binding, carrick#1648).
     ///
     /// A constant built by a library client's factory call holds that
     /// client's instance (carrick#1564), unless the body declares its name a
     /// second time somewhere, where nothing here says which one a use means.
     fn body(&self, stmts: &[Stmt], scope: &mut Scope<'_>, ir: &mut FnIr) {
         let mut reassigned = Reassigned::default();
+        let mut declared = Declarations::default();
         for stmt in stmts {
             stmt.visit_with(&mut reassigned);
+            stmt.visit_with(&mut declared);
         }
-        let mut declared: Option<DeclaredNames> = None;
         for stmt in stmts {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
@@ -2096,30 +2064,26 @@ impl Reader<'_> {
                     }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
-                        let client = if reassigned.names.contains(&name) {
+                        let key = ident_key(&ident.id);
+                        let unsettled =
+                            reassigned.names.contains(&name) || declared.binding_count(&key) > 1;
+                        let client = if unsettled {
                             None
                         } else {
                             self.factory_call(init, scope)
                         };
-                        let value = if reassigned.names.contains(&name) {
+                        let value = if unsettled {
                             Value::opaque(name.clone())
                         } else {
                             bound(name.clone(), self.eval(init, scope))
                         };
-                        scope.locals.insert(name.clone(), value);
-                        scope.local_receivers.remove(&name);
-                        if let Some(client) = client {
-                            let declared = declared.get_or_insert_with(|| {
-                                let mut names = DeclaredNames::default();
-                                for stmt in stmts {
-                                    stmt.visit_with(&mut names);
-                                }
-                                names
-                            });
-                            if declared.counts.get(&name) == Some(&1) {
-                                let client = scope.module.with_uses(client, &name);
-                                scope.local_receivers.insert(name, client);
-                            }
+                        scope.locals.insert(key.clone(), value);
+                        scope.local_receivers.remove(&key);
+                        if let Some(client) = client
+                            && declared.name_count(&name) == 1
+                        {
+                            let client = scope.module.with_uses(client, &name);
+                            scope.local_receivers.insert(key, client);
                         }
                     }
                 }
@@ -2171,15 +2135,19 @@ impl Reader<'_> {
                     _ => Value::opaque(self.text(bin.span)),
                 }
             }
+            // The binding the identifier resolves to, never another of the
+            // same name (carrick#1648): a block that declares the name again
+            // holds a binding this pass does not read, so it is opaque.
             Expr::Ident(ident) => {
                 let name = ident.sym.as_ref();
-                if let Some(index) = scope.param_index(name) {
+                if let Some(index) = scope.param_index(ident) {
                     return Value::Str(vec![Piece::Param(index, name.to_string())]);
                 }
+                let key = ident_key(ident);
                 if let Some(value) = scope
                     .locals
-                    .get(name)
-                    .or_else(|| scope.module.consts.get(name))
+                    .get(&key)
+                    .or_else(|| scope.module.consts.get(&key))
                 {
                     // An object the file writes through holds keys its
                     // literal does not state (carrick#1564, third review).
@@ -2410,12 +2378,11 @@ impl Reader<'_> {
             return None;
         };
         let is_fetch = match &**callee {
-            // Only the global: a parameter or a local named `fetch` is
-            // someone's own function.
+            // Only the global: a parameter, a local or a block's own binding
+            // named `fetch` is someone's own function (carrick#1648).
             Expr::Ident(ident) => {
                 ident.sym == *"fetch"
-                    && scope.param_index("fetch").is_none()
-                    && !scope.locals.contains_key("fetch")
+                    && scope.module.declared_below.binding_count(&ident_key(ident)) == 0
             }
             Expr::Member(member) => {
                 member_prop(member).as_deref() == Some("fetch")
@@ -2601,7 +2568,7 @@ impl Reader<'_> {
             return None;
         };
         let factory = member_prop(member)?;
-        let client = scope.receiver(binding.sym.as_ref())?;
+        let client = scope.receiver(binding)?;
         if client.instance.is_some() {
             return None;
         }
@@ -2637,7 +2604,7 @@ impl Reader<'_> {
     fn call_receiver(&self, callee: &Expr, scope: &Scope<'_>) -> Option<CallReceiver> {
         match callee.unwrap_parens() {
             Expr::Ident(ident) => Some(CallReceiver {
-                client: scope.call_binding(ident.sym.as_ref())?,
+                client: scope.call_binding(ident)?,
                 member: None,
             }),
             Expr::Member(member) => {
@@ -2649,7 +2616,7 @@ impl Reader<'_> {
                 }
                 let member_name = member_prop(member)?;
                 let client = match member.obj.unwrap_parens() {
-                    Expr::Ident(ident) => scope.call_binding(ident.sym.as_ref())?,
+                    Expr::Ident(ident) => scope.call_binding(ident)?,
                     Expr::Member(field) if matches!(&*field.obj, Expr::This(_)) => {
                         ClientBinding::Own(field_receiver(field, scope)?.clone())
                     }
@@ -2748,20 +2715,19 @@ fn field_receiver<'s>(member: &MemberExpr, scope: &'s Scope<'_>) -> Option<&'s C
 
 /// The library instances a function written inside another can read: the
 /// enclosing function's, less any name it declares again itself.
-fn inherited_receivers<N>(captured: &Captured, node: &N) -> HashMap<String, ClientRef>
+fn inherited_receivers<N>(captured: &Captured, node: &N) -> HashMap<BindingKey, ClientRef>
 where
-    N: VisitWith<DeclaredNames>,
+    N: VisitWith<Declarations>,
 {
     if captured.receivers.is_empty() {
         return HashMap::new();
     }
-    let mut declared = DeclaredNames::default();
-    node.visit_with(&mut declared);
+    let declared = Declarations::of(node);
     captured
         .receivers
         .iter()
-        .filter(|(name, _)| !declared.names.contains(*name))
-        .map(|(name, client)| (name.clone(), client.clone()))
+        .filter(|((name, _), _)| !declared.declares_name(name))
+        .map(|(key, client)| (key.clone(), client.clone()))
         .collect()
 }
 
@@ -2793,7 +2759,7 @@ impl Visit for CallWalker<'_, '_, '_> {
         // `produce()`: the body invokes a parameter.
         let invokes_param = match &call.callee {
             Callee::Expr(callee) => match &**callee {
-                Expr::Ident(ident) => self.scope.param_index(ident.sym.as_ref()),
+                Expr::Ident(ident) => self.scope.param_index(ident),
                 _ => None,
             },
             _ => None,
@@ -2950,8 +2916,8 @@ impl CallWalker<'_, '_, '_> {
     /// the library instances this body holds.
     fn captured(&self) -> Captured {
         let mut values = self.scope.locals.clone();
-        for name in self.scope.params.iter().flatten() {
-            values.insert(name.clone(), Value::opaque(name.clone()));
+        for key in self.scope.params.iter().flatten() {
+            values.insert(key.clone(), Value::opaque(key.0.clone()));
         }
         Captured {
             values,
@@ -3030,14 +2996,6 @@ fn this_assignment(stmt: &Stmt) -> Option<(String, &Expr)> {
         MemberProp::Computed(_) => return None,
     };
     Some((name, &assign.right))
-}
-
-fn pat_name(pat: &Pat) -> Option<String> {
-    match pat {
-        Pat::Ident(ident) => Some(ident.id.sym.to_string()),
-        Pat::Assign(assign) => pat_name(&assign.left),
-        _ => None,
-    }
 }
 
 fn prop_name(key: &PropName) -> Option<String> {

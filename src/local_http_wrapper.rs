@@ -79,10 +79,11 @@
 
 use std::collections::HashMap;
 
-use swc_common::{SourceMap, SourceMapper, Spanned, SyntaxContext, sync::Lrc};
+use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::binding_scope::{BindingKey, pat_key};
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{is_request_options, literal_string, verb_from_callee_property};
 
@@ -117,9 +118,6 @@ const MAX_CONST_HOPS: usize = 8;
 /// An object literal with more properties than this is a table, not a request
 /// options bag or a URL, and is not kept in the `const` index.
 const MAX_INDEXED_OBJECT_PROPS: usize = 64;
-
-/// A binding's resolver identity: its name and syntax context.
-type BindingKey = (String, SyntaxContext);
 
 /// A part of the URL a wrapper builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -925,18 +923,6 @@ fn callee_property(call: &CallExpr) -> Option<String> {
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
-    }
-}
-
-/// The binding a parameter introduces, when it is a plain identifier.
-/// Destructured and rest parameters bind no single name and hold a position no
-/// argument can be read from.
-fn pat_key(pat: &Pat) -> Option<BindingKey> {
-    match pat {
-        Pat::Ident(ident) => Some((ident.id.sym.to_string(), ident.id.ctxt)),
-        // `path = "/default"`: the binding is the left side.
-        Pat::Assign(assign) => pat_key(&assign.left),
-        _ => None,
     }
 }
 

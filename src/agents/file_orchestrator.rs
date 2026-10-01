@@ -35,7 +35,7 @@ use crate::{
         WholeUrlFallbackMap, base_default_states_a_path, exported_env_aliases,
         exported_literal_bases, merge_imported_bindings, module_env_schema,
         resolve_target_env_alias, resolve_target_literal_base, resolve_whole_url_target,
-        whole_url_local_default,
+        whole_url_local_default, whole_url_target_binding,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -6130,8 +6130,13 @@ impl FileOrchestrator {
             // environment variable (carrick#572/#632). The method has to be
             // the call's own literal: the site states no path, so a verb
             // inferred from anything else would index the wrong operation.
+            //
+            // The tables are keyed by name, so the binding the call names has
+            // to be the one they describe (carrick#1648).
             if let RequestShapeSignal::Known(shape) = &candidate.request_shape
                 && let Some(snippet) = candidate.path_snippet.as_deref()
+                && whole_url_target_binding(snippet)
+                    .is_none_or(|binding| Self::binding_in_scope(candidate, binding))
                 && let Some(target) =
                     resolve_whole_url_target(snippet, aliases, whole_url_fallbacks)
             {
@@ -6169,9 +6174,14 @@ impl FileOrchestrator {
             // (carrick#744): `app.get(`${PREFIX}/users`, handler)` under
             // `const PREFIX = process.env.API_PREFIX || "/api"` writes this
             // shape to REGISTER a route, and the source says which it is.
+            //
+            // A base binding is read only where the call names the one the
+            // name-keyed alias table describes (carrick#1648).
             if let Some(base_path) = candidate.base_path_target.as_ref()
                 && let RequestShapeSignal::Known(shape) = &candidate.request_shape
-                && (base_path.base_reads_env || aliases.contains_key(&base_path.base))
+                && (base_path.base_reads_env
+                    || (Self::binding_in_scope(candidate, &base_path.base)
+                        && aliases.contains_key(&base_path.base)))
                 && !base_default_states_a_path(&base_path.base, env_fallbacks)
             {
                 let target = base_path.target();
@@ -6211,9 +6221,12 @@ impl FileOrchestrator {
             // inferred from elsewhere would index the wrong operation. And the
             // base has to state an ORIGIN: a base declared as a path is a
             // route prefix, and what is written after it is not another
-            // service's route.
+            // service's route. And, as for the env rule, the base the call
+            // names has to be the binding the literal was declared on
+            // (carrick#1648).
             if let Some(base_path) = candidate.base_path_target.as_ref()
                 && let RequestShapeSignal::Known(shape) = &candidate.request_shape
+                && Self::binding_in_scope(candidate, &base_path.base)
                 && let Some(literal) = literal_bases.get(&base_path.base)
                 && literal_base_states_an_origin(literal)
             {
@@ -6491,6 +6504,14 @@ impl FileOrchestrator {
             }
         }
         resolved
+    }
+
+    /// Whether a name-keyed table's entry for `name` describes the binding
+    /// the candidate's URL is read through (carrick#1648): the file declares
+    /// that name once, and the call names that declaration
+    /// ([`CandidateTarget::url_binding`]).
+    fn binding_in_scope(candidate: &CandidateTarget, name: &str) -> bool {
+        candidate.url_binding.as_deref() == Some(name)
     }
 
     /// The row a request summary states at a call site (carrick#1555).
@@ -15582,6 +15603,7 @@ export { routes };
             ),
             receiver_ident: Some(receiver.to_string()),
             base_path_target: None,
+            url_binding: None,
         }
     }
 
@@ -15876,6 +15898,7 @@ export { routes };
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
             receiver_ident: Some("router".to_string()),
             base_path_target: None,
+            url_binding: None,
         }
     }
 
@@ -17888,9 +17911,12 @@ export { routes };
     }
 
     /// A site that passes a whole-URL env-var binding straight to a request,
-    /// with the method stated as a literal in its own options bag.
+    /// with the method stated as a literal in its own options bag. The
+    /// binding is the file's one declaration of its name, as the scanner
+    /// reads it ([`CandidateTarget::url_binding`]).
     fn whole_url_site(binding: &str, method: &str) -> HashMap<String, CandidateTarget> {
         let mut candidate = candidate_with_snippet("c1", Some(binding));
+        candidate.url_binding = whole_url_target_binding(binding).map(str::to_string);
         candidate.callee_object = "fetch".to_string();
         candidate.callee_property = None;
         candidate.request_shape = RequestShapeSignal::Known(WrapperRequestShape {
@@ -17912,6 +17938,34 @@ export { routes };
                 (env_name.to_string(), fallback.to_string()),
             ]),
         )
+    }
+
+    /// carrick#1648: the alias tables are keyed by name, so a call whose
+    /// binding is not the file's one declaration of that name (a block
+    /// declares it again) is not read through them.
+    #[test]
+    fn a_whole_url_binding_the_tables_do_not_describe_states_no_row() {
+        let mut candidate_map = whole_url_site("askUrl", "POST");
+        for candidate in candidate_map.values_mut() {
+            candidate.url_binding = None;
+        }
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult::default(),
+            &candidate_map,
+            &HashMap::new(),
+            &[],
+            &aliases,
+            &paths,
+            &[],
+            "src/support.ts",
+            false,
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::WholeUrlEnv), 0);
+        assert!(result.data_calls.is_empty(), "{:#?}", result.data_calls);
     }
 
     /// carrick#632: `resolve_env_var_aliases` can only rewrite a row that
@@ -18273,7 +18327,9 @@ export { routes };
     }
 
     /// A site whose target opens with a base binding and continues with a
-    /// literal path, with the verb stated in its own options bag.
+    /// literal path, with the verb stated in its own options bag. The base is
+    /// the file's one declaration of its name, as the scanner reads it
+    /// ([`CandidateTarget::url_binding`]).
     fn literal_base_site(target: &str, method: &str) -> HashMap<String, CandidateTarget> {
         let mut candidate = candidate_with_snippet("c1", Some(target));
         candidate.callee_object = "fetch".to_string();
@@ -18285,8 +18341,10 @@ export { routes };
         let (base, path) = target
             .split_once('}')
             .expect("a base-plus-path target opens with an interpolation");
+        let base = base.trim_start_matches("${").to_string();
+        candidate.url_binding = Some(base.clone());
         candidate.base_path_target = Some(crate::swc_scanner::BasePathTarget {
-            base: base.trim_start_matches("${").to_string(),
+            base,
             base_reads_env: false,
             path: path.to_string(),
         });
@@ -18324,6 +18382,28 @@ export { routes };
         assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
         assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
         assert_eq!(result.data_calls[0].line_number, 12);
+    }
+
+    /// carrick#1648: the literal-base table is keyed by name, so a base the
+    /// file declares again in a block is not read through it.
+    #[test]
+    fn a_literal_base_the_table_does_not_describe_is_not_claimed() {
+        let bases =
+            LiteralBaseMap::from([("ADMIN_API".to_string(), "http://localhost:8080".to_string())]);
+        let mut candidate_map = literal_base_site("${ADMIN_API}/cache/${id}", "DELETE");
+        for candidate in candidate_map.values_mut() {
+            candidate.url_binding = None;
+        }
+
+        let (result, stats) = emit_and_join_with_literal_bases(
+            FileAnalysisResult::default(),
+            &candidate_map,
+            &bases,
+            "src/checks.ts",
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::LiteralBasePath), 0);
+        assert!(result.data_calls.is_empty(), "{:#?}", result.data_calls);
     }
 
     /// A base whose literal is a PATH states a route prefix, not an origin:

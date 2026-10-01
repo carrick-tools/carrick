@@ -25,6 +25,7 @@ use swc_ecma_ast::*;
 
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::binding_scope::Declarations;
 use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
 use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
@@ -135,6 +136,16 @@ pub struct CandidateTarget {
     /// the JSON candidate context the prompt receives is unchanged.
     #[serde(skip)]
     pub base_path_target: Option<BasePathTarget>,
+    /// The binding that leads this call's URL argument (`url` in
+    /// `fetch(url)`, `API` in `` `${API}/users` ``, `config` in
+    /// `fetch(config.url)`), when it is the one declaration the file makes of
+    /// that name (carrick#1648). The env-alias and literal-base tables a base
+    /// is read through are keyed by name alone, so a deterministic row reads
+    /// one only for this binding: a block that declares the name again, or a
+    /// second function with one of its own, holds a different value. Not
+    /// serialized, for the same reason as `request_spec`.
+    #[serde(skip)]
+    pub url_binding: Option<String>,
 }
 
 /// The HTTP method and URL a call declares as data on one object-literal
@@ -546,6 +557,7 @@ impl SwcScanner {
             new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
+            Declarations::of(&module),
         );
         module.visit_with(&mut visitor);
 
@@ -637,6 +649,7 @@ impl SwcScanner {
             new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
+            Declarations::of(&module),
         );
         module.visit_with(&mut visitor);
 
@@ -1696,6 +1709,21 @@ fn quasi_text(quasi: &TplElement) -> String {
         .unwrap_or_else(|| quasi.raw.to_string())
 }
 
+/// The identifier a URL expression opens with: the expression itself, the
+/// root of a member chain (`config` in `config.url`), the first interpolation
+/// of a template that opens with one, or the left-most operand of a `+`.
+fn leading_ident(expr: &Expr) -> Option<&Ident> {
+    match unwrap_expr(expr) {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Member(member) => leading_ident(&member.obj),
+        Expr::Tpl(tpl) if quasi_text(tpl.quasis.first()?).is_empty() => {
+            leading_ident(tpl.exprs.first()?)
+        }
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => leading_ident(&bin.left),
+        _ => None,
+    }
+}
+
 /// Flatten a left-associated `a + b + c` into its parts, in source order.
 /// Anything that is not an addition is one part.
 fn flatten_add_parts<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
@@ -2211,9 +2239,12 @@ struct CandidateVisitor {
     /// fn)` from becoming a phantom subscriber. Empty when the repo detected
     /// no messaging clients.
     messaging_import_locals: HashSet<String>,
+    /// Every declaration in the file, for [`CandidateTarget::url_binding`].
+    declarations: Declarations,
 }
 
 impl CandidateVisitor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source_map: Lrc<SourceMap>,
         network_import_locals: HashSet<String>,
@@ -2222,6 +2253,7 @@ impl CandidateVisitor {
         new_url_paths: NewUrlPathMap,
         repo_has_messaging_clients: bool,
         messaging_import_locals: HashSet<String>,
+        declarations: Declarations,
     ) -> Self {
         Self {
             candidates: Vec::new(),
@@ -2237,6 +2269,7 @@ impl CandidateVisitor {
             repo_has_messaging_clients,
             pubsub_anchor_ops: Vec::new(),
             messaging_import_locals,
+            declarations,
         }
     }
 
@@ -2682,6 +2715,7 @@ impl CandidateVisitor {
         // (carrick#733). Structural, and read here rather than from the
         // snippet above: the snippet is one truncated line.
         let base_path_target = self.base_path_target(call);
+        let url_binding = self.url_binding(call);
 
         self.candidates.push(CandidateTarget {
             protocol: Protocol::Http,
@@ -2700,7 +2734,22 @@ impl CandidateVisitor {
             request_shape,
             receiver_ident,
             base_path_target,
+            url_binding,
         });
+    }
+
+    /// The binding that leads `call`'s URL argument, when the file declares
+    /// its name once and this identifier is that declaration
+    /// ([`CandidateTarget::url_binding`]).
+    fn url_binding(&self, call: &CallExpr) -> Option<String> {
+        let arg = call.args.first()?;
+        if arg.spread.is_some() {
+            return None;
+        }
+        let ident = leading_ident(&arg.expr)?;
+        self.declarations
+            .is_sole_binding(ident)
+            .then(|| ident.sym.to_string())
     }
 
     /// Emit a candidate from a raw span (for nodes that are not call
@@ -2741,6 +2790,7 @@ impl CandidateVisitor {
             request_shape: RequestShapeSignal::NotARequest,
             receiver_ident: None,
             base_path_target: None,
+            url_binding: None,
         });
     }
 
@@ -5373,6 +5423,7 @@ async function fetchUser(id: string) {
             request_shape: RequestShapeSignal::NotARequest,
             receiver_ident: Some("app".to_string()),
             base_path_target: None,
+            url_binding: None,
         };
 
         let hint = candidate.format_hint();
@@ -5817,6 +5868,57 @@ async function health() {
                 "/api/health".to_string()
             )]
         );
+    }
+
+    /// carrick#1648: the binding a call's URL opens with is named only when it
+    /// is the file's one declaration of that name, in every spelling the
+    /// name-keyed base tables are read for.
+    #[test]
+    fn the_url_binding_is_named_only_where_the_file_declares_it_once() {
+        let url_bindings = |content: &str| -> Vec<Option<String>> {
+            scan_test_content(content)
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.url_binding)
+                .collect()
+        };
+        let sole = r#"
+import { config } from './config';
+const API = process.env.API_URL;
+const answer = process.env.ANSWER_URL ?? 'http://localhost:7100/api/answer';
+async function run(id: string) {
+  await fetch(`${API}/users/${id}`, { method: 'GET' });
+  await fetch(API + '/users', { method: 'POST' });
+  await fetch(answer, { method: 'POST' });
+  return fetch(config.url, { method: 'PUT' });
+}
+"#;
+        assert_eq!(
+            url_bindings(sole),
+            vec![
+                Some("API".to_string()),
+                Some("API".to_string()),
+                Some("answer".to_string()),
+                Some("config".to_string()),
+            ]
+        );
+
+        let shadowed = r#"
+const API = process.env.API_URL;
+async function outer() {
+  return fetch(`${API}/users`, { method: 'GET' });
+}
+async function inner(internal: boolean) {
+  if (internal) {
+    const API = '/internal';
+    return fetch(`${API}/users`, { method: 'POST' });
+  }
+}
+async function global() {
+  return fetch(`${process.env.API_URL}/users`, { method: 'GET' });
+}
+"#;
+        assert_eq!(url_bindings(shadowed), vec![None, None, None]);
     }
 
     /// The shapes that state no base-plus-path: a bare literal, a target that

@@ -4,6 +4,7 @@ pub mod analysis_channel;
 pub mod analysis_job;
 pub mod analyzer;
 pub mod app_context;
+pub mod binding_scope;
 pub mod boundary;
 pub mod call_base;
 pub mod call_graph;

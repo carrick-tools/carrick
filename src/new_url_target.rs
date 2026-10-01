@@ -42,15 +42,18 @@
 //!   path at all.
 //!
 //! The value reaches the request either directly, or through a binding
-//! declared in the same function (or an enclosing one). Scope is tracked with
-//! a stack rather than a flat name map, because one client class declares
-//! `const url = new URL(…)` in every method it has, and a flat map keyed on
-//! `url` would collide on every one of them.
+//! declared in the same function (or an enclosing one). A binding is read by
+//! the one the identifier resolves to ([`crate::binding_scope`]), never by
+//! its name: one client class declares `const url = new URL(…)` in every
+//! method it has, and a block that declares `url` again holds a value of its
+//! own (carrick#1648).
 
 use std::collections::HashMap;
 use swc_common::{SourceMap, SourceMapper, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::binding_scope::{BindingKey, ident_key};
 
 /// Maps the start byte offset of a call expression to the path stated by the
 /// `new URL(path, base)` supplying its target.
@@ -95,8 +98,9 @@ impl Collector<'_> {
 pub(crate) struct UrlBindings<'a> {
     source_map: &'a Lrc<SourceMap>,
     /// One frame per enclosing function, outermost (module) first. Each maps a
-    /// binding name to the path the `new URL` it was declared from states.
-    scopes: Vec<HashMap<String, String>>,
+    /// binding to the path the `new URL` it was declared from states, or to
+    /// `None` when its declarations state none ([`Self::declare`]).
+    scopes: Vec<HashMap<BindingKey, Option<String>>>,
 }
 
 impl<'a> UrlBindings<'a> {
@@ -107,8 +111,8 @@ impl<'a> UrlBindings<'a> {
         }
     }
 
-    /// Enter a function's scope. One client class declares `const url` in every
-    /// method it has, and a flat map keyed on `url` would collide on all of them.
+    /// Enter a function's scope: what it declares is gone once the walk
+    /// leaves it.
     pub(crate) fn push(&mut self) {
         self.scopes.push(HashMap::new());
     }
@@ -118,18 +122,22 @@ impl<'a> UrlBindings<'a> {
     }
 
     /// Record `const url = new URL(path, base)` in the innermost scope. A
-    /// declarator that states no path records nothing.
+    /// declarator that states no path holds none, and a binding declared a
+    /// second time (a `var` written again in a block) holds whichever ran
+    /// last, which nothing here says, so it states none either.
     pub(crate) fn declare(&mut self, node: &VarDeclarator) {
-        if let Pat::Ident(binding) = &node.name
-            && let Some(init) = &node.init
-            && let Some(path) = self.stated_path(init)
-        {
-            let frame = self
-                .scopes
-                .last_mut()
-                .expect("the module frame is never popped");
-            frame.insert(binding.id.sym.to_string(), path);
-        }
+        let Pat::Ident(binding) = &node.name else {
+            return;
+        };
+        let path = node.init.as_deref().and_then(|init| self.stated_path(init));
+        let frame = self
+            .scopes
+            .last_mut()
+            .expect("the module frame is never popped");
+        frame
+            .entry(ident_key(&binding.id))
+            .and_modify(|held| *held = None)
+            .or_insert(path);
     }
 
     /// The path an expression handed to a request states, if any: a `new URL`
@@ -138,7 +146,7 @@ impl<'a> UrlBindings<'a> {
     pub(crate) fn stated_path(&self, expr: &Expr) -> Option<String> {
         match unwrap_transparent(expr) {
             Expr::New(new_expr) => self.new_url_path(new_expr),
-            Expr::Ident(ident) => self.lookup(ident.sym.as_ref()),
+            Expr::Ident(ident) => self.lookup(ident),
             // `url.href`.
             Expr::Member(member) if is_prop(&member.prop, "href") => self.stated_path(&member.obj),
             Expr::Call(call) => match &call.callee {
@@ -161,12 +169,15 @@ impl<'a> UrlBindings<'a> {
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<String> {
+    /// The path the binding `ident` resolves to was declared with.
+    fn lookup(&self, ident: &Ident) -> Option<String> {
+        let key = ident_key(ident);
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name))
+            .find_map(|scope| scope.get(&key))
             .cloned()
+            .flatten()
     }
 
     /// The absolute path `new URL(path, base)` states in its first argument.
@@ -361,6 +372,48 @@ mod tests {
         // third: its `url` is declared in neither its own scope nor an
         // enclosing one.
         assert_eq!(paths(source), vec!["/api/v2/first", "/api/v2/second"]);
+    }
+
+    /// carrick#1648: a block that declares the name again holds its own
+    /// value, whether or not that value is a `new URL`.
+    #[test]
+    fn a_binding_a_block_declares_again_is_read_as_the_blocks_own() {
+        let source = r#"
+            const target = new URL("/api/v2/module", process.env.BASE);
+            async function shadowed(raw: boolean) {
+              if (raw) {
+                const target = "/api/v2/raw";
+                return fetch(target, { method: "POST" });
+              }
+            }
+            async function inner(base: string) {
+              const link = new URL("/api/v2/outer", base);
+              if (base) {
+                const link = new URL("/api/v2/inner", base);
+                await fetch(link, { method: "PUT" });
+              }
+              return fetch(link, { method: "GET" });
+            }
+        "#;
+        // Nothing for the raw string; the inner block's own path at its own
+        // call; the outer path after the block.
+        assert_eq!(paths(source), vec!["/api/v2/inner", "/api/v2/outer"]);
+    }
+
+    /// A `var` written again in a block is one binding holding whichever
+    /// declaration ran last.
+    #[test]
+    fn a_var_declared_twice_states_no_path() {
+        let source = r#"
+            async function run(base: string, flag: boolean) {
+              var url = new URL("/api/v2/first", base);
+              if (flag) {
+                var url = new URL("/api/v2/second", base);
+              }
+              return fetch(url, { method: "POST" });
+            }
+        "#;
+        assert_eq!(paths(source), Vec::<String>::new());
     }
 
     #[test]

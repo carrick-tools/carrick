@@ -4,6 +4,7 @@ mod analysis_channel;
 mod analysis_job;
 mod analyzer;
 mod app_context;
+mod binding_scope;
 mod boundary;
 mod call_base;
 mod call_graph;
