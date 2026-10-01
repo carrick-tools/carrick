@@ -607,8 +607,8 @@ function scopeStep(claim: ScopeClaim): string {
  * A message check names a receiver its claim can be read on. A maker is read
  * on the export itself. An op, scope or reserved name claimed `on` the export
  * is read there only, one claimed `on` instances only on an instance, and one
- * claimed `of` a maker only on that maker's instances (the scope step, if
- * any, follows the instance it was read on). A claim read on a receiver it
+ * claimed `of` a maker on no other maker's instances (the scope step, if any,
+ * follows the instance it was read on). A claim read on a receiver it
  * was not claimed for could verify a member of the same name with another
  * shape (`client.write(name, value)` against `instance.write(value)`).
  */
@@ -619,7 +619,9 @@ function fitsReceiver(check: LibraryCheck): boolean {
   if (claim.kind === 'make') return check.receiver === 'export';
   if (claim.on === 'export' && receiver.base !== 'export') return false;
   if (claim.on === 'instance' && receiver.maker === undefined) return false;
-  if (claim.of !== undefined && receiver.maker?.member !== claim.of) return false;
+  // `of` names the maker whose instances the claim is for; it says nothing
+  // about the export, which an `on: both` claim is also read on.
+  if (claim.of !== undefined && receiver.maker !== undefined && receiver.maker.member !== claim.of) return false;
   return true;
 }
 

@@ -69,6 +69,15 @@ export declare const tasks: {
 // Two overloads, each with a string key the other lacks.
 export declare function pipeline(options: { id: string; run: (payload: unknown) => Promise<unknown>; queue: string }): Task<unknown>;
 export declare function pipeline(options: { id: string; run: (payload: unknown) => Promise<unknown>; tag: string }): ScheduledTask;
+// An op written the same way on the export and on the instances its makers build.
+export interface Topic {
+  publish(topic: string, payload: unknown): Promise<void>;
+}
+export declare const broker: {
+  publish(topic: string, payload: unknown): Promise<void>;
+  connect(options: { url: string }): Topic;
+  reconnect(options: { url: string }): Topic;
+};
 // A maker one level below the export.
 export declare const schedules: {
   task(options: { id: string; run: (payload: unknown) => Promise<unknown>; cron: number }): ScheduledTask;
@@ -615,6 +624,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       op('send', 'trigger', { name: { bound: 'maker' }, payload: { arg: 0 }, ...parts });
     const exportSend = (parts: Record<string, unknown>) =>
       op('send', 'trigger', { name: { arg: 0 }, payload: { arg: 1 }, ...parts });
+    const publishBoth = op('send', 'publish', { name: { arg: 0 }, payload: { arg: 1 }, on: 'both', of: 'connect' });
     const checks = [
       check(T, 'task', 'broker', 'export', definition),
       check(T, 'schedules', 'broker', 'export', scheduled),
@@ -631,6 +641,12 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       check(T, 'task', 'broker', 'instance:()', bound({ on: 'both' })),
       // A reserved name claimed for the export, asked on an instance.
       check(T, 'task', 'broker', 'instance:()', reserved('trigger', 'x', { on: 'export' })),
+      // Claimed on the export and on one maker's instances: of says nothing about the export leg.
+      check(T, 'broker', 'broker', 'export', make('call', 'connect', { base_key: 'url' })),
+      check(T, 'broker', 'broker', 'export', make('call', 'reconnect', { base_key: 'url' })),
+      check(T, 'broker', 'broker', 'export', publishBoth),
+      check(T, 'broker', 'broker', 'instance:connect', publishBoth),
+      check(T, 'broker', 'broker', 'instance:reconnect', publishBoth),
     ];
     assert.deepStrictEqual(verdicts(await send(checks)), [
       'verified',
@@ -639,6 +655,11 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'unchecked receiver_invalid',
       'unchecked receiver_invalid',
       'unchecked receiver_invalid',
+      'verified',
+      'verified',
+      'verified',
+      'unchecked receiver_invalid',
+      'verified',
       'verified',
       'verified',
       'verified',
