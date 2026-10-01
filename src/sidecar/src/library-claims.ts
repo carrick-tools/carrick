@@ -1570,7 +1570,9 @@ class DeclarationReader {
    */
   private handlerFailure(declared: Slot | undefined): Outcome | undefined {
     if (declared === undefined) return failed('param_missing');
-    const slot = this.throughConstraint(declared);
+    // A listener typed by deferred conditional machinery (`ListenerOf<Ev>`)
+    // is read through its branches; one that says nothing is untyped.
+    const slot = this.throughConditional(this.throughConstraint(declared));
     if (slot === VARIADIC) return unchecked('handler_untyped');
     const parts = this.parts(slot);
     if (parts.length === 0) return failed('handler_not_function');

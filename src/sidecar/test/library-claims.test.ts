@@ -179,6 +179,7 @@ export interface Channel<Events extends EventMap = EventMap> {
   onRest(topic: string, handler: (...args: any[]) => void): void;
   onOptions(topic: string, options: { retry?: number }): void;
   onTyped(topic: string, handler: Handler): void;
+  onDeferred<K extends string>(topic: K, handler: K extends 'error' ? (error: Error) => void : any): void;
   define(options: { id: string; run: Handler }): void;
   defineDescribed(options: { id: string; description?: string; run: Handler }): void;
   defineSplit(options: { id: string } | { run: Handler }): void;
@@ -496,7 +497,7 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
   it('refuses a handler typed Function, any, unknown or (...args: any[]), and an options object as a handler', async () => {
     const R = 'fixture-rules';
     const on = (member: string) => check(R, 'channel', 'broker', 'export', op('receive', member, { name: { arg: 0 }, handler: { arg: 1 } }));
-    const checks = ['onTyped', 'onAny', 'onUnknown', 'onFunction', 'onRest', 'onOptions'].map(on);
+    const checks = ['onTyped', 'onAny', 'onUnknown', 'onFunction', 'onRest', 'onOptions', 'onDeferred'].map(on);
     assert.deepStrictEqual(verdicts(await verify(checks)), [
       'verified',
       'unchecked handler_untyped',
@@ -504,6 +505,8 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'unchecked handler_untyped',
       'unchecked handler_untyped',
       'failed handler_not_function',
+      // Conditional machinery with an any branch says nothing.
+      'unchecked handler_untyped',
     ]);
   });
 
