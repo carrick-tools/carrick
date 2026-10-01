@@ -429,6 +429,18 @@ impl SiteReader<'_> {
             else {
                 continue;
             };
+            // So is an instance such a call made: what it holds is that
+            // function's return, not a package's.
+            if let Some(instance) = &client.instance
+                && instance.form == MakerForm::Call
+                && self
+                    .inputs
+                    .sites
+                    .target(declared_in, instance.site.lo)
+                    .is_some()
+            {
+                continue;
+            }
             let receiver = match &client.instance {
                 None => SiteReceiver::Export,
                 Some(instance) => SiteReceiver::Instance(SiteMaker {
@@ -1154,6 +1166,40 @@ mod tests {
             "{sites:#?}"
         );
         site(&sites, "src/queue.ts", 3, Some("add"));
+    }
+
+    /// A call the call graph resolves to a function of this service is that
+    /// function's, and so is what it returns: a package of the repo's own
+    /// (carrick#1666) is read through its source, never as a library.
+    #[test]
+    fn a_call_into_the_service_s_own_package_is_no_site() {
+        let sites = sites_of(&[
+            (
+                "packages/jobs/package.json",
+                "{ \"name\": \"@fixture/jobs-local\", \"main\": \"src/index.ts\" }\n",
+            ),
+            (
+                "packages/jobs/src/index.ts",
+                "export function task(options: { id: string }) {\n\
+                 \x20 return { trigger: (payload: unknown) => options.id };\n\
+                 }\n",
+            ),
+            (
+                "src/tasks.ts",
+                "import { task } from \"@fixture/jobs-local\";\n\
+                 import { Queue } from \"@fixture/queue\";\n\
+                 export const nightly = task({ id: \"nightly\" });\n\
+                 export function run() { return nightly.trigger({}); }\n\
+                 export const emails = new Queue(\"emails\");\n\
+                 export function send() { return emails.add(\"welcome\", {}); }\n",
+            ),
+        ]);
+        let in_tasks: Vec<(u32, Option<&str>)> = sites
+            .iter()
+            .filter(|site| site.file.ends_with("src/tasks.ts"))
+            .map(|site| (site.line, site.member.as_deref()))
+            .collect();
+        assert_eq!(in_tasks, vec![(5, None), (6, Some("add"))], "{sites:#?}");
     }
 
     /// Who holds an instance: a function's own `const` is read, and a class
