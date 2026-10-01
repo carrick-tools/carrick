@@ -280,6 +280,19 @@ jobs:
         working-directory: src/sidecar
         run: node --test dist/test/lister/lister-artifact.test.js dist/test/library-surface.test.js
 
+  # The release steps that decide what a release attaches and announces
+  # (scripts/release-artifacts.sh), dry-run with `gh` stubbed: a surface
+  # lister that fails to build or test must still leave the matcher attached
+  # and announced. A tag is the only other place these steps run.
+  release-artifact-steps:
+    name: Release artifact steps (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Dry-run the release steps with a failed and a passed lister
+        run: bash scripts/release-artifacts.test.sh
+
   wasm-match:
     name: carrick-match wasm smoke
     runs-on: ubuntu-latest

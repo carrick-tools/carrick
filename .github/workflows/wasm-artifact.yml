@@ -42,6 +42,15 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
+      # The release steps' script from this workflow's own commit, not the
+      # tag's: a backfill of a tag from before the script still runs it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          sparse-checkout: scripts/release-artifacts.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -106,17 +115,30 @@ jobs:
         working-directory: wasm-artifact
         run: sha256sum carrick_match.js carrick_match.d.ts carrick_match_bg.wasm > carrick_match.sha256
 
+      # The matcher first: whatever happens to the lister below, the matcher
+      # is attached and announced, because its pin bump is what every cloud
+      # deploy waits on.
+      - name: Attach the matcher to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: bash release-tools/scripts/release-artifacts.sh upload-matcher "$TAG"
+
       # The surface lister (carrick#1660): the sidecar at this tag in one
       # self-contained file, and the manifest the library store's pin copies.
-      # A tag from before the lister has no build script, and its release
-      # carries the matcher only.
+      # Its steps never stop the job: a failure is a warning here, the lister
+      # is neither attached nor announced, and the last step fails the job so
+      # it is seen. A tag from before the lister has no build script, and its
+      # release carries the matcher only.
       - name: Build the surface lister
-        id: lister
+        id: lister_build
+        continue-on-error: true
+        timeout-minutes: 15
         env:
           TAG: ${{ inputs.tag }}
         run: |
           if [ ! -f src/sidecar/lister/build.mjs ]; then
-            echo "No surface lister at ${TAG}; attaching the matcher only."
             echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -127,34 +149,36 @@ jobs:
       # On the store's Node 22 (set up above), against the exact bytes
       # attached below.
       - name: Test the surface lister on Node 22
-        if: steps.lister.outputs.built == 'true'
+        id: lister_test
+        if: steps.lister_build.outputs.built == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
         working-directory: src/sidecar
         env:
           CARRICK_LISTER_ARTIFACT: ${{ github.workspace }}/lister-artifact/carrick-lister.mjs
         run: node --test dist/test/lister/lister-artifact.test.js dist/test/library-surface.test.js
 
-      - name: Attach assets to release
+      - name: Decide whether the surface lister ships
+        id: lister
+        env:
+          BUILD_OUTCOME: ${{ steps.lister_build.outcome }}
+          BUILT: ${{ steps.lister_build.outputs.built }}
+          TEST_OUTCOME: ${{ steps.lister_test.outcome }}
+        run: bash release-tools/scripts/release-artifacts.sh lister-status
+
+      - name: Attach the surface lister to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LISTER_BUILT: ${{ steps.lister.outputs.built }}
-        run: |
-          files=(
-            wasm-artifact/carrick_match.js
-            wasm-artifact/carrick_match.d.ts
-            wasm-artifact/carrick_match_bg.wasm
-            wasm-artifact/carrick_match.sha256
-          )
-          if [ "$LISTER_BUILT" = "true" ]; then
-            files+=(lister-artifact/carrick-lister.mjs lister-artifact/carrick-lister.manifest.json)
-          fi
-          gh release upload "${{ inputs.tag }}" "${files[@]}" \
-            --clobber --repo "${{ github.repository }}"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          LISTER_OK: ${{ steps.lister.outputs.ok }}
+        run: bash release-tools/scripts/release-artifacts.sh upload-lister "$TAG"
 
       # Fires .github/workflows/wasm-pin-bump.yml in carrick-cloud, which
       # opens the pin-bump PR against the freshly attached assets. The same
-      # event carries the lister manifest's sha256 when this release has a
-      # lister, so the cloud can verify the manifest it downloads before it
-      # copies the lister pin from it (carrick-cloud#1579). The default
+      # event carries the lister manifest's sha256 when the lister passed, so
+      # the cloud can verify the manifest it downloads before it copies the
+      # lister pin from it (carrick-cloud#1579). The default
       # GITHUB_TOKEN cannot dispatch cross-repo: CARRICK_CLOUD_DISPATCH_TOKEN
       # is a fine-grained PAT with contents:write + pull-requests:write on
       # carrick-tools/carrick-cloud. Assets are already attached by this point,
@@ -164,26 +188,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
           TAG: ${{ inputs.tag }}
-          LISTER_BUILT: ${{ steps.lister.outputs.built }}
+          LISTER_OK: ${{ steps.lister.outputs.ok }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "CARRICK_CLOUD_DISPATCH_TOKEN is not set; assets are attached but carrick-cloud was not notified." >&2
             exit 1
           fi
-          SOURCE_SHA="$(git rev-parse HEAD)"
-          JS_SHA="$(awk '$2 == "carrick_match.js" {print $1}' wasm-artifact/carrick_match.sha256)"
-          DTS_SHA="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
-          WASM_SHA="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
-          lister=()
-          if [ "$LISTER_BUILT" = "true" ]; then
-            MANIFEST_SHA="$(sha256sum lister-artifact/carrick-lister.manifest.json | awk '{print $1}')"
-            lister=(-f "client_payload[lister_manifest_sha256]=$MANIFEST_SHA")
-          fi
-          gh api "repos/carrick-tools/carrick-cloud/dispatches" \
-            -f event_type=carrick-match-release \
-            -f "client_payload[tag]=$TAG" \
-            -f "client_payload[source_sha]=$SOURCE_SHA" \
-            -f "client_payload[js_sha256]=$JS_SHA" \
-            -f "client_payload[dts_sha256]=$DTS_SHA" \
-            -f "client_payload[wasm_sha256]=$WASM_SHA" \
-            "${lister[@]}"
+          SOURCE_SHA="$(git rev-parse HEAD)" bash release-tools/scripts/release-artifacts.sh dispatch "$TAG"
+
+      # Last, so the matcher is attached and announced first: a lister that
+      # failed to build or test fails the job here, where it is seen.
+      - name: Surface lister failed
+        if: always() && steps.lister.outputs.status == 'failed'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          echo "::error title=Surface lister not released::The surface lister failed to build or test at ${TAG}. The matcher was attached and announced; the lister was not. Fix it and re-run this workflow with workflow_dispatch for this tag."
+          exit 1
