@@ -261,9 +261,11 @@ pub struct ApiEndpointDetails {
     ///
     /// `None` on an operation that does not come from the HTTP emit/join phase
     /// (GraphQL, socket and pub/sub ops are indexed by their own extractions)
-    /// and on every blob written before the field existed. Absence reads as
+    /// and on every blob written before the field existed, except the model's
+    /// own pub/sub rows, which say `model` (carrick#1626). Absence reads as
     /// "not stated by this scan", never as "the model said it". Nothing in
-    /// matching or type compatibility reads it.
+    /// matching or type compatibility reads it; the findings fold does
+    /// ([`crate::findings::EdgeSource::fold`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     /// For endpoints: whether the module serving the route also renders a
@@ -415,6 +417,26 @@ fn parse_producer_key(key: &str) -> Option<(String, String)> {
         _ => None,
     }
 }
+
+/// The exact-key protocol a [`PairCheckOutcome`]'s pseudo-method names, the
+/// inverse of the pseudo-methods [`parse_producer_key`] writes; `None` for an
+/// HTTP verb.
+fn exact_key_protocol(pseudo_method: &str) -> Option<crate::operation::Protocol> {
+    use crate::operation::Protocol;
+    match pseudo_method {
+        "SOCKET" => Some(Protocol::Websocket),
+        "GRAPHQL" => Some(Protocol::Graphql),
+        "PUBSUB" => Some(Protocol::Pubsub),
+        _ => None,
+    }
+}
+
+/// A consumer row as a verdict names it (carrick#1626): its protocol, its
+/// operation's join identity, and its call site. Two rows on one line are
+/// told apart by protocol (an HTTP request and a publish) and, for the
+/// exact-key protocols, by operation (two publishes). An HTTP row's identity
+/// is empty: its verdict names the producer's path, not the call's.
+type ConsumerRowKey = (crate::operation::Protocol, String, String, u32);
 
 /// Reconstruct a verified endpoint's DISPLAY `(method_or_label, path_or_name)`
 /// from a canonical `OperationKey` string, matching [`OperationKey::display_labels`]
@@ -3393,15 +3415,23 @@ impl Analyzer {
                 // this verdict was reached at. The consumer key is the stored
                 // (unstripped) location, matching how the data calls are keyed;
                 // `apply_pair_outcomes` reads a zero line as line 1, so this
-                // does too.
-                let consumer_key = (
-                    outcome.consumer_file.clone(),
-                    if outcome.consumer_line == 0 {
-                        1
-                    } else {
-                        outcome.consumer_line
-                    },
-                );
+                // does too. It names the protocol and, for an exact-key
+                // protocol, the operation, so a row on the same line of another
+                // protocol or topic is never the one read (carrick#1626).
+                let consumer_key: ConsumerRowKey = match exact_key_protocol(&method) {
+                    Some(protocol) => (
+                        protocol,
+                        normalize_compat_path(&outcome.identity),
+                        outcome.consumer_file.clone(),
+                        outcome.consumer_line.max(1),
+                    ),
+                    None => (
+                        crate::operation::Protocol::Http,
+                        String::new(),
+                        outcome.consumer_file.clone(),
+                        outcome.consumer_line.max(1),
+                    ),
+                };
                 let mut sources = self.producer_resolution_sources_for(&method, &path);
                 match consumer_sources.get(&consumer_key) {
                     Some(source) => sources.push(*source),
@@ -3454,16 +3484,47 @@ impl Analyzer {
             .collect()
     }
 
+    /// The non-HTTP producer rows behind a compat verdict (carrick#1626): every
+    /// endpoint whose canonical key recovers the outcome's `(pseudo-method,
+    /// identity)` through [`parse_producer_key`], the join the edge overlay
+    /// already uses, with the same param-agnostic normalization. Empty for an
+    /// HTTP verb, whose producers are the mount graph's routes.
+    fn exact_key_producers<'a>(
+        &'a self,
+        pseudo_method: &'a str,
+        identity: &str,
+    ) -> impl Iterator<Item = &'a ApiEndpointDetails> + 'a {
+        let want = exact_key_protocol(pseudo_method).map(|_| normalize_compat_path(identity));
+        self.endpoints.iter().filter(move |endpoint| {
+            let Some(want) = want.as_deref() else {
+                return false;
+            };
+            endpoint.key.protocol() != crate::operation::Protocol::Http
+                && parse_producer_key(&endpoint.key.canonical()).is_some_and(|(method, path)| {
+                    method == pseudo_method && normalize_compat_path(&path) == want
+                })
+        })
+    }
+
     /// Provenance of the producer behind a compat verdict, joined against
     /// the mount graph's resolved endpoints by `(METHOD, path)` — the same
-    /// param-name-agnostic path normalization the compat overlay uses. When
-    /// several producers share the key, route-wins (`.min()`); an unmatched
-    /// key (non-HTTP labels, no mount graph) conservatively reads as `Route`.
+    /// param-name-agnostic path normalization the compat overlay uses — or,
+    /// for a socket, GraphQL or pub/sub verdict, against the index's own
+    /// producer rows ([`Self::exact_key_producers`]). When several producers
+    /// share the key, route-wins (`.min()`); an unmatched key conservatively
+    /// reads as `Route`.
     fn producer_provenance_for(
         &self,
         method: &str,
         path: &str,
     ) -> crate::operation::EndpointProvenance {
+        if exact_key_protocol(method).is_some() {
+            return self
+                .exact_key_producers(method, path)
+                .map(|endpoint| endpoint.provenance)
+                .min()
+                .unwrap_or_default();
+        }
         let Some(mount_graph) = self.mount_graph.as_ref() else {
             return Default::default();
         };
@@ -3488,11 +3549,20 @@ impl Analyzer {
     /// row among them makes the pairing a candidate however the other rows
     /// were stated. Empty when nothing matched, which the fold reads as
     /// "cannot say" rather than as a fact.
+    ///
+    /// A socket, GraphQL or pub/sub verdict reads the index's own producer
+    /// rows instead ([`Self::exact_key_producers`], carrick#1626).
     fn producer_resolution_sources_for(
         &self,
         method: &str,
         path: &str,
     ) -> Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+        if exact_key_protocol(method).is_some() {
+            return self
+                .exact_key_producers(method, path)
+                .map(|endpoint| endpoint.resolution_source)
+                .collect();
+        }
         let Some(mount_graph) = self.mount_graph.as_ref() else {
             return Vec::new();
         };
@@ -3515,23 +3585,38 @@ impl Analyzer {
 
     /// Consumer call rows by call-site identity (`file`, `line`) — the same key
     /// `apply_pair_outcomes` joins a verdict to its consumer with, so a
-    /// finding's edge source is folded over the very rows that made the pair.
+    /// finding's edge source is folded over the very rows that made the pair —
+    /// under their protocol and, for socket, GraphQL and pub/sub rows, their
+    /// operation ([`ConsumerRowKey`], carrick#1626). HTTP rows come from the
+    /// mount graph's data calls; the others are the index's own call rows.
     fn consumer_resolution_sources(
         &self,
-    ) -> HashMap<(String, u32), Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
-        let Some(mount_graph) = self.mount_graph.as_ref() else {
-            return HashMap::new();
-        };
-        mount_graph
-            .get_data_calls()
-            .iter()
-            .map(|call| {
-                (
-                    consumer_identity(&call.file_location),
+    ) -> HashMap<ConsumerRowKey, Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+        let mut rows = HashMap::new();
+        if let Some(mount_graph) = self.mount_graph.as_ref() {
+            for call in mount_graph.get_data_calls() {
+                let (file, line) = consumer_identity(&call.file_location);
+                rows.insert(
+                    (crate::operation::Protocol::Http, String::new(), file, line),
                     call.resolution_source,
-                )
-            })
-            .collect()
+                );
+            }
+        }
+        for call in &self.calls {
+            let protocol = call.key.protocol();
+            if protocol == crate::operation::Protocol::Http {
+                continue;
+            }
+            let Some((_, identity)) = parse_producer_key(&call.key.canonical()) else {
+                continue;
+            };
+            let (file, line) = consumer_identity(&call.file_path.display().to_string());
+            rows.insert(
+                (protocol, normalize_compat_path(&identity), file, line),
+                call.resolution_source,
+            );
+        }
+        rows
     }
 
     fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
@@ -5046,6 +5131,278 @@ mod tests {
                 "consumer {consumer_source:?} + producer {producer_source:?}"
             );
         }
+    }
+
+    /// One non-HTTP row as the cross-repo merge leaves it.
+    fn protocol_row(
+        key: OperationKey,
+        file_path: &str,
+        service: &str,
+        resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    ) -> ApiEndpointDetails {
+        ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(file_path),
+            repo_name: None,
+            service_name: Some(service.to_string()),
+            provenance: Default::default(),
+            resolution_source,
+            dispatch: None,
+            schema_binding: None,
+            handler_span: None,
+        }
+    }
+
+    fn type_mismatch_sources(analyzer: &Analyzer) -> Vec<Option<crate::findings::EdgeSource>> {
+        analyzer
+            .get_type_mismatch_findings()
+            .iter()
+            .map(|finding| match finding {
+                Finding::TypeMismatch { edge_source, .. } => *edge_source,
+                other => panic!("expected a TypeMismatch finding, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// carrick#1626: a pub/sub, socket or GraphQL type mismatch folds the
+    /// sources of the rows it rests on, as an HTTP one does. A model row on
+    /// either side makes it a candidate (ruling A, 2026-10-01: a model-only
+    /// non-HTTP row's mismatch no longer fails a PR check); rows that stated
+    /// nothing leave it unstated, as before.
+    #[test]
+    fn a_non_http_type_mismatch_folds_the_rows_behind_it() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::Model;
+        use crate::operation::{GraphqlOperationKind, SocketDirection};
+
+        let operations = [
+            (
+                OperationKey::pubsub("orders.created"),
+                "PUBSUB",
+                "orders.created",
+            ),
+            (
+                OperationKey::socket("order:placed", SocketDirection::ClientToServer),
+                "SOCKET",
+                "CLIENT->SERVER|order:placed",
+            ),
+            (
+                OperationKey::graphql(GraphqlOperationKind::Query, "orders"),
+                "GRAPHQL",
+                "query|orders",
+            ),
+        ];
+        // (producer source, consumer source) -> expected edge_source
+        let cases = [
+            (
+                Some(Model),
+                Some(Model),
+                Some(crate::findings::EdgeSource::Candidate),
+            ),
+            (
+                None,
+                Some(Model),
+                Some(crate::findings::EdgeSource::Candidate),
+            ),
+            (
+                Some(Model),
+                None,
+                Some(crate::findings::EdgeSource::Candidate),
+            ),
+            (None, None, None),
+        ];
+        for (key, pseudo_method, identity) in &operations {
+            for (producer_source, consumer_source, expected) in cases {
+                let mut analyzer = analyzer_with_outcomes(vec![outcome(
+                    pseudo_method,
+                    identity,
+                    "web/src/client.ts:9",
+                    VerdictBucket::Incompatible,
+                    Some("Type 'A' is not assignable to type 'B'"),
+                )]);
+                analyzer.endpoints.push(protocol_row(
+                    key.clone(),
+                    "orders-svc/src/server.ts:5",
+                    "orders-svc",
+                    producer_source,
+                ));
+                analyzer.calls.push(protocol_row(
+                    key.clone(),
+                    "web/src/client.ts:9",
+                    "web",
+                    consumer_source,
+                ));
+                assert_eq!(
+                    type_mismatch_sources(&analyzer),
+                    vec![expected],
+                    "{pseudo_method} {identity}: producer {producer_source:?} + consumer \
+                     {consumer_source:?}"
+                );
+            }
+        }
+    }
+
+    /// The consumer row behind a verdict is looked up by its protocol as well
+    /// as its `file:line`: an HTTP call and a pub/sub publish written on one
+    /// line are two rows, and neither may lend the other its source.
+    #[test]
+    fn a_consumer_row_is_found_by_protocol_as_well_as_line() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{
+            FileBasedRoute, ImportedMember,
+        };
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let mut analyzer = analyzer_with_outcomes(vec![
+            outcome(
+                "PUBSUB",
+                "orders.created",
+                "web/src/client.ts:9",
+                VerdictBucket::Incompatible,
+                None,
+            ),
+            outcome(
+                "POST",
+                "/api/orders",
+                "web/src/client.ts:9",
+                VerdictBucket::Incompatible,
+                None,
+            ),
+        ]);
+        // The pub/sub publish on line 9 is a row the scanner backfilled: it
+        // states no source. So does its subscriber.
+        analyzer.endpoints.push(protocol_row(
+            OperationKey::pubsub("orders.created"),
+            "orders-svc/src/server.ts:5",
+            "orders-svc",
+            None,
+        ));
+        analyzer.calls.push(protocol_row(
+            OperationKey::pubsub("orders.created"),
+            "web/src/client.ts:9",
+            "web",
+            None,
+        ));
+        // The HTTP request on the same line is a fact, and so is its route.
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
+            method: "POST".to_string(),
+            path: "/api/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "orders-svc/src/routes.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("orders-svc".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(FileBasedRoute),
+            dispatch: None,
+            handler_span: None,
+        });
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/api/orders".to_string(),
+            canonical_path: "/api/orders".to_string(),
+            client: "fetch".to_string(),
+            file_location: "web/src/client.ts:9".to_string(),
+            call_kind: None,
+            repo_name: Some("web".to_string()),
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ImportedMember),
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+        });
+        analyzer.mount_graph = Some(mount_graph);
+
+        assert_eq!(
+            type_mismatch_sources(&analyzer),
+            vec![None, Some(crate::findings::EdgeSource::Fact)],
+            "the pub/sub mismatch states nothing; the HTTP one is a fact"
+        );
+    }
+
+    /// An index blob written before non-HTTP rows carried a source reads
+    /// exactly as it did: no `resolution_source` on either side, so the
+    /// mismatch states no edge source, and the cloud keeps enforcing it.
+    #[test]
+    fn a_non_http_row_from_an_older_blob_states_no_source() {
+        let row = |file: &str, service: &str| -> ApiEndpointDetails {
+            serde_json::from_value(serde_json::json!({
+                "owner": null,
+                "key": { "protocol": "pubsub", "topic": "orders.created" },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": file,
+                "service_name": service,
+                "provenance": "route"
+            }))
+            .expect("an older row reads")
+        };
+        let mut analyzer = analyzer_with_outcomes(vec![outcome(
+            "PUBSUB",
+            "orders.created",
+            "web/src/client.ts:9",
+            VerdictBucket::Incompatible,
+            None,
+        )]);
+        analyzer
+            .endpoints
+            .push(row("orders-svc/src/server.ts:5", "orders-svc"));
+        analyzer.calls.push(row("web/src/client.ts:9", "web"));
+        assert!(analyzer.calls[0].resolution_source.is_none());
+        assert_eq!(type_mismatch_sources(&analyzer), vec![None]);
+    }
+
+    /// A non-HTTP producer the index tags as a mock carries that tag onto its
+    /// type mismatch, as an HTTP one does (#380).
+    #[test]
+    fn a_non_http_type_mismatch_names_a_mock_producer() {
+        let mut analyzer = analyzer_with_outcomes(vec![outcome(
+            "PUBSUB",
+            "orders.created",
+            "web/src/client.ts:9",
+            VerdictBucket::Incompatible,
+            None,
+        )]);
+        let mut producer = protocol_row(
+            OperationKey::pubsub("orders.created"),
+            "orders-svc/src/mocks/server.ts:5",
+            "orders-svc",
+            None,
+        );
+        producer.provenance = crate::operation::EndpointProvenance::Mock;
+        analyzer.endpoints.push(producer);
+        let findings = analyzer.get_type_mismatch_findings();
+        let Finding::TypeMismatch {
+            producer_provenance,
+            ..
+        } = &findings[0]
+        else {
+            panic!("expected a TypeMismatch finding, got {:?}", findings[0]);
+        };
+        assert_eq!(
+            *producer_provenance,
+            crate::operation::EndpointProvenance::Mock
+        );
     }
 
     /// A call-site-evidence entry is not a producer (#379), so its (usually
