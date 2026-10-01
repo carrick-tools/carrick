@@ -404,6 +404,96 @@ export const VerifyClientSemanticsRequestSchema = BaseRequestSchema.extend({
   budget_ms: z.number().int().nonnegative().optional(),
 });
 
+/** Where one part of a library call sits (carrick#1616). */
+const ClaimSlotSchema = z
+  .object({
+    arg: z.number().int().nonnegative(),
+    key: z.string().min(1).optional(),
+  })
+  .strict();
+
+const BoundNameSchema = z.object({ bound: z.enum(['maker', 'scope']) }).strict();
+
+/** One entry of a package's claim in the shared shape (design 2026-10-01, section 4). */
+const LibraryClaimSchema = z.discriminatedUnion('list', [
+  z
+    .object({
+      list: z.literal('makes'),
+      form: z.enum(['call', 'new']),
+      member: z.string().min(1).nullable(),
+      base: ClaimSlotSchema.optional(),
+      name: ClaimSlotSchema.optional(),
+      handler: ClaimSlotSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      list: z.literal('scopes'),
+      member: z.string().min(1),
+      name: ClaimSlotSchema,
+    })
+    .strict(),
+  z
+    .object({
+      list: z.literal('ops'),
+      op: z.enum(['request', 'send', 'receive', 'execute', 'define', 'mount']),
+      member: z.string().min(1).nullable(),
+      name: z.union([BoundNameSchema, ClaimSlotSchema]).optional(),
+      payload: ClaimSlotSchema.optional(),
+      handler: ClaimSlotSchema.optional(),
+      ack: ClaimSlotSchema.optional(),
+      options: ClaimSlotSchema.optional(),
+      method: z.string().min(1).optional(),
+      method_key: ClaimSlotSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      list: z.literal('reserved'),
+      name: z.string().min(1),
+      member: z.string().min(1),
+      at: ClaimSlotSchema,
+    })
+    .strict(),
+]);
+
+const LibraryCheckSchema = z.object({
+  claim_id: z.string().min(1),
+  package: z.string().min(1),
+  export: z.string().min(1),
+  role: z.enum([
+    'http_client',
+    'graphql_client',
+    'broker',
+    'in_process_bus',
+    'socket',
+    'server_framework',
+    'none',
+  ]),
+  side: z.enum(['client', 'server', 'both']).optional(),
+  // Any other receiver answers `unchecked` (`receiver_invalid`) on its own.
+  receiver: z.string().min(1),
+  claim: LibraryClaimSchema,
+});
+
+export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('verify_library_claims'),
+  from_dir: z.string().min(1),
+  checks: z.array(LibraryCheckSchema),
+  budget_ms: z.number().int().nonnegative().optional(),
+  variants: z
+    .array(z.enum(['d2_required_siblings', 'inherited_bound_emitter', 'index_key_generic_map']))
+    .optional(),
+});
+
+export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('list_library_surface'),
+  from_dir: z.string().min(1),
+  packages: z.array(z.string().min(1)),
+  max_entries: z.number().int().positive().optional(),
+  exports: z.record(z.string(), z.array(z.string().min(1))).optional(),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -423,6 +513,8 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ResolveDefinitionsRequestSchema,
   RetypeCheckRequestSchema,
   VerifyClientSemanticsRequestSchema,
+  VerifyLibraryClaimsRequestSchema,
+  ListLibrarySurfaceRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

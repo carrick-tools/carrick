@@ -66,7 +66,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check` and `verify_client_semantics` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
 `capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -80,6 +80,8 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `infer` | yes | Resolve the type at a set of locators |
 | `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
+| `verify_library_claims` | yes | Check library claims of any role, in the shared shape, against the package's own declarations |
+| `list_library_surface` | yes | List each package's declared surface the way the verifier reads it |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
 | `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
@@ -455,6 +457,132 @@ The resolver and the checker must land on the same installed file. With two inst
 
 When no overload satisfies a claim, the reason is the one from the overload that got furthest, and at the same depth `unchecked` wins. A `request_body` claim reads the signatures its `request` claim selects. `semantics_modules` says how each package resolved, for logs.
 
+#### `verify_library_claims` - Check library claims of any role (prototype, carrick#1616)
+
+One verifier for every protocol: the claim says what a package's export does (its role, from a closed list) and where each part of a call sits, and the role alone picks which checks the claim needs. Same probe file, module resolution rules, definitions ("declared property", "accepts string", "says nothing") and answer fields as `verify_client_semantics`; `verify_client_semantics` converts its checks into this shape and answers through the same code.
+
+```json
+{
+  "request_id": "7",
+  "action": "verify_library_claims",
+  "from_dir": "/abs/worker",
+  "checks": [
+    {
+      "claim_id": "@fixture/tasks@4:task:makes",
+      "package": "@fixture/tasks",
+      "export": "task",
+      "role": "broker",
+      "receiver": "export",
+      "claim": { "list": "makes", "form": "call", "member": null, "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" } }
+    },
+    {
+      "claim_id": "@fixture/tasks@4:task:ops:trigger",
+      "package": "@fixture/tasks",
+      "export": "task",
+      "role": "broker",
+      "receiver": "instance:()",
+      "claim": { "list": "ops", "op": "send", "member": "trigger", "name": { "bound": "maker" }, "payload": { "arg": 0 } }
+    },
+    {
+      "claim_id": "@fixture/tasks@4:tasks:ops:trigger",
+      "package": "@fixture/tasks",
+      "export": "tasks",
+      "role": "broker",
+      "receiver": "export",
+      "claim": { "list": "ops", "op": "send", "member": "trigger", "name": { "arg": 0 }, "payload": { "arg": 1 } }
+    },
+    {
+      "claim_id": "fixture-socket@2:io:reserved:connect",
+      "package": "fixture-socket",
+      "export": "io",
+      "role": "socket",
+      "side": "client",
+      "receiver": "instance:()",
+      "claim": { "list": "reserved", "name": "connect", "member": "on", "at": { "arg": 0 } }
+    }
+  ]
+}
+```
+
+A slot is `{ "arg": n }` (argument `n`, 0-based) or `{ "arg": n, "key": "k" }` (property `k` of the object passed there). An op's `name` may instead be `{ "bound": "maker" }` (the maker's `name` slot bound it to the instance) or `{ "bound": "scope" }` (the scope member bound it). The lists:
+
+| `list` | Fields | Says |
+|---|---|---|
+| `makes` | `form` (`call` or `new`), `member` (null: the receiver itself), `base?`, `name?`, `handler?` | How an instance is made, and the option keys or arguments it reads |
+| `scopes` | `member`, `name` | A member that returns a receiver bound to a name (a channel, room or queue) |
+| `ops` | `op` (`request` `send` `receive` `execute` `define` `mount`), `member` (null: the receiver itself), `name?`, `payload?`, `handler?`, `ack?`; HTTP only: `method?`, `method_key?`, `options?` | A member that acts on the wire |
+| `reserved` | `name`, `member`, `at` | A name the library emits itself, spelled in that member's name slot |
+
+The receiver is `export`, `instance:<member>` (what `export.member(...)` returns), `instance:()` (what calling the export returns), `instance:new` (what `new export(...)` builds) or `instance:new:<member>` (what `new export.member(...)` builds), optionally followed by `>scope:<member>` (what that scope member returns on it).
+
+Response: the same `semantics` (one result per check, in request order) and `semantics_modules` as `verify_client_semantics`.
+
+`variants` (optional) switches on readings a slice run measures against the strict default; none is ever the default. `d2_required_siblings`: only a required string sibling makes a name ambiguous, so an optional `description?: string` beside a definition's `id` does not. `inherited_bound_emitter`: a member inherited from another package's base type counts when the receiver's class binds that base with a concrete type its own packages declare (`extends Emitter<L, E, OwnReservedEvents>`); the runtime's emitter extended with nothing of the package's own, and a base bound only through type parameters, stay refused. `index_key_generic_map`: a name slot typed as a key of an event map the receiver takes as a type parameter reads as a string slot; a key of a concrete index-signature map stays refused.
+
+```json
+{
+  "request_id": "7",
+  "status": "success",
+  "semantics": [
+    { "claim_id": "@fixture/tasks@4:task:makes", "receiver": "export", "verdict": "verified" },
+    { "claim_id": "@fixture/tasks@4:task:ops:trigger", "receiver": "instance:()", "verdict": "verified" },
+    { "claim_id": "@fixture/tasks@4:tasks:ops:trigger", "receiver": "export", "verdict": "verified" },
+    { "claim_id": "fixture-socket@2:io:reserved:connect", "receiver": "instance:()", "verdict": "failed", "reason": "reserved_not_declared" }
+  ],
+  "semantics_modules": [
+    { "package": "@fixture/tasks", "resolved_file": "/abs/worker/node_modules/@fixture/tasks/index.d.ts", "installed_version": "4.0.0" }
+  ]
+}
+```
+
+#### `list_library_surface` - List a package's declared surface (prototype, carrick#1616)
+
+Each package's exports, the receivers the verifier can read claims on, and what each declares, read with the verifier's own predicates: a model that chooses claims from this list chooses only what the declarations hold. `exports` (optional, per package) lists only the exports the service imports. Capped at `max_entries` per package (default 1000), with the count it dropped; every export, receiver and member name is listed before any signature, so the cap cuts signatures first.
+
+```json
+{ "request_id": "8", "action": "list_library_surface", "from_dir": "/abs/worker", "packages": ["@fixture/tasks"] }
+```
+
+```json
+{
+  "request_id": "8",
+  "status": "success",
+  "surfaces": [
+    {
+      "package": "@fixture/tasks",
+      "installed_version": "4.0.0",
+      "sha256": "9f2c...",
+      "truncated": 0,
+      "exports": [
+        {
+          "export": "tasks",
+          "receivers": [
+            {
+              "receiver": "export",
+              "members": [
+                {
+                  "name": "trigger",
+                  "own": true,
+                  "signatures": [
+                    {
+                      "params": [
+                        { "name": "id", "optional": false, "rest": false, "type": "string", "accepts_string": true, "function": false },
+                        { "name": "payload", "optional": false, "rest": false, "type": "unknown", "accepts_string": false, "function": false }
+                      ],
+                      "returns": "Promise<RunHandle>"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
 #### `infer` - Resolve the type at a locator
 
 Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
@@ -731,7 +859,7 @@ Response, written before the process exits:
 | `src/bundler.ts` | Legacy symbol bundling and surface emission |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
-| `src/client-semantics.ts` | `verify_client_semantics`: library claims against a package's declarations |
+| `src/library-claims.ts` | `verify_library_claims`, `verify_client_semantics` and `list_library_surface`: library claims against a package's own declarations |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
 | `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |
