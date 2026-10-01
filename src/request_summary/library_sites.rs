@@ -2088,6 +2088,14 @@ mod tests {
                  export class Special extends Mailer { q = new Queue(\"special\"); }\n",
             ),
             (
+                "a base class that writes it plainly",
+                "class Base { reset() { this.q = undefined as any; } } export class Mailer extends Base {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
                 "a base class that writes it",
                 "class Base { reset() { (this as any).q = undefined; } } export class Mailer extends Base {\n\
                  \x20 private q: Queue;\n\

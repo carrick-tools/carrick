@@ -191,7 +191,8 @@ an HTTP row.
   - another value, another maker, or the same maker with other arguments;
   - any operator but `=`, an update, a `delete`, or a destructuring target;
   - a write where `this` may not be the instance (a `function` expression,
-    a setter, a static member);
+    a setter, a static member): a static member's `this.<field> = …` counts
+    against the instance field of that name;
   - a decorator, a parameter property, an accessor of its name, or a
     property by a computed key;
   - a class of the file that it extends, or that extends it, declaring or
