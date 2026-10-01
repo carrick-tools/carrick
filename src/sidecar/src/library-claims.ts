@@ -562,12 +562,20 @@ export class LibraryClaimsVerifier {
 
   /**
    * Each package's declared surface, read with the verifier's predicates:
-   * every value export, the receivers a claim can be read on (the export, what
-   * calling or constructing it returns, what its maker members return), and
-   * each receiver's callable members with their parameter slots. Capped at
-   * `maxEntries` per package, with the count dropped.
+   * every value export (or only those `only` names for the package), the
+   * receivers a claim can be read on (the export, what calling or
+   * constructing it returns, what its maker members return), and each
+   * receiver's callable members with their parameter slots. Capped at
+   * `maxEntries` per package, with the count dropped: every export and
+   * receiver is listed before any member name, and every member name before
+   * any signature, so the cap cuts signatures first and exports last.
    */
-  listSurface(fromDir: string, packages: string[], maxEntries: number): LibrarySurface[] {
+  listSurface(
+    fromDir: string,
+    packages: string[],
+    maxEntries: number,
+    only: Readonly<Record<string, string[]>> = {}
+  ): LibrarySurface[] {
     if (packages.length === 0) return [];
     const probeText = packages
       .map((pkg, i) => `import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`)
@@ -580,7 +588,7 @@ export class LibraryClaimsVerifier {
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
       const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
       return packages.map((pkg, i) =>
-        reader.listPackage(pkg, file.statements[i] as ts.ImportDeclaration, maxEntries)
+        reader.listPackage(pkg, file.statements[i] as ts.ImportDeclaration, maxEntries, only[pkg])
       );
     } finally {
       this.project.removeSourceFile(probe);
@@ -1803,7 +1811,7 @@ class DeclarationReader {
   // --------------------------------------------------------------------------
 
   /** One package's declared surface (see `LibraryClaimsVerifier.listSurface`). */
-  listPackage(pkg: string, declaration: ts.ImportDeclaration, maxEntries: number): LibrarySurface {
+  listPackage(pkg: string, declaration: ts.ImportDeclaration, maxEntries: number, only?: readonly string[]): LibrarySurface {
     this.setPackage(pkg);
     const moduleRead = this.readModule(pkg, declaration);
     const surface: LibrarySurface = { package: pkg, truncated: 0, exports: [] };
@@ -1823,12 +1831,19 @@ class DeclarationReader {
       dropped += 1;
       return false;
     };
+    // Three passes: every export and receiver, then every member name, then signatures.
+    const names: Array<() => void> = [];
+    const fills: Array<() => void> = [];
 
     const exportsOf = this.checker
       .getExportsOfModule(moduleSymbol)
       .filter(symbol => {
         const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
-        return !this.checker.isUnknownSymbol(target) && (target.flags & ts.SymbolFlags.Value) !== 0;
+        return (
+          !this.checker.isUnknownSymbol(target) &&
+          (target.flags & ts.SymbolFlags.Value) !== 0 &&
+          (only === undefined || only.includes(symbol.getName()))
+        );
       })
       .sort((a, b) => (a.getName() < b.getName() ? -1 : a.getName() > b.getName() ? 1 : 0));
 
@@ -1836,27 +1851,35 @@ class DeclarationReader {
       if (!take()) continue;
       const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
       const type = this.checker.getTypeOfSymbolAtLocation(symbol, declaration);
-      const name = symbol.getName();
-      const entry: SurfaceExport = { export: name === 'default' ? 'default' : name, receivers: [] };
-      if (this.isOpenTop(type)) {
-        surface.exports.push(entry);
-        continue;
-      }
-      const receiverOf = (receiverName: string, receiverType: ts.Type): SurfaceReceiver => {
-        const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        return this.listReceiver(receiverName, receiverType, home, take);
-      };
-      entry.receivers.push(receiverOf('export', type));
-      const made = (signatures: readonly ts.Signature[], receiverName: string) => {
-        const returns = [...new Set(signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)))];
-        if (returns.length === 1 && !this.returnSaysNothing(returns[0]) && this.isObjectType(returns[0])) {
-          entry.receivers.push(receiverOf(receiverName, returns[0]));
-        }
-      };
-      made(this.librarySignatures(type, 'call'), 'instance:()');
-      made(this.librarySignatures(type, 'new'), 'instance:new');
+      const entry: SurfaceExport = { export: symbol.getName(), receivers: [] };
       surface.exports.push(entry);
+      if (this.isOpenTop(type)) continue;
+      const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
+        if (!take()) return;
+        const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
+        entry.receivers.push(this.outlineReceiver(receiverName, receiverType, home, take, names, fills));
+      };
+      // What a maker builds, when its overloads agree on one object type.
+      const madeBy = (signatures: readonly ts.Signature[]): ts.Type | undefined => {
+        const returns = [...new Set(signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)))];
+        return returns.length === 1 && !this.returnSaysNothing(returns[0]) && this.isObjectType(returns[0])
+          ? returns[0]
+          : undefined;
+      };
+      receiverOf('export', type);
+      const called = madeBy(this.librarySignatures(type, 'call'));
+      if (called) receiverOf('instance:()', called);
+      const constructed = madeBy(this.librarySignatures(type, 'new'));
+      if (constructed) receiverOf('instance:new', constructed);
+      for (const property of this.declaredProperties(type)) {
+        const made = madeBy(this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call'));
+        if (made && this.declaredProperties(made).some(member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0)) {
+          receiverOf(`instance:${property.getName()}`, made);
+        }
+      }
     }
+    for (const name of names) name();
+    for (const fill of fills) fill();
     surface.truncated = dropped;
     surface.sha256 = crypto.createHash('sha256').update(JSON.stringify(surface.exports)).digest('hex');
     return surface;
@@ -1871,29 +1894,39 @@ class DeclarationReader {
     });
   }
 
-  private listReceiver(
+  /**
+   * A receiver, now; its member names later (`names`), once every export and
+   * receiver of the package is listed; its call, construct and member
+   * signatures last (`fills`), once every name is.
+   */
+  private outlineReceiver(
     receiverName: string,
     type: ts.Type,
     home: ReadonlySet<string>,
-    take: () => boolean
+    take: () => boolean,
+    names: Array<() => void>,
+    fills: Array<() => void>
   ): SurfaceReceiver {
     const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
     const call = this.librarySignatures(type, 'call');
-    if (call.length > 0) receiver.call = this.listSignatures(call, take);
+    if (call.length > 0) fills.push(() => (receiver.call = this.listSignatures(call, take)));
     const construct = this.librarySignatures(type, 'new');
-    if (construct.length > 0) receiver.construct = this.listSignatures(construct, take);
+    if (construct.length > 0) fills.push(() => (receiver.construct = this.listSignatures(construct, take)));
     if (this.isOpenTop(type)) return receiver;
-    const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
-    for (const property of this.declaredProperties(type)) {
-      const signatures = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
-      if (signatures.length === 0 || !take()) continue;
-      const member: SurfaceMember = {
-        name: property.getName(),
-        own: this.isOwnMember(property, apparent, home),
-        signatures: this.listSignatures(signatures, take),
-      };
-      receiver.members.push(member);
-    }
+    names.push(() => {
+      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
+      for (const property of this.declaredProperties(type)) {
+        const signatures = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
+        if (signatures.length === 0 || !take()) continue;
+        const member: SurfaceMember = {
+          name: property.getName(),
+          own: this.isOwnMember(property, apparent, home),
+          signatures: [],
+        };
+        receiver.members.push(member);
+        fills.push(() => (member.signatures = this.listSignatures(signatures, take)));
+      }
+    });
     return receiver;
   }
 

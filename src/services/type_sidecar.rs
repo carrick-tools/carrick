@@ -949,6 +949,8 @@ enum SidecarRequest {
         packages: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_entries: Option<u32>,
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        exports: std::collections::BTreeMap<String, Vec<String>>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -1882,6 +1884,23 @@ impl TypeSidecar {
         packages: &[String],
         max_entries: Option<u32>,
     ) -> Result<Vec<serde_json::Value>, SidecarError> {
+        self.list_library_surface_of(
+            from_dir,
+            packages,
+            &std::collections::BTreeMap::new(),
+            max_entries,
+        )
+    }
+
+    /// `list_library_surface`, listing for each package in `exports` only the
+    /// exports named there (the ones the service imports).
+    pub fn list_library_surface_of(
+        &self,
+        from_dir: &Path,
+        packages: &[String],
+        exports: &std::collections::BTreeMap<String, Vec<String>>,
+        max_entries: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, SidecarError> {
         self.ensure_ready()?;
         if packages.is_empty() {
             return Ok(Vec::new());
@@ -1891,6 +1910,7 @@ impl TypeSidecar {
             from_dir: from_dir.to_string_lossy().into_owned(),
             packages: packages.to_vec(),
             max_entries,
+            exports: exports.clone(),
         };
         self.send_request(&request)?;
         let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
@@ -3236,6 +3256,39 @@ mod tests {
                 "index_key_generic_map"
             ])
         );
+    }
+
+    /// The surface request names the exports to list per package only when
+    /// asked to.
+    #[test]
+    fn list_library_surface_request_wire_shape() {
+        let all = SidecarRequest::ListLibrarySurface {
+            request_id: "req-13".into(),
+            from_dir: "/svc".into(),
+            packages: vec!["@fixture/tasks".into()],
+            max_entries: None,
+            exports: std::collections::BTreeMap::new(),
+        };
+        let value = serde_json::to_value(&all).unwrap();
+        assert_eq!(value["action"], "list_library_surface");
+        assert_eq!(value["packages"], serde_json::json!(["@fixture/tasks"]));
+        assert!(value.get("exports").is_none());
+        assert!(value.get("max_entries").is_none());
+        let some = SidecarRequest::ListLibrarySurface {
+            request_id: "req-14".into(),
+            from_dir: "/svc".into(),
+            packages: vec!["@fixture/tasks".into()],
+            max_entries: Some(50),
+            exports: [("@fixture/tasks".to_string(), vec!["task".to_string()])]
+                .into_iter()
+                .collect(),
+        };
+        let value = serde_json::to_value(&some).unwrap();
+        assert_eq!(
+            value["exports"],
+            serde_json::json!({ "@fixture/tasks": ["task"] })
+        );
+        assert_eq!(value["max_entries"], 50);
     }
 
     /// A `verify_library_claims` answer is read by the same rule as a

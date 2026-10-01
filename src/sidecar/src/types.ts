@@ -555,8 +555,10 @@ export interface ListLibrarySurfaceRequest extends BaseRequest {
   action: 'list_library_surface';
   from_dir: string;
   packages: string[];
-  /** Entries kept per package (members, signatures, parameters, keys and literals each count one); default 400. */
+  /** Entries kept per package (exports, receivers, members, signatures, parameters and keys each count one); default 1000. */
   max_entries?: number;
+  /** Per package, the only exports to list (the ones the service imports); absent lists every value export. */
+  exports?: Record<string, string[]>;
 }
 
 /**
