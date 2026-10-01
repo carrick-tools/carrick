@@ -3131,6 +3131,8 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
                 &in_process_pubsub,
+                repo_path,
+                service,
             );
             attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
             attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -3838,14 +3840,46 @@ fn fold_graphql_transport_calls(
     });
 }
 
+/// Where a GraphQL, socket or pub/sub producer row's evidence comes from
+/// (#380), classified as an HTTP route's is
+/// ([`crate::file_finder::endpoint_provenance`]): from the row's file relative
+/// to the service's own directory, so a scan root that itself sits under a
+/// conventionally named directory is not misread (carrick#1626).
+///
+/// Both scan paths are read: the full scan hands over paths as scanned,
+/// prefixed by `repo_path`; the incremental scan's pub/sub keys are already
+/// repo-relative. A path that is neither (outside the repo) reads as `Route`,
+/// the classifier's own conservative answer.
+fn protocol_producer_provenance(
+    file: &Path,
+    repo_path: &str,
+    service: &Config,
+) -> crate::operation::EndpointProvenance {
+    let repo_root = normalize_protocol_file(Path::new(repo_path));
+    let file = normalize_protocol_file(file);
+    let relative = file
+        .strip_prefix(&repo_root)
+        .map(Path::to_path_buf)
+        .unwrap_or(file);
+    if relative.is_absolute() {
+        return crate::operation::EndpointProvenance::Route;
+    }
+    let service_dir =
+        normalize_protocol_file(Path::new(service.directory.as_deref().unwrap_or_default()));
+    crate::file_finder::endpoint_provenance(&relative, &service_dir)
+}
+
 fn append_deterministic_protocol_operations(
     cloud_data: &mut CloudRepoData,
     extractions: &ProtocolExtractions,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
+    repo_path: &str,
+    service: &Config,
 ) {
-    // Same "{file}:{line}" convention the mount-graph conversions use
-    let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+    // Same "{file}:{line}" convention the mount-graph conversions use. A
+    // call's row; a producer's is `to_producer` below.
+    let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
         owner: None,
         key,
         params: vec![],
@@ -3857,9 +3891,7 @@ fn append_deterministic_protocol_operations(
         file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
         repo_name: None,
         service_name: None,
-        // Provenance classification is HTTP-only today (#380): non-HTTP op
-        // paths are not root-stripped here, and segment-matching an
-        // un-relativized path would misfire on scan-prefix directories.
+        // Provenance is producer-side metadata, as it is for an HTTP call.
         provenance: Default::default(),
         // These ops come from the deterministic protocol extractions, not from
         // the HTTP emit/join phase, so no pass stated them in the sense
@@ -3878,6 +3910,12 @@ fn append_deterministic_protocol_operations(
         // (cloud#948); these rows have none.
         handler_span: None,
     };
+    // A producer's row: tagged when its file sits in a mock or test-support
+    // tree of the service, as an HTTP route is (#380, carrick#1626).
+    let to_producer = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+        provenance: protocol_producer_provenance(file_path, repo_path, service),
+        ..to_call(key, file_path, line)
+    };
 
     let graphql = &extractions.graphql;
     if !graphql.is_empty() {
@@ -3895,15 +3933,15 @@ fn append_deterministic_protocol_operations(
             .endpoints
             .extend(graphql.producers.iter().map(|op| {
                 match (&op.resolver_file, op.resolver_line) {
-                    (Some(file), Some(line)) => to_details(op.key.clone(), file, line),
-                    _ => to_details(op.key.clone(), &op.file_path, op.line),
+                    (Some(file), Some(line)) => to_producer(op.key.clone(), file, line),
+                    _ => to_producer(op.key.clone(), &op.file_path, op.line),
                 }
             }));
         cloud_data
             .calls
             .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
                 schema_binding: op.schema_binding,
-                ..to_details(op.key.clone(), &op.file_path, op.line)
+                ..to_call(op.key.clone(), &op.file_path, op.line)
             }));
     }
 
@@ -3918,13 +3956,13 @@ fn append_deterministic_protocol_operations(
             sockets
                 .listeners
                 .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
+                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
         );
         cloud_data.calls.extend(
             sockets
                 .emitters
                 .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
+                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
         );
     }
 
@@ -3932,14 +3970,16 @@ fn append_deterministic_protocol_operations(
         cloud_data,
         &extractions.event_bus,
         file_results,
-        &to_details,
+        &to_producer,
+        &to_call,
     );
     append_pubsub_operations(
         cloud_data,
         file_results,
         &extractions.sockets,
         in_process,
-        &to_details,
+        &to_producer,
+        &to_call,
     );
 }
 
@@ -4020,7 +4060,8 @@ fn append_event_bus_operations(
     cloud_data: &mut CloudRepoData,
     event_bus: &crate::event_emitter::BusExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    to_call: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
     use crate::operation::PubsubRole;
 
@@ -4033,6 +4074,7 @@ fn append_event_bus_operations(
     let mut deferred = 0usize;
     let mut push = |ops: &[crate::event_emitter::BusOp],
                     role: PubsubRole,
+                    to_details: &dyn Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
                     into: &mut Vec<ApiEndpointDetails>,
                     counter: &mut usize| {
         for op in ops {
@@ -4057,12 +4099,14 @@ fn append_event_bus_operations(
     push(
         &event_bus.subscribers,
         PubsubRole::Subscriber,
+        to_producer,
         &mut cloud_data.endpoints,
         &mut subscribers,
     );
     push(
         &event_bus.publishers,
         PubsubRole::Publisher,
+        to_call,
         &mut cloud_data.calls,
         &mut publishers,
     );
@@ -4180,7 +4224,8 @@ fn append_pubsub_operations(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
-    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    to_call: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
     use crate::operation::PubsubRole;
 
@@ -4222,18 +4267,22 @@ fn append_pubsub_operations(
             // The model's row says so (carrick#1626). A row the scanner's own
             // pass backfilled into the model's list is not the model's, and no
             // pass here is a labelled source yet, so it states none.
-            let row = ApiEndpointDetails {
+            let stated = |row: ApiEndpointDetails| ApiEndpointDetails {
                 resolution_source: (!op.backfilled)
                     .then_some(crate::agents::file_analyzer_agent::ResolutionSource::Model),
-                ..to_details(key, &file_path, line)
+                ..row
             };
             match op.role {
                 Some(PubsubRole::Subscriber) => {
-                    cloud_data.endpoints.push(row);
+                    cloud_data
+                        .endpoints
+                        .push(stated(to_producer(key, &file_path, line)));
                     subscribers += 1;
                 }
                 Some(PubsubRole::Publisher) => {
-                    cloud_data.calls.push(row);
+                    cloud_data
+                        .calls
+                        .push(stated(to_call(key, &file_path, line)));
                     publishers += 1;
                 }
                 None => {
@@ -7202,6 +7251,8 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
         &in_process_pubsub,
+        repo_path,
+        service,
     );
     attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
     attach_sdk_surface(&mut cloud_data, repo_path, config);
@@ -14871,6 +14922,8 @@ mod tests {
             &ProtocolExtractions::default(),
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
         );
 
         let wire = serde_json::to_value(&cloud_data).expect("the repo data serializes");
@@ -14892,6 +14945,114 @@ mod tests {
         assert!(
             scanner_row.get("resolution_source").is_none(),
             "a backfilled row is not the model's: {scanner_row}"
+        );
+    }
+
+    /// #380 for every protocol (carrick#1626): a GraphQL, socket or pub/sub
+    /// producer written under a mock or test-support tree of its service is
+    /// tagged `mock`, read from the row's file relative to the service's own
+    /// directory, as an HTTP route is. Both path shapes the two scan paths
+    /// hand over are read: as scanned (prefixed by the repo path) and
+    /// repo-relative (the incremental path's pub/sub keys). A file outside the
+    /// service directory stays `route`, and a call keeps the default, as an
+    /// HTTP call does.
+    #[test]
+    fn non_http_producers_under_a_mock_tree_are_tagged_mock() {
+        use crate::operation::{EndpointProvenance, PubsubRole, SocketDirection};
+
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            ..Config::default()
+        };
+        let mut graphql_producer = graphql_op(
+            crate::operation::GraphqlOperationKind::Query,
+            "partnerQuote",
+            None,
+        );
+        graphql_producer.file_path = PathBuf::from("/repo/apps/api/src/mocks/partnerMock.ts");
+        let mut socket_listener =
+            socket_op("chat:send", SocketDirection::ClientToServer, None, None);
+        socket_listener.file_path = PathBuf::from("/repo/apps/api/cypress/support/chat.ts");
+        let bus = |event: &str, file: &str| crate::event_emitter::BusOp {
+            key: OperationKey::pubsub(event),
+            event: event.to_string(),
+            file_path: PathBuf::from(file),
+            line: 4,
+        };
+        let extractions = ProtocolExtractions {
+            graphql: crate::graphql::GraphqlExtraction {
+                producers: vec![graphql_producer],
+                ..Default::default()
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![socket_listener],
+                emitters: vec![],
+            },
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![
+                    bus("job.done", "/repo/apps/api/src/jobs.ts"),
+                    bus("job.stalled", "/repo/shared/mocks/jobs.ts"),
+                ],
+                publishers: vec![bus("job.retry", "/repo/apps/api/src/mocks/jobs.ts")],
+            },
+        };
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "apps/api/src/mocks/broker.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "payments.settled",
+                    PubsubRole::Subscriber,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            "/repo",
+            &service,
+        );
+
+        let provenance_of = |rows: &[ApiEndpointDetails], canonical: &str| {
+            rows.iter()
+                .find(|row| row.key.canonical() == canonical)
+                .unwrap_or_else(|| panic!("no row for {canonical}"))
+                .provenance
+        };
+        let endpoints = &cloud_data.endpoints;
+        assert_eq!(
+            provenance_of(endpoints, "graphql|query|partnerQuote"),
+            EndpointProvenance::Mock
+        );
+        assert_eq!(
+            provenance_of(endpoints, "socket|CLIENT->SERVER|chat:send"),
+            EndpointProvenance::Mock,
+            "a test-runner support tree is not product source"
+        );
+        assert_eq!(
+            provenance_of(endpoints, "pubsub|payments.settled"),
+            EndpointProvenance::Mock,
+            "a repo-relative key is read against the service directory too"
+        );
+        assert_eq!(
+            provenance_of(endpoints, "pubsub|job.done"),
+            EndpointProvenance::Route
+        );
+        assert_eq!(
+            provenance_of(endpoints, "pubsub|job.stalled"),
+            EndpointProvenance::Route,
+            "outside the service directory nothing is classified"
+        );
+        assert_eq!(
+            provenance_of(&cloud_data.calls, "pubsub|job.retry"),
+            EndpointProvenance::Route,
+            "provenance is producer-side; a call keeps the default"
         );
     }
 
@@ -16204,6 +16365,7 @@ mod tests {
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
             &to_details,
+            &to_details,
         );
         assert_eq!(
             cloud_data
@@ -16334,6 +16496,8 @@ mod tests {
             &extractions,
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
         );
 
         // The socket emit is indexed exactly once, as the socket op.
@@ -16458,6 +16622,8 @@ mod tests {
             &extractions,
             &file_results,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
         );
 
         // The subscription is the gap #676 was filed for: nothing else reports
