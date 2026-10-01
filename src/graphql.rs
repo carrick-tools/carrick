@@ -387,8 +387,13 @@ fn is_graphql_file(path: &Path) -> bool {
 
 /// Every `.graphql`/`.gql` file a service's own walk reads under `roots`, in
 /// walk order (roots in order, names sorted), skipping dependency, build and
-/// generated-artifact folders. A path under two overlapping roots is listed
-/// twice; callers dedup.
+/// generated-artifact folders, and the test folders the TypeScript walk does
+/// not read either ([`crate::file_finder::is_under_test_dir`], carrick#1626).
+/// A path under two overlapping roots is listed twice; callers dedup.
+///
+/// [`SchemaCatalogue::build`] reads the repository's other schema files
+/// through the same test-folder filter: a schema this walk leaves out must not
+/// come back as another API's.
 fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for root in roots {
@@ -406,7 +411,9 @@ fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
             })
             .filter_map(Result::ok)
         {
-            if is_graphql_file(entry.path()) {
+            if is_graphql_file(entry.path())
+                && !crate::file_finder::is_under_test_dir(entry.path(), root)
+            {
                 files.push(entry.path().to_path_buf());
             }
         }
@@ -823,6 +830,10 @@ impl SchemaCatalogue {
             }
         }
         served.extend(declared.iter().cloned());
+        // A schema under a test folder is no schema at all, as it is to every
+        // service's own walk (carrick#1626): a fixture copy of a served schema
+        // read here as another API's would make every document against it
+        // unresolved. One the repo declares is served whatever folder it is in.
         let tracked: BTreeSet<PathBuf> = match crate::git_state::tracked_paths(
             repo_root,
             &["*.graphql", "*.gql"],
@@ -841,6 +852,10 @@ impl SchemaCatalogue {
                     .collect()
             }
         };
+        let tracked: BTreeSet<PathBuf> = tracked
+            .into_iter()
+            .filter(|file| !crate::file_finder::is_under_test_dir(file, Path::new("")))
+            .collect();
         let schemas: Vec<KnownSchema> = served
             .iter()
             .chain(tracked.difference(&served))
@@ -2986,6 +3001,101 @@ export const typeDefs = gql`
                     .to_string()
             ]
         );
+    }
+
+    /// carrick#1626: the GraphQL walk reads what the TypeScript walk reads.
+    /// A schema or document under a test folder of the service (a fixture
+    /// copy, an end-to-end suite's operations) is neither a field it serves
+    /// nor a call it makes. A mock tree is still read, as its TypeScript is;
+    /// its rows are tagged mock downstream.
+    #[test]
+    fn a_service_walk_skips_test_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write("api/src/schema.graphql", "type Query { orders: [String] }");
+        write(
+            "api/test/fixtures/legacy-schema.graphql",
+            "type Query { legacyReport: String }",
+        );
+        write("api/e2e/operations/smoke.graphql", "query Smoke { orders }");
+        write(
+            "api/src/mocks/partner.graphql",
+            "type Query { partnerQuote: Int }",
+        );
+
+        let extraction = scan_repo(&[root.join("api")], &[], &[]);
+        let mut producers: Vec<String> = extraction
+            .producers
+            .iter()
+            .map(|op| op.key.canonical())
+            .collect();
+        producers.sort();
+        assert_eq!(
+            producers,
+            vec!["graphql|query|orders", "graphql|query|partnerQuote"]
+        );
+        assert!(
+            extraction.consumers.is_empty(),
+            "an end-to-end suite's operations are not calls: {:?}",
+            extraction.consumers
+        );
+    }
+
+    /// The catalogue reads schemas through the same filter as the walk, in the
+    /// same change. A test-folder copy of a served schema left out of the walk
+    /// alone would be catalogued as ANOTHER API's schema holding the same
+    /// fields, and every document against them would become unresolved and
+    /// be dropped.
+    #[test]
+    fn a_test_folder_copy_of_a_served_schema_is_no_schema_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        write("api/src/schema.graphql", "type Query { orders: [String] }");
+        write(
+            "api/test/fixtures/schema.graphql",
+            "type Query { orders: [String] }",
+        );
+        let document = write("web/src/orders.gql", "query Orders { orders }");
+        let roots = |dir: &str| vec![root.join(dir)];
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                ServedSchemaSources {
+                    roots: roots("api"),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: roots("web"),
+                    declared: vec![],
+                },
+            ],
+        );
+        let mut api = scan_repo(&roots("api"), &[], &[]);
+        catalogue.settle_walked_schemas("api", &mut api, true);
+        let web = scan_repo(&roots("web"), &[], &[]);
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &web, &document.to_string_lossy()),
+            &DocumentIdentity::Served
+        );
+
+        let files: Vec<&Path> = catalogue
+            .schemas
+            .iter()
+            .map(|schema| schema.file.as_path())
+            .collect();
+        assert_eq!(files, vec![Path::new("api/src/schema.graphql")]);
     }
 
     /// A second service that walks the same file and serves a schema keeps it

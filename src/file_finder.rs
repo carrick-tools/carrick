@@ -94,6 +94,14 @@ fn has_test_dir(path: &Path, root_dir: &Path) -> bool {
     has_dir_named(path, root_dir, TEST_DIR_NAMES)
 }
 
+/// Whether `path` sits under a test directory ([`TEST_DIR_NAMES`]) below
+/// `root_dir`: the folders [`find_files`] does not read. For a walk over
+/// files that are not TypeScript (the GraphQL walk, carrick#1626), so both
+/// read the same tree.
+pub fn is_under_test_dir(path: &Path, root_dir: &Path) -> bool {
+    has_test_dir(path, root_dir)
+}
+
 fn has_test_suffix(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
