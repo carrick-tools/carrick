@@ -171,7 +171,7 @@ describe('HTTP claims in the shared shape (carrick#1616 parity)', () => {
       kind: 'make',
       form: 'call',
       member: 'create',
-      base_key: 'baseURL',
+      base: { arg: 0, key: 'baseURL' },
     });
     assert.deepStrictEqual(convert({ kind: 'verb', member: 'get', method: 'GET' }), {
       kind: 'op',

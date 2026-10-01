@@ -136,12 +136,21 @@ export interface PubSub {
 export declare function connect(url: string): PubSub;
 `;
 
-// The runtime's event emitter, as its type package declares it, under the
-// bare name and the node: name.
+// The runtime's event emitter, as its type package declares it (generic in
+// its event map, defaulting to "no map"), under the bare name and the node:
+// name.
 const RUNTIME_EVENTS = `declare module 'events' {
-  class EventEmitter {
-    emit(eventName: string | symbol, ...args: any[]): boolean;
-    on(eventName: string | symbol, listener: (...args: any[]) => void): this;
+  type DefaultEventMap = [never];
+  type EventMap<T> = Record<keyof T, any[]> | DefaultEventMap;
+  type AnyRest = [...args: any[]];
+  type Args<K, T> = T extends DefaultEventMap ? AnyRest : K extends keyof T ? T[K] : never;
+  type Key<K, T> = T extends DefaultEventMap ? string | symbol : K | keyof T;
+  type Listener<K, T, F> = T extends DefaultEventMap ? F : K extends keyof T ? (T[K] extends unknown[] ? (...args: T[K]) => void : never) : never;
+  type Listener1<K, T> = Listener<K, T, (...args: any[]) => void>;
+  class EventEmitter<T extends EventMap<T> = DefaultEventMap> {
+    constructor(options?: { captureRejections?: boolean });
+    emit<K>(eventName: Key<K, T>, ...args: Args<K, T>): boolean;
+    on<K>(eventName: Key<K, T>, listener: Listener1<K, T>): this;
   }
   export = EventEmitter;
 }
@@ -291,6 +300,75 @@ export declare const dispatcher: Dispatcher;
 export declare function makeAny(): any;
 export declare function makeOpen<T>(): T;
 export declare function makeChannel(): Channel;
+export declare function makeDefault<T = Channel>(): T;
+`;
+
+// Makers whose parts are positional (contract amendment 2, B2): a queue named
+// at argument 0, a worker with its handler at argument 1, a client whose base
+// is argument 0.
+const QUEUE = `export interface QueueOptions {
+  connection?: { host: string; port?: number };
+  prefix?: string;
+}
+export declare class Queue<Data = unknown> {
+  constructor(name: string, options?: QueueOptions);
+  publish(data: Data): Promise<void>;
+}
+export declare class Worker {
+  constructor(name: string, processor: (job: { data: unknown }) => Promise<void>, options?: { concurrency?: number });
+  close(): Promise<void>;
+}
+export declare class Pair {
+  constructor(name: string, group?: string);
+  publish(data: unknown): Promise<void>;
+}
+export interface Connection {
+  publish(topic: string, data: unknown): void;
+}
+export declare function connect(url: string, options?: { reconnect?: boolean }): Connection;
+export declare function open(port: number): Connection;
+`;
+
+// Generic makers and scopes, read at their type-parameter defaults
+// (contract amendment 2, B6).
+const GENERIC = `type DefaultMap = [never];
+type EventMap<T> = Record<keyof T, unknown[]> | DefaultMap;
+type Key<K, T> = T extends DefaultMap ? string | symbol : K | keyof T;
+export interface Channel<T> {
+  emit<K>(eventName: Key<K, T>, data: unknown): boolean;
+}
+// A scope whose own type parameter defaults to the class's.
+export interface Topic {
+  publish(data: unknown): void;
+}
+export declare class Hub<T extends EventMap<T> = DefaultMap> {
+  constructor();
+  room<R extends EventMap<R> = T>(name: string): Channel<R>;
+  // A scope whose return is its own type parameter, with a default.
+  topic<P = Topic>(name: string): P;
+}
+// Two overloads with their own defaults: an instance one builds says nothing
+// about the other's.
+export interface Line<N> {
+  send(name: N, data: unknown): void;
+}
+export declare function line<N = string>(port: number): Line<N>;
+export declare function line<M = number>(options: { id: string }): Line<M>;
+`;
+
+// An HTTP client whose factory builds a different instance per options type.
+const HTTP_FACTORY = `export interface Plain {
+  get(url: string): Promise<unknown>;
+}
+export interface Prefixed {
+  get(url: string): Promise<unknown>;
+}
+export interface Static {
+  create(options: { timeout?: number }): Plain;
+  create(options: { prefixUrl: string }): Prefixed;
+}
+declare const client: Static;
+export default client;
 `;
 
 const ANY_EXPORT = `declare const client: any;
@@ -335,6 +413,9 @@ interface Response {
   errors?: string[];
 }
 
+/** A key of the options object at argument 0. */
+const keyed = (key: string): Slot => ({ arg: 0, key });
+
 let sequence = 0;
 function check(pkg: string, exported: string, role: string, receiver: string, claim: Claim): Check {
   return { claim_id: `c${sequence++}`, package: pkg, export: exported, role, receiver, claim };
@@ -374,14 +455,13 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   let client: SidecarClient;
   let requestId = 0;
 
-  const send = (checks: Check[], variants?: string[]) =>
+  const send = (checks: Check[]) =>
     client.send<Response>(
       {
         request_id: `claims-${requestId++}`,
         action: 'verify_library_claims',
         from_dir: root,
         checks,
-        ...(variants === undefined ? {} : { variants }),
       },
       60_000
     );
@@ -431,6 +511,12 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'node_modules/fixture-typed-socket/index.d.ts': TYPED_SOCKET,
       'node_modules/fixture-rules/package.json': packageJson('fixture-rules', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-rules/index.d.ts': RULES,
+      'node_modules/fixture-queue/package.json': packageJson('fixture-queue', '3.0.0', { types: 'index.d.ts' }),
+      'node_modules/fixture-queue/index.d.ts': QUEUE,
+      'node_modules/fixture-generic/package.json': packageJson('fixture-generic', '1.0.0', { types: 'index.d.ts' }),
+      'node_modules/fixture-generic/index.d.ts': GENERIC,
+      'node_modules/fixture-http-factory/package.json': packageJson('fixture-http-factory', '1.0.0', { types: 'index.d.ts' }),
+      'node_modules/fixture-http-factory/index.d.ts': HTTP_FACTORY,
       'node_modules/fixture-any-bus/package.json': packageJson('fixture-any-bus', '1.0.0', { types: 'index.d.ts' }),
       'node_modules/fixture-any-bus/index.d.ts': ANY_EXPORT,
       // Installed from the service's own source by a `file:` range.
@@ -455,7 +541,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('verifies the task SDK: the definition maker, sends bound to its name, and export sends', async () => {
     const T = '@fixture/tasks';
     const checks = [
-      check(T, 'task', 'broker', 'export', make('call', null, { name_key: 'id', handler_key: 'run' })),
+      check(T, 'task', 'broker', 'export', make('call', null, { name: keyed('id'), handler: keyed('run') })),
       check(T, 'task', 'broker', 'instance:()', op('send', 'trigger', { on: 'instance', name: { bound: 'maker' }, payload: { arg: 0 } })),
       check(T, 'tasks', 'broker', 'export', op('send', 'trigger', { on: 'export', name: { arg: 0 }, payload: { arg: 1 } })),
     ];
@@ -485,8 +571,8 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     const T = '@fixture/tasks';
     const checks = [
       check(T, 'task', 'broker', 'export', make('call', null, {
-        name_key: 'id',
-        handler_key: 'run',
+        name: keyed('id'),
+        handler: keyed('run'),
         key_labels: { id: 'name' },
         name_scope: { scope: 'service', namespace: 'task' },
         picker: 'model/q1',
@@ -519,7 +605,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'unchecked maker_unverified',
     ]);
     // A maker claim that does not hold builds no instance.
-    const wrongMaker = make('call', null, { name_key: 'name' });
+    const wrongMaker = make('call', null, { name: keyed('name') });
     assert.deepStrictEqual(
       verdicts(await send([check(T, 'task', 'broker', 'export', wrongMaker), check(T, 'task', 'broker', 'instance:()', sendBound)])),
       ['failed key_missing', 'unchecked maker_unverified']
@@ -528,7 +614,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     assert.deepStrictEqual(
       verdicts(
         await send([
-          check(T, 'task', 'broker', 'export', make('call', null, { handler_key: 'run' })),
+          check(T, 'task', 'broker', 'export', make('call', null, { handler: keyed('run') })),
           check(T, 'task', 'broker', 'instance:()', sendBound),
         ])
       ),
@@ -538,7 +624,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
 
   it('reads an instance through every maker overload that holds, and needs the op on each', async () => {
     const T = '@fixture/tasks';
-    const maker = make('call', null, { name_key: 'id', handler_key: 'run' });
+    const maker = make('call', null, { name: keyed('id'), handler: keyed('run') });
     const checks = [
       check(T, 'job', 'broker', 'export', maker),
       check(T, 'job', 'broker', 'instance:()', op('send', 'trigger', { name: { bound: 'maker' }, payload: { arg: 0 } })),
@@ -551,12 +637,12 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('reads an instance through the overloads every maker claim of the request holds on', async () => {
     const T = '@fixture/tasks';
     const definition = make('call', null, {
-      name_key: 'id',
-      handler_key: 'run',
+      name: keyed('id'),
+      handler: keyed('run'),
       key_labels: { queue: 'not_name', tag: 'not_name' },
     });
-    const tagged = make('call', null, { prefix_key: 'tag' });
-    const queued = make('call', null, { prefix_key: 'queue' });
+    const tagged = make('call', null, { prefix: keyed('tag') });
+    const queued = make('call', null, { prefix: keyed('queue') });
     const cancel = op('receive', 'cancel', { name: { bound: 'maker' } });
     // Only the second overload takes a tag, and only its instance can cancel.
     assert.deepStrictEqual(
@@ -589,7 +675,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('verifies the key-value client re-exported from its core package', async () => {
     const K = 'fixture-kv';
     const checks = [
-      check(K, 'createClient', 'broker', 'export', make('call', null, { base_key: 'url' })),
+      check(K, 'createClient', 'broker', 'export', make('call', null, { base: keyed('url') })),
       check(K, 'createClient', 'broker', 'instance:()', op('send', 'publish', { name: { arg: 0 }, payload: { arg: 1 } })),
       check(K, 'createClient', 'broker', 'instance:()', op('receive', 'subscribe', { name: { arg: 0 }, handler: { arg: 1 } })),
     ];
@@ -624,15 +710,14 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   // Receivers: on, of, makers on the export, scopes
   // --------------------------------------------------------------------------
 
-  it('reads an op, scope or reserved name only on the receivers its on and of name', async () => {
+  it('reads an op, scope or reserved name only on the receivers its on and of name (amendment 2, B3)', async () => {
     const T = '@fixture/tasks';
-    const definition = make('call', null, { name_key: 'id', handler_key: 'run' });
-    const scheduled = make('call', 'task', { name_key: 'id', handler_key: 'run' });
+    const definition = make('call', null, { name: keyed('id'), handler: keyed('run') });
+    const scheduled = make('call', 'task', { name: keyed('id'), handler: keyed('run') });
     const bound = (parts: Record<string, unknown>) =>
       op('send', 'trigger', { name: { bound: 'maker' }, payload: { arg: 0 }, ...parts });
     const exportSend = (parts: Record<string, unknown>) =>
       op('send', 'trigger', { name: { arg: 0 }, payload: { arg: 1 }, ...parts });
-    const publishBoth = op('send', 'publish', { name: { arg: 0 }, payload: { arg: 1 }, on: 'both', of: 'connect' });
     const checks = [
       check(T, 'task', 'broker', 'export', definition),
       check(T, 'schedules', 'broker', 'export', scheduled),
@@ -640,21 +725,16 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       check(T, 'tasks', 'broker', 'export', exportSend({ on: 'instance' })),
       // Claimed for the export, asked on an instance.
       check(T, 'task', 'broker', 'instance:()', bound({ on: 'export' })),
-      // Claimed of one maker, asked on another's instance.
-      check(T, 'schedules', 'broker', 'instance:task', bound({ on: 'instance', of: 'cron' })),
-      check(T, 'task', 'broker', 'instance:()', bound({ on: 'instance', of: 'task' })),
-      // Claimed of the maker it is asked on.
-      check(T, 'schedules', 'broker', 'instance:task', bound({ on: 'instance', of: 'task' })),
+      // `of` names one receiver by its id: asked on another.
+      check(T, 'schedules', 'broker', 'instance:task', bound({ of: 'instance:cron' })),
+      check(T, 'task', 'broker', 'instance:()', bound({ of: 'instance:task' })),
+      // Asked on the receiver it names.
+      check(T, 'schedules', 'broker', 'instance:task', bound({ of: 'instance:task' })),
+      check(T, 'task', 'broker', 'instance:()', bound({ of: 'instance:()' })),
       check(T, 'tasks', 'broker', 'export', exportSend({ on: 'both' })),
       check(T, 'task', 'broker', 'instance:()', bound({ on: 'both' })),
       // A reserved name claimed for the export, asked on an instance.
       check(T, 'task', 'broker', 'instance:()', reserved('trigger', 'x', { on: 'export' })),
-      // Claimed on the export and on one maker's instances: of says nothing about the export leg.
-      check(T, 'broker', 'broker', 'export', make('call', 'connect', { base_key: 'url' })),
-      check(T, 'broker', 'broker', 'export', make('call', 'reconnect', { base_key: 'url' })),
-      check(T, 'broker', 'broker', 'export', publishBoth),
-      check(T, 'broker', 'broker', 'instance:connect', publishBoth),
-      check(T, 'broker', 'broker', 'instance:reconnect', publishBoth),
     ];
     assert.deepStrictEqual(verdicts(await send(checks)), [
       'verified',
@@ -666,18 +746,47 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'verified',
       'verified',
       'verified',
-      'unchecked receiver_invalid',
-      'verified',
-      'verified',
-      'verified',
       'verified',
       'unchecked receiver_invalid',
     ]);
   });
 
+  it('reads on and of as exclusive, and a member on both receivers as two elements (amendment 2, B3)', async () => {
+    const T = '@fixture/tasks';
+    const publish = (parts: Record<string, unknown>) =>
+      op('send', 'publish', { name: { arg: 0 }, payload: { arg: 1 }, ...parts });
+    const checks = [
+      check(T, 'broker', 'broker', 'export', make('call', 'connect', { base: keyed('url') })),
+      check(T, 'broker', 'broker', 'export', make('call', 'reconnect', { base: keyed('url') })),
+      // The export's leg and one maker's leg, each its own element.
+      check(T, 'broker', 'broker', 'export', publish({ on: 'export' })),
+      check(T, 'broker', 'broker', 'instance:connect', publish({ of: 'instance:connect' })),
+      check(T, 'broker', 'broker', 'instance:reconnect', publish({ of: 'instance:connect' })),
+      // An element carrying both says no one receiver, on any receiver.
+      check(T, 'broker', 'broker', 'export', publish({ on: 'both', of: 'instance:connect' })),
+      check(T, 'broker', 'broker', 'instance:connect', publish({ on: 'both', of: 'instance:connect' })),
+      check(T, 'broker', 'broker', 'instance:connect', publish({ on: 'instance', of: 'instance:connect' })),
+      // `of` is a receiver id a maker or scope builds: a maker's member name is not one, nor is the export.
+      check(T, 'broker', 'broker', 'instance:connect', publish({ of: 'connect' })),
+      check(T, 'broker', 'broker', 'export', publish({ of: 'export' })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), [
+      'verified',
+      'verified',
+      'verified',
+      'verified',
+      'unchecked receiver_invalid',
+      'unchecked claim_invalid',
+      'unchecked claim_invalid',
+      'unchecked claim_invalid',
+      'unchecked claim_invalid',
+      'unchecked claim_invalid',
+    ]);
+  });
+
   it('reads a maker on the export only', async () => {
     const T = '@fixture/tasks';
-    const definition = make('call', null, { name_key: 'id', handler_key: 'run' });
+    const definition = make('call', null, { name: keyed('id'), handler: keyed('run') });
     const checks = [
       check(T, 'task', 'broker', 'export', definition),
       check(T, 'task', 'broker', 'instance:()', definition),
@@ -702,9 +811,26 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
           check(P, 'connect', 'broker', 'instance:()>scope:admin.topic', publish),
           // A name bound by a scope on a receiver no scope made.
           check(P, 'connect', 'broker', 'instance:()', publish),
+          // A scope's receiver is named by `of`, whole; `on` never reaches it.
+          check(P, 'connect', 'broker', 'instance:()>scope:topic', { ...publish, of: 'instance:()>scope:topic' }),
+          check(P, 'connect', 'broker', 'instance:()>scope:topic', { ...publish, of: 'instance:()' }),
+          check(P, 'connect', 'broker', 'instance:()>scope:topic', { ...publish, on: 'instance' }),
+          check(P, 'connect', 'broker', 'instance:()>scope:topic', { ...publish, on: 'both' }),
         ])
       ),
-      ['verified', 'verified', 'verified', 'verified', 'verified', 'verified', 'failed name_unbound']
+      [
+        'verified',
+        'verified',
+        'verified',
+        'verified',
+        'verified',
+        'verified',
+        'failed name_unbound',
+        'verified',
+        'unchecked receiver_invalid',
+        'unchecked receiver_invalid',
+        'unchecked receiver_invalid',
+      ]
     );
     assert.deepStrictEqual(
       verdicts(await send([check(P, 'connect', 'broker', 'export', connect), check(P, 'connect', 'broker', 'instance:()>scope:topic', publish)])),
@@ -760,6 +886,92 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       ),
       ['verified', 'failed member_inherited']
     );
+  });
+
+  // --------------------------------------------------------------------------
+  // A maker's parts are slots (contract amendment 2, B2)
+  // --------------------------------------------------------------------------
+
+  it('reads a positional maker name, handler and base', async () => {
+    const Q = 'fixture-queue';
+    const queue = make('new', null, { name: { arg: 0 }, key_labels: { prefix: 'not_name' } });
+    const checks = [
+      // new Queue("emails"), its options' prefix labelled.
+      check(Q, 'Queue', 'broker', 'export', queue),
+      // An instance op whose name is the one the maker's positional name bound.
+      check(Q, 'Queue', 'broker', 'instance:new', op('send', 'publish', { of: 'instance:new', name: { bound: 'maker' }, payload: { arg: 0 } })),
+      // new Worker("emails", processor).
+      check(Q, 'Worker', 'broker', 'export', make('new', null, { name: { arg: 0 }, handler: { arg: 1 } })),
+      // connect(url): a positional base.
+      check(Q, 'connect', 'broker', 'export', make('call', null, { base: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), ['verified', 'verified', 'verified', 'verified']);
+  });
+
+  it("holds a maker's positional parts to the name-slot and string rules", async () => {
+    const Q = 'fixture-queue';
+    const checks = [
+      // Strict D2 on a maker name: the options' string key is not accounted for.
+      check(Q, 'Queue', 'broker', 'export', make('new', null, { name: { arg: 0 } })),
+      // An unassigned positional string beside the name cannot be labelled.
+      check(Q, 'Pair', 'broker', 'export', make('new', null, { name: { arg: 0 }, key_labels: {} })),
+      // A base or prefix accepts a string: a port number is not one, nor is an options object.
+      check(Q, 'open', 'broker', 'export', make('call', null, { base: { arg: 0 } })),
+      check(Q, 'connect', 'broker', 'export', make('call', null, { prefix: { arg: 1 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), [
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+      'failed slot_not_string',
+      'failed slot_not_string',
+    ]);
+  });
+
+  it('binds no name through a maker claim with no name slot', async () => {
+    const Q = 'fixture-queue';
+    const checks = [
+      check(Q, 'Pair', 'broker', 'export', make('new', null)),
+      check(Q, 'Pair', 'broker', 'instance:new', op('send', 'publish', { name: { bound: 'maker' }, payload: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), ['verified', 'failed name_unbound']);
+  });
+
+  // --------------------------------------------------------------------------
+  // A generic receiver is read at its type-parameter defaults (contract amendment 2, B6)
+  // --------------------------------------------------------------------------
+
+  it('reads a maker that returns a generic with a default at that default', async () => {
+    const R = 'fixture-rules';
+    const checks = [
+      check(R, 'makeDefault', 'broker', 'export', make('call', null)),
+      check(R, 'makeDefault', 'broker', 'instance:()', op('send', 'send', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // No default and no constraint: still nothing.
+      check(R, 'makeOpen', 'broker', 'export', make('call', null)),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), ['verified', 'verified', 'unchecked maker_unresolved']);
+  });
+
+  it('reads a scope whose own type parameter defaults to its receiver\'s at that default', async () => {
+    const G = 'fixture-generic';
+    const checks = [
+      check(G, 'Hub', 'socket', 'export', make('new', null)),
+      check(G, 'Hub', 'socket', 'instance:new', scope('room', { arg: 0 }, { of: 'instance:new' })),
+      check(G, 'Hub', 'socket', 'instance:new>scope:room', op('send', 'emit', { of: 'instance:new>scope:room', name: { arg: 0 }, payload: { arg: 1 } })),
+      check(G, 'Hub', 'socket', 'instance:new', scope('topic', { arg: 0 }, { of: 'instance:new' })),
+      check(G, 'Hub', 'socket', 'instance:new>scope:topic', op('send', 'publish', { of: 'instance:new>scope:topic', name: { bound: 'scope' }, payload: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), ['verified', 'verified', 'verified', 'verified', 'verified']);
+  });
+
+  it("reads an overload at another overload's defaults only when they build the same instance", async () => {
+    const G = 'fixture-generic';
+    // Only the options overload takes the claim; a call with no argument
+    // resolves to the port overload, whose instance is another type.
+    const checks = [
+      check(G, 'line', 'broker', 'export', make('call', null, { name: keyed('id') })),
+      check(G, 'line', 'broker', 'instance:()', op('send', 'send', { name: { arg: 0 }, payload: { arg: 1 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), ['verified', 'unchecked member_untyped']);
   });
 
   // --------------------------------------------------------------------------
@@ -828,7 +1040,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     );
     // HTTP answers as #1564 does: a node: specifier is not read as the runtime module there.
     assert.deepStrictEqual(
-      verdicts(await send([check(E, 'default', 'http_client', 'export', make('call', 'create', { base_key: 'url' }))])),
+      verdicts(await send([check(E, 'default', 'http_client', 'export', make('call', 'create', { base: keyed('url') }))])),
       ['unchecked module_local']
     );
   });
@@ -912,18 +1124,34 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     ]);
   });
 
-  it('refuses a name slot typed as a key of an index-signature map', async () => {
+  it('refuses a name slot typed as a key of a concrete index-signature map, and reads a key of a type-parameter map as a string slot (amendment 2, B6)', async () => {
     const R = 'fixture-rules';
     const checks = [
       check(R, 'channel', 'broker', 'export', op('send', 'send', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // A key of the receiver's event map, a type parameter defaulting to an index signature.
       check(R, 'channel', 'broker', 'export', op('send', 'emitKey', { name: { arg: 0 }, payload: { arg: 1 } })),
+      // A key of a concrete index-signature map.
       check(R, 'channel', 'broker', 'export', op('send', 'sendKey', { name: { arg: 0 }, payload: { arg: 1 } })),
     ];
     assert.deepStrictEqual(verdicts(await send(checks)), [
       'verified',
-      'failed name_index_key',
+      'verified',
       'failed name_index_key',
     ]);
+    // A socket client whose emitter is bound to its own reserved events and
+    // whose event maps are type parameters defaulting to an index signature.
+    const S = 'fixture-typed-socket';
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          check(S, 'io', 'socket', 'export', make('call', null)),
+          check(S, 'io', 'socket', 'instance:()', op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 } })),
+          check(S, 'io', 'socket', 'instance:()', op('receive', 'on', { name: { arg: 0 } })),
+          check(S, 'io', 'socket', 'instance:()', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
+        ])
+      ),
+      ['verified', 'verified', 'verified', 'verified']
+    );
   });
 
   it('refuses a handler typed Function, any, unknown or (...args: any[]), and an options object as a handler', async () => {
@@ -959,7 +1187,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('refuses keys split across union members', async () => {
     const R = 'fixture-rules';
     const define = (member: string) =>
-      check(R, 'channel', 'broker', 'export', make('call', member, { name_key: 'id', handler_key: 'run' }));
+      check(R, 'channel', 'broker', 'export', make('call', member, { name: keyed('id'), handler: keyed('run') }));
     assert.deepStrictEqual(verdicts(await send([define('define'), define('defineSplit')])), [
       'verified',
       'failed key_missing',
@@ -981,7 +1209,7 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       // A rest that holds the name holds other names.
       at(op('receive', 'subscribeAll', { name: { arg: 0 } })),
       // The definition's id beside an optional description nobody labels.
-      at(make('call', 'defineDescribed', { name_key: 'id', handler_key: 'run' })),
+      at(make('call', 'defineDescribed', { name: keyed('id'), handler: keyed('run') })),
     ];
     assert.deepStrictEqual(verdicts(await send(checks)), [
       'failed name_ambiguous',
@@ -997,8 +1225,8 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     const R = 'fixture-rules';
     const define = (labels?: Record<string, string>) =>
       check(R, 'channel', 'broker', 'export', make('call', 'defineDescribed', {
-        name_key: 'id',
-        handler_key: 'run',
+        name: keyed('id'),
+        handler: keyed('run'),
         ...(labels === undefined ? {} : { key_labels: labels }),
       }));
     const checks = [
@@ -1111,11 +1339,14 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('reads an HTTP claim only in the parts its #1564 kinds use', async () => {
     const K = 'fixture-kv';
     const factory = (parts: Record<string, unknown>) =>
-      check(K, 'createClient', 'http_client', 'export', make('call', 'create', { base_key: 'url', ...parts }));
+      check(K, 'createClient', 'http_client', 'export', make('call', 'create', { base: keyed('url'), ...parts }));
     const checks = [
-      factory({ name_key: 'id' }),
-      factory({ handler_key: 'run' }),
-      factory({ prefix_key: 'prefix' }),
+      factory({ name: keyed('id') }),
+      factory({ handler: keyed('run') }),
+      factory({ prefix: keyed('prefix') }),
+      // #1564's factory reads its base key on the options at argument 0, and nowhere else.
+      factory({ base: { arg: 1, key: 'url' } }),
+      factory({ base: { arg: 0 } }),
       check(K, 'createClient', 'http_client', 'export', op('request', 'get', { method: 'GET', name: { arg: 0 }, path: ['client'] })),
     ];
     assert.deepStrictEqual(verdicts(await send(checks)), [
@@ -1123,7 +1354,21 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'unchecked claim_invalid',
       'unchecked claim_invalid',
       'unchecked claim_invalid',
+      'unchecked claim_invalid',
+      'unchecked claim_invalid',
     ]);
+    // A factory claim steers which overload an instance is read through only
+    // as #1564 states it: a base key at argument 0.
+    const F = 'fixture-http-factory';
+    const get = check(F, 'default', 'http_client', 'instance:create', op('request', 'get', { method: 'GET', name: { arg: 0 } }));
+    assert.deepStrictEqual(
+      verdicts(await send([check(F, 'default', 'http_client', 'export', make('call', 'create', { base: { arg: 1, key: 'prefixUrl' } })), get])),
+      ['unchecked claim_invalid', 'verified']
+    );
+    assert.deepStrictEqual(
+      verdicts(await send([check(F, 'default', 'http_client', 'export', make('call', 'create', { base: keyed('prefixUrl') })), get])),
+      ['verified', 'unchecked factory_unresolved']
+    );
   });
 
   it('gives no fact from an export given two roles in one request', async () => {
@@ -1167,43 +1412,18 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
   it('rejects a request whose claim is outside the contract shape', async () => {
     const T = '@fixture/tasks';
     const shapes: Claim[] = [
-      // There is no define op: a definition is a maker with a name key and a handler key.
+      // There is no define op: a definition is a maker with a name slot and a handler slot.
       op('define', 'task', { name: { arg: 0 } }),
-      // A maker's keys are named, not placed.
-      { kind: 'make', form: 'call', member: null, name: { arg: 0, key: 'id' } },
+      // A maker's parts are slots (amendment 2, B2): the named keys are gone, and no part is bound.
+      make('call', null, { name_key: 'id', handler_key: 'run' }),
+      make('call', null, { base_key: 'url' }),
+      make('call', null, { name: { bound: 'maker' } }),
       { kind: 'reserved', member: 'on', name: 'connect', at: { arg: 0 } },
-      make('call', null, { name_key: 'id', key_labels: { id: 'maybe' } }),
+      make('call', null, { name: keyed('id'), key_labels: { id: 'maybe' } }),
     ];
     for (const claim of shapes) {
       const response = await send([check(T, 'task', 'broker', 'export', claim)]);
       assert.strictEqual(response.status, 'error', JSON.stringify(claim));
     }
-  });
-
-  // --------------------------------------------------------------------------
-  // A reading a request can switch on (never the default)
-  // --------------------------------------------------------------------------
-
-  it('index_key_generic_map reads a key of a generic event map as a string slot, only when asked', async () => {
-    const S = 'fixture-typed-socket';
-    const checks = [
-      check(S, 'io', 'socket', 'export', make('call', null)),
-      check(S, 'io', 'socket', 'instance:()', op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 } })),
-      check(S, 'io', 'socket', 'instance:()', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
-      // A key of a concrete index-signature map.
-      check('fixture-rules', 'channel', 'broker', 'export', op('send', 'sendKey', { name: { arg: 0 }, payload: { arg: 1 } })),
-    ];
-    assert.deepStrictEqual(verdicts(await send(checks)), [
-      'verified',
-      'failed name_index_key',
-      'failed name_index_key',
-      'failed name_index_key',
-    ]);
-    assert.deepStrictEqual(verdicts(await send(checks, ['index_key_generic_map'])), [
-      'verified',
-      'verified',
-      'verified',
-      'failed name_index_key',
-    ]);
   });
 });

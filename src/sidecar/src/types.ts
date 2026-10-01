@@ -433,7 +433,7 @@ export interface ClaimSlot {
 }
 
 /**
- * A name the call does not carry: the one the maker's `name_key` bound to
+ * A name the call does not carry: the one the maker's `name` slot bound to
  * the instance (`maker`), or the one the scope member bound (`scope`).
  */
 export interface BoundName {
@@ -471,10 +471,14 @@ export interface NameScope {
 
 /**
  * One claim element, in the shape the store answers (contract on
- * carrick#1564, comment 5937606126, sections 2 and 3), tagged by `kind`.
- * `picker` and `name_scope` are carried and never read. A maker's keys
- * (`base_key`, `prefix_key`, `name_key`, `handler_key`) are keys of the
- * options object at argument 0.
+ * carrick#1564, comment 5937606126, sections 2 and 3, as amendment 2,
+ * comment 5939543981, changes it), tagged by `kind`. `picker` and
+ * `name_scope` are carried and never read.
+ *
+ * `on` and `of` say which receivers an op, scope or reserved name applies
+ * to, and an element carries at most one of them: `of` is exactly one
+ * receiver, by its receiver id (`instance:new`, `instance:connect>scope:channel`);
+ * `on` is the export, every instance of every maker, or both.
  */
 export type LibraryClaim =
   | {
@@ -482,13 +486,13 @@ export type LibraryClaim =
       kind: 'make';
       form: 'call' | 'new';
       member: string | null;
-      /** An HTTP base URL. */
-      base_key?: string;
+      /** An HTTP base URL, or a broker's address. */
+      base?: ClaimSlot;
       /** A prefix every name the instance sends gets. */
-      prefix_key?: string;
-      /** A definition's id: bound to every op that names `{ bound: 'maker' }`. */
-      name_key?: string;
-      handler_key?: string;
+      prefix?: ClaimSlot;
+      /** A definition's id or a queue's name: bound to every op that names `{ bound: 'maker' }`. */
+      name?: ClaimSlot;
+      handler?: ClaimSlot;
       key_labels?: Record<string, KeyLabel>;
       name_scope?: NameScope;
       picker?: string;
@@ -513,7 +517,7 @@ export type LibraryClaim =
       /** The members walked from the receiver to the object `member` sits on (`client.tasks.trigger`). */
       path?: string[];
       on?: ClaimOn;
-      /** The maker member whose instances the op acts on. */
+      /** The one receiver the op acts on, by its receiver id. */
       of?: string;
       name?: ClaimSlot | BoundName;
       payload?: ClaimSlot;
@@ -570,19 +574,7 @@ export interface VerifyLibraryClaimsRequest extends BaseRequest {
   checks: LibraryCheck[];
   /** Checks not reached in time come back `unchecked` with reason `budget`; null or absent is the default. */
   budget_ms?: number | null;
-  /** Readings switched on for this request; none is the strict default (see `ClaimVariant`). */
-  variants?: ClaimVariant[];
 }
-
-/**
- * A reading of the message checks a request can switch on; never the default.
- * - `index_key_generic_map`: a name slot typed as a key of an event map the
- *   receiver takes as a type parameter (defaulting to an index signature)
- *   reads as a string slot; a key of a concrete index-signature map is still
- *   refused. The strict default refuses both, because only the service's own
- *   type argument says what the map holds (carrick#1563 part 1).
- */
-export type ClaimVariant = 'index_key_generic_map';
 
 /**
  * List each package's declared surface the way the verifier reads it

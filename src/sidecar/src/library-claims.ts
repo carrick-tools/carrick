@@ -24,7 +24,10 @@
  * the contract's must-not-verify rules (a member only another package
  * declares, a name slot beside a string slot the claim does not account for,
  * a handler that says nothing). The wire is pinned on carrick#1564 (comment
- * 5937606126, section 3).
+ * 5937606126, section 3), as contract amendment 2 (comment 5939543981)
+ * changes it: a maker's parts are slots, `of` is a receiver id, and a
+ * receiver a generic maker or scope builds is read at its declared
+ * type-parameter defaults.
  *
  * The export's type is read the way the service's own code would read it: a
  * probe file in `from_dir` imports it, inside the service's program, under the
@@ -39,7 +42,6 @@ import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
 import type {
   ClaimSlot,
-  ClaimVariant,
   KeyLabel,
   LibraryCheck,
   LibraryClaim,
@@ -264,8 +266,8 @@ export interface VerifyResult {
 /**
  * A #1564 HTTP check in the shared shape. The conversion is one to one, so
  * each claim keeps its own id and its own verdict:
- * - `factory` is a `make` call of `member` whose options at argument 0 carry
- *   the base key;
+ * - `factory` is a `make` call of `member` whose base is the base key of the
+ *   options at argument 0;
  * - `verb` is a `request` op with a fixed method and the path at argument 0;
  * - `verb_body` is the same op with the body at argument 1, or with an
  *   options object at argument 1 and the body as one of its keys;
@@ -286,7 +288,7 @@ export function httpCheck(check: SemanticsCheck): LibraryCheck {
     case 'factory':
       return {
         ...common,
-        claim: { kind: 'make', form: 'call', member: claim.member, base_key: claim.base_url_key },
+        claim: { kind: 'make', form: 'call', member: claim.member, base: { arg: 0, key: claim.base_url_key } },
       };
     case 'verb':
       return {
@@ -343,12 +345,7 @@ export class LibraryClaimsVerifier {
    * A check on an instance or a scope reads the maker or scope claims of the
    * same request first, whatever their place in it.
    */
-  run(
-    fromDir: string,
-    checks: LibraryCheck[],
-    budgetMs: number,
-    variants: ReadonlySet<ClaimVariant> = new Set()
-  ): VerifyResult {
+  run(fromDir: string, checks: LibraryCheck[], budgetMs: number): VerifyResult {
     const deadline = performance.now() + budgetMs;
     const stamp = (check: LibraryCheck, outcome: Outcome): SemanticsResult =>
       outcome.verdict === 'verified'
@@ -380,27 +377,46 @@ export class LibraryClaimsVerifier {
       given.add(check.role);
       roles.set(key, given);
       const claim = check.claim;
-      if (check.role === 'http_client' && claim.kind === 'make' && claim.member !== null && claim.base_key) {
+      const baseKey = claim.kind === 'make' && claim.base?.arg === 0 ? claim.base.key : undefined;
+      if (check.role === 'http_client' && claim.kind === 'make' && claim.member !== null && baseKey !== undefined) {
         const factory = factoryKey(key, claim.member);
         const keys = factoryKeys.get(factory) ?? new Set<string>();
-        keys.add(claim.base_key);
+        keys.add(baseKey);
         factoryKeys.set(factory, keys);
       }
     }
-    const probeText = importKeys
-      .map((key, i) => {
-        const [pkg, name] = JSON.parse(key) as [string, string];
-        return importLine(pkg, name, `__carrick_e${i}`);
-      })
-      .join('\n');
+    const importLines = importKeys.map((key, i) => {
+      const [pkg, name] = JSON.parse(key) as [string, string];
+      return importLine(pkg, name, `__carrick_e${i}`);
+    });
+    // One statement per receiver a message check's maker or scope claim
+    // builds, after the imports: that receiver built with no argument and no
+    // type argument. Its resolved signature is the maker (or scope) read at
+    // its declared type-parameter defaults (`DeclarationReader.returnOf`). An
+    // HTTP request adds none, so its probe is the one #1564 reads.
+    const builtLines: string[] = [];
+    const builtIndex = new Map<string, number>();
+    for (const check of checks) {
+      if (!ROLE_TABLE[check.role]?.message) continue;
+      const built = builtReceiver(check);
+      if (built === undefined) continue;
+      const key = builtKey(check, built);
+      if (builtIndex.has(key)) continue;
+      const expression = receiverExpression(`__carrick_e${importIndex.get(exportKey(check))!}`, built);
+      if (expression === undefined) continue;
+      builtIndex.set(key, importLines.length + builtLines.length);
+      builtLines.push(`${expression};`);
+    }
+    const probeText = [...importLines, ...builtLines].join('\n');
 
     const probePath = path.join(fromDir, `__carrick_claims_probe_${process.pid}_${probeSequence++}.ts`);
     const probe = this.project.createSourceFile(probePath, `${probeText}\n`, { overwrite: true });
     try {
       const program = this.project.getProgram().compilerObject;
+      const checker = program.getTypeChecker();
       const file = program.getSourceFile(probe.getFilePath());
       if (!file) throw new Error(`probe file ${probePath} is not in the program`);
-      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir, variants);
+      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
       const localRanges = readLocalRanges(fromDir);
 
       const moduleReads = new Map<string, ModuleRead>();
@@ -410,6 +426,17 @@ export class LibraryClaimsVerifier {
 
       const declarationOf = (check: LibraryCheck) =>
         file.statements[importIndex.get(exportKey(check))!] as ts.ImportDeclaration;
+
+      /** The probe's no-argument build of `receiver` on the check's export, resolved. */
+      const atDefaults = (check: LibraryCheck, receiver: string): ts.Signature | undefined => {
+        const index = builtIndex.get(builtKey(check, receiver));
+        if (index === undefined) return undefined;
+        const statement = file.statements[index];
+        if (!statement || !ts.isExpressionStatement(statement)) return undefined;
+        const expression = statement.expression;
+        if (!ts.isCallExpression(expression) && !ts.isNewExpression(expression)) return undefined;
+        return checker.getResolvedSignature(expression);
+      };
 
       // A runtime module is read for the message roles only: HTTP answers as #1564 does.
       const readModule = (check: LibraryCheck, runtimeModules: boolean): ModuleRead => {
@@ -457,10 +484,13 @@ export class LibraryClaimsVerifier {
                 other.claim.form === maker.form &&
                 other.claim.member === maker.member
             );
-          const made = holdingReturns(makers.map(({ i }) => judge(i)));
+          const made = holdingReturns(
+            makers.map(({ i }) => judge(i)),
+            atDefaults(check, receiverPath.base)
+          );
           if ('reason' in made) return { reason: made.reason === 'unresolved' ? 'maker_unresolved' : 'maker_unverified' };
           types = made.value;
-          makerBindsName = makers.some(({ other }) => other.claim.kind === 'make' && other.claim.name_key !== undefined);
+          makerBindsName = makers.some(({ other }) => other.claim.kind === 'make' && other.claim.name !== undefined);
         }
         if (receiverPath.scope !== undefined) {
           const scope = receiverPath.scope;
@@ -474,7 +504,10 @@ export class LibraryClaimsVerifier {
                 other.claim.kind === 'scope' &&
                 scopeStep(other.claim) === scope
             );
-          const scoped = holdingReturns(scopes.map(({ i }) => judge(i)));
+          const scoped = holdingReturns(
+            scopes.map(({ i }) => judge(i)),
+            atDefaults(check, check.receiver)
+          );
           if ('reason' in scoped) return { reason: scoped.reason === 'unresolved' ? 'scope_unresolved' : 'scope_unverified' };
           types = scoped.value;
         }
@@ -492,15 +525,20 @@ export class LibraryClaimsVerifier {
         };
       };
 
-      /** What a set of maker (or scope) judgements build: the distinct types their common overloads return. */
-      const holdingReturns = (judgements: Judged[]): Read<ts.Type[]> => {
+      /**
+       * What a set of maker (or scope) judgements build: the distinct types
+       * their common overloads return, each read at its declared
+       * type-parameter defaults where `built` (the probe's no-argument build
+       * of that receiver) instantiates it.
+       */
+      const holdingReturns = (judgements: Judged[], built: ts.Signature | undefined): Read<ts.Type[]> => {
         if (judgements.length === 0) return { reason: 'unverified' };
         let holding: readonly ts.Signature[] | undefined;
         for (const judgement of judgements) {
           if (judgement.outcome.verdict !== 'verified' || !judgement.holding) return { reason: 'unverified' };
           holding = holding === undefined ? judgement.holding : holding.filter(sig => judgement.holding!.includes(sig));
         }
-        const returns = [...new Set((holding ?? []).map(sig => reader.returnOf(sig)))];
+        const returns = [...new Set((holding ?? []).map(sig => reader.returnOf(sig, built)))];
         if (returns.length === 0) return { reason: 'unresolved' };
         return { value: returns };
       };
@@ -521,6 +559,7 @@ export class LibraryClaimsVerifier {
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
+        if (placementInvalid(check.claim)) return { outcome: unchecked('claim_invalid') };
         if (rules.http && !HTTP_RECEIVER.test(check.receiver)) return { outcome: unchecked('receiver_invalid') };
         if (rules.message && !fitsReceiver(check)) return { outcome: unchecked('receiver_invalid') };
         reader.setPackage(check.package);
@@ -555,9 +594,11 @@ export class LibraryClaimsVerifier {
         }
         const receivers = readMessageReceivers(index, exportRead.value);
         if ('reason' in receivers) return { outcome: unchecked(receivers.reason) };
+        const built = builtReceiver(check);
+        const builtAtDefaults = built === undefined ? undefined : atDefaults(check, built);
         const holding: ts.Signature[] = [];
         for (const receiver of receivers.value) {
-          const result = reader.judgeMessage(receiver, check.claim);
+          const result = reader.judgeMessage(receiver, check.claim, builtAtDefaults);
           if (result.outcome.verdict !== 'verified') return result;
           holding.push(...(result.holding ?? []));
         }
@@ -683,25 +724,78 @@ function scopeStep(claim: ScopeClaim): string {
 }
 
 /**
- * A message check names a receiver its claim can be read on. A maker is read
- * on the export itself. An op, scope or reserved name claimed `on` the export
- * is read there only, one claimed `on` instances only on an instance, and one
- * claimed `of` a maker on no other maker's instances (the scope step, if any,
- * follows the instance it was read on). A claim read on a receiver it
- * was not claimed for could verify a member of the same name with another
- * shape (`client.write(name, value)` against `instance.write(value)`).
+ * An op, scope or reserved name carries `on` or `of`, never both, and `of` is
+ * a receiver a maker or a scope builds, by its receiver id: never the export
+ * itself, which `on: 'export'` names (contract amendment 2, B3). "Both the
+ * export and one maker's instances" is two elements, not one.
+ */
+function placementInvalid(claim: LibraryClaim): boolean {
+  if (claim.kind === 'make' || claim.of === undefined) return false;
+  if (claim.on !== undefined) return true;
+  const of = parseReceiver(claim.of);
+  return of === undefined || (of.maker === undefined && of.scope === undefined);
+}
+
+/**
+ * A message check names a receiver its claim can be read on (contract
+ * amendment 2, B3). A maker is read on the export itself. An element with
+ * `of` is read on exactly that receiver. One with `on` is read on the export
+ * (`export`), on an instance of a maker (`instance`) or on either (`both`),
+ * and never on a receiver a scope returns, which only `of` names. One with
+ * neither names no receiver of its own. A claim read on a receiver it was
+ * not claimed for could verify a member of the same name with another shape
+ * (`client.write(name, value)` against `instance.write(value)`).
  */
 function fitsReceiver(check: LibraryCheck): boolean {
   const receiver = parseReceiver(check.receiver);
   if (!receiver) return false;
   const claim = check.claim;
   if (claim.kind === 'make') return check.receiver === 'export';
-  if (claim.on === 'export' && receiver.base !== 'export') return false;
-  if (claim.on === 'instance' && receiver.maker === undefined) return false;
-  // `of` names the maker whose instances the claim is for; it says nothing
-  // about the export, which an `on: both` claim is also read on.
-  if (claim.of !== undefined && receiver.maker !== undefined && receiver.maker.member !== claim.of) return false;
+  if (claim.of !== undefined) return check.receiver === claim.of;
+  if (claim.on === undefined) return true;
+  if (receiver.scope !== undefined) return false;
+  if (claim.on === 'export') return receiver.maker === undefined;
+  if (claim.on === 'instance') return receiver.maker !== undefined;
   return true;
+}
+
+/**
+ * The receiver a maker or scope check builds: what the maker makes
+ * (`instance:new`), or what the scope member returns on the receiver it is
+ * read on (`instance:connect>scope:channel`). Undefined for an op or a
+ * reserved name, and for a scope on a receiver a scope already returned.
+ */
+function builtReceiver(check: LibraryCheck): string | undefined {
+  const claim = check.claim;
+  if (claim.kind === 'make') {
+    if (claim.member === null) return claim.form === 'call' ? 'instance:()' : 'instance:new';
+    return claim.form === 'call' ? `instance:${claim.member}` : `instance:new:${claim.member}`;
+  }
+  if (claim.kind !== 'scope' || check.receiver.includes('>')) return undefined;
+  return `${check.receiver}>scope:${scopeStep(claim)}`;
+}
+
+function builtKey(check: LibraryCheck, receiver: string): string {
+  return JSON.stringify([check.package, check.export, receiver]);
+}
+
+/**
+ * What a service writes to build `receiver` on the export bound to `local`,
+ * passing no argument and no type argument: `new e()`, `e()`, `e.m()` or
+ * `new e.m()`, then `.path.member()` for a scope step. Undefined for a
+ * receiver id that does not parse.
+ */
+function receiverExpression(local: string, receiver: string): string | undefined {
+  const parsed = parseReceiver(receiver);
+  if (!parsed) return undefined;
+  const access = (name: string) => (IDENTIFIER.test(name) ? `.${name}` : `[${JSON.stringify(name)}]`);
+  let text = local;
+  if (parsed.maker) {
+    const callee = parsed.maker.member === null ? local : `${local}${access(parsed.maker.member)}`;
+    text = parsed.maker.form === 'new' ? `new ${callee}()` : `${callee}()`;
+  }
+  if (parsed.scope !== undefined) text = `${text}${parsed.scope.split('.').map(access).join('')}()`;
+  return text;
 }
 
 /** The symbols that say who declared a type: its own, its alias's, its parts'. */
@@ -757,7 +851,7 @@ function readLocalRanges(fromDir: string): ReadonlyMap<string, string> {
   }
 }
 
-/** A part of a message claim. `base` and `prefix` are a maker's string options. */
+/** A part of a message claim. `base` and `prefix` are a maker's string parts. */
 type PartName = 'name' | 'base' | 'prefix' | 'payload' | 'handler' | 'ack';
 
 /** Where the parts of a message claim sit, and which argument holds which keys. */
@@ -790,9 +884,7 @@ class DeclarationReader {
     private readonly program: ts.Program,
     private readonly probe: ts.SourceFile,
     private readonly host: ts.ModuleResolutionHost,
-    serviceRoot: string,
-    /** Readings switched on for this request; none is the strict default (`ClaimVariant`). */
-    private readonly variants: ReadonlySet<ClaimVariant> = new Set()
+    serviceRoot: string
   ) {
     this.checker = program.getTypeChecker();
     this.root = this.realpath(serviceRoot);
@@ -986,9 +1078,37 @@ class DeclarationReader {
     return { value: instance };
   }
 
-  /** What a call (or construct) signature returns. */
-  returnOf(signature: ts.Signature): ts.Type {
+  /**
+   * What a maker or scope signature returns. A generic one is read at its
+   * declared type-parameter defaults (contract amendment 2, B6) when `built`,
+   * the probe's build of that receiver with no argument and no type argument,
+   * resolved to it: TypeScript instantiates such a call at each parameter's
+   * default, else at its constraint when `unknown` does not satisfy it, else
+   * at `unknown`, which says nothing. That is what a service that passes no
+   * type argument gets; a type argument of its own only narrows which names
+   * the slots allow. Otherwise the type parameters stay open.
+   */
+  returnOf(signature: ts.Signature, built?: ts.Signature): ts.Type {
+    if (built !== undefined && this.instantiates(built, signature)) return this.checker.getReturnTypeOfSignature(built);
     return this.checker.getReturnTypeOfSignature(signature);
+  }
+
+  /**
+   * `resolved` instantiates an overload that returns the very type
+   * `signature` returns: `signature` itself, or another constructor of the
+   * same generic class, which builds the same instance. Its type arguments
+   * are then `signature`'s too. Another overload's instance says nothing
+   * about this one's.
+   */
+  private instantiates(resolved: ts.Signature, signature: ts.Signature): boolean {
+    // `target` is internal to the compiler, but it is the only record of
+    // which overload a resolved call instantiated. Without it, nothing is
+    // read at its defaults.
+    const target = (resolved as { target?: ts.Signature }).target;
+    return (
+      target !== undefined &&
+      this.checker.getReturnTypeOfSignature(target) === this.checker.getReturnTypeOfSignature(signature)
+    );
   }
 
   /**
@@ -1045,17 +1165,20 @@ class DeclarationReader {
    */
   judgeHttp(receiver: ts.Type, claim: LibraryClaim): Outcome {
     if (claim.kind === 'make') {
+      const base = claim.base;
       if (
         claim.form !== 'call' ||
         claim.member === null ||
-        claim.name_key !== undefined ||
-        claim.handler_key !== undefined ||
-        claim.prefix_key !== undefined ||
-        claim.base_key === undefined
+        claim.name !== undefined ||
+        claim.handler !== undefined ||
+        claim.prefix !== undefined ||
+        base === undefined ||
+        base.arg !== 0 ||
+        base.key === undefined
       ) {
         return unchecked('claim_invalid');
       }
-      return this.judgeFactory(receiver, claim.member, claim.base_key);
+      return this.judgeFactory(receiver, claim.member, base.key);
     }
     if (claim.kind !== 'op' || claim.op !== 'request' || claim.handler || claim.ack || claim.path !== undefined) {
       return unchecked('claim_invalid');
@@ -1303,13 +1426,17 @@ class DeclarationReader {
   // Message claims (broker, in-process bus, socket)
   // --------------------------------------------------------------------------
 
-  /** A message claim on its receiver; a maker or scope claim also returns the overloads it holds on. */
-  judgeMessage(receiver: MessageReceiver, claim: LibraryClaim): Judged {
+  /**
+   * A message claim on its receiver; a maker or scope claim also returns the
+   * overloads it holds on. `built` is the probe's no-argument build of the
+   * receiver a maker or scope claim makes (see `returnOf`).
+   */
+  judgeMessage(receiver: MessageReceiver, claim: LibraryClaim, built?: ts.Signature): Judged {
     switch (claim.kind) {
       case 'make':
-        return this.judgeMake(receiver, claim);
+        return this.judgeMake(receiver, claim, built);
       case 'scope':
-        return this.judgeScope(receiver, claim);
+        return this.judgeScope(receiver, claim, built);
       case 'op':
         return { outcome: this.judgeOp(receiver, claim) };
       case 'reserved':
@@ -1320,19 +1447,15 @@ class DeclarationReader {
   /**
    * `member` (or the export itself, when null) is callable (`call`) or
    * constructible (`new`) through signatures the receiver's home packages
-   * declare; some overload takes the claimed keys on its options object at
-   * argument 0, and returns a type that says something. Those overloads are
-   * the ones an instance is read through. A definition (`task({ id, run })`)
-   * is a maker with a `name_key` and a `handler_key`.
+   * declare; some overload takes the base, prefix, name and handler where the
+   * claim's slots put them (contract amendment 2, B2), under the name-slot
+   * rules, and returns a type that says something, read at its type-parameter
+   * defaults (`returnOf`). Those overloads are the ones an instance is read
+   * through. A definition (`task({ id, run })`) is a maker with a `name` and a
+   * `handler` slot; a queue (`new Queue("emails")`) one with a positional name.
    */
-  private judgeMake(receiver: MessageReceiver, claim: MakeClaim): Judged {
-    const at = (key: string | undefined): ClaimSlot | undefined => (key === undefined ? undefined : { arg: 0, key });
-    const layout = this.layout({
-      base: at(claim.base_key),
-      prefix: at(claim.prefix_key),
-      name: at(claim.name_key),
-      handler: at(claim.handler_key),
-    });
+  private judgeMake(receiver: MessageReceiver, claim: MakeClaim, built?: ts.Signature): Judged {
+    const layout = this.layout({ base: claim.base, prefix: claim.prefix, name: claim.name, handler: claim.handler });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, [], claim.member, claim.form);
     if ('failure' in callee) return { outcome: callee.failure };
@@ -1341,7 +1464,7 @@ class DeclarationReader {
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
-      if (result.rank === Infinity && this.returnSaysNothing(this.checker.getReturnTypeOfSignature(signature))) {
+      if (result.rank === Infinity && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('maker_unresolved') };
       }
       if (result.rank === Infinity) holding.push(signature);
@@ -1354,9 +1477,9 @@ class DeclarationReader {
   /**
    * `member` (after `path`) is a home-declared callable member whose name
    * slot accepts a string, under the name-slot rules, and returns a type that
-   * says something.
+   * says something, read at its type-parameter defaults (`returnOf`).
    */
-  private judgeScope(receiver: MessageReceiver, claim: ScopeClaim): Judged {
+  private judgeScope(receiver: MessageReceiver, claim: ScopeClaim, built?: ts.Signature): Judged {
     const layout = this.layout({ name: claim.name });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
@@ -1366,7 +1489,7 @@ class DeclarationReader {
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
       let result = this.messageSignatureOutcome(signature, layout.value, labels);
-      if (result.rank === Infinity && this.returnSaysNothing(this.checker.getReturnTypeOfSignature(signature))) {
+      if (result.rank === Infinity && this.returnSaysNothing(this.returnOf(signature, built))) {
         result = { rank: 6, outcome: unchecked('scope_unresolved') };
       }
       if (result.rank === Infinity) holding.push(signature);
@@ -1381,7 +1504,7 @@ class DeclarationReader {
    * `path`; or the receiver itself, when null) with some overload that takes
    * the name, payload, handler and acknowledgement where the claim puts them.
    * A name bound by the maker or the scope must have been bound: the
-   * instance's maker claim names a `name_key`, or the receiver came through a
+   * instance's maker claim has a `name` slot, or the receiver came through a
    * scope.
    */
   private judgeOp(receiver: MessageReceiver, claim: OpClaim): Outcome {
@@ -1457,7 +1580,7 @@ class DeclarationReader {
   /**
    * One overload against a message claim's layout; rank `Infinity` holds.
    *
-   * 1. A positional name accepts a string.
+   * 1. A positional name, base or prefix accepts a string.
    * 2. A positional name is not a key of an index-signature map; a payload
    *    is there (its type is not read) and is not a callback.
    * 3. A positional handler or acknowledgement is a function type with a
@@ -1469,11 +1592,13 @@ class DeclarationReader {
    */
   private messageSignatureOutcome(signature: ts.Signature, layout: ClaimLayout, labels: KeyLabels): RankedFailure {
     for (const [arg, part] of layout.positional) {
-      if (part !== 'name') continue;
+      if (part !== 'name' && part !== 'base' && part !== 'prefix') continue;
       const declared = this.keyParameterAt(signature, arg);
       if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
       const slot = this.throughConditional(declared);
-      if (!this.acceptsString(slot)) return { rank: 1, outcome: this.slotFailure(slot, 'name_not_string') };
+      if (!this.acceptsString(slot)) {
+        return { rank: 1, outcome: this.slotFailure(slot, part === 'name' ? 'name_not_string' : 'slot_not_string') };
+      }
     }
     for (const [arg, part] of layout.positional) {
       if (part === 'name' && this.isIndexKeySlot(signature, arg)) {
@@ -1707,12 +1832,15 @@ class DeclarationReader {
   }
 
   /**
-   * The map a `keyof` reads has an index signature. Under
-   * `index_key_generic_map`, a map the receiver takes as a type parameter is
-   * the caller's to type, so its key slot reads as a string slot.
+   * The map a `keyof` reads is a concrete map with an index signature. A map
+   * the library takes as a type parameter (an event map defaulting to an
+   * index signature) is the service's to type: its own type argument only
+   * narrows which names the slot allows and never moves the name to another
+   * argument, so the key slot reads as a string slot (contract amendment 2,
+   * B6, the `index_key_generic_map` reading, now the only one).
    */
   private isIndexMap(map: ts.Type): boolean {
-    if (this.variants.has('index_key_generic_map') && map.flags & ts.TypeFlags.TypeParameter) return false;
+    if (map.flags & ts.TypeFlags.TypeParameter) return false;
     return this.hasIndexSignature(map);
   }
 

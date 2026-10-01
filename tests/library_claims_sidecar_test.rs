@@ -8,8 +8,8 @@
 //! checked end to end. The package is invented and hand-written.
 
 use carrick::services::type_sidecar::{
-    BoundName, ClaimOn, ClaimSlot, ClaimVariant, KeyLabel, LibraryCheck, LibraryClaim, LibraryOp,
-    LibraryRole, MakeForm, NameScope, NameScopeKind, OpName, SemanticsVerdict, TypeSidecar,
+    BoundName, ClaimOn, ClaimSlot, KeyLabel, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole,
+    MakeForm, NameScope, NameScopeKind, OpName, SemanticsVerdict, TypeSidecar,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,14 @@ fn slot(arg: u32) -> ClaimSlot {
     ClaimSlot { arg, key: None }
 }
 
+/// A key of the options object at argument 0.
+fn keyed(key: &str) -> ClaimSlot {
+    ClaimSlot {
+        arg: 0,
+        key: Some(key.into()),
+    }
+}
+
 fn check(claim_id: &str, receiver: &str, claim: LibraryClaim) -> LibraryCheck {
     LibraryCheck {
         claim_id: claim_id.into(),
@@ -92,10 +100,10 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
     LibraryClaim::Make {
         form: MakeForm::Call,
         member: Some("job".into()),
-        base_key: None,
-        prefix_key: None,
-        name_key: Some("id".into()),
-        handler_key: Some("run".into()),
+        base: None,
+        prefix: None,
+        name: Some(keyed("id")),
+        handler: Some(keyed("run")),
         key_labels: labels
             .iter()
             .map(|(key, label)| (key.to_string(), *label))
@@ -108,21 +116,29 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
     }
 }
 
-/// A send whose payload is argument 0.
-fn send(
-    member: &str,
-    path: &[&str],
-    on: ClaimOn,
-    of: Option<&str>,
-    name: OpName,
-    payload: u32,
-) -> LibraryClaim {
+/// Which receivers an element applies to: every one `on` names, or exactly
+/// the one `of` names.
+enum Place {
+    On(ClaimOn),
+    Of(&'static str),
+}
+
+fn placed(place: Place) -> (Option<ClaimOn>, Option<String>) {
+    match place {
+        Place::On(on) => (Some(on), None),
+        Place::Of(of) => (None, Some(of.into())),
+    }
+}
+
+/// A send whose payload is argument `payload`.
+fn send(member: &str, path: &[&str], place: Place, name: OpName, payload: u32) -> LibraryClaim {
+    let (on, of) = placed(place);
     LibraryClaim::Op {
         op: LibraryOp::Send,
         member: Some(member.into()),
         path: path.iter().map(|hop| hop.to_string()).collect(),
-        on: Some(on),
-        of: of.map(str::to_string),
+        on,
+        of,
         name: Some(name),
         payload: Some(slot(payload)),
         handler: None,
@@ -174,8 +190,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             send(
                 "trigger",
                 &[],
-                ClaimOn::Instance,
-                Some("job"),
+                Place::Of("instance:job"),
                 bound(BoundName::Maker),
                 0,
             ),
@@ -186,8 +201,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             send(
                 "trigger",
                 &["tasks"],
-                ClaimOn::Export,
-                None,
+                Place::On(ClaimOn::Export),
                 OpName::Slot(slot(0)),
                 1,
             ),
@@ -212,8 +226,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             send(
                 "publish",
                 &[],
-                ClaimOn::Export,
-                None,
+                Place::Of("export>scope:channel"),
                 bound(BoundName::Scope),
                 0,
             ),
@@ -225,8 +238,8 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
                 member: "on".into(),
                 name: "ready".into(),
                 path: vec![],
-                on: Some(ClaimOn::Export),
-                of: None,
+                on: None,
+                of: Some("export>scope:channel".into()),
                 picker: None,
             },
         ),
@@ -237,15 +250,36 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             send(
                 "trigger",
                 &["tasks"],
-                ClaimOn::Instance,
-                None,
+                Place::On(ClaimOn::Instance),
                 OpName::Slot(slot(0)),
                 1,
             ),
         ),
+        // `on` and `of` together name no one receiver.
+        check(
+            "both",
+            "export",
+            LibraryClaim::Op {
+                op: LibraryOp::Send,
+                member: Some("trigger".into()),
+                path: vec!["tasks".into()],
+                on: Some(ClaimOn::Both),
+                of: Some("instance:job".into()),
+                name: Some(OpName::Slot(slot(0))),
+                payload: Some(slot(1)),
+                handler: None,
+                ack: None,
+                key_labels: BTreeMap::new(),
+                name_scope: None,
+                picker: None,
+                options: None,
+                method: None,
+                method_key: None,
+            },
+        ),
     ];
     let answer = sidecar
-        .verify_library_claims(&repo, &checks, &[])
+        .verify_library_claims(&repo, &checks)
         .expect("the sidecar answers");
     assert_eq!(
         verdicts(&answer.verdicts),
@@ -257,6 +291,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             "channel.publish verified",
             "channel.ready verified",
             "misplaced Unchecked receiver_invalid",
+            "both Unchecked claim_invalid",
         ]
     );
     assert_eq!(answer.modules.len(), 1);
@@ -271,7 +306,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
     // name ambiguous, so the maker builds no instance its sends can be read on.
     let unlabelled = vec![check("job", "export", job(&[])), checks[1].clone()];
     let answer = sidecar
-        .verify_library_claims(&repo, &unlabelled, &[])
+        .verify_library_claims(&repo, &unlabelled)
         .expect("the sidecar answers");
     assert_eq!(
         verdicts(&answer.verdicts),
@@ -280,10 +315,4 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
             "job.trigger Unchecked maker_unverified",
         ]
     );
-
-    // The one opt-in reading travels and is accepted.
-    let answer = sidecar
-        .verify_library_claims(&repo, &checks[..1], &[ClaimVariant::IndexKeyGenericMap])
-        .expect("the sidecar accepts the reading");
-    assert_eq!(verdicts(&answer.verdicts), vec!["job verified"]);
 }

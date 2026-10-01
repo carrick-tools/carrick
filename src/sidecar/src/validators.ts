@@ -424,7 +424,9 @@ const NameScopeSchema = z
 
 /**
  * One claim element in the shape the store answers, tagged by `kind`
- * (contract on carrick#1564, sections 2 and 3).
+ * (contract on carrick#1564, sections 2 and 3, as amendment 2 changes them).
+ * A maker's parts are slots; `on` and `of` are checked against each other by
+ * the verifier (`claim_invalid`), not here.
  */
 const LibraryClaimSchema = z.discriminatedUnion('kind', [
   z
@@ -432,10 +434,10 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       kind: z.literal('make'),
       form: z.enum(['call', 'new']),
       member: z.string().min(1).nullable(),
-      base_key: z.string().min(1).optional(),
-      prefix_key: z.string().min(1).optional(),
-      name_key: z.string().min(1).optional(),
-      handler_key: z.string().min(1).optional(),
+      base: ClaimSlotSchema.optional(),
+      prefix: ClaimSlotSchema.optional(),
+      name: ClaimSlotSchema.optional(),
+      handler: ClaimSlotSchema.optional(),
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
@@ -513,7 +515,6 @@ export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   checks: z.array(LibraryCheckSchema),
   // The contract's sample sends `null` for "no budget of the request's own".
   budget_ms: z.number().int().nonnegative().nullable().optional(),
-  variants: z.array(z.enum(['index_key_generic_map'])).optional(),
 });
 
 export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({

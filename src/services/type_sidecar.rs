@@ -716,7 +716,7 @@ pub struct ClaimSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoundName {
-    /// The maker's `name_key` bound it to the instance.
+    /// The maker's `name` slot bound it to the instance.
     Maker,
     /// The scope member bound it to the receiver.
     Scope,
@@ -748,7 +748,9 @@ pub enum MakeForm {
     New,
 }
 
-/// Which receivers an op, scope or reserved name is claimed on.
+/// Which receivers an op, scope or reserved name is claimed on, when it does
+/// not name one receiver with `of`: the export, every instance of every
+/// maker, or both. Never a receiver a scope returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimOn {
@@ -785,26 +787,30 @@ pub struct NameScope {
 }
 
 /// One claim element in the shape the store answers, tagged by `kind`
-/// (contract on carrick#1564, comment 5937606126, sections 2 and 3). A
-/// maker's keys are keys of the options object at argument 0. `picker` and
-/// `name_scope` travel with the claim and are never read by the verifier.
+/// (contract on carrick#1564, comment 5937606126, sections 2 and 3, as
+/// amendment 2, comment 5939543981, changes them). A maker's parts are
+/// slots. An op, scope or reserved name carries `on` or `of`, never both
+/// (the verifier answers `claim_invalid`): `of` is the one receiver it
+/// applies to, by its receiver id. `picker` and `name_scope` travel with the
+/// claim and are never read by the verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LibraryClaim {
     /// `member(...)` or `new member(...)` makes an instance; `member: None`
-    /// is the export itself. A definition is a maker with a `name_key` and a
-    /// `handler_key`.
+    /// is the export itself. A definition is a maker with a `name` and a
+    /// `handler` slot; a queue (`new Queue("emails")`) one with a
+    /// positional `name`.
     Make {
         form: MakeForm,
         member: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        base_key: Option<String>,
+        base: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        prefix_key: Option<String>,
+        prefix: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name_key: Option<String>,
+        name: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        handler_key: Option<String>,
+        handler: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         key_labels: BTreeMap<String, KeyLabel>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,7 +846,8 @@ pub enum LibraryClaim {
         path: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<ClaimOn>,
-        /// The maker member whose instances the op acts on.
+        /// The one receiver the op acts on, by its receiver id
+        /// (`instance:new`, `instance:connect>scope:channel`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         of: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -896,17 +903,6 @@ pub struct LibraryCheck {
     pub role: LibraryRole,
     pub receiver: String,
     pub claim: LibraryClaim,
-}
-
-/// A reading of the message checks a request can switch on; never the
-/// default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaimVariant {
-    /// A name slot typed as a key of an event map the receiver takes as a
-    /// type parameter reads as a string slot. Off by default: only the
-    /// service's own type argument says what the map holds (carrick#1563).
-    IndexKeyGenericMap,
 }
 
 /// A `verify_library_claims` answer: one verdict per check in request order,
@@ -1016,8 +1012,6 @@ enum SidecarRequest {
         checks: Vec<LibraryCheck>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        variants: Vec<ClaimVariant>,
     },
     #[serde(rename = "health")]
     Health { request_id: String },
@@ -1910,19 +1904,17 @@ impl TypeSidecar {
 
     /// Check library claims against each package's own declarations,
     /// resolved from `from_dir` (carrick#1616; the wire is pinned on
-    /// carrick#1564, comment 5937606126, section 3). Same scoping, timeout
-    /// and answer rules as `verify_client_semantics`: one verdict per check,
-    /// in request order, `failed` and `unchecked` both meaning "drop".
-    /// Send every check of one `(package, export)` in ONE request: two roles
-    /// for one export, and an instance or scope op whose maker or scope claim
-    /// is not in the same request, are judged across the request. `variants`
-    /// switches on readings that are never the default; production passes
-    /// none.
+    /// carrick#1564, comment 5937606126, section 3, as amendment 2 changes
+    /// it). Same scoping, timeout and answer rules as
+    /// `verify_client_semantics`: one verdict per check, in request order,
+    /// `failed` and `unchecked` both meaning "drop". Send every check of one
+    /// `(package, export)` in ONE request: two roles for one export, and an
+    /// instance or scope op whose maker or scope claim is not in the same
+    /// request, are judged across the request.
     pub fn verify_library_claims(
         &self,
         from_dir: &Path,
         checks: &[LibraryCheck],
-        variants: &[ClaimVariant],
     ) -> Result<LibraryClaimsAnswer, SidecarError> {
         self.ensure_ready()?;
         if checks.is_empty() {
@@ -1937,7 +1929,6 @@ impl TypeSidecar {
             from_dir: from_dir.to_string_lossy().into_owned(),
             checks: checks.to_vec(),
             budget_ms: None,
-            variants: variants.to_vec(),
         };
         self.send_request(&request)?;
         let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
@@ -3120,12 +3111,14 @@ mod tests {
     }
 
     /// The `verify_library_claims` wire must match the contract pinned on
-    /// carrick#1564 (comment 5937606126, sections 2 and 3) and the sidecar's
-    /// schema exactly: claims tagged by `kind`, a maker's keys named
-    /// (`name_key`, `handler_key`), slots as `{ arg, key? }`, a bound name
-    /// as `{ bound }`, `path`/`on`/`of` on ops, scopes and reserved names,
-    /// `name_scope` with an explicit null namespace, no `side` on the check,
-    /// and the optional parts omitted rather than sent as null.
+    /// carrick#1564 (comment 5937606126, sections 2 and 3, as amendment 2
+    /// changes them) and the sidecar's schema exactly: claims tagged by
+    /// `kind`, a maker's parts as slots (`name`, `handler`, keyed or
+    /// positional), slots as `{ arg, key? }`, a bound name as `{ bound }`,
+    /// `path` and one of `on` or `of` (a receiver id) on ops, scopes and
+    /// reserved names, `name_scope` with an explicit null namespace, no
+    /// `side` on the check, and the optional parts omitted rather than sent
+    /// as null.
     #[test]
     fn verify_library_claims_request_wire_shape() {
         let check = |claim_id: &str, role: LibraryRole, receiver: &str, claim| LibraryCheck {
@@ -3151,10 +3144,10 @@ mod tests {
                     LibraryClaim::Make {
                         form: MakeForm::Call,
                         member: Some("task".into()),
-                        base_key: None,
-                        prefix_key: None,
-                        name_key: Some("id".into()),
-                        handler_key: Some("run".into()),
+                        base: None,
+                        prefix: None,
+                        name: Some(slot(0, Some("id"))),
+                        handler: Some(slot(0, Some("run"))),
                         key_labels: [
                             ("id".to_string(), KeyLabel::Name),
                             ("description".to_string(), KeyLabel::NotName),
@@ -3176,8 +3169,8 @@ mod tests {
                         op: LibraryOp::Send,
                         member: Some("trigger".into()),
                         path: vec![],
-                        on: Some(ClaimOn::Instance),
-                        of: Some("task".into()),
+                        on: None,
+                        of: Some("instance:task".into()),
                         name: Some(OpName::Bound {
                             bound: BoundName::Maker,
                         }),
@@ -3225,8 +3218,8 @@ mod tests {
                         member: "channel".into(),
                         name: slot(0, None),
                         path: vec![],
-                        on: Some(ClaimOn::Instance),
-                        of: Some("connect".into()),
+                        on: None,
+                        of: Some("instance:connect".into()),
                         key_labels: BTreeMap::new(),
                         name_scope: None,
                         picker: None,
@@ -3240,8 +3233,24 @@ mod tests {
                         member: "on".into(),
                         name: "ready".into(),
                         path: vec![],
-                        on: Some(ClaimOn::Instance),
-                        of: Some("connect".into()),
+                        on: None,
+                        of: Some("instance:connect>scope:channel".into()),
+                        picker: None,
+                    },
+                ),
+                check(
+                    "q",
+                    LibraryRole::Broker,
+                    "export",
+                    LibraryClaim::Make {
+                        form: MakeForm::New,
+                        member: None,
+                        base: None,
+                        prefix: None,
+                        name: Some(slot(0, None)),
+                        handler: Some(slot(1, None)),
+                        key_labels: BTreeMap::new(),
+                        name_scope: None,
                         picker: None,
                     },
                 ),
@@ -3269,13 +3278,10 @@ mod tests {
                 ),
             ],
             budget_ms: Some(500),
-            variants: vec![],
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["action"], "verify_library_claims");
         assert_eq!(value["budget_ms"], 500);
-        // No reading switched on: the field is absent, and the sidecar is strict.
-        assert!(value.get("variants").is_none());
         let checks = value["checks"].as_array().unwrap();
         assert_eq!(
             checks[0],
@@ -3287,7 +3293,7 @@ mod tests {
                 "receiver": "export",
                 "claim": {
                     "kind": "make", "form": "call", "member": "task",
-                    "name_key": "id", "handler_key": "run",
+                    "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" },
                     "key_labels": { "description": "not_name", "id": "name" },
                     "name_scope": { "scope": "service", "namespace": "task" },
                     "picker": "model/q1"
@@ -3297,7 +3303,7 @@ mod tests {
         assert_eq!(
             checks[1]["claim"],
             serde_json::json!({
-                "kind": "op", "op": "send", "member": "trigger", "on": "instance", "of": "task",
+                "kind": "op", "op": "send", "member": "trigger", "of": "instance:task",
                 "name": { "bound": "maker" }, "payload": { "arg": 0 }
             })
         );
@@ -3312,17 +3318,24 @@ mod tests {
         assert_eq!(
             checks[3]["claim"],
             serde_json::json!({
-                "kind": "scope", "member": "channel", "name": { "arg": 0 }, "on": "instance", "of": "connect"
+                "kind": "scope", "member": "channel", "name": { "arg": 0 }, "of": "instance:connect"
             })
         );
         assert_eq!(checks[4]["role"], "socket");
         assert_eq!(
             checks[4]["claim"],
-            serde_json::json!({ "kind": "reserved", "member": "on", "name": "ready", "on": "instance", "of": "connect" })
+            serde_json::json!({ "kind": "reserved", "member": "on", "name": "ready", "of": "instance:connect>scope:channel" })
         );
-        assert_eq!(checks[5]["role"], "http_client");
+        // A queue named at argument 0, its handler at argument 1.
         assert_eq!(
             checks[5]["claim"],
+            serde_json::json!({
+                "kind": "make", "form": "new", "member": null, "name": { "arg": 0 }, "handler": { "arg": 1 }
+            })
+        );
+        assert_eq!(checks[6]["role"], "http_client");
+        assert_eq!(
+            checks[6]["claim"],
             serde_json::json!({
                 "kind": "op", "op": "request", "member": null,
                 "name": { "arg": 0, "key": "url" }, "method_key": { "arg": 0, "key": "method" }
@@ -3342,24 +3355,6 @@ mod tests {
         }
     }
 
-    /// The one reading a request can switch on travels as its snake_case name.
-    #[test]
-    fn verify_library_claims_variants_wire_shape() {
-        let request = SidecarRequest::VerifyLibraryClaims {
-            request_id: "req-12".into(),
-            from_dir: "/svc".into(),
-            checks: vec![],
-            budget_ms: None,
-            variants: vec![ClaimVariant::IndexKeyGenericMap],
-        };
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(
-            value["variants"],
-            serde_json::json!(["index_key_generic_map"])
-        );
-        assert!(value.get("budget_ms").is_none());
-    }
-
     /// A `verify_library_claims` answer is read from the contract's names
     /// (`verdicts`, `modules`, `duration_ms`), by the same positional rule as
     /// a `verify_client_semantics` one, and never from the HTTP action's
@@ -3375,10 +3370,10 @@ mod tests {
             claim: LibraryClaim::Make {
                 form: MakeForm::Call,
                 member: None,
-                base_key: None,
-                prefix_key: None,
-                name_key: None,
-                handler_key: None,
+                base: None,
+                prefix: None,
+                name: None,
+                handler: None,
                 key_labels: BTreeMap::new(),
                 name_scope: None,
                 picker: None,

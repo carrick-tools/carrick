@@ -470,7 +470,7 @@ When no overload satisfies a claim, the reason is the one from the overload that
 
 #### `verify_library_claims` - Check library claims of every role (carrick#1616)
 
-The wire is pinned on carrick#1564 (comment 5937606126, section 3); where this section and the contract disagree, the contract wins. A claim says what a package's export does (its role, from a closed list) and where each part of a call through it sits, and the role alone picks which checks it needs. Same probe file, module resolution rules and definitions ("declared property", "accepts string", "says nothing") as `verify_client_semantics`, which converts each of its checks into this shape and answers through the same code (`http_client` keeps the #1564 checks and reasons exactly).
+The wire is pinned on carrick#1564 (comment 5937606126, section 3, as amendment 2, comment 5939543981, changes it); where this section and the contract disagree, the contract wins. A claim says what a package's export does (its role, from a closed list) and where each part of a call through it sits, and the role alone picks which checks it needs. Same probe file, module resolution rules and definitions ("declared property", "accepts string", "says nothing") as `verify_client_semantics`, which converts each of its checks into this shape and answers through the same code (`http_client` keeps the #1564 checks and reasons exactly).
 
 ```json
 {
@@ -485,7 +485,7 @@ The wire is pinned on carrick#1564 (comment 5937606126, section 3); where this s
       "export": "default",
       "role": "broker",
       "receiver": "export",
-      "claim": { "kind": "make", "form": "call", "member": "task", "name_key": "id", "handler_key": "run",
+      "claim": { "kind": "make", "form": "call", "member": "task", "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" },
                  "key_labels": { "id": "name", "description": "not_name" },
                  "name_scope": { "scope": "service", "namespace": "task" }, "picker": "<model>/<question set>" }
     },
@@ -495,7 +495,7 @@ The wire is pinned on carrick#1564 (comment 5937606126, section 3); where this s
       "export": "default",
       "role": "broker",
       "receiver": "instance:task",
-      "claim": { "kind": "op", "op": "send", "member": "trigger", "on": "instance", "of": "task",
+      "claim": { "kind": "op", "op": "send", "member": "trigger", "of": "instance:task",
                  "name": { "bound": "maker" }, "payload": { "arg": 0 } }
     },
     {
@@ -511,16 +511,16 @@ The wire is pinned on carrick#1564 (comment 5937606126, section 3); where this s
 }
 ```
 
-A slot is `{ "arg": n }` (argument `n`, 0-based) or `{ "arg": n, "key": "k" }` (property `k` of the object passed there). An op's `name` may instead be `{ "bound": "maker" }` (the maker's `name_key` bound it to the instance) or `{ "bound": "scope" }` (the scope member bound it). `picker` and `name_scope` travel with the claim and are never read.
+A slot is `{ "arg": n }` (argument `n`, 0-based) or `{ "arg": n, "key": "k" }` (property `k` of the object passed there). An op's `name` may instead be `{ "bound": "maker" }` (the maker's `name` slot bound it to the instance) or `{ "bound": "scope" }` (the scope member bound it). `picker` and `name_scope` travel with the claim and are never read.
 
 | `kind` | Fields | Says |
 |---|---|---|
-| `make` | `form` (`call` or `new`), `member` (null: the export itself), `base_key?`, `prefix_key?`, `name_key?`, `handler_key?`, `key_labels?` | How an instance is made. The keys are keys of the options object at argument 0. A definition (`task({ id, run })`) is a maker with a `name_key` and a `handler_key`. |
+| `make` | `form` (`call` or `new`), `member` (null: the export itself), `base?`, `prefix?`, `name?`, `handler?` (each a slot), `key_labels?` | How an instance is made. A definition (`task({ id, run })`) is a maker with a keyed `name` and `handler`; a queue (`new Queue("emails")`) is one with a positional `name`. |
 | `scope` | `member`, `name`, `path?`, `on?`, `of?`, `key_labels?` | A member that returns a receiver bound to a name (a channel, room or queue) |
 | `op` | `op` (`request`, `send`, `receive`, `execute`), `member` (null: the object itself), `path?`, `on?`, `of?`, `name?`, `payload?`, `handler?`, `ack?`, `key_labels?`; HTTP only: `method?`, `method_key?`, `options?` | A member that acts on the wire |
 | `reserved` | `member`, `name`, `path?`, `on?`, `of?` | A name the library emits itself, spelled in one of that member's parameters |
 
-`path` is the member path from the receiver to the object `member` sits on (`client.tasks.trigger`). `on` (`export`, `instance` or `both`) and `of` (the maker member) say which receivers the claim is for.
+`path` is the member path from the receiver to the object `member` sits on (`client.tasks.trigger`). An op, scope or reserved name says which receivers it is for with `on` or `of`, never both: `on` is `export`, `instance` (every instance of every maker) or `both`; `of` is exactly one receiver, by its receiver id (`instance:new`, `instance:connect>scope:channel`). A member on the export and on one maker's instances is two elements.
 
 The receiver is `export`, `instance:<member>` (what `export.member(...)` returns), `instance:()` (what calling the export returns), `instance:new` (what `new export(...)` builds) or `instance:new:<member>` (what `new export.member(...)` builds), optionally followed by `>scope:<path.member>` (what that scope member returns on it, its `path` joined by `.`).
 
@@ -528,24 +528,24 @@ Rules for the message roles (`broker`, `in_process_bus`, `socket`):
 
 | Rule | Reason when it does not hold |
 |---|---|
-| A maker is checked on the receiver `export`; an op, scope or reserved name claimed `on` the export only there, `on` instances only on an instance, and `of` a maker only on that maker's instances | `unchecked receiver_invalid` |
+| An element carries `on` or `of`, not both, and `of` is a receiver id a maker or scope builds (not `export`) | `unchecked claim_invalid` |
+| A maker is checked on the receiver `export`; an element with `of` only on that receiver; one `on` the export only there, `on` instances only on an instance; `on` never on a receiver a scope returns | `unchecked receiver_invalid` |
 | A member (and each `path` hop) is declared by the receiver's home packages: the named package and its `@types` package, the packages its export is re-exported from, and the package that declares the receiver's type (a hop adds the package that declares its type). Never the runtime's type packages, never only another package's base. A base the class binds with a concrete type its home packages declare (`extends Emitter<L, E, OwnReservedEvents>`) counts as declared. | `failed member_inherited` |
 | A claim that names a runtime module itself (`node:events`) reads the runtime's types package's ambient `declare module` block, reports that package's installed version, and has that package as its home (contract amendment 1, A1). A bare name (`events`) is a registry package's, a `node:` block only the service writes is not the runtime's, and HTTP reads `node:` as #1564 does. | `unchecked module_local` |
 | A hop typed `any`, `unknown` or `{}` | `unchecked member_untyped` |
-| The name slot accepts a string and is not a key of an index-signature map | `failed name_not_string` / `failed name_index_key` |
+| The name slot accepts a string and is not a key of a concrete index-signature map. A key of a map the library takes as a type parameter (an event map defaulting to an index signature) reads as a string slot (amendment 2, B6). | `failed name_not_string` / `failed name_index_key` |
+| A positional `base` or `prefix` accepts a string | `failed slot_not_string` |
 | Strict D2: every other string-accepting argument or key at the call is assigned a part by the claim or labelled `not_name` in `key_labels`; at most one key is labelled `name`, and only the claim's own name key. A positional string cannot be labelled, so it always competes. A `not_name` label for a key the overload does not declare is ignored. | `failed name_ambiguous` |
 | A `send` carries a payload slot; the name alone, or no name, describes no call | `unchecked claim_invalid` |
 | A callback is not a payload; name and payload never share an argument | `failed payload_is_function` / `failed slots_overlap` |
 | Handler and ack slots are functions with a declared signature (`Function`, `any`, `unknown`, `(...args: any[])` say nothing) | `unchecked handler_untyped` / `failed handler_not_function` |
 | Keys at one argument come from one union member | `failed key_missing` |
-| A maker is read on every overload that holds (across every maker claim of the request for it); each instance op must hold on every instance type those overloads return; a maker returning `any` or an unconstrained generic builds nothing | `unchecked maker_unresolved` |
+| A maker is read on every overload that holds (across every maker claim of the request for it); each instance op must hold on every instance type those overloads return. A generic maker or scope is read at its declared type-parameter defaults (amendment 2, B6): what TypeScript gives a call with no argument and no type argument, so a default, else a constraint `unknown` does not satisfy, else `unknown`. A maker returning `any`, or a generic with no default and no constraint, builds nothing | `unchecked maker_unresolved` |
 | Instance and scope ops travel in the same request as a maker or scope claim that verifies | `unchecked maker_unverified` / `unchecked scope_unverified` |
-| A name `{ "bound": ... }` needs a maker with a `name_key`, or a scope | `failed name_unbound` |
+| A name `{ "bound": ... }` needs a maker with a `name` slot, or a scope | `failed name_unbound` |
 | An export given two roles in one request | `unchecked role_conflict` |
 | A `workspace:`, `file:`, `link:` or `portal:` dependency (until its own source is verified, #1666) | `unchecked module_workspace` |
 | `graphql_client`, `server_framework` and `none`, and an `execute` op on a message role | `unchecked role_unsupported` |
-
-`variants` (optional; not in the contract) switches on a reading that is never the default. `index_key_generic_map`: a name slot typed as a key of an event map the receiver takes as a type parameter reads as a string slot; a key of a concrete index-signature map stays refused. It stays off because only the service's own type argument says what the map holds (carrick#1563 part 1).
 
 Not refusable by shape (carrick#1653): an in-process emitter classified as a socket, a raw `send(data, options)` with a wrong name-at-0 claim, and a generic event map defaulting to an index signature.
 

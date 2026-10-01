@@ -530,12 +530,7 @@ function handleVerifyLibraryClaims(
     const { claimsVerifier } = projectComponents();
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
-    const { semantics, modules } = claimsVerifier.run(
-      fromDir,
-      request.checks,
-      request.budget_ms ?? SEMANTICS_BUDGET_MS,
-      new Set(request.variants ?? [])
-    );
+    const { semantics, modules } = claimsVerifier.run(fromDir, request.checks, request.budget_ms ?? SEMANTICS_BUDGET_MS);
     return {
       request_id: request.request_id,
       status: 'success',
