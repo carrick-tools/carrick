@@ -33,6 +33,7 @@
  * for itself is not evidence about the library.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
@@ -43,9 +44,16 @@ import type {
   LibraryCheck,
   LibraryClaim,
   LibraryRole,
+  LibrarySurface,
   SemanticsCheck,
   SemanticsModule,
   SemanticsResult,
+  SurfaceExport,
+  SurfaceKey,
+  SurfaceMember,
+  SurfaceParam,
+  SurfaceReceiver,
+  SurfaceSignature,
 } from './types.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
@@ -574,6 +582,67 @@ export class LibraryClaimsVerifier {
       this.project.removeSourceFile(probe);
     }
   }
+
+  /**
+   * Each specifier's declared surface, read with the verifier's predicates
+   * (carrick#1660): every value export (or only those `only` names for the
+   * specifier), the receivers a claim can be read on, in the verifier's
+   * receiver grammar, and each receiver's callable members with their
+   * parameter slots. A runtime module (`node:events`) is listed from the
+   * runtime's types package, as the message roles read it. Capped at
+   * `maxEntries` per specifier, with the count dropped: every export and
+   * receiver is listed before any member name, and every member name before
+   * any signature, so the cap cuts signatures first and exports last.
+   *
+   * `surface_sha256` is the full-surface hash (see `fullSurfaceSha256`).
+   */
+  listSurface(
+    fromDir: string,
+    packages: string[],
+    maxEntries: number,
+    only: Readonly<Record<string, string[]>> = {}
+  ): ListedSurface {
+    if (packages.length === 0) return { surfaces: [], surface_sha256: fullSurfaceSha256([]) };
+    const probeText = packages
+      .map((pkg, i) => `import * as __carrick_ns${i} from ${JSON.stringify(pkg)};`)
+      .join('\n');
+    const probePath = path.join(fromDir, `__carrick_surface_probe_${process.pid}_${probeSequence++}.ts`);
+    const probe = this.project.createSourceFile(probePath, `${probeText}\n`, { overwrite: true });
+    try {
+      const program = this.project.getProgram().compilerObject;
+      const file = program.getSourceFile(probe.getFilePath());
+      if (!file) throw new Error(`probe file ${probePath} is not in the program`);
+      const reader = new DeclarationReader(program, file, this.project.getModuleResolutionHost(), fromDir);
+      const surfaces = packages.map((pkg, i) =>
+        reader.listPackage(pkg, file.statements[i] as ts.ImportDeclaration, maxEntries, only[pkg])
+      );
+      return { surfaces, surface_sha256: fullSurfaceSha256(surfaces) };
+    } finally {
+      this.project.removeSourceFile(probe);
+    }
+  }
+}
+
+/** The answer to `list_library_surface`. */
+export interface ListedSurface {
+  surfaces: LibrarySurface[];
+  surface_sha256: string;
+}
+
+/**
+ * The full-surface hash the shared library store keys on: sha256 of the JSON
+ * array of `[package, exports]` for every surface that listed at least one
+ * export, sorted by `package` (code unit order). A specifier that lists
+ * nothing (unresolved, local, no value exports) is left out, so asking for a
+ * subpath a version does not have changes nothing. Type text already names
+ * the request's directory as `<root>`.
+ */
+export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
+  const listed = surfaces
+    .filter(surface => surface.reason === undefined && surface.exports.length > 0)
+    .map(surface => [surface.package, surface.exports] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return crypto.createHash('sha256').update(JSON.stringify(listed)).digest('hex');
 }
 
 function exportKey(check: { package: string; export: string }): string {
@@ -714,6 +783,8 @@ class DeclarationReader {
   private augmentedNames: ReadonlyMap<string, ReadonlySet<string>> | undefined;
   /** The package of the check being judged; see `serviceAugmentedNames`. */
   private currentPackage = '';
+  /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
+  private readonly printedRoots: readonly string[];
 
   constructor(
     private readonly program: ts.Program,
@@ -725,6 +796,9 @@ class DeclarationReader {
   ) {
     this.checker = program.getTypeChecker();
     this.root = this.realpath(serviceRoot);
+    this.printedRoots = [...new Set([this.root, serviceRoot])]
+      .filter(root => root.length > 1)
+      .sort((a, b) => b.length - a.length);
   }
 
   /**
@@ -1912,6 +1986,204 @@ class DeclarationReader {
   }
 
   // --------------------------------------------------------------------------
+  // Surface listing (carrick#1660)
+  // --------------------------------------------------------------------------
+
+  /** One specifier's declared surface (see `LibraryClaimsVerifier.listSurface`). */
+  listPackage(pkg: string, declaration: ts.ImportDeclaration, maxEntries: number, only?: readonly string[]): LibrarySurface {
+    this.setPackage(pkg);
+    // Runtime modules on: a `node:` specifier is listed from the runtime's
+    // types package, as the message roles read it.
+    const moduleRead = this.readModule(pkg, declaration, true);
+    const surface: LibrarySurface = { package: pkg, truncated: 0, exports: [] };
+    if (moduleRead.entry.resolved_file) surface.resolved_file = moduleRead.entry.resolved_file;
+    if (moduleRead.entry.installed_version) surface.installed_version = moduleRead.entry.installed_version;
+    if (moduleRead.reason) return { ...surface, reason: moduleRead.reason };
+    const moduleSymbol = this.checker.getSymbolAtLocation(declaration.moduleSpecifier);
+    if (!moduleSymbol) return { ...surface, reason: 'module_unresolved' };
+
+    let budget = maxEntries;
+    let dropped = 0;
+    const take = (): boolean => {
+      if (budget > 0) {
+        budget -= 1;
+        return true;
+      }
+      dropped += 1;
+      return false;
+    };
+    // Three passes: every export and receiver, then every member name, then signatures.
+    const names: Array<() => void> = [];
+    const fills: Array<() => void> = [];
+
+    const exportsOf = this.checker
+      .getExportsOfModule(moduleSymbol)
+      .filter(symbol => {
+        const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
+        // A module that exports a class whole (\`export =\`) exports its
+        // statics, and its \`prototype\`, which no service imports.
+        return (
+          !this.checker.isUnknownSymbol(target) &&
+          (target.flags & ts.SymbolFlags.Value) !== 0 &&
+          (target.flags & ts.SymbolFlags.Prototype) === 0 &&
+          (only === undefined || only.includes(symbol.getName()))
+        );
+      })
+      .sort((a, b) => (a.getName() < b.getName() ? -1 : a.getName() > b.getName() ? 1 : 0));
+
+    for (const symbol of exportsOf) {
+      if (!take()) continue;
+      const target = symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
+      const type = this.checker.getTypeOfSymbolAtLocation(symbol, declaration);
+      const entry: SurfaceExport = { export: symbol.getName(), receivers: [] };
+      surface.exports.push(entry);
+      if (this.isOpenTop(type)) continue;
+      const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
+        if (!take()) return;
+        const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
+        entry.receivers.push(this.outlineReceiver(receiverName, receiverType, home, take, names, fills));
+      };
+      receiverOf('export', type);
+      const called = this.madeBy(this.librarySignatures(type, 'call'));
+      if (called) receiverOf('instance:()', called);
+      const constructed = this.madeBy(this.librarySignatures(type, 'new'));
+      if (constructed) receiverOf('instance:new', constructed);
+      // Makers one level below the export: `export.member(...)` and
+      // `new export.Member(...)`, when the export's home declares the member
+      // (a static a class only inherits from another package is no maker the
+      // verifier reads, `member_inherited`) and what it builds declares a
+      // callable member.
+      const exportHome = this.homeOf(pkg, [target, ...typeSymbols(type)]);
+      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
+      for (const property of this.declaredProperties(type)) {
+        if (!this.isOwnMember(property, apparent, exportHome)) continue;
+        const memberType = this.checker.getTypeOfSymbol(property);
+        for (const [form, prefix] of [['call', 'instance:'], ['new', 'instance:new:']] as const) {
+          const made = this.madeBy(this.librarySignatures(memberType, form));
+          if (made && this.declaredProperties(made).some(member => this.librarySignatures(this.checker.getTypeOfSymbol(member), 'call').length > 0)) {
+            receiverOf(`${prefix}${property.getName()}`, made);
+          }
+        }
+      }
+    }
+    for (const name of names) name();
+    for (const fill of fills) fill();
+    surface.truncated = dropped;
+    return surface;
+  }
+
+  /** What a maker builds, when its overloads agree on one object type that says something. */
+  private madeBy(signatures: readonly ts.Signature[]): ts.Type | undefined {
+    const returns = [...new Set(signatures.map(sig => this.checker.getReturnTypeOfSignature(sig)))];
+    return returns.length === 1 && !this.returnSaysNothing(returns[0]) && this.isObjectType(returns[0])
+      ? returns[0]
+      : undefined;
+  }
+
+  /** The call (or construct) signatures of `type` an installed package or the default library declares. */
+  private librarySignatures(type: ts.Type, form: 'call' | 'new'): readonly ts.Signature[] {
+    const nonNullable = this.checker.getNonNullableType(type);
+    const all = form === 'new' ? nonNullable.getConstructSignatures() : nonNullable.getCallSignatures();
+    return all.filter(signature => {
+      const file = this.signatureFile(signature, nonNullable, form);
+      return file !== undefined && this.isLibraryFile(file);
+    });
+  }
+
+  /**
+   * A receiver, now; its member names later (`names`), once every export and
+   * receiver of the package is listed; its call, construct and member
+   * signatures last (`fills`), once every name is.
+   */
+  private outlineReceiver(
+    receiverName: string,
+    type: ts.Type,
+    home: ReadonlySet<string>,
+    take: () => boolean,
+    names: Array<() => void>,
+    fills: Array<() => void>
+  ): SurfaceReceiver {
+    const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
+    const call = this.librarySignatures(type, 'call');
+    if (call.length > 0) fills.push(() => (receiver.call = this.listSignatures(call, take)));
+    const construct = this.librarySignatures(type, 'new');
+    if (construct.length > 0) fills.push(() => (receiver.construct = this.listSignatures(construct, take)));
+    if (this.isOpenTop(type)) return receiver;
+    names.push(() => {
+      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
+      for (const property of this.declaredProperties(type)) {
+        const signatures = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
+        if (signatures.length === 0 || !take()) continue;
+        const member: SurfaceMember = {
+          name: property.getName(),
+          own: this.isOwnMember(property, apparent, home),
+          signatures: [],
+        };
+        receiver.members.push(member);
+        fills.push(() => (member.signatures = this.listSignatures(signatures, take)));
+      }
+    });
+    return receiver;
+  }
+
+  private listSignatures(signatures: readonly ts.Signature[], take: () => boolean): SurfaceSignature[] {
+    const listed: SurfaceSignature[] = [];
+    for (const signature of signatures) {
+      if (!take()) continue;
+      const params: SurfaceParam[] = [];
+      for (const parameter of signature.getParameters()) {
+        if (!take()) continue;
+        const declaration = parameter.valueDeclaration;
+        const isParameter = declaration !== undefined && ts.isParameter(declaration);
+        const type = this.checker.getTypeOfSymbol(parameter);
+        const slot = this.throughConstraint(type);
+        const param: SurfaceParam = {
+          name: parameter.getName(),
+          optional: isParameter && (declaration.questionToken !== undefined || declaration.initializer !== undefined),
+          rest: isParameter && declaration.dotDotDotToken !== undefined,
+          type: this.printed(type),
+          accepts_string: this.acceptsString(type),
+          function: this.handlerFailure(type) === undefined,
+        };
+        if (slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
+          const keys: SurfaceKey[] = [];
+          for (const property of this.declaredProperties(slot)) {
+            if (!take()) continue;
+            const keyType = this.checker.getTypeOfSymbol(property);
+            keys.push({
+              name: property.getName(),
+              optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+              accepts_string: this.acceptsString(keyType),
+              function: this.handlerFailure(keyType) === undefined,
+            });
+          }
+          if (keys.length > 0) param.keys = keys;
+        }
+        const literals = new Set<string>();
+        this.spell(type, literals, 0);
+        const node = isParameter ? declaration.type : undefined;
+        if (node) this.spell(this.checker.getTypeFromTypeNode(node), literals, 0);
+        if (literals.size > 0) param.literals = [...literals].sort();
+        params.push(param);
+      }
+      listed.push({ params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) });
+    }
+    return listed;
+  }
+
+  /**
+   * A type as the declarations print it, with the service root written as
+   * `<root>` (the checker spells a type no entry exports through the file that
+   * declares it), cut to a length a listing can carry. The root goes first,
+   * so where the cut falls does not depend on where the package is installed.
+   */
+  private printed(type: ts.Type): string {
+    let text = this.checker.typeToString(type);
+    for (const root of this.printedRoots) text = text.split(root).join('<root>');
+    return truncate(text);
+  }
+
+  // --------------------------------------------------------------------------
   // Definitions
   // --------------------------------------------------------------------------
 
@@ -2337,6 +2609,11 @@ class DeclarationReader {
     }
     return this.isOpenTop(rest) ? rest : VARIADIC;
   }
+}
+
+/** A printed type, cut to a length a listing can carry. */
+function truncate(text: string): string {
+  return text.length > 200 ? `${text.slice(0, 197)}...` : text;
 }
 
 /**

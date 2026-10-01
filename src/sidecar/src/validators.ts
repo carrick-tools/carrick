@@ -516,6 +516,14 @@ export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   variants: z.array(z.enum(['index_key_generic_map'])).optional(),
 });
 
+export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('list_library_surface'),
+  from_dir: z.string().min(1),
+  packages: z.array(z.string().min(1)),
+  max_entries: z.number().int().positive().optional(),
+  exports: z.record(z.string(), z.array(z.string().min(1))).optional(),
+});
+
 // ============================================================================
 // Discriminated Union Schema
 // ============================================================================
@@ -536,6 +544,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   RetypeCheckRequestSchema,
   VerifyClientSemanticsRequestSchema,
   VerifyLibraryClaimsRequestSchema,
+  ListLibrarySurfaceRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
 ]);

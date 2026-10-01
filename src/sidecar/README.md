@@ -29,6 +29,16 @@ npm test        # node --test over dist/test
 
 `npm test` runs the COMPILED tests, so a stale `dist/` makes the suite lie. The Rust integration tests spawn `dist/src/index.js` for the same reason; the pre-commit hook rebuilds it.
 
+### The surface lister artifact
+
+```bash
+npm run build
+npm ci --prefix lister
+node lister/build.mjs --tag <release tag> --source-sha <commit>   # default --out dist/lister
+```
+
+Bundles `dist/src/index.js` into one self-contained ESM file, `carrick-lister.mjs`, with every dependency inlined, the TypeScript default library included. Beside it, `carrick-lister.manifest.json` holds `tag`, `source_sha`, `entry`, `node_floor` (`22`), `protocol` (`sidecar-stdio`, this README's protocol) and `files` (each file's sha256). Every release attaches both files (`.github/workflows/wasm-artifact.yml`), and carrick-cloud's library store pins them to run `list_library_surface` on packages as published (carrick#1660). The artifact runs on Node 22, the store's runtime; `test/lister/lister-artifact.test.ts` checks that it reads nothing outside its own file and the package directory it is given. The bundler has its own manifest in `lister/`, so the sidecar's install, which every Action run repeats, does not carry it.
+
 ## Usage
 
 ### From Rust
@@ -66,7 +76,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics` and `verify_library_claims` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
 `capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -81,6 +91,7 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `retype_check` | yes | Judge untyped consumer calls by retyping them with the producer's response |
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
+| `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
 | `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
@@ -556,6 +567,69 @@ Response: `verdicts` (exactly one per check, in request order, the same objects 
 }
 ```
 
+#### `list_library_surface` - List a package's declared surface (carrick#1660)
+
+Lists each specifier the way `verify_library_claims` reads it, from the same probe file, module resolution and definitions, so a claim chosen from the listing names a slot the verifier indexes the same way. The library store runs it on every package it answers for, as the released artifact (see "The surface lister artifact").
+
+```json
+{
+  "request_id": "8",
+  "action": "list_library_surface",
+  "from_dir": "/abs/worker",
+  "packages": ["@fixture/queue", "@fixture/queue/v2"],
+  "max_entries": 1000,
+  "exports": { "@fixture/queue": ["default"] }
+}
+```
+
+`packages` are module specifiers: a package, its subpaths, or a runtime module (`node:events`, listed from the runtime's types package, as the message roles read it). `exports` (optional) lists only the named exports of a specifier. `max_entries` (default 1000) caps each specifier; exports, receivers, members, signatures, parameters and keys each count one. Every export and receiver is listed before any member name, and every member name before any signature, so the cap cuts signatures first.
+
+Per specifier, the listing holds each value export (sorted by name), and per export the receivers a claim can be read on, in the verifier's grammar: `export`; `instance:()` and `instance:new` when calling or constructing the export builds one object type; `instance:<member>` and `instance:new:<member>` when a member the export's home packages declare does. Each receiver lists its call and construct signatures and its callable members (with `own`: declared by the receiver's home packages), and each signature its parameters: `optional`, `rest`, printed `type`, `accepts_string`, `function` (a handler with a declared signature), declared `keys` of an options object (each with `optional`, `accepts_string` and `function`), and the string `literals` the slot spells. Type text names `from_dir` as `<root>`.
+
+A specifier that lists nothing carries the verifier's module `reason` (`module_unresolved`, `module_local`, `module_js_only`). `surface_sha256` is the full-surface hash the store keys on: the sha256 of the JSON array of `[package, exports]` for every specifier that listed at least one export, sorted by `package`. The same packages hash the same in any directory.
+
+```json
+{
+  "request_id": "8",
+  "status": "success",
+  "surfaces": [
+    {
+      "package": "@fixture/queue",
+      "resolved_file": "/abs/worker/node_modules/@fixture/queue/index.d.ts",
+      "installed_version": "2.4.1",
+      "truncated": 0,
+      "exports": [
+        {
+          "export": "default",
+          "receivers": [
+            { "receiver": "export", "members": [
+              { "name": "task", "own": true, "signatures": [
+                { "params": [
+                  { "name": "options", "optional": false, "rest": false, "type": "TaskOptions<unknown>", "accepts_string": false, "function": false,
+                    "keys": [
+                      { "name": "id", "optional": false, "accepts_string": true, "function": false },
+                      { "name": "run", "optional": false, "accepts_string": false, "function": true }
+                    ] }
+                ], "returns": "Task<unknown>" }
+              ] }
+            ] },
+            { "receiver": "instance:task", "members": [
+              { "name": "trigger", "own": true, "signatures": [
+                { "params": [
+                  { "name": "payload", "optional": false, "rest": false, "type": "unknown", "accepts_string": false, "function": false }
+                ], "returns": "Promise<RunHandle>" }
+              ] }
+            ] }
+          ]
+        }
+      ]
+    },
+    { "package": "@fixture/queue/v2", "truncated": 0, "exports": [], "reason": "module_unresolved" }
+  ],
+  "surface_sha256": "<sha256>"
+}
+```
+
 #### `infer` - Resolve the type at a locator
 
 Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
@@ -832,7 +906,8 @@ Response, written before the process exits:
 | `src/bundler.ts` | Legacy symbol bundling and surface emission |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
-| `src/library-claims.ts` | `verify_library_claims` and `verify_client_semantics`: library claims against a package's own declarations |
+| `src/library-claims.ts` | `verify_library_claims`, `verify_client_semantics` and `list_library_surface`: library claims against a package's own declarations, and the surface they are read from |
+| `lister/build.mjs` | Bundles the sidecar into the surface lister artifact and writes its manifest; esbuild is installed by `lister/package.json`, not the sidecar's own |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
 | `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |

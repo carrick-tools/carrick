@@ -1,8 +1,12 @@
-name: Wasm Artifact
+name: Release Artifacts
 
-# Builds the carrick-match wasm artifact (the query-time matcher that
-# carrick-cloud's mcp-server runs — see crates/carrick-match), attaches it to
-# a GitHub release, and dispatches the pin-bump PR in carrick-cloud (#325).
+# Builds the two artifacts carrick-cloud pins from a release, attaches them to
+# the GitHub release, and dispatches the pin bumps in carrick-cloud:
+#   - the carrick-match wasm artifact, the query-time matcher that
+#     carrick-cloud's mcp-server runs (see crates/carrick-match, #325);
+#   - the surface lister, the type sidecar bundled into one file that the
+#     library store runs to list a package (carrick-lister.mjs and its
+#     manifest, carrick#1660).
 #
 # Two entry points:
 #   - workflow_call from release.yml, on every release-please release
@@ -102,19 +106,55 @@ jobs:
         working-directory: wasm-artifact
         run: sha256sum carrick_match.js carrick_match.d.ts carrick_match_bg.wasm > carrick_match.sha256
 
+      # The surface lister (carrick#1660): the sidecar at this tag in one
+      # self-contained file, and the manifest the library store's pin copies.
+      # A tag from before the lister has no build script, and its release
+      # carries the matcher only.
+      - name: Build the surface lister
+        id: lister
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ ! -f src/sidecar/lister/build.mjs ]; then
+            echo "No surface lister at ${TAG}; attaching the matcher only."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          (cd src/sidecar && npm ci && npm run build && npm ci --prefix lister)
+          node src/sidecar/lister/build.mjs --tag "$TAG" --source-sha "$(git rev-parse HEAD)" --out lister-artifact
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      # On the store's Node 22 (set up above), against the exact bytes
+      # attached below.
+      - name: Test the surface lister on Node 22
+        if: steps.lister.outputs.built == 'true'
+        working-directory: src/sidecar
+        env:
+          CARRICK_LISTER_ARTIFACT: ${{ github.workspace }}/lister-artifact/carrick-lister.mjs
+        run: node --test dist/test/lister/lister-artifact.test.js dist/test/library-surface.test.js
+
       - name: Attach assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LISTER_BUILT: ${{ steps.lister.outputs.built }}
         run: |
-          gh release upload "${{ inputs.tag }}" \
-            wasm-artifact/carrick_match.js \
-            wasm-artifact/carrick_match.d.ts \
-            wasm-artifact/carrick_match_bg.wasm \
-            wasm-artifact/carrick_match.sha256 \
+          files=(
+            wasm-artifact/carrick_match.js
+            wasm-artifact/carrick_match.d.ts
+            wasm-artifact/carrick_match_bg.wasm
+            wasm-artifact/carrick_match.sha256
+          )
+          if [ "$LISTER_BUILT" = "true" ]; then
+            files+=(lister-artifact/carrick-lister.mjs lister-artifact/carrick-lister.manifest.json)
+          fi
+          gh release upload "${{ inputs.tag }}" "${files[@]}" \
             --clobber --repo "${{ github.repository }}"
 
       # Fires .github/workflows/wasm-pin-bump.yml in carrick-cloud, which
-      # opens the pin-bump PR against the freshly attached assets. The default
+      # opens the pin-bump PR against the freshly attached assets. The same
+      # event carries the lister manifest's sha256 when this release has a
+      # lister, so the cloud can verify the manifest it downloads before it
+      # copies the lister pin from it (carrick-cloud#1579). The default
       # GITHUB_TOKEN cannot dispatch cross-repo: CARRICK_CLOUD_DISPATCH_TOKEN
       # is a fine-grained PAT with contents:write + pull-requests:write on
       # carrick-tools/carrick-cloud. Assets are already attached by this point,
@@ -124,6 +164,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
           TAG: ${{ inputs.tag }}
+          LISTER_BUILT: ${{ steps.lister.outputs.built }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "CARRICK_CLOUD_DISPATCH_TOKEN is not set; assets are attached but carrick-cloud was not notified." >&2
@@ -133,10 +174,16 @@ jobs:
           JS_SHA="$(awk '$2 == "carrick_match.js" {print $1}' wasm-artifact/carrick_match.sha256)"
           DTS_SHA="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
           WASM_SHA="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
+          lister=()
+          if [ "$LISTER_BUILT" = "true" ]; then
+            MANIFEST_SHA="$(sha256sum lister-artifact/carrick-lister.manifest.json | awk '{print $1}')"
+            lister=(-f "client_payload[lister_manifest_sha256]=$MANIFEST_SHA")
+          fi
           gh api "repos/carrick-tools/carrick-cloud/dispatches" \
             -f event_type=carrick-match-release \
             -f "client_payload[tag]=$TAG" \
             -f "client_payload[source_sha]=$SOURCE_SHA" \
             -f "client_payload[js_sha256]=$JS_SHA" \
             -f "client_payload[dts_sha256]=$DTS_SHA" \
-            -f "client_payload[wasm_sha256]=$WASM_SHA"
+            -f "client_payload[wasm_sha256]=$WASM_SHA" \
+            "${lister[@]}"

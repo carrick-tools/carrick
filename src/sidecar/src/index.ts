@@ -45,6 +45,7 @@ import type {
   RetypeCheckResponse,
   VerifyClientSemanticsResponse,
   VerifyLibraryClaimsResponse,
+  ListLibrarySurfaceResponse,
   HealthResponse,
   ShutdownResponse,
   ErrorResponse,
@@ -549,6 +550,35 @@ function handleVerifyLibraryClaims(
   }
 }
 
+/** Entries a surface listing keeps per package when the request names no cap. */
+const SURFACE_MAX_ENTRIES = 1000;
+
+/**
+ * Handle the 'list_library_surface' action - each specifier's declared
+ * surface, read with the verifier's predicates, and the full-surface hash
+ * (carrick#1660).
+ */
+function handleListLibrarySurface(
+  request: SidecarRequest & { action: 'list_library_surface' }
+): ListLibrarySurfaceResponse {
+  try {
+    const { claimsVerifier } = projectComponents();
+    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    log(`Listing the declared surface of ${request.packages.length} specifier(s) from ${fromDir}`);
+    const { surfaces, surface_sha256 } = claimsVerifier.listSurface(
+      fromDir,
+      request.packages,
+      request.max_entries ?? SURFACE_MAX_ENTRIES,
+      request.exports ?? {}
+    );
+    return { request_id: request.request_id, status: 'success', surfaces, surface_sha256 };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Surface listing failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
 /**
  * Handle the 'build_workspace' action - build synthetic monorepo workspace
  */
@@ -730,6 +760,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleVerifyClientSemantics(request);
     case 'verify_library_claims':
       return handleVerifyLibraryClaims(request);
+    case 'list_library_surface':
+      return handleListLibrarySurface(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

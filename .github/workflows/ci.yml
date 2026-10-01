@@ -252,6 +252,34 @@ jobs:
           # shellcheck disable=SC2086
           node --test $files
 
+  # The surface lister carrick-cloud's library store runs (carrick#1660): the
+  # sidecar bundled into one file, on the store's Node 22 runtime. The listing
+  # tests also run on Node 24 in the `rest` shard above; the artifact test
+  # (dist/test/lister/, outside the shards' glob) needs the bundler's own
+  # install. The release builds the artifact and runs both again on the bytes
+  # it attaches (wasm-artifact.yml).
+  lister-artifact:
+    name: Surface lister on Node 22
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            src/sidecar/package-lock.json
+            src/sidecar/lister/package-lock.json
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build && npm ci --prefix lister
+
+      - name: Run the lister tests
+        working-directory: src/sidecar
+        run: node --test dist/test/lister/lister-artifact.test.js dist/test/library-surface.test.js
+
   wasm-match:
     name: carrick-match wasm smoke
     runs-on: ubuntu-latest

@@ -585,12 +585,29 @@ export interface VerifyLibraryClaimsRequest extends BaseRequest {
 export type ClaimVariant = 'index_key_generic_map';
 
 /**
+ * List each package's declared surface the way the verifier reads it
+ * (carrick#1660): the input a model picks claims from, and the full-surface
+ * hash the shared library store keys its answers on.
+ */
+export interface ListLibrarySurfaceRequest extends BaseRequest {
+  action: 'list_library_surface';
+  from_dir: string;
+  /** Module specifiers: a package, its subpaths, or a runtime module (`node:events`). */
+  packages: string[];
+  /** Entries kept per package (exports, receivers, members, signatures, parameters and keys each count one); default 1000. */
+  max_entries?: number;
+  /** Per package, the only exports to list (the ones the service imports); absent lists every value export. */
+  exports?: Record<string, string[]>;
+}
+
+/**
  * Union type for all possible sidecar requests
  */
 export type SidecarRequest =
   | RetypeCheckRequest
   | VerifyClientSemanticsRequest
   | VerifyLibraryClaimsRequest
+  | ListLibrarySurfaceRequest
   | InitRequest
   | BundleRequest
   | EmitSurfaceRequest
@@ -875,6 +892,80 @@ export interface VerifyLibraryClaimsResponse extends BaseResponse {
   errors?: string[];
 }
 
+/** What one parameter position takes, read with the verifier's predicates. */
+export interface SurfaceParam {
+  name: string;
+  optional: boolean;
+  rest: boolean;
+  /** The parameter's type as the declarations print it, truncated. */
+  type: string;
+  accepts_string: boolean;
+  /** A function type with a declared signature. */
+  function: boolean;
+  /** Declared keys, when it is an object type. */
+  keys?: SurfaceKey[];
+  /** String literals the slot spells (an overload's literal, a `keyof` map's keys). */
+  literals?: string[];
+}
+
+export interface SurfaceKey {
+  name: string;
+  /** Declared optional (`key?:`). */
+  optional: boolean;
+  accepts_string: boolean;
+  function: boolean;
+}
+
+export interface SurfaceSignature {
+  params: SurfaceParam[];
+  returns: string;
+}
+
+export interface SurfaceMember {
+  name: string;
+  /** Declared by the receiver's home packages (not only inherited from another package). */
+  own: boolean;
+  signatures: SurfaceSignature[];
+}
+
+/** One receiver the verifier can read claims on, in its receiver grammar, with what it declares. */
+export interface SurfaceReceiver {
+  receiver: string;
+  call?: SurfaceSignature[];
+  construct?: SurfaceSignature[];
+  members: SurfaceMember[];
+}
+
+export interface SurfaceExport {
+  export: string;
+  receivers: SurfaceReceiver[];
+}
+
+/** One specifier's surface. */
+export interface LibrarySurface {
+  package: string;
+  resolved_file?: string;
+  installed_version?: string;
+  /** Why nothing was listed (the verifier's module reasons). */
+  reason?: string;
+  /** Entries dropped by `max_entries`. */
+  truncated: number;
+  exports: SurfaceExport[];
+}
+
+export interface ListLibrarySurfaceResponse extends BaseResponse {
+  /** One per requested specifier, in request order. */
+  surfaces?: LibrarySurface[];
+  /**
+   * The full-surface hash: sha256 of the JSON array of `[package, exports]`
+   * for every surface that listed at least one export, sorted by `package`.
+   * Type text names the request's directory as `<root>`, so the same
+   * packages hash the same wherever they are installed.
+   */
+  surface_sha256?: string;
+  errors?: string[];
+}
+
 /**
  * Union type for all possible sidecar responses
  */
@@ -882,6 +973,7 @@ export type SidecarResponse =
   | RetypeCheckResponse
   | VerifyClientSemanticsResponse
   | VerifyLibraryClaimsResponse
+  | ListLibrarySurfaceResponse
   | InitResponse
   | BundleResponse
   | EmitSurfaceResponse
