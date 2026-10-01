@@ -92,6 +92,14 @@ const RUNTIME_TYPE_PACKAGES: ReadonlySet<string> = new Set([
   '@types/deno',
 ]);
 
+/**
+ * A runtime module's own specifier (`node:events`). Its declarations are the
+ * runtime's types package's, which is therefore its home (contract
+ * amendment 1, A1, on carrick#1564). The bare name (`events`) is a registry
+ * package's, never the runtime module.
+ */
+const RUNTIME_MODULE = /^node:/;
+
 /** A dependency range that names the service's own source, not a registry release. */
 const LOCAL_RANGE = /^(workspace|file|link|portal):/;
 
@@ -395,11 +403,13 @@ export class LibraryClaimsVerifier {
       const declarationOf = (check: LibraryCheck) =>
         file.statements[importIndex.get(exportKey(check))!] as ts.ImportDeclaration;
 
-      const readModule = (check: LibraryCheck): ModuleRead => {
-        let moduleRead = moduleReads.get(check.package);
+      // A runtime module is read for the message roles only: HTTP answers as #1564 does.
+      const readModule = (check: LibraryCheck, runtimeModules: boolean): ModuleRead => {
+        const key = `${runtimeModules}\u0000${check.package}`;
+        let moduleRead = moduleReads.get(key);
         if (!moduleRead) {
-          moduleRead = reader.readModule(check.package, declarationOf(check));
-          moduleReads.set(check.package, moduleRead);
+          moduleRead = reader.readModule(check.package, declarationOf(check), runtimeModules);
+          moduleReads.set(key, moduleRead);
         }
         return moduleRead;
       };
@@ -507,7 +517,7 @@ export class LibraryClaimsVerifier {
         if (rules.message && !fitsReceiver(check)) return { outcome: unchecked('receiver_invalid') };
         reader.setPackage(check.package);
 
-        const moduleRead = readModule(check);
+        const moduleRead = readModule(check, rules.message);
         if (moduleRead.reason) return { outcome: unchecked(moduleRead.reason) };
         if (rules.message && LOCAL_RANGE.test(localRanges.get(packageNameOf(check.package)) ?? '')) {
           return { outcome: unchecked('module_workspace') };
@@ -752,7 +762,7 @@ class DeclarationReader {
    * longer calls it external. `resolved_file` and `installed_version` both
    * come from that one agreeing answer.
    */
-  readModule(pkg: string, declaration: ts.ImportDeclaration): ModuleRead {
+  readModule(pkg: string, declaration: ts.ImportDeclaration, runtimeModules = false): ModuleRead {
     const specifier = declaration.moduleSpecifier as ts.StringLiteral;
     const resolved = ts.resolveModuleName(
       pkg,
@@ -769,6 +779,7 @@ class DeclarationReader {
 
     const moduleSymbol = this.checker.getSymbolAtLocation(specifier);
     const declarations = moduleSymbol?.declarations ?? [];
+    if (runtimeModules && RUNTIME_MODULE.test(pkg)) return this.readRuntimeModule(declarations, entry, done);
     // The module itself, not a service-side augmentation of it.
     const primary = declarations.find(ts.isSourceFile) ?? declarations[0];
     const file = primary?.getSourceFile();
@@ -803,6 +814,31 @@ class DeclarationReader {
     if (!TYPESCRIPT_FILE.test(resolved.resolvedFileName)) return done('module_js_only');
     // A declaration file with no module symbol exports nothing: every export
     // of it is missing.
+    return done();
+  }
+
+  /**
+   * `node:<module>`: the runtime's types package declares it in an ambient
+   * `declare module` block, which no module resolution lands on (and which
+   * the checker prefers over one that does). It is the runtime's when that
+   * package, installed under the service, declares it; a block only the
+   * service writes is `module_local`.
+   */
+  private readRuntimeModule(
+    declarations: readonly ts.Declaration[],
+    entry: SemanticsModule,
+    done: (reason?: string) => ModuleRead
+  ): ModuleRead {
+    if (declarations.length === 0) return done('module_unresolved');
+    const ambient = declarations.find(declaration => {
+      const owner = this.packageOf(declaration.getSourceFile());
+      return owner !== undefined && RUNTIME_TYPE_PACKAGES.has(owner);
+    });
+    if (!ambient) return done('module_local');
+    const file = ambient.getSourceFile();
+    entry.resolved_file = file.fileName;
+    const version = this.installedPackage(file.fileName)?.version;
+    if (version) entry.installed_version = version;
     return done();
   }
 
@@ -899,7 +935,8 @@ class DeclarationReader {
   ): ReadonlySet<string> {
     const named = packageNameOf(pkg);
     const home = new Set<string>(base ?? [named, typesPackageOf(named)]);
-    const runtime = RUNTIME_TYPE_PACKAGES.has(named) || RUNTIME_TYPE_PACKAGES.has(typesPackageOf(named));
+    const runtime =
+      RUNTIME_MODULE.test(pkg) || RUNTIME_TYPE_PACKAGES.has(named) || RUNTIME_TYPE_PACKAGES.has(typesPackageOf(named));
     for (const symbol of symbols) {
       for (const declaration of symbol?.declarations ?? []) {
         const owner = this.packageOf(declaration.getSourceFile());
@@ -2323,10 +2360,11 @@ function packageNameOf(specifier: string): string {
   return specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
 }
 
-/** A package directory under `node_modules`: the name it is installed as, and the name its package.json gives. */
+/** A package directory under `node_modules`: the name it is installed as, and the name and version its package.json gives. */
 interface InstalledPackage {
   directoryName: string;
   packageName: string | undefined;
+  version: string | undefined;
 }
 
 function readInstalledPackage(
@@ -2337,14 +2375,15 @@ function readInstalledPackage(
   const manifest = path.join(directory, 'package.json');
   if (!host.fileExists(manifest)) return null;
   let packageName: string | undefined;
+  let version: string | undefined;
   try {
-    const parsed: unknown = JSON.parse(host.readFile(manifest) ?? '');
-    const name = (parsed as { name?: unknown } | null)?.name;
-    if (typeof name === 'string') packageName = name;
+    const parsed = JSON.parse(host.readFile(manifest) ?? '') as { name?: unknown; version?: unknown } | null;
+    if (typeof parsed?.name === 'string') packageName = parsed.name;
+    if (typeof parsed?.version === 'string') version = parsed.version;
   } catch {
     // An unreadable manifest still marks an installed directory; it names no package.
   }
-  return { directoryName, packageName };
+  return { directoryName, packageName, version };
 }
 
 function isNullish(type: ts.Type): boolean {

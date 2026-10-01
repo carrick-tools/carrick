@@ -136,12 +136,17 @@ export interface PubSub {
 export declare function connect(url: string): PubSub;
 `;
 
-// The runtime's event emitter, as its type package declares it.
+// The runtime's event emitter, as its type package declares it, under the
+// bare name and the node: name.
 const RUNTIME_EVENTS = `declare module 'events' {
   class EventEmitter {
     emit(eventName: string | symbol, ...args: any[]): boolean;
     on(eventName: string | symbol, listener: (...args: any[]) => void): this;
   }
+  export = EventEmitter;
+}
+declare module 'node:events' {
+  import EventEmitter = require('events');
   export = EventEmitter;
 }
 `;
@@ -390,7 +395,10 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
         dependencies: { '@fixture/tasks': '^4.0.0', 'fixture-local-bus': 'file:./vendor/local-bus' },
       }),
       'src/index.ts': 'export const service = 1;\n',
-      'types/shims.d.ts': "declare module 'fixture-shorthand-bus';\n",
+      'types/shims.d.ts':
+        "declare module 'fixture-shorthand-bus';\ndeclare module 'node:shim' {\n  export function publish(topic: string, payload: unknown): void;\n}\n",
+      // The service compiles against the runtime's types, as a real Node service does.
+      'src/runtime.ts': '/// <reference types="node" />\nexport {};\n',
       // The service adds a member to the key-value client for itself.
       'src/augment.ts':
         "import '@fixture/kv-core';\ndeclare module '@fixture/kv-core' {\n  interface Client {\n    broadcast(channel: string, message: string): Promise<number>;\n  }\n}\n",
@@ -780,6 +788,49 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
       'verified',
       'failed member_inherited',
     ]);
+  });
+
+  it('reads node:<module> with the runtime types package as its home, and only that specifier (contract amendment 1)', async () => {
+    const E = 'node:events';
+    const runtime = [
+      check(E, 'default', 'in_process_bus', 'export', make('new', null)),
+      check(E, 'default', 'in_process_bus', 'instance:new', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
+      check(E, 'default', 'in_process_bus', 'instance:new', op('receive', 'on', { name: { arg: 0 } })),
+      // The runtime's listener type, (...args: any[]) => void, says nothing about a handler.
+      check(E, 'default', 'in_process_bus', 'instance:new', op('receive', 'on', { name: { arg: 0 }, handler: { arg: 1 } })),
+    ];
+    const response = await send(runtime);
+    assert.deepStrictEqual(verdicts(response), ['verified', 'verified', 'verified', 'unchecked handler_untyped']);
+    assert.strictEqual(response.modules![0].installed_version, '22.0.0');
+    assert.match(String(response.modules![0].resolved_file), /node_modules\/@types\/node\/index\.d\.ts$/);
+    // A class another package declares that only inherits them stays refused.
+    const B = 'fixture-bus';
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          check(B, 'Bus', 'in_process_bus', 'export', make('new', null)),
+          check(B, 'Bus', 'in_process_bus', 'instance:new', op('send', 'emit', { name: { arg: 0 }, payload: { arg: 1 } })),
+          check(B, 'Bus', 'in_process_bus', 'instance:new', op('receive', 'on', { name: { arg: 0 } })),
+        ])
+      ),
+      ['verified', 'failed member_inherited', 'failed member_inherited']
+    );
+    // The bare name is a registry package's, never the runtime module; a
+    // node: module the service declares for itself is not the runtime's.
+    assert.deepStrictEqual(
+      verdicts(
+        await send([
+          check('events', 'default', 'in_process_bus', 'export', make('new', null)),
+          check('node:shim', 'publish', 'in_process_bus', 'export', op('send', null, { name: { arg: 0 }, payload: { arg: 1 } })),
+        ])
+      ),
+      ['unchecked module_local', 'unchecked module_local']
+    );
+    // HTTP answers as #1564 does: a node: specifier is not read as the runtime module there.
+    assert.deepStrictEqual(
+      verdicts(await send([check(E, 'default', 'http_client', 'export', make('call', 'create', { base_key: 'url' }))])),
+      ['unchecked module_local']
+    );
   });
 
   it("refuses a member only inherited from another package's base class", async () => {
