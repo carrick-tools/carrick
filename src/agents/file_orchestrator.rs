@@ -1048,6 +1048,9 @@ impl ResolutionSource {
             // Ranked at the top so this arm reads as "nothing outranks the
             // repo's own declaration" rather than as an unexamined default.
             Self::DeclaredOperation => u8::MAX,
+            // A library claim states pub/sub and socket rows, which never
+            // compete for an HTTP call site (carrick#1616, prototype).
+            Self::LibraryClaim => 0,
         }
     }
 

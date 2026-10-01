@@ -195,7 +195,8 @@ impl ConsumerRole {
             | S::DescriptorRoute
             | S::ClassController
             | S::DecoratorRoute
-            | S::DeclaredOperation => None,
+            | S::DeclaredOperation
+            | S::LibraryClaim => None,
         }
     }
 }

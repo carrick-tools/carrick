@@ -92,6 +92,7 @@ fn create_express_detection() -> DetectionResult {
         socket_clients: vec![],
         notes: "Test detection result".to_string(),
         client_semantics: None,
+        library_claims: None,
     }
 }
 

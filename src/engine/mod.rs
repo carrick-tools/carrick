@@ -10337,6 +10337,7 @@ mod tests {
                     socket_clients: vec![],
                     notes: String::new(),
                     client_semantics: None,
+                    library_claims: None,
                 }),
                 cached_guidance: None,
                 cached_extraction_config: None,
@@ -10635,6 +10636,7 @@ mod tests {
                 socket_clients: vec![],
                 notes: "test".to_string(),
                 client_semantics: None,
+                library_claims: None,
             }),
             cached_guidance: None,
             cached_extraction_config: None,
@@ -13557,6 +13559,7 @@ mod tests {
             socket_clients: Vec::new(),
             notes: "the stored notes".to_string(),
             client_semantics: None,
+            library_claims: None,
         };
         let answer = DetectionResult {
             notes: "the fresh notes".to_string(),

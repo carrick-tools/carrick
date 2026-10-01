@@ -303,12 +303,93 @@ struct ClientRef {
     called_computed: bool,
 }
 
-/// `export.factory({ ... })`: the factory member and the object literal it
-/// was handed, read where the instance is built.
+/// How an instance is made from a package export (carrick#1616): called
+/// (`export.member(...)`, `export(...)`) or constructed (`new export(...)`,
+/// `new export.member(...)`), with what the maker was handed, read where the
+/// instance is built. Which receiver of the package's claims it is follows
+/// from the form and the member alone ([`ClientInstance::receiver`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientInstance {
-    factory: String,
-    options: ObjValue,
+    form: MakerForm,
+    /// The export's member the maker is, or `None` for the export itself.
+    member: Option<String>,
+    /// The one object literal the maker was handed, read as a request reads
+    /// it: what an HTTP factory's base comes from (carrick#1564). `None`
+    /// unless the call is handed exactly that.
+    options: Option<ObjValue>,
+    /// Every argument's literal reading, for the names a claim binds to the
+    /// instance (carrick#1616).
+    args: Vec<LitArg>,
+}
+
+/// Whether an instance was called or constructed into being.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MakerForm {
+    Call,
+    New,
+}
+
+impl ClientInstance {
+    /// The receiver string the package's claims are checked on:
+    /// `instance:<member>`, `instance:()`, `instance:new` or
+    /// `instance:new:<member>`.
+    fn receiver(&self) -> String {
+        maker_receiver(self.form, self.member.as_deref())
+    }
+
+    /// The HTTP factory this is, when it is one: `export.member({ ... })`
+    /// with exactly one object literal (carrick#1564).
+    fn http_factory(&self) -> Option<(&str, &ObjValue)> {
+        match (self.form, &self.member, &self.options) {
+            (MakerForm::Call, Some(member), Some(options)) => Some((member, options)),
+            _ => None,
+        }
+    }
+}
+
+/// The receiver string for an instance a maker of `form` on `member`
+/// (`None`: the export itself) makes.
+pub fn maker_receiver(form: MakerForm, member: Option<&str>) -> String {
+    match (form, member) {
+        (MakerForm::Call, Some(member)) => instance_receiver(member),
+        (MakerForm::Call, None) => "instance:()".to_string(),
+        (MakerForm::New, None) => "instance:new".to_string(),
+        (MakerForm::New, Some(member)) => format!("instance:new:{member}"),
+    }
+}
+
+/// One argument of a call, as far as its literal text goes (carrick#1616):
+/// what a library claim's name slot reads. Only text the source writes at the
+/// call, or a module constant the argument names in the module's own scope,
+/// is a literal here; anything a parameter, a local or a shadowing binding
+/// could supply is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LitArg {
+    /// The argument's text, when it is a literal.
+    pub text: Option<String>,
+    /// The argument's keys, when it is an object literal.
+    pub object: Option<LitObject>,
+    /// The argument is a function expression.
+    pub function: bool,
+}
+
+/// An object literal's keys, each with its literal text when it has one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LitObject {
+    /// Key -> its literal text, or `None` when the value is not one. A key
+    /// written before a spread or a computed key is not here: what follows
+    /// may overwrite it.
+    pub fields: BTreeMap<String, Option<String>>,
+    /// A spread or a computed key is in the object.
+    pub open: bool,
+}
+
+impl LitArg {
+    /// The literal at `key` of this argument's object, when the object
+    /// states one there.
+    pub fn key(&self, key: &str) -> Option<&str> {
+        self.object.as_ref()?.fields.get(key)?.as_deref()
+    }
 }
 
 /// A call made through a library client: on one of its members, or on the
@@ -375,6 +456,13 @@ struct CallIr {
     /// one. What it sends is read through the client's verified semantics,
     /// which are known only when the summaries are composed.
     receiver: Option<CallReceiver>,
+    /// Each argument's literal reading, for a call made through a library
+    /// client (carrick#1616). Empty for every other call.
+    lit_args: Vec<LitArg>,
+    /// The line of the member the call names (`.subscribe(` on a chain that
+    /// starts lines above), or of the callee itself: where a library row is
+    /// stated (carrick#1616, F4).
+    op_line: u32,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -433,6 +521,13 @@ pub struct FileIr {
     /// ([`crate::commonjs::export_assignments`]), so a write anywhere else can
     /// replace it unseen: nothing it holds is read in another module.
     names_commonjs_exports: bool,
+    /// The calls written at module level, outside any function: a
+    /// definition made where a module is loaded (`export const t =
+    /// task({ ... })`) is one. Read for library rows only (carrick#1616); the
+    /// request summaries are composed from the functions alone, as before.
+    module_level: FnIr,
+    /// Every package specifier the file imports from, as written.
+    package_specifiers: BTreeSet<String>,
 }
 
 impl FileIr {
@@ -495,6 +590,7 @@ pub fn extract_file_ir(
         uses: uses.uses,
         object_consts: object_consts(module),
         subclass_fields: subclass_fields(module),
+        const_literals: module_const_literals(module),
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -520,11 +616,17 @@ pub fn extract_file_ir(
     let value_specifiers = value_specifiers(module, |name| {
         module_scope.uses.contains_key(name) || jsx.contains(name)
     });
+    let package_specifiers = imports
+        .values()
+        .map(|import| import.specifier.clone())
+        .filter(|specifier| !specifier.starts_with('.') && !specifier.starts_with('/'))
+        .collect();
     let mut file = FileIr {
         imported,
         value_specifiers,
         loads: module_loads(module, &bound_requires),
         names_commonjs_exports: names_commonjs_exports(module),
+        package_specifiers,
         ..FileIr::default()
     };
     let reader = Reader { source_map };
@@ -627,6 +729,40 @@ pub fn extract_file_ir(
             }
         }
     }
+    // The calls made where the module is loaded (carrick#1616): every
+    // statement and initialiser outside the functions read above. A function
+    // written inside one is read where it is written, as a callback or a
+    // detached function, exactly as inside a body.
+    {
+        let scope = Scope::module(module_scope);
+        let mut module_level = FnIr::default();
+        for item in &module.body {
+            match item {
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                    reader.walk(&*export.expr, &scope, &mut module_level);
+                }
+                ModuleItem::ModuleDecl(_) if module_decl(item).is_none() => {}
+                _ => match module_decl(item) {
+                    Some(Decl::Var(var)) => {
+                        for declarator in &var.decls {
+                            if let Some(init) = &declarator.init
+                                && !matches!(&**init, Expr::Arrow(_) | Expr::Fn(_))
+                            {
+                                reader.walk(&**init, &scope, &mut module_level);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let ModuleItem::Stmt(stmt) = item {
+                            reader.walk(stmt, &scope, &mut module_level);
+                        }
+                    }
+                },
+            }
+        }
+        file.module_level = module_level;
+    }
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
     // that imports a package's client may build one.
@@ -671,9 +807,87 @@ struct ModuleScope {
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
+    /// Module-scope `const NAME = "text"`, with the binding's own syntax
+    /// context: an identifier names this constant only where the resolver
+    /// gave it the same context, so a parameter or a local that shadows the
+    /// name reads as nothing (carrick#1616, P2-2).
+    const_literals: HashMap<String, (swc_common::SyntaxContext, String)>,
 }
 
 impl ModuleScope {
+    /// The literal text `expr` is: a string, a template with no hole, or a
+    /// module constant holding one, named in the module's own scope.
+    fn literal(&self, expr: &Expr) -> Option<String> {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Lit(Lit::Str(text)) => Some(text.value.to_string()),
+            Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {
+                quasi
+                    .cooked
+                    .as_ref()
+                    .map(|cooked| cooked.to_string())
+                    .unwrap_or_else(|| quasi.raw.to_string())
+            }),
+            Expr::Ident(ident) => self
+                .const_literals
+                .get(ident.sym.as_ref())
+                .filter(|(ctxt, _)| *ctxt == ident.ctxt)
+                .map(|(_, text)| text.clone()),
+            _ => None,
+        }
+    }
+
+    /// One argument's literal reading ([`LitArg`]).
+    fn lit_arg(&self, expr: &Expr) -> LitArg {
+        let expr = crate::graphql_document_sites::unwrap_expression(expr);
+        let object = match expr {
+            Expr::Object(object) => Some(self.lit_object(object)),
+            _ => None,
+        };
+        LitArg {
+            text: self.literal(expr),
+            object,
+            function: matches!(expr, Expr::Arrow(_) | Expr::Fn(_)),
+        }
+    }
+
+    /// An object literal's keys ([`LitObject`]). A key written before a
+    /// spread or a computed key is dropped: what comes after may overwrite
+    /// it.
+    fn lit_object(&self, object: &ObjectLit) -> LitObject {
+        let mut out = LitObject::default();
+        for prop in &object.props {
+            let prop = match prop {
+                PropOrSpread::Spread(_) => {
+                    out.fields.clear();
+                    out.open = true;
+                    continue;
+                }
+                PropOrSpread::Prop(prop) => prop,
+            };
+            let (key, value) = match &**prop {
+                Prop::KeyValue(kv) => (prop_name(&kv.key), self.literal(&kv.value)),
+                Prop::Shorthand(ident) => (
+                    Some(ident.sym.to_string()),
+                    self.literal(&Expr::Ident(ident.clone())),
+                ),
+                Prop::Method(MethodProp { key, .. })
+                | Prop::Getter(GetterProp { key, .. })
+                | Prop::Setter(SetterProp { key, .. }) => (prop_name(key), None),
+                Prop::Assign(_) => (None, None),
+            };
+            match key {
+                Some(key) => {
+                    out.fields.insert(key, value);
+                }
+                None => {
+                    out.fields.clear();
+                    out.open = true;
+                }
+            }
+        }
+        out
+    }
+
     /// `client`, contested when the file uses `binding` other than to call
     /// through it or export it (carrick#1564 re-review, R6).
     fn with_uses(&self, mut client: ClientRef, binding: &str) -> ClientRef {
@@ -1152,6 +1366,40 @@ fn is_commonjs_export(target: &AssignTarget) -> bool {
         && member_prop(member).as_deref() == Some("exports"))
         || is_module_exports(&member.obj)
         || matches!(&*member.obj, Expr::Ident(obj) if obj.sym == *"exports")
+}
+
+/// Every module-scope `const NAME = "text"` (or a template with no hole),
+/// with the binding's syntax context ([`ModuleScope::const_literals`]).
+fn module_const_literals(module: &Module) -> HashMap<String, (swc_common::SyntaxContext, String)> {
+    let mut out = HashMap::new();
+    for item in &module.body {
+        let Some(decl) = module_var_decl(item) else {
+            continue;
+        };
+        if decl.kind != VarDeclKind::Const {
+            continue;
+        }
+        for declarator in &decl.decls {
+            let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) else {
+                continue;
+            };
+            let text = match crate::graphql_document_sites::unwrap_expression(init) {
+                Expr::Lit(Lit::Str(text)) => Some(text.value.to_string()),
+                Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {
+                    quasi
+                        .cooked
+                        .as_ref()
+                        .map(|cooked| cooked.to_string())
+                        .unwrap_or_else(|| quasi.raw.to_string())
+                }),
+                _ => None,
+            };
+            if let Some(text) = text {
+                out.insert(ident.id.sym.to_string(), (ident.id.ctxt, text));
+            }
+        }
+    }
+    out
 }
 
 /// Every name declared exactly once in the module, by `const <name> = { … }`.
@@ -1805,6 +2053,10 @@ impl Reader<'_> {
             .span_to_snippet(span)
             .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default()
+    }
+
+    fn line(&self, span: Span) -> u32 {
+        self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
     fn site(&self, span: Span) -> Site {
@@ -2576,11 +2828,15 @@ impl Reader<'_> {
         })
     }
 
-    /// `<client>.<factory>({ ... })`, where `<client>` is a binding imported
-    /// from a package (carrick#1564): the instance it builds, with the object
-    /// literal it was handed. Anything else — an instance's own factory call,
-    /// options that are not written as one literal — builds nothing this pass
-    /// reads.
+    /// A maker call on a binding imported from a package: `<client>.<member>(…)`
+    /// or `<client>(…)`, or the same constructed with `new` (carrick#1564,
+    /// carrick#1616). The instance it builds, with what it was handed.
+    /// Anything else — an instance's own maker call, an argument spread that
+    /// moves every position — builds nothing this pass reads.
+    ///
+    /// Which of these is a maker at all is the package's claims' to say,
+    /// read when the summaries are composed: an instance no verified claim
+    /// makes is read through nothing.
     fn factory_call(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
         let expr = match expr {
             Expr::TsAs(e) => &*e.expr,
@@ -2588,40 +2844,52 @@ impl Reader<'_> {
             Expr::TsSatisfies(e) => &*e.expr,
             other => other,
         };
-        let Expr::Call(call) = expr.unwrap_parens() else {
-            return None;
+        let (form, callee, args): (MakerForm, &Expr, &[ExprOrSpread]) = match expr.unwrap_parens() {
+            Expr::Call(call) => match &call.callee {
+                Callee::Expr(callee) => (MakerForm::Call, &**callee, call.args.as_slice()),
+                _ => return None,
+            },
+            Expr::New(new) => (
+                MakerForm::New,
+                &*new.callee,
+                new.args.as_deref().unwrap_or_default(),
+            ),
+            _ => return None,
         };
-        let Callee::Expr(callee) = &call.callee else {
-            return None;
+        let (binding, member) = match callee.unwrap_parens() {
+            Expr::Ident(binding) => (binding, None),
+            Expr::Member(member) => match &*member.obj {
+                Expr::Ident(binding) => (binding, Some(member_prop(member)?)),
+                _ => return None,
+            },
+            _ => return None,
         };
-        let Expr::Member(member) = &**callee else {
-            return None;
-        };
-        let Expr::Ident(binding) = &*member.obj else {
-            return None;
-        };
-        let factory = member_prop(member)?;
         let client = scope.receiver(binding.sym.as_ref())?;
         if client.instance.is_some() {
             return None;
         }
-        let [options] = call.args.as_slice() else {
-            return None;
-        };
-        if options.spread.is_some() {
+        if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        let Expr::Object(options_literal) =
-            crate::graphql_document_sites::unwrap_expression(&options.expr)
-        else {
-            return None;
+        // The HTTP factory's options: exactly one object literal, as before.
+        let options = match args {
+            [options] => match crate::graphql_document_sites::unwrap_expression(&options.expr) {
+                Expr::Object(literal) => Some(self.object(literal, scope)),
+                _ => None,
+            },
+            _ => None,
         };
         Some(ClientRef {
             package: client.package.clone(),
             export: client.export.clone(),
             instance: Some(ClientInstance {
-                factory,
-                options: self.object(options_literal, scope),
+                form,
+                member,
+                options,
+                args: args
+                    .iter()
+                    .map(|arg| scope.module.lit_arg(&arg.expr))
+                    .collect(),
             }),
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
@@ -2868,14 +3136,34 @@ impl Visit for CallWalker<'_, '_, '_> {
             },
             _ => String::new(),
         };
+        let site = self.reader.site(call.span);
+        // The member's own line, where a library row is stated (F4): on a
+        // chain written over several lines the call starts lines above it.
+        let op_line = match &call.callee {
+            Callee::Expr(callee) => match callee.unwrap_parens() {
+                Expr::Member(member) => self.reader.line(member.prop.span()),
+                other => self.reader.line(other.span()),
+            },
+            _ => site.line,
+        };
+        let lit_args = if receiver.is_some() {
+            call.args
+                .iter()
+                .map(|arg| self.scope.module.lit_arg(&arg.expr))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.ir.calls.push(CallIr {
-            site: self.reader.site(call.span),
+            site,
             callee,
             args,
             request,
             inert,
             invokes_param,
             receiver,
+            lit_args,
+            op_line,
         });
     }
 
@@ -3973,11 +4261,13 @@ fn library_shape(
             Vec::new(),
         ),
         Some(instance) => {
-            let factory = semantics.factory(&client.package, &client.export, &instance.factory)?;
+            // Only `export.member({ ... })` is an HTTP factory's instance.
+            let (factory_member, options) = instance.http_factory()?;
+            let factory = semantics.factory(&client.package, &client.export, factory_member)?;
             let surface = semantics.surface(
                 &client.package,
                 &client.export,
-                &instance_receiver(&instance.factory),
+                &instance_receiver(factory_member),
             )?;
             if client.called_computed
                 || client
@@ -3993,10 +4283,10 @@ fn library_shape(
             // ([`Reader::object`] drops the rest), so it stands even in open
             // options; a key missing from open options may be in the part the
             // source does not state.
-            let base = match instance.options.fields.get(&factory.base_url_key) {
+            let base = match options.fields.get(&factory.base_url_key) {
                 Some(Value::Str(pieces)) => pieces.clone(),
                 Some(_) => return None,
-                None if instance.options.open => return None,
+                None if options.open => return None,
                 None => Vec::new(),
             };
             used.insert(factory.claim_id.clone());
@@ -4222,6 +4512,430 @@ fn is_whole_segment(url: &[Piece], position: usize) -> bool {
         Some(_) => false,
     };
     after_slash && segment_ends
+}
+
+// ---------------------------------------------------------------------------
+// Library rows: pub/sub and socket ops read through verified library claims
+// (carrick#1616, PROTOTYPE for the $0 slice)
+// ---------------------------------------------------------------------------
+
+/// What a library row states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LibraryRowKind {
+    /// A named message to or from a broker: a subscriber registers a handler
+    /// (a definition, or a receive op), a publisher sends.
+    Pubsub(crate::operation::PubsubRole),
+    /// A socket event: the side that registers is the listener.
+    Socket {
+        direction: crate::operation::SocketDirection,
+        listener: bool,
+    },
+}
+
+/// One row a library claim states at a call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryRow {
+    pub kind: LibraryRowKind,
+    /// The topic or event, as the source writes it.
+    pub name: String,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The line of the member the call names, or of the callee.
+    pub line: u32,
+    /// Every claim the row rests on, sorted.
+    pub claim_ids: Vec<String>,
+    pub specifier: String,
+    pub export: String,
+    pub receiver: String,
+    pub member: Option<String>,
+    /// The call registers a handler under the name it makes (a maker with a
+    /// name and a handler), rather than an op on a receiver.
+    pub definition: bool,
+}
+
+/// What became of one call made through a classified library export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryOutcome {
+    /// The call states these rows.
+    Stated(Vec<LibraryRow>),
+    /// The call reaches a claimed maker or op and states nothing, for this
+    /// reason.
+    Silent(&'static str),
+}
+
+/// One call made through a classified library export, with its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryCall {
+    pub file: PathBuf,
+    pub line: u32,
+    pub span_start: u32,
+    pub specifier: String,
+    pub export: String,
+    pub receiver: String,
+    pub member: Option<String>,
+    pub outcome: LibraryOutcome,
+}
+
+/// Every library call a service makes through a claimed maker or op, and the
+/// rows the verified ones state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryRowIndex {
+    pub calls: Vec<LibraryCall>,
+}
+
+impl LibraryRowIndex {
+    pub fn rows(&self) -> impl Iterator<Item = (&Path, &LibraryRow)> {
+        self.calls.iter().flat_map(|call| match &call.outcome {
+            LibraryOutcome::Stated(rows) => rows
+                .iter()
+                .map(|row| (call.file.as_path(), row))
+                .collect::<Vec<_>>(),
+            LibraryOutcome::Silent(_) => Vec::new(),
+        })
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows().count()
+    }
+
+    /// The (span start, span end) of every definition row in `file`: a
+    /// model row of another protocol at exactly one of these spans is the
+    /// model reading this definition as something else.
+    pub fn definition_spans(&self, file: &Path) -> BTreeSet<(u32, u32)> {
+        self.rows()
+            .filter(|(at, row)| *at == file && row.definition)
+            .map(|(_, row)| (row.span_start, row.span_end))
+            .collect()
+    }
+
+    /// Calls that stated nothing, by reason.
+    pub fn silent_by_reason(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts = BTreeMap::new();
+        for call in &self.calls {
+            if let LibraryOutcome::Silent(reason) = call.outcome {
+                *counts.entry(reason).or_default() += 1;
+            }
+        }
+        counts
+    }
+}
+
+/// Read every call the service makes through a classified library export
+/// with the claims its packages verified (carrick#1616).
+///
+/// The receiver is identified exactly as for an HTTP library client: from
+/// the syntax alone, one instance in every module, with every module's uses
+/// merged. Then the export's role is the only branch: a broker's ops state
+/// pub/sub rows, a socket's ops state socket rows with the direction its side
+/// and the op give. HTTP clients are read by [`summarize`]; every other role
+/// states nothing in the prototype.
+///
+/// A call states nothing where the source may not mean what the claim says
+/// (the #1564/#1568 contest set, a test or mock path, an unverified maker, a
+/// name that is not a literal in the module's own scope, a wildcard, a name
+/// the library emits itself, a slot the claim positions that the call does
+/// not supply).
+pub fn library_rows(
+    inputs: &RequestSummaryInputs,
+    claims: &crate::library_claims::ClaimSurface,
+    service_root: &Path,
+) -> LibraryRowIndex {
+    let mut index = LibraryRowIndex::default();
+    if claims.is_empty() {
+        return index;
+    }
+    let files = &inputs.files;
+    let clients = LinkedClients::link(files, &inputs.bindings);
+    let mut paths: Vec<&PathBuf> = files.keys().collect();
+    paths.sort();
+    for path in paths {
+        let file = &files[path];
+        let mut keys: Vec<&String> = file.functions.keys().collect();
+        keys.sort();
+        let reader = LibraryReader {
+            file: path,
+            claims,
+            clients: &clients,
+            sites: &inputs.sites,
+            mock: crate::file_finder::endpoint_provenance(path, service_root).is_mock(),
+        };
+        for key in keys {
+            reader.walk(&file.functions[key], &mut index);
+        }
+        reader.walk(&file.module_level, &mut index);
+    }
+    index
+}
+
+struct LibraryReader<'a> {
+    file: &'a Path,
+    claims: &'a crate::library_claims::ClaimSurface,
+    clients: &'a LinkedClients,
+    sites: &'a CallSiteTargets,
+    mock: bool,
+}
+
+impl LibraryReader<'_> {
+    fn walk(&self, ir: &FnIr, index: &mut LibraryRowIndex) {
+        for call in &ir.calls {
+            if let Some(read) = self.read(call) {
+                index.calls.push(read);
+            }
+        }
+        for nested in ir.nested.iter().chain(&ir.detached) {
+            self.walk(nested, index);
+        }
+    }
+
+    /// The outcome of one call, or `None` when it is no call through a
+    /// claimed maker or op of a classified broker or socket export.
+    fn read(&self, call: &CallIr) -> Option<LibraryCall> {
+        use crate::library_claims::Role;
+        let receiver = call.receiver.as_ref()?;
+        // A call the call graph resolves to a function of this service is
+        // that function's, whatever its name.
+        if self.sites.target(self.file, call.site.lo).is_some() {
+            return None;
+        }
+        let (client, _) = self.clients.client_in_scope(self.file, &receiver.client)?;
+        let export = self.claims.export(&client.package, &client.export)?;
+        if !matches!(export.facts.role, Role::Broker | Role::Socket) {
+            return None;
+        }
+        let receiver_id = match &client.instance {
+            None => "export".to_string(),
+            Some(instance) => instance.receiver(),
+        };
+        let member = receiver.member.as_deref();
+        if !export.claims(&receiver_id, member) {
+            return None;
+        }
+        let outcome = match self.state(call, client, export, &receiver_id, member) {
+            Ok(rows) => LibraryOutcome::Stated(rows),
+            Err(reason) => LibraryOutcome::Silent(reason),
+        };
+        Some(LibraryCall {
+            file: self.file.to_path_buf(),
+            line: call.op_line,
+            span_start: call.site.span_start,
+            specifier: client.package.clone(),
+            export: client.export.clone(),
+            receiver: receiver_id,
+            member: member.map(str::to_string),
+            outcome,
+        })
+    }
+
+    fn state(
+        &self,
+        call: &CallIr,
+        client: &ClientRef,
+        export: &crate::library_claims::SurfaceExport,
+        receiver_id: &str,
+        member: Option<&str>,
+    ) -> Result<Vec<LibraryRow>, &'static str> {
+        use crate::library_claims::{NameSource, OpKind, Role, Side};
+        use crate::operation::{PubsubRole, SocketDirection};
+
+        if self.mock {
+            return Err("test_or_mock_path");
+        }
+        if client.contested {
+            return Err("contested");
+        }
+        // An instance is read only through the maker that verified, and only
+        // where nothing calls a member its verified surface does not name.
+        let maker = match &client.instance {
+            None => None,
+            Some(instance) => {
+                let maker = export
+                    .maker(instance.form, instance.member.as_deref())
+                    .ok_or("maker_unverified")?;
+                if client.called_computed
+                    || client
+                        .called
+                        .iter()
+                        .any(|called| !export.names(receiver_id, called.as_deref()))
+                {
+                    return Err("call_outside_surface");
+                }
+                Some((instance, maker))
+            }
+        };
+        let name_ok = |name: &str| -> Result<(), &'static str> {
+            if export
+                .facts
+                .patterns
+                .iter()
+                .any(|pattern| name.contains(pattern.as_str()))
+            {
+                return Err("wildcard_name");
+            }
+            if export
+                .facts
+                .reserved
+                .iter()
+                .any(|(at, reserved)| Some(at.as_str()) == member && reserved == name)
+            {
+                return Err("library_owned_name");
+            }
+            Ok(())
+        };
+        let supplies = |slot: &Option<crate::library_claims::Slot>| {
+            slot.as_ref()
+                .is_none_or(|slot| (slot.arg as usize) < call.lit_args.len())
+        };
+
+        let mut rows = Vec::new();
+        let mut silent: Option<&'static str> = None;
+        let row = |kind: LibraryRowKind, name: String, claim_ids: Vec<String>, definition: bool| {
+            let mut claim_ids = claim_ids;
+            claim_ids.sort();
+            claim_ids.dedup();
+            LibraryRow {
+                kind,
+                name,
+                span_start: call.site.span_start,
+                span_end: call.site.span_end,
+                line: call.op_line,
+                claim_ids,
+                specifier: client.package.clone(),
+                export: client.export.clone(),
+                receiver: receiver_id.to_string(),
+                member: member.map(str::to_string),
+                definition,
+            }
+        };
+
+        // A definition: the export's maker with a name and a handler, called.
+        // It registers the handler under the name, so it is the subscriber.
+        if client.instance.is_none() && export.facts.role == Role::Broker {
+            let definition = export.makes.iter().find(|makes| {
+                makes.makes.form == MakerForm::Call
+                    && makes.makes.member.as_deref() == member
+                    && makes.makes.name.is_some()
+                    && makes.makes.handler.is_some()
+            });
+            if let Some(definition) = definition {
+                let name_slot = definition.makes.name.as_ref().expect("checked above");
+                match lit_at(&call.lit_args, name_slot) {
+                    None => silent = Some("name_not_literal"),
+                    Some(name) => match name_ok(&name) {
+                        Err(reason) => silent = Some(reason),
+                        Ok(()) if !handler_supplied(&call.lit_args, &definition.makes.handler) => {
+                            silent = Some("slot_missing")
+                        }
+                        Ok(()) => rows.push(row(
+                            LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                            name,
+                            vec![definition.claim_id.clone()],
+                            true,
+                        )),
+                    },
+                }
+            }
+        }
+
+        for verified in export.ops_on(receiver_id, member) {
+            let op = &verified.op;
+            let name = match &op.name {
+                Some(NameSource::Slot(slot)) => {
+                    // Every other slot the claim positions must be in the call:
+                    // an overload with fewer arguments can put the payload
+                    // where the name was claimed (`send(data)`).
+                    if !(supplies(&op.payload) && supplies(&op.handler) && supplies(&op.ack)) {
+                        silent = Some("slot_missing");
+                        continue;
+                    }
+                    lit_at(&call.lit_args, slot)
+                }
+                Some(NameSource::Maker) => maker.and_then(|(instance, maker)| {
+                    lit_at(&instance.args, maker.makes.name.as_ref()?)
+                }),
+                Some(NameSource::Scope) => {
+                    silent = Some("scope_not_read");
+                    continue;
+                }
+                None => {
+                    silent = Some("no_name");
+                    continue;
+                }
+            };
+            let Some(name) = name else {
+                silent = Some("name_not_literal");
+                continue;
+            };
+            if let Err(reason) = name_ok(&name) {
+                silent = Some(reason);
+                continue;
+            }
+            let kind = match (export.facts.role, op.op, export.facts.side) {
+                (Role::Broker, OpKind::Send, _) => LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                (Role::Broker, OpKind::Receive, _) => {
+                    LibraryRowKind::Pubsub(PubsubRole::Subscriber)
+                }
+                (Role::Socket, OpKind::Send, Some(Side::Client)) => LibraryRowKind::Socket {
+                    direction: SocketDirection::ClientToServer,
+                    listener: false,
+                },
+                (Role::Socket, OpKind::Receive, Some(Side::Client)) => LibraryRowKind::Socket {
+                    direction: SocketDirection::ServerToClient,
+                    listener: true,
+                },
+                (Role::Socket, OpKind::Send, Some(Side::Server)) => LibraryRowKind::Socket {
+                    direction: SocketDirection::ServerToClient,
+                    listener: false,
+                },
+                (Role::Socket, OpKind::Receive, Some(Side::Server)) => LibraryRowKind::Socket {
+                    direction: SocketDirection::ClientToServer,
+                    listener: true,
+                },
+                (Role::Socket, _, _) => {
+                    silent = Some("socket_side_unknown");
+                    continue;
+                }
+                _ => {
+                    silent = Some("op_kind_not_read");
+                    continue;
+                }
+            };
+            let mut claim_ids = vec![verified.claim_id.clone()];
+            if let Some((_, maker)) = maker {
+                claim_ids.push(maker.claim_id.clone());
+            }
+            rows.push(row(kind, name, claim_ids, false));
+        }
+        if rows.is_empty() {
+            return Err(silent.unwrap_or("not_verified"));
+        }
+        Ok(rows)
+    }
+}
+
+/// The literal a slot holds among `args`.
+fn lit_at(args: &[LitArg], slot: &crate::library_claims::Slot) -> Option<String> {
+    let arg = args.get(slot.arg as usize)?;
+    match &slot.key {
+        None => arg.text.clone(),
+        Some(key) => arg.key(key).map(str::to_string),
+    }
+}
+
+/// Whether a definition's handler is where its claim puts it.
+fn handler_supplied(args: &[LitArg], handler: &Option<crate::library_claims::Slot>) -> bool {
+    let Some(handler) = handler else {
+        return true;
+    };
+    let Some(arg) = args.get(handler.arg as usize) else {
+        return false;
+    };
+    match &handler.key {
+        None => true,
+        Some(key) => arg
+            .object
+            .as_ref()
+            .is_some_and(|object| object.fields.contains_key(key)),
+    }
 }
 
 #[cfg(test)]

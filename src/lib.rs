@@ -40,6 +40,7 @@ pub mod import_bindings;
 pub mod imported_request_member;
 pub mod in_process_pubsub;
 pub mod intent_generator;
+pub mod library_claims;
 pub mod local_http_wrapper;
 pub mod local_mode;
 pub mod logging;

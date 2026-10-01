@@ -1570,6 +1570,7 @@ mod tests {
                 socket_clients: vec![],
                 notes: String::new(),
                 client_semantics: None,
+                library_claims: None,
             },
             framework_guidance: ProtocolGuidance::new(),
             mount_graph: MountGraph::new(),
