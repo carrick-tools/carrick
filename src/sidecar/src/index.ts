@@ -486,7 +486,7 @@ function handleRetypeCheck(
 const SEMANTICS_BUDGET_MS = 600_000;
 
 /** Entries a surface listing keeps per package when the request names no cap. */
-const SURFACE_MAX_ENTRIES = 400;
+const SURFACE_MAX_ENTRIES = 1000;
 
 /**
  * Handle the 'verify_client_semantics' action - check HTTP client-library
@@ -564,7 +564,8 @@ function handleListLibrarySurface(
     const surfaces = claimsVerifier.listSurface(
       fromDir,
       request.packages,
-      request.max_entries ?? SURFACE_MAX_ENTRIES
+      request.max_entries ?? SURFACE_MAX_ENTRIES,
+      request.exports ?? {}
     );
     return { request_id: request.request_id, status: 'success', surfaces };
   } catch (err) {

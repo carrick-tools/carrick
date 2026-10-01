@@ -537,7 +537,7 @@ Response: the same `semantics` (one result per check, in request order) and `sem
 
 #### `list_library_surface` - List a package's declared surface (prototype, carrick#1616)
 
-Each package's exports, the receivers the verifier can read claims on, and what each declares, read with the verifier's own predicates: a model that chooses claims from this list chooses only what the declarations hold. Capped at `max_entries` per package (default 400), with the count it dropped.
+Each package's exports, the receivers the verifier can read claims on, and what each declares, read with the verifier's own predicates: a model that chooses claims from this list chooses only what the declarations hold. `exports` (optional, per package) lists only the exports the service imports. Capped at `max_entries` per package (default 1000), with the count it dropped; every export, receiver and member name is listed before any signature, so the cap cuts signatures first.
 
 ```json
 { "request_id": "8", "action": "list_library_surface", "from_dir": "/abs/worker", "packages": ["@fixture/tasks"] }

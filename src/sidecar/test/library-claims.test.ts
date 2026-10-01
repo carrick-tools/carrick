@@ -124,10 +124,19 @@ export declare function createBus(): EventEmitter;
 const BASE_EMITTER = `export declare class Emitter {
   send(topic: string, payload: unknown): void;
 }
+export declare class Holder<F> {
+  send: F;
+}
 `;
-const DERIVED = `import { Emitter } from '@fixture/base-emitter';
+const DERIVED = `import { Emitter, Holder } from '@fixture/base-emitter';
 export declare class Relay extends Emitter {
   forward(topic: string, payload: unknown): void;
+}
+// The member is the base's; only its signature is written here.
+export declare class GenericRelay extends Holder<(topic: string, payload: unknown) => void> {}
+// The member is written here; its signature is the base's.
+export declare class Proxy {
+  relay: Emitter['send'];
 }
 `;
 
@@ -449,12 +458,27 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
 
   it("refuses a member only inherited from another package's base class", async () => {
     const D = 'fixture-derived';
+    const send = (member: string) => op('send', member, { name: { arg: 0 }, payload: { arg: 1 } });
     const checks = [
       check(D, 'Relay', 'broker', 'export', makes('new', null)),
-      check(D, 'Relay', 'broker', 'instance:new', op('send', 'send', { name: { arg: 0 }, payload: { arg: 1 } })),
-      check(D, 'Relay', 'broker', 'instance:new', op('send', 'forward', { name: { arg: 0 }, payload: { arg: 1 } })),
+      check(D, 'Relay', 'broker', 'instance:new', send('send')),
+      check(D, 'Relay', 'broker', 'instance:new', send('forward')),
+      check(D, 'GenericRelay', 'broker', 'export', makes('new', null)),
+      check(D, 'GenericRelay', 'broker', 'instance:new', send('send')),
+      check(D, 'Proxy', 'broker', 'export', makes('new', null)),
+      check(D, 'Proxy', 'broker', 'instance:new', send('relay')),
     ];
-    assert.deepStrictEqual(verdicts(await verify(checks)), ['verified', 'failed member_inherited', 'verified']);
+    assert.deepStrictEqual(verdicts(await verify(checks)), [
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'verified',
+      // Stopped by the member rule alone: the signature is written here.
+      'failed member_inherited',
+      'verified',
+      // Stopped by the signature rule alone: the member is written here.
+      'failed member_inherited',
+    ]);
   });
 
   it("refuses a member only the service's own augmentation adds", async () => {
@@ -728,5 +752,95 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'failed member_inherited',
       'failed name_index_key',
     ]);
+  });
+
+  // --------------------------------------------------------------------------
+  // list_library_surface
+  // --------------------------------------------------------------------------
+
+  interface SurfaceResponse {
+    status: string;
+    surfaces: Array<{
+      package: string;
+      installed_version?: string;
+      reason?: string;
+      sha256?: string;
+      truncated: number;
+      exports: Array<{
+        export: string;
+        receivers: Array<{
+          receiver: string;
+          call?: unknown[];
+          members: Array<{
+            name: string;
+            own: boolean;
+            signatures: Array<{
+              params: Array<{ name: string; accepts_string: boolean; function: boolean; literals?: string[]; keys?: Array<{ name: string; accepts_string: boolean; function: boolean }> }>;
+            }>;
+          }>;
+        }>;
+      }>;
+    }>;
+  }
+  const surface = (packages: string[], extra: Record<string, unknown> = {}) =>
+    client.send<SurfaceResponse>(
+      { request_id: `surface-${requestId++}`, action: 'list_library_surface', from_dir: root, packages, ...extra },
+      60_000
+    );
+
+  it('lists each export, its receivers and members with the verifier predicates', async () => {
+    const response = await surface(['fixture-socket', 'fixture-bus', 'fixture-not-installed']);
+    assert.strictEqual(response.status, 'success');
+    const [socket, bus, missing] = response.surfaces;
+    assert.strictEqual(socket.installed_version, '2.0.0');
+    assert.strictEqual(socket.truncated, 0);
+    assert.deepStrictEqual(socket.exports.map(e => e.export), ['Server', 'io']);
+    const io = socket.exports.find(e => e.export === 'io')!;
+    assert.deepStrictEqual(io.receivers.map(r => r.receiver), ['export', 'instance:()']);
+    const clientSocket = io.receivers[1];
+    assert.deepStrictEqual(clientSocket.members.map(m => m.name), ["emit", "on"]);
+    const on = clientSocket.members.find(m => m.name === "on")!;
+    assert.ok(on.own);
+    // The literal overload spells the library's own names; the general one takes a string.
+    const eventParams = on.signatures.map(sig => sig.params[0]);
+    assert.deepStrictEqual(eventParams[0].literals, ['connect', 'disconnect']);
+    assert.strictEqual(eventParams[1].accepts_string, true);
+    assert.strictEqual(on.signatures[1].params[1].function, true);
+    // A class extending the runtime emitter lists the inherited members as not its own.
+    const busClass = bus.exports.find(e => e.export === 'Bus')!;
+    const instance = busClass.receivers.find(r => r.receiver === 'instance:new')!;
+    const own = Object.fromEntries(instance.members.map(m => [m.name, m.own]));
+    assert.deepStrictEqual(own, { publishLocal: true, emit: false, on: false });
+    assert.strictEqual(missing.reason, 'module_unresolved');
+    // The listing is stable, so a choice made from it can be cached by its sha.
+    const again = await surface(['fixture-socket']);
+    assert.strictEqual(again.surfaces[0].sha256, socket.sha256);
+  });
+
+  it('lists the option keys of a maker, and only the exports asked for', async () => {
+    const response = await surface(['@fixture/tasks'], { exports: { '@fixture/tasks': ['task'] } });
+    const tasks = response.surfaces[0];
+    assert.deepStrictEqual(tasks.exports.map(e => e.export), ['task']);
+    const maker = tasks.exports[0].receivers.find(r => r.receiver === 'export')!;
+    const keys = (maker as unknown as { call: Array<{ params: Array<{ keys?: Array<{ name: string; accepts_string: boolean; function: boolean }> }> }> }).call[0]
+      .params[0].keys!;
+    assert.deepStrictEqual(
+      keys.map(k => [k.name, k.accepts_string, k.function]),
+      [
+        ['id', true, false],
+        ['run', false, true],
+        ['retries', false, false],
+      ]
+    );
+  });
+
+  it('cuts signatures before names when the cap is reached, and counts what it cut', async () => {
+    const full = (await surface(['fixture-socket'])).surfaces[0];
+    const capped = (await surface(['fixture-socket'], { max_entries: 12 })).surfaces[0];
+    assert.ok(capped.truncated > 0, 'nothing was cut');
+    // Every export and every member name is still there.
+    assert.deepStrictEqual(capped.exports.map(e => e.export), full.exports.map(e => e.export));
+    const names = (s: typeof full) => s.exports.flatMap(e => e.receivers.flatMap(r => r.members.map(m => `${e.export}.${r.receiver}.${m.name}`)));
+    assert.deepStrictEqual(names(capped), names(full));
   });
 });
