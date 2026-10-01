@@ -122,6 +122,7 @@ jobs:
           --test scan_durability_test
           --test scan_timing_lines_test
           --test service_derivation_test
+          --test shadowed_binding_test
           --test sidecar_integration_test
           --test socket_class_field_test
           --test socket_extraction_test
