@@ -530,6 +530,8 @@ export class LibraryClaimsVerifier {
         }
         const receivers = readMessageReceivers(index, exportRead.value);
         if ('reason' in receivers) return { outcome: unchecked(receivers.reason) };
+        // No receiver would verify every claim vacuously.
+        if (receivers.value.length === 0) return { outcome: unchecked('maker_unresolved') };
         const holding: ts.Signature[] = [];
         for (const receiver of receivers.value) {
           const result = reader.judgeMessage(receiver, check.claim);

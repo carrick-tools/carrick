@@ -124,10 +124,19 @@ export declare function createBus(): EventEmitter;
 const BASE_EMITTER = `export declare class Emitter {
   send(topic: string, payload: unknown): void;
 }
+export declare class Holder<F> {
+  send: F;
+}
 `;
-const DERIVED = `import { Emitter } from '@fixture/base-emitter';
+const DERIVED = `import { Emitter, Holder } from '@fixture/base-emitter';
 export declare class Relay extends Emitter {
   forward(topic: string, payload: unknown): void;
+}
+// The member is the base's; only its signature is written here.
+export declare class GenericRelay extends Holder<(topic: string, payload: unknown) => void> {}
+// The member is written here; its signature is the base's.
+export declare class Proxy {
+  relay: Emitter['send'];
 }
 `;
 
@@ -449,12 +458,27 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
 
   it("refuses a member only inherited from another package's base class", async () => {
     const D = 'fixture-derived';
+    const send = (member: string) => op('send', member, { name: { arg: 0 }, payload: { arg: 1 } });
     const checks = [
       check(D, 'Relay', 'broker', 'export', makes('new', null)),
-      check(D, 'Relay', 'broker', 'instance:new', op('send', 'send', { name: { arg: 0 }, payload: { arg: 1 } })),
-      check(D, 'Relay', 'broker', 'instance:new', op('send', 'forward', { name: { arg: 0 }, payload: { arg: 1 } })),
+      check(D, 'Relay', 'broker', 'instance:new', send('send')),
+      check(D, 'Relay', 'broker', 'instance:new', send('forward')),
+      check(D, 'GenericRelay', 'broker', 'export', makes('new', null)),
+      check(D, 'GenericRelay', 'broker', 'instance:new', send('send')),
+      check(D, 'Proxy', 'broker', 'export', makes('new', null)),
+      check(D, 'Proxy', 'broker', 'instance:new', send('relay')),
     ];
-    assert.deepStrictEqual(verdicts(await verify(checks)), ['verified', 'failed member_inherited', 'verified']);
+    assert.deepStrictEqual(verdicts(await verify(checks)), [
+      'verified',
+      'failed member_inherited',
+      'verified',
+      'verified',
+      // Stopped by the member rule alone: the signature is written here.
+      'failed member_inherited',
+      'verified',
+      // Stopped by the signature rule alone: the member is written here.
+      'failed member_inherited',
+    ]);
   });
 
   it("refuses a member only the service's own augmentation adds", async () => {
