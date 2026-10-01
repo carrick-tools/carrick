@@ -34,6 +34,15 @@
 //!   states its row where the member is named.
 //! - **Sub-object hops** (`client.tasks.trigger(…)`) are a member path, not a
 //!   member read that contests the client.
+//! - **Class fields are read wherever the class writes them** (carrick#1665,
+//!   [`field_receivers`]): a field every write in its class sets to an
+//!   instance of one maker, handed the same arguments, is a receiver in each
+//!   instance member, written in a method or not. Anything else that may set
+//!   it (another value, an accessor, a decorator, a parameter property, a
+//!   related class of the file, `this` handed to a call) leaves it no
+//!   receiver, and its uses are its class's and its related classes' alone,
+//!   so a field of the same name in another class of the file is another
+//!   field. HTTP keeps its constructor-only rule.
 //! - **The contest set.** A hand-off, a write, a member read that is not
 //!   called, a spread, a member called by a key the source does not state, a
 //!   namespace import of the module that holds an instance, and loading that
@@ -47,30 +56,31 @@
 //!
 //! Seams left for later tickets:
 //!
-//! - **Class fields** (carrick#1665): a `this.<field>` receiver is produced
-//!   by today's constructor-only rule, tagged [`Holder::Field`], and contested
-//!   with [`Contest::ClassField`] until that ticket's rule replaces it.
-//! - **Value flow** (carrick#1562): [`literal_text`] and
-//!   [`super::Reader::library_receiver`] are the only two places a name or a
-//!   receiver is read. Name builders, names passed as parameters, imported
-//!   constants, own-module factories and injected clients extend those two.
+//! - **Value flow** (carrick#1562): [`literal_text`],
+//!   [`super::Reader::library_receiver`] and
+//!   [`super::Reader::written_instance`] are the only three places a name, a
+//!   receiver or what a class field is set to is read. Name builders, names
+//!   passed as parameters, imported constants, own-module factories (a field
+//!   set by `createRedisClient(…)` or `this.#connect()`) and injected clients
+//!   extend those three.
 //! - **In-repo packages** (carrick#1666): a call the call graph resolves to a
 //!   function of this service is that function's, and is no site here, which
 //!   is where a workspace package's calls go today.
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
+use swc_ecma_visit::{Visit, VisitWith};
 
 use super::{
-    ClientBinding, FnIr, LinkedClients, Reader, RequestSummaryInputs, Scope, Site, field_receiver,
-    member_prop, prop_name,
+    BindingUse, BindingUses, ClassFields, ClientBinding, ClientRef, FileIr, FnIr, LinkedClients,
+    ModuleScope, Reader, RequestSummaryInputs, Scope, Site, member_prop, prop_name, this_field,
 };
-use crate::binding_scope::ident_key;
+use crate::binding_scope::{ident_key, pat_key};
 use crate::graphql_document_sites::unwrap_expression;
 
 /// Whether a maker or a call site calls its callee (`m(…)`) or constructs it
@@ -124,8 +134,9 @@ pub enum Holder {
     /// A module-scope `const`, or an anonymous `export default <maker>`,
     /// read in its own module or in one that imports it (carrick#1568).
     Module,
-    /// A class field (`this.<field>`), by today's constructor-only rule. Not
-    /// read for message roles until carrick#1665.
+    /// A class field (`this.<field>`) every write in its class sets to one
+    /// maker's instance, read in the class's instance members
+    /// (carrick#1665, [`field_receivers`]).
     Field,
 }
 
@@ -207,8 +218,6 @@ pub enum MemberWire {
 /// say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Contest {
-    /// A class-field receiver, read once carrick#1665 lands.
-    ClassField,
     /// The receiver is used other than to call or construct through it, in
     /// any module that reaches it ([`LibrarySite::contested`]).
     Used,
@@ -313,11 +322,6 @@ impl LibrarySite {
     /// that can change a name, a prefix or a base contests, and so does one
     /// the package's surface does not list: nothing says it cannot.
     pub fn contest(&self, classify: impl Fn(&str, &MemberUse) -> MemberWire) -> Option<Contest> {
-        if let SiteReceiver::Instance(maker) = &self.receiver
-            && maker.holder == Holder::Field
-        {
-            return Some(Contest::ClassField);
-        }
         if self.contested {
             return Some(Contest::Used);
         }
@@ -390,6 +394,7 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
         keys.sort();
         let reader = SiteReader {
             file: path,
+            ir: file,
             clients: &clients,
             inputs,
         };
@@ -411,6 +416,7 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
 
 struct SiteReader<'a> {
     file: &'a Path,
+    ir: &'a FileIr,
     clients: &'a LinkedClients,
     inputs: &'a RequestSummaryInputs,
 }
@@ -425,9 +431,25 @@ impl SiteReader<'_> {
             {
                 continue;
             }
-            let Some((client, declared_in)) = self.clients.client_in_scope(self.file, &site.client)
-            else {
-                continue;
+            let (client, declared_in, holder) = match &site.binding {
+                SiteBinding::Client(binding) => {
+                    let Some((client, declared_in)) =
+                        self.clients.client_in_scope(self.file, binding)
+                    else {
+                        continue;
+                    };
+                    let holder = match &**binding {
+                        ClientBinding::Own(_) => Holder::Local,
+                        ClientBinding::Module(_) | ClientBinding::Imported { .. } => Holder::Module,
+                    };
+                    (client, declared_in, holder)
+                }
+                SiteBinding::Field { class, field } => {
+                    let Some(client) = self.ir.field_receivers.get(&(*class, field.clone())) else {
+                        continue;
+                    };
+                    (client, self.file, Holder::Field)
+                }
             };
             // So is an instance such a call made: what it holds is that
             // function's return, not a package's.
@@ -450,11 +472,7 @@ impl SiteReader<'_> {
                     file: declared_in.to_path_buf(),
                     span_start: instance.site.span_start,
                     line: instance.site.line,
-                    holder: match &site.client {
-                        ClientBinding::Own(_) if site.field => Holder::Field,
-                        ClientBinding::Own(_) => Holder::Local,
-                        ClientBinding::Module(_) | ClientBinding::Imported { .. } => Holder::Module,
-                    },
+                    holder,
                 }),
             };
             out.push(LibrarySite {
@@ -488,18 +506,27 @@ pub(super) struct LibrarySiteIr {
     /// The line of the member named, or of the callee.
     pub(super) op_line: u32,
     pub(super) form: MakerForm,
-    pub(super) client: ClientBinding,
-    /// The receiver is a class field (`this.<field>`).
-    pub(super) field: bool,
+    pub(super) binding: SiteBinding,
     pub(super) path: Vec<String>,
     pub(super) member: Option<String>,
     pub(super) args: Vec<SiteArg>,
 }
 
-/// The receiver a library site names: the binding, whether it is a class
-/// field, the sub-object hops, the member, and the span of the member's name
-/// (or the callee's).
-type LibraryReceiver = (ClientBinding, bool, Vec<String>, Option<String>, Span);
+/// What a library site's receiver is read through.
+#[derive(Debug, Clone)]
+pub(super) enum SiteBinding {
+    /// A binding, by the scope rules an HTTP client's is
+    /// ([`Scope::call_binding`]).
+    Client(Box<ClientBinding>),
+    /// `this.<field>` in an instance member of a class, named by the class's
+    /// span start: what it holds is settled once every member of the class
+    /// is read ([`field_receivers`]).
+    Field { class: u32, field: String },
+}
+
+/// The receiver a library site names: the binding, the sub-object hops, the
+/// member, and the span of the member's name (or the callee's).
+type LibraryReceiver = (SiteBinding, Vec<String>, Option<String>, Span);
 
 impl Reader<'_> {
     /// The library site a call or a `new` writes, when its callee names a
@@ -516,13 +543,12 @@ impl Reader<'_> {
         if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        let (client, field, path, member, named) = self.library_receiver(callee, scope)?;
+        let (binding, path, member, named) = self.library_receiver(callee, scope)?;
         Some(LibrarySiteIr {
             site: self.site(span),
             op_line: self.line(named),
             form,
-            client,
-            field,
+            binding,
             path,
             member,
             args: args.iter().map(|arg| site_arg(&arg.expr, scope)).collect(),
@@ -532,7 +558,8 @@ impl Reader<'_> {
     /// The client a library site's callee names, by the same scope rules as
     /// an HTTP client's ([`Scope::call_binding`]): `client(…)`,
     /// `client.member(…)`, `client.a.b.member(…)`, and the same on a class
-    /// field. Every hop is a plain name; anything computed is no site.
+    /// field ([`field_binding`]). Every hop is a plain name; anything
+    /// computed is no site.
     ///
     /// The one place a library receiver is identified: value flow
     /// (carrick#1562) extends it, never a second resolver.
@@ -541,8 +568,7 @@ impl Reader<'_> {
         let outer = match callee {
             Expr::Ident(ident) => {
                 return Some((
-                    scope.call_binding(ident)?,
-                    false,
+                    SiteBinding::Client(Box::new(scope.call_binding(ident)?)),
                     Vec::new(),
                     None,
                     ident.span,
@@ -552,10 +578,8 @@ impl Reader<'_> {
             _ => return None,
         };
         if let Expr::This(_) = &*outer.obj {
-            let client = field_receiver(outer, scope)?.clone();
             return Some((
-                ClientBinding::Own(client),
-                true,
+                field_binding(outer, scope)?,
                 Vec::new(),
                 None,
                 outer.prop.span(),
@@ -569,12 +593,12 @@ impl Reader<'_> {
             match obj {
                 Expr::Ident(ident) => {
                     path.reverse();
-                    return Some((scope.call_binding(ident)?, false, path, Some(member), named));
+                    let binding = SiteBinding::Client(Box::new(scope.call_binding(ident)?));
+                    return Some((binding, path, Some(member), named));
                 }
                 Expr::Member(inner) if matches!(&*inner.obj, Expr::This(_)) => {
                     path.reverse();
-                    let client = field_receiver(inner, scope)?.clone();
-                    return Some((ClientBinding::Own(client), true, path, Some(member), named));
+                    return Some((field_binding(inner, scope)?, path, Some(member), named));
                 }
                 Expr::Member(inner) => {
                     path.push(member_prop(inner)?);
@@ -587,6 +611,610 @@ impl Reader<'_> {
 
     pub(super) fn line(&self, span: Span) -> u32 {
         self.source_map.lookup_char_pos(span.lo).line as u32
+    }
+
+    /// The instance a write to a class field sets, when the source states
+    /// one: a maker call on a package export ([`Reader::factory_call`]).
+    ///
+    /// The one place what a field is set to is read: value flow
+    /// (carrick#1562) extends it to an own-module factory
+    /// (`this.redis = createRedisClient(…)`) and an injected client.
+    fn written_instance(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+        self.factory_call(expr, scope)
+    }
+
+    /// The maker write `this.<field> = <maker>(…)` an assignment is, in an
+    /// instance member of a class (where the class's field table is in
+    /// scope, so `this` is the instance). Only `=` sets the field to the
+    /// value written.
+    pub(super) fn field_write(
+        &self,
+        assign: &AssignExpr,
+        scope: &Scope<'_>,
+    ) -> Option<FieldWriteIr> {
+        if scope.fields.is_none() || assign.op != AssignOp::Assign {
+            return None;
+        }
+        let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left else {
+            return None;
+        };
+        if !is_this(&member.obj) {
+            return None;
+        }
+        Some(FieldWriteIr {
+            field: written_field(&member.prop)?,
+            at: assign.span.lo.0,
+            client: self.written_instance(&assign.right, scope)?,
+        })
+    }
+
+    /// The maker writes a class's instance property initialisers and its
+    /// constructor make, each read in its own scope: an initialiser in the
+    /// module's, the constructor's statements in the constructor's.
+    pub(super) fn initialiser_and_constructor_writes(
+        &self,
+        class: &Class,
+        fields: &ClassFields,
+        module: &ModuleScope,
+    ) -> Vec<FieldWriteIr> {
+        let mut writes = Vec::new();
+        for member in &class.body {
+            let (field, init, at) = match member {
+                ClassMember::ClassProp(prop) if !prop.is_static => {
+                    (prop_name(&prop.key), prop.value.as_deref(), prop.span.lo.0)
+                }
+                ClassMember::PrivateProp(prop) if !prop.is_static => (
+                    Some(format!("#{}", prop.key.name)),
+                    prop.value.as_deref(),
+                    prop.span.lo.0,
+                ),
+                ClassMember::Constructor(ctor) => {
+                    if let Some(body) = &ctor.body {
+                        let mut scope = Scope::module(module);
+                        scope.params = ctor.params.iter().map(constructor_param).collect();
+                        scope.fields = Some(fields);
+                        let mut ir = FnIr::default();
+                        self.body(&body.stmts, &mut scope, &mut ir);
+                        take_field_writes(&mut ir, &mut writes);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if let (Some(field), Some(init)) = (field, init)
+                && let Some(client) = self.written_instance(init, &Scope::module(module))
+            {
+                writes.push(FieldWriteIr { field, at, client });
+            }
+        }
+        writes
+    }
+}
+
+/// The binding a constructor parameter introduces: a parameter property's
+/// is its name.
+fn constructor_param(param: &ParamOrTsParamProp) -> Option<crate::binding_scope::BindingKey> {
+    match param {
+        ParamOrTsParamProp::Param(param) => pat_key(&param.pat),
+        ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
+            TsParamPropParam::Ident(ident) => Some(ident_key(&ident.id)),
+            TsParamPropParam::Assign(assign) => pat_key(&assign.left),
+        },
+    }
+}
+
+/// The field `this.<field>` names, in an instance member of a class, where
+/// the class's field table is in scope. In a static member, or a function
+/// that binds its own `this`, no field of the class is.
+fn field_binding(member: &MemberExpr, scope: &Scope<'_>) -> Option<SiteBinding> {
+    Some(SiteBinding::Field {
+        class: scope.fields?.class,
+        field: this_field(member)?,
+    })
+}
+
+/// A write `this.<field> = <maker>(…)` an instance member makes
+/// (carrick#1665): the field, where the assignment starts (discovery
+/// numbering, the key [`ClassThis::writes`] holds it by), and the instance it
+/// sets.
+#[derive(Debug, Clone)]
+pub(super) struct FieldWriteIr {
+    field: String,
+    at: u32,
+    client: ClientRef,
+}
+
+/// Move every maker write out of a function body and those written inside it.
+pub(super) fn take_field_writes(ir: &mut FnIr, out: &mut Vec<FieldWriteIr>) {
+    out.append(&mut ir.field_writes);
+    for nested in ir.nested.iter_mut().chain(ir.detached.iter_mut()) {
+        take_field_writes(nested, out);
+    }
+}
+
+/// The fields of the class `name` that hold one maker's instance
+/// (carrick#1665), given the maker writes its members make (`writes`).
+///
+/// A field is one when every write to it in the class is one of `writes`
+/// and they all build an instance of one maker of one export, handed the
+/// same arguments; when nothing else may set it (an accessor of its name, a
+/// decorator, a parameter property); when no class of the file that it
+/// extends, or that extends it, writes or declares it; and when neither the
+/// class nor those let `this` escape ([`ClassThis::escapes`]). The instance
+/// is the first write's, used as the class and those classes use the field.
+pub(super) fn field_receivers(
+    name: &str,
+    classes: &HashMap<String, ClassThis>,
+    writes: Vec<FieldWriteIr>,
+) -> HashMap<String, ClientRef> {
+    let mut out = HashMap::new();
+    let Some(own) = classes.get(name) else {
+        return out;
+    };
+    let related = relatives(name, classes);
+    if own.escapes || related.iter().any(|class| class.escapes) {
+        return out;
+    }
+    let mut by_field: BTreeMap<String, Vec<FieldWriteIr>> = BTreeMap::new();
+    for write in writes {
+        by_field.entry(write.field.clone()).or_default().push(write);
+    }
+    for (field, mut made) in by_field {
+        let made_at: BTreeSet<u32> = made.iter().map(|write| write.at).collect();
+        if own.writes.get(&field) != Some(&made_at)
+            || own.opaque.contains(&field)
+            || related.iter().any(|class| class.sets(&field))
+        {
+            continue;
+        }
+        made.sort_by_key(|write| write.at);
+        let first = &made[0].client;
+        if !made.iter().all(|write| same_maker(&write.client, first)) {
+            continue;
+        }
+        let key = format!("this.{field}");
+        let mut used = BindingUse::default();
+        for class in std::iter::once(own).chain(related.iter().copied()) {
+            if let Some(uses) = class.uses.get(&key) {
+                used.merge(uses);
+            }
+        }
+        out.insert(field, first.clone().used_as(&used));
+    }
+    out
+}
+
+/// Whether two instances are one maker's, handed the same arguments.
+fn same_maker(a: &ClientRef, b: &ClientRef) -> bool {
+    a.package == b.package
+        && a.export == b.export
+        && match (&a.instance, &b.instance) {
+            (Some(a), Some(b)) => a.form == b.form && a.member == b.member && a.args == b.args,
+            _ => false,
+        }
+}
+
+/// Every class of the file `name` extends, directly or through another, and
+/// every class that extends it so: on an instance of either, a field of one
+/// is a field of the other.
+fn relatives<'c>(name: &str, classes: &'c HashMap<String, ClassThis>) -> Vec<&'c ClassThis> {
+    let up = ancestors(name, classes);
+    let mut names: BTreeSet<&str> = up.iter().copied().collect();
+    for other in classes.keys() {
+        if ancestors(other, classes).contains(name) {
+            names.insert(other);
+        }
+    }
+    names.remove(name);
+    names.iter().filter_map(|name| classes.get(*name)).collect()
+}
+
+/// The names `name` extends, directly or through a class of the file.
+fn ancestors<'c>(name: &str, classes: &'c HashMap<String, ClassThis>) -> BTreeSet<&'c str> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut next: Vec<&str> = classes
+        .get(name)
+        .map(|class| class.extends.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    while let Some(base) = next.pop() {
+        if seen.insert(base)
+            && let Some(class) = classes.get(base)
+        {
+            next.extend(class.extends.iter().map(String::as_str));
+        }
+    }
+    seen
+}
+
+/// What one class does with `this` (carrick#1665): every write to a field
+/// of it, the fields something other than a write may set, whether `this`
+/// escapes, and how each field is used. Read over the whole class body,
+/// static members and the functions written in it included, so a write
+/// where `this` may not be the instance counts as one that may be.
+#[derive(Debug, Default)]
+pub(super) struct ClassThis {
+    /// The classes it extends, by name.
+    extends: BTreeSet<String>,
+    /// Each field written, with where every write starts (discovery
+    /// numbering): an assignment, an update, a `delete`, a destructuring
+    /// target, or an instance property's initialiser (the property's start).
+    writes: HashMap<String, BTreeSet<u32>>,
+    /// Instance properties declared with no value: a class that extends
+    /// another and declares one again replaces the field.
+    declared: HashSet<String>,
+    /// Fields something other than a write in the source may set: a
+    /// decorated property, a constructor's parameter property, an accessor
+    /// of that name.
+    opaque: HashSet<String>,
+    /// `this` is handed to a call or a construction, aliased, destructured,
+    /// spread, or read or written by a computed key, or a member is named by
+    /// one: any field may hold anything, and a use of one may be unseen.
+    /// Returned, or put in an object or an array, it leaves the class as
+    /// `new` hands it out, which is not followed for any holder.
+    escapes: bool,
+    /// How the class uses each field, keyed `this.<field>` ([`BindingUses`]).
+    uses: HashMap<String, BindingUse>,
+}
+
+impl ClassThis {
+    /// What `class` does with `this`.
+    fn of(class: &Class) -> Self {
+        let mut facts = ClassThis::default();
+        if let Some(Expr::Ident(base)) = class.super_class.as_deref().map(unwrap_expression) {
+            facts.extends.insert(base.sym.to_string());
+        }
+        for member in &class.body {
+            match member {
+                ClassMember::ClassProp(prop) if !prop.is_static && !prop.declare => {
+                    match prop_name(&prop.key) {
+                        Some(name) => facts.property(name, prop.decorators.is_empty(), prop),
+                        None => facts.escapes = true,
+                    }
+                }
+                ClassMember::PrivateProp(prop) if !prop.is_static => {
+                    let name = format!("#{}", prop.key.name);
+                    if !prop.decorators.is_empty() {
+                        facts.opaque.insert(name);
+                    } else if prop.value.is_some() {
+                        facts.write(name, prop.span.lo.0);
+                    } else {
+                        facts.declared.insert(name);
+                    }
+                }
+                ClassMember::Constructor(ctor) => {
+                    for param in &ctor.params {
+                        if let ParamOrTsParamProp::TsParamProp(prop) = param {
+                            let name = match &prop.param {
+                                TsParamPropParam::Ident(ident) => Some(&ident.id),
+                                TsParamPropParam::Assign(assign) => {
+                                    assign.left.as_ident().map(|binding| &binding.id)
+                                }
+                            };
+                            match name {
+                                Some(ident) => {
+                                    facts.opaque.insert(ident.sym.to_string());
+                                }
+                                None => facts.escapes = true,
+                            }
+                        }
+                    }
+                }
+                ClassMember::Method(method)
+                    if !method.is_static
+                        && matches!(method.kind, MethodKind::Getter | MethodKind::Setter) =>
+                {
+                    match prop_name(&method.key) {
+                        Some(name) => {
+                            facts.opaque.insert(name);
+                        }
+                        None => facts.escapes = true,
+                    }
+                }
+                ClassMember::PrivateMethod(method)
+                    if !method.is_static
+                        && matches!(method.kind, MethodKind::Getter | MethodKind::Setter) =>
+                {
+                    facts.opaque.insert(format!("#{}", method.key.name));
+                }
+                ClassMember::AutoAccessor(accessor) if !accessor.is_static => match &accessor.key {
+                    Key::Private(private) => {
+                        facts.opaque.insert(format!("#{}", private.name));
+                    }
+                    Key::Public(key) => match prop_name(key) {
+                        Some(name) => {
+                            facts.opaque.insert(name);
+                        }
+                        None => facts.escapes = true,
+                    },
+                },
+                _ => {}
+            }
+        }
+        class.body.visit_with(&mut ThisWalker { facts: &mut facts });
+        let mut uses = BindingUses::default();
+        class.body.visit_with(&mut uses);
+        facts.uses = uses
+            .uses
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("this."))
+            .collect();
+        facts
+    }
+
+    /// A public instance property: decorated (set by whatever the decorator
+    /// installs), initialised, or declared.
+    fn property(&mut self, name: String, undecorated: bool, prop: &ClassProp) {
+        if !undecorated {
+            self.opaque.insert(name);
+        } else if prop.value.is_some() {
+            self.write(name, prop.span.lo.0);
+        } else {
+            self.declared.insert(name);
+        }
+    }
+
+    fn write(&mut self, field: String, at: u32) {
+        self.writes.entry(field).or_default().insert(at);
+    }
+
+    /// Whether the class writes or declares `field`, or may set it unseen.
+    fn sets(&self, field: &str) -> bool {
+        self.writes.contains_key(field)
+            || self.declared.contains(field)
+            || self.opaque.contains(field)
+    }
+
+    /// Another class of the same name, read as this one.
+    fn merge(&mut self, other: ClassThis) {
+        self.extends.extend(other.extends);
+        for (field, at) in other.writes {
+            self.writes.entry(field).or_default().extend(at);
+        }
+        self.declared.extend(other.declared);
+        self.opaque.extend(other.opaque);
+        self.escapes |= other.escapes;
+        for (key, used) in other.uses {
+            self.uses.entry(key).or_default().merge(&used);
+        }
+    }
+}
+
+/// Every class this file declares by name ([`ClassThis`]). Two classes of
+/// one name read as one, so each one's writes and uses count against the
+/// other's fields.
+pub(super) fn class_this(module: &Module) -> HashMap<String, ClassThis> {
+    #[derive(Default)]
+    struct Classes {
+        found: HashMap<String, ClassThis>,
+    }
+    impl Visit for Classes {
+        fn visit_class_decl(&mut self, decl: &ClassDecl) {
+            self.found
+                .entry(decl.ident.sym.to_string())
+                .or_default()
+                .merge(ClassThis::of(&decl.class));
+            decl.visit_children_with(self);
+        }
+        fn visit_class_expr(&mut self, expr: &ClassExpr) {
+            if let Some(ident) = &expr.ident {
+                self.found
+                    .entry(ident.sym.to_string())
+                    .or_default()
+                    .merge(ClassThis::of(&expr.class));
+            }
+            expr.visit_children_with(self);
+        }
+    }
+    let mut classes = Classes::default();
+    module.visit_with(&mut classes);
+    classes.found
+}
+
+/// The writes to fields of `this` in a class body, and the ways `this` leaves
+/// it other than as a value ([`ClassThis::escapes`]).
+struct ThisWalker<'f> {
+    facts: &'f mut ClassThis,
+}
+
+impl ThisWalker<'_> {
+    /// A write at `at` to the member `target` of `this`.
+    fn write(&mut self, target: &MemberExpr, at: u32) {
+        match written_field(&target.prop) {
+            Some(field) => self.facts.write(field, at),
+            None => self.facts.escapes = true,
+        }
+        if let MemberProp::Computed(key) = &target.prop {
+            key.expr.visit_with(self);
+        }
+    }
+}
+
+impl Visit for ThisWalker<'_> {
+    fn visit_ts_type(&mut self, _: &TsType) {}
+
+    /// `this` anywhere no visit below keeps it from: handed on.
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::This(_) = expr {
+            self.facts.escapes = true;
+            return;
+        }
+        expr.visit_children_with(self);
+    }
+
+    /// `this.field` names a field; `this[key]` may name any.
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if !is_this(&member.obj) {
+            member.visit_children_with(self);
+            return;
+        }
+        if let MemberProp::Computed(key) = &member.prop {
+            self.facts.escapes = true;
+            key.expr.visit_with(self);
+        }
+    }
+
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        match &assign.left {
+            AssignTarget::Simple(target) => match simple_member(target) {
+                Some(member) if is_this(&member.obj) => self.write(member, assign.span.lo.0),
+                _ => match target {
+                    SimpleAssignTarget::SuperProp(sup) => match &sup.prop {
+                        SuperProp::Ident(ident) => {
+                            self.facts.write(ident.sym.to_string(), assign.span.lo.0);
+                        }
+                        SuperProp::Computed(_) => self.facts.escapes = true,
+                    },
+                    other => other.visit_with(self),
+                },
+            },
+            AssignTarget::Pat(pat) => pat.visit_with(self),
+        }
+        assign.right.visit_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        match unwrap_expression(&update.arg) {
+            Expr::Member(member) if is_this(&member.obj) => self.write(member, update.span.lo.0),
+            _ => update.visit_children_with(self),
+        }
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        match (unary.op, unwrap_expression(&unary.arg)) {
+            (UnaryOp::Delete, Expr::Member(member)) if is_this(&member.obj) => {
+                self.write(member, unary.span.lo.0);
+            }
+            // Read, and nothing of it kept.
+            (UnaryOp::TypeOf | UnaryOp::Bang | UnaryOp::Void, Expr::This(_)) => {}
+            _ => unary.visit_children_with(self),
+        }
+    }
+
+    /// A member of `this` as a destructuring or loop target is written.
+    fn visit_pat(&mut self, pat: &Pat) {
+        if let Pat::Expr(expr) = pat
+            && let Expr::Member(member) = unwrap_expression(expr)
+            && is_this(&member.obj)
+        {
+            self.write(member, expr.span().lo.0);
+            return;
+        }
+        pat.visit_children_with(self);
+    }
+
+    /// `this` handed to a call may be written by it (`Object.assign(this,
+    /// options)`), unless it binds one of the class's own methods to it.
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        call.callee.visit_with(self);
+        let binds_own = matches!(&call.callee, Callee::Expr(callee) if binds_own_method(callee));
+        for (index, arg) in call.args.iter().enumerate() {
+            if index == 0 && binds_own && arg.spread.is_none() && is_this(&arg.expr) {
+                continue;
+            }
+            arg.visit_with(self);
+        }
+    }
+
+    /// `new this()` constructs, as `new` on the class does.
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        if !is_this(&new.callee) {
+            new.callee.visit_with(self);
+        }
+        new.args.visit_with(self);
+    }
+
+    fn visit_bin_expr(&mut self, bin: &BinExpr) {
+        let compares = matches!(
+            bin.op,
+            BinaryOp::InstanceOf
+                | BinaryOp::EqEq
+                | BinaryOp::NotEq
+                | BinaryOp::EqEqEq
+                | BinaryOp::NotEqEq
+        );
+        for side in [&bin.left, &bin.right] {
+            if !(compares && is_this(side)) {
+                side.visit_with(self);
+            }
+        }
+    }
+
+    fn visit_return_stmt(&mut self, ret: &ReturnStmt) {
+        match &ret.arg {
+            Some(arg) if is_this(arg) => {}
+            _ => ret.visit_children_with(self),
+        }
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        arrow.params.visit_with(self);
+        match &*arrow.body {
+            BlockStmtOrExpr::Expr(body) if is_this(body) => {}
+            body => body.visit_with(self),
+        }
+    }
+
+    fn visit_key_value_prop(&mut self, prop: &KeyValueProp) {
+        prop.key.visit_with(self);
+        if !is_this(&prop.value) {
+            prop.value.visit_with(self);
+        }
+    }
+
+    fn visit_array_lit(&mut self, array: &ArrayLit) {
+        for element in array.elems.iter().flatten() {
+            if element.spread.is_none() && is_this(&element.expr) {
+                continue;
+            }
+            element.visit_with(self);
+        }
+    }
+}
+
+fn is_this(expr: &Expr) -> bool {
+    matches!(unwrap_expression(expr), Expr::This(_))
+}
+
+/// `this.method.bind(…)`, `.call(…)` or `.apply(…)`: one of the class's own
+/// methods, whose writes are the class's.
+fn binds_own_method(callee: &Expr) -> bool {
+    let Expr::Member(outer) = unwrap_expression(callee) else {
+        return false;
+    };
+    matches!(
+        member_prop(outer).as_deref(),
+        Some("bind" | "call" | "apply")
+    ) && matches!(unwrap_expression(&outer.obj), Expr::Member(inner) if is_this(&inner.obj))
+}
+
+/// The member an assignment target is, through any parentheses or type
+/// assertion around it.
+fn simple_member(target: &SimpleAssignTarget) -> Option<&MemberExpr> {
+    let inner = match target {
+        SimpleAssignTarget::Member(member) => return Some(member),
+        SimpleAssignTarget::Paren(paren) => &paren.expr,
+        SimpleAssignTarget::TsAs(cast) => &cast.expr,
+        SimpleAssignTarget::TsSatisfies(cast) => &cast.expr,
+        SimpleAssignTarget::TsNonNull(cast) => &cast.expr,
+        SimpleAssignTarget::TsTypeAssertion(cast) => &cast.expr,
+        _ => return None,
+    };
+    match unwrap_expression(inner) {
+        Expr::Member(member) => Some(member),
+        _ => None,
+    }
+}
+
+/// The field a written member of `this` names: a name, a private name, or a
+/// string key. `None`: a key the source does not state.
+fn written_field(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
+        MemberProp::Computed(key) => match unwrap_expression(&key.expr) {
+            Expr::Lit(Lit::Str(text)) => Some(text.value.to_string()),
+            _ => None,
+        },
     }
 }
 
@@ -1229,10 +1857,10 @@ mod tests {
         assert_eq!(in_tasks, vec![(5, None), (6, Some("add"))], "{sites:#?}");
     }
 
-    /// Who holds an instance: a function's own `const` is read, and a class
-    /// field waits for carrick#1665.
+    /// Who holds an instance: a function's own `const`, and a class field
+    /// whose initialiser is the maker.
     #[test]
-    fn a_local_instance_is_read_and_a_class_field_waits_for_its_own_rule() {
+    fn a_local_instance_and_an_initialised_field_are_read() {
         let sites = sites_of(&[(
             "src/mail.ts",
             "import { Queue } from \"@fixture/queue\";\n\
@@ -1249,7 +1877,331 @@ mod tests {
         assert_eq!(maker(local).holder, Holder::Local);
         assert_eq!(local.contest(on_wire), None);
         let field = site(&sites, "src/mail.ts", 8, Some("add"));
+        assert_eq!(field.receiver_id(), "instance:new");
         assert_eq!(maker(field).holder, Holder::Field);
-        assert_eq!(field.contest(on_wire), Some(Contest::ClassField));
+        assert_eq!(maker(field).line, 7);
+        assert_eq!(maker(field).args[0].text.as_deref(), Some("emails"));
+        assert_eq!(field.contest(on_wire), None);
+    }
+
+    /// The service the class-field tests read: `body` is a class (or
+    /// classes) written after one import of each export.
+    fn class_sites(body: &str) -> Vec<LibrarySite> {
+        let source = format!(
+            "import {{ Queue, Worker }} from \"@fixture/queue\";\n\
+             import {{ register }} from \"./registry\";\n\
+             {body}"
+        );
+        sites_of(&[
+            ("src/mail.ts", source.as_str()),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+        ])
+    }
+
+    /// The `add` site on `line` of a [`class_sites`] service, if there is one.
+    fn add_at(sites: &[LibrarySite], line: u32) -> Option<&LibrarySite> {
+        sites.iter().find(|site| {
+            site.file.ends_with("src/mail.ts")
+                && site.line == line
+                && site.member.as_deref() == Some("add")
+        })
+    }
+
+    /// A field is a receiver wherever its class writes it (carrick#1665):
+    /// in a method, behind a guard, in the constructor and a method alike,
+    /// so long as every write sets an instance of one maker with the same
+    /// arguments. Each write's arguments are read in its own scope, and the
+    /// instance is the first write's.
+    #[test]
+    fn a_field_every_write_sets_to_one_maker_is_a_receiver_in_any_method() {
+        let sites = class_sites(
+            "export class Starter {\n\
+             \x20 private q?: Queue;\n\
+             \x20 async start() {\n\
+             \x20   const name = \"emails\";\n\
+             \x20   this.q = new Queue(name);\n\
+             \x20 }\n\
+             \x20 async send(to: string) { await this.q.add(\"welcome\", { to }); }\n\
+             }\n\
+             export class Lazy {\n\
+             \x20 private q: Queue | undefined;\n\
+             \x20 constructor() { this.q = new Queue(\"jobs\"); }\n\
+             \x20 reset() {\n\
+             \x20   if (!this.q) {\n\
+             \x20     this.q = new Queue(\"jobs\");\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 send() { return this.q.add(\"tick\", {}); }\n\
+             }\n\
+             export class Held {\n\
+             \x20 #q = new Queue(\"held\");\n\
+             \x20 send() { return this.#q.add(\"ping\", {}); }\n\
+             }\n",
+        );
+
+        let in_method = add_at(&sites, 9).expect("a field written in a method");
+        assert_eq!(in_method.receiver_id(), "instance:new");
+        assert_eq!(maker(in_method).holder, Holder::Field);
+        assert_eq!(maker(in_method).line, 7);
+        assert_eq!(maker(in_method).args[0].text.as_deref(), Some("emails"));
+        assert_eq!(in_method.literal(0, None), Some("welcome"));
+        assert_eq!(in_method.contest(on_wire), None);
+
+        let guarded = add_at(&sites, 19).expect("a field the class writes twice");
+        assert_eq!(maker(guarded).line, 13, "the first write's instance");
+        assert_eq!(maker(guarded).args[0].text.as_deref(), Some("jobs"));
+        assert_eq!(
+            guarded.contest(on_wire),
+            None,
+            "a truthiness test changes nothing"
+        );
+
+        let private = add_at(&sites, 23).expect("a private field");
+        assert_eq!(maker(private).args[0].text.as_deref(), Some("held"));
+        assert_eq!(private.contest(on_wire), None);
+    }
+
+    /// A field is no receiver when anything but one maker's instance may be
+    /// in it: another maker, the same maker handed other arguments, a
+    /// parameter, a write by any operator but `=`, a write where `this` is
+    /// not the instance read here, a related class's write or declaration, a
+    /// decorator, an accessor, or `this` handed on, aliased, spread or
+    /// written by a computed key. A static member reads no instance field.
+    #[test]
+    fn a_field_anything_else_may_write_is_no_receiver() {
+        let control = class_sites(
+            "export class Mailer {\n\
+             \x20 private q: Queue;\n\
+             \x20 start() { this.q = new Queue(\"emails\"); }\n\
+             \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+             }\n",
+        );
+        assert!(add_at(&control, 6).is_some(), "control: {control:#?}");
+
+        for (case, class) in [
+            (
+                "two makers",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 swap() { this.q = new Worker(\"emails\"); }\n\
+                 }\n",
+            ),
+            (
+                "one maker handed other arguments",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 swap() { this.q = new Queue(\"other\"); }\n\
+                 }\n",
+            ),
+            (
+                "a parameter",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 use(q: Queue) { this.q = q; }\n\
+                 }\n",
+            ),
+            (
+                "a parameter property",
+                "export class Mailer {\n\
+                 \x20 constructor(private q: Queue) {}\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "a logical assignment",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q ??= new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "a function expression's this",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { setTimeout(function () { this.q = new Queue(\"emails\"); }); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "a setter's write",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 \x20 set name(value: string) { this.q = new Queue(value); }\n\
+                 }\n",
+            ),
+            (
+                "a subclass that declares it again",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n\
+                 export class Special extends Mailer { q = new Queue(\"special\"); }\n",
+            ),
+            (
+                "a base class that writes it",
+                "class Base { reset() { (this as any).q = undefined; } } export class Mailer extends Base {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "a decorator",
+                "export class Mailer {\n\
+                 \x20 @inject() private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n\
+                 function inject() { return (target: unknown, key: string) => {}; }\n",
+            ),
+            (
+                "an accessor of the same name",
+                "export class Mailer {\n\
+                 \x20 set q(value: Queue) {}\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "this handed to a call",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start(options: object) { this.q = new Queue(\"emails\"); Object.assign(this, options); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "this aliased",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); const self = this; self.q.setName(\"x\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "this destructured",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); const { q } = this; q.setName(\"x\"); }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "this spread",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start() { this.q = new Queue(\"emails\"); return { ...this }; }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+            (
+                "a computed key",
+                "export class Mailer {\n\
+                 \x20 private q: Queue;\n\
+                 \x20 start(key: string, value: unknown) { this.q = new Queue(\"emails\"); (this as any)[key] = value; }\n\
+                 \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+                 }\n",
+            ),
+        ] {
+            let sites = class_sites(class);
+            assert!(add_at(&sites, 6).is_none(), "{case}: {sites:#?}");
+        }
+
+        let statics = class_sites(
+            "export class Mailer {\n\
+             \x20 private q = new Queue(\"emails\");\n\
+             \x20 static q = new Queue(\"static\");\n\
+             \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+             \x20 static send() { return this.q.add(\"static\", {}); }\n\
+             }\n",
+        );
+        assert_eq!(
+            maker(add_at(&statics, 6).expect("the instance member's call")).args[0]
+                .text
+                .as_deref(),
+            Some("emails")
+        );
+        assert!(
+            add_at(&statics, 7).is_none(),
+            "a static member reads no instance field: {statics:#?}"
+        );
+    }
+
+    /// The instance may leave the class the way `new` hands it out: returned,
+    /// or as a value in an object or an array, or bound to the class's own
+    /// method. A class that does no more than that still reads its field.
+    #[test]
+    fn this_handed_out_as_a_value_or_bound_keeps_the_field() {
+        let sites = class_sites(
+            "export class Mailer {\n\
+             \x20 private q: Queue;\n\
+             \x20 start() { this.q = new Queue(\"emails\"); return this; }\n\
+             \x20 send() { return this.q.add(\"welcome\", { by: this, all: [this] }); }\n\
+             \x20 listen(on: (f: () => void) => void) { on(this.stop.bind(this)); }\n\
+             \x20 stop() { return this === undefined; }\n\
+             }\n",
+        );
+        let add = add_at(&sites, 6).expect("the field is read");
+        assert_eq!(add.contest(on_wire), None);
+    }
+
+    /// A field's uses are its class's: a hand-off or a member read in the
+    /// class, or in a class of the file that extends it, contests it, and
+    /// the same field name in an unrelated class of the file is another
+    /// field (the F1 finding of the carrick#1626 socket review).
+    #[test]
+    fn a_field_s_uses_are_its_own_class_s() {
+        let sites = class_sites(
+            "export class Mailer {\n\
+             \x20 private q = new Queue(\"emails\");\n\
+             \x20 send() { return this.q.add(\"welcome\", {}); }\n\
+             }\n\
+             export class Jobs {\n\
+             \x20 private q = new Worker(\"jobs\");\n\
+             \x20 send() { register(this.q); return this.q.add(\"tick\", {}); }\n\
+             }\n\
+             export class Reports {\n\
+             \x20 private q = new Queue(\"reports\");\n\
+             \x20 send() { return this.q.add(\"nightly\", {}); }\n\
+             }\n\
+             export class Monthly extends Reports {\n\
+             \x20 peek() { return this.q.defaults; }\n\
+             }\n",
+        );
+
+        let mailer = add_at(&sites, 5).expect("Mailer's field");
+        assert_eq!(mailer.export, "Queue");
+        assert_eq!(maker(mailer).args[0].text.as_deref(), Some("emails"));
+        assert_eq!(
+            mailer.contest(on_wire),
+            None,
+            "another class's hand-off of its own field"
+        );
+
+        let jobs = add_at(&sites, 9).expect("Jobs' field");
+        assert_eq!(jobs.export, "Worker");
+        assert_eq!(maker(jobs).args[0].text.as_deref(), Some("jobs"));
+        assert_eq!(jobs.contest(on_wire), Some(Contest::Used), "a hand-off");
+
+        let reports = add_at(&sites, 13).expect("Reports' field");
+        assert_eq!(
+            reports.contest(on_wire),
+            Some(Contest::Used),
+            "a member read in a subclass"
+        );
     }
 }

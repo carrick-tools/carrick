@@ -137,7 +137,7 @@ use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::is_http_method;
 use crate::visitor::SymbolKind;
 use crate::wrapper_request_shape::{is_request_options, verb_from_callee_property};
-use library_sites::LibrarySiteIr;
+use library_sites::{ClassThis, FieldWriteIr, LibrarySiteIr};
 
 /// One piece of a URL or a body value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -339,6 +339,18 @@ struct ClientRef {
     export_uses: BTreeSet<MemberUse>,
 }
 
+impl ClientRef {
+    /// This client, held by a binding the file uses as `used`.
+    fn used_as(mut self, used: &BindingUse) -> Self {
+        self.contested |= used.contests_client();
+        self.called = used.called.clone();
+        self.called_computed = used.called_computed;
+        self.contested_message |= used.contests_message();
+        self.member_uses = used.member_uses().collect();
+        self
+    }
+}
+
 /// How an instance was made from a package export (carrick#1564,
 /// carrick#1661): called (`export.member(…)`, `export(…)`) or constructed
 /// (`new export(…)`, `new export.member(…)`), with what the maker was handed,
@@ -451,6 +463,10 @@ struct FnIr {
     /// message-role readers (carrick#1661). Kept apart from `calls`, which
     /// the summaries compose: a `new` there would make a body incomplete.
     library: Vec<LibrarySiteIr>,
+    /// The writes `this.<field> = <maker>(…)` an instance member makes, for
+    /// the message-role field rule (carrick#1665). Taken out by the class
+    /// that reads them ([`library_sites::take_field_writes`]).
+    field_writes: Vec<FieldWriteIr>,
     /// Parameters the body calls (`produce()`), by position.
     invoked_params: BTreeSet<usize>,
     /// Function expressions passed as call arguments, referenced from a
@@ -508,6 +524,10 @@ pub struct FileIr {
     /// t = task({ … })`) is one. Read for the message-role readers only
     /// (carrick#1661); the summaries are composed from the functions alone.
     module_level: FnIr,
+    /// Each class field that holds one maker's instance as a message role
+    /// reads it (carrick#1665), keyed by its class (the class's span start)
+    /// and the field. An HTTP reading reads the class's own field table.
+    field_receivers: HashMap<(u32, String), ClientRef>,
 }
 
 impl FileIr {
@@ -571,6 +591,7 @@ pub fn extract_file_ir(
         uses: uses.uses,
         object_consts: object_consts(module),
         subclass_fields: subclass_fields(module),
+        class_this: library_sites::class_this(module),
         declared_below: redeclared_names(module),
     };
     module_scope.receivers = import_receivers(&imports)
@@ -816,6 +837,9 @@ struct ModuleScope {
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
+    /// Class name -> what the class does with `this`, for the message-role
+    /// field rule (carrick#1665).
+    class_this: HashMap<String, ClassThis>,
     /// Every declaration below module scope ([`redeclared_names`]): what a
     /// function, a block or a parameter binds.
     declared_below: Declarations,
@@ -824,15 +848,11 @@ struct ModuleScope {
 impl ModuleScope {
     /// `client`, contested when the file uses `binding` other than to call
     /// through it or export it (carrick#1564 re-review, R6).
-    fn with_uses(&self, mut client: ClientRef, binding: &str) -> ClientRef {
-        if let Some(used) = self.uses.get(binding) {
-            client.contested |= used.contests_client();
-            client.called = used.called.clone();
-            client.called_computed = used.called_computed;
-            client.contested_message |= used.contests_message();
-            client.member_uses = used.member_uses().collect();
+    fn with_uses(&self, client: ClientRef, binding: &str) -> ClientRef {
+        match self.uses.get(binding) {
+            Some(used) => client.used_as(used),
+            None => client,
         }
-        client
     }
 
     /// Whether the file writes through `name` (`name.key = …`, `delete
@@ -879,6 +899,11 @@ struct BindingUse {
     /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
     /// use, which keeps an import at run time, that changes nothing.
     read: bool,
+    /// Tested for truth: the whole test of an `if`, a loop or a conditional,
+    /// or the operand of `!` (`if (!this.client)`). A message role reads it
+    /// as [`Self::read`] (carrick#1665); before, it was the operand it is to
+    /// an HTTP reading, which still contests on it.
+    tested: bool,
     /// Calls through a sub-object of it (`client.tasks.trigger(…)`, every hop
     /// a plain name) and constructions of it or of a member (`new Queue(…)`,
     /// `new lib.Worker(…)`), as the message roles read them (carrick#1661).
@@ -894,12 +919,14 @@ impl BindingUse {
     ///
     /// A call through a sub-object and a construction contest exactly as
     /// the member read and the operand they were recorded as before
-    /// carrick#1661.
+    /// carrick#1661, and a truthiness test as the operand it was before
+    /// carrick#1665.
     fn contests_client(&self) -> bool {
         self.written
             || self.member_read
             || self.spread
             || self.other
+            || self.tested
             || !self.library_calls.is_empty()
     }
 
@@ -907,9 +934,26 @@ impl BindingUse {
     /// member read that is not called, a spread, or a member called by a key
     /// the source does not state. Constructing the binding is what a `new`
     /// maker does, and a call through a sub-object is a call; both are among
-    /// [`Self::member_uses`], which the caller classifies.
+    /// [`Self::member_uses`], which the caller classifies. A truthiness test
+    /// keeps nothing of the binding.
     fn contests_message(&self) -> bool {
         self.written || self.member_read || self.spread || self.other || self.called_computed
+    }
+
+    /// Every use of `other` added to these (one class's uses of a field and
+    /// a related class's, carrick#1665).
+    fn merge(&mut self, other: &BindingUse) {
+        self.called.extend(other.called.iter().cloned());
+        self.called_computed |= other.called_computed;
+        self.written |= other.written;
+        self.member_read |= other.member_read;
+        self.spread |= other.spread;
+        self.other |= other.other;
+        self.exported |= other.exported;
+        self.read |= other.read;
+        self.tested |= other.tested;
+        self.library_calls
+            .extend(other.library_calls.iter().cloned());
     }
 
     /// Every member called or constructed through the binding.
@@ -926,11 +970,12 @@ impl BindingUse {
 
     /// An object constant never written through, passed to a call or
     /// aliased holds exactly the keys its literal writes. Constructing the
-    /// binding itself was an operand use before carrick#1661, and counts as
-    /// one here.
+    /// binding itself was an operand use before carrick#1661, and so was a
+    /// truthiness test before carrick#1665; each counts as one here.
     fn keeps_object(&self) -> bool {
         !self.written
             && !self.other
+            && !self.tested
             && !self.library_calls.contains(&MemberUse {
                 form: MakerForm::New,
                 path: Vec::new(),
@@ -1210,7 +1255,42 @@ impl Visit for BindingUses {
             self.compared(&unary.arg);
             return;
         }
+        if unary.op == UnaryOp::Bang {
+            self.tested(&unary.arg);
+            return;
+        }
         unary.arg.visit_with(self);
+    }
+
+    fn visit_if_stmt(&mut self, stmt: &IfStmt) {
+        self.tested(&stmt.test);
+        stmt.cons.visit_with(self);
+        stmt.alt.visit_with(self);
+    }
+
+    fn visit_while_stmt(&mut self, stmt: &WhileStmt) {
+        self.tested(&stmt.test);
+        stmt.body.visit_with(self);
+    }
+
+    fn visit_do_while_stmt(&mut self, stmt: &DoWhileStmt) {
+        stmt.body.visit_with(self);
+        self.tested(&stmt.test);
+    }
+
+    fn visit_for_stmt(&mut self, stmt: &ForStmt) {
+        stmt.init.visit_with(self);
+        if let Some(test) = &stmt.test {
+            self.tested(test);
+        }
+        stmt.update.visit_with(self);
+        stmt.body.visit_with(self);
+    }
+
+    fn visit_cond_expr(&mut self, cond: &CondExpr) {
+        self.tested(&cond.test);
+        cond.cons.visit_with(self);
+        cond.alt.visit_with(self);
     }
 
     /// `e instanceof http.HttpError`, `api === other`: each operand is read
@@ -1333,6 +1413,15 @@ impl BindingUses {
     fn spread(&mut self, expr: &Expr) {
         match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
             Some(key) => self.mark(key, |used| used.spread = true),
+            None => expr.visit_with(self),
+        }
+    }
+
+    /// A test for truth (carrick#1665): a binding that is the whole test is
+    /// [`BindingUse::tested`]; anything else is visited as usual.
+    fn tested(&mut self, expr: &Expr) {
+        match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
+            Some(key) => self.mark(key, |used| used.tested = true),
             None => expr.visit_with(self),
         }
     }
@@ -1543,6 +1632,9 @@ fn subclass_fields(module: &Module) -> HashMap<String, HashSet<String>> {
 /// hold a library client's instance.
 #[derive(Default)]
 struct ClassFields {
+    /// The class's span start: what a message-role field site names its
+    /// class by ([`FileIr::field_receivers`]).
+    class: u32,
     values: HashMap<String, Value>,
     receivers: HashMap<String, ClientRef>,
 }
@@ -2075,14 +2167,19 @@ impl Reader<'_> {
         // In a static member `this` is the class, not an instance: the
         // instance field table says nothing about what it holds.
         let table = |is_static: bool| (!is_static).then_some(&fields);
+        // Every maker write to a field, for the message-role field rule
+        // (carrick#1665): the initialisers' and the constructor's here, each
+        // member's as it is read.
+        let mut field_writes = self.initialiser_and_constructor_writes(class, &fields, module);
         for member in &class.body {
             match member {
                 ClassMember::Method(method) if !matches!(method.kind, MethodKind::Setter) => {
                     let Some(member_name) = prop_name(&method.key) else {
                         continue;
                     };
-                    let ir =
+                    let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
+                    library_sites::take_field_writes(&mut ir, &mut field_writes);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -2090,8 +2187,9 @@ impl Reader<'_> {
                     if !matches!(method.kind, MethodKind::Setter) =>
                 {
                     let member_name = format!("#{}", method.key.name);
-                    let ir =
+                    let mut ir =
                         self.function(&method.function, table(method.is_static), module, &none);
+                    library_sites::take_field_writes(&mut ir, &mut field_writes);
                     file.functions
                         .insert(key(&member_name, method.is_static), ir);
                 }
@@ -2100,7 +2198,7 @@ impl Reader<'_> {
                     else {
                         continue;
                     };
-                    let ir = match &**init {
+                    let mut ir = match &**init {
                         Expr::Arrow(arrow) => {
                             self.arrow(arrow, table(prop.is_static), module, &none)
                         }
@@ -2109,10 +2207,16 @@ impl Reader<'_> {
                         }
                         _ => continue,
                     };
+                    library_sites::take_field_writes(&mut ir, &mut field_writes);
                     file.functions.insert(key(&member_name, prop.is_static), ir);
                 }
                 _ => {}
             }
+        }
+        for (field, client) in
+            library_sites::field_receivers(name, &module.class_this, field_writes)
+        {
+            file.field_receivers.insert((fields.class, field), client);
         }
     }
 
@@ -2258,7 +2362,11 @@ impl Reader<'_> {
                 (name, value)
             })
             .collect();
-        ClassFields { values, receivers }
+        ClassFields {
+            class: class.span.lo.0,
+            values,
+            receivers,
+        }
     }
 
     fn function(
@@ -2997,12 +3105,17 @@ fn body_of(value: &Value) -> BodyValue {
 
 /// The library client a class field holds (`this.api`), when it holds one.
 fn field_receiver<'s>(member: &MemberExpr, scope: &'s Scope<'_>) -> Option<&'s ClientRef> {
-    let name = match &member.prop {
-        MemberProp::Ident(ident) => ident.sym.to_string(),
-        MemberProp::PrivateName(private) => format!("#{}", private.name),
-        MemberProp::Computed(_) => return None,
-    };
-    scope.fields?.receivers.get(&name)
+    scope.fields?.receivers.get(&this_field(member)?)
+}
+
+/// The field a member of `this` names (`this.api`, `this.#api`). A computed
+/// key names none.
+fn this_field(member: &MemberExpr) -> Option<String> {
+    match &member.prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
+        MemberProp::Computed(_) => None,
+    }
 }
 
 /// The library instances a function written inside another can read: the
@@ -3210,6 +3323,15 @@ impl Visit for CallWalker<'_, '_, '_> {
             self.ir.library.push(site);
         }
         new.visit_children_with(self);
+    }
+
+    // `this.queue = new Queue("emails")`: a maker write, as the message-role
+    // field rule reads it (carrick#1665). Never a summary's.
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        if let Some(write) = self.reader.field_write(assign, self.scope) {
+            self.ir.field_writes.push(write);
+        }
+        assign.visit_children_with(self);
     }
 
     fn visit_opt_call(&mut self, call: &OptCall) {
@@ -4710,5 +4832,49 @@ mod tests {
         }
         assert!(!uses.uses["Bare"].keeps_object());
         assert!(uses.uses["lib"].keeps_object());
+    }
+
+    /// carrick#1665 split a truthiness test out of the operand it was: a
+    /// message role reads `if (!this.client)` as reading the binding and
+    /// keeping nothing of it, and an HTTP client and an object constant are
+    /// contested by it exactly as before.
+    #[test]
+    fn a_truthiness_test_still_contests_an_http_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(
+            &path,
+            "if (api) {}\n\
+             if (!this.client) {}\n\
+             while (lib) {}\n\
+             do {} while (bus);\n\
+             for (; queue; ) {}\n\
+             const picked = opts ? 1 : 2;\n\
+             const both = !!pair;\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut uses = BindingUses::default();
+        module.visit_with(&mut uses);
+        for name in ["api", "this.client", "lib", "bus", "queue", "opts", "pair"] {
+            let used = &uses.uses[name];
+            assert!(used.tested, "{name} is tested");
+            assert!(used.contests_client(), "{name} contests an HTTP client");
+            assert!(
+                !used.contests_message(),
+                "{name} is no use to a message role"
+            );
+            assert!(
+                !used.keeps_object(),
+                "{name} is no object constant's key set"
+            );
+        }
     }
 }
