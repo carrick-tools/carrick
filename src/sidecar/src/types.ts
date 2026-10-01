@@ -537,8 +537,15 @@ export interface VerifyLibraryClaimsRequest extends BaseRequest {
  * it against the strict default (carrick#1616 prototype; never the default):
  * - `d2_required_siblings`: only a REQUIRED string sibling makes a name
  *   ambiguous; an optional one (`description?: string`) does not.
+ * - `inherited_bound_emitter`: a member inherited from another package's
+ *   base type counts when the receiver binds that base with a concrete type
+ *   its own packages declare (`extends Emitter<..., OwnReservedEvents>`).
+ * - `index_key_generic_map`: a name slot typed as a key of an event map the
+ *   receiver takes as a type parameter (defaulting to an index signature)
+ *   reads as a string slot; a key of a concrete index-signature map is still
+ *   refused.
  */
-export type ClaimVariant = 'd2_required_siblings';
+export type ClaimVariant = 'd2_required_siblings' | 'inherited_bound_emitter' | 'index_key_generic_map';
 
 /**
  * List each package's declared surface, the way the verifier reads it, for a

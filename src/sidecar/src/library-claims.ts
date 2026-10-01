@@ -1522,10 +1522,10 @@ class DeclarationReader {
     // map's keys (`string | number` for an index signature); the node keeps
     // what was written.
     if (node && ts.isTypeOperatorNode(node) && node.operator === ts.SyntaxKind.KeyOfKeyword) {
-      return this.hasIndexSignature(this.checker.getTypeFromTypeNode(node.type));
+      return this.isIndexMap(this.checker.getTypeFromTypeNode(node.type));
     }
     if (type.flags & ts.TypeFlags.Index) {
-      return this.hasIndexSignature((type as ts.IndexType).type);
+      return this.isIndexMap((type as ts.IndexType).type);
     }
     if (type.flags & ts.TypeFlags.TypeParameter) {
       const constraintNode = this.declaredConstraint(type);
@@ -1543,6 +1543,16 @@ class DeclarationReader {
   /** The constraint a type parameter's declaration writes, unresolved (`K extends keyof M`). */
   private declaredConstraint(type: ts.Type): ts.TypeNode | undefined {
     return (type.getSymbol()?.declarations ?? []).find(ts.isTypeParameterDeclaration)?.constraint;
+  }
+
+  /**
+   * The map a `keyof` reads has an index signature. Under
+   * `index_key_generic_map`, a map the receiver takes as a type parameter is
+   * the caller's to type, so its key slot reads as a string slot.
+   */
+  private isIndexMap(map: ts.Type): boolean {
+    if (this.variants.has('index_key_generic_map') && map.flags & ts.TypeFlags.TypeParameter) return false;
+    return this.hasIndexSignature(map);
   }
 
   private hasIndexSignature(type: ts.Type): boolean {
@@ -1674,11 +1684,18 @@ class DeclarationReader {
    */
   private ownCallee(receiver: MessageReceiver, member: string | null, form: 'call' | 'new'): Callable {
     let type = receiver.type;
+    // Under `inherited_bound_emitter`, a member of a base the receiver binds with its own type.
+    let boundBase = false;
     if (member !== null) {
       const apparent = this.checker.getApparentType(this.checker.getNonNullableType(receiver.type));
       const property = this.declaredProperty(receiver.type, member);
       if (!property) return { failure: failed('member_missing') };
-      if (!this.isOwnMember(property, apparent, receiver.home)) return { failure: failed('member_inherited') };
+      if (!this.isOwnMember(property, apparent, receiver.home)) {
+        if (!(this.variants.has('inherited_bound_emitter') && this.isBoundByOwnType(property, receiver))) {
+          return { failure: failed('member_inherited') };
+        }
+        boundBase = true;
+      }
       type = this.checker.getTypeOfSymbol(property);
     }
     const all =
@@ -1689,10 +1706,56 @@ class DeclarationReader {
       const file = this.signatureFile(signature, type, form);
       return file !== undefined && this.isLibraryFile(file);
     });
-    const own = library.filter(signature => this.isOwnFile(this.signatureFile(signature, type, form)!, receiver.home));
+    const own = boundBase
+      ? library
+      : library.filter(signature => this.isOwnFile(this.signatureFile(signature, type, form)!, receiver.home));
     if (own.length > 0) return { signatures: own };
     if (library.length > 0) return { failure: failed('member_inherited') };
     return { failure: this.slotFailure(type, form === 'new' ? 'member_not_constructible' : 'member_not_callable') };
+  }
+
+  /**
+   * `inherited_bound_emitter`: the member is declared on a base type another
+   * package writes, and the receiver's class binds that base with at least
+   * one concrete type argument (not a type parameter) its own packages
+   * declare: `class Socket<L, E> extends Emitter<L, E, SocketReservedEvents>`.
+   * The runtime's emitter, extended with no type of the package's own, is
+   * not bound; nor is a base bound only through the class's type parameters.
+   */
+  private isBoundByOwnType(property: ts.Symbol, receiver: MessageReceiver): boolean {
+    const owners = (property.declarations ?? [])
+      .map(declaration => declaration.parent)
+      .filter((owner): owner is ts.ClassLikeDeclaration | ts.InterfaceDeclaration =>
+        owner !== undefined && (ts.isClassLike(owner) || ts.isInterfaceDeclaration(owner))
+      );
+    if (owners.length === 0) return false;
+    const targetOf = (type: ts.Type): ts.Type =>
+      ((type as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference ? (type as ts.TypeReference).target : type;
+    const isOwnType = (type: ts.Type) =>
+      !(type.flags & ts.TypeFlags.TypeParameter) &&
+      typeSymbols(type).some(symbol =>
+        (symbol?.declarations ?? []).some(declaration => this.isOwnFile(declaration.getSourceFile(), receiver.home))
+      );
+    const visit = (type: ts.Type, depth: number): boolean => {
+      if (depth > 8) return false;
+      if (type.isIntersection()) return type.types.some(part => visit(part, depth + 1));
+      const target = targetOf(type);
+      if (!(((target as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.ClassOrInterface)) return false;
+      for (const base of this.checker.getBaseTypes(target as ts.InterfaceType)) {
+        const declarations = targetOf(base).getSymbol()?.declarations ?? [];
+        if (owners.some(owner => declarations.includes(owner))) {
+          const bound =
+            ((base as ts.ObjectType).objectFlags ?? 0) & ts.ObjectFlags.Reference
+              ? this.checker.getTypeArguments(base as ts.TypeReference)
+              : [];
+          if (bound.some(isOwnType)) return true;
+          continue;
+        }
+        if (visit(base, depth + 1)) return true;
+      }
+      return false;
+    };
+    return visit(this.checker.getNonNullableType(receiver.type), 0);
   }
 
   /**

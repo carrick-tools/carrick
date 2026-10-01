@@ -833,6 +833,12 @@ pub struct LibraryCheck {
 pub enum ClaimVariant {
     /// Only a required string sibling makes a name ambiguous (design D2).
     D2RequiredSiblings,
+    /// A member inherited from another package's base counts when the
+    /// receiver binds that base with a concrete type of its own packages.
+    InheritedBoundEmitter,
+    /// A key of an event map the receiver takes as a type parameter reads as
+    /// a string slot.
+    IndexKeyGenericMap,
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).
@@ -3215,12 +3221,20 @@ mod tests {
             from_dir: "/svc".into(),
             checks: vec![],
             budget_ms: None,
-            variants: vec![ClaimVariant::D2RequiredSiblings],
+            variants: vec![
+                ClaimVariant::D2RequiredSiblings,
+                ClaimVariant::InheritedBoundEmitter,
+                ClaimVariant::IndexKeyGenericMap,
+            ],
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(
             value["variants"],
-            serde_json::json!(["d2_required_siblings"])
+            serde_json::json!([
+                "d2_required_siblings",
+                "inherited_bound_emitter",
+                "index_key_generic_map"
+            ])
         );
     }
 

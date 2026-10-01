@@ -482,7 +482,7 @@ export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   checks: z.array(LibraryCheckSchema),
   budget_ms: z.number().int().nonnegative().optional(),
   variants: z
-    .array(z.enum(['d2_required_siblings']))
+    .array(z.enum(['d2_required_siblings', 'inherited_bound_emitter', 'index_key_generic_map']))
     .optional(),
 });
 
