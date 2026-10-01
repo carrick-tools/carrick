@@ -133,6 +133,9 @@ pub struct Makes {
     pub handler: Option<Slot>,
     /// The scope of the name the maker binds (variant).
     pub scope: NameScope,
+    /// The kind of id the name is (variant): names of different kinds never
+    /// pair, whatever their spelling.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -157,6 +160,9 @@ pub struct Op {
     /// The scope of the op's name (variant). A name bound by the maker takes
     /// the maker's scope.
     pub scope: NameScope,
+    /// The kind of id the op's name is (variant). A name bound by the maker
+    /// takes the maker's.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -281,7 +287,15 @@ fn parse_makes(value: &Value) -> Option<Makes> {
         name: optional_slot(object.get("name"))?,
         handler: optional_slot(object.get("handler"))?,
         scope: name_scope(object.get("scope"))?,
+        namespace: optional_text(object.get("namespace"))?,
     })
+}
+
+fn optional_text(value: Option<&Value>) -> Option<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => key_text(value).map(Some),
+    }
 }
 
 fn name_scope(value: Option<&Value>) -> Option<NameScope> {
@@ -339,6 +353,7 @@ fn parse_op(value: &Value) -> Option<Op> {
         method_key: optional_slot(object.get("method_key"))?,
         on,
         scope: name_scope(object.get("scope"))?,
+        namespace: optional_text(object.get("namespace"))?,
         of: match object.get("of") {
             None | Some(Value::Null) => None,
             Some(of) => {

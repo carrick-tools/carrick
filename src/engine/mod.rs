@@ -3991,9 +3991,15 @@ fn append_library_operations(
         .clone()
         .unwrap_or_else(|| cloud_data.repo_name.clone());
     for (file, row) in library.rows() {
+        // `[<namespace>:]<name>[@<owner>]`: names of different kinds never
+        // pair, and a service-scoped name never pairs across services.
+        let named = match &row.namespace {
+            Some(namespace) => format!("{namespace}:{}", row.name),
+            None => row.name.clone(),
+        };
         let keyed = match row.scope {
-            crate::library_claims::NameScope::Global => row.name.clone(),
-            crate::library_claims::NameScope::Service => format!("{}@{owner}", row.name),
+            crate::library_claims::NameScope::Global => named,
+            crate::library_claims::NameScope::Service => format!("{named}@{owner}"),
         };
         let rel = protocol_rel(file, repo_root);
         sites
@@ -6230,6 +6236,7 @@ fn write_slice_record(
             "claim_ids": row.claim_ids,
             "definition": row.definition,
             "scope": format!("{:?}", row.scope).to_lowercase(),
+            "namespace": row.namespace,
             "anchor": row.anchor,
         })
     };

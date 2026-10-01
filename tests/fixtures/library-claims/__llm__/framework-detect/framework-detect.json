@@ -343,6 +343,47 @@
           ]
         }
       ]
+    },
+    {
+      "package": "@fixture/jobs",
+      "major": 2,
+      "status": "answered",
+      "exports": [
+        {
+          "export": "job",
+          "role": "broker",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "name": {
+                "arg": 0,
+                "key": "id"
+              },
+              "handler": {
+                "arg": 0,
+                "key": "run"
+              }
+            }
+          ]
+        },
+        {
+          "export": "queues",
+          "role": "broker",
+          "ops": [
+            {
+              "op": "send",
+              "member": "enqueue",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

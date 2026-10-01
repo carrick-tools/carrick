@@ -4622,6 +4622,8 @@ pub struct LibraryRow {
     pub definition: bool,
     /// Where the name means something (scope variant; `Global` otherwise).
     pub scope: crate::library_claims::NameScope,
+    /// The kind of id the name is (scope variant).
+    pub namespace: Option<String>,
     /// The definition the name resolves to, as `<file>:<span start>` of the
     /// maker call: the instance's maker for a name the maker binds, the call
     /// itself for a definition. `None` for a name written at the call.
@@ -4874,7 +4876,7 @@ impl LibraryReader<'_> {
                    name: String,
                    claim_ids: Vec<String>,
                    definition: bool,
-                   scope: crate::library_claims::NameScope,
+                   scope: (crate::library_claims::NameScope, Option<String>),
                    anchor: Option<String>| {
             let mut claim_ids = claim_ids;
             claim_ids.sort();
@@ -4891,7 +4893,8 @@ impl LibraryReader<'_> {
                 receiver: receiver_id.to_string(),
                 member: member.map(str::to_string),
                 definition,
-                scope,
+                scope: scope.0,
+                namespace: scope.1,
                 anchor,
             }
         };
@@ -4919,7 +4922,7 @@ impl LibraryReader<'_> {
                             name,
                             vec![definition.claim_id.clone()],
                             true,
-                            definition.makes.scope,
+                            (definition.makes.scope, definition.makes.namespace.clone()),
                             Some(format!("{}:{}", self.file.display(), call.site.span_start)),
                         )),
                     },
@@ -4996,10 +4999,10 @@ impl LibraryReader<'_> {
             }
             let (scope, anchor) = match (&op.name, maker) {
                 (Some(NameSource::Maker), Some((instance, maker))) => (
-                    maker.makes.scope,
+                    (maker.makes.scope, maker.makes.namespace.clone()),
                     Some(format!("{}:{}", declared_in.display(), instance.site_start)),
                 ),
-                _ => (op.scope, None),
+                _ => ((op.scope, op.namespace.clone()), None),
             };
             rows.push(row(kind, name, claim_ids, false, scope, anchor));
         }

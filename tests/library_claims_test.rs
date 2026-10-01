@@ -272,6 +272,11 @@ async fn the_reader_states_each_positive_and_refuses_each_negative() {
             // read as verified here (`socket_readings_on_a_typed_emitter_base`).
             "producer live-prices.ts:7 socket|server_to_client|price:updated",
             "consumer live-prices.ts:8 socket|client_to_server|price:subscribe",
+            // The design's counterexample, read as verified: the job is
+            // named by `id` though `queue` routes it
+            // (`an_optional_routing_key_decides_d2`).
+            "producer jobs.ts:6 pubsub|resize-image",
+            "consumer jobs.ts:15 pubsub|images",
         ]),
         "routes.ts:10/11 (computed names), routes.ts:18 (a local shadows the constant), \
          kv.ts:12 (a wildcard), kv.ts:16 (a parameter shadows the constant), kv-cache.ts:9 \
@@ -560,5 +565,46 @@ async fn a_service_scoped_name_is_keyed_with_its_service() {
     assert!(
         rows.contains("consumer kv.ts:7 pubsub|orders.created"),
         "a name the claim leaves global keeps the global key: {rows:#?}"
+    );
+}
+
+/// The design's own counterexample for D2: the definition's options carry an
+/// OPTIONAL string key (`queue`) that is the real routing name, and the claim
+/// names `id`. The strict reading refuses the claim, since the optional
+/// string sibling is unassigned. The required-siblings reading verifies it,
+/// and the reader then states a subscriber for `resize-image` where the job
+/// consumes `images`: a wrong fact. This test pins what each reading does.
+#[tokio::test]
+#[serial]
+async fn an_optional_routing_key_decides_d2() {
+    let mut seen = Vec::new();
+    for reading in ["strict", "required_siblings"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cassette) = fixture_copy(tmp.path(), "library-claims");
+        mock_env(&cassette, false);
+        // SAFETY: every test in this binary is `#[serial]`.
+        unsafe { std::env::set_var(carrick::library_claims::D2_READING_ENV, reading) };
+        let sidecar = real_sidecar(&repo);
+        let data = scan(&repo, Some(&sidecar)).await;
+        unsafe { std::env::remove_var(carrick::library_claims::D2_READING_ENV) };
+        seen.push(
+            rows_from(&data, Some(ResolutionSource::LibraryClaim))
+                .into_iter()
+                .filter(|row| row.contains("jobs.ts"))
+                .collect::<BTreeSet<String>>(),
+        );
+    }
+    assert_eq!(
+        seen[0],
+        set(&["consumer jobs.ts:15 pubsub|images"]),
+        "strict: the definition is refused, the enqueue states its queue"
+    );
+    assert_eq!(
+        seen[1],
+        set(&[
+            "producer jobs.ts:6 pubsub|resize-image",
+            "consumer jobs.ts:15 pubsub|images",
+        ]),
+        "required siblings: the definition verifies under the wrong name"
     );
 }
