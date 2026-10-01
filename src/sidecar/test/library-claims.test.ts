@@ -55,6 +55,14 @@ export interface Task<TPayload> {
   trigger(payload: TPayload, options?: TriggerOptions): Promise<RunHandle>;
 }
 export declare function task<TPayload = unknown>(options: TaskOptions<TPayload>): Task<TPayload>;
+// Two maker overloads that both take the claim, building different instances.
+export interface ScheduledTask {
+  id: string;
+  trigger(payload: unknown): Promise<RunHandle>;
+  cancel(): void;
+}
+export declare function job(options: { id: string; run: (payload: unknown) => Promise<unknown>; cron: number }): Task<unknown>;
+export declare function job(options: { id: string; run: (payload: unknown) => Promise<unknown> }): ScheduledTask;
 export declare const tasks: {
   trigger<TPayload = unknown>(id: string, payload: TPayload, options?: TriggerOptions): Promise<RunHandle>;
 };
@@ -148,7 +156,20 @@ export interface Channel<Events extends EventMap = EventMap> {
   defineDescribed(options: { id: string; description?: string; run: Handler }): void;
   defineSplit(options: { id: string } | { run: Handler }): void;
 }
+export interface Definition<Id extends string> {
+  id: Id;
+}
+export type IdOf<D> = D extends Definition<infer Id> ? Id : never;
+export type IdOrAny<D> = D extends Definition<infer Id> ? Id : any;
+export interface Dispatcher {
+  triggerById<D extends Definition<string>>(id: IdOf<D>, payload: unknown): void;
+  triggerLoose<D extends Definition<string>>(id: IdOrAny<D>, payload: unknown): void;
+  subscribeMany(...args: [...channels: string[], callback: (err: Error | null) => void]): void;
+  sendRaw(data: string, callback?: (err?: Error) => void): void;
+  ping(event: string): void;
+}
 export declare const channel: Channel;
+export declare const dispatcher: Dispatcher;
 export declare function makeAny(): any;
 export declare function makeOpen<T>(): T;
 export declare function makeChannel(): Channel;
@@ -314,6 +335,18 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
     );
   });
 
+  it('reads an instance through every maker overload that holds, and needs the op on each', async () => {
+    const T = '@fixture/tasks';
+    const maker = makes('call', null, { name: { arg: 0, key: 'id' }, handler: { arg: 0, key: 'run' } });
+    const checks = [
+      check(T, 'job', 'broker', 'export', maker),
+      check(T, 'job', 'broker', 'instance:()', op('send', 'trigger', { name: { bound: 'maker' }, payload: { arg: 0 } })),
+      // Only one overload's instance can cancel.
+      check(T, 'job', 'broker', 'instance:()', op('send', 'cancel', { name: { bound: 'maker' }, payload: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await verify(checks)), ['verified', 'verified', 'failed member_missing']);
+  });
+
   it('verifies the key-value client re-exported from its core package', async () => {
     const K = 'fixture-kv';
     const checks = [
@@ -474,7 +507,7 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       // A rest the claim puts the payload in is the payload's.
       on('publishMany', { name: { arg: 0 }, payload: { arg: 1 } }),
       // A rest that holds the name holds other names.
-      on('subscribeAll', { name: { arg: 0 } }),
+      check(R, 'channel', 'broker', 'export', op('receive', 'subscribeAll', { name: { arg: 0 } })),
       // The options bag with two string keys: the definition's id beside an unassigned description.
       check(R, 'channel', 'broker', 'export', makes('call', 'defineDescribed', { name: { arg: 0, key: 'id' }, handler: { arg: 0, key: 'run' } })),
     ];
@@ -485,6 +518,39 @@ describe('verify_library_claims (carrick#1616 prototype)', () => {
       'verified',
       'failed name_ambiguous',
       'failed name_ambiguous',
+    ]);
+  });
+
+  it('reads a name slot typed by a conditional through its branches, unless a branch says nothing', async () => {
+    const R = 'fixture-rules';
+    const send = (member: string) => check(R, 'dispatcher', 'broker', 'export', op('send', member, { name: { arg: 0 }, payload: { arg: 1 } }));
+    assert.deepStrictEqual(verdicts(await verify([send('triggerById'), send('triggerLoose')])), [
+      'verified',
+      'unchecked member_untyped',
+    ]);
+  });
+
+  it('refuses a name inside a variadic tuple rest, whose positions are not fixed', async () => {
+    const R = 'fixture-rules';
+    const checks = [
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'subscribeMany', { name: { arg: 0 }, handler: { arg: 1 } })),
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'subscribeMany', { name: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await verify(checks)), ['failed name_ambiguous', 'failed name_ambiguous']);
+  });
+
+  it('refuses a send with no payload slot, and a payload slot that is a callback', async () => {
+    const R = 'fixture-rules';
+    const checks = [
+      // send(data) read as a name alone: the data is the message, not a name.
+      check(R, 'dispatcher', 'broker', 'export', op('send', 'sendRaw', { name: { arg: 0 } })),
+      check(R, 'dispatcher', 'broker', 'export', op('send', 'sendRaw', { name: { arg: 0 }, payload: { arg: 1 } })),
+      check(R, 'dispatcher', 'broker', 'export', op('send', 'ping', { name: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await verify(checks)), [
+      'unchecked claim_invalid',
+      'failed payload_is_function',
+      'unchecked claim_invalid',
     ]);
   });
 

@@ -402,12 +402,17 @@ export class LibraryClaimsVerifier {
         return exportRead;
       };
 
-      /** The message receiver of check `index`, reading its maker and scope claims. */
-      const readMessageReceiver = (index: number, exported: ExportRead): Read<MessageReceiver> => {
+      /**
+       * The message receivers of check `index`, reading its maker and scope
+       * claims: one per distinct type the holding overloads return. A maker
+       * whose two overloads both hold builds either instance, so a claim on
+       * it must hold on each.
+       */
+      const readMessageReceivers = (index: number, exported: ExportRead): Read<MessageReceiver[]> => {
         const check = checks[index];
         const receiverPath = parseReceiver(check.receiver);
         if (!receiverPath) return { reason: 'receiver_invalid' };
-        let type = exported.type;
+        let types: readonly ts.Type[] = [exported.type];
         let makerBindsName = false;
         if (receiverPath.maker) {
           const maker = receiverPath.maker;
@@ -422,9 +427,9 @@ export class LibraryClaimsVerifier {
                 other.claim.form === maker.form &&
                 other.claim.member === maker.member
             );
-          const made = holdingReturn(makers.map(({ i }) => judge(i)));
+          const made = holdingReturns(makers.map(({ i }) => judge(i)));
           if ('reason' in made) return { reason: made.reason === 'unresolved' ? 'maker_unresolved' : 'maker_unverified' };
-          type = made.value;
+          types = made.value;
           makerBindsName = makers.some(({ other }) => other.claim.list === 'makes' && other.claim.name !== undefined);
         }
         if (receiverPath.scope !== undefined) {
@@ -439,23 +444,25 @@ export class LibraryClaimsVerifier {
                 other.claim.list === 'scopes' &&
                 other.claim.member === scope
             );
-          const scoped = holdingReturn(scopes.map(({ i }) => judge(i)));
+          const scoped = holdingReturns(scopes.map(({ i }) => judge(i)));
           if ('reason' in scoped) return { reason: scoped.reason === 'unresolved' ? 'scope_unresolved' : 'scope_unverified' };
-          type = scoped.value;
+          types = scoped.value;
         }
-        if (reader.returnSaysNothing(type)) return { reason: receiverPath.maker ? 'maker_unresolved' : 'export_untyped' };
+        if (types.some(type => reader.returnSaysNothing(type))) {
+          return { reason: receiverPath.maker ? 'maker_unresolved' : 'export_untyped' };
+        }
         return {
-          value: {
+          value: types.map(type => ({
             type,
             home: reader.homeOf(check.package, [exported.target, ...typeSymbols(type)]),
             makerBindsName,
             scoped: receiverPath.scope !== undefined,
-          },
+          })),
         };
       };
 
-      /** The instance a set of maker (or scope) judgements build: one type, or why not. */
-      const holdingReturn = (judgements: Judged[]): Read<ts.Type> => {
+      /** What a set of maker (or scope) judgements build: the distinct types their common overloads return. */
+      const holdingReturns = (judgements: Judged[]): Read<ts.Type[]> => {
         if (judgements.length === 0) return { reason: 'unverified' };
         let holding: readonly ts.Signature[] | undefined;
         for (const judgement of judgements) {
@@ -463,8 +470,8 @@ export class LibraryClaimsVerifier {
           holding = holding === undefined ? judgement.holding : holding.filter(sig => judgement.holding!.includes(sig));
         }
         const returns = [...new Set((holding ?? []).map(sig => reader.returnOf(sig)))];
-        if (returns.length !== 1) return { reason: 'unresolved' };
-        return { value: returns[0] };
+        if (returns.length === 0) return { reason: 'unresolved' };
+        return { value: returns };
       };
 
       const judge = (index: number): Judged => {
@@ -515,9 +522,15 @@ export class LibraryClaimsVerifier {
         if (check.claim.list === 'ops' && !rules.ops.has(check.claim.op)) {
           return { outcome: unchecked('role_unsupported') };
         }
-        const receiver = readMessageReceiver(index, exportRead.value);
-        if ('reason' in receiver) return { outcome: unchecked(receiver.reason) };
-        return reader.judgeMessage(receiver.value, check.claim);
+        const receivers = readMessageReceivers(index, exportRead.value);
+        if ('reason' in receivers) return { outcome: unchecked(receivers.reason) };
+        const holding: ts.Signature[] = [];
+        for (const receiver of receivers.value) {
+          const result = reader.judgeMessage(receiver, check.claim);
+          if (result.outcome.verdict !== 'verified') return result;
+          holding.push(...(result.holding ?? []));
+        }
+        return { outcome: VERIFIED, holding };
       };
 
       const semantics: SemanticsResult[] = [];
@@ -1235,7 +1248,8 @@ class DeclarationReader {
       return unchecked('claim_invalid');
     }
     const name = claim.name;
-    if (name === undefined) return unchecked('claim_invalid');
+    // A send carries a payload: a name alone on `send(data)` is the data.
+    if (name === undefined || (claim.op === 'send' && claim.payload === undefined)) return unchecked('claim_invalid');
     let nameSlot: ClaimSlot | undefined;
     if ('bound' in name) {
       if (name.bound === 'maker' ? !receiver.makerBindsName : !receiver.scoped) return failed('name_unbound');
@@ -1313,16 +1327,20 @@ class DeclarationReader {
   private messageSignatureOutcome(signature: ts.Signature, layout: ClaimLayout): RankedFailure {
     for (const [arg, part] of layout.positional) {
       if (part !== 'name' && part !== 'base') continue;
-      const slot = this.keyParameterAt(signature, arg);
-      if (slot === undefined) return { rank: 1, outcome: failed('param_missing') };
+      const declared = this.keyParameterAt(signature, arg);
+      if (declared === undefined) return { rank: 1, outcome: failed('param_missing') };
+      const slot = this.throughConditional(declared);
       if (!this.acceptsString(slot)) return { rank: 1, outcome: this.slotFailure(slot, `${part}_not_string`) };
     }
     for (const [arg, part] of layout.positional) {
       if (part === 'name' && this.isIndexKeySlot(signature, arg)) {
         return { rank: 2, outcome: failed('name_index_key') };
       }
-      if (part === 'payload' && this.parameterAt(signature, arg) === undefined) {
-        return { rank: 2, outcome: failed('payload_missing') };
+      if (part === 'payload') {
+        const payload = this.parameterAt(signature, arg);
+        if (payload === undefined) return { rank: 2, outcome: failed('payload_missing') };
+        // Function versus data is shape: a callback in that place is not the payload.
+        if (this.isFunctionSlot(payload)) return { rank: 2, outcome: failed('payload_is_function') };
       }
     }
     for (const [arg, part] of layout.positional) {
@@ -1365,8 +1383,12 @@ class DeclarationReader {
           break;
         }
         const type = this.checker.getTypeOfSymbol(property);
-        if ((part === 'name' || part === 'base') && !this.acceptsString(type)) {
-          failure = { rank: 3, outcome: this.slotFailure(type, 'key_not_string') };
+        if ((part === 'name' || part === 'base') && !this.acceptsString(this.throughConditional(type))) {
+          failure = { rank: 3, outcome: this.slotFailure(this.throughConditional(type), 'key_not_string') };
+          break;
+        }
+        if (part === 'payload' && this.isFunctionSlot(type)) {
+          failure = { rank: 3, outcome: failed('payload_is_function') };
           break;
         }
         if (part === 'handler' || part === 'ack') {
@@ -1412,10 +1434,26 @@ class DeclarationReader {
     if (restIndex !== -1) {
       const rest = this.checker.getTypeOfSymbol(last);
       if (this.checker.isTupleType(rest)) {
-        const length = this.checker.getTypeArguments(rest as ts.TypeReference).length;
-        for (let i = restIndex; i < restIndex + length; i++) {
+        const elements = this.checker.getTypeArguments(rest as ts.TypeReference);
+        const flags = ((rest as ts.TypeReference).target as ts.TupleType).elementFlags;
+        // From the first variable element on (`[...channels: string[], cb]`),
+        // no position is fixed: a name there is one of many.
+        const variable = flags.findIndex(flag => (flag & ts.ElementFlags.Variable) !== 0);
+        const fixedLength = variable === -1 ? elements.length : variable;
+        for (let i = restIndex; i < restIndex + fixedLength; i++) {
           if (layout.positional.has(i) || layout.keyed.has(i)) continue;
           if (takesString(this.keyParameterAt(signature, i))) return ambiguous;
+        }
+        if (variable !== -1) {
+          const unfixed = [...layout.positional].filter(([arg]) => arg >= restIndex + variable).map(([, part]) => part);
+          if (unfixed.includes('name')) return ambiguous;
+          const element = elements[variable];
+          const elementTakesString =
+            element !== undefined &&
+            (this.checker.isArrayType(element)
+              ? takesString(this.checker.getTypeArguments(element as ts.TypeReference)[0])
+              : takesString(element));
+          if (unfixed.length === 0 && elementTakesString) return ambiguous;
         }
       } else {
         const inRest = [...layout.positional].filter(([arg]) => arg >= restIndex).map(([, part]) => part);
@@ -1512,6 +1550,33 @@ class DeclarationReader {
       if (signatures.every(signature => this.isUntypedSignature(signature))) return unchecked('handler_untyped');
     }
     return undefined;
+  }
+
+  /**
+   * A name typed by a conditional (`IdOf<T> = T extends Def<infer Id> ? Id
+   * : never`) is read through what its branches allow. When a branch says
+   * nothing (`... ? Id : any`), so does the slot: the checker's constraint of
+   * such a conditional drops the `any` branch and would read as a string.
+   */
+  private throughConditional(slot: Slot): Slot {
+    if (slot === VARIADIC) return slot;
+    const parts = this.parts(slot);
+    if (parts.length !== 1 || !(parts[0].flags & ts.TypeFlags.Conditional)) return slot;
+    const node = (parts[0] as ts.ConditionalType).root.node;
+    const branchSaysNothing = [node.trueType, node.falseType].some(branch => {
+      const type = this.checker.getTypeFromTypeNode(branch);
+      return (type.flags & ts.TypeFlags.Never) === 0 && this.returnSaysNothing(type);
+    });
+    if (branchSaysNothing) return VARIADIC;
+    return this.checker.getBaseConstraintOfType(parts[0]) ?? slot;
+  }
+
+  /** Every part besides null and undefined is callable: a function, not data. */
+  private isFunctionSlot(declared: Slot): boolean {
+    const slot = this.throughConstraint(declared);
+    if (slot === VARIADIC) return false;
+    const parts = this.parts(slot);
+    return parts.length > 0 && parts.every(part => !this.isOpenTop(part) && part.getCallSignatures().length > 0);
   }
 
   /** `(...args: any[])` or `(...args: unknown[])`: a signature that declares nothing. */
