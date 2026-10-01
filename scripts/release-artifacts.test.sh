@@ -28,6 +28,11 @@ manifest_sha="$(sha256sum lister-artifact/carrick-lister.manifest.json | awk '{p
 calls="$work/calls"
 cat > "$work/gh" <<'STUB'
 #!/usr/bin/env bash
+# GH_FAIL_LISTER=1: the lister's upload fails, as the network or an existing asset can.
+if [ "${GH_FAIL_LISTER:-}" = "1" ] && [ "$1" = "release" ] && [[ " $* " == *carrick-lister* ]]; then
+  echo "upload failed" >&2
+  exit 1
+fi
 printf '%s ' "$@" >> "$CALLS"
 printf '\n' >> "$CALLS"
 STUB
@@ -54,12 +59,14 @@ check_status success false skipped "false absent"
 status_of failure "" skipped > /dev/null
 if grep -q '::warning' "$work/log"; then pass "a failed lister warns"; else fail "a failed lister prints no warning"; fi
 
-# A release step sequence, as the workflow runs it, for one lister state.
+# A release step sequence, as the workflow runs it, for one lister state. The
+# attach step continues on error; its outcome goes to the dispatch.
 release() {
   : > "$calls"
   "$script" upload-matcher carrick-v0.0.0 > /dev/null
-  LISTER_OK="$1" "$script" upload-lister carrick-v0.0.0 > /dev/null
-  LISTER_OK="$1" "$script" dispatch carrick-v0.0.0 > /dev/null
+  local attached=success
+  LISTER_OK="$1" "$script" upload-lister carrick-v0.0.0 > /dev/null 2>&1 || attached=failure
+  LISTER_OK="$1" LISTER_ATTACHED="$attached" "$script" dispatch carrick-v0.0.0 > /dev/null
 }
 matcher_upload='release upload carrick-v0.0.0 wasm-artifact/carrick_match.js wasm-artifact/carrick_match.d.ts wasm-artifact/carrick_match_bg.wasm wasm-artifact/carrick_match.sha256'
 expect_call() { if grep -qF -- "$1" "$calls"; then pass "$2"; else fail "$2: no call with '$1' in: $(cat "$calls")"; fi; }
@@ -83,6 +90,13 @@ release "$(status_of success true success | cut -d' ' -f1)"
 expect_call "$matcher_upload" "passed lister: matcher attached"
 expect_call "release upload carrick-v0.0.0 lister-artifact/carrick-lister.mjs lister-artifact/carrick-lister.manifest.json" "passed lister: lister attached"
 expect_call "client_payload[lister_manifest_sha256]=$manifest_sha" "passed lister: manifest sha announced"
+
+# The lister passed but its upload failed: the matcher is still announced,
+# and the cloud is not told to fetch a lister that is not attached.
+GH_FAIL_LISTER=1 release "$(status_of success true success | cut -d' ' -f1)"
+expect_call "$matcher_upload" "lister upload failed: matcher attached"
+expect_call "client_payload[wasm_sha256]=" "lister upload failed: matcher announced"
+refuse_call "lister_manifest_sha256" "lister upload failed: lister not announced"
 
 # Told it passed, but its files are missing: nothing of it ships.
 rm lister-artifact/carrick-lister.mjs
@@ -116,13 +130,15 @@ failed = step("Surface lister failed")
 if not problems:
     if not matcher[0] < build[0] < test[0] < decide[0] < attach[0] < dispatch[0] < failed[0]:
         problems.append("steps out of order: matcher upload, lister build, test, decide, lister upload, dispatch, lister failure")
-    for name, (_, body) in (("build", build), ("test", test)):
+    for name, (_, body) in (("build", build), ("test", test), ("upload", attach)):
         if "continue-on-error: true" not in body:
             problems.append(f"the lister {name} step can stop the job")
     for name, (_, body) in (("matcher upload", matcher), ("decision", decide), ("lister upload", attach), ("dispatch", dispatch)):
         if re.search(r"^\s+if:", body, re.M):
             problems.append(f"the {name} step is conditional")
-    if "if: always() && steps.lister.outputs.status == 'failed'" not in failed[1]:
+    if "LISTER_ATTACHED: ${{ steps.lister_attach.outcome }}" not in dispatch[1] or "id: lister_attach" not in attach[1]:
+        problems.append("the dispatch does not read whether the lister was attached")
+    if "if: always() && (steps.lister.outputs.status == 'failed' || steps.lister_attach.outcome == 'failure')" not in failed[1]:
         problems.append("the lister failure step does not report every failure")
     if failed[0] != len(steps) - 1:
         problems.append("the lister failure step is not the last")
@@ -130,7 +146,7 @@ for p in problems:
     print(p)
 sys.exit(1 if problems else 0)
 PY
-then pass "workflow: matcher first, lister steps continue on error, failure reported last"
+then pass "workflow: matcher first, lister steps (attach too) continue on error, failure reported last"
 else fail "workflow step order or guards"
 fi
 

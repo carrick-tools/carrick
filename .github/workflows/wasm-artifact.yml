@@ -166,7 +166,11 @@ jobs:
           TEST_OUTCOME: ${{ steps.lister_test.outcome }}
         run: bash release-tools/scripts/release-artifacts.sh lister-status
 
+      # Continues on error too: an upload that fails (the network, an asset a
+      # backfill finds already there) must not stop the matcher's dispatch.
       - name: Attach the surface lister to the release
+        id: lister_attach
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -176,9 +180,9 @@ jobs:
 
       # Fires .github/workflows/wasm-pin-bump.yml in carrick-cloud, which
       # opens the pin-bump PR against the freshly attached assets. The same
-      # event carries the lister manifest's sha256 when the lister passed, so
-      # the cloud can verify the manifest it downloads before it copies the
-      # lister pin from it (carrick-cloud#1579). The default
+      # event carries the lister manifest's sha256 when the lister passed and
+      # is attached, so the cloud can verify the manifest it downloads before
+      # it copies the lister pin from it (carrick-cloud#1579). The default
       # GITHUB_TOKEN cannot dispatch cross-repo: CARRICK_CLOUD_DISPATCH_TOKEN
       # is a fine-grained PAT with contents:write + pull-requests:write on
       # carrick-tools/carrick-cloud. Assets are already attached by this point,
@@ -189,6 +193,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CARRICK_CLOUD_DISPATCH_TOKEN }}
           TAG: ${{ inputs.tag }}
           LISTER_OK: ${{ steps.lister.outputs.ok }}
+          LISTER_ATTACHED: ${{ steps.lister_attach.outcome }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "CARRICK_CLOUD_DISPATCH_TOKEN is not set; assets are attached but carrick-cloud was not notified." >&2
@@ -197,11 +202,13 @@ jobs:
           SOURCE_SHA="$(git rev-parse HEAD)" bash release-tools/scripts/release-artifacts.sh dispatch "$TAG"
 
       # Last, so the matcher is attached and announced first: a lister that
-      # failed to build or test fails the job here, where it is seen.
+      # failed to build, test or attach fails the job here, where it is seen.
       - name: Surface lister failed
-        if: always() && steps.lister.outputs.status == 'failed'
+        if: always() && (steps.lister.outputs.status == 'failed' || steps.lister_attach.outcome == 'failure')
         env:
           TAG: ${{ inputs.tag }}
+          STATUS: ${{ steps.lister.outputs.status }}
+          ATTACHED: ${{ steps.lister_attach.outcome }}
         run: |
-          echo "::error title=Surface lister not released::The surface lister failed to build or test at ${TAG}. The matcher was attached and announced; the lister was not. Fix it and re-run this workflow with workflow_dispatch for this tag."
+          echo "::error title=Surface lister not released::The surface lister was not released at ${TAG} (build and tests: ${STATUS}; attach: ${ATTACHED}). The matcher was attached and announced; the lister was not. Fix it and re-run this workflow with workflow_dispatch for this tag."
           exit 1

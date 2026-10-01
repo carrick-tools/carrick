@@ -12,7 +12,8 @@
 #   release-artifacts.sh lister-status         reads BUILD_OUTCOME, BUILT, TEST_OUTCOME;
 #                                              writes ok= and status= to $GITHUB_OUTPUT
 #   release-artifacts.sh upload-lister <tag>   reads LISTER_OK; uploads nothing unless it passed
-#   release-artifacts.sh dispatch <tag>        reads LISTER_OK, SOURCE_SHA; runs `gh api`
+#   release-artifacts.sh dispatch <tag>        reads LISTER_OK, LISTER_ATTACHED (the attach step's
+#                                              outcome), SOURCE_SHA; runs `gh api`
 #
 # Paths are relative to the working directory: wasm-artifact/ (matcher) and
 # lister-artifact/ (lister). GH names the gh binary (a stub in the test).
@@ -67,7 +68,8 @@ case "${1:-}" in
     dts_sha="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
     wasm_sha="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
     lister=()
-    if lister_ships; then
+    # Announced only when it is attached: the cloud fetches what it is told.
+    if lister_ships && [ "${LISTER_ATTACHED:-}" = "success" ]; then
       manifest_sha="$(sha256sum "$LISTER_MANIFEST" | awk '{print $1}')"
       lister=(-f "client_payload[lister_manifest_sha256]=$manifest_sha")
     fi
