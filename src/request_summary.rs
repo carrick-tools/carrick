@@ -324,6 +324,9 @@ struct ClientInstance {
     /// Every argument's literal reading, for the names a claim binds to the
     /// instance (carrick#1616).
     args: Vec<LitArg>,
+    /// Where the maker call starts, in the module that declares the
+    /// instance: the definition a name the maker binds resolves to.
+    site_start: u32,
 }
 
 /// Whether an instance was called or constructed into being.
@@ -2924,6 +2927,7 @@ impl Reader<'_> {
                     .iter()
                     .map(|arg| scope.module.lit_arg(&arg.expr))
                     .collect(),
+                site_start: self.site(expr.unwrap_parens().span()).span_start,
             }),
             // A write through the export before the factory ran reaches the
             // instance; the caller adds the instance binding's own uses.
@@ -4592,6 +4596,12 @@ pub struct LibraryRow {
     /// The call registers a handler under the name it makes (a maker with a
     /// name and a handler), rather than an op on a receiver.
     pub definition: bool,
+    /// Where the name means something (scope variant; `Global` otherwise).
+    pub scope: crate::library_claims::NameScope,
+    /// The definition the name resolves to, as `<file>:<span start>` of the
+    /// maker call: the instance's maker for a name the maker binds, the call
+    /// itself for a definition. `None` for a name written at the call.
+    pub anchor: Option<String>,
 }
 
 /// What became of one call made through a classified library export.
@@ -4738,7 +4748,7 @@ impl LibraryReader<'_> {
         if self.sites.target(self.file, call.site.lo).is_some() {
             return None;
         }
-        let (client, _) = self.clients.client_in_scope(self.file, &receiver.client)?;
+        let (client, declared_in) = self.clients.client_in_scope(self.file, &receiver.client)?;
         let export = self.claims.export(&client.package, &client.export)?;
         if !matches!(export.facts.role, Role::Broker | Role::Socket) {
             return None;
@@ -4751,7 +4761,7 @@ impl LibraryReader<'_> {
         if !export.claims(&receiver_id, member) {
             return None;
         }
-        let outcome = match self.state(call, client, export, &receiver_id, member) {
+        let outcome = match self.state(call, client, declared_in, export, &receiver_id, member) {
             Ok(rows) => LibraryOutcome::Stated(rows),
             Err(reason) => LibraryOutcome::Silent(reason),
         };
@@ -4767,10 +4777,12 @@ impl LibraryReader<'_> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn state(
         &self,
         call: &CallIr,
         client: &ClientRef,
+        declared_in: &Path,
         export: &crate::library_claims::SurfaceExport,
         receiver_id: &str,
         member: Option<&str>,
@@ -4834,7 +4846,12 @@ impl LibraryReader<'_> {
 
         let mut rows = Vec::new();
         let mut silent: Option<&'static str> = None;
-        let row = |kind: LibraryRowKind, name: String, claim_ids: Vec<String>, definition: bool| {
+        let row = |kind: LibraryRowKind,
+                   name: String,
+                   claim_ids: Vec<String>,
+                   definition: bool,
+                   scope: crate::library_claims::NameScope,
+                   anchor: Option<String>| {
             let mut claim_ids = claim_ids;
             claim_ids.sort();
             claim_ids.dedup();
@@ -4850,6 +4867,8 @@ impl LibraryReader<'_> {
                 receiver: receiver_id.to_string(),
                 member: member.map(str::to_string),
                 definition,
+                scope,
+                anchor,
             }
         };
 
@@ -4876,6 +4895,8 @@ impl LibraryReader<'_> {
                             name,
                             vec![definition.claim_id.clone()],
                             true,
+                            definition.makes.scope,
+                            Some(format!("{}:{}", self.file.display(), call.site.span_start)),
                         )),
                     },
                 }
@@ -4949,7 +4970,14 @@ impl LibraryReader<'_> {
             if let Some((_, maker)) = maker {
                 claim_ids.push(maker.claim_id.clone());
             }
-            rows.push(row(kind, name, claim_ids, false));
+            let (scope, anchor) = match (&op.name, maker) {
+                (Some(NameSource::Maker), Some((instance, maker))) => (
+                    maker.makes.scope,
+                    Some(format!("{}:{}", declared_in.display(), instance.site_start)),
+                ),
+                _ => (op.scope, None),
+            };
+            rows.push(row(kind, name, claim_ids, false, scope, anchor));
         }
         if rows.is_empty() {
             return Err(silent.unwrap_or("not_verified"));

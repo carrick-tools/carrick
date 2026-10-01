@@ -268,6 +268,10 @@ async fn the_reader_states_each_positive_and_refuses_each_negative() {
             "consumer socket-client.ts:8 socket|client_to_server|order:place",
             "producer socket-server.ts:6 socket|client_to_server|order:place",
             "consumer socket-server.ts:7 socket|server_to_client|order:accepted",
+            // The typed-emitter socket: stated only because every claim is
+            // read as verified here (`socket_readings_on_a_typed_emitter_base`).
+            "producer live-prices.ts:7 socket|server_to_client|price:updated",
+            "consumer live-prices.ts:8 socket|client_to_server|price:subscribe",
         ]),
         "routes.ts:10/11 (computed names), routes.ts:18 (a local shadows the constant), \
          kv.ts:12 (a wildcard), kv.ts:16 (a parameter shadows the constant), kv-cache.ts:9 \
@@ -320,6 +324,10 @@ async fn the_verifier_refuses_what_the_types_cannot_pin() {
         "producer bus.ts:6 pubsub|cache.flushed",
         "consumer bus.ts:7 pubsub|cache.flushed",
         "producer tasks.ts:26 pubsub|nightly-report",
+        // Strict: `on` is only the emitter base's, and `emit`'s name slot
+        // is a key of an index-signature map.
+        "producer live-prices.ts:7 socket|server_to_client|price:updated",
+        "consumer live-prices.ts:8 socket|client_to_server|price:subscribe",
     ] {
         assert!(
             !rows.contains(refused),
@@ -456,4 +464,101 @@ async fn http_claims_in_the_shared_shape_state_the_same_rows() {
         "the fixture states library rows to compare: {before:#?}"
     );
     assert_eq!(before, after);
+}
+
+/// The verifier's socket readings on a client whose `on` comes from an
+/// emitter base bound to the package's own events and whose event names are
+/// keys of a generic index-signature map: nothing under the strict reading or
+/// with the inherited-member reading alone; both rows with the index-key
+/// reading too, which rests on the claim (argument 0 is the event), not on
+/// the types. The library's own `connect` stays silent under every reading.
+#[tokio::test]
+#[serial]
+async fn socket_readings_on_a_typed_emitter_base() {
+    let live = |rows: &BTreeSet<String>| -> BTreeSet<String> {
+        rows.iter()
+            .filter(|row| row.contains("live-prices.ts"))
+            .cloned()
+            .collect()
+    };
+    let mut seen = Vec::new();
+    for reading in ["a", "ab"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cassette) = fixture_copy(tmp.path(), "library-claims");
+        mock_env(&cassette, false);
+        // SAFETY: every test in this binary is `#[serial]`.
+        unsafe { std::env::set_var(carrick::library_claims::SOCKET_READING_ENV, reading) };
+        let sidecar = real_sidecar(&repo);
+        let data = scan(&repo, Some(&sidecar)).await;
+        unsafe { std::env::remove_var(carrick::library_claims::SOCKET_READING_ENV) };
+        seen.push(live(&rows_from(
+            &data,
+            Some(ResolutionSource::LibraryClaim),
+        )));
+    }
+    assert_eq!(
+        seen[0],
+        BTreeSet::new(),
+        "the inherited-member reading alone"
+    );
+    assert_eq!(
+        seen[1],
+        set(&[
+            "producer live-prices.ts:7 socket|server_to_client|price:updated",
+            "consumer live-prices.ts:8 socket|client_to_server|price:subscribe",
+        ]),
+        "with the index-key reading"
+    );
+}
+
+/// The name-scope VARIANT (not in the design record): a name the claim
+/// scopes to the service that defines it is keyed with that service, so no
+/// other service's row on the same name can pair with it. The rows are the
+/// same rows; only their key moves.
+#[tokio::test]
+#[serial]
+async fn a_service_scoped_name_is_keyed_with_its_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path(), "library-claims");
+    let path = cassette.join("framework-detect/framework-detect.json");
+    let mut answer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for entry in answer["library_claims"].as_array_mut().unwrap() {
+        if entry["package"] != "@fixture/tasks" {
+            continue;
+        }
+        for export in entry["exports"].as_array_mut().unwrap() {
+            for list in ["makes", "ops"] {
+                if let Some(items) = export.get_mut(list).and_then(|v| v.as_array_mut()) {
+                    for item in items {
+                        item["scope"] = serde_json::json!("service");
+                    }
+                }
+            }
+        }
+    }
+    std::fs::write(&path, answer.to_string()).unwrap();
+    mock_env(&cassette, true);
+    let data = scan(&repo, None).await;
+    let rows = rows_from(&data, Some(ResolutionSource::LibraryClaim));
+    let owner = data
+        .service_name
+        .clone()
+        .unwrap_or_else(|| data.repo_name.clone());
+    assert!(
+        rows.contains(&format!("producer tasks.ts:3 pubsub|send-email@{owner}")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.contains(&format!("consumer routes.ts:5 pubsub|send-email@{owner}")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.ends_with("pubsub|send-email")),
+        "no task row keeps the global key: {rows:#?}"
+    );
+    assert!(
+        rows.contains("consumer kv.ts:7 pubsub|orders.created"),
+        "a name the claim leaves global keeps the global key: {rows:#?}"
+    );
 }

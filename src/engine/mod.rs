@@ -3984,7 +3984,17 @@ fn append_library_operations(
     use crate::request_summary::LibraryRowKind;
     let mut sites = LibrarySites::default();
     let mut stated = 0usize;
+    // A service-scoped name (the scope variant) is keyed with the service
+    // that owns it, so no other service's row can pair with it.
+    let owner = cloud_data
+        .service_name
+        .clone()
+        .unwrap_or_else(|| cloud_data.repo_name.clone());
     for (file, row) in library.rows() {
+        let keyed = match row.scope {
+            crate::library_claims::NameScope::Global => row.name.clone(),
+            crate::library_claims::NameScope::Service => format!("{}@{owner}", row.name),
+        };
         let rel = protocol_rel(file, repo_root);
         sites
             .named
@@ -3998,7 +4008,7 @@ fn append_library_operations(
         match row.kind {
             LibraryRowKind::Pubsub(role) => {
                 sites.pubsub.insert((rel, row.line, row.name.clone(), role));
-                let key = OperationKey::pubsub(row.name.clone());
+                let key = OperationKey::pubsub(keyed.clone());
                 match role {
                     PubsubRole::Subscriber => cloud_data.endpoints.push(details(key)),
                     PubsubRole::Publisher => cloud_data.calls.push(details(key)),
@@ -4008,7 +4018,7 @@ fn append_library_operations(
                 direction,
                 listener,
             } => {
-                let key = OperationKey::socket(row.name.clone(), direction);
+                let key = OperationKey::socket(keyed.clone(), direction);
                 if listener {
                     cloud_data.endpoints.push(details(key));
                 } else {
@@ -6196,6 +6206,8 @@ fn write_slice_record(
             "span": [row.span_start, row.span_end],
             "claim_ids": row.claim_ids,
             "definition": row.definition,
+            "scope": format!("{:?}", row.scope).to_lowercase(),
+            "anchor": row.anchor,
         })
     };
     let calls: Vec<serde_json::Value> = rows
@@ -6232,6 +6244,7 @@ fn write_slice_record(
         "service_root": service_root.display().to_string(),
         "elapsed_ms": verification.elapsed.as_millis() as u64,
         "error": verification.error,
+        "variants": verification.variants,
         "verdicts_by_reason": verification.by_reason(),
         "checks": checks,
         "verdicts": verification.verdicts,

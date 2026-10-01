@@ -37,9 +37,9 @@ use crate::client_semantics::{
 };
 use crate::request_summary::{MakerForm, maker_receiver};
 use crate::services::type_sidecar::{
-    BoundName, ClaimSlot, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakesForm, OpName,
-    SemanticsRequestArgs, SemanticsResult, SemanticsVerbArgs, SemanticsVerdict, SocketSide,
-    TypeSidecar,
+    BoundName, ClaimSlot, ClaimVariant, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole,
+    MakesForm, OpName, SemanticsRequestArgs, SemanticsResult, SemanticsVerbArgs, SemanticsVerdict,
+    SocketSide, TypeSidecar,
 };
 
 /// The longest member, export or key the shape admits.
@@ -111,6 +111,19 @@ pub enum OpOn {
     Both,
 }
 
+/// Where a name means something (carrick#1616 slice, scope VARIANT, not in
+/// the design record): `global` (the default) is a topic any service can
+/// publish to; `service` is an id the deployment that defines it owns (a task
+/// id, a stream id, a run's stream key), which never pairs across services.
+/// A behaviour claim, never sent to the verifier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameScope {
+    #[default]
+    Global,
+    Service,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Makes {
     pub form: MakerForm,
@@ -118,6 +131,8 @@ pub struct Makes {
     pub base: Option<Slot>,
     pub name: Option<Slot>,
     pub handler: Option<Slot>,
+    /// The scope of the name the maker binds (variant).
+    pub scope: NameScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -139,6 +154,9 @@ pub struct Op {
     /// `instance:()`, `instance:new`, ...) whose instances it acts on, where
     /// the export has more than one maker. `None`: every instance receiver.
     pub of: Option<String>,
+    /// The scope of the op's name (variant). A name bound by the maker takes
+    /// the maker's scope.
+    pub scope: NameScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -262,7 +280,15 @@ fn parse_makes(value: &Value) -> Option<Makes> {
         base: optional_slot(object.get("base"))?,
         name: optional_slot(object.get("name"))?,
         handler: optional_slot(object.get("handler"))?,
+        scope: name_scope(object.get("scope"))?,
     })
+}
+
+fn name_scope(value: Option<&Value>) -> Option<NameScope> {
+    match value {
+        None | Some(Value::Null) => Some(NameScope::Global),
+        Some(scope) => serde_json::from_value(scope.clone()).ok(),
+    }
 }
 
 fn parse_op(value: &Value) -> Option<Op> {
@@ -312,6 +338,7 @@ fn parse_op(value: &Value) -> Option<Op> {
         method,
         method_key: optional_slot(object.get("method_key"))?,
         on,
+        scope: name_scope(object.get("scope"))?,
         of: match object.get("of") {
             None | Some(Value::Null) => None,
             Some(of) => {
@@ -934,6 +961,14 @@ impl ClaimSurface {
 /// slice's report). Never set in a real scan.
 pub const ASSUME_VERIFIED_ENV: &str = "CARRICK_SLICE_ASSUME_VERIFIED";
 
+/// Set to `required_siblings` for the verifier's reading of D2 in which only a
+/// REQUIRED unassigned string sibling makes a name ambiguous (prototype).
+pub const D2_READING_ENV: &str = "CARRICK_SLICE_D2";
+
+/// Set to `a` (inherited bound emitter) or `ab` (and generic index-key maps)
+/// for the verifier's socket readings (prototype).
+pub const SOCKET_READING_ENV: &str = "CARRICK_SLICE_SOCKET";
+
 /// What one service's verification came to.
 #[derive(Debug, Clone, Default)]
 pub struct Verification {
@@ -946,6 +981,8 @@ pub struct Verification {
     pub elapsed: std::time::Duration,
     /// The sidecar failed outright, and why.
     pub error: Option<String>,
+    /// The verifier readings the request asked for (empty: strict).
+    pub variants: Vec<String>,
 }
 
 impl Verification {
@@ -1075,7 +1112,29 @@ pub fn verify(
     };
     let checks: Vec<LibraryCheck> = derived.checks.iter().map(wire_check).collect();
     let started = std::time::Instant::now();
-    let results = sidecar.verify_library_claims(from_dir, &checks);
+    // Which reading of the design's D2 the verifier applies (prototype):
+    // strict unless the slice asks for the required-siblings reading.
+    let mut variants: Vec<ClaimVariant> = match std::env::var(D2_READING_ENV).as_deref() {
+        Ok("required_siblings") => vec![ClaimVariant::D2RequiredSiblings],
+        _ => Vec::new(),
+    };
+    // The socket readings (prototype): `a` reads a member the package
+    // inherits from an emitter base it binds to its own declared events;
+    // `ab` also takes a name slot keyed by a generic index-signature map,
+    // which rests on the claim rather than on the types.
+    match std::env::var(SOCKET_READING_ENV).as_deref() {
+        Ok("a") => variants.push(ClaimVariant::InheritedBoundEmitter),
+        Ok("ab") => {
+            variants.push(ClaimVariant::InheritedBoundEmitter);
+            variants.push(ClaimVariant::IndexKeyGenericMap);
+        }
+        _ => {}
+    }
+    verification.variants = variants
+        .iter()
+        .map(|variant| format!("{variant:?}"))
+        .collect();
+    let results = sidecar.verify_library_claims_with(from_dir, &checks, &variants);
     verification.elapsed = started.elapsed();
     match results {
         Ok(results) => {
