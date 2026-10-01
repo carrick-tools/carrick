@@ -101,7 +101,7 @@ pub enum OpKind {
 /// Which receivers an op acts on: the export, the instances its makers make,
 /// or both. Not in the design record's shape; without it every op is checked
 /// on every receiver, and an op whose slots differ between the export and its
-/// instances (`streams.append(name, value)` against `stream.append(value)`)
+/// instances (`client.write(name, value)` against `instance.write(value)`)
 /// could verify on the receiver it was never claimed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +135,10 @@ pub struct Op {
     /// HTTP only: where the method sits.
     pub method_key: Option<Slot>,
     pub on: OpOn,
+    /// For an op on instances: the one receiver (`instance:<member>`,
+    /// `instance:()`, `instance:new`, ...) whose instances it acts on, where
+    /// the export has more than one maker. `None`: every instance receiver.
+    pub of: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -308,6 +312,16 @@ fn parse_op(value: &Value) -> Option<Op> {
         method,
         method_key: optional_slot(object.get("method_key"))?,
         on,
+        of: match object.get("of") {
+            None | Some(Value::Null) => None,
+            Some(of) => {
+                let of = of.as_str()?;
+                if !of.starts_with("instance:") || on != OpOn::Instance {
+                    return None;
+                }
+                Some(of.to_string())
+            }
+        },
     })
 }
 
@@ -667,28 +681,49 @@ fn derive_export(
     for op in &export.ops {
         let receivers: Vec<String> = match op.on {
             OpOn::Export => vec!["export".to_string()],
-            OpOn::Instance => instance_receivers.clone(),
+            OpOn::Instance => instance_receivers
+                .iter()
+                .filter(|receiver| op.of.as_ref().is_none_or(|of| of == *receiver))
+                .cloned()
+                .collect(),
             OpOn::Both => std::iter::once("export".to_string())
                 .chain(instance_receivers.iter().cloned())
                 .collect(),
         };
         state(
             format!(
-                "{prefix}:ops:{}:{}:{}",
+                "{prefix}:ops:{}:{}:{}{}",
                 op_name(op.op),
                 op.member.as_deref().unwrap_or("()"),
-                on_name(op.on)
+                on_name(op.on),
+                op.of
+                    .as_deref()
+                    .map(|of| format!(":{of}"))
+                    .unwrap_or_default()
             ),
             receivers,
             Claim::Op(op.clone()),
         );
     }
     for reserved in &export.reserved {
-        state(
-            format!("{prefix}:reserved:{}:{}", reserved.member, reserved.name),
-            std::iter::once("export".to_string())
+        // On the receivers an op of the same member acts on: a name the
+        // library emits is spelled where its listener is declared.
+        let on = export
+            .ops
+            .iter()
+            .find(|op| op.member.as_deref() == Some(reserved.member.as_str()))
+            .map(|op| op.on)
+            .unwrap_or(OpOn::Both);
+        let receivers: Vec<String> = match on {
+            OpOn::Export => vec!["export".to_string()],
+            OpOn::Instance => instance_receivers.clone(),
+            OpOn::Both => std::iter::once("export".to_string())
                 .chain(instance_receivers.iter().cloned())
                 .collect(),
+        };
+        state(
+            format!("{prefix}:reserved:{}:{}", reserved.member, reserved.name),
+            receivers,
             Claim::Reserved(reserved.clone()),
         );
     }

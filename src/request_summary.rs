@@ -4792,6 +4792,11 @@ impl LibraryReader<'_> {
                 let maker = export
                     .maker(instance.form, instance.member.as_deref())
                     .ok_or("maker_unverified")?;
+                // The call's own op first, so a refused op reads as refused
+                // rather than as a call outside the surface.
+                if export.ops_on(receiver_id, member).next().is_none() {
+                    return Err("not_verified");
+                }
                 if client.called_computed
                     || client
                         .called

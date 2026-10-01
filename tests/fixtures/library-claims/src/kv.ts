@@ -1,6 +1,6 @@
 import { KvClient } from "@fixture/kv";
 
-const kv = new KvClient("redis://localhost:6379");
+const kv = new KvClient("kv://localhost:6379");
 const ORDERS = "orders.created";
 
 export async function publishOrder(id: string) {
