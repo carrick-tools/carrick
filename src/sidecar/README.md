@@ -857,7 +857,7 @@ Response, written before the process exits:
 | `src/bundler.ts` | Legacy symbol bundling and surface emission |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
-| `src/client-semantics.ts` | `verify_client_semantics`: library claims against a package's declarations |
+| `src/library-claims.ts` | `verify_library_claims`, `verify_client_semantics` and `list_library_surface`: library claims against a package's own declarations |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
 | `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |
