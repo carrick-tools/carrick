@@ -1,0 +1,13 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [
+    "@fixture/queue",
+    "fixture-private-bus"
+  ],
+  "socket_clients": [
+    "@fixture/beacon",
+    "@fixture/live"
+  ],
+  "notes": ""
+}

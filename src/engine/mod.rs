@@ -302,6 +302,109 @@ fn untouched_reading_clause(reading: &crate::pr_baseline::UntouchedReading) -> S
 /// A copy another scanner version wrote is compared with when that scanner
 /// read the files this PR left alone as this run did (carrick#1530).
 /// `as_uploaded` is this run's services in the form main's copy was stored in.
+/// An operation of one of this repo's services: in a monorepo an endpoint
+/// newly added to one service still counts as new even if a sibling service
+/// already exposes the same route.
+type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+
+/// What a PR's endpoint delta is compared with (carrick#1712).
+#[derive(Debug, PartialEq, Eq)]
+enum DeltaBaseline {
+    /// No stored index of this repo: nothing to compare with.
+    Absent,
+    /// A stored index another scanner version wrote, or one that did not say
+    /// which: a row this run states and it did not may be the scanner's
+    /// change rather than the PR's, so no delta is shown. Once main is
+    /// scanned by this version, the versions agree and the delta returns.
+    /// Holds the versions it names, for the log.
+    OtherScanner(Vec<String>),
+    /// The stored index's operations, by service and key.
+    Keys(HashSet<ServiceEndpointKey>),
+}
+
+impl DeltaBaseline {
+    /// The baseline `stored` (this repo's stored services) gives a run of
+    /// `scanner`.
+    fn of<'a>(stored: impl IntoIterator<Item = &'a CloudRepoData>, scanner: &str) -> Self {
+        let stored: Vec<&CloudRepoData> = stored.into_iter().collect();
+        if stored.is_empty() {
+            return Self::Absent;
+        }
+        if stored
+            .iter()
+            .any(|repo| repo.scanner_version.as_deref() != Some(scanner))
+        {
+            let mut versions: Vec<String> = stored
+                .iter()
+                .map(|repo| {
+                    repo.scanner_version
+                        .clone()
+                        .unwrap_or_else(|| "of unknown version".to_string())
+                })
+                .collect();
+            versions.sort();
+            versions.dedup();
+            return Self::OtherScanner(versions);
+        }
+        Self::Keys(
+            stored
+                .iter()
+                .flat_map(|repo| {
+                    repo.endpoints
+                        .iter()
+                        .map(|e| (repo.service_name.clone(), e.key.clone()))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The operations `current` states that `previous` lacks, and those
+/// `previous` states that `current` no longer does, each sorted by (method,
+/// path, service) so the output is deterministic even when two services add
+/// or drop the same operation.
+fn endpoint_delta(
+    previous: &HashSet<ServiceEndpointKey>,
+    current: &[CloudRepoData],
+) -> crate::findings::PrDelta {
+    let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
+        let (label, name) = key.display_labels();
+        crate::findings::EndpointRef {
+            method: label,
+            path: name,
+            service: service.clone(),
+        }
+    };
+    let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
+        refs.sort_by(|a, b| {
+            (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
+        });
+    };
+    let mut current_keys = HashSet::new();
+    let mut new_endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for service_data in current {
+        for endpoint in &service_data.endpoints {
+            let id = (service_data.service_name.clone(), endpoint.key.clone());
+            current_keys.insert(id.clone());
+            if !previous.contains(&id) && seen.insert(id) {
+                new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
+            }
+        }
+    }
+    let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous
+        .iter()
+        .filter(|id| !current_keys.contains(*id))
+        .map(|(service, key)| endpoint_ref(service, key))
+        .collect();
+    sort_refs(&mut new_endpoints);
+    sort_refs(&mut removed_endpoints);
+    crate::findings::PrDelta {
+        new_endpoints,
+        removed_endpoints,
+    }
+}
+
 fn main_copy_against_base(
     repo_path: &str,
     main_self: &[CloudRepoData],
@@ -1094,35 +1197,24 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         None
     };
 
-    // On a PR run, capture this repo's previously-indexed endpoints (its last
-    // uploaded state, i.e. main) before they're removed below, so the diff can
-    // surface what this change added relative to that baseline. Keyed by
-    // (service, key) so that in a
-    // monorepo an endpoint newly added to one service still counts as new even
-    // if a sibling service already exposes the same route. `had_prior_index` is
-    // tracked separately so a prior scan that indexed zero endpoints still
-    // counts as a baseline, rather than being conflated with a first-ever scan
-    // where "new" is meaningless. On non-PR runs the capture is skipped
-    // entirely, since the block is suppressed there anyway.
-    type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+    // On a PR run, read what this repo's last uploaded index (main) says
+    // before it is removed below, so the delta can surface what this change
+    // added and removed relative to it. `had_prior_index` is tracked
+    // separately so a prior scan that indexed zero endpoints still counts as
+    // a baseline, rather than being conflated with a first-ever scan where
+    // "new" is meaningless. On non-PR runs the capture is skipped entirely,
+    // since the block is suppressed there anyway.
     let is_pr_run = pr_number_from_env().is_some();
-    let (had_prior_index, previous_self_keys): (
-        bool,
-        std::collections::HashSet<ServiceEndpointKey>,
-    ) = if is_pr_run {
-        let had = all_repo_data.iter().any(|repo| repo.repo_name == repo_name);
-        let keys = all_repo_data
+    let (had_prior_index, delta_baseline) = if is_pr_run {
+        let stored = all_repo_data
             .iter()
-            .filter(|repo| repo.repo_name == repo_name)
-            .flat_map(|repo| {
-                repo.endpoints
-                    .iter()
-                    .map(|e| (repo.service_name.clone(), e.key.clone()))
-            })
-            .collect();
-        (had, keys)
+            .filter(|repo| repo.repo_name == repo_name);
+        (
+            all_repo_data.iter().any(|repo| repo.repo_name == repo_name),
+            DeltaBaseline::of(stored, env!("CARGO_PKG_VERSION")),
+        )
     } else {
-        (false, std::collections::HashSet::new())
+        (false, DeltaBaseline::Absent)
     };
 
     // What the analysis phase put on the wire, once, for the whole scan. A
@@ -1192,55 +1284,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         peer_repo_count, local_service_count
     );
 
-    // On a PR run with a prior index, surface what this change added and
-    // removed: operations in the freshly-analyzed services that the previous
-    // (last-uploaded) index didn't have, and previously-indexed operations
-    // that no longer exist. Because the baseline is the last uploaded index,
-    // this can include an operation that landed on main since its last scan
-    // rather than in this PR. Computed before `current_services_data` is
-    // moved into the analyzer.
-    let pr_delta = if is_pr_run && had_prior_index {
-        let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
-            let (label, name) = key.display_labels();
-            crate::findings::EndpointRef {
-                method: label,
-                path: name,
-                service: service.clone(),
-            }
-        };
-        // Sort by (method, path, service) for deterministic output even when
-        // two services add or drop the same operation.
-        let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
-            refs.sort_by(|a, b| {
-                (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
-            });
-        };
-
-        let mut current_keys = std::collections::HashSet::new();
-        let mut new_endpoints = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for service_data in &current_services_data {
-            for endpoint in &service_data.endpoints {
-                let id = (service_data.service_name.clone(), endpoint.key.clone());
-                current_keys.insert(id.clone());
-                if !previous_self_keys.contains(&id) && seen.insert(id) {
-                    new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
-                }
-            }
+    // On a PR run with a prior index this scanner version wrote, surface
+    // what this change added and removed: operations in the freshly-analyzed
+    // services that the previous (last-uploaded) index didn't have, and
+    // previously-indexed operations that no longer exist. Because the
+    // baseline is the last uploaded index, this can include an operation that
+    // landed on main since its last scan rather than in this PR. Computed
+    // before `current_services_data` is moved into the analyzer.
+    let pr_delta = match delta_baseline {
+        DeltaBaseline::Keys(previous) => Some(endpoint_delta(&previous, &current_services_data)),
+        DeltaBaseline::OtherScanner(versions) => {
+            info!(
+                "Main's index was written by Carrick {} and this run is Carrick {}, so the PR \
+                 comment lists no endpoint changes until main is scanned again",
+                versions.join(", "),
+                env!("CARGO_PKG_VERSION")
+            );
+            None
         }
-        let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous_self_keys
-            .iter()
-            .filter(|id| !current_keys.contains(*id))
-            .map(|(service, key)| endpoint_ref(service, key))
-            .collect();
-        sort_refs(&mut new_endpoints);
-        sort_refs(&mut removed_endpoints);
-        Some(crate::findings::PrDelta {
-            new_endpoints,
-            removed_endpoints,
-        })
-    } else {
-        None
+        DeltaBaseline::Absent => None,
     };
 
     // Collect the merged type manifest before `all_repo_data` /
@@ -2778,25 +2840,22 @@ async fn analyze_current_repo_incremental(
     } = discover_files_and_symbols(repo_path, config, cm.clone())?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
-    // 3. Check if we can use incremental mode
-    let can_use_incremental = previous_data.and_then(|prev| {
-        // Must have file_results and matching cache_version
-        let has_cache = prev.file_results.is_some();
+    // 3. Check if we can use incremental mode. The cache version is the whole
+    // test. A generation that stored no file answers (none of its files was
+    // asked about, or every answered file was edited when it was written)
+    // holds an empty answer cache, not no generation: its detection and
+    // guidance replay under the same manifest gate as any other service's.
+    // Reading it as no generation asked detection and every guidance section
+    // again on every scan (carrick#1746).
+    let can_use_incremental = previous_data.filter(|prev| {
         let version_matches = prev.cache_version == Some(CACHE_VERSION);
-        if has_cache && version_matches {
-            Some(prev)
-        } else {
-            if !has_cache {
-                debug!("No cached file_results found, running full analysis");
-            }
-            if !version_matches {
-                debug!(
-                    "Cache version mismatch (expected {}, got {:?}), running full analysis",
-                    CACHE_VERSION, prev.cache_version
-                );
-            }
-            None
+        if !version_matches {
+            debug!(
+                "Cache version mismatch (expected {}, got {:?}), running full analysis",
+                CACHE_VERSION, prev.cache_version
+            );
         }
+        version_matches
     });
 
     if let Some(prev) = can_use_incremental {
@@ -2828,7 +2887,8 @@ async fn analyze_current_repo_incremental(
                 run_intents.clone(),
             );
 
-            let prev_file_results = prev.file_results.as_ref().unwrap();
+            let no_answers = HashMap::new();
+            let prev_file_results = prev.file_results.as_ref().unwrap_or(&no_answers);
             let repo_prefix = format!("{}/", repo_path);
 
             // Helper to normalize a file path to repo-relative
@@ -3012,7 +3072,13 @@ async fn analyze_current_repo_incremental(
             // asked (carrick#1564).
             let declared_dependencies = packages.declared_dependency_names();
             let semantics_root = service_scan_root(repo_path, config);
-            let (analysis, settled) = tokio::join!(
+            let library_ask = LibraryAsk::start(
+                &request_inputs,
+                sidecar,
+                &semantics_root,
+                Path::new(repo_path),
+            );
+            let (analysis, settled, library_answer) = tokio::join!(
                 file_orchestrator.analyze_files(
                     &files,
                     &cached_model_results,
@@ -3034,6 +3100,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
+                first_library_answer(library_ask.as_ref()),
             );
             let analysis = analysis?;
             setup.detection.client_semantics = settled;
@@ -3084,8 +3151,13 @@ async fn analyze_current_repo_incremental(
                 service,
                 graphql_schemas,
             );
-            protocol_extractions.library =
-                library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &semantics_root);
+            protocol_extractions.library = library_rows(
+                library_ask.as_ref(),
+                library_answer,
+                sidecar,
+                &semantics_root,
+            )
+            .await;
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
                 &merged_results,
@@ -3196,16 +3268,21 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &service_modules,
             );
-            append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+            let library_sites = LibrarySiteIndex::of(
+                &stated_library_rows(&protocol_extractions.library, repo_path, service),
+                repo_path,
+            );
+            append_protocol_manifest_entries(
+                &mut manifest_entries,
+                &protocol_extractions,
+                &library_sites,
+            );
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
                 &merged_results,
                 &protocol_extractions.sockets,
                 &in_process_pubsub,
-                &LibrarySiteIndex::of(
-                    &stated_library_rows(&protocol_extractions.library, repo_path, service),
-                    repo_path,
-                ),
+                &library_sites,
                 repo_path,
             );
             if !manifest_entries.is_empty() {
@@ -3216,7 +3293,7 @@ async fn analyze_current_repo_incremental(
             // both resolve through the same sidecar bundle path as HTTP explicit
             // symbols (#245/#248). Concatenate both into the extra-explicit slice.
             let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-                &protocol_extractions.sockets,
+                &library_sites.typed_sockets(&protocol_extractions.sockets),
                 repo_path,
                 &service_modules,
             );
@@ -3701,7 +3778,7 @@ fn scan_protocol_extractions(
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
-    merge_graphql_consumer_locations(&mut graphql, file_results);
+    merge_graphql_consumer_locations(&mut graphql, file_results, repo_path);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
     // through a relative specifier.
@@ -3724,18 +3801,94 @@ fn scan_protocol_extractions(
     )
 }
 
-/// The library claims a service's imported packages answer, by export
-/// (carrick#1662). None yet: the scan asks the library store for them in
-/// carrick#1664, and passes them to [`library_rows`] in place of this.
-const NO_LIBRARY_CLAIMS: &[crate::library_claims::ExportClaims] = &[];
+/// A service's library sites and what the library store is asked about
+/// them (carrick#1664). Read before the analysis, so the first ask runs
+/// beside it.
+struct LibraryAsk {
+    sites: crate::request_summary::LibrarySites,
+    asked: crate::library_store::Asked,
+}
 
-/// The service's library sites read through `claims`, each verified by the
-/// sidecar against the package's own declarations, from `from_dir` (the
-/// service root, as for the client semantics). Verification runs on every
-/// scan and is never cached. No claims, or no sidecar, read nothing, and the
-/// sites are not even collected.
-fn library_rows(
-    inputs: &crate::request_summary::RequestSummaryInputs,
+impl LibraryAsk {
+    /// What the service asks, or `None` when it asks nothing: a run with no
+    /// model asks the cloud nothing, a scan with no sidecar could verify no
+    /// answer, and a service whose library calls go through no public
+    /// registry package has nothing to ask about.
+    fn start(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        sidecar: Option<&TypeSidecar>,
+        service_root: &Path,
+        repo_root: &Path,
+    ) -> Option<Self> {
+        if crate::local_mode::no_model() || sidecar.is_none() {
+            return None;
+        }
+        let sites = crate::request_summary::library_sites(inputs);
+        let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
+        let home = dirs::home_dir();
+        let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
+        let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
+        let asked = crate::library_store::request(
+            &specifiers,
+            &crate::library_store::Install {
+                service_root,
+                repo_root,
+                home: home.as_deref(),
+                yarn_registry_env: yarn_registry_env.as_deref(),
+                npm_registry_env: npm_registry_env.as_deref(),
+            },
+        )?;
+        Some(Self { sites, asked })
+    }
+}
+
+/// Send one request to the library store: one attempt, because a failure
+/// costs nothing the next scan does not fix, and a refusal or a throttle
+/// means no claims this scan.
+async fn send_to_library_store(
+    request: crate::library_store::LibraryClaimsRequest,
+) -> Result<String, crate::agent_service::AgentCallError> {
+    reask_agent()
+        .post_to_lambda(
+            crate::library_store::ROUTE,
+            &request,
+            crate::library_store::MOCK_SEED,
+        )
+        .await
+}
+
+/// The store's first answer for `ask`, asked beside the analysis.
+async fn first_library_answer(ask: Option<&LibraryAsk>) -> crate::library_store::LibraryAnswer {
+    match ask {
+        Some(ask) => {
+            crate::library_store::ask(ask.asked.request.clone(), send_to_library_store).await
+        }
+        None => crate::library_store::LibraryAnswer::default(),
+    }
+}
+
+/// The service's library rows: its library sites read through the claims
+/// the store answered (packages it had pending asked once more), each
+/// verified by the sidecar from `from_dir`. Nothing asked reads nothing.
+async fn library_rows(
+    ask: Option<&LibraryAsk>,
+    first: crate::library_store::LibraryAnswer,
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> crate::library_claims::LibraryRows {
+    let Some(ask) = ask else {
+        return crate::library_claims::LibraryRows::default();
+    };
+    let claims = crate::library_store::settle(&ask.asked, first, send_to_library_store).await;
+    read_library_rows(&ask.sites, &claims, sidecar, from_dir)
+}
+
+/// `sites` read through `claims`, each verified by the sidecar against the
+/// package's own declarations, from `from_dir` (the service root, as for the
+/// client semantics). Verification runs on every scan and is never cached.
+/// No claims, or no sidecar, read nothing.
+fn read_library_rows(
+    sites: &crate::request_summary::LibrarySites,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -3743,8 +3896,7 @@ fn library_rows(
     let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
         return crate::library_claims::LibraryRows::default();
     };
-    let sites = crate::request_summary::library_sites(inputs);
-    crate::library_claims::read(&sites, claims, |checks| {
+    crate::library_claims::read(sites, claims, |checks| {
         sidecar
             .verify_library_claims(from_dir, checks)
             .map(|answer| answer.verdicts)
@@ -4083,27 +4235,6 @@ fn append_deterministic_protocol_operations(
             }));
     }
 
-    let sockets = &extractions.sockets;
-    if !sockets.is_empty() {
-        debug!(
-            listeners = sockets.listeners.len(),
-            emitters = sockets.emitters.len(),
-            "Indexing Socket.IO operations"
-        );
-        cloud_data.endpoints.extend(
-            sockets
-                .listeners
-                .iter()
-                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
-        );
-        cloud_data.calls.extend(
-            sockets
-                .emitters
-                .iter()
-                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
-        );
-    }
-
     let library = append_library_operations(
         cloud_data,
         &extractions.library,
@@ -4112,6 +4243,40 @@ fn append_deterministic_protocol_operations(
         &to_producer,
         &to_call,
     );
+
+    // A socket pass row a library row states at the same file, line, name,
+    // direction and side is the same call read twice: the library row is the
+    // fact, so the pass's row folds into it. With no library row there, the
+    // pass's row stands (ruled on carrick#1664). Its payload anchor stays in
+    // the manifest: it types the same operation at the same site.
+    let sockets = &extractions.sockets;
+    if !sockets.is_empty() {
+        let unstated = |ops: &[crate::socket_io::SocketOp], listener: bool| -> Vec<_> {
+            ops.iter()
+                .filter(|op| !library.states_socket(&op.file_path, op.line, &op.key, listener))
+                .cloned()
+                .collect()
+        };
+        let listeners = unstated(&sockets.listeners, true);
+        let emitters = unstated(&sockets.emitters, false);
+        debug!(
+            listeners = listeners.len(),
+            emitters = emitters.len(),
+            folded =
+                sockets.listeners.len() + sockets.emitters.len() - listeners.len() - emitters.len(),
+            "Indexing Socket.IO operations"
+        );
+        cloud_data.endpoints.extend(
+            listeners
+                .iter()
+                .map(|op| to_producer(op.key.clone(), &op.file_path, op.line)),
+        );
+        cloud_data.calls.extend(
+            emitters
+                .iter()
+                .map(|op| to_call(op.key.clone(), &op.file_path, op.line)),
+        );
+    }
     append_event_bus_operations(
         cloud_data,
         &extractions.event_bus,
@@ -4132,16 +4297,26 @@ fn append_deterministic_protocol_operations(
 }
 
 /// Where library rows were stated (carrick#1662), by normalized file and
-/// line: each name, and each pub/sub name with its role. A model pub/sub row
-/// at the same file, line, topic and role is the same call read again and
-/// folds into the library row; so does an event-bus row at the same file,
-/// line and name.
+/// line: each name, each pub/sub name with its role, and each socket name
+/// with its direction and side. A model pub/sub row at the same file, line,
+/// topic and role is the same call read again and folds into the library
+/// row; so does an event-bus row at the same file, line and name, and a
+/// socket pass row at the same file, line, name, direction and side
+/// (carrick#1664).
 #[derive(Debug, Default)]
 struct LibrarySiteIndex {
     /// Files are keyed relative to this root, whichever form a caller holds.
     repo_root: PathBuf,
     named: HashSet<(PathBuf, u32, String)>,
     pubsub: HashSet<(PathBuf, u32, String, crate::operation::PubsubRole)>,
+    /// Each socket name with its direction, and whether the row listens.
+    socket: HashSet<(
+        PathBuf,
+        u32,
+        String,
+        crate::operation::SocketDirection,
+        bool,
+    )>,
 }
 
 impl LibrarySiteIndex {
@@ -4156,10 +4331,20 @@ impl LibrarySiteIndex {
             index
                 .named
                 .insert((file.clone(), row.line, row.name.clone()));
-            if let LibraryRowKind::Pubsub(role) = row.kind {
-                index
-                    .pubsub
-                    .insert((file, row.line, row.name.clone(), role));
+            match row.kind {
+                LibraryRowKind::Pubsub(role) => {
+                    index
+                        .pubsub
+                        .insert((file, row.line, row.name.clone(), role));
+                }
+                LibraryRowKind::Socket {
+                    direction,
+                    listener,
+                } => {
+                    index
+                        .socket
+                        .insert((file, row.line, row.name.clone(), direction, listener));
+                }
             }
         }
         index
@@ -4181,6 +4366,65 @@ impl LibrarySiteIndex {
     ) -> bool {
         self.pubsub
             .contains(&(self.relative(file), line, name.to_string(), role))
+    }
+
+    /// Whether a library socket row on the same side (listening or not) was
+    /// stated here for `key`'s event: in `key`'s direction, or, when the pass
+    /// could not read one (`Unknown`), in either (ruled on carrick#1664: the
+    /// library row's direction wins).
+    fn states_socket(&self, file: &Path, line: u32, key: &OperationKey, listener: bool) -> bool {
+        use crate::operation::SocketDirection;
+        let OperationKey::Socket { event, direction } = key else {
+            return false;
+        };
+        let directions: &[SocketDirection] = match direction {
+            SocketDirection::Unknown => &[
+                SocketDirection::ClientToServer,
+                SocketDirection::ServerToClient,
+            ],
+            known => std::slice::from_ref(known),
+        };
+        let file = self.relative(file);
+        directions.iter().any(|direction| {
+            self.socket
+                .contains(&(file.clone(), line, event.clone(), *direction, listener))
+        })
+    }
+
+    /// Whether `op` is a socket pass op of unknown direction folded into a
+    /// library row here: the operation it named is gone, so an anchor for it
+    /// would orphan (the library row's direction replaced its key).
+    fn folds_unknown(&self, op: &crate::socket_io::SocketOp, listener: bool) -> bool {
+        matches!(
+            op.key,
+            OperationKey::Socket {
+                direction: crate::operation::SocketDirection::Unknown,
+                ..
+            }
+        ) && self.states_socket(&op.file_path, op.line, &op.key, listener)
+    }
+
+    /// `sockets` without the ops [`Self::folds_unknown`] names: the ops
+    /// whose payload anchors still type an operation. An op folded in its own
+    /// direction keeps its anchor, which types the library row on its key.
+    fn typed_sockets(
+        &self,
+        sockets: &crate::socket_io::SocketExtraction,
+    ) -> crate::socket_io::SocketExtraction {
+        crate::socket_io::SocketExtraction {
+            listeners: sockets
+                .listeners
+                .iter()
+                .filter(|op| !self.folds_unknown(op, true))
+                .cloned()
+                .collect(),
+            emitters: sockets
+                .emitters
+                .iter()
+                .filter(|op| !self.folds_unknown(op, false))
+                .cloned()
+                .collect(),
+        }
     }
 
     fn states_name(&self, file: &Path, line: u32, name: &str) -> bool {
@@ -4951,14 +5195,18 @@ fn merge_graphql_resolver_locations(
 fn merge_graphql_consumer_locations(
     graphql: &mut crate::graphql::GraphqlExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
 ) {
     // (file_path, canonical_key) -> index. A consumer op's identity for this
     // join is its file AND its operation key together — never the key alone.
+    // Both sides are read repo-relative: the op carries the path the scan
+    // discovered, and the incremental path's answers are keyed repo-relative
+    // (carrick#1725).
     let mut by_file_key: HashMap<(String, String), usize> = HashMap::new();
     for (idx, op) in graphql.consumers.iter().enumerate() {
         by_file_key.insert(
             (
-                op.file_path.to_string_lossy().to_string(),
+                repo_relative(&op.file_path.to_string_lossy(), repo_path),
                 op.key.canonical(),
             ),
             idx,
@@ -4968,7 +5216,8 @@ fn merge_graphql_consumer_locations(
     for (path, result) in file_results {
         for locate in &result.graphql_consumer_locates {
             let key = OperationKey::graphql(locate.kind, locate.field.clone());
-            let Some(&idx) = by_file_key.get(&(path.clone(), key.canonical())) else {
+            let file = repo_relative(path, repo_path);
+            let Some(&idx) = by_file_key.get(&(file, key.canonical())) else {
                 debug!(
                     op = %key.canonical(),
                     file = %path,
@@ -5014,7 +5263,9 @@ fn merge_graphql_consumer_locations(
 fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
+    library: &LibrarySiteIndex,
 ) {
+    let sockets = library.typed_sockets(&extractions.sockets);
     for op in &extractions.graphql.producers {
         add_protocol_manifest_entry(
             entries,
@@ -5058,7 +5309,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.listeners {
+    for op in &sockets.listeners {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -5069,7 +5320,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.emitters {
+    for op in &sockets.emitters {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -7518,7 +7769,13 @@ async fn analyze_current_repo(
     // settled; the analysis reads them only once the model has been asked
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
-    let (analysis_result, settled) = tokio::join!(
+    let library_ask = LibraryAsk::start(
+        &request_inputs,
+        sidecar,
+        &service_root,
+        Path::new(repo_path),
+    );
+    let (analysis_result, settled, library_answer) = tokio::join!(
         orchestrator.run_complete_analysis(
             files.clone(),
             packages,
@@ -7539,6 +7796,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
+        first_library_answer(library_ask.as_ref()),
     );
     let analysis_result = analysis_result?;
     setup.detection.client_semantics = settled;
@@ -7581,7 +7839,7 @@ async fn analyze_current_repo(
         graphql_schemas,
     );
     protocol_extractions.library =
-        library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &service_root);
+        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root).await;
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
@@ -7655,16 +7913,17 @@ async fn analyze_current_repo(
         repo_path,
         &service_modules,
     );
-    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+    let library_sites = LibrarySiteIndex::of(
+        &stated_library_rows(&protocol_extractions.library, repo_path, service),
+        repo_path,
+    );
+    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions, &library_sites);
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
         &protocol_extractions.sockets,
         &in_process_pubsub,
-        &LibrarySiteIndex::of(
-            &stated_library_rows(&protocol_extractions.library, repo_path, service),
-            repo_path,
-        ),
+        &library_sites,
         repo_path,
     );
     if !manifest_entries.is_empty() {
@@ -7681,7 +7940,7 @@ async fn analyze_current_repo(
     // resolve through the same sidecar bundle path as HTTP explicit symbols
     // (#245/#248). Concatenate both into the extra-explicit slice.
     let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-        &protocol_extractions.sockets,
+        &library_sites.typed_sockets(&protocol_extractions.sockets),
         repo_path,
         &service_modules,
     );
@@ -16281,8 +16540,188 @@ mod tests {
         );
     }
 
-    /// carrick#1662: with no claims (every scan until carrick#1664 asks the
-    /// library store), or no sidecar to verify them, nothing is read.
+    /// A socket pass op at `file:line`, keyed `name` in `direction`.
+    fn socket_op_at(
+        file: &str,
+        line: u32,
+        name: &str,
+        direction: crate::operation::SocketDirection,
+    ) -> crate::socket_io::SocketOp {
+        crate::socket_io::SocketOp {
+            key: OperationKey::socket(name, direction),
+            file_path: PathBuf::from(file),
+            line,
+            payload_type_symbol: None,
+            payload_type_source: None,
+        }
+    }
+
+    /// Ruled on carrick#1664: a socket pass row folds into the verified
+    /// library socket row at the same file, line, name, direction and side,
+    /// as an event-bus row does; a row whose direction the pass could not
+    /// read folds into one at the same file, line, name and side, whose
+    /// direction wins. Any other socket row stands, the opposite side at the
+    /// same site included, and with no library row the pass's row stands.
+    /// The repo path is absolute and the pass's files are too, as a full scan
+    /// walks them; the library rows are relative.
+    #[test]
+    fn a_socket_pass_row_folds_into_the_library_row_at_its_site_and_no_other() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::library_claims::{LibraryRowKind, LibraryRows};
+        use crate::operation::SocketDirection::{ClientToServer, ServerToClient, Unknown};
+
+        let live = "/repo/svc/src/live.ts";
+        let extractions = ProtocolExtractions {
+            library: LibraryRows {
+                rows: vec![
+                    library_row(
+                        "svc/src/live.ts",
+                        4,
+                        "chat",
+                        LibraryRowKind::Socket {
+                            direction: ClientToServer,
+                            listener: true,
+                        },
+                    ),
+                    library_row(
+                        "svc/src/live.ts",
+                        5,
+                        "typing",
+                        LibraryRowKind::Socket {
+                            direction: ServerToClient,
+                            listener: false,
+                        },
+                    ),
+                ],
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![
+                    socket_op_at(live, 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat", Unknown),
+                    socket_op_at(live, 4, "chat", ServerToClient),
+                    socket_op_at(live, 9, "chat", ClientToServer),
+                    socket_op_at("/repo/svc/src/other.ts", 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat-room", ClientToServer),
+                    socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
+                ],
+                emitters: vec![
+                    socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
+                    socket_op_at(live, 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat", Unknown),
+                ],
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &HashMap::new(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            "/repo",
+            &Config::default(),
+        );
+        let rows =
+            |rows: &[ApiEndpointDetails]| -> Vec<(String, String, Option<ResolutionSource>)> {
+                let mut rows: Vec<_> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.key.canonical(),
+                            row.file_path.display().to_string(),
+                            row.resolution_source,
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+        let fact = Some(ResolutionSource::LibraryClaim);
+        let row = |key: &str, at: &str, source: Option<ResolutionSource>| {
+            (key.to_string(), at.to_string(), source)
+        };
+        let (live4, live5) = ("/repo/svc/src/live.ts:4", "/repo/svc/src/live.ts:5");
+        assert_eq!(
+            rows(&cloud_data.endpoints),
+            vec![
+                row(
+                    "socket|CLIENT->SERVER|chat",
+                    "/repo/svc/src/live.ts:9",
+                    None
+                ),
+                row(
+                    "socket|CLIENT->SERVER|chat",
+                    "/repo/svc/src/other.ts:4",
+                    None
+                ),
+                row("socket|CLIENT->SERVER|chat", "svc/src/live.ts:4", fact),
+                row("socket|CLIENT->SERVER|chat-room", live4, None),
+                row("socket|SERVER->CLIENT|chat", live4, None),
+                row("socket|SERVER->CLIENT|typing", live5, None),
+                row("socket|UNKNOWN|typing", live5, None),
+            ],
+            "the listeners at the library listener's site in its direction or none fold; \
+             every other listener stands, those at the library emitter's site included"
+        );
+        assert_eq!(
+            rows(&cloud_data.calls),
+            vec![
+                row("socket|CLIENT->SERVER|chat", live4, None),
+                row("socket|SERVER->CLIENT|typing", "svc/src/live.ts:5", fact),
+                row("socket|UNKNOWN|chat", live4, None),
+            ],
+            "the emitters at the library emitter's site fold; those at a listener's site stand"
+        );
+
+        // An op folded in its own direction keeps its payload anchor, which
+        // types the library row on the same key; one of unknown direction
+        // loses it, as no operation has its key any more.
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::of(
+                &stated_library_rows(&extractions.library, "/repo", &Config::default()),
+                "/repo",
+            ),
+        );
+        let anchored: Vec<(String, bool, u32)> = {
+            let mut anchored: Vec<(String, bool, u32)> = entries
+                .iter()
+                .filter(|entry| entry.file_path == live && entry.line_number <= 5)
+                .map(|entry| {
+                    (
+                        entry.key.canonical(),
+                        entry.role == ManifestRole::Producer,
+                        entry.line_number,
+                    )
+                })
+                .collect();
+            anchored.sort();
+            anchored
+        };
+        let anchor = |key: &str, listener: bool, line: u32| (key.to_string(), listener, line);
+        assert_eq!(
+            anchored,
+            vec![
+                anchor("socket|CLIENT->SERVER|chat", false, 4),
+                anchor("socket|CLIENT->SERVER|chat", true, 4),
+                anchor("socket|CLIENT->SERVER|chat-room", true, 4),
+                anchor("socket|SERVER->CLIENT|chat", true, 4),
+                anchor("socket|SERVER->CLIENT|typing", false, 5),
+                anchor("socket|SERVER->CLIENT|typing", true, 5),
+                anchor("socket|UNKNOWN|chat", false, 4),
+                anchor("socket|UNKNOWN|typing", true, 5),
+            ],
+            "the folded listener of unknown direction at line 4 and emitter at line 5 \
+             keep no anchor; every other op at those lines does"
+        );
+    }
+
+    /// carrick#1662: with no claims, or no sidecar to verify them, nothing
+    /// is read.
     #[test]
     fn no_claims_or_no_sidecar_read_no_library_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -16291,9 +16730,9 @@ mod tests {
             "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
         )
         .expect("write");
-        let inputs = discover_request_inputs(dir.path());
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(dir.path()));
         assert!(
-            library_rows(&inputs, NO_LIBRARY_CLAIMS, None, dir.path())
+            read_library_rows(&sites, &[], None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -16307,7 +16746,7 @@ mod tests {
             .expect("claims"),
         ];
         assert!(
-            library_rows(&inputs, &claims, None, dir.path())
+            read_library_rows(&sites, &claims, None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -17057,7 +17496,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         let order = &graphql.consumers[0];
         assert_eq!(
@@ -17128,7 +17567,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         let web = graphql
             .consumers
@@ -17149,6 +17588,57 @@ mod tests {
             admin.consumer_located_type_symbol.as_deref(),
             Some("AdminOrderUpdate"),
             "admin-dashboard must get its OWN located type, not web-frontend's"
+        );
+    }
+
+    /// carrick#1725: the op carries the path the scan discovered, absolute
+    /// under an absolute repo path, while the incremental path keys the
+    /// replayed answers repo-relative. Both forms of the answer's key must
+    /// meet the op, and a file outside the repo must not.
+    #[test]
+    fn merge_graphql_consumer_locations_joins_absolute_ops_to_either_key_form() {
+        use crate::agents::file_analyzer_agent::GraphqlConsumerLocate;
+        use crate::operation::GraphqlOperationKind;
+
+        let locate = |symbol: &str| FileAnalysisResult {
+            graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                kind: GraphqlOperationKind::Subscription,
+                field: "orderUpdated".to_string(),
+                result_type_symbol: symbol.to_string(),
+                result_type_source: None,
+            }],
+            ..Default::default()
+        };
+        let located = |key: &str, repo: &str| {
+            let mut graphql = crate::graphql::GraphqlExtraction {
+                producers: vec![],
+                consumers: vec![graphql_consumer_op_at(
+                    GraphqlOperationKind::Subscription,
+                    "orderUpdated",
+                    "/work/web/lib/graphql.ts",
+                    None,
+                )],
+                input_declarations: Default::default(),
+            };
+            let file_results = HashMap::from([(key.to_string(), locate("OrderUpdate"))]);
+            merge_graphql_consumer_locations(&mut graphql, &file_results, repo);
+            graphql.consumers[0].consumer_located_type_symbol.clone()
+        };
+
+        assert_eq!(
+            located("lib/graphql.ts", "/work/web").as_deref(),
+            Some("OrderUpdate"),
+            "the incremental path's repo-relative key"
+        );
+        assert_eq!(
+            located("/work/web/lib/graphql.ts", "/work/web/").as_deref(),
+            Some("OrderUpdate"),
+            "the full path's discovered key, with a trailing slash on the repo"
+        );
+        assert_eq!(
+            located("lib/graphql.ts", "/work/other"),
+            None,
+            "an op outside the repo stays absolute and meets no relative key"
         );
     }
 
@@ -17188,7 +17678,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         assert_eq!(graphql.consumers.len(), 1, "no new consumer op was created");
         assert_eq!(
@@ -17230,7 +17720,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let socket_entry = entries
             .iter()
@@ -17304,7 +17794,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let requests: Vec<&TypeManifestEntry> = entries
             .iter()
@@ -17370,7 +17860,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_alias = entries
             .iter()
             .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
@@ -18213,7 +18703,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
@@ -18352,7 +18842,7 @@ mod tests {
 
         // The producer manifest entry's alias (Producer, Response).
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
@@ -18428,6 +18918,83 @@ mod tests {
 
     /// Minimal `CloudRepoData` carrying just a repo/service identity and a
     /// bundled `.d.ts`, for the bundle-file-emission tests below.
+    /// `service`'s stored or scanned copy, by `version`, stating `GET` on
+    /// each of `paths`.
+    fn service_stating(service: &str, version: Option<&str>, paths: &[&str]) -> CloudRepoData {
+        let mut repo = repo_with_bundle("api", Some(service), "");
+        repo.scanner_version = version.map(str::to_string);
+        repo.endpoints = paths
+            .iter()
+            .map(|path| ApiEndpointDetails {
+                view_module: false,
+                owner: None,
+                key: OperationKey::http("GET", path.to_string()),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("src/routes.ts:1"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: None,
+                dispatch: None,
+                schema_binding: None,
+                handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
+            })
+            .collect();
+        repo
+    }
+
+    /// carrick#1712: a PR's endpoint delta compares with main's index only
+    /// when this scanner version wrote every stored service of the repo.
+    /// Another version, or none named, gives no delta, so a row the PR did
+    /// not add never shows as new or removed; no index gives none either.
+    #[test]
+    fn the_pr_delta_compares_only_with_an_index_this_version_wrote() {
+        const THIS: &str = "0.4.0";
+        let same = service_stating("web", Some(THIS), &["/orders"]);
+        assert_eq!(
+            DeltaBaseline::of(std::iter::empty(), THIS),
+            DeltaBaseline::Absent
+        );
+        assert_eq!(
+            DeltaBaseline::of(
+                [&service_stating("web", Some("0.3.99"), &["/orders"])],
+                THIS
+            ),
+            DeltaBaseline::OtherScanner(vec!["0.3.99".to_string()])
+        );
+        assert_eq!(
+            DeltaBaseline::of([&service_stating("web", None, &["/orders"])], THIS),
+            DeltaBaseline::OtherScanner(vec!["of unknown version".to_string()])
+        );
+        assert_eq!(
+            DeltaBaseline::of([&same, &service_stating("jobs", Some("0.3.99"), &[])], THIS),
+            DeltaBaseline::OtherScanner(vec!["0.3.99".to_string(), THIS.to_string()]),
+            "one service by another version is enough"
+        );
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&same], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let delta = endpoint_delta(
+            &previous,
+            &[service_stating("web", Some(THIS), &["/orders", "/users"])],
+        );
+        let paths = |refs: &[crate::findings::EndpointRef]| -> Vec<String> {
+            refs.iter().map(|r| r.path.clone()).collect()
+        };
+        assert_eq!(paths(&delta.new_endpoints), vec!["/users"]);
+        assert!(delta.removed_endpoints.is_empty());
+        let dropped = endpoint_delta(&previous, &[service_stating("web", Some(THIS), &[])]);
+        assert_eq!(paths(&dropped.removed_endpoints), vec!["/orders"]);
+        assert!(dropped.new_endpoints.is_empty());
+    }
+
     fn repo_with_bundle(
         repo_name: &str,
         service_name: Option<&str>,

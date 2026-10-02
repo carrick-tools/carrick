@@ -88,6 +88,10 @@ impl CloudStorage for StubStorage {
     ) -> Result<(), StorageError> {
         Ok(())
     }
+    /// One row per service, as the index stores a monorepo.
+    fn supports_multi_service(&self) -> bool {
+        true
+    }
 }
 
 fn run_git(dir: &Path, args: &[&str]) {
@@ -434,6 +438,100 @@ async fn guidance_without_an_id_is_asked_for_again_instead_of_replayed() {
     );
 }
 
+/// Two services: the fixture's own files, and one whose only file raises no
+/// candidate, so the analyzer is never asked about it.
+const TWO_SERVICES: &str = r#"{
+  "services": [
+    { "name": "helpdesk", "directory": "src" },
+    { "name": "slugs", "directory": "slugs" }
+  ]
+}
+"#;
+
+/// A service whose scan asked the analyzer about no file stores no answers,
+/// and that is an empty answer cache, not a missing generation: the next scan
+/// of the unchanged tree replays its detection and guidance like any other
+/// service's. Before carrick#1746 it ran a full analysis instead, which asks
+/// detection and every guidance section again, on every scan.
+#[tokio::test]
+#[serial]
+async fn a_service_with_no_answered_file_replays_its_detection_and_guidance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture_with(
+        tmp.path(),
+        &[
+            ("carrick.json", TWO_SERVICES),
+            ("slugs/slugify.ts", NO_CANDIDATES),
+        ],
+    );
+    mock_env(&cassette);
+
+    let storage = StubStorage::default();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
+    let first = stored_service(&storage, "slugs");
+    // The shape this test is about. Should the writer ever store an empty map
+    // instead, the replay below proves nothing about a stored null.
+    assert!(
+        first.file_results.is_none(),
+        "the service analysed no file, so it stores no answers: {:?}",
+        first.file_results
+    );
+    assert!(
+        first.cached_detection.is_some()
+            && first.cached_guidance.is_some()
+            && first.cached_extraction_config.is_some(),
+        "scan #1 must store the setup the next scan replays"
+    );
+    assert!(
+        stored_service(&storage, "helpdesk").file_results.is_some(),
+        "the other service's answers are stored as before"
+    );
+
+    let detect = requests_to("/framework-detect");
+    let guidance = requests_to("/framework-guidance");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
+    assert_eq!(
+        (
+            requests_to("/framework-detect") - detect,
+            requests_to("/framework-guidance") - guidance,
+        ),
+        (0, 0),
+        "an unchanged tree replays every service's detection and guidance, \
+         including one that stored no answers"
+    );
+    let second = stored_service(&storage, "slugs");
+    assert_eq!(
+        serde_json::to_value(&second.cached_detection).unwrap(),
+        serde_json::to_value(&first.cached_detection).unwrap(),
+        "the stored detection is carried forward unchanged"
+    );
+    assert_eq!(
+        serde_json::to_value(&second.cached_guidance).unwrap(),
+        serde_json::to_value(&first.cached_guidance).unwrap(),
+        "the stored guidance is carried forward unchanged"
+    );
+}
+
+/// The blob stored for `service`.
+fn stored_service(storage: &StubStorage, service: &str) -> CloudRepoData {
+    let repos = storage.repos.lock().unwrap();
+    repos
+        .iter()
+        .find(|stored| stored.service_name.as_deref() == Some(service))
+        .cloned()
+        .unwrap_or_else(|| {
+            let held: Vec<_> = repos
+                .iter()
+                .map(|stored| (&stored.repo_name, &stored.service_name))
+                .collect();
+            panic!("no blob stored for service {service}; the store holds {held:?}")
+        })
+}
+
 /// The guidance id each protocol's persisted answer carries, `None` for an
 /// answer that has none.
 fn guidance_ids(data: &CloudRepoData) -> Vec<Option<String>> {
@@ -676,5 +774,94 @@ async fn an_answer_about_an_uncommitted_edit_is_never_replayed() {
         dispatched_reverted, 1,
         "the reverted file has no cached answer, so it is asked about again; zero would mean \
          the answer about the edit was replayed for the committed code"
+    );
+}
+
+/// A GraphQL document consumer whose result type is a co-located interface the
+/// file analyzer names (`graphql_consumer_locates`, #268).
+const GRAPHQL_CONSUMER: &str = "declare function gql(strings: TemplateStringsArray, ...values: unknown[]): string;\n\
+\n\
+export const ON_ORDER_UPDATED = gql`\n  \
+  subscription OnOrderUpdated {\n    \
+    orderUpdated {\n      \
+      id\n      \
+      note\n    \
+    }\n  \
+  }\n\
+`;\n\
+\n\
+export interface OrderUpdate {\n  \
+  id: string;\n  \
+  note: string;\n\
+}\n\
+\n\
+export function renderOrderUpdate(update: OrderUpdate): string {\n  \
+  return `${update.id}: ${update.note}`;\n\
+}\n";
+
+/// The model's answer for that file: the subscription's result type is
+/// `OrderUpdate`.
+const GRAPHQL_CONSUMER_ANSWER: &str = r#"{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_consumer_locates": [
+    {"kind": "subscription", "field": "orderUpdated", "result_type_symbol": "OrderUpdate", "result_type_source": null}
+  ]
+}"#;
+
+/// The type anchor the upload's manifest carries for the consumer of
+/// `subscription orderUpdated`.
+fn order_updated_consumer_anchor(data: &CloudRepoData) -> Option<String> {
+    let blob = serde_json::to_value(data).expect("the upload serializes");
+    let entries = blob["type_manifest"]
+        .as_array()
+        .expect("the upload carries a type manifest");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["field"] == "orderUpdated" && entry["role"] == "consumer")
+        .unwrap_or_else(|| panic!("no manifest entry for the orderUpdated consumer: {entries:#?}"));
+    entry["primary_type_symbol"].as_str().map(str::to_string)
+}
+
+/// carrick#1725: the incremental path keys the replayed answers repo-relative,
+/// and the GraphQL consumer ops carry the path the scan discovered. The locate
+/// joined on both, so on every scan after the first the located result type was
+/// dropped, the consumer's type read `unknown`, and its edges lost their
+/// verdicts. The warm scan must anchor the consumer exactly as the cold one did.
+#[tokio::test]
+#[serial]
+async fn an_unchanged_graphql_consumer_keeps_its_located_result_type() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture_with(
+        tmp.path(),
+        &[
+            ("src/order_feed.ts", GRAPHQL_CONSUMER),
+            (
+                "__llm__/analyze-file/order_feed.json",
+                GRAPHQL_CONSUMER_ANSWER,
+            ),
+        ],
+    );
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (cold, dispatched_cold) = scan(&storage, &repo_path).await;
+    assert!(dispatched_cold > 0, "scan #1 is the cold scan");
+    assert_eq!(
+        order_updated_consumer_anchor(&cold).as_deref(),
+        Some("OrderUpdate"),
+        "the cold scan anchors the consumer on the located type"
+    );
+
+    let (warm, dispatched_warm) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_warm, 0,
+        "an unchanged tree reaches the model zero times"
+    );
+    assert_eq!(
+        order_updated_consumer_anchor(&warm).as_deref(),
+        Some("OrderUpdate"),
+        "the warm scan replays the same answer, so it must anchor the consumer the same way"
     );
 }

@@ -1,0 +1,39 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@std/path@1": "1.1.6",
+    "npm:@fixture/beacon@~0.9.0": "0.9.0",
+    "npm:@fixture/live@^1.2.0": "1.2.0",
+    "npm:@fixture/queue@^2.4.0": "2.4.1",
+    "npm:fixture-private-bus@1": "1.0.0"
+  },
+  "jsr": {
+    "@std/path@1.1.6": {
+      "integrity": "c68485c2a4dfbb5ae3cc74fae4e8c4e5d874cf8a8ed12927917235c758b46cbe"
+    }
+  },
+  "npm": {
+    "@fixture/beacon@0.9.0": {
+      "integrity": "sha512-fixture"
+    },
+    "@fixture/live@1.2.0": {
+      "integrity": "sha512-fixture"
+    },
+    "@fixture/queue@2.4.1": {
+      "integrity": "sha512-fixture"
+    },
+    "fixture-private-bus@1.0.0": {
+      "integrity": "sha512-fixture",
+      "tarball": "https://npm.internal.example/fixture-private-bus/-/fixture-private-bus-1.0.0.tgz"
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@std/path@1",
+      "npm:@fixture/beacon@~0.9.0",
+      "npm:@fixture/live@^1.2.0",
+      "npm:@fixture/queue@^2.4.0",
+      "npm:fixture-private-bus@1"
+    ]
+  }
+}

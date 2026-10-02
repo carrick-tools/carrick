@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.102](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.101...carrick-v0.3.102) (2026-10-02)
+
+
+### Features
+
+* **scanner:** ask the library store for registry packages' claims and state library rows ([#1664](https://github.com/carrick-tools/carrick/issues/1664)) ([#1713](https://github.com/carrick-tools/carrick/issues/1713)) ([61a167c](https://github.com/carrick-tools/carrick/commit/61a167c1eef6628df54d1a68e34664361e31d668))
+* **scanner:** send a Deno workspace's public npm packages to the library store ([#1720](https://github.com/carrick-tools/carrick/issues/1720)) ([#1723](https://github.com/carrick-tools/carrick/issues/1723)) ([10e3c82](https://github.com/carrick-tools/carrick/commit/10e3c82739f804ebf0d83289d0931f29e07e980d))
+
+
+### Bug Fixes
+
+* **engine:** a PR shows no endpoint delta against an index another scanner version wrote ([#1712](https://github.com/carrick-tools/carrick/issues/1712)) ([#1714](https://github.com/carrick-tools/carrick/issues/1714)) ([a53e9b3](https://github.com/carrick-tools/carrick/commit/a53e9b3e63ee20523a809d15ceb57e90491cc299))
+* **engine:** incremental scans keep GraphQL consumer located types ([#1726](https://github.com/carrick-tools/carrick/issues/1726)) ([8679027](https://github.com/carrick-tools/carrick/commit/8679027cadddbcede2afa07ea1daacda41772a87))
+* **scanner:** send a pnpm package whose lockfile records a public tarball URL ([#1721](https://github.com/carrick-tools/carrick/issues/1721)) ([#1724](https://github.com/carrick-tools/carrick/issues/1724)) ([4362354](https://github.com/carrick-tools/carrick/commit/43623543de38264e7226d7e9d8d22623365d0496))
+
+## [0.3.101](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.100...carrick-v0.3.101) (2026-10-02)
+
+
+### Features
+
+* **carrick-match:** names_pair, the name-scope pairing rule, run from the cloud's vectors ([#1663](https://github.com/carrick-tools/carrick/issues/1663)) ([#1708](https://github.com/carrick-tools/carrick/issues/1708)) ([18540d9](https://github.com/carrick-tools/carrick/commit/18540d9c37471fbe23663c8f09bad1bb3f6c2e31))
+* **scanner:** a member read only tested contests no message-role receiver ([#1690](https://github.com/carrick-tools/carrick/issues/1690)) ([#1703](https://github.com/carrick-tools/carrick/issues/1703)) ([abaffca](https://github.com/carrick-tools/carrick/commit/abaffca4b1359a2392a48a32decf86a5e87bcd11))
+* **scanner:** a receiver that is one of a few makers' instances is read as the set ([#1689](https://github.com/carrick-tools/carrick/issues/1689)) ([#1706](https://github.com/carrick-tools/carrick/issues/1706)) ([92bfd01](https://github.com/carrick-tools/carrick/commit/92bfd016c74a4e94b0e33ffd4a48d27fc770017d))
+* **scanner:** broker, socket and in-process rows from verified library claims ([#1662](https://github.com/carrick-tools/carrick/issues/1662)) ([#1710](https://github.com/carrick-tools/carrick/issues/1710)) ([0e17ae1](https://github.com/carrick-tools/carrick/commit/0e17ae132ccd8e12579ac1019e25d708aa5e6117))
+* **scanner:** class-field library receivers written in any method ([#1686](https://github.com/carrick-tools/carrick/issues/1686)) ([8293b5f](https://github.com/carrick-tools/carrick/commit/8293b5f5f86ebab1d17b4b9e8242efcb29c1c410))
+* **scanner:** socket and pub/sub rows pair only where their name scope allows ([#1663](https://github.com/carrick-tools/carrick/issues/1663)) ([#1711](https://github.com/carrick-tools/carrick/issues/1711)) ([2017f01](https://github.com/carrick-tools/carrick/commit/2017f01d48a6b43b9b2a4e47632d34f2d8d09b9d))
+* **scanner:** the receiver core for message roles ([#1675](https://github.com/carrick-tools/carrick/issues/1675)) ([7ed1ec0](https://github.com/carrick-tools/carrick/commit/7ed1ec065fd5666525868f5e60d3ff30128723b2))
+* **scanner:** value flow for library operation names through the service's own code ([#1562](https://github.com/carrick-tools/carrick/issues/1562)) ([#1698](https://github.com/carrick-tools/carrick/issues/1698)) ([781afeb](https://github.com/carrick-tools/carrick/commit/781afeb153bd0525cd2e5b439ab040947b0041bc)), closes [#1616](https://github.com/carrick-tools/carrick/issues/1616)
+* **sidecar:** the surface lister, released as an artifact the cloud pins ([#1660](https://github.com/carrick-tools/carrick/issues/1660)) ([#1683](https://github.com/carrick-tools/carrick/issues/1683)) ([648297a](https://github.com/carrick-tools/carrick/commit/648297a4d1a7d9b6905a097358e6d495faa65aa6))
+* **sidecar:** verify_library_claims for message roles ([#1659](https://github.com/carrick-tools/carrick/issues/1659)) ([#1677](https://github.com/carrick-tools/carrick/issues/1677)) ([6e313d0](https://github.com/carrick-tools/carrick/commit/6e313d04b563ea0131de5e7a733aff97174cad67))
+* **sidecar:** verify_library_claims to contract amendment 2 ([#1679](https://github.com/carrick-tools/carrick/issues/1679)) ([#1688](https://github.com/carrick-tools/carrick/issues/1688)) ([8d5f123](https://github.com/carrick-tools/carrick/commit/8d5f1234ea55909439ee9ad9db0802effdea9128))
+
+
+### Bug Fixes
+
+* **local:** read the latest stored generation at an unchanged commit; end a wait's notice when the wait is over ([#1681](https://github.com/carrick-tools/carrick/issues/1681)) ([f3c8399](https://github.com/carrick-tools/carrick/commit/f3c8399839f326be097ac12825a437125f8e55a9))
+* **scanner:** hold back the injected-fetch rule until [#1601](https://github.com/carrick-tools/carrick/issues/1601) lands ([#1717](https://github.com/carrick-tools/carrick/issues/1717)) ([57e0ca7](https://github.com/carrick-tools/carrick/commit/57e0ca7ca2e750881950d2424e1ec0276834262b)), closes [#1562](https://github.com/carrick-tools/carrick/issues/1562)
+* **sidecar:** strict D2 fails closed on an unreadable rest and on conditional siblings ([#1687](https://github.com/carrick-tools/carrick/issues/1687)) ([#1701](https://github.com/carrick-tools/carrick/issues/1701)) ([46cb722](https://github.com/carrick-tools/carrick/commit/46cb722ffba594b8fa46478c4ce54fe6a0a02dc7))
+* **sidecar:** the surface lister reads every field as the verifier does, at generic defaults, with stable text ([#1696](https://github.com/carrick-tools/carrick/issues/1696)) ([#1700](https://github.com/carrick-tools/carrick/issues/1700)) ([bfb38d5](https://github.com/carrick-tools/carrick/commit/bfb38d52ca435d6fef0f466e59080fc8177045ba))
+
 ## [0.3.100](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.99...carrick-v0.3.100) (2026-10-01)
 
 

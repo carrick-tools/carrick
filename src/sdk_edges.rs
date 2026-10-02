@@ -532,7 +532,9 @@ struct SdkVerdict {
 /// verdict, not the sources of the two rows in the other repo. Saying "fact"
 /// would claim what this run cannot see, and saying "candidate" would demote a
 /// pairing that may be entirely deterministic; the absence reads as "not
-/// stated", which leaves these rows enforced as they are today.
+/// stated", which leaves these rows enforced as they are today. A direct
+/// mismatch whose consumer row this scan does not hold is a candidate
+/// (carrick#1735); whether these rows follow is carrick#1753.
 ///
 /// `verdict_state` is a different case since cloud#622: `SdkEdge::resolved` now
 /// rides on the edge, so this function COULD state it, and an edge whose

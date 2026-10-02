@@ -50,7 +50,7 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
-import { isExternalOrigin } from './origin.js';
+import { externalImportsOf, isExternalOrigin } from './origin.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -484,6 +484,7 @@ export class TypeInferrer {
     return {
       program: this.project.getProgram().compilerObject,
       repoRoot: this.repoRoot,
+      imports: externalImportsOf(this.project),
     };
   }
 
@@ -1331,7 +1332,9 @@ export class TypeInferrer {
         );
         return null;
       }
-      if (args.length > 0) {
+      // A call whose result is a value the repo shapes is not a send: it is
+      // the payload (carrick#1732), and drilling would publish its input.
+      if (args.length > 0 && !this.callResultIsPayload(node)) {
         payloadNode = args[0];
       }
     }
@@ -1384,6 +1387,32 @@ export class TypeInferrer {
       this.primaryTypeSymbol(anchor.element),
       anchor.depth
     );
+  }
+
+  /**
+   * True when a located call's own result is the route's payload, so the
+   * transitional drill into its first argument must not run (carrick#1732).
+   *
+   * `res.json(users)` reached that drill because nothing above it recognised
+   * the send: its result reads `void`, `any` or `unknown`, and the payload is
+   * the argument. `toPublicView(row)` is the opposite case: a mapper building
+   * the object the route sends. Its first argument is the row it was built
+   * FROM, which carries columns the route never sends.
+   *
+   * The call's result decides, not where its callee is declared. It is the
+   * payload when it reads as one by the rule a response helper's argument is
+   * read with (`nodeCarriesPayloadContract`: object-shaped, not machinery,
+   * not `void`/`any`/`unknown`) and the object is not a library's own: a
+   * codec's writer from `encode(message)` or a reply builder from a send is
+   * the library describing itself, and keeps the drill. A library call that
+   * returns the repo's own type (`toInstance(View, plain)`) is the payload.
+   */
+  private callResultIsPayload(call: CallExpression): boolean {
+    const { element } = this.unwrapArrayLevels(this.unwrapPromiseType(call.getType()));
+    if (this.symbolIsLibOrExternalOrigin(element.getSymbol() ?? element.getAliasSymbol())) {
+      return false;
+    }
+    return this.nodeCarriesPayloadContract(call, false);
   }
 
   /**
@@ -3420,7 +3449,7 @@ export class TypeInferrer {
     }
     const program = this.project.getProgram().compilerObject;
     for (const decl of symbol.getDeclarations()) {
-      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot)) {
+      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot, externalImportsOf(this.project))) {
         return true;
       }
     }

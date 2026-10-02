@@ -1023,10 +1023,9 @@ impl HostedInput {
             result.failure =
                 Some("Hosted index was written from a tree with uncommitted changes".into());
             HostedState::ReadFailed
-        } else if previous.file_results.is_none() {
-            result.failure = Some("Hosted index has no reusable model answers".into());
-            HostedState::ReadFailed
         } else {
+            // A clean generation with no file answers asked the analyzer about
+            // no file, and the scan replays it like any other (carrick#1746).
             HostedState::Enriched
         };
         result
@@ -2382,6 +2381,43 @@ mod tests {
             "{note}"
         );
         assert!(!note.contains("retained"), "{note}");
+    }
+
+    /// A clean generation whose scan asked the analyzer about no file stores
+    /// no answers, and the next scan replays it all the same (carrick#1746):
+    /// it is a hosted index this machine reads, not one it failed to read.
+    #[test]
+    fn a_clean_generation_with_no_file_answers_is_read() {
+        let (dir, head) = committed_repo(&[("slugify.ts", "export const slug = 1;")]);
+        let repo = dir.path();
+
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": "api", "hash": head, "updated_at": null,
+            "scanner_version": env!("CARGO_PKG_VERSION"), "source": "ci",
+            "uploaded_by": null, "dirty": false
+        }]);
+        let mut stored = blob_from(Some(env!("CARGO_PKG_VERSION")));
+        stored.commit_hash = head;
+        stored.file_results = None;
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([("p".into(), vec![stored])]),
+                stored_rows: BTreeMap::new(),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
+            unnamed: BTreeMap::new(),
+            downloads: None,
+        };
+        let answer = input.service(repo, &blob());
+        assert_eq!(answer.hosted_state, HostedState::Enriched, "{answer:?}");
+        assert_eq!(answer.failure, None);
+        let note = super::super::query::enrichment_note(&answer, None, "api");
+        assert!(!note.contains("could not refresh"), "{note}");
     }
 
     /// A scan whose write the cloud refuses as already current changed nothing

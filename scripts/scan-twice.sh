@@ -60,7 +60,8 @@ echo "scan-twice: output  $out_dir"
 # carrick#599 names it. `extraction-config` matches the rule but is absent: it
 # holds a cassette and no source at all, its test reads that JSON directly, and
 # the scanner refuses a tree with no TS/JS in it. There is nothing to scan
-# twice.
+# twice. `deno-lock` and `library-store-deno` are absent for the same reason:
+# they hold lockfiles only, which their tests lay over a tree of their own.
 fixture_targets=(
   astro
   class-controller-api
@@ -76,6 +77,7 @@ fixture_targets=(
   imported-request-member
   imported-routers
   koa-api
+  library-store
   literal-base-url
   llm-mocked-api
   new-url-target

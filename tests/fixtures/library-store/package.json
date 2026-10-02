@@ -1,0 +1,11 @@
+{
+  "name": "library-store-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/beacon": "^0.9.0",
+    "@fixture/live": "^1.2.0",
+    "@fixture/queue": "^2.4.0",
+    "fixture-private-bus": "^1.0.0"
+  }
+}

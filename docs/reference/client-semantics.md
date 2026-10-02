@@ -300,9 +300,21 @@ an HTTP row.
   library emits itself, or sits beside a missing part the claim positions
   states nothing, and so does a row in a mock or test tree. A model pub/sub
   row at the same file, line, topic and role folds into the library row,
-  and so does an event-bus row at the same site; a model route at exactly a
-  verified definition's span is withdrawn. Until the scan asks the library
-  store (carrick#1664), no service has claims and nothing is read.
+  and so does an event-bus row at the same site, and a socket pass row at
+  the same file, line, name and side whose direction is the library row's
+  or unknown; a model route at exactly a verified definition's span is
+  withdrawn.
+- **Claims** (carrick#1664, `src/library_store.rs`). Beside the analysis,
+  the scan asks the library store (`POST /library-claims`) about each
+  registry package a library site is made through, at its installed
+  version, and each runtime module (`node:events`, at the runtime types
+  package's version). A package goes only when its lockfile (npm, pnpm,
+  Yarn or Deno, carrick#1720) and registry configuration show it came from
+  the public npm registry; an in-repo package, a JSR package and a URL
+  import never go. A package the store has not finished is asked once
+  more after the analysis, and again next scan. A failure, a refusal or a
+  throttle gives no claims, and the scan carries on. A run with no model,
+  or no sidecar, asks nothing.
 - **Not read yet.** A client handed in as a parameter or a constructor
   argument (carrick#1693), a builder that picks its return by a parameter
   (carrick#1694), a set of makers of two exports (carrick#1704), and a

@@ -3563,19 +3563,26 @@ impl Analyzer {
                     &outcome.producer_service,
                     consumer,
                 );
-                let mut sources = self.producer_resolution_sources_for(
-                    &method,
-                    &path,
-                    &outcome.producer_service,
-                    consumer,
-                );
-                match consumer_row {
-                    Some(row) => sources.push(row.source),
-                    // The consumer row is not in this graph (a peer whose
-                    // calls did not merge). One side unknown is not a fact.
-                    None => sources.push(None),
-                }
-                let edge_source = crate::findings::EdgeSource::fold(sources);
+                let edge_source = match consumer_row {
+                    Some(row) => {
+                        let mut sources = self.producer_resolution_sources_for(
+                            &method,
+                            &path,
+                            &outcome.producer_service,
+                            consumer,
+                        );
+                        sources.push(row.source);
+                        crate::findings::EdgeSource::fold(sources)
+                    }
+                    // The verdict was reached at a consumer call this graph
+                    // holds no row for (a peer whose calls did not merge). A
+                    // pairing with a side the scan cannot see is not a fact,
+                    // so it is a candidate, as a model row would make it
+                    // (carrick#1735). Not the fold's silence: that is a row
+                    // the scan holds which states no source, and stays
+                    // unstated.
+                    None => Some(crate::findings::EdgeSource::Candidate),
+                };
                 let detail = outcome
                     .diagnostic
                     .clone()
@@ -5805,6 +5812,97 @@ mod tests {
             vec![None, Some(crate::findings::EdgeSource::Fact)],
             "the pub/sub mismatch states nothing; the HTTP one is a fact"
         );
+    }
+
+    /// carrick#1735: a verdict reached at a consumer call this scan holds no
+    /// row for is a candidate, whatever its producer rows say. The pairing
+    /// has a side the scan cannot see, so it is not a fact, and the PR check
+    /// must not fail on it while it lists the same mismatch on a model row as
+    /// a candidate. The wire says `candidate`, the value the cloud already
+    /// reads as not enforced; a missing field would be enforced.
+    #[test]
+    fn a_verdict_whose_consumer_row_is_not_held_is_a_candidate() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{
+            FileBasedRoute, ImportedMember, LibraryClaim,
+        };
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let mut analyzer = analyzer_with_outcomes(vec![
+            outcome(
+                "POST",
+                "/api/orders",
+                "web/src/client.ts:9",
+                VerdictBucket::Incompatible,
+                None,
+            ),
+            outcome(
+                "PUBSUB",
+                "orders.created",
+                "web/src/client.ts:9",
+                VerdictBucket::Incompatible,
+                None,
+            ),
+        ]);
+        // Both producers are facts.
+        analyzer.endpoints.push(protocol_row(
+            OperationKey::pubsub("orders.created"),
+            "orders-svc/src/server.ts:5",
+            "producer-svc",
+            Some(LibraryClaim),
+        ));
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
+            method: "POST".to_string(),
+            path: "/api/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "orders-svc/src/routes.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("orders-svc".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(FileBasedRoute),
+            dispatch: None,
+            handler_span: None,
+        });
+        // The one call row the scan holds in that file is on another line,
+        // and there is no pub/sub call row at all.
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/api/orders".to_string(),
+            canonical_path: "/api/orders".to_string(),
+            client: "fetch".to_string(),
+            file_location: "web/src/client.ts:30".to_string(),
+            call_kind: None,
+            repo_name: Some("web".to_string()),
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ImportedMember),
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+        });
+        analyzer.mount_graph = Some(mount_graph);
+
+        assert_eq!(
+            type_mismatch_sources(&analyzer),
+            vec![
+                Some(crate::findings::EdgeSource::Candidate),
+                Some(crate::findings::EdgeSource::Candidate),
+            ],
+            "a consumer the scan holds no row for is not a fact, on any protocol"
+        );
+        for finding in analyzer.get_type_mismatch_findings() {
+            let wire = serde_json::to_value(&finding).expect("a finding serializes");
+            assert_eq!(wire["edge_source"], "candidate", "got: {wire}");
+        }
     }
 
     /// An index blob written before non-HTTP rows carried a source reads

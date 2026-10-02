@@ -1873,7 +1873,7 @@ fn assert_phase_a_persisted(repo: &Path, cache_dir: &Path) {
 /// sidecar is auto-discovered by the binary (contract §7 seam), so cross-repo
 /// type checking *runs* and the compat-verdict metric is scored over real data.
 /// Fails loud if type checking was silently skipped (no sidecar), per §7.
-fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> EvalProjection {
+fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> (EvalProjection, String) {
     let mut cmd = Command::new(bin);
     cmd.arg(repo)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache_dir)
@@ -1906,16 +1906,65 @@ fn phase_b(bin: &Path, repo: &Path, cache_dir: &Path, mock: bool) -> EvalProject
          skipped. Ensure src/sidecar is built (npm ci && npm run build).\n{stderr}"
     );
     let stdout = String::from_utf8(output.stdout).expect("Phase B stdout was not UTF-8");
-    parse_projection(&stdout).unwrap_or_else(|| {
+    let json = projection_json(&stdout).unwrap_or_else(|| {
+        panic!("Phase B stdout carried no JSON object:\n{stdout}");
+    });
+    let projection = parse_projection(json).unwrap_or_else(|| {
         panic!("Phase B stdout was not a valid EvalProjection:\n{stdout}");
-    })
+    });
+    (projection, json.to_string())
 }
 
 /// Tolerate log noise around the JSON by slicing from the first `{` to the last `}`.
-fn parse_projection(stdout: &str) -> Option<EvalProjection> {
+fn projection_json(stdout: &str) -> Option<&str> {
     let start = stdout.find('{')?;
     let end = stdout.rfind('}')?;
-    serde_json::from_str(stdout.get(start..=end)?).ok()
+    stdout.get(start..=end)
+}
+
+fn parse_projection(json: &str) -> Option<EvalProjection> {
+    serde_json::from_str(json).ok()
+}
+
+/// `CARRICK_EVAL_KEEP_BLOBS=<dir>` keeps what a two-phase run wrote, so a
+/// later offline replay can reuse its recorded model answers (carrick#1667).
+/// Unset, nothing is kept.
+fn keep_blobs_dir() -> Option<PathBuf> {
+    std::env::var_os("CARRICK_EVAL_KEEP_BLOBS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Copy every Phase A blob in `cache_dir` to `<keep>/<corpus>/run-<n>/blobs/`
+/// and write the Phase B projection beside them as `projection.json`. `n` is
+/// the first run number with no directory yet, so repeated runs never
+/// overwrite each other. Returns the run directory.
+fn keep_run(keep: &Path, corpus: &str, cache_dir: &Path, projection_json: &str) -> PathBuf {
+    let corpus_dir = keep.join(corpus);
+    let run_dir = (1..)
+        .map(|n| corpus_dir.join(format!("run-{n}")))
+        .find(|dir| !dir.exists())
+        .expect("an unused run directory");
+    let blobs = run_dir.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap_or_else(|e| panic!("create {}: {e}", blobs.display()));
+    let mut kept = 0usize;
+    for entry in std::fs::read_dir(cache_dir).expect("read cache dir") {
+        let path = entry.expect("cache dir entry").path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path.file_name().expect("blob file name");
+        std::fs::copy(&path, blobs.join(name))
+            .unwrap_or_else(|e| panic!("keep {}: {e}", path.display()));
+        kept += 1;
+    }
+    std::fs::write(run_dir.join("projection.json"), projection_json)
+        .unwrap_or_else(|e| panic!("write projection.json in {}: {e}", run_dir.display()));
+    eprintln!(
+        "[eval] kept {kept} Phase A blob(s) and the projection in {}",
+        run_dir.display()
+    );
+    run_dir
 }
 
 /// Load every repo's `expected.json`, keyed by repo dir name.
@@ -1963,7 +2012,15 @@ fn run_two_phase(bin: &Path, corpus: &Path, mock: bool) -> EvalProjection {
         }
         assert_phase_a_persisted(repo, cache.path());
     }
-    phase_b(bin, &repos[0], cache.path(), mock)
+    let (projection, json) = phase_b(bin, &repos[0], cache.path(), mock);
+    if let Some(keep) = keep_blobs_dir() {
+        let corpus_label = corpus
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("corpus dir has a name");
+        keep_run(&keep, corpus_label, cache.path(), &json);
+    }
+    projection
 }
 
 fn emit_record(record: &EvalRunRecord) {
@@ -3968,5 +4025,64 @@ mod scoring_tests {
         assert_eq!(back.dep_f1_mean, Some(1.0));
         assert!(line.contains("compat_verdict_accuracy_mean"));
         assert!(line.contains("dep_f1_mean"));
+    }
+
+    /// carrick#1667: a kept run holds every Phase A blob and the exact
+    /// projection JSON, and a second run lands beside the first rather than
+    /// over it. Non-JSON files in the cache are not blobs and are not kept.
+    #[test]
+    fn keep_run_copies_blobs_and_projection_without_overwriting() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        std::fs::write(cache.path().join("svc-a.json"), "{\"repo_name\":\"svc-a\"}").unwrap();
+        std::fs::write(
+            cache.path().join("mono__api.json"),
+            "{\"repo_name\":\"mono\"}",
+        )
+        .unwrap();
+        std::fs::write(cache.path().join("lock.tmp"), "not a blob").unwrap();
+        let keep = tempfile::tempdir().expect("keep dir");
+
+        let first = keep_run(
+            keep.path(),
+            "xrepo-corpus-9",
+            cache.path(),
+            "{\"calls\":[]}",
+        );
+        assert_eq!(first, keep.path().join("xrepo-corpus-9/run-1"));
+        let mut kept: Vec<String> = std::fs::read_dir(first.join("blobs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, vec!["mono__api.json", "svc-a.json"]);
+        assert_eq!(
+            std::fs::read_to_string(first.join("blobs/svc-a.json")).unwrap(),
+            "{\"repo_name\":\"svc-a\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("projection.json")).unwrap(),
+            "{\"calls\":[]}"
+        );
+
+        let second = keep_run(keep.path(), "xrepo-corpus-9", cache.path(), "{}");
+        assert_eq!(second, keep.path().join("xrepo-corpus-9/run-2"));
+        assert_eq!(
+            std::fs::read_to_string(first.join("projection.json")).unwrap(),
+            "{\"calls\":[]}",
+            "a later run must not overwrite an earlier one"
+        );
+    }
+
+    /// The kept projection is the JSON object Phase B printed, with the log
+    /// noise around it cut away, and it parses as the projection scored.
+    #[test]
+    fn projection_json_slices_the_object_out_of_stdout() {
+        let stdout = "Analyzing...\n{\"cross_repo_matches\":[{\"producer_repo\":\"a\",\"producer_key\":\"http|GET|/x\",\"consumer_repo\":\"b\",\"consumer_key\":\"http|GET|/x\",\"type_compatible\":false}]}\ndone\n";
+        let json = projection_json(stdout).expect("an object");
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        let proj = parse_projection(json).expect("a projection");
+        assert_eq!(proj.cross_repo_matches.len(), 1);
+        assert_eq!(proj.cross_repo_matches[0].type_compatible, Some(false));
+        assert!(projection_json("no json here").is_none());
     }
 }
