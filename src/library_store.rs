@@ -475,8 +475,10 @@ fn read_yaml(path: &Path) -> Option<serde_yaml_ng::Value> {
 /// `node_modules/.modules.yaml`, or `None` when the lockfile is absent. The
 /// registry pnpm recorded for the package's scope (or its default) must be
 /// public, and the lockfile's entry for the installed version must resolve
-/// by integrity alone: a `tarball`, a `type` (git, directory), a `directory`
-/// or a `repo` names another source.
+/// by integrity, with any `tarball` on the public registry: a lockfile
+/// written with `lockfile-include-tarball-url=true` records one for every
+/// package (carrick#1721). A `tarball` elsewhere, a `type` (git, directory),
+/// a `directory` or a `repo` names another source.
 fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
     let lock_path = lock_dir.join("pnpm-lock.yaml");
     if !lock_path.is_file() {
@@ -514,7 +516,10 @@ fn pnpm_lock(name: &str, package: &Installed, lock_dir: &Path) -> Option<bool> {
     };
     Some(
         resolution.get("integrity").is_some()
-            && ["tarball", "type", "directory", "repo"]
+            && resolution
+                .get("tarball")
+                .is_none_or(|tarball| tarball.as_str().is_some_and(is_public_url))
+            && ["type", "directory", "repo"]
                 .iter()
                 .all(|field| resolution.get(*field).is_none()),
     )
@@ -1239,18 +1244,41 @@ mod tests {
         );
     }
 
+    /// pnpm 9.10.0 with `lockfile-include-tarball-url=true` writes every
+    /// entry this way, public ones included (carrick#1721).
     #[test]
-    fn a_pnpm_tarball_or_private_default_registry_is_not_sent() {
-        let tarball = tempfile::tempdir().unwrap();
+    fn a_pnpm_package_whose_tarball_is_on_the_public_registry_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
         pnpm_install(
-            tarball.path(),
+            dir.path(),
             "  default: https://registry.npmjs.org/\n",
-            "{integrity: sha512-abc, tarball: https://npm.acme.dev/lib.tgz}",
+            "{integrity: sha512-abc, tarball: https://registry.npmjs.org/lib/-/lib-1.0.0.tgz}",
         );
         assert_eq!(
-            asked(request(&specifiers(&["lib"]), &install_at(tarball.path()))),
-            vec![]
+            asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
+            one("lib", "1.0.0", &["lib"])
         );
+    }
+
+    #[test]
+    fn a_pnpm_tarball_off_the_public_registry_or_private_default_registry_is_not_sent() {
+        for url in [
+            "https://npm.acme.dev/lib.tgz",
+            "https://npm.acme.dev/lib/-/lib-1.0.0.tgz",
+            "http://registry.npmjs.org/lib/-/lib-1.0.0.tgz",
+        ] {
+            let tarball = tempfile::tempdir().unwrap();
+            pnpm_install(
+                tarball.path(),
+                "  default: https://registry.npmjs.org/\n",
+                &format!("{{integrity: sha512-abc, tarball: {url}}}"),
+            );
+            assert_eq!(
+                asked(request(&specifiers(&["lib"]), &install_at(tarball.path()))),
+                vec![],
+                "{url}"
+            );
+        }
         let private = tempfile::tempdir().unwrap();
         pnpm_install(
             private.path(),
