@@ -209,12 +209,16 @@ an HTTP row.
   Classes are told apart by their binding, not their name. A static member
   reads no instance field. HTTP keeps its rule above: a field written
   anywhere but the constructor's own statements holds no client.
-- **The contest set.** A hand-off, a write, a member read that is not
-  called, a spread, a member called by a key the source does not state, a
-  namespace import of the module that holds an instance, and loading that
-  module any other way still take the receiver away. A test for truth
-  (`if (!this.client)`) reads the receiver and keeps nothing of it, so it
-  contests nothing here; it still takes an HTTP client away. A module the
+- **The contest set.** A hand-off, a write, a member read used as a value
+  (assigned, passed, a property's value, returned), a spread, a member
+  called by a key the source does not state, a namespace import of the
+  module that holds an instance, and loading that module any other way still
+  take the receiver away. A test for truth reads the receiver and keeps
+  nothing of it, so it contests nothing here: the receiver, or a member read
+  off it, as the test of an `if`, a loop or a conditional, under `!`, or as
+  an operand of a `&&` or `||` that is itself tested (`if (!this.client)`,
+  `if (socket.recovered || retrying)`, carrick#1690). It still takes an HTTP
+  client away. A comparison or `typeof` operand contests neither. A module the
   scan cannot follow still turns imported reading off. Every member called
   or constructed through the receiver is kept, along with the export's own
   uses where an instance was made. The reader classifies each against the

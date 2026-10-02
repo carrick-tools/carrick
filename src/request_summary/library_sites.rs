@@ -44,12 +44,14 @@
 //!   receiver, and its uses are its class's and its related classes' alone,
 //!   so a field of the same name in another class of the file is another
 //!   field. HTTP keeps its constructor-only rule.
-//! - **The contest set.** A hand-off, a write, a member read that is not
-//!   called, a spread, a member called by a key the source does not state, a
+//! - **The contest set.** A hand-off, a write, a member read used as a
+//!   value, a spread, a member called by a key the source does not state, a
 //!   namespace import of the module that holds an instance, and loading that
 //!   module any other way contest the receiver ([`LibrarySite::contested`]),
 //!   and a module the scan cannot follow turns imported reading off, as for
-//!   HTTP. Every member called or constructed through the receiver is kept
+//!   HTTP. The receiver or a member read off it in a test position contests
+//!   nothing (carrick#1665, carrick#1690, [`super::BindingUses::tested`]).
+//!   Every member called or constructed through the receiver is kept
 //!   ([`LibrarySite::uses`]); the caller classifies each one against the
 //!   package's surface, and only a member that can change a name, a prefix or
 //!   a base, or one the surface does not list, contests. HTTP's rule, "any
@@ -2710,6 +2712,104 @@ mod tests {
         }
     }
 
+    /// A member read whose value is only tested keeps nothing of the
+    /// receiver, so it contests nothing (carrick#1690): the test of an `if`,
+    /// a loop or a conditional, the operand of `!`, a comparison operand, and
+    /// an operand of a `&&` or `||` that is itself tested, the binding itself
+    /// included. Read as a value anywhere else (assigned, passed, a
+    /// property's value, returned, in an array or a template, an operand of a
+    /// `||` or `??` whose value is used, a conditional's branch), it still
+    /// contests. Each case is a service of its own, so no use of one masks
+    /// another's.
+    #[test]
+    fn a_member_read_only_tested_contests_no_message_role() {
+        let log = "export function log(value: unknown) {}\n";
+        let module_const = |statement: &str| {
+            let source = format!(
+                "import {{ Queue }} from \"@fixture/queue\";\n\
+                 import {{ log }} from \"./log\";\n\
+                 const emails = new Queue(\"emails\");\n\
+                 export async function welcome() {{ await emails.add(\"welcome\", {{}}); }}\n\
+                 export function check(flag: boolean, retrying: boolean) {{ {statement} }}\n"
+            );
+            let sites = sites_of(&[("src/mail.ts", source.as_str()), ("src/log.ts", log)]);
+            site(&sites, "src/mail.ts", 4, Some("add")).contest(on_wire)
+        };
+        for statement in [
+            "if (emails.closing) { return 1; }",
+            "while (emails.paused) { break; }",
+            "do { break; } while (emails.paused);",
+            "for (; emails.paused; ) { break; }",
+            "return emails.ready ? 1 : 2;",
+            "return !emails.ready;",
+            "return emails.count > 3;",
+            "if (emails.recovered || retrying) { return 1; }",
+            "if (!(flag && emails.a.b)) { return 1; }",
+            "if ((emails as any)?.ready) { return 1; }",
+            "if (emails && emails.ready) { return 1; }",
+        ] {
+            assert_eq!(module_const(statement), None, "{statement}");
+        }
+        for statement in [
+            "const opts = emails.opts; return opts;",
+            "log(emails.opts);",
+            "log({ active: emails.active });",
+            "return emails.opts;",
+            "return [emails.opts];",
+            "return `${emails.name}`;",
+            "return emails.opts || {};",
+            "if (emails.opts ?? flag) { return 1; }",
+            "return flag ? emails.opts : null;",
+        ] {
+            assert_eq!(module_const(statement), Some(Contest::Used), "{statement}");
+        }
+
+        // An own factory's socket, tested in its own callback and read
+        // through the factory by a field (the shape carrick#1690 found), and
+        // the same factory with the read also passed to a logger.
+        let factory = |extra: &str| {
+            let source = format!(
+                "import {{ Socket }} from \"@fixture/socket\";\n\
+                 import {{ log }} from \"./log\";\n\
+                 let reconnecting = false;\n\
+                 export class Supervisor {{\n\
+                 \x20 private socket?: Socket;\n\
+                 \x20 start() {{ this.socket = this.createSocket(); }}\n\
+                 \x20 createSocket() {{\n\
+                 \x20   const socket = new Socket(\"ws://dev\");\n\
+                 \x20   socket.on(\"connect\", () => {{ if (socket.recovered || reconnecting) {{ log(\"back\"); }} }});\n\
+                 \x20   {extra}\n\
+                 \x20   return socket;\n\
+                 \x20 }}\n\
+                 \x20 subscribe() {{ if (!this.socket) {{ return; }} this.socket.emit(\"run:subscribe\", {{}}); }}\n\
+                 }}\n"
+            );
+            let sites = sites_of(&[("src/supervisor.ts", source.as_str()), ("src/log.ts", log)]);
+            let emit = site(&sites, "src/supervisor.ts", 13, Some("emit"));
+            assert_eq!(maker(emit).holder, Holder::Field, "{extra}");
+            emit.contest(on_wire)
+        };
+        assert_eq!(factory(""), None);
+        assert_eq!(
+            factory("socket.on(\"disconnect\", () => log({ active: socket.active }));"),
+            Some(Contest::Used)
+        );
+
+        // A field read only in a test.
+        let sites = sites_of(&[(
+            "src/worker.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export class Worker {\n\
+             \x20 private queue = new Queue(\"work\");\n\
+             \x20 run() { if (!this.queue.closing) { return this.queue.add(\"tick\", {}); } }\n\
+             }\n",
+        )]);
+        assert_eq!(
+            site(&sites, "src/worker.ts", 4, Some("add")).contest(on_wire),
+            None
+        );
+    }
+
     /// A module the scan cannot follow turns imported reading off, as it does
     /// for an HTTP client (carrick#1568): the importer reads nothing through
     /// the instance, and the declaring module still reads its own calls.
@@ -3759,7 +3859,8 @@ mod tests {
     /// A constant object used any way but to read an entry holds nothing a
     /// name reads (carrick#1562): handed to a call, spread (a copy shares its
     /// inner objects), returned, read by a key the source does not state, or
-    /// read through an optional chain.
+    /// read through an optional chain. An inner object read in a test is an
+    /// inner object read, as it was before carrick#1690.
     #[test]
     fn an_object_used_any_way_but_read_holds_no_name() {
         let sites = sites_of(&[
@@ -3773,11 +3874,14 @@ mod tests {
                  const COMPUTED = { a: \"computed.a\" };\n\
                  const OPTIONAL = { inner: { a: \"optional.a\" } };\n\
                  const KEPT = { a: \"kept.a\" };\n\
+                 const TESTED_INNER = { inner: { a: \"tested.a\" } };\n\
+                 const TESTED_TEXT = { a: \"tested.text\" };\n\
                  register(HANDED);\n\
                  export const copy = { ...SPREAD };\n\
                  export function give() { return RETURNED; }\n\
                  export function pick(key: \"a\") { return COMPUTED[key]; }\n\
                  export function maybe() { return OPTIONAL?.inner; }\n\
+                 export function check() { if (TESTED_INNER.inner || TESTED_TEXT.a) { return 1; } return 0; }\n\
                  export function send() {\n\
                  \x20 bus.publish(HANDED.a, {});\n\
                  \x20 bus.publish(SPREAD.a, {});\n\
@@ -3785,6 +3889,8 @@ mod tests {
                  \x20 bus.publish(COMPUTED.a, {});\n\
                  \x20 bus.publish(OPTIONAL.inner.a, {});\n\
                  \x20 bus.publish(KEPT.a, {});\n\
+                 \x20 bus.publish(TESTED_INNER.inner.a, {});\n\
+                 \x20 bus.publish(TESTED_TEXT.a, {});\n\
                  }\n",
             ),
             (
@@ -3797,12 +3903,18 @@ mod tests {
                 .literal(0, None)
                 .map(str::to_string)
         };
-        assert_eq!(name(15), None, "handed to a call");
-        assert_eq!(name(16), None, "spread");
-        assert_eq!(name(17), None, "returned");
-        assert_eq!(name(18), None, "read by a computed key");
-        assert_eq!(name(19), None, "read through an optional chain");
-        assert_eq!(name(20).as_deref(), Some("kept.a"), "the control");
+        assert_eq!(name(18), None, "handed to a call");
+        assert_eq!(name(19), None, "spread");
+        assert_eq!(name(20), None, "returned");
+        assert_eq!(name(21), None, "read by a computed key");
+        assert_eq!(name(22), None, "read through an optional chain");
+        assert_eq!(name(23).as_deref(), Some("kept.a"), "the control");
+        assert_eq!(name(24), None, "an inner object read in a test");
+        assert_eq!(
+            name(25).as_deref(),
+            Some("tested.text"),
+            "a text entry read in a test"
+        );
     }
 
     /// A constant object is read only where every module that reaches it

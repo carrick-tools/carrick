@@ -1162,11 +1162,20 @@ struct BindingUse {
     /// Read as an operand of `instanceof`, `typeof` or a comparison: a value
     /// use, which keeps an import at run time, that changes nothing.
     read: bool,
-    /// Tested for truth: the whole test of an `if`, a loop or a conditional,
-    /// or the operand of `!` (`if (!this.client)`). A message role reads it
-    /// as [`Self::read`] (carrick#1665); before, it was the operand it is to
-    /// an HTTP reading, which still contests on it.
+    /// Tested for truth: in a test position ([`BindingUses::tested`]), the
+    /// whole test of an `if`, a loop or a conditional, the operand of `!`
+    /// (`if (!this.client)`), or an operand of a `&&` or `||` in a test
+    /// position (carrick#1690). A message role reads it as [`Self::read`]
+    /// (carrick#1665); before, it was the operand it is to an HTTP reading,
+    /// which still contests on it.
     tested: bool,
+    /// The object of a member read whose value is only tested
+    /// (carrick#1690): a member chain read off the binding in a test
+    /// position (`if (socket.recovered || retrying)`). A message role reads
+    /// it as [`Self::read`]: a read changes no name, prefix or base. Before,
+    /// it was the [`Self::member_read`] it is to an HTTP reading, which still
+    /// contests on it.
+    member_tested: bool,
     /// Calls through a sub-object of it (`client.tasks.trigger(…)`, every hop
     /// a plain name) and constructions of it or of a member (`new Queue(…)`,
     /// `new lib.Worker(…)`), as the message roles read them (carrick#1661).
@@ -1196,10 +1205,13 @@ impl BindingUse {
     /// A call through a sub-object and a construction contest exactly as
     /// the member read and the operand they were recorded as before
     /// carrick#1661, a truthiness test as the operand it was before
-    /// carrick#1665, and a return as the operand it was before carrick#1562.
+    /// carrick#1665, a return as the operand it was before carrick#1562, and
+    /// a member read only tested as the member read it was before
+    /// carrick#1690.
     fn contests_client(&self) -> bool {
         self.written
             || self.member_read
+            || self.member_tested
             || self.spread
             || self.other
             || self.tested
@@ -1208,13 +1220,14 @@ impl BindingUse {
     }
 
     /// The same for a message role (carrick#1661): a hand-off, a write, a
-    /// member read that is not called, a spread, or a member called by a key
+    /// member read used as a value, a spread, or a member called by a key
     /// the source does not state. Constructing the binding is what a `new`
     /// maker does, and a call through a sub-object is a call; both are among
     /// [`Self::member_uses`], which the caller classifies. A truthiness test
-    /// keeps nothing of the binding. A return is the reader's to judge
-    /// ([`BindingUse::returned_at`]): followed to an own factory's callers,
-    /// or a hand-off.
+    /// of the binding or of a member read off it keeps nothing of the
+    /// binding (carrick#1665, carrick#1690). A return is the reader's to
+    /// judge ([`BindingUse::returned_at`]): followed to an own factory's
+    /// callers, or a hand-off.
     fn contests_message(&self) -> bool {
         self.written || self.member_read || self.spread || self.other || self.called_computed
     }
@@ -1231,6 +1244,7 @@ impl BindingUse {
         self.exported |= other.exported;
         self.read |= other.read;
         self.tested |= other.tested;
+        self.member_tested |= other.member_tested;
         self.library_calls
             .extend(other.library_calls.iter().cloned());
         self.returned_at.extend(other.returned_at.iter().copied());
@@ -1314,16 +1328,46 @@ impl BindingUses {
 
     /// `member` is read and not called: its chain's root is read.
     fn read_member(&mut self, member: &MemberExpr) {
+        self.read_member_as(member, |used| used.member_read = true);
+    }
+
+    /// `member` is read, and its chain's root, when a binding, is recorded
+    /// by `record`. A computed key is visited, and a root that is no binding
+    /// is visited as usual.
+    fn read_member_as(&mut self, member: &MemberExpr, record: fn(&mut BindingUse)) {
         if let MemberProp::Computed(key) = &member.prop {
             key.expr.visit_with(self);
         }
         let obj = crate::graphql_document_sites::unwrap_expression(&member.obj);
         if let Some(key) = binding_key(obj) {
-            self.mark(key, |used| used.member_read = true);
+            self.mark(key, record);
         } else if let Some(inner) = as_member(obj) {
-            self.read_member(inner);
+            self.read_member_as(inner, record);
         } else {
             obj.visit_with(self);
+        }
+    }
+
+    /// `TOPICS.orders` read off its binding: an entry read (carrick#1562).
+    /// One by a key the source does not state, or through an optional
+    /// chain, may read any entry: the object itself as far as a name is
+    /// concerned.
+    fn entry_read(&mut self, expr: &Expr) {
+        let path = match expr {
+            Expr::Member(_) => member_path(expr),
+            _ => None,
+        };
+        match path {
+            Some((key, path)) => self.mark(key, |used| {
+                used.entry_reads.insert(path);
+            }),
+            None => {
+                if let Some(key) = chain_root(expr) {
+                    self.mark(key, |used| {
+                        used.entry_reads.insert(Vec::new());
+                    });
+                }
+            }
         }
     }
 
@@ -1504,21 +1548,8 @@ impl Visit for BindingUses {
             return;
         }
         if let Expr::Member(member) = expr {
-            // `TOPICS.orders` as a value: an entry read (carrick#1562). One
-            // by a key the source does not state may read any entry, the
-            // object itself as far as a name is concerned.
-            match member_path(expr) {
-                Some((key, path)) => self.mark(key, |used| {
-                    used.entry_reads.insert(path);
-                }),
-                None => {
-                    if let Some(key) = chain_root(expr) {
-                        self.mark(key, |used| {
-                            used.entry_reads.insert(Vec::new());
-                        });
-                    }
-                }
-            }
+            // `TOPICS.orders` as a value: an entry read (carrick#1562).
+            self.entry_read(expr);
             self.read_member(member);
             return;
         }
@@ -1790,13 +1821,33 @@ impl BindingUses {
         }
     }
 
-    /// A test for truth (carrick#1665): a binding that is the whole test is
-    /// [`BindingUse::tested`]; anything else is visited as usual.
+    /// An expression in a test position, whose value is only tested for
+    /// truth: the whole test of an `if`, a loop or a conditional, the operand
+    /// of `!`, and each operand of a `&&` or `||` in a test position
+    /// (carrick#1690). A binding there is [`BindingUse::tested`]
+    /// (carrick#1665), and a member chain read off one, through any hops, is
+    /// [`BindingUse::member_tested`], its entry read as a value's is.
+    /// Anything else is visited as usual. A comparison or `typeof` operand is
+    /// [`Self::compared`].
     fn tested(&mut self, expr: &Expr) {
-        match binding_key(crate::graphql_document_sites::unwrap_expression(expr)) {
-            Some(key) => self.mark(key, |used| used.tested = true),
-            None => expr.visit_with(self),
+        let expr = crate::graphql_document_sites::unwrap_expression(expr);
+        if let Some(key) = binding_key(expr) {
+            self.mark(key, |used| used.tested = true);
+            return;
         }
+        if let Expr::Bin(bin) = expr
+            && matches!(bin.op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr)
+        {
+            self.tested(&bin.left);
+            self.tested(&bin.right);
+            return;
+        }
+        if let Some(member) = as_member(expr) {
+            self.entry_read(expr);
+            self.read_member_as(member, |used| used.member_tested = true);
+            return;
+        }
+        expr.visit_with(self);
     }
 
     /// An operand whose value is read and not kept: a binding, or a member
@@ -5494,6 +5545,92 @@ mod tests {
                 "{name} is no object constant's key set"
             );
         }
+    }
+
+    /// carrick#1690 split a member read whose value is only tested out of
+    /// the member read it was, and a binding that is a `&&` or `||` operand
+    /// in a test position out of the operand it was: a message role reads
+    /// each as reading the binding and keeping nothing of it, and an HTTP
+    /// client and an object constant are contested by it exactly as before.
+    /// A member read used as a value is a member read still.
+    #[test]
+    fn a_member_read_only_tested_still_contests_an_http_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(
+            &path,
+            "if (api.ready) {}\n\
+             while (lib.a.b) {}\n\
+             do {} while (bus?.open);\n\
+             for (; queue[key].busy; ) {}\n\
+             const picked = opts.mode ? 1 : 2;\n\
+             const off = !this.client.connected;\n\
+             if (sock.recovered || retrying) {}\n\
+             if (!(left.x && (right as any).y)) {}\n\
+             if (pair && flag) {}\n\
+             const kept = held.value;\n\
+             const either = other.value || fallback;\n\
+             const maybe = nullish.value ?? fallback;\n\
+             const chosen = flag ? branch.value : null;\n",
+        )
+        .expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut uses = BindingUses::default();
+        module.visit_with(&mut uses);
+        for name in [
+            "api",
+            "lib",
+            "bus",
+            "queue",
+            "opts",
+            "this.client",
+            "sock",
+            "left",
+            "right",
+        ] {
+            let used = &uses.uses[name];
+            assert!(used.member_tested, "{name} has a member read only tested");
+            assert!(!used.member_read, "{name} has no member read as a value");
+            assert!(used.contests_client(), "{name} contests an HTTP client");
+            assert!(
+                !used.contests_message(),
+                "{name} is no use to a message role"
+            );
+            assert!(
+                used.keeps_object(),
+                "{name} keeps an object constant's key set, as a member read did"
+            );
+        }
+        assert!(uses.uses["retrying"].tested, "an operand of a tested `||`");
+        assert!(
+            uses.uses["key"].other,
+            "a computed key in a tested chain is a value"
+        );
+        let pair = &uses.uses["pair"];
+        assert!(pair.tested, "an operand of a tested `&&`");
+        assert!(pair.contests_client(), "pair contests an HTTP client");
+        assert!(!pair.contests_message(), "pair is no use to a message role");
+        assert!(!pair.keeps_object(), "pair is no object constant's key set");
+        for name in ["held", "other", "nullish", "branch"] {
+            let used = &uses.uses[name];
+            assert!(used.member_read, "{name} has a member read as a value");
+            assert!(!used.member_tested, "{name} is not only tested");
+            assert!(used.contests_message(), "{name} contests a message role");
+        }
+        assert!(
+            uses.uses["fallback"].other,
+            "an operand of a `||` or `??` used as a value is a value"
+        );
+        let mut merged = BindingUse::default();
+        merged.merge(&uses.uses["api"]);
+        assert!(merged.member_tested);
     }
 
     /// carrick#1562 split a returned binding out of the operand it was: a
