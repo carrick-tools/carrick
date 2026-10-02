@@ -24,6 +24,8 @@
 //!   not the envelope (ruled on carrick#1664, 2026-10-02). Any failure, a
 //!   `403 scan_not_started` or a throttled `429` included, means no claims
 //!   this scan, and the scan carries on.
+//!
+//! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
