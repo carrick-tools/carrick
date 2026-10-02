@@ -1292,10 +1292,8 @@ export class TypeInferrer {
     // The resolved node IS the payload subexpression in the MVP schema.
     // Transitional fallback: if a caller still supplies a bare call expression
     // (e.g., `res.json(users)`), drill to its first argument. No method-name list.
-    // A call whose result is a value the repo shapes is not a send: it is the
-    // payload (carrick#1732), and drilling would publish its input instead.
     let payloadNode: Node = node;
-    if (Node.isCallExpression(node) && !this.callResultIsPayload(node)) {
+    if (Node.isCallExpression(node)) {
       const args = node.getArguments();
       // A call that receives a function is a callback registration (e.g. an
       // endpoint registration like `app.get('/path', handler)`) — its first
@@ -1334,7 +1332,9 @@ export class TypeInferrer {
         );
         return null;
       }
-      if (args.length > 0) {
+      // A call whose result is a value the repo shapes is not a send: it is
+      // the payload (carrick#1732), and drilling would publish its input.
+      if (args.length > 0 && !this.callResultIsPayload(node)) {
         payloadNode = args[0];
       }
     }
