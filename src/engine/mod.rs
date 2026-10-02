@@ -5890,6 +5890,8 @@ fn build_cloud_data_from_mount_graph(
         // "same commit, same scanner" (skip) from "same commit, newer
         // scanner" (re-index).
         scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        // And the build, which names the code even between releases (#1739).
+        scanner_build: crate::cloud_storage::ScannerBuild::current(),
         boundary: None,
         dispatch_tables: None,
     }
@@ -9144,6 +9146,10 @@ mod tests {
             data.scanner_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+        assert_eq!(
+            data.scanner_build,
+            crate::cloud_storage::ScannerBuild::current()
+        );
     }
 
     /// "Uploaded" would be a lie when the cloud short-circuited every payload,
@@ -9247,6 +9253,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }
@@ -10104,6 +10111,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -10318,6 +10326,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -10369,6 +10378,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }];
@@ -10464,6 +10474,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }];
@@ -11107,6 +11118,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11163,6 +11175,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11232,6 +11245,7 @@ mod tests {
                 sdk_edges: None,
                 sdk_unresolved: None,
                 scanner_version: None,
+                scanner_build: None,
                 boundary: None,
                 dispatch_tables: None,
             }
@@ -11310,6 +11324,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11530,6 +11545,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11677,6 +11693,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11799,6 +11816,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -11917,6 +11935,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         };
@@ -19385,6 +19404,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }

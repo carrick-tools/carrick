@@ -544,6 +544,28 @@ pub struct TypeDegradation {
     pub detail: String,
 }
 
+/// Which build of the scanner wrote a blob; see [`CloudRepoData::scanner_build`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ScannerBuild {
+    /// The scanner repo's commit the binary was compiled from (full object id).
+    pub commit: String,
+    /// The binary's sources (`src`, `crates`, `build.rs`, `Cargo.toml`,
+    /// `Cargo.lock`) had tracked changes that commit does not hold.
+    pub dirty: bool,
+}
+
+impl ScannerBuild {
+    /// The running binary's own build, compiled in by `build.rs`, or `None`
+    /// when it was built where no commit could be named.
+    pub fn current() -> Option<Self> {
+        let commit = env!("CARRICK_BUILD_COMMIT");
+        (!commit.is_empty()).then(|| Self {
+            commit: commit.to_string(),
+            dirty: env!("CARRICK_BUILD_DIRTY") == "true",
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -682,6 +704,22 @@ pub struct CloudRepoData {
     /// else's scan, not this scanner's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanner_version: Option<String>,
+    /// The build of the scanner that produced this upload (carrick#1739):
+    /// the scanner repo's commit and whether its sources matched it.
+    /// `scanner_version` only moves at a release, so a build of main between
+    /// two releases stamps the previous one; this field is what says which
+    /// code wrote a blob. A release build carries the tag's commit.
+    ///
+    /// Nothing pairs, gates or ranks on it, on either side: reuse pairing and
+    /// the version gate read `scanner_version` and are unchanged. It sits in a
+    /// struct of its own because the blob's top-level `dirty` is a different
+    /// claim (the scanned tree's, read by the cloud as upload provenance).
+    ///
+    /// Additive and optional: `None` on blobs written before the field
+    /// existed, on test fixtures, and on a binary built outside a git checkout
+    /// of the scanner, where no commit can be named without guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_build: Option<ScannerBuild>,
     /// What this service's scan could not classify (carrick#705): the files it
     /// lost, the calls it could not place, the operations it has no type for,
     /// each with its reasons capped and its exact total kept.
@@ -895,6 +933,8 @@ impl CloudRepoData {
             // "same commit, same scanner" (skip) from "same commit, newer
             // scanner" (re-index).
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // And the build, which names the code even between releases.
+            scanner_build: ScannerBuild::current(),
             // Collected once the blob is complete and its paths are relative;
             // see `crate::boundary::ServiceBoundary::collect`.
             boundary: None,
@@ -1603,6 +1643,82 @@ mod tests {
             data.scanner_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+        assert_eq!(data.scanner_build, ScannerBuild::current());
+    }
+
+    /// The build stamp (carrick#1739) rides the wire as its own nested object
+    /// and touches neither the field the cloud pairs on (`scanner_version`)
+    /// nor the blob's top-level `dirty`, which is the scanned tree's claim and
+    /// which the cloud reads as upload provenance. Unset, the key is absent,
+    /// so every blob stored before the field existed still reads as `None`.
+    #[test]
+    fn scanner_build_rides_the_wire_beside_scanner_version_and_is_omitted_when_unset() {
+        let unstamped = empty_repo("orders-service", None);
+        let unstamped_json = serde_json::to_value(&unstamped).unwrap();
+        let mut repo = empty_repo("orders-service", None);
+        repo.scanner_build = Some(ScannerBuild {
+            commit: "7b220a47".repeat(5),
+            dirty: true,
+        });
+
+        let json = serde_json::to_value(&repo).unwrap();
+        assert_eq!(
+            json["scanner_build"],
+            serde_json::json!({ "commit": "7b220a47".repeat(5), "dirty": true })
+        );
+        assert_eq!(
+            json.get("scanner_version"),
+            unstamped_json.get("scanner_version")
+        );
+        assert_eq!(json.get("dirty"), unstamped_json.get("dirty"));
+
+        let back: CloudRepoData = serde_json::from_value(json).expect("a stamped blob round-trips");
+        assert_eq!(back.scanner_build, repo.scanner_build);
+
+        let json = serde_json::to_string(&unstamped).unwrap();
+        assert!(
+            !json.contains("scanner_build"),
+            "an unset scanner_build must be omitted, not serialized as null"
+        );
+        let back: CloudRepoData =
+            serde_json::from_str(&json).expect("old cloud data (no field) still deserializes");
+        assert!(back.scanner_build.is_none());
+    }
+
+    /// The stamp names the commit this binary was built from, not one a
+    /// cached `target/` remembers: `build.rs` has to rerun whenever HEAD moves.
+    /// Run against the checkout the test binary was built in; skipped where
+    /// `build.rs` could not name a commit either (no git, or the package is
+    /// not the root of its checkout). `dirty` is not compared against the live
+    /// tree: tests in this crate write to tracked fixtures.
+    #[test]
+    fn scanner_build_names_the_commit_the_binary_was_built_from() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(manifest_dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        let own_checkout = git(&["rev-parse", "--show-toplevel"])
+            .and_then(|top| std::fs::canonicalize(top).ok())
+            .is_some_and(|top| std::fs::canonicalize(manifest_dir).ok() == Some(top));
+        let Some(head) = git(&["rev-parse", "HEAD"]).filter(|_| own_checkout) else {
+            return;
+        };
+
+        assert_eq!(
+            ScannerBuild::current().map(|build| build.commit),
+            Some(head),
+            "the compiled-in build commit is not the checkout's HEAD: build.rs did not rerun \
+             when HEAD moved, or did not stamp at all"
+        );
     }
 
     /// The flattened key is the wire contract with the manifest matcher:
@@ -2012,6 +2128,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            scanner_build: None,
             boundary: None,
             dispatch_tables: None,
         }
