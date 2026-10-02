@@ -3147,6 +3147,8 @@ async fn analyze_current_repo_incremental(
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
                 document_sites,
+                &merged_results,
+                repo_path,
                 &mut mount_graph,
                 service,
                 graphql_schemas,
@@ -3751,14 +3753,15 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
 }
 
 /// Run the deterministic protocol scans (GraphQL SDL/documents, Socket.IO)
-/// and join in the file-analyzer's located types. Split from
+/// and join in the file-analyzer's located producer types. Split from
 /// `append_deterministic_protocol_operations` so the extractions exist BEFORE
 /// the mount graph is projected into cloud data — the GraphQL consumer file
 /// set drives `fold_graphql_transport_calls` on the graph first (#307).
 ///
 /// The calls that execute a GraphQL document are read here too, and placed
 /// in the extraction by [`settle_graphql_documents`] once the transport fold
-/// has run (carrick#1157).
+/// has run (carrick#1157). The located consumer types join there, after the
+/// placement, because they are keyed by the file that executes the document.
 fn scan_protocol_extractions(
     repo_path: &str,
     service: &Config,
@@ -3777,7 +3780,6 @@ fn scan_protocol_extractions(
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
-    merge_graphql_consumer_locations(&mut graphql, file_results, repo_path);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
     // through a relative specifier.
@@ -3985,15 +3987,24 @@ fn withdraw_model_routes_at_definitions(
 /// passes a generated document to a hook is not a document file, and folding
 /// its HTTP calls would drop the REST requests it also makes. Those rows are
 /// attributed like any other document.
+///
+/// The consumer types the file-analyzer located (`file_results`) join once
+/// those rows are placed (carrick#1728). The model answers for the file it
+/// reads, and the row a located type describes sits in that file only after
+/// the placement: before it, the operation is still at its document file or
+/// the module that declares the document, and no locate finds it.
 fn settle_graphql_documents(
     graphql: &mut crate::graphql::GraphqlExtraction,
     document_sites: crate::graphql_document_sites::DocumentSiteConsumers,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
 ) {
     fold_graphql_transport_calls(mount_graph, graphql);
     document_sites.apply(graphql);
+    merge_graphql_consumer_locations(graphql, file_results, repo_path);
     let label = service.service_name.as_deref().unwrap_or("(root)");
     // A schema the service's walk found is one it serves only with evidence
     // that it serves a schema at all (carrick#1189): it declares one, it serves
@@ -5183,7 +5194,9 @@ fn merge_graphql_resolver_locations(
 /// type. Joining on the canonical key alone would collide every file's locate
 /// entry onto whichever consumer op happened to occupy that key first. So this
 /// joins on the triple `(file_path, kind, field)`: each file's located type is
-/// scoped strictly to its own consumer op.
+/// scoped strictly to its own consumer op. The file is the one the model read,
+/// so this runs once the rows at the calls that execute a document are placed
+/// ([`settle_graphql_documents`], carrick#1728).
 ///
 /// ISOLATION GUARD: an op that already carries `payload_type_symbol` (the
 /// deterministic `TaggedTplVisitor::capture_request_call` explicit-generic
@@ -7782,6 +7795,8 @@ async fn analyze_current_repo(
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
         document_sites,
+        &analysis_result.file_results,
+        repo_path,
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
@@ -15748,6 +15763,8 @@ mod tests {
         settle_graphql_documents(
             &mut graphql,
             Default::default(),
+            &HashMap::new(),
+            "",
             &mut mount_graph,
             &Config::default(),
             &catalogue,

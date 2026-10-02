@@ -2,7 +2,8 @@
 import type { TypedDocumentNode as DocumentNode } from '@example/typed-document';
 
 export type OrdersQuery = { orders: Array<{ id: string }>; zones: Array<{ code: string }> };
-export type PlaceOrderMutation = { placeOrder: { id: string } };
+export type PlacedOrderFragment = { id: string };
+export type PlaceOrderMutation = { placeOrder: PlacedOrderFragment };
 export type PlaceOrderMutationVariables = { id: string };
 export type CarriersQuery = { carriers: Array<{ name: string }> };
 

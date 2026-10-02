@@ -4323,8 +4323,9 @@ impl FileOrchestrator {
     /// the #268 fallback, "the consuming file" is `op.file_path` itself — unlike
     /// the producer type-locate (which has a separate `resolver_file` the
     /// backing type may differ from), the consumer join is scoped per-file, so
-    /// the located type always resolves against the same file the document
-    /// lives in.
+    /// the located type always resolves against the file the model read: the
+    /// one the row sits in, which for a document executed elsewhere is the
+    /// file of the call that executes it (carrick#1728).
     pub fn collect_graphql_type_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
