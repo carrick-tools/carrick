@@ -39,6 +39,7 @@ import {
   expandTypeStructural,
   type ExpandOrigin,
 } from './type-structural-expander.js';
+import { externalImportsOf } from './origin.js';
 
 /**
  * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
@@ -699,6 +700,7 @@ export class TypeBundler {
     return {
       program: this.project.getProgram().compilerObject,
       repoRoot: this.repoRoot,
+      imports: externalImportsOf(this.project),
     };
   }
 

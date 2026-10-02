@@ -377,4 +377,108 @@ export const hex = encodeHex(new Uint8Array());
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+  it('keeps a Deno-cached dependency read as library origin after the project is edited (carrick#1731)', async () => {
+    // ts-morph rebuilds the program after any edit to the project with every
+    // file it has loaded as a ROOT file, and the compiler marks no root file
+    // as an external-library import. On a Deno project that flag is the only
+    // thing that says an npm dependency's types are not the user's (no path
+    // carries `node_modules`), so an edit made every later answer read the
+    // dependency as user source: machinery stopped abstaining, and the printer
+    // inlined library types it keeps by name.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-origin-history-'));
+    const client = new SidecarClient();
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({ imports: { hono: 'npm:hono@4.12.12' } }));
+      const mainPath = path.join(root, 'main.ts');
+      fs.writeFileSync(mainPath, [
+        'import type { ExecutionContext, HonoRequest } from "hono";',
+        'export interface Payload { id: string }',
+        'export interface Wrapped { req: HonoRequest; id: string }',
+        'export function envelope(): HonoRequest { return null as unknown as HonoRequest; }',
+        'export function payload(): Payload { return { id: "x" }; }',
+        'export function tagged() { return { kind: "made" }; }',
+        'export function carried(req: HonoRequest) { return { req, id: req.path }; }',
+        'export function scheduled(ctx: ExecutionContext) { return { ctx, at: Date.now() }; }',
+      ].join('\n'));
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+
+      // The trap itself, in process: one probe file created and removed, and
+      // the compiler's flag is gone for the dependency's declaration file.
+      const loader = new ProjectLoader({ repoRoot: root });
+      assert.equal(loader.load().success, true);
+      const project = loader.getProject();
+      const declaring = project.getSourceFileOrThrow(mainPath).getFunctionOrThrow('envelope')
+        .getReturnType().getSymbolOrThrow().getDeclarations()[0].getSourceFile();
+      assert.doesNotMatch(declaring.getFilePath(), /\/node_modules\//);
+      assert.equal(project.getProgram().compilerObject.isSourceFileFromExternalLibrary(declaring.compilerNode), true);
+      project.removeSourceFile(project.createSourceFile(path.join(root, '__probe.ts'), 'export {};\n'));
+      const edited = project.getProgram().compilerObject;
+      assert.equal(edited.isSourceFileFromExternalLibrary(declaring.compilerNode), false,
+        'the fixture must reproduce the compiler forgetting the flag, or this test proves nothing');
+
+      // The answers, through the protocol, before and after each kind of edit
+      // a scan makes on the warm project.
+      await client.start();
+      await client.send({ action: 'init', request_id: 'init', repo_root: root });
+      let sequence = 0;
+      const read = async () => {
+        const inferred = (await client.send({
+          action: 'infer',
+          request_id: `read-${++sequence}`,
+          requests: [
+            { file_path: mainPath, line_number: 4, infer_kind: 'function_return', alias: 'Envelope' },
+            { file_path: mainPath, line_number: 5, infer_kind: 'function_return', alias: 'Body' },
+            { file_path: mainPath, line_number: 7, infer_kind: 'function_return', alias: 'Carried' },
+            { file_path: mainPath, line_number: 8, infer_kind: 'function_return', alias: 'Scheduled' },
+          ],
+        })) as { inferred_types?: Array<{ alias: string; type_string: string }>; errors?: string[] };
+        const bundled = (await client.send({
+          action: 'bundle',
+          request_id: `bundle-${sequence}`,
+          symbols: [{ symbol_name: 'Wrapped', source_file: mainPath, alias: 'WrappedAlias' }],
+        })) as { dts_content?: string };
+        return {
+          inferred: (inferred.inferred_types ?? []).map(t => [t.alias, t.type_string]),
+          errors: (inferred.errors ?? []).length,
+          bundled: bundled.dts_content,
+        };
+      };
+      const fresh = await read();
+      // The request wrapper and the payload carrying it abstain as machinery;
+      // a plain library type stays by name in a published payload.
+      assert.deepEqual(fresh.inferred, [
+        ['Body', '{ id: string; }'],
+        ['Scheduled', '{ ctx: ExecutionContext; at: number; }'],
+      ]);
+      assert.match(fresh.bundled ?? '', /req: HonoRequest<"\/", \{\}>;/, 'a library type stays by name');
+
+      // Edit 1: the unwidened reading rewrites the handler's file and restores it.
+      const tagged = (await client.send({
+        action: 'infer',
+        request_id: 'tagged',
+        requests: [{ file_path: mainPath, line_number: 6, infer_kind: 'function_return', alias: 'Tagged' }],
+      })) as { inferred_types?: Array<{ unwidened_type_string?: string }> };
+      assert.ok(tagged.inferred_types?.[0]?.unwidened_type_string, 'the unwidened reading must have rewritten a file');
+      assert.deepEqual(await read(), fresh, 'answers after a rewrite-and-restore');
+
+      // Edit 2: a probe file created and removed (verify_client_semantics).
+      await client.send({
+        action: 'verify_client_semantics',
+        request_id: 'semantics',
+        from_dir: root,
+        checks: [{
+          claim_id: 'hono@4:Hono:verb:get',
+          package: 'hono',
+          export: 'Hono',
+          receiver: 'export',
+          claim: { kind: 'verb', member: 'get', method: 'GET' },
+        }],
+      });
+      assert.deepEqual(await read(), fresh, 'answers after a probe file');
+    } finally {
+      await client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

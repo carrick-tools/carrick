@@ -50,7 +50,7 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
-import { isExternalOrigin } from './origin.js';
+import { externalImportsOf, isExternalOrigin } from './origin.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -484,6 +484,7 @@ export class TypeInferrer {
     return {
       program: this.project.getProgram().compilerObject,
       repoRoot: this.repoRoot,
+      imports: externalImportsOf(this.project),
     };
   }
 
@@ -3420,7 +3421,7 @@ export class TypeInferrer {
     }
     const program = this.project.getProgram().compilerObject;
     for (const decl of symbol.getDeclarations()) {
-      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot)) {
+      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot, externalImportsOf(this.project))) {
         return true;
       }
     }

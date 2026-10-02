@@ -34,7 +34,7 @@ import {
   canonicalizeUnionsInText,
   foldBooleanLiterals,
 } from './type-text-canonicalizer.js';
-import { isExternalOrigin } from './origin.js';
+import { isExternalOrigin, type ExternalImports } from './origin.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -126,11 +126,14 @@ export type WireFormat = 'declared' | 'json';
  * its own cache leaves no such segment in the path (carrick#1264). The program
  * carries the resolver's own verdict, so it is what `isExternalOrigin` is
  * asked — the same instrument the inference path uses, so the two layers
- * cannot disagree about which types to inline.
+ * cannot disagree about which types to inline. `imports` is that verdict kept
+ * past the program rebuilds that drop it (carrick#1731), for a project the
+ * loader built.
  */
 export interface ExpandOrigin {
   readonly program: ts.Program;
   readonly repoRoot: string;
+  readonly imports?: ExternalImports;
 }
 
 /** Everything `expandTypeStructural` takes besides the type and its origin. */
@@ -545,7 +548,7 @@ function isLibraryType(type: Type, origin: ExpandOrigin): boolean {
   const decls = symbol.getDeclarations();
   if (decls.length === 0) return false;
   return decls.some((decl) =>
-    isExternalOrigin(origin.program, decl.getSourceFile().compilerNode, origin.repoRoot),
+    isExternalOrigin(origin.program, decl.getSourceFile().compilerNode, origin.repoRoot, origin.imports),
   );
 }
 

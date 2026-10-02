@@ -16,6 +16,7 @@ import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
 import { DenoProject, findDenoConfig, serviceConfigPath } from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
+import { ExternalImports, registerExternalImports } from './origin.js';
 
 /**
  * Options for ProjectLoader construction
@@ -229,17 +230,21 @@ export class ProjectLoader {
           this.buildProject = () => {
             const deno = new DenoProject(denoConfig, this.repoRoot);
             this.denoProject = deno;
+            // The graph's external-library verdicts, kept past the program
+            // rebuilds that drop them (carrick#1731).
+            const imports = new ExternalImports();
             const project = new Project({
               compilerOptions: deno.parsed.options as CompilerOptions,
               skipAddingFilesFromTsConfig: true,
-              resolutionHost: (host, getOptions) => ({
+              resolutionHost: imports.recording((host, getOptions) => ({
                 resolveModuleNames: (names, from) => names.map(name =>
                   deno.resolve(name, from, getOptions() as import('typescript').CompilerOptions, host)),
                 resolveTypeReferenceDirectives: (names, from) => names.map(name =>
                   deno.resolveTypeReference(typeof name === 'string' ? name : name.fileName, from,
                     getOptions() as import('typescript').CompilerOptions, host)),
-              }),
+              })),
             });
+            registerExternalImports(project, imports);
             for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
             for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
             return project;
@@ -352,12 +357,17 @@ export class ProjectLoader {
 
   /** A ts-morph project built from one tsconfig and the files it lists. */
   private projectFromConfig(configPath: string): Project {
-    return new Project({
+    const imports = new ExternalImports();
+    const project = new Project({
       tsConfigFilePath: configPath,
       skipAddingFilesFromTsConfig: false,
-      // Each import resolves in its file's own module format (carrick#1619).
-      resolutionHost: moduleFormatResolutionHost,
+      // Each import resolves in its file's own module format (carrick#1619),
+      // and every external-library answer is kept past the program rebuilds
+      // that drop it (carrick#1731).
+      resolutionHost: imports.recording(moduleFormatResolutionHost),
     });
+    registerExternalImports(project, imports);
+    return project;
   }
 
   /**
