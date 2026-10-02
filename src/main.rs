@@ -41,6 +41,7 @@ mod import_bindings;
 mod imported_request_member;
 mod in_process_pubsub;
 mod intent_generator;
+mod library_claims;
 mod local_http_wrapper;
 mod local_mode;
 mod logging;
