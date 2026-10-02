@@ -276,6 +276,12 @@ pub enum ResolutionSource {
     /// own, only the method of the model's row at that site
     /// (carrick-cloud#1365).
     InlineLiteral,
+    /// A pub/sub or socket row read through the claims a package's library
+    /// entry makes, each verified against the package's own declarations
+    /// (carrick#1662, contract carrick#1564 section 4). A fact: the row
+    /// carries the claim ids it rests on (`library_semantics`) and where its
+    /// name means something (`name_scope`).
+    LibraryClaim,
     /// The row is the model's, with no deterministic twin at its span.
     Model,
     /// An operation the REPO declares, in the `operations` block of

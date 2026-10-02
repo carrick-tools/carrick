@@ -714,6 +714,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         }
     }
 
@@ -736,6 +738,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         }
     }
 
@@ -1117,6 +1121,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
 
         let result = ApiAnalysisResult {
@@ -1202,6 +1208,8 @@ mod tests {
                 dispatch: None,
                 schema_binding: None,
                 handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1361,6 +1369,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1434,6 +1444,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

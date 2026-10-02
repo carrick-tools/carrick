@@ -1047,7 +1047,9 @@ impl ResolutionSource {
             // pass has run, and the config is the only thing that states them.
             // Ranked at the top so this arm reads as "nothing outranks the
             // repo's own declaration" rather than as an unexamined default.
-            Self::DeclaredOperation => u8::MAX,
+            // A library-claim row (carrick#1662) is a pub/sub or socket row,
+            // never an HTTP call site the passes compete for.
+            Self::DeclaredOperation | Self::LibraryClaim => u8::MAX,
         }
     }
 

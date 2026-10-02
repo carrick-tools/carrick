@@ -310,6 +310,18 @@ pub struct ApiEndpointDetails {
     /// the scan could not place, and on rows written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_span: Option<crate::mount_graph::HandlerSpan>,
+    /// On a pub/sub or socket row stated through verified library claims
+    /// (`resolution_source: library_claim`, carrick#1662): where its name
+    /// means something. `global` pairs across services, `service` only
+    /// within its own; two namespaces never pair. The operation key keeps
+    /// the literal name. `None` on every other row and on every blob written
+    /// before the field (contract carrick#1564, section 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_scope: Option<crate::services::type_sidecar::NameScope>,
+    /// The claim ids such a row rests on, every maker of a set included
+    /// (carrick#1662). Empty, and skipped on the wire, on every other row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_semantics: Vec<String>,
 }
 
 pub struct ApiAnalysisResult {
@@ -4396,6 +4408,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         }
     }
 
@@ -4759,6 +4773,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -4780,6 +4796,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -4801,6 +4819,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -4823,6 +4843,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -4900,6 +4922,8 @@ mod tests {
                 dispatch: None,
                 schema_binding: None,
                 handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
             });
         }
 
@@ -4971,6 +4995,8 @@ mod tests {
                 dispatch: None,
                 schema_binding: None,
                 handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
             });
         }
 
@@ -5021,6 +5047,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5111,6 +5139,8 @@ mod tests {
                 dispatch: None,
                 schema_binding: None,
                 handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
             });
 
             let mut mount_graph = MountGraph::new();
@@ -5193,6 +5223,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         }
     }
 
@@ -5409,6 +5441,76 @@ mod tests {
         assert_eq!(type_mismatch_sources(&analyzer), vec![None]);
     }
 
+    /// A row stated through verified library claims (carrick#1662) carries
+    /// `resolution_source: library_claim`, `name_scope` and
+    /// `library_semantics` beside its key, whose name stays the literal (the
+    /// wire pinned on carrick#1564, section 4). A row without them, from any
+    /// other source or an older blob, carries neither key and reads as
+    /// before.
+    #[test]
+    fn a_library_claim_row_carries_its_scope_and_claims_and_an_older_row_neither() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::services::type_sidecar::{NameScope, NameScopeKind};
+        let older: ApiEndpointDetails = serde_json::from_value(serde_json::json!({
+            "owner": null,
+            "key": { "protocol": "pubsub", "topic": "send-email" },
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": null,
+            "request_type": null,
+            "response_type": null,
+            "file_path": "src/tasks.ts:2",
+            "provenance": "route"
+        }))
+        .expect("an older row reads");
+        assert!(older.name_scope.is_none());
+        assert!(older.library_semantics.is_empty());
+        let wire = serde_json::to_value(&older).expect("serialize");
+        assert!(wire.get("name_scope").is_none(), "{wire}");
+        assert!(wire.get("library_semantics").is_none(), "{wire}");
+
+        let stated = ApiEndpointDetails {
+            resolution_source: Some(ResolutionSource::LibraryClaim),
+            name_scope: Some(NameScope {
+                scope: NameScopeKind::Service,
+                namespace: Some("task".to_string()),
+            }),
+            library_semantics: vec!["@fixture/jobs@3:task:make:call:()".to_string()],
+            ..older.clone()
+        };
+        let wire = serde_json::to_value(&stated).expect("serialize");
+        assert_eq!(wire["resolution_source"], "library_claim");
+        assert_eq!(
+            wire["name_scope"],
+            serde_json::json!({ "scope": "service", "namespace": "task" })
+        );
+        assert_eq!(
+            wire["library_semantics"],
+            serde_json::json!(["@fixture/jobs@3:task:make:call:()"])
+        );
+        assert_eq!(
+            wire["key"]["topic"], "send-email",
+            "the name stays the literal"
+        );
+        let global = ApiEndpointDetails {
+            name_scope: Some(NameScope {
+                scope: NameScopeKind::Global,
+                namespace: None,
+            }),
+            ..stated.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&global).expect("serialize")["name_scope"],
+            serde_json::json!({ "scope": "global", "namespace": null }),
+            "a missing namespace is written null, as the cloud reads it"
+        );
+        let back: ApiEndpointDetails = serde_json::from_value(wire).expect("reads back");
+        assert_eq!(back.name_scope, stated.name_scope);
+        assert_eq!(back.library_semantics, stated.library_semantics);
+        assert!(!ResolutionSource::LibraryClaim.is_candidate());
+    }
+
     /// A non-HTTP verdict names one producer service and one consumer
     /// service, and only their rows are folded: another service subscribing
     /// to the same topic, or calling from the same `file:line` in its own
@@ -5518,6 +5620,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5671,6 +5775,8 @@ mod tests {
                 dispatch: value.map(&case),
                 schema_binding: None,
                 handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
             });
         };
         call(Some("search-by-intent"), 115);
@@ -5750,6 +5856,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5813,6 +5921,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5876,6 +5986,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5939,6 +6051,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let mut mount_graph = MountGraph::new();

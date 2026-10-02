@@ -968,6 +968,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
         let data = CloudRepoData {
             endpoints: vec![

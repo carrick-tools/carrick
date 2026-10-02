@@ -189,13 +189,15 @@ impl ConsumerRole {
             // row is, with its `reaches_request`.
             S::RequestSummary => None,
             // The model's own reading, and the sources that only ever state a
-            // ROUTE. Neither says what a consumer row is.
+            // ROUTE. Neither says what a consumer row is. A library-claim row
+            // (carrick#1662) is a pub/sub or socket row, never an HTTP call.
             S::Model
             | S::FileBasedRoute
             | S::DescriptorRoute
             | S::ClassController
             | S::DecoratorRoute
-            | S::DeclaredOperation => None,
+            | S::DeclaredOperation
+            | S::LibraryClaim => None,
         }
     }
 }

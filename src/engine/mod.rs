@@ -3932,6 +3932,8 @@ fn append_deterministic_protocol_operations(
         // The handler span is placed from an HTTP route's registration
         // (cloud#948); these rows have none.
         handler_span: None,
+        name_scope: None,
+        library_semantics: Vec::new(),
     };
     // A producer's row: tagged when its file sits in a mock or test-support
     // tree of the service, as an HTTP route is (#380, carrick#1626).
@@ -9197,6 +9199,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
 
         let mut graph = MountGraph::new();
@@ -9619,6 +9623,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
 
         let test_data = CloudRepoData {
@@ -9763,6 +9769,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
 
         let test_data = vec![CloudRepoData {
@@ -16778,6 +16786,8 @@ mod tests {
             dispatch: None,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
         append_pubsub_operations(
             &mut cloud_data,

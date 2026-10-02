@@ -932,6 +932,8 @@ pub fn mount_graph_to_api_details(
             dispatch: endpoint.dispatch.clone(),
             schema_binding: None,
             handler_span: endpoint.handler_span,
+            name_scope: None,
+            library_semantics: Vec::new(),
         })
         .collect();
 
@@ -961,6 +963,8 @@ pub fn mount_graph_to_api_details(
             schema_binding: None,
             // A call has no handler.
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         })
         .collect();
 
@@ -2527,6 +2531,8 @@ mod tests {
             dispatch: None,
             schema_binding: binding,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![

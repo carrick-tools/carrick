@@ -947,6 +947,8 @@ mod tests {
             }),
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         });
 
         let findings = dispatch_operation_findings(&[producer, consumer]);
@@ -1032,6 +1034,8 @@ mod tests {
             dispatch,
             schema_binding: None,
             handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
         }
     }
 
