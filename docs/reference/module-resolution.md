@@ -99,6 +99,13 @@ Two forms are not read, and each has a reason rather than an omission:
   its function under a different name (`module.exports = otherName`) records no
   edge for it.
 
+Framework detection's import list (`ImportSample`, `src/framework_detector.rs`)
+reads more than the binding table: every `require` and `import()` whose
+specifier is a literal, anywhere in a file, so a package a service loads only
+that way is still classified (carrick#1727). A load that binds nothing at module
+scope is listed as a side-effect import (`import 'x';`). A computed specifier
+adds nothing.
+
 The four passes that build ANALYZER inputs — mount, wrapper, SDK surface,
 GraphQL — do not read CommonJS exports, for the reason the section below gives
 for aliases: a module they newly resolve changes what the model is asked.

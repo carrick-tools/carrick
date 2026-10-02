@@ -585,10 +585,10 @@ mod tests {
         assert!(exports.local.is_empty());
     }
 
-    /// The analyzer's import table and the framework-detect sample are built
-    /// from `ImportSymbolExtractor` alone. A require binding must never reach
-    /// them: the prompt bytes of a CommonJS file would move, and its cached
-    /// answer would stop replaying.
+    /// The analyzer's import table is built from `ImportSymbolExtractor`
+    /// alone. A require binding must never reach it: the prompt bytes of a
+    /// CommonJS file would move, and its cached answer would stop replaying.
+    /// (The framework-detect sample reads requires on its own, carrick#1727.)
     #[test]
     fn require_bindings_stay_out_of_the_esm_import_table() {
         let module = parse(

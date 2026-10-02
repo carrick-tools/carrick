@@ -152,6 +152,13 @@ pub struct TypeManifestEntry {
     /// `None` unless it differs from `expanded_definition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_definition: Option<String>,
+    /// The state v1 gave this entry before a top type inside its printed
+    /// shape demoted it to `Unknown` (carrick#1752). v1's text cannot say who
+    /// put the top type there; the capture's record can, later in the same
+    /// scan, and when it shows the source declared it, this is the state the
+    /// entry returns to. Scan-local: never written to the blob.
+    #[serde(skip)]
+    pub v1_state_before_demotion: Option<ManifestTypeState>,
 }
 
 /// The declaration site of a manifest entry's anchor symbol (carrick#649).
@@ -1628,6 +1635,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            v1_state_before_demotion: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();

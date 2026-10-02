@@ -26,7 +26,10 @@ export type DeepTopType = Pick<TypeProvenance, 'kind' | 'path'>;
 /** Cap on findings reported per alias. The FIRST one is what the check phase
  * pre-gates on, so verdicts never depend on this number; the rest are there to
  * tell a reader which fields are `any` (carrick#376), and a type with more
- * than this many is already better described by "this type is not typed". */
+ * than this many is already better described by "this type is not typed".
+ * The scanner mirrors it (`CAPTURE_FINDINGS_CAP` in
+ * `src/engine/type_compat_v2.rs`): a record this long may have stopped
+ * listing, so it cannot vouch for every position (carrick#1752). */
 const MAX_DEEP_FINDINGS = 32;
 
 /**
@@ -132,6 +135,15 @@ function walkTopTypes(
   // about the whole type and makes any further finding meaningless.
   const found: DeepTopType[] = [];
   let exhausted = false;
+  // One finding per kind and position, under the cap. Two union members that
+  // both type `x` reach the same position twice.
+  const named = new Set<string>();
+  const note = (kind: 'any' | 'unknown', path: string): void => {
+    const key = `${kind}\u0000${path}`;
+    if (named.has(key) || found.length >= MAX_DEEP_FINDINGS) return;
+    named.add(key);
+    found.push({ kind, path });
+  };
 
   const walk = (t: ts.Type, path: string, depth: number): void => {
     // Genuine cycle handling — NOT fail-open. `t` is already on the walk stack
@@ -143,7 +155,23 @@ function walkTopTypes(
     // any shallower re-entry — so `seen` never memoizes a truncated visit as
     // clean. And a type fully explored clean at depth d1 is clean at any d2 < d1
     // (the shallower reach is a superset of the deeper), so reusing it is safe.
-    if (exhausted || seen.has(t)) return;
+    if (exhausted) return;
+    if (seen.has(t)) {
+      // A type met before has nothing left to walk, but a top type is a leaf
+      // that sits at every position typed with it, and `any` and `unknown`
+      // are intrinsics: the compiler hands out one object for each, however
+      // many members hold it. So this position is named too. Without it the
+      // record named the first `unknown` and the first `any` and nothing after
+      // them, and a member the source declares `unknown` hid a later one that
+      // an unresolved import left (carrick#1752). An object type met again is
+      // one declaration reached twice, and the first path already named
+      // every top type inside it, with its cause. The first finding, which
+      // the check phase pre-gates on, does not move: a repeat always follows
+      // the first meeting.
+      const kind = depth > 0 ? flagOf(t) : undefined;
+      if (kind) note(kind, path);
+      return;
+    }
     // Budget exhaustion FAILS CLOSED. Returning "clean" here would let an
     // `any` buried past the depth/node budget read compatible — the fail-open
     // cliff a bigger number only relocates. Instead abstain: the alias demotes
@@ -176,7 +204,7 @@ function walkTopTypes(
     if (depth > 0) {
       const kind = flagOf(t);
       if (kind) {
-        if (found.length < MAX_DEEP_FINDINGS) found.push({ kind, path });
+        note(kind, path);
         return;
       }
     }
@@ -206,16 +234,20 @@ function walkTopTypes(
     }
 
     // Type arguments: arrays, tuples, Promise<T>, Map<K, V>, ...
-    if ((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) {
-      const args = checker.getTypeArguments(t as ts.TypeReference);
-      for (let i = 0; i < args.length; i++) {
-        walk(args[i], `${path}<${i}>`, depth + 1);
-        if (exhausted) return;
-      }
+    const args =
+      (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference
+        ? checker.getTypeArguments(t as ts.TypeReference)
+        : [];
+    for (let i = 0; i < args.length; i++) {
+      walk(args[i], `${path}<${i}>`, depth + 1);
+      if (exhausted) return;
     }
 
-    // Index signatures: { [k: string]: T }, Record<string, T>.
+    // Index signatures: { [k: string]: T }, Record<string, T>. An array's
+    // number index is its element type argument again, the position walked
+    // just above under `<0>`: walking it twice would name one element twice.
     for (const info of checker.getIndexInfosOfType(t)) {
+      if (args.includes(info.type)) continue;
       walk(info.type, `${path}[index]`, depth + 1);
       if (exhausted) return;
     }
