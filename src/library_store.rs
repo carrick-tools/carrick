@@ -19,9 +19,11 @@
 //!   never fail a scan. An entry the store has not finished is `pending`, and
 //!   is asked once more after the analysis ([`settle`]), and again next scan.
 //! - **Transport (A5)** is the agent service's one path
-//!   ([`crate::agent_service::AgentService::post_json_to_lambda`]): the scan
-//!   slot, the scanner version, the pacer. Its 2xx body is the answer itself,
-//!   not the envelope (ruled on carrick#1664, 2026-10-02). Any failure, a
+//!   ([`crate::agent_service::AgentService::post_to_lambda`]): the scan slot,
+//!   the scanner version, the pacer. The route's 2xx body is the answer
+//!   itself, not the envelope
+//!   ([`crate::agent_service::SuccessBody::of`]; ruled on carrick#1664,
+//!   2026-10-02). Any failure, a
 //!   `403 scan_not_started` or a throttled `429` included, means no claims
 //!   this scan, and the scan carries on.
 //!

@@ -3781,7 +3781,7 @@ async fn send_to_library_store(
     request: crate::library_store::LibraryClaimsRequest,
 ) -> Result<String, crate::agent_service::AgentCallError> {
     reask_agent()
-        .post_json_to_lambda(
+        .post_to_lambda(
             crate::library_store::ROUTE,
             &request,
             crate::library_store::MOCK_SEED,

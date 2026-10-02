@@ -683,35 +683,6 @@ impl AgentService {
         body: &B,
         mock_seed: &str,
     ) -> Result<LambdaOutcome, AgentCallError> {
-        self.post_reading(task_path, body, mock_seed, SuccessBody::Envelope)
-            .await
-    }
-
-    /// As [`Self::post_to_lambda`], for a route whose 2xx body is the answer
-    /// itself rather than the envelope: `POST /library-claims`
-    /// ([`SuccessBody::Json`]). Its errors are read from the envelope, as
-    /// every route's are.
-    pub async fn post_json_to_lambda<B: Serialize + ?Sized>(
-        &self,
-        task_path: &str,
-        body: &B,
-        mock_seed: &str,
-    ) -> Result<String, AgentCallError> {
-        self.post_reading(task_path, body, mock_seed, SuccessBody::Json)
-            .await
-            .map(|outcome| outcome.text)
-    }
-
-    /// The one path every lambda call takes: the mock short-circuit, the
-    /// credential, then [`Self::post_with_retry_reading`]. `reading` says
-    /// how the route's 2xx body is read, and nothing else differs.
-    async fn post_reading<B: Serialize + ?Sized>(
-        &self,
-        task_path: &str,
-        body: &B,
-        mock_seed: &str,
-        reading: SuccessBody,
-    ) -> Result<LambdaOutcome, AgentCallError> {
         // Counted here, before the mock short-circuit: this is every request
         // the scan would put on the wire. The concurrency permit is taken per
         // HTTP attempt inside `post_with_retry`, so an offline run takes none.
@@ -744,47 +715,25 @@ impl AgentService {
             ),
             crate::credentials::CloudAuth::Bearer(token) => RequestAuth::Bearer(token),
         };
-        self.post_with_retry_reading(
-            &auth,
-            env!("CARRICK_API_ENDPOINT"),
-            task_path,
-            body,
-            reading,
-        )
-        .await
+        self.post_with_retry(&auth, env!("CARRICK_API_ENDPOINT"), task_path, body)
+            .await
     }
 
     /// Shared HTTP + retry implementation for all lambda calls. Sends
     /// the version header, parses the structured error envelope, and
     /// only consumes a backoff attempt when the error is marked
-    /// retriable=true (or on bare network failures).
+    /// retriable=true (or on bare network failures). A 2xx body is read as
+    /// the route says ([`SuccessBody::of`]).
     ///
     /// `auth` and `api_base` are parameters rather than the globals the
     /// public entry point reads, so the retry loop can be driven against a
     /// stub in tests.
-    #[cfg(test)]
     async fn post_with_retry<B>(
         &self,
         auth: &RequestAuth<'_>,
         api_base: &str,
         path: &str,
         body: &B,
-    ) -> Result<LambdaOutcome, AgentCallError>
-    where
-        B: Serialize + ?Sized,
-    {
-        self.post_with_retry_reading(auth, api_base, path, body, SuccessBody::Envelope)
-            .await
-    }
-
-    /// [`Self::post_with_retry`], reading a 2xx body as `reading` says.
-    async fn post_with_retry_reading<B>(
-        &self,
-        auth: &RequestAuth<'_>,
-        api_base: &str,
-        path: &str,
-        body: &B,
-        reading: SuccessBody,
     ) -> Result<LambdaOutcome, AgentCallError>
     where
         B: Serialize + ?Sized,
@@ -1017,7 +966,7 @@ impl AgentService {
                     // that is not JSON is a bad response, never retried, as
                     // an unparseable envelope on a 2xx is below; every
                     // non-2xx is read from the envelope like any route's.
-                    if reading == SuccessBody::Json && status.is_success() {
+                    if SuccessBody::of(path) == SuccessBody::Json && status.is_success() {
                         if let Err(e) = serde_json::from_str::<serde_json::Value>(&response_text) {
                             return Err(AgentCallError::permanent(
                                 "bad_response",
@@ -1420,6 +1369,18 @@ pub enum SuccessBody {
     /// 200 is the store's answer in the shape carrick#1564 section 2 pins
     /// (ruled on carrick#1664, 2026-10-02).
     Json,
+}
+
+impl SuccessBody {
+    /// How `path`'s 2xx body is read: the store's route answers raw, every
+    /// other route in the envelope.
+    pub fn of(path: &str) -> Self {
+        if path == crate::library_store::ROUTE {
+            Self::Json
+        } else {
+            Self::Envelope
+        }
+    }
 }
 
 /// What a lambda answered: the text, plus the envelope fields a caller may
@@ -4621,12 +4582,11 @@ pub(crate) mod tests {
         crate::credentials::set_scan_id("scan_01J");
         let (api_base, server) = stub_server(vec![(200, ANSWERED.to_string())]);
         let text = AgentService::new()
-            .post_with_retry_reading(
+            .post_with_retry(
                 &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
                 &api_base,
                 crate::library_store::ROUTE,
                 &serde_json::json!({"roles": ["broker"], "packages": []}),
-                SuccessBody::Json,
             )
             .await
             .expect("the store's answer is read")
@@ -4655,12 +4615,11 @@ pub(crate) mod tests {
             (200, r#"{"library_claims":[]}"#.to_string()),
         ]);
         let err = AgentService::new()
-            .post_with_retry_reading(
+            .post_with_retry(
                 &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
                 &api_base,
                 crate::library_store::ROUTE,
                 &serde_json::json!({}),
-                SuccessBody::Json,
             )
             .await
             .expect_err("a body that is not JSON is no answer");
@@ -4679,17 +4638,34 @@ pub(crate) mod tests {
                 .to_string(),
         )]);
         let err = AgentService::new()
-            .post_with_retry_reading(
+            .post_with_retry(
                 &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
                 &api_base,
                 crate::library_store::ROUTE,
                 &serde_json::json!({}),
-                SuccessBody::Json,
             )
             .await
             .expect_err("a refusal is an error");
         assert_eq!(err.code, "scan_not_started");
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// Each route's 2xx reader is its own: the store's raw, the prompt
+    /// lambdas' the envelope.
+    #[test]
+    fn each_route_reads_its_own_2xx_body() {
+        assert_eq!(
+            SuccessBody::of(crate::library_store::ROUTE),
+            SuccessBody::Json
+        );
+        for prompt in [
+            "/analyze-file",
+            "/framework-detect",
+            "/framework-guidance",
+            "/generate-intent",
+        ] {
+            assert_eq!(SuccessBody::of(prompt), SuccessBody::Envelope, "{prompt}");
+        }
     }
 
     /// The prompt lambdas read the envelope exactly as before: its `text` on

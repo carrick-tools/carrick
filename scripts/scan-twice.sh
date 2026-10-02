@@ -76,6 +76,7 @@ fixture_targets=(
   imported-request-member
   imported-routers
   koa-api
+  library-store
   literal-base-url
   llm-mocked-api
   new-url-target
