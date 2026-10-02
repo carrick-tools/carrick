@@ -291,6 +291,11 @@ export type IdOrAny<D> = D extends Definition<infer Id> ? Id : any;
 export interface Dispatcher {
   triggerById<D extends Definition<string>>(id: IdOf<D>, payload: unknown): void;
   triggerLoose<D extends Definition<string>>(id: IdOrAny<D>, payload: unknown): void;
+  // A task SDK's trigger: the id is typed by a conditional on the task.
+  triggerWith<D extends Definition<string>>(id: IdOf<D>, payload: unknown, options?: { concurrencyKey?: string; delay?: number }): void;
+  triggerLooseWith<D extends Definition<string>>(id: IdOrAny<D>, payload: unknown, options?: { concurrencyKey?: string }): void;
+  watchById<D extends Definition<string>>(id: IdOf<D>, channel: string): void;
+  defineTyped<D extends Definition<string>>(options: { id: IdOf<D>; queue?: string; run: Handler }): void;
   subscribeMany(...args: [...channels: string[], callback: (err: Error | null) => void]): void;
   sendRaw(data: string, callback?: (err?: Error) => void): void;
   ping(event: string): void;
@@ -327,6 +332,26 @@ export interface Connection {
 }
 export declare function connect(url: string, options?: { reconnect?: boolean }): Connection;
 export declare function open(port: number): Connection;
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+export interface Backend { kind: string }
+export interface DefaultBackend extends Backend { kind: 'default' }
+export type BackendFactory<B> = (name: string) => B;
+// What the queue takes at its default backend: a conditional on the backend
+// type parameter, so a rest the declared signature cannot read.
+export type DefaultRest<B> = true extends Equal<B, DefaultBackend> ? [options?: QueueOptions, backendFactory?: undefined] : [options: never];
+export declare class BackendQueue<B extends Backend = DefaultBackend> {
+  constructor(name: string, options: QueueOptions, backendFactory: BackendFactory<B>);
+  constructor(name: string, options: QueueOptions, backendFactory?: undefined);
+  constructor(name: string, ...args: DefaultRest<B>);
+  publish(data: unknown): Promise<void>;
+}
+export interface Plain {}
+export type Rest<B> = B extends Plain ? [options?: QueueOptions] : [options: QueueOptions, factory: () => void];
+export declare class Spread<B = Plain> {
+  constructor(name: string, ...args: Rest<B>);
+  close(): void;
+}
+export declare function emitTo<B = Plain>(name: string, ...args: Rest<B>): void;
 `;
 
 // Generic makers and scopes, read at their type-parameter defaults
@@ -927,6 +952,41 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     ]);
   });
 
+  it('counts a rest parameter it cannot read as a string slot beside the name (strict D2, fail closed)', async () => {
+    const Q = 'fixture-queue';
+    const labelled = make('new', null, { name: { arg: 0 }, key_labels: { prefix: 'not_name' } });
+    const checks = [
+      // new BackendQueue("emails"): two overloads read the options' prefix; the
+      // third takes a rest typed by a conditional on the backend, which could
+      // hold that prefix too.
+      check(Q, 'BackendQueue', 'broker', 'export', make('new', null, { name: { arg: 0 } })),
+      // Only an unreadable rest beside the name: no label can account for it.
+      check(Q, 'Spread', 'broker', 'export', make('new', null, { name: { arg: 0 } })),
+      check(Q, 'Spread', 'broker', 'export', make('new', null, { name: { arg: 0 }, key_labels: { prefix: 'not_name' } })),
+      // No name, no rule.
+      check(Q, 'Spread', 'broker', 'export', make('new', null, {})),
+      // An op beside an unreadable rest, unless the claim puts the payload in it.
+      check(Q, 'emitTo', 'broker', 'export', op('receive', null, { on: 'export', name: { arg: 0 } })),
+      check(Q, 'emitTo', 'broker', 'export', op('send', null, { on: 'export', name: { arg: 0 }, payload: { arg: 1 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), [
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+      'verified',
+      'failed name_ambiguous',
+      'verified',
+    ]);
+
+    // With the prefix labelled, the two readable overloads hold, and the
+    // instance is read through them.
+    const bound = [
+      check(Q, 'BackendQueue', 'broker', 'export', labelled),
+      check(Q, 'BackendQueue', 'broker', 'instance:new', op('send', 'publish', { of: 'instance:new', name: { bound: 'maker' }, payload: { arg: 0 } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(bound)), ['verified', 'verified']);
+  });
+
   it('binds no name through a maker claim with no name slot', async () => {
     const Q = 'fixture-queue';
     const checks = [
@@ -1291,6 +1351,34 @@ describe('verify_library_claims: message roles (carrick#1659)', () => {
     assert.deepStrictEqual(verdicts(await send([at('triggerById'), at('triggerLoose')])), [
       'verified',
       'unchecked member_untyped',
+    ]);
+  });
+
+  it('counts a sibling a conditional types as a string when a branch takes one (strict D2, fail closed)', async () => {
+    const R = 'fixture-rules';
+    const at = (member: string, parts: Record<string, unknown>) =>
+      check(R, 'dispatcher', 'broker', 'export', op('send', member, { on: 'export', ...parts }));
+    const checks = [
+      // trigger(id, payload, options): the id is the name.
+      at('triggerWith', { name: { arg: 0 }, payload: { arg: 1 }, key_labels: { concurrencyKey: 'not_name' } }),
+      // An options key read as the name leaves the id beside it, a string
+      // through its conditional: which is the name is behaviour.
+      at('triggerWith', { name: { arg: 2, key: 'concurrencyKey' }, payload: { arg: 1 } }),
+      // A branch that says nothing counts no more than \`any\` does.
+      at('triggerLooseWith', { name: { arg: 2, key: 'concurrencyKey' }, payload: { arg: 1 } }),
+      // A positional name beside the conditional id.
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'watchById', { on: 'export', name: { arg: 1 } })),
+      // A keyed name beside a conditional id key, unlabelled and labelled.
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'defineTyped', { on: 'export', name: keyed('queue'), handler: keyed('run') })),
+      check(R, 'dispatcher', 'broker', 'export', op('receive', 'defineTyped', { on: 'export', name: keyed('queue'), handler: keyed('run'), key_labels: { id: 'not_name' } })),
+    ];
+    assert.deepStrictEqual(verdicts(await send(checks)), [
+      'verified',
+      'failed name_ambiguous',
+      'verified',
+      'failed name_ambiguous',
+      'failed name_ambiguous',
+      'verified',
     ]);
   });
 

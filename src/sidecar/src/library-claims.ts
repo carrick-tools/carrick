@@ -1770,8 +1770,10 @@ class DeclarationReader {
    * is behaviour, not shape. A slot is accounted for when the claim assigns it
    * a part (payload, handler, base, prefix), or, for a key of an object at
    * the call, when `key_labels` labels it `not_name`. A positional string the
-   * claim leaves unassigned cannot be labelled, so it always competes. Keys
-   * are counted with the same `acceptsString` the surface listing labels by.
+   * claim leaves unassigned cannot be labelled, so it always competes. A
+   * slot or key counts as a string exactly when a name there would
+   * (`siblingTakesString`): a conditional counts when one of its branches
+   * takes a string (fail closed, carrick#1687).
    *
    * The labels must agree with the claim: at most one key is labelled `name`,
    * and only the claim's own name key; that key is never labelled `not_name`.
@@ -1781,7 +1783,10 @@ class DeclarationReader {
    * Rest parameters: a rest the claim puts a payload or handler in belongs
    * wholly to that part; one that holds the name holds other names too; from
    * the first variable element of a tuple rest (`[...channels: string[], cb]`)
-   * no position is fixed, so a name there is one of many.
+   * no position is fixed, so a name there is one of many. A rest the claim
+   * leaves unassigned competes when its element accepts a string, or when it
+   * cannot be read at all (`...args: Rest<B>`, a conditional on a type
+   * parameter), since it could hold a string slot.
    */
   private nameSiblings(
     signature: ts.Signature,
@@ -1806,9 +1811,12 @@ class DeclarationReader {
     const unaccountedKey = (keys: readonly string[], assigned: ReadonlyMap<string, PartName>) =>
       keys.some(key => !assigned.has(key) && labels[key] !== 'not_name');
     const none = new Map<string, PartName>();
-    const takesString = (slot: Slot | undefined) => slot !== undefined && slot !== VARIADIC && this.acceptsString(slot);
-    // An argument the claim gives no part: a string, or an object with a string key nobody accounts for.
-    const competes = (slot: Slot | undefined) => takesString(slot) || unaccountedKey(this.stringKeys(slot), none);
+    const takesString = (slot: Slot | undefined) => slot !== undefined && this.siblingTakesString(slot);
+    // An argument the claim gives no part: a string, an object with a string
+    // key nobody accounts for, or a rest the verifier cannot read, which could
+    // hold either and no label can account for (fail closed, carrick#1687).
+    const competes = (slot: Slot | undefined) =>
+      slot === VARIADIC || takesString(slot) || unaccountedKey(this.stringKeys(slot), none);
 
     // Every object the claim reads keys of: its other string keys.
     for (const [arg, keys] of layout.keyed) {
@@ -1861,6 +1869,15 @@ class DeclarationReader {
   }
 
   /**
+   * A slot beside the name takes a string, read as a name there is read: a
+   * conditional through its branches (`throughConditional`). One whose
+   * branch says nothing counts no more than `any` does.
+   */
+  private siblingTakesString(slot: Slot): boolean {
+    return this.acceptsString(this.throughConditional(slot));
+  }
+
+  /**
    * The string-accepting keys of an argument: every key some object part of
    * it declares, read through a type parameter's constraint.
    */
@@ -1870,7 +1887,7 @@ class DeclarationReader {
     for (const part of this.parts(this.throughConstraint(slot) as ts.Type)) {
       if (!this.isObjectLike(part)) continue;
       for (const property of this.namedProperties(part)) {
-        if (this.acceptsString(this.checker.getTypeOfSymbol(property))) keys.add(property.getName());
+        if (this.siblingTakesString(this.checker.getTypeOfSymbol(property))) keys.add(property.getName());
       }
     }
     return [...keys];
