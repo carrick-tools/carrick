@@ -574,6 +574,92 @@ struct FnIr {
     /// anew, of one of its makers, each handed its own arguments
     /// (carrick#1689).
     returned: Option<Returned>,
+    /// What each `return` hands back, an arrow's expression body included,
+    /// as far as it is a request's parsed body or another call's value
+    /// ([`BodyReturn`], carrick#1601). Empty when the body returns nothing.
+    body_returns: Vec<BodyReturn>,
+}
+
+/// What one `return` hands back, read for whether a call of the function is
+/// worth its request's parsed body (carrick#1601). Calls are named by their
+/// span start in the discovery source map ([`Site`]'s `lo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyReturn {
+    /// The body the response of the call at this span parses into, unchanged
+    /// (`(await res.json()) as T` with `res` that call's value, or
+    /// `(await fetch(url)).json()`).
+    Parsed(u32),
+    /// The value of the call at this span, unchanged.
+    Value(u32),
+    /// Anything else: a value the function computes from the body, a
+    /// literal, a binding this pass cannot follow.
+    Other,
+}
+
+/// What a local binding holds, for [`BodyReturn`]: a call's value or the
+/// body that call's response parses into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodySource {
+    Response(u32),
+    Parsed(u32),
+}
+
+/// What `expr` hands back as a [`BodyReturn`], reading bindings through
+/// `bodies`. Types, parentheses and `await` change nothing it holds.
+fn body_return(expr: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> BodyReturn {
+    let parsed = |response: &Expr| match unwrap_value(response) {
+        Expr::Call(call) => Some(call.span.lo.0),
+        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
+            Some(BodySource::Response(at)) => Some(*at),
+            _ => None,
+        },
+        _ => None,
+    };
+    match unwrap_value(expr) {
+        Expr::Call(call) => match parse_call_object(call) {
+            Some(response) => parsed(response).map_or(BodyReturn::Other, BodyReturn::Parsed),
+            None => BodyReturn::Value(call.span.lo.0),
+        },
+        Expr::Ident(ident) => match bodies.get(&ident_key(ident)) {
+            Some(BodySource::Parsed(at)) => BodyReturn::Parsed(*at),
+            Some(BodySource::Response(at)) => BodyReturn::Value(*at),
+            None => BodyReturn::Other,
+        },
+        _ => BodyReturn::Other,
+    }
+}
+
+/// What a binding initialised with `init` holds, for [`body_return`].
+fn body_source(init: &Expr, bodies: &HashMap<BindingKey, BodySource>) -> Option<BodySource> {
+    match body_return(init, bodies) {
+        BodyReturn::Parsed(at) => Some(BodySource::Parsed(at)),
+        BodyReturn::Value(at) => Some(BodySource::Response(at)),
+        BodyReturn::Other => None,
+    }
+}
+
+/// The response a `<response>.json()` call parses: the Fetch body read the
+/// platform's `fetch` answers with. No arguments, no optional chain.
+fn parse_call_object(call: &CallExpr) -> Option<&Expr> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    match &**callee {
+        Expr::Member(member)
+            if call.args.is_empty() && member_prop(member).as_deref() == Some("json") =>
+        {
+            Some(&member.obj)
+        }
+        _ => None,
+    }
+}
+
+/// `expr` with its types, parentheses and `await` taken off.
+fn unwrap_value(expr: &Expr) -> &Expr {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Await(awaited) => unwrap_value(&awaited.arg),
+        other => other,
+    }
 }
 
 /// The instance an own factory returns (carrick#1562).
@@ -2512,6 +2598,9 @@ struct Scope<'a> {
     /// [`Reader::let_makers`]). Read only where they are returned: no call
     /// is read through one, for any role.
     let_makers: HashMap<BindingKey, Vec<ClientRef>>,
+    /// Locals set once to a call's value or to the body its response parses
+    /// into ([`body_source`], carrick#1601).
+    bodies: HashMap<BindingKey, BodySource>,
     /// Parameters, the enclosing function's included, that hold the
     /// platform's `fetch` unless a caller hands another (`fetchImpl =
     /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
@@ -2529,6 +2618,7 @@ impl<'a> Scope<'a> {
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
             fetches: HashSet::new(),
             fields: None,
             module,
@@ -2891,6 +2981,7 @@ impl Reader<'_> {
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
             fetches,
             fields,
             module,
@@ -2922,6 +3013,7 @@ impl Reader<'_> {
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
             let_makers: HashMap::new(),
+            bodies: HashMap::new(),
             fetches,
             fields,
             module,
@@ -2934,6 +3026,7 @@ impl Reader<'_> {
             BlockStmtOrExpr::Expr(expr) => {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
+                ir.body_returns.push(body_return(expr, &scope.bodies));
                 self.walk(expr, &scope, &mut ir);
             }
         }
@@ -3014,6 +3107,15 @@ impl Reader<'_> {
                             scope.texts.insert(key.clone(), pieces);
                         }
                         scope.locals.insert(key.clone(), value);
+                        // What a call or its parsed response leaves in it,
+                        // for what a `return` of it hands back (carrick#1601).
+                        match (!unsettled)
+                            .then(|| body_source(init, &scope.bodies))
+                            .flatten()
+                        {
+                            Some(source) => scope.bodies.insert(key.clone(), source),
+                            None => scope.bodies.remove(&key),
+                        };
                         scope.local_receivers.remove(&key);
                         if let Some(client) = client
                             && declared.name_count(&name) == 1
@@ -4034,6 +4136,11 @@ impl Visit for CallWalker<'_, '_, '_> {
             .map(|arg| self.reader.returned_instances(arg, self.scope))
             .unwrap_or_default();
         self.ir.returns.push((ret.span.lo.0, returned));
+        self.ir
+            .body_returns
+            .push(ret.arg.as_deref().map_or(BodyReturn::Other, |arg| {
+                body_return(arg, &self.scope.bodies)
+            }));
         ret.visit_children_with(self);
     }
 
@@ -4404,6 +4511,11 @@ struct Summary {
     complete: bool,
     /// Parameters the function invokes.
     invokes: BTreeSet<usize>,
+    /// The function sends one request and every `return` hands back that
+    /// request's parsed body unchanged, here or through a call to a function
+    /// that does the same (carrick#1601). A call of it is worth the body,
+    /// so a row stated at that call can be typed by the call's value.
+    passes_body: bool,
 }
 
 /// A row this pass states at one call site.
@@ -4768,6 +4880,7 @@ impl Composer<'_> {
             effects: BTreeSet::new(),
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
+            passes_body: false,
         };
         for call in &ir.calls {
             if call.invokes_param.is_some() {
@@ -4820,7 +4933,37 @@ impl Composer<'_> {
                 }
             }
         }
+        summary.passes_body = summary.effects.len() == 1
+            && !ir.body_returns.is_empty()
+            && ir
+                .body_returns
+                .iter()
+                .all(|returned| self.hands_back_body(file, ir, *returned));
         summary
+    }
+
+    /// Whether one `return` of `ir` hands back its request's parsed body
+    /// unchanged (carrick#1601): the response a request this body makes
+    /// answers with, parsed, or what a call of a function that does the
+    /// same returns.
+    fn hands_back_body(&mut self, file: &Path, ir: &FnIr, returned: BodyReturn) -> bool {
+        let (BodyReturn::Parsed(at) | BodyReturn::Value(at)) = returned else {
+            return false;
+        };
+        let Some(call) = ir
+            .calls
+            .iter()
+            .find(|call| call.site.lo == at && call.invokes_param.is_none())
+        else {
+            return false;
+        };
+        match (returned, self.callee(file, call)) {
+            (BodyReturn::Parsed(_), None) => {
+                shape_of(call, file, self.semantics, &self.clients).is_some()
+            }
+            (BodyReturn::Value(_), Some((_, callee))) => callee.passes_body,
+            _ => false,
+        }
     }
 }
 
@@ -4903,14 +5046,14 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(
-                        &instantiated,
-                        file,
-                        composer.files,
-                        call,
-                        reaches,
-                        RowSite::Caller,
-                    ) {
+                    // A function that hands back its one request's parsed
+                    // body makes its call worth that body (carrick#1601).
+                    let at = if callee.passes_body {
+                        RowSite::PassThrough
+                    } else {
+                        RowSite::Caller
+                    };
+                    match row(&instantiated, file, composer.files, call, reaches, at) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -4978,8 +5121,12 @@ enum RowSite {
     /// A call through a verified library client: the call is the request.
     Library,
     /// A call to a function the service declares, which makes the request
-    /// inside it (carrick#1601).
+    /// inside it and hands back something else (carrick#1601).
     Caller,
+    /// A call to a function the service declares, which makes one request
+    /// and hands back its parsed body unchanged: the call's value is the
+    /// body ([`Summary::passes_body`]).
+    PassThrough,
 }
 
 /// The row an effect supports at `site`, when its URL and method are both

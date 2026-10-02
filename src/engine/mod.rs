@@ -12249,6 +12249,92 @@ mod tests {
         );
     }
 
+    /// carrick#1601: a call of a function that makes one request and hands
+    /// back its parsed body unchanged is worth that body, so a row stated
+    /// there is not marked: a generic transport helper (`send<T>`), the body
+    /// held in a local first, the response parsed where it is awaited, an
+    /// arrow, and a function that returns such a helper's call. A helper that
+    /// hands back the raw response, returns early with something else, or
+    /// makes two requests is marked.
+    #[test]
+    fn a_helper_that_hands_back_its_parsed_body_leaves_its_caller_unmarked() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/send.ts",
+                "export async function send<T>(url: string, options: { method: string }): Promise<T> {\n\
+                 \x20 const response = await fetch(url, options);\n\
+                 \x20 return (await response.json()) as T;\n\
+                 }\n\
+                 export async function held(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 const data = (await res.json()) as { id: string };\n\
+                 \x20 return data;\n\
+                 }\n\
+                 export async function inline(url: string) {\n\
+                 \x20 return (await fetch(url, { method: \"GET\" })).json();\n\
+                 }\n\
+                 export const arrow = async (url: string) => (await fetch(url, { method: \"GET\" })).json();\n\
+                 export async function raw(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 return res;\n\
+                 }\n\
+                 export async function early(url: string) {\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 if (!res.ok) return null;\n\
+                 \x20 return res.json();\n\
+                 }\n\
+                 export async function twice(url: string) {\n\
+                 \x20 await fetch(`${url}/audit`, { method: \"POST\" });\n\
+                 \x20 const res = await fetch(url, { method: \"GET\" });\n\
+                 \x20 return res.json();\n\
+                 }\n",
+            ),
+            (
+                "src/client.ts",
+                "import { send, held, inline, arrow, raw, early, twice } from \"./send\";\n\
+                 const BASE = process.env.API_BASE;\n\
+                 export function readWidget(id: string) {\n\
+                 \x20 return send<{ id: string }>(`${BASE}/widgets/${id}`, { method: \"GET\" });\n\
+                 }\n\
+                 export function readAll() {\n\
+                 \x20 held(`${BASE}/held`);\n\
+                 \x20 inline(`${BASE}/inline`);\n\
+                 \x20 arrow(`${BASE}/arrow`);\n\
+                 \x20 raw(`${BASE}/raw`);\n\
+                 \x20 early(`${BASE}/early`);\n\
+                 \x20 twice(`${BASE}/twice`);\n\
+                 }\n",
+            ),
+        ]);
+        let mut marks: Vec<(u32, String, bool)> =
+            summary_rows_of(&dir, &discovery, "src/client.ts")
+                .into_iter()
+                .map(|row| {
+                    let last = row
+                        .target
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    (row.line, last, row.at_caller)
+                })
+                .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec![
+                (4, "${id}".to_string(), false),
+                (7, "held".to_string(), false),
+                (8, "inline".to_string(), false),
+                (9, "arrow".to_string(), false),
+                (10, "raw".to_string(), true),
+                (11, "early".to_string(), true),
+                (12, "audit".to_string(), true),
+                (12, "twice".to_string(), true),
+            ]
+        );
+    }
+
     /// carrick#1562: a call to a module-scope builder is what the builder
     /// returns, with the call's arguments in its parameters: an arrow, a
     /// function declaration, and one held in a constant object. A function
