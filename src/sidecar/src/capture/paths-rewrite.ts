@@ -17,6 +17,7 @@ import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { installedPackageSpecifier } from './installed-package.js';
+import type { WriteGuard } from './guarded-fs.js';
 import {
   isRelative,
   matchPathsPattern,
@@ -25,6 +26,8 @@ import {
 } from './specifiers.js';
 
 export interface RewriteArgs {
+  /** Writes are held to the stub (carrick#1748). */
+  guard: WriteGuard;
   /** Absolute path of the stub's types/ directory. */
   typesDir: string;
   /** Tree-relative emitted file paths (as recorded in emitted_files, without
@@ -178,7 +181,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
       return undefined;
     });
     if (rewrites + importTypeRewrites > 0) {
-      fs.writeFileSync(absFile, rewritten);
+      args.guard.writeFile(absFile, rewritten);
       total += rewrites + importTypeRewrites;
     }
   }

@@ -31,7 +31,7 @@
 
 import ts from 'typescript';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
+import type { WriteGuard } from './guarded-fs.js';
 
 /** What one file's repair removed, for the caller's re-check. */
 export interface RepairedFile {
@@ -55,42 +55,29 @@ interface Edit {
  * resolve from it. Returns the files actually rewritten; a file whose names
  * cannot all be replaced by `unknown` is left exactly as it was.
  *
- * Only a file inside `stubTypesDir` is ever rewritten (carrick#1742). The
- * self-check program also loads files the stub merely reaches: the repo's own
- * sources, through a workspace package linked into the `node_modules` the
- * stub borrows, or a runtime's dependency cache. Those report their missing
- * modules exactly as an emitted declaration does, and they belong to the
- * user: a scan reads them and never writes them.
+ * Only a file `tree` (a guard over the stub's types tree) lets it write is
+ * repaired (carrick#1742). The self-check program also loads files the stub
+ * merely reaches: the repo's own sources, through a workspace package linked
+ * into the `node_modules` the stub borrows, or a runtime's dependency cache.
+ * Those report their missing modules exactly as an emitted declaration does,
+ * and they belong to the user: a scan reads them and never writes them. The
+ * guard decides on the resolved path, so a file reached through the link is
+ * the repo's, whatever path the program loaded it by.
  */
 export function repairDanglingImports(
   failing: Map<string, Set<string>>,
-  stubTypesDir: string
+  tree: WriteGuard
 ): Map<string, RepairedFile> {
   const repaired = new Map<string, RepairedFile>();
-  const stubRoot = realPath(stubTypesDir);
   for (const [file, specifiers] of failing) {
-    if (!isInside(stubRoot, realPath(file))) continue;
-    const result = repairFile(file, specifiers);
+    if (!tree.allowsWrite(file)) continue;
+    const result = repairFile(file, specifiers, tree);
     if (result) repaired.set(file, result);
   }
   return repaired;
 }
 
-/** The path with every link resolved; the path itself when it cannot be. */
-function realPath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
-}
-
-function isInside(root: string, file: string): boolean {
-  const rel = path.relative(root, file);
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
-}
-
-function repairFile(file: string, specifiers: Set<string>): RepairedFile | undefined {
+function repairFile(file: string, specifiers: Set<string>, tree: WriteGuard): RepairedFile | undefined {
   let text: string;
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -163,7 +150,7 @@ function repairFile(file: string, specifiers: Set<string>): RepairedFile | undef
   for (const edit of edits) {
     out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
   }
-  fs.writeFileSync(file, out);
+  tree.writeFile(file, out);
   return { specifiers: [...removedSpecifiers].sort(), names: [...names].sort() };
 }
 

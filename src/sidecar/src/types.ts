@@ -135,30 +135,6 @@ export interface TsconfigSnapshot {
 }
 
 // ============================================================================
-// Repo Metadata Types
-// ============================================================================
-
-/**
- * Metadata for a single repository in the synthetic monorepo.
- */
-export interface RepoMetadata {
-  /** Unique name for this repo (used in @carrick/{repoName}/...) */
-  repoName: string;
-
-  /** Pinned dependency versions for this repo */
-  dependencies: PinnedDependencySnapshot;
-
-  /** Closed tsconfig snapshot for this repo */
-  tsconfig: TsconfigSnapshot;
-
-  /** Extraction config for unwrapping machinery types */
-  extractionConfig?: ExtractionConfig;
-
-  /** The emitted surface .d.ts content (after Task 2) */
-  surfaceContent?: string;
-}
-
-// ============================================================================
 // Request Types
 // ============================================================================
 
@@ -184,37 +160,10 @@ export interface InitRequest extends BaseRequest {
 
 /**
  * Request to bundle explicit types from source files
- * @deprecated Use emit_surface instead for the new architecture
  */
 export interface BundleRequest extends BaseRequest {
   action: 'bundle';
   symbols: SymbolRequest[];
-}
-
-/**
- * Request to emit a surface .d.ts file with rewritten module specifiers
- */
-export interface EmitSurfaceRequest extends BaseRequest {
-  action: 'emit_surface';
-  /** The repo name for specifier rewriting (@carrick/{repoName}/...) */
-  repo_name: string;
-  /** Payload types to include in the surface */
-  payloads: PayloadDefinition[];
-  /** Output path for the surface .d.ts file */
-  output_path: string;
-}
-
-/**
- * Definition of a payload type to emit
- */
-export interface PayloadDefinition {
-  /** Alias/name for this payload in the surface */
-  alias: string;
-  /** The type string (already unwrapped from machinery) */
-  type_string: string;
-  /** Optional source information */
-  source_file?: string;
-  source_location?: SourceLocation;
 }
 
 /**
@@ -281,43 +230,6 @@ export interface InferRequest extends BaseRequest {
   requests: InferRequestItem[];
   /** Agent-generated extraction config for machinery unwrapping */
   extraction_config?: ExtractionConfig;
-}
-
-/**
- * Request to build the synthetic monorepo workspace
- */
-export interface BuildWorkspaceRequest extends BaseRequest {
-  action: 'build_workspace';
-  repos: RepoMetadata[];
-  /** Root directory for the workspace (defaults to .carrick/workspace) */
-  workspace_root?: string;
-}
-
-/**
- * Request to run type compatibility checks
- */
-export interface CheckCompatibilityRequest extends BaseRequest {
-  action: 'check_compatibility';
-  /** Path to the workspace root */
-  workspace_root: string;
-  /** Pairs of types to check for compatibility */
-  checks: CompatibilityCheck[];
-}
-
-/**
- * A single compatibility check between two types
- */
-export interface CompatibilityCheck {
-  /** Source repo name */
-  source_repo: string;
-  /** Source payload alias */
-  source_alias: string;
-  /** Target repo name */
-  target_repo: string;
-  /** Target payload alias */
-  target_alias: string;
-  /** Direction: 'source_extends_target' or 'target_extends_source' or 'bidirectional' */
-  direction: 'source_extends_target' | 'target_extends_source' | 'bidirectional';
 }
 
 /**
@@ -602,12 +514,9 @@ export type SidecarRequest =
   | ListLibrarySurfaceRequest
   | InitRequest
   | BundleRequest
-  | EmitSurfaceRequest
   | CaptureV2Request
   | CheckV2Request
   | InferRequest
-  | BuildWorkspaceRequest
-  | CheckCompatibilityRequest
   | ResolveDefinitionsRequest
   | HealthRequest
   | ShutdownRequest;
@@ -684,7 +593,6 @@ export interface InitResponse extends BaseResponse {
 
 /**
  * Response for bundle action
- * @deprecated Use EmitSurfaceResponse instead
  */
 export interface BundleResponse extends BaseResponse {
   /** The bundled .d.ts content */
@@ -698,29 +606,6 @@ export interface BundleResponse extends BaseResponse {
 }
 
 /**
- * Response for emit_surface action
- */
-export interface EmitSurfaceResponse extends BaseResponse {
-  /** Path to the emitted surface file */
-  output_path?: string;
-  /** The emitted .d.ts content */
-  surface_content?: string;
-  /** Manifest of emitted payloads */
-  manifest?: SurfaceManifestEntry[];
-  /** Errors during emission */
-  errors?: string[];
-}
-
-/**
- * Entry in the surface manifest
- */
-export interface SurfaceManifestEntry {
-  alias: string;
-  type_string: string;
-  rewritten_imports: string[];
-}
-
-/**
  * Response for infer action
  */
 export interface InferResponse extends BaseResponse {
@@ -728,45 +613,6 @@ export interface InferResponse extends BaseResponse {
   inferred_types?: InferredType[];
   /** General errors */
   errors?: string[];
-}
-
-/**
- * Response for build_workspace action
- */
-export interface BuildWorkspaceResponse extends BaseResponse {
-  /** Path to the created workspace */
-  workspace_path?: string;
-  /** Paths to generated stub packages */
-  stub_packages?: string[];
-  /** Path to the checker package */
-  checker_path?: string;
-  /** Errors during workspace creation */
-  errors?: string[];
-}
-
-/**
- * Response for check_compatibility action
- */
-export interface CheckCompatibilityResponse extends BaseResponse {
-  /** Results of each compatibility check */
-  results?: CompatibilityResult[];
-  /** TypeScript compiler diagnostics */
-  diagnostics?: string[];
-  /** Errors during checking */
-  errors?: string[];
-}
-
-/**
- * Result of a single compatibility check
- */
-export interface CompatibilityResult {
-  source_repo: string;
-  source_alias: string;
-  target_repo: string;
-  target_alias: string;
-  compatible: boolean;
-  /** Diagnostic message if not compatible */
-  diagnostic?: string;
 }
 
 /**
@@ -968,12 +814,9 @@ export type SidecarResponse =
   | ListLibrarySurfaceResponse
   | InitResponse
   | BundleResponse
-  | EmitSurfaceResponse
   | CaptureV2Response
   | CheckV2Response
   | InferResponse
-  | BuildWorkspaceResponse
-  | CheckCompatibilityResponse
   | ResolveDefinitionsResponse
   | HealthResponse
   | ShutdownResponse
@@ -1126,7 +969,6 @@ export interface SymbolFailure {
 
 /**
  * Internal result from the bundler
- * @deprecated Use SurfaceEmitResult instead
  */
 export interface BundleResult {
   /** Whether bundling was successful */
@@ -1142,22 +984,6 @@ export interface BundleResult {
 }
 
 /**
- * Internal result from surface emission
- */
-export interface SurfaceEmitResult {
-  /** Whether emission was successful */
-  success: boolean;
-  /** The emitted .d.ts content */
-  surface_content?: string;
-  /** Output path where content was written */
-  output_path?: string;
-  /** Manifest of emitted payloads */
-  manifest?: SurfaceManifestEntry[];
-  /** General error messages */
-  errors?: string[];
-}
-
-/**
  * Internal result from the type inferrer
  */
 export interface InferResult {
@@ -1166,35 +992,5 @@ export interface InferResult {
   /** Successfully inferred types */
   inferred_types?: InferredType[];
   /** General error messages */
-  errors?: string[];
-}
-
-/**
- * Result from building the synthetic workspace
- */
-export interface WorkspaceBuildResult {
-  /** Whether build was successful */
-  success: boolean;
-  /** Path to the workspace root */
-  workspace_path?: string;
-  /** Paths to stub packages */
-  stub_packages?: string[];
-  /** Path to the checker package */
-  checker_path?: string;
-  /** Error messages */
-  errors?: string[];
-}
-
-/**
- * Result from running compatibility checks
- */
-export interface CompatibilityCheckResult {
-  /** Whether checks ran successfully (not whether types are compatible) */
-  success: boolean;
-  /** Individual check results */
-  results?: CompatibilityResult[];
-  /** TypeScript diagnostics */
-  diagnostics?: string[];
-  /** Error messages */
   errors?: string[];
 }

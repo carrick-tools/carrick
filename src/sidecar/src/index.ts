@@ -3,7 +3,7 @@
  *
  * This module implements a message loop that:
  * 1. Listens on stdin for JSON requests
- * 2. Processes each request (init, bundle, emit_surface, infer, build_workspace, check_compatibility, health, shutdown)
+ * 2. Processes each request (see handleRequest for the actions)
  * 3. Writes JSON responses to stdout
  *
  * IMPORTANT:
@@ -16,9 +16,8 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
-import { TypeBundler, SurfaceEmitter } from './bundler.js';
+import { TypeBundler } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
-import { MonorepoBuilder } from './monorepo-builder.js';
 import { DefinitionResolver } from './definition-resolver.js';
 import {
   captureStub,
@@ -35,12 +34,9 @@ import type {
   SidecarResponse,
   InitResponse,
   BundleResponse,
-  EmitSurfaceResponse,
   CaptureV2Response,
   CheckV2Response,
   InferResponse,
-  BuildWorkspaceResponse,
-  CheckCompatibilityResponse,
   ResolveDefinitionsResponse,
   RetypeCheckResponse,
   VerifyClientSemanticsResponse,
@@ -56,7 +52,6 @@ import type {
 // ===========================================================================
 
 let projectLoader: ProjectLoader | null = null;
-let monorepoBuilder: MonorepoBuilder | null = null;
 let initTimeMs: number | null = null;
 
 /**
@@ -66,7 +61,6 @@ let initTimeMs: number | null = null;
  */
 interface ProjectComponents {
   typeBundler: TypeBundler;
-  surfaceEmitter: SurfaceEmitter;
   typeInferrer: TypeInferrer;
   definitionResolver: DefinitionResolver;
   retyper: Retyper;
@@ -108,7 +102,6 @@ function projectComponents(key = ''): ProjectComponents {
     });
     built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
-      surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
       typeInferrer,
       definitionResolver: new DefinitionResolver({ project }),
       // Locates calls exactly as `infer` does, so it rewrites the node the
@@ -204,9 +197,6 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     // that needs them, so readiness costs the same on a bare checkout as on
     // one with its dependencies installed (carrick#749).
 
-    // Initialize monorepo builder (doesn't need project)
-    monorepoBuilder = new MonorepoBuilder();
-
     initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
 
     log(`Initialization complete in ${initTimeMs}ms`);
@@ -264,46 +254,6 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logError(`Bundle failed: ${error}`);
-
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: [error],
-    };
-  }
-}
-
-/**
- * Handle the 'emit_surface' action - emit a surface .d.ts with rewritten specifiers
- */
-function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' }): EmitSurfaceResponse {
-  try {
-    log(`Emitting surface for repo '${request.repo_name}' with ${request.payloads.length} payload(s)`);
-
-    const result = projectComponents().surfaceEmitter.emit(
-      request.repo_name,
-      request.payloads,
-      request.output_path
-    );
-
-    if (!result.success) {
-      return {
-        request_id: request.request_id,
-        status: 'error',
-        errors: result.errors,
-      };
-    }
-
-    return {
-      request_id: request.request_id,
-      status: 'success',
-      output_path: result.output_path,
-      surface_content: result.surface_content,
-      manifest: result.manifest,
-    };
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    logError(`Surface emission failed: ${error}`);
 
     return {
       request_id: request.request_id,
@@ -575,89 +525,6 @@ function handleListLibrarySurface(
 }
 
 /**
- * Handle the 'build_workspace' action - build synthetic monorepo workspace
- */
-function handleBuildWorkspace(request: SidecarRequest & { action: 'build_workspace' }): BuildWorkspaceResponse {
-  // MonorepoBuilder doesn't require project initialization
-  if (!monorepoBuilder) {
-    monorepoBuilder = new MonorepoBuilder();
-  }
-
-  try {
-    log(`Building synthetic workspace with ${request.repos.length} repo(s)`);
-
-    const result = monorepoBuilder.build(request.repos, request.workspace_root);
-
-    if (!result.success) {
-      return {
-        request_id: request.request_id,
-        status: 'error',
-        errors: result.errors,
-      };
-    }
-
-    return {
-      request_id: request.request_id,
-      status: 'success',
-      workspace_path: result.workspace_path,
-      stub_packages: result.stub_packages,
-      checker_path: result.checker_path,
-    };
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    logError(`Workspace build failed: ${error}`);
-
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: [error],
-    };
-  }
-}
-
-/**
- * Handle the 'check_compatibility' action - run type compatibility checks
- */
-function handleCheckCompatibility(request: SidecarRequest & { action: 'check_compatibility' }): CheckCompatibilityResponse {
-  if (!monorepoBuilder) {
-    monorepoBuilder = new MonorepoBuilder();
-  }
-
-  try {
-    log(`Running compatibility checks: ${request.checks.length} check(s)`);
-
-    const result = monorepoBuilder.checkCompatibility(
-      request.workspace_root,
-      request.checks
-    );
-
-    if (!result.success) {
-      return {
-        request_id: request.request_id,
-        status: 'error',
-        errors: result.errors,
-      };
-    }
-
-    return {
-      request_id: request.request_id,
-      status: 'success',
-      results: result.results,
-      diagnostics: result.diagnostics,
-    };
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    logError(`Compatibility check failed: ${error}`);
-
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: [error],
-    };
-  }
-}
-
-/**
  * Handle the 'resolve_definitions' action - resolve surface aliases from a
  * v2 capture stub package's declaration tree.
  */
@@ -737,16 +604,10 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleInit(request);
     case 'bundle':
       return handleBundle(request);
-    case 'emit_surface':
-      return handleEmitSurface(request);
     case 'capture_v2':
       return handleCaptureV2(request);
     case 'infer':
       return handleInfer(request);
-    case 'build_workspace':
-      return handleBuildWorkspace(request);
-    case 'check_compatibility':
-      return handleCheckCompatibility(request);
     case 'resolve_definitions':
       return handleResolveDefinitions(request);
     case 'retype_check':

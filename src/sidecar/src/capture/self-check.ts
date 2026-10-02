@@ -37,6 +37,7 @@ import type { CaptureAliasRecord, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
+import type { WriteGuard } from './guarded-fs.js';
 import {
   findDisqualifyingTopTypes,
   provenanceOf,
@@ -44,6 +45,8 @@ import {
 } from './deep-walk.js';
 
 export interface SelfCheckArgs {
+  /** Writes are held to the stub (carrick#1748). */
+  guard: WriteGuard;
   stubDir: string;
   surfaceAbsPath: string;
   resolved: ResolvedAnchor[];
@@ -76,7 +79,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
   const linkPath = path.join(args.stubDir, 'node_modules');
   let linked = false;
   if (!args.bareCheckout && fs.existsSync(repoNodeModules) && !fs.existsSync(linkPath)) {
-    fs.symlinkSync(repoNodeModules, linkPath, 'dir');
+    args.guard.symlink(repoNodeModules, linkPath, 'dir');
     linked = true;
   }
 
@@ -89,13 +92,13 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
     // the verdict: it reads the repaired text, and a name the rewrite did not
     // reach comes back as a `Cannot find name` diagnostic that
     // `repairedNameFailures` folds back into the same dangling specifier.
-    const repaired = repairDanglingImports(first.internalFailuresByFile, typesDir);
+    const repaired = repairDanglingImports(first.internalFailuresByFile, args.guard.narrow(typesDir));
     if (repaired.size === 0) return first.records;
     return runSelfCheck(args, treeFiles, repaired).records;
   } finally {
     // unlinkSync, not rmSync: the link target is a directory and rmSync
     // refuses symlinks-to-directories with EISDIR.
-    if (linked) fs.unlinkSync(linkPath);
+    if (linked) args.guard.unlink(linkPath);
   }
 }
 
