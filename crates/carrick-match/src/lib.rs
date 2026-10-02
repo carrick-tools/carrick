@@ -45,6 +45,15 @@
 //! wasm-bindgen --target nodejs --out-dir <dir> \
 //!     target/wasm32-unknown-unknown/<profile>/carrick_match.wasm
 //! ```
+//!
+//! Socket and pub/sub rows pair by exact key, and [`names_pair`] decides
+//! whether two rows that share a key may pair, given where each row's name
+//! means something ([`NameScope`], carrick#1663). It is native only: the
+//! cloud runs its own copy against the same test vectors.
+
+mod name_scope;
+
+pub use name_scope::{GLOBAL_SCOPE, NameScope, SERVICE_SCOPE, ScopedRow, names_pair};
 
 /// The kind of source evidence backing one side of a match: a route
 /// definition (a server declaring the operation) or a call site (a client

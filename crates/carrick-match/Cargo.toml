@@ -25,3 +25,10 @@ serde = ["dep:serde"]
 # in .github/workflows/ci.yml in lockstep.
 wasm-bindgen = { version = "=0.2.126", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+# The name-scope vectors test reads the JSON vector file and checks its pinned
+# sha256 (tests/name_scope_vectors.rs). Test-only: the library builds stay
+# dependency-free.
+serde_json = "1.0.140"
+sha2 = "0.10"

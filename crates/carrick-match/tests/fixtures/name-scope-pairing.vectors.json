@@ -1,0 +1,194 @@
+{
+  "title": "Which pub/sub and socket rows pair, by name scope",
+  "version": 1,
+  "contract": "carrick-tools/carrick#1564, comment 5937606126 section 4, and the in_process_bus line pinned 2026-10-01; implemented by carrick-tools/carrick#1663 (carrick-match) and carrick-tools/carrick-cloud#1570 (the cloud's read path)",
+  "rule": [
+    "Two rows can pair only when their operation keys are equal: the protocol, the name exactly as written, and for a socket the direction. The name is never parsed: real names contain ':' and '@'.",
+    "Scope. When either row states a name_scope whose scope is anything other than \"global\", the two rows pair only when they belong to the same service. A scope value the reader does not know restricts like \"service\".",
+    "Namespace. When both rows state a name_scope, they pair only when their namespace values are equal. null equals null and nothing else.",
+    "A row that states no name_scope adds no restriction of its own. Two such rows pair exactly as they did before the field existed.",
+    "An in_process_bus row is always written with scope \"service\", so it never pairs across services."
+  ],
+  "unpinned_by_the_contract": [
+    "unstated-beside-service-scope-across-services: the scope clause applies to whichever row states it, so a row with no name_scope does not cross a service boundary that the other row's scope forbids.",
+    "unstated-beside-a-namespace: the namespace clause needs both rows to state a name_scope, so a row with no name_scope pairs with a namespaced one.",
+    "null-namespace-is-a-value: a stated null namespace is a value of its own, not a wildcard.",
+    "unknown-scope-restricts: a scope other than \"global\" or \"service\" keeps its row inside its own service, because a false edge costs more than a lost one (design section 5)."
+  ],
+  "row_fields": {
+    "id": "unique within the case; pairs name rows by it",
+    "side": "producer (a subscriber or listener, the top-level endpoints[] entry) or consumer (a publisher or emitter, the calls[] entry)",
+    "service": "the service the row belongs to",
+    "protocol": "pubsub or socket",
+    "name": "the topic or event, exactly as the operation key carries it",
+    "direction": "socket rows only: client_to_server, server_to_client or unknown",
+    "name_scope": "the wire object, { scope, namespace }, or absent when the row states none"
+  },
+  "pairs": "every [consumer id, producer id] that pairs, consumer first, sorted",
+  "cases": [
+    {
+      "id": "no-name-scope-pairs-as-before",
+      "note": "An index written before the field existed: every row with the same key pairs, across services and within one.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "orders.created" },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "orders.created" },
+        { "id": "c2", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "orders.created" }
+      ],
+      "pairs": [["c1", "p1"], ["c2", "p1"]]
+    },
+    {
+      "id": "service-scope-pairs-inside-its-service",
+      "note": "A task defined and triggered in one service.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "service-scope-never-crosses",
+      "note": "Same name, same namespace, two services. Only the scope clause refuses it.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } }
+      ],
+      "pairs": []
+    },
+    {
+      "id": "task-id-defined-in-two-services",
+      "note": "The first wrong edge the slice found: each service's trigger reaches its own definition and never the other's.",
+      "rows": [
+        { "id": "pa", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "pb", "side": "producer", "service": "svc-b", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "ca", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "cb", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } }
+      ],
+      "pairs": [["ca", "pa"], ["cb", "pb"]]
+    },
+    {
+      "id": "namespaces-never-mix",
+      "note": "The second wrong edge the slice found: a stream child against a task child in one service. Only the namespace clause refuses it.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "input_stream" } },
+        { "id": "c1", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } }
+      ],
+      "pairs": []
+    },
+    {
+      "id": "two-kinds-of-one-name-in-one-service",
+      "note": "A task and a stream share a name in one service, and only the task is triggered. They are two operations: the stream is unpaired however the task is used. A second name has two unpaired kinds, which stay two operations.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "p2", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "input_stream" } },
+        { "id": "c1", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "p3", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "rebuild", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "p4", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "rebuild", "name_scope": { "scope": "service", "namespace": "input_stream" } }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "global-namespaces-never-mix-across-services",
+      "note": "Two global names of different kinds. The scope clause allows the crossing; the namespace clause refuses it.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "global", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "global", "namespace": "input_stream" } }
+      ],
+      "pairs": []
+    },
+    {
+      "id": "global-crosses-services",
+      "note": "A broker topic stated through claims pairs across services.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "orders.created", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "orders.created", "name_scope": { "scope": "global", "namespace": null } }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "null-namespace-is-a-value",
+      "note": "A stated null namespace pairs with a stated null and with a row that states nothing, never with a stated string.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "jobs.done", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "jobs.done", "name_scope": { "scope": "global", "namespace": "task" } },
+        { "id": "c2", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "jobs.done", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c3", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "jobs.done" }
+      ],
+      "pairs": [["c2", "p1"], ["c3", "p1"]]
+    },
+    {
+      "id": "unstated-beside-service-scope-across-services",
+      "note": "One row states a service scope and the other states nothing. The stated scope still keeps them apart across services, in both directions.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "child" },
+        { "id": "p2", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "rebuild" },
+        { "id": "c2", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "rebuild", "name_scope": { "scope": "service", "namespace": "task" } }
+      ],
+      "pairs": []
+    },
+    {
+      "id": "unstated-beside-service-scope-in-one-service",
+      "note": "Inside one service a row that states nothing pairs with a service-scoped one.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child" }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "unstated-beside-a-namespace",
+      "note": "The namespace clause needs both rows to state a name_scope, so a row that states nothing pairs with a namespaced global name.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "reports.ready", "name_scope": { "scope": "global", "namespace": "task" } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "reports.ready" }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "unknown-scope-restricts",
+      "note": "A scope value the reader does not know keeps its row inside its own service.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "sync", "name_scope": { "scope": "region", "namespace": null } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "sync", "name_scope": { "scope": "region", "namespace": null } },
+        { "id": "c2", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "sync", "name_scope": { "scope": "region", "namespace": null } }
+      ],
+      "pairs": [["c2", "p1"]]
+    },
+    {
+      "id": "in-process-bus-stays-in-its-service",
+      "note": "Two services each emit and handle one in-process event. Each pairs with its own and never with the other's.",
+      "rows": [
+        { "id": "pa", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "user.created", "name_scope": { "scope": "service", "namespace": null } },
+        { "id": "ca", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "user.created", "name_scope": { "scope": "service", "namespace": null } },
+        { "id": "pb", "side": "producer", "service": "svc-b", "protocol": "pubsub", "name": "user.created", "name_scope": { "scope": "service", "namespace": null } },
+        { "id": "cb", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "user.created", "name_scope": { "scope": "service", "namespace": null } }
+      ],
+      "pairs": [["ca", "pa"], ["cb", "pb"]]
+    },
+    {
+      "id": "names-are-never-parsed",
+      "note": "Names holding ':' and '@' compare as written. A reader that folded the scope into the name ('<namespace>:<name>' or '<name>@<service>') would pair c2 with p2 and c3 with p3; neither pairs.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "order:created@v2", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "pubsub", "name": "order:created@v2", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "p2", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "task:child", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c2", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": "task" } },
+        { "id": "p3", "side": "producer", "service": "svc-a", "protocol": "pubsub", "name": "child@svc-a", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c3", "side": "consumer", "service": "svc-a", "protocol": "pubsub", "name": "child", "name_scope": { "scope": "service", "namespace": null } }
+      ],
+      "pairs": [["c1", "p1"]]
+    },
+    {
+      "id": "socket-direction-is-part-of-the-key",
+      "note": "Socket rows pair on event and direction first, then by the same scope rule.",
+      "rows": [
+        { "id": "p1", "side": "producer", "service": "svc-a", "protocol": "socket", "name": "chat:message", "direction": "client_to_server", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c1", "side": "consumer", "service": "svc-b", "protocol": "socket", "name": "chat:message", "direction": "client_to_server", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "c2", "side": "consumer", "service": "svc-b", "protocol": "socket", "name": "chat:message", "direction": "server_to_client", "name_scope": { "scope": "global", "namespace": null } },
+        { "id": "p3", "side": "producer", "service": "svc-a", "protocol": "socket", "name": "room:join", "direction": "client_to_server", "name_scope": { "scope": "service", "namespace": null } },
+        { "id": "c3", "side": "consumer", "service": "svc-b", "protocol": "socket", "name": "room:join", "direction": "client_to_server", "name_scope": { "scope": "service", "namespace": null } }
+      ],
+      "pairs": [["c1", "p1"]]
+    }
+  ]
+}

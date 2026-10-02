@@ -261,6 +261,8 @@ name = "carrick-match"
 version = "0.3.100"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2",
  "wasm-bindgen",
 ]
 
