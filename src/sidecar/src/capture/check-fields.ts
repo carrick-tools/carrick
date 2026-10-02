@@ -84,6 +84,16 @@ const MAX_TYPE_TEXT = 80;
 const MAX_FIELD_DEPTH = 4;
 
 /**
+ * Members a GraphQL server adds to every object a selection asks for
+ * (carrick#1759). The probe reads them as optional on the consumer, which is
+ * the probe's reading and not the consumer's source, so the walk states no
+ * optionality gap for them and does not count one the producer omits as a
+ * field the consumer is waiting on. A type they disagree on is still named.
+ */
+const GRAPHQL_SERVER_SUPPLIED: ReadonlySet<string> = new Set(['__typename']);
+const NONE_SERVER_SUPPLIED: ReadonlySet<string> = new Set();
+
+/**
  * The compiler's assignability relation — the same one the judge's assignment
  * statement is checked with, which is why this walk cannot disagree with it.
  * Not in the public `TypeChecker` surface (the same standing as the
@@ -159,7 +169,8 @@ export function pairFieldReports(
       expected.type,
       checker,
       isAssignableTo,
-      expected.node
+      expected.node,
+      plan.spec.protocol === 'graphql' ? GRAPHQL_SERVER_SUPPLIED : NONE_SERVER_SUPPLIED
     );
     report.wireApplied = wireChanges;
     results.set(plan.pairId, report);
@@ -190,10 +201,11 @@ function diffReport(
   expected: ts.Type,
   checker: ts.TypeChecker,
   isAssignableTo: (a: ts.Type, b: ts.Type) => boolean,
-  at: ts.Node
+  at: ts.Node,
+  serverSupplied: ReadonlySet<string>
 ): PairFieldReport {
   const found: FieldDifference[] = [];
-  walk(sent, expected, '', 0, { checker, isAssignableTo, at, found });
+  walk(sent, expected, '', 0, { checker, isAssignableTo, at, found, serverSupplied });
   found.sort((a, b) =>
     a.path === b.path ? compareText(a.nature, b.nature) : compareText(a.path, b.path)
   );
@@ -214,6 +226,8 @@ interface WalkContext {
   /** Location the member types are read at (the probe's own declaration). */
   at: ts.Node;
   found: FieldDifference[];
+  /** Members the transport supplies, whatever the sender's type says. */
+  serverSupplied: ReadonlySet<string>;
 }
 
 /**
@@ -264,7 +278,10 @@ function walk(
   for (const [name, expectedProp] of expectedProps) {
     const at = join(path, name);
     const sentProp = sentProps.get(name);
+    const supplied = ctx.serverSupplied.has(name);
     if (!sentProp) {
+      // The server sends it whether or not the producer's type states it.
+      if (supplied) continue;
       absent += 1;
       // An optional member the sender omits is what optional MEANS. Naming it
       // would state that the receiver requires it, which is false, and it is
@@ -278,9 +295,10 @@ function walk(
     const expectedOptional = isOptional(expectedProp);
     if (sentOptional && !expectedOptional) {
       ctx.found.push({ path: at, nature: 'optional_in_sent' });
-    } else if (!sentOptional && expectedOptional) {
+    } else if (!sentOptional && expectedOptional && !supplied) {
       // No assignment error exists for this direction, which is exactly why
-      // the judge cannot report it and this walk must.
+      // the judge cannot report it and this walk must. A server-supplied
+      // member is optional only in the probe's reading, so no gap is stated.
       ctx.found.push({ path: at, nature: 'optional_in_expected' });
     }
     const sentType = memberType(sentProp, ctx);

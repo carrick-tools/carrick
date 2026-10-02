@@ -90,11 +90,13 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
   it('graphql pairs assign a comparand that unwraps a single-payload envelope', () => {
     const plan = buildProbe(spec({ protocol: 'graphql' }), PKG);
     assert.ok(plan.source.includes('type GqlComparand ='), plan.source);
-    assert.ok(plan.source.includes('const expected: Expected = sentComparand;'));
-    // The comparand short-circuits to Sent when it already satisfies Expected
-    // (plain subset selection), and falls back to Sent when no unambiguous
-    // single payload property exists.
-    assert.ok(plan.source.includes('[Sent] extends [Expected] ? Sent'));
+    // The consumer is read with `__typename` optional (carrick#1759).
+    assert.ok(plan.source.includes('type GqlExpected ='), plan.source);
+    assert.ok(plan.source.includes('const expected: GqlExpected = sentComparand;'));
+    // The comparand short-circuits to Sent when it already satisfies that
+    // consumer (plain subset selection), and falls back to Sent when no
+    // unambiguous single payload property exists.
+    assert.ok(plan.source.includes('[Sent] extends [GqlExpected] ? Sent'));
     // Comparand re-gates (the v2 port of v1's post-unwrap top-type re-guard)
     // classify through the standard sent-side gate names.
     const names = [...plan.gateLines.values()];
@@ -103,13 +105,14 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
     assert.strictEqual(names.filter((n) => n === 'sent:never').length, 2);
     // The assignment line bookkeeping still points at the real assignment.
     const lines = plan.source.split('\n');
-    assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sentComparand;');
+    assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: GqlExpected = sentComparand;');
   });
 
   it('non-graphql pairs keep the raw sent assignment and eight gates', () => {
     for (const protocol of ['http', 'socket', 'pubsub'] as const) {
       const plan = buildProbe(spec({ protocol }), PKG);
       assert.ok(!plan.source.includes('GqlComparand'), protocol);
+      assert.ok(!plan.source.includes('__typename'), protocol);
       // any/unknown/never on both sides, plus void on both sides (carrick#1162).
       assert.strictEqual(plan.gateLines.size, 8, protocol);
       const lines = plan.source.split('\n');

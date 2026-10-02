@@ -23,6 +23,11 @@
  * at compare time (ts_check type-checker `unwrapGraphqlPayload`, deleted in
  * WP8); the type-level port here is its v2-native equivalent.
  *
+ * GraphQL pairs also read the consumer's `__typename` as optional, at any depth
+ * (carrick#1759): the server adds that meta-field to every object a selection
+ * asks for, so a resolver's return type never states it, while a consumer type
+ * generated from a document that selects it declares it required.
+ *
  * Seam: node builtins + `typescript` + this bundle only. No imports needed here.
  */
 
@@ -269,8 +274,38 @@ export function buildProbe(
     push(
       `type GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([GqlSingleKey<GqlPayloadKeys<S>>] extends [never] ? never : S[GqlSingleKey<GqlPayloadKeys<S>> & keyof S]) : never;`
     );
+    // carrick#1759: the server supplies `__typename` on every object a
+    // selection asks for, so the consumer's `__typename` is read as OPTIONAL,
+    // at any depth. It keeps its declared type: a producer that states a
+    // different one is still a mismatch, and tsc stays the judge of that.
+    //
+    //   - only an object that declares `__typename` is rebuilt, through one
+    //     anonymous mapped type, so modifiers survive, the field walk sees an
+    //     object root, and a headline prints its members, not a helper name;
+    //   - arrays and tuples map homomorphically, so they stay arrays, and a
+    //     function member is kept whole (a mapped function loses its call
+    //     signature and would accept anything);
+    //   - the depth bound ends the expansion; below it the consumer type is
+    //     compared as declared, which can only keep a mismatch;
+    //   - `GqlExpected` keeps the declared type whenever relaxing changes
+    //     nothing observable, so a consumer with no `__typename` to relax is
+    //     judged, and named in the headline, exactly as before.
+    //
+    // The envelope short-circuit below tests the RELAXED consumer: a bare
+    // payload with one object-shaped property would otherwise fail it on
+    // `__typename` alone and unwrap onto that property.
+    push(`type GqlDepth = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];`);
     push(
-      `type GqlComparand = [Sent] extends [Expected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : GqlPayloadOf<Sent>);`
+      `type GqlTypenameParts<T, D extends number> = { [K in keyof T as K extends '__typename' ? never : K]: GqlTypenameOptional<T[K], GqlDepth[D]> } & { [K in keyof T as K extends '__typename' ? K : never]?: T[K] };`
+    );
+    push(
+      `type GqlTypenameOptional<T, D extends number = 16> = [D] extends [never] ? T : T extends (...args: any[]) => any ? T : T extends object ? ('__typename' extends keyof T ? { [K in keyof GqlTypenameParts<T, D>]: GqlTypenameParts<T, D>[K] } : { [K in keyof T]: GqlTypenameOptional<T[K], GqlDepth[D]> }) : T;`
+    );
+    push(
+      `type GqlExpected = [GqlTypenameOptional<Expected>] extends [Expected] ? Expected : GqlTypenameOptional<Expected>;`
+    );
+    push(
+      `type GqlComparand = [Sent] extends [GqlExpected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : GqlPayloadOf<Sent>);`
     );
     gateLines.set(
       push(`type _G_comparand_any = Assert<Not<IsAny<GqlComparand>>>;`),
@@ -285,7 +320,7 @@ export function buildProbe(
       'sent:never'
     );
     push(`declare const sentComparand: GqlComparand;`);
-    assignmentLine = push(`const expected: Expected = sentComparand;`);
+    assignmentLine = push(`const expected: GqlExpected = sentComparand;`);
   } else {
     assignmentLine = push(`const expected: Expected = sent;`);
   }
