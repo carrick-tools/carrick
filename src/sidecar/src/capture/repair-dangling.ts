@@ -31,6 +31,7 @@
 
 import ts from 'typescript';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 /** What one file's repair removed, for the caller's re-check. */
 export interface RepairedFile {
@@ -53,16 +54,40 @@ interface Edit {
  * `failing` maps an absolute file path to the specifiers the stub could not
  * resolve from it. Returns the files actually rewritten; a file whose names
  * cannot all be replaced by `unknown` is left exactly as it was.
+ *
+ * Only a file inside `stubTypesDir` is ever rewritten (carrick#1742). The
+ * self-check program also loads files the stub merely reaches: the repo's own
+ * sources, through a workspace package linked into the `node_modules` the
+ * stub borrows, or a runtime's dependency cache. Those report their missing
+ * modules exactly as an emitted declaration does, and they belong to the
+ * user: a scan reads them and never writes them.
  */
 export function repairDanglingImports(
-  failing: Map<string, Set<string>>
+  failing: Map<string, Set<string>>,
+  stubTypesDir: string
 ): Map<string, RepairedFile> {
   const repaired = new Map<string, RepairedFile>();
+  const stubRoot = realPath(stubTypesDir);
   for (const [file, specifiers] of failing) {
+    if (!isInside(stubRoot, realPath(file))) continue;
     const result = repairFile(file, specifiers);
     if (result) repaired.set(file, result);
   }
   return repaired;
+}
+
+/** The path with every link resolved; the path itself when it cannot be. */
+function realPath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+function isInside(root: string, file: string): boolean {
+  const rel = path.relative(root, file);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 function repairFile(file: string, specifiers: Set<string>): RepairedFile | undefined {

@@ -89,7 +89,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
     // the verdict: it reads the repaired text, and a name the rewrite did not
     // reach comes back as a `Cannot find name` diagnostic that
     // `repairedNameFailures` folds back into the same dangling specifier.
-    const repaired = repairDanglingImports(first.internalFailuresByFile);
+    const repaired = repairDanglingImports(first.internalFailuresByFile, typesDir);
     if (repaired.size === 0) return first.records;
     return runSelfCheck(args, treeFiles, repaired).records;
   } finally {
