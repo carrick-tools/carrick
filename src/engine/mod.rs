@@ -11943,69 +11943,6 @@ mod tests {
             .collect()
     }
 
-    /// carrick#1562: a parameter or a field that holds the platform's
-    /// `fetch` unless a caller hands another is `fetch`: a positional or a
-    /// destructured default, a constructor parameter's default kept in a
-    /// field, and a `??` falling back to it. One the function assigns again,
-    /// one written in a method, and a parameter with no default (the
-    /// caller's own function, composed where the caller writes it) are not.
-    /// No call here carries an options bag, which reads as a request
-    /// whatever its callee.
-    #[test]
-    fn an_injected_fetch_is_the_platform_s_fetch() {
-        let (dir, discovery) = discover_sources(&[(
-            "src/client.ts",
-            "declare function wrap(f: typeof fetch): typeof fetch;\n\
-             const BASE = process.env.API_BASE;\n\
-             export async function post(owner: string, { fetchImpl = fetch }: { fetchImpl?: typeof fetch }) {\n\
-             \x20 const url = `${BASE}/repos/${owner}/comments`;\n\
-             \x20 return fetchImpl(url);\n\
-             }\n\
-             export async function get(id: string, fetchFn: typeof fetch = fetch) {\n\
-             \x20 const url = `${BASE}/items/${id}`;\n\
-             \x20 return fetchFn(url);\n\
-             }\n\
-             export async function swapped(id: string, fetchFn: typeof fetch = fetch) {\n\
-             \x20 fetchFn = wrap(fetchFn);\n\
-             \x20 const url = `${BASE}/swapped/${id}`;\n\
-             \x20 return fetchFn(url);\n\
-             }\n\
-             export async function handed(id: string, fetchFn: typeof fetch) {\n\
-             \x20 const url = `${BASE}/handed/${id}`;\n\
-             \x20 return fetchFn(url);\n\
-             }\n\
-             export class Client {\n\
-             \x20 #fetch: typeof fetch;\n\
-             \x20 private fetchFn: typeof fetch;\n\
-             \x20 constructor(fetcher: typeof fetch = fetch, options: { fetch?: typeof fetch } = {}) {\n\
-             \x20   this.#fetch = fetcher;\n\
-             \x20   this.fetchFn = options.fetch ?? fetch;\n\
-             \x20 }\n\
-             \x20 ping() { const url = `${BASE}/ping`; return this.#fetch(url); }\n\
-             \x20 pong() { const url = `${BASE}/pong`; return this.fetchFn(url); }\n\
-             }\n\
-             export class Swapped {\n\
-             \x20 #fetch: typeof fetch = fetch;\n\
-             \x20 swap(other: typeof fetch) { this.#fetch = other; }\n\
-             \x20 ping() { const url = `${BASE}/moved`; return this.#fetch(url); }\n\
-             }\n",
-        )]);
-        let get = |target: &str| (String::from("GET"), target.to_string());
-        let rows: Vec<(u32, (String, String))> = rows_by_line(&dir, &discovery, "src/client.ts")
-            .into_iter()
-            .map(|(line, method, target)| (line, (method, target)))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                (5, get("${process.env.API_BASE}/repos/${owner}/comments")),
-                (9, get("${process.env.API_BASE}/items/${id}")),
-                (27, get("${process.env.API_BASE}/ping")),
-                (28, get("${process.env.API_BASE}/pong")),
-            ]
-        );
-    }
-
     /// carrick#1562: a call to a module-scope builder is what the builder
     /// returns, with the call's arguments in its parameters: an arrow, a
     /// function declaration, and one held in a constant object. A function
