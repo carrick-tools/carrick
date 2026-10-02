@@ -3802,7 +3802,10 @@ fn withdraw_model_routes_at_definitions(
         endpoint.resolution_source
             != Some(crate::agents::file_analyzer_agent::ResolutionSource::Model)
             || !withdrawn.contains(&(
-                normalize_protocol_file(Path::new(&endpoint.file_location))
+                // `file:line`, relative as the analysis keys are: the full
+                // scan's graph holds the walked path, absolute when the repo
+                // path is.
+                relative(Path::new(&endpoint.file_location))
                     .display()
                     .to_string(),
                 endpoint.method.to_uppercase(),
@@ -15915,6 +15918,38 @@ mod tests {
             .map(|route| route.path.as_str())
             .collect();
         assert_eq!(kept, vec!["/awaited", "/stated", "/not-a-definition"]);
+
+        // The full scan's analysis keys, graph and library rows hold the
+        // walked path, absolute when the repo path is.
+        let mut absolute_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        absolute_results.insert(
+            "/repo/svc/src/tasks.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![endpoint(2, "/send-email", (10, 40))],
+                ..Default::default()
+            },
+        );
+        let mut absolute_graph = crate::mount_graph::MountGraph::new();
+        absolute_graph.endpoints = vec![crate::mount_graph::ResolvedEndpoint {
+            file_location: "/repo/svc/src/tasks.ts:2".to_string(),
+            ..route(2, "/send-email", ResolutionSource::Model)
+        }];
+        let absolute_library = LibraryRows {
+            rows: vec![crate::library_claims::LibraryRow {
+                file: PathBuf::from("/repo/svc/src/tasks.ts"),
+                ..definition(2, "send-email", (10, 40), true)
+            }],
+        };
+        assert_eq!(
+            withdraw_model_routes_at_definitions(
+                &mut absolute_graph,
+                &absolute_results,
+                &absolute_library,
+                "/repo",
+            ),
+            1,
+            "an absolute repo path withdraws the same route"
+        );
     }
 
     /// carrick#1662: with no claims (every scan until carrick#1664 asks the
