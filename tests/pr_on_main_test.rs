@@ -796,3 +796,79 @@ async fn another_scanners_copy_counts_when_it_reads_the_untouched_files_alike() 
         "{finding:#}"
     );
 }
+
+/// Scan `repo` as PR #7 and return the endpoint delta it posted.
+async fn pr_delta(store: &Store, repo: &Path) -> serde_json::Value {
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe {
+        std::env::set_var("GITHUB_REF", "refs/pull/7/merge");
+        std::env::set_var("GITHUB_EVENT_NAME", "pull_request");
+    }
+    scan_with(store, repo, false).await;
+    unsafe {
+        std::env::remove_var("GITHUB_REF");
+        std::env::remove_var("GITHUB_EVENT_NAME");
+    }
+    let payload = store
+        .pr_results
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("a PR run posts its result");
+    serde_json::to_value(&payload).unwrap()["delta"].clone()
+}
+
+/// Main's stored copies of `repo_name` as another scanner release would have
+/// written them: by `version`, and without the endpoint that release did not
+/// state.
+fn as_written_by(store: &Store, repo_name: &str, version: Option<&str>) {
+    for stored in store
+        .repos
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|stored| stored.repo_name == repo_name)
+    {
+        stored.scanner_version = version.map(str::to_string);
+        stored.endpoints.clear();
+    }
+}
+
+/// carrick#1712: a row the PR did not add never shows as new. Main's index
+/// written by this release lacking an endpoint the PR's scan states is a real
+/// difference, and the delta lists it; the same index written by another
+/// release, or by one that did not say which, is no baseline for the delta,
+/// so the PR posts none.
+#[tokio::test]
+async fn a_pr_shows_no_endpoint_delta_against_an_index_another_release_wrote() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, _consumer) = setup();
+    let repo_name = producer.file_name().unwrap().to_str().unwrap().to_string();
+    let new_paths = |delta: &serde_json::Value| -> Vec<String> {
+        delta["new_endpoints"]
+            .as_array()
+            .map(|refs| {
+                refs.iter()
+                    .map(|r| r["path"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let store = Store::default();
+    scan(&store, &producer).await;
+    as_written_by(&store, &repo_name, Some(env!("CARGO_PKG_VERSION")));
+    let delta = pr_delta(&store, &producer).await;
+    assert!(
+        !new_paths(&delta).is_empty(),
+        "this release's index lacks the endpoint, so the PR lists it: {delta:#}"
+    );
+
+    for other in [Some("0.0.1"), None] {
+        let store = Store::default();
+        scan(&store, &producer).await;
+        as_written_by(&store, &repo_name, other);
+        let delta = pr_delta(&store, &producer).await;
+        assert!(delta.is_null(), "{other:?}: {delta:#}");
+    }
+}

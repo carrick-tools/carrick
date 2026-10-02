@@ -302,6 +302,109 @@ fn untouched_reading_clause(reading: &crate::pr_baseline::UntouchedReading) -> S
 /// A copy another scanner version wrote is compared with when that scanner
 /// read the files this PR left alone as this run did (carrick#1530).
 /// `as_uploaded` is this run's services in the form main's copy was stored in.
+/// An operation of one of this repo's services: in a monorepo an endpoint
+/// newly added to one service still counts as new even if a sibling service
+/// already exposes the same route.
+type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+
+/// What a PR's endpoint delta is compared with (carrick#1712).
+#[derive(Debug, PartialEq, Eq)]
+enum DeltaBaseline {
+    /// No stored index of this repo: nothing to compare with.
+    Absent,
+    /// A stored index another scanner version wrote, or one that did not say
+    /// which: a row this run states and it did not may be the scanner's
+    /// change rather than the PR's, so no delta is shown. Once main is
+    /// scanned by this version, the versions agree and the delta returns.
+    /// Holds the versions it names, for the log.
+    OtherScanner(Vec<String>),
+    /// The stored index's operations, by service and key.
+    Keys(HashSet<ServiceEndpointKey>),
+}
+
+impl DeltaBaseline {
+    /// The baseline `stored` (this repo's stored services) gives a run of
+    /// `scanner`.
+    fn of<'a>(stored: impl IntoIterator<Item = &'a CloudRepoData>, scanner: &str) -> Self {
+        let stored: Vec<&CloudRepoData> = stored.into_iter().collect();
+        if stored.is_empty() {
+            return Self::Absent;
+        }
+        if stored
+            .iter()
+            .any(|repo| repo.scanner_version.as_deref() != Some(scanner))
+        {
+            let mut versions: Vec<String> = stored
+                .iter()
+                .map(|repo| {
+                    repo.scanner_version
+                        .clone()
+                        .unwrap_or_else(|| "of unknown version".to_string())
+                })
+                .collect();
+            versions.sort();
+            versions.dedup();
+            return Self::OtherScanner(versions);
+        }
+        Self::Keys(
+            stored
+                .iter()
+                .flat_map(|repo| {
+                    repo.endpoints
+                        .iter()
+                        .map(|e| (repo.service_name.clone(), e.key.clone()))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The operations `current` states that `previous` lacks, and those
+/// `previous` states that `current` no longer does, each sorted by (method,
+/// path, service) so the output is deterministic even when two services add
+/// or drop the same operation.
+fn endpoint_delta(
+    previous: &HashSet<ServiceEndpointKey>,
+    current: &[CloudRepoData],
+) -> crate::findings::PrDelta {
+    let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
+        let (label, name) = key.display_labels();
+        crate::findings::EndpointRef {
+            method: label,
+            path: name,
+            service: service.clone(),
+        }
+    };
+    let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
+        refs.sort_by(|a, b| {
+            (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
+        });
+    };
+    let mut current_keys = HashSet::new();
+    let mut new_endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for service_data in current {
+        for endpoint in &service_data.endpoints {
+            let id = (service_data.service_name.clone(), endpoint.key.clone());
+            current_keys.insert(id.clone());
+            if !previous.contains(&id) && seen.insert(id) {
+                new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
+            }
+        }
+    }
+    let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous
+        .iter()
+        .filter(|id| !current_keys.contains(*id))
+        .map(|(service, key)| endpoint_ref(service, key))
+        .collect();
+    sort_refs(&mut new_endpoints);
+    sort_refs(&mut removed_endpoints);
+    crate::findings::PrDelta {
+        new_endpoints,
+        removed_endpoints,
+    }
+}
+
 fn main_copy_against_base(
     repo_path: &str,
     main_self: &[CloudRepoData],
@@ -1094,35 +1197,24 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         None
     };
 
-    // On a PR run, capture this repo's previously-indexed endpoints (its last
-    // uploaded state, i.e. main) before they're removed below, so the diff can
-    // surface what this change added relative to that baseline. Keyed by
-    // (service, key) so that in a
-    // monorepo an endpoint newly added to one service still counts as new even
-    // if a sibling service already exposes the same route. `had_prior_index` is
-    // tracked separately so a prior scan that indexed zero endpoints still
-    // counts as a baseline, rather than being conflated with a first-ever scan
-    // where "new" is meaningless. On non-PR runs the capture is skipped
-    // entirely, since the block is suppressed there anyway.
-    type ServiceEndpointKey = (Option<String>, crate::operation::OperationKey);
+    // On a PR run, read what this repo's last uploaded index (main) says
+    // before it is removed below, so the delta can surface what this change
+    // added and removed relative to it. `had_prior_index` is tracked
+    // separately so a prior scan that indexed zero endpoints still counts as
+    // a baseline, rather than being conflated with a first-ever scan where
+    // "new" is meaningless. On non-PR runs the capture is skipped entirely,
+    // since the block is suppressed there anyway.
     let is_pr_run = pr_number_from_env().is_some();
-    let (had_prior_index, previous_self_keys): (
-        bool,
-        std::collections::HashSet<ServiceEndpointKey>,
-    ) = if is_pr_run {
-        let had = all_repo_data.iter().any(|repo| repo.repo_name == repo_name);
-        let keys = all_repo_data
+    let (had_prior_index, delta_baseline) = if is_pr_run {
+        let stored = all_repo_data
             .iter()
-            .filter(|repo| repo.repo_name == repo_name)
-            .flat_map(|repo| {
-                repo.endpoints
-                    .iter()
-                    .map(|e| (repo.service_name.clone(), e.key.clone()))
-            })
-            .collect();
-        (had, keys)
+            .filter(|repo| repo.repo_name == repo_name);
+        (
+            all_repo_data.iter().any(|repo| repo.repo_name == repo_name),
+            DeltaBaseline::of(stored, env!("CARGO_PKG_VERSION")),
+        )
     } else {
-        (false, std::collections::HashSet::new())
+        (false, DeltaBaseline::Absent)
     };
 
     // What the analysis phase put on the wire, once, for the whole scan. A
@@ -1192,55 +1284,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         peer_repo_count, local_service_count
     );
 
-    // On a PR run with a prior index, surface what this change added and
-    // removed: operations in the freshly-analyzed services that the previous
-    // (last-uploaded) index didn't have, and previously-indexed operations
-    // that no longer exist. Because the baseline is the last uploaded index,
-    // this can include an operation that landed on main since its last scan
-    // rather than in this PR. Computed before `current_services_data` is
-    // moved into the analyzer.
-    let pr_delta = if is_pr_run && had_prior_index {
-        let endpoint_ref = |service: &Option<String>, key: &crate::operation::OperationKey| {
-            let (label, name) = key.display_labels();
-            crate::findings::EndpointRef {
-                method: label,
-                path: name,
-                service: service.clone(),
-            }
-        };
-        // Sort by (method, path, service) for deterministic output even when
-        // two services add or drop the same operation.
-        let sort_refs = |refs: &mut Vec<crate::findings::EndpointRef>| {
-            refs.sort_by(|a, b| {
-                (&a.method, &a.path, &a.service).cmp(&(&b.method, &b.path, &b.service))
-            });
-        };
-
-        let mut current_keys = std::collections::HashSet::new();
-        let mut new_endpoints = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for service_data in &current_services_data {
-            for endpoint in &service_data.endpoints {
-                let id = (service_data.service_name.clone(), endpoint.key.clone());
-                current_keys.insert(id.clone());
-                if !previous_self_keys.contains(&id) && seen.insert(id) {
-                    new_endpoints.push(endpoint_ref(&service_data.service_name, &endpoint.key));
-                }
-            }
+    // On a PR run with a prior index this scanner version wrote, surface
+    // what this change added and removed: operations in the freshly-analyzed
+    // services that the previous (last-uploaded) index didn't have, and
+    // previously-indexed operations that no longer exist. Because the
+    // baseline is the last uploaded index, this can include an operation that
+    // landed on main since its last scan rather than in this PR. Computed
+    // before `current_services_data` is moved into the analyzer.
+    let pr_delta = match delta_baseline {
+        DeltaBaseline::Keys(previous) => Some(endpoint_delta(&previous, &current_services_data)),
+        DeltaBaseline::OtherScanner(versions) => {
+            info!(
+                "Main's index was written by Carrick {} and this run is Carrick {}, so the PR \
+                 comment lists no endpoint changes until main is scanned again",
+                versions.join(", "),
+                env!("CARGO_PKG_VERSION")
+            );
+            None
         }
-        let mut removed_endpoints: Vec<crate::findings::EndpointRef> = previous_self_keys
-            .iter()
-            .filter(|id| !current_keys.contains(*id))
-            .map(|(service, key)| endpoint_ref(service, key))
-            .collect();
-        sort_refs(&mut new_endpoints);
-        sort_refs(&mut removed_endpoints);
-        Some(crate::findings::PrDelta {
-            new_endpoints,
-            removed_endpoints,
-        })
-    } else {
-        None
+        DeltaBaseline::Absent => None,
     };
 
     // Collect the merged type manifest before `all_repo_data` /
@@ -18099,6 +18161,83 @@ mod tests {
 
     /// Minimal `CloudRepoData` carrying just a repo/service identity and a
     /// bundled `.d.ts`, for the bundle-file-emission tests below.
+    /// `service`'s stored or scanned copy, by `version`, stating `GET` on
+    /// each of `paths`.
+    fn service_stating(service: &str, version: Option<&str>, paths: &[&str]) -> CloudRepoData {
+        let mut repo = repo_with_bundle("api", Some(service), "");
+        repo.scanner_version = version.map(str::to_string);
+        repo.endpoints = paths
+            .iter()
+            .map(|path| ApiEndpointDetails {
+                view_module: false,
+                owner: None,
+                key: OperationKey::http("GET", path.to_string()),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("src/routes.ts:1"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: None,
+                dispatch: None,
+                schema_binding: None,
+                handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
+            })
+            .collect();
+        repo
+    }
+
+    /// carrick#1712: a PR's endpoint delta compares with main's index only
+    /// when this scanner version wrote every stored service of the repo.
+    /// Another version, or none named, gives no delta, so a row the PR did
+    /// not add never shows as new or removed; no index gives none either.
+    #[test]
+    fn the_pr_delta_compares_only_with_an_index_this_version_wrote() {
+        const THIS: &str = "0.4.0";
+        let same = service_stating("web", Some(THIS), &["/orders"]);
+        assert_eq!(
+            DeltaBaseline::of(std::iter::empty(), THIS),
+            DeltaBaseline::Absent
+        );
+        assert_eq!(
+            DeltaBaseline::of(
+                [&service_stating("web", Some("0.3.99"), &["/orders"])],
+                THIS
+            ),
+            DeltaBaseline::OtherScanner(vec!["0.3.99".to_string()])
+        );
+        assert_eq!(
+            DeltaBaseline::of([&service_stating("web", None, &["/orders"])], THIS),
+            DeltaBaseline::OtherScanner(vec!["of unknown version".to_string()])
+        );
+        assert_eq!(
+            DeltaBaseline::of([&same, &service_stating("jobs", Some("0.3.99"), &[])], THIS),
+            DeltaBaseline::OtherScanner(vec!["0.3.99".to_string(), THIS.to_string()]),
+            "one service by another version is enough"
+        );
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&same], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let delta = endpoint_delta(
+            &previous,
+            &[service_stating("web", Some(THIS), &["/orders", "/users"])],
+        );
+        let paths = |refs: &[crate::findings::EndpointRef]| -> Vec<String> {
+            refs.iter().map(|r| r.path.clone()).collect()
+        };
+        assert_eq!(paths(&delta.new_endpoints), vec!["/users"]);
+        assert!(delta.removed_endpoints.is_empty());
+        let dropped = endpoint_delta(&previous, &[service_stating("web", Some(THIS), &[])]);
+        assert_eq!(paths(&dropped.removed_endpoints), vec!["/orders"]);
+        assert!(dropped.new_endpoints.is_empty());
+    }
+
     fn repo_with_bundle(
         repo_name: &str,
         service_name: Option<&str>,
