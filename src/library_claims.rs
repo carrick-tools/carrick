@@ -933,6 +933,7 @@ mod tests {
         \x20 await bus.publish(\"orders.lonely\");\n\
         \x20 bus.subscribe(\"orders.created\", (message) => {});\n\
         \x20 bus.subscribe(\"$connected\", () => {});\n\
+        \x20 await bus.publish(\"\", {});\n\
         }\n";
 
     /// Claim ids follow the HTTP convention, `<specifier>@<major>:<export>:…`,
@@ -1130,6 +1131,13 @@ mod tests {
              export const sendEmail = task({ id: \"send-email\", run: async () => {} });\n\
              export const noHandler = task({ id: \"no-handler\" });\n",
         )]);
+        assert!(
+            rows_of(&sites, std::slice::from_ref(&jobs), |check| {
+                !check.claim_id.contains(":make:")
+            })
+            .is_empty(),
+            "an unverified maker defines nothing"
+        );
         let rows = rows_of(&sites, &[jobs], all);
         assert_eq!(rows.len(), 1, "{rows:#?}");
         assert_eq!(rows[0].name, "send-email");
@@ -1306,6 +1314,28 @@ mod tests {
         );
     }
 
+    /// Two verified op elements that apply to one call and read different
+    /// names state nothing: the call names one topic or the claims disagree.
+    #[test]
+    fn op_elements_that_read_different_names_state_nothing() {
+        let sites = sites_of(&[(
+            "src/orders.ts",
+            "import { bus } from \"@fixture/bus\";\n\
+             export async function send() { await bus.publish(\"orders.created\", { topic: \"orders.v2\" }); }\n",
+        )]);
+        let control = rows_of(&sites, &[bus()], all);
+        assert_eq!(control.len(), 1, "{control:#?}");
+        let mut both = bus();
+        both.claims.push(
+            serde_json::from_value(json!({
+                "kind": "op", "op": "send", "member": "publish", "of": "export",
+                "name": { "arg": 1, "key": "topic" }, "payload": { "arg": 1 }
+            }))
+            .expect("an op"),
+        );
+        assert!(rows_of(&sites, &[both], all).is_empty());
+    }
+
     /// Only the message roles state rows here: an HTTP client's export, even
     /// with claims that would read as a send, asks and states nothing.
     #[test]
@@ -1356,6 +1386,18 @@ mod tests {
                 .collect()
         };
         assert_eq!(names("instance:new"), vec!["welcome".to_string()]);
+        let scopes: Vec<NameScope> = rows_of(&sites, &[queue("instance:new")], all)
+            .into_iter()
+            .map(|row| row.name_scope)
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![NameScope {
+                scope: NameScopeKind::Service,
+                namespace: None
+            }],
+            "a claim that states no scope is read as `service`"
+        );
         assert!(names("instance:new:Cluster").is_empty());
     }
 }
