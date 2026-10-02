@@ -2323,6 +2323,19 @@ fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<St
             _ => {}
         }
     }
+    found.extend(literal_loads(module));
+    found
+}
+
+/// Every specifier `module` hands `import()` or `require` as a literal,
+/// anywhere in the file: in a function, in a chain (`require("x").config()`),
+/// or bound at module scope. A computed specifier (`require(name)`, a
+/// template with a hole) names no module and is not here.
+///
+/// The one reader of these loads: the request summaries' value specifiers
+/// and the framework-detect import sample
+/// ([`crate::framework_detector::ImportSample`], carrick#1727) both read it.
+pub(crate) fn literal_loads(module: &Module) -> BTreeSet<String> {
     struct Loads {
         found: BTreeSet<String>,
     }
@@ -2347,7 +2360,9 @@ fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<St
             call.visit_children_with(self);
         }
     }
-    let mut loads = Loads { found };
+    let mut loads = Loads {
+        found: BTreeSet::new(),
+    };
     module.visit_with(&mut loads);
     loads.found
 }

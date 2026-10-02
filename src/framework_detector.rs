@@ -4,8 +4,61 @@ use crate::{
     visitor::{ImportedSymbol, SymbolKind},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use swc_ecma_ast::Module;
 use tracing::{debug, trace};
+
+/// A service's import sample: every module its files load by a literal
+/// specifier, whatever syntax loads it. The `imports` list of the
+/// `/framework-detect` body is rendered from it, and detection classifies only
+/// the packages that list names, so a package loaded any way the sample does
+/// not read is never classified (carrick#1727).
+///
+/// Built from every file of the service through [`ImportSample::add_file`],
+/// which is the one way facts enter it, in discovery and in the tests alike.
+/// Ordered sets only, so the body does not depend on walk order (carrick#954).
+///
+/// Reference: `docs/reference/module-resolution.md`, "CommonJS".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportSample {
+    /// Every binding a file introduces from another module: its import
+    /// declarations, and the module-scope `require` bindings and
+    /// `import x = require()` that state the same thing
+    /// ([`crate::commonjs::require_bindings`], the call graph's reader).
+    bindings: BTreeSet<ImportedSymbol>,
+    /// Every specifier a `require` or `import()` call names by a literal,
+    /// anywhere in a file. A source a binding above also names is stated by
+    /// the binding.
+    loads: BTreeSet<String>,
+}
+
+impl ImportSample {
+    /// Add one file. `esm` is its import-declaration table
+    /// ([`crate::visitor::ImportSymbolExtractor`]), which the caller reads
+    /// once for the analyzer anyway; this sample reads more than that table
+    /// does, and the table stays as it is, because the analyzer's prompt is
+    /// built from it.
+    pub fn add_file(&mut self, module: &Module, esm: &HashMap<String, ImportedSymbol>) {
+        self.bindings.extend(esm.values().cloned());
+        self.bindings.extend(
+            crate::commonjs::require_bindings(module)
+                .bindings
+                .into_values(),
+        );
+        self.loads
+            .extend(crate::request_summary::literal_loads(module));
+    }
+
+    /// The sample as the body's `imports` list states it.
+    pub fn statements(&self) -> Vec<String> {
+        extract_import_statements(self)
+    }
+
+    /// How many facts the sample holds, for the discovery log line.
+    pub fn fact_count(&self) -> usize {
+        self.bindings.len() + self.loads.len()
+    }
+}
 
 /// Result of framework and library detection
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -109,17 +162,17 @@ impl FrameworkDetector {
 
     /// Main detection function that combines package.json and import analysis.
     ///
-    /// `imports` is the service's whole import sample: every distinct
-    /// `(local_name, imported_name, source, kind)` fact its files state,
-    /// deduplicated and ordered. It is deliberately NOT the local-name-keyed
-    /// symbol map the rest of the pipeline carries — that map collapses two
-    /// files importing different things under one local name down to whichever
-    /// file was parsed last, so the sample it yields varies between runs of an
-    /// unchanged checkout (carrick#954).
+    /// `imports` is the service's whole import sample ([`ImportSample`]):
+    /// every distinct fact its files state, deduplicated and ordered. It is
+    /// deliberately NOT the local-name-keyed symbol map the rest of the
+    /// pipeline carries — that map collapses two files importing different
+    /// things under one local name down to whichever file was parsed last, so
+    /// the sample it yields varies between runs of an unchanged checkout
+    /// (carrick#954).
     pub async fn detect_frameworks_and_libraries(
         &self,
         packages: &Packages,
-        imports: &BTreeSet<ImportedSymbol>,
+        imports: &ImportSample,
     ) -> Result<DetectionResult, Box<dyn std::error::Error>> {
         let result = self
             .classify_with_llm(build_detection_input(packages, imports))
@@ -223,13 +276,10 @@ fn extract_json_from_response(response: &str) -> Result<String, Box<dyn std::err
 /// Build the `/framework-detect` request body from a service's manifests and
 /// its import sample. Pure and total: the same inputs always produce the same
 /// bytes, whatever order the files were parsed in (carrick#954).
-fn build_detection_input(
-    packages: &Packages,
-    imports: &BTreeSet<ImportedSymbol>,
-) -> FrameworkDetectionInput {
+fn build_detection_input(packages: &Packages, imports: &ImportSample) -> FrameworkDetectionInput {
     FrameworkDetectionInput {
         package_json: extract_package_summary(packages),
-        imports: extract_import_statements(imports),
+        imports: imports.statements(),
         ask_client_semantics: true,
     }
 }
@@ -263,15 +313,22 @@ fn extract_package_summary(packages: &Packages) -> PackageJsonSummary {
 /// source the service imports from appears — including the ones whose only
 /// local name is also used for a different module elsewhere in the service.
 ///
+/// A source no binding names, only a `require` or `import()` call, is stated
+/// as a side-effect import (`import 'x';`): the statement form the cloud's
+/// detection reads a package name from, as it reads every other line here.
+///
 /// There is no cap on the list: if one is ever added it goes AFTER this
 /// function's ordering, or the sample starts varying again (carrick#954).
-fn extract_import_statements(imports: &BTreeSet<ImportedSymbol>) -> Vec<String> {
+fn extract_import_statements(imports: &ImportSample) -> Vec<String> {
     let mut by_source: BTreeMap<&str, Vec<&ImportedSymbol>> = BTreeMap::new();
-    for symbol in imports {
+    for symbol in &imports.bindings {
         by_source
             .entry(symbol.source.as_str())
             .or_default()
             .push(symbol);
+    }
+    for source in &imports.loads {
+        by_source.entry(source.as_str()).or_default();
     }
 
     let mut import_statements = Vec::new();
@@ -305,7 +362,7 @@ fn extract_import_statements(imports: &BTreeSet<ImportedSymbol>) -> Vec<String> 
         } else if let Some(name) = namespace_imports.first() {
             format!("import * as {} from '{}';", name, source)
         } else {
-            continue;
+            format!("import '{}';", source)
         };
 
         import_statements.push(statement);
@@ -374,21 +431,90 @@ mod tests {
             .collect()
     }
 
-    /// Extract import facts exactly as `engine::discover_files_and_symbols`
-    /// does — the production parse path, one `ImportSymbolExtractor` per file,
-    /// every symbol folded into the service-wide sample.
-    fn import_facts(files: &[PathBuf]) -> BTreeSet<ImportedSymbol> {
+    /// Build the sample exactly as `engine::discover_files_and_symbols` does
+    /// — the production parse path, one `ImportSymbolExtractor` per file,
+    /// every file folded in through [`ImportSample::add_file`].
+    fn import_facts(files: &[PathBuf]) -> ImportSample {
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
-        let mut facts = BTreeSet::new();
+        let mut sample = ImportSample::default();
         for file in files {
             let module = crate::parser::parse_file(file, &cm, &handler).expect("fixture parses");
             let mut extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut extractor);
-            facts.extend(extractor.imported_symbols.into_values());
+            sample.add_file(&module, &extractor.imported_symbols);
         }
-        facts
+        sample
+    }
+
+    /// A CommonJS service and a module loaded by `import()` (carrick#1727):
+    /// every module these files load by a literal specifier, in every form a
+    /// `require` or an `import()` takes, at module scope and in a function.
+    const LOADED_FILES: [(&str, &str); 2] = [
+        (
+            "worker.js",
+            "const { Kafka } = require('kafkajs');\n\
+             const express = require('express');\n\
+             const publish = require('amqplib').connect;\n\
+             const helpers = require('./helpers');\n\
+             require('dotenv').config();\n\
+             function cache() { const redis = require('redis'); return redis.createClient(); }\n\
+             async function plugin(name) {\n\
+               const { default: Redis } = await import('ioredis');\n\
+               await import(`@scope/plugin-${name}`);\n\
+               return require(name);\n\
+             }\n\
+             module.exports = { cache, plugin, Kafka, express, publish, helpers };\n",
+        ),
+        (
+            "legacy.ts",
+            "import fs = require('node:fs');\n\
+             import express from 'express';\n\
+             export const load = () => import(`pg`);\n",
+        ),
+    ];
+
+    fn write_loaded(root: &Path) -> Vec<PathBuf> {
+        std::fs::write(root.join("package.json"), MANIFEST).expect("manifest");
+        LOADED_FILES
+            .iter()
+            .map(|(name, source)| {
+                let path = root.join(name);
+                std::fs::write(&path, source).expect("fixture file");
+                path
+            })
+            .collect()
+    }
+
+    /// A module a file loads only with `require` or `import()` is in the
+    /// sample, so detection is asked about it (carrick#1727). A binding the
+    /// require states is stated as an import of that binding; a load that
+    /// binds nothing the sample reads is a side-effect import, the form the
+    /// cloud reads a package name from. A specifier the source computes
+    /// names no module and adds nothing.
+    #[test]
+    fn import_sample_carries_modules_loaded_by_require_and_import() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let files = write_loaded(dir.path());
+        let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
+
+        let input = build_detection_input(&packages, &import_facts(&files));
+
+        assert_eq!(
+            input.imports,
+            vec![
+                "import * as helpers from './helpers';",
+                "import { publish } from 'amqplib';",
+                "import 'dotenv';",
+                "import express from 'express';",
+                "import 'ioredis';",
+                "import { Kafka } from 'kafkajs';",
+                "import * as fs from 'node:fs';",
+                "import 'pg';",
+                "import 'redis';",
+            ]
+        );
     }
 
     /// The bytes `post_to_lambda` puts on the wire for this input.
@@ -418,6 +544,16 @@ mod tests {
         // that must not move.
         let body: serde_json::Value = serde_json::from_str(&forward).unwrap();
         assert_eq!(body["ask_client_semantics"], serde_json::json!(true));
+
+        // The same for modules loaded by `require` and `import()`
+        // (carrick#1727), which one file also imports by a declaration.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut files = write_loaded(dir.path());
+        let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
+        let forward = wire_body(&build_detection_input(&packages, &import_facts(&files)));
+        files.reverse();
+        let reversed = wire_body(&build_detection_input(&packages, &import_facts(&files)));
+        assert_eq!(forward, reversed);
     }
 
     /// The contract sample (carrick#1564), byte for byte as both repos hold it.

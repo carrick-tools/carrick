@@ -95,10 +95,11 @@ use tracing::debug;
 ///
 /// The ESM facts are passed in rather than widened in place, and they are
 /// merged LAST so a name declared both ways keeps its ESM meaning. The
-/// analyzer's import-table section and the framework-detect sample are built
-/// from exactly those facts and from nothing this adds: a require binding
-/// reaching them would move the prompt bytes of every CommonJS file, and
-/// every cached answer for one would stop replaying, for no gain.
+/// analyzer's import-table section is built from exactly those facts and from
+/// nothing this adds: a require binding reaching it would move the prompt
+/// bytes of every CommonJS file, and every cached answer for one would stop
+/// replaying, for no gain. The framework-detect sample reads requires on its
+/// own ([`crate::framework_detector::ImportSample`], carrick#1727).
 pub fn call_resolution_imports(
     module: &Module,
     esm: HashMap<String, ImportedSymbol>,

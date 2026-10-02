@@ -114,7 +114,7 @@ pub(crate) const CACHE_VERSION: u32 = 22;
 #[derive(Debug)]
 struct FileDiscovery {
     files: Vec<PathBuf>,
-    import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
+    import_facts: crate::framework_detector::ImportSample,
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
     /// What each function's calls send is composed from these over the call
@@ -3630,7 +3630,7 @@ impl SettledDetection {
 /// arrived.
 async fn model_setup(
     packages: &Packages,
-    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
+    import_facts: &crate::framework_detector::ImportSample,
     settled: Option<SettledDetection>,
 ) -> ModelSetup {
     crate::scan_stage::enter(crate::scan_stage::Stage::FrameworkDetect);
@@ -6441,7 +6441,7 @@ fn discover_files_and_symbols(
     // let walk order decide which module is in the framework-detect body at
     // all (carrick#954). The per-file maps below keep their local-name keying,
     // which is what call resolution needs.
-    let mut all_import_facts = BTreeSet::new();
+    let mut all_import_facts = crate::framework_detector::ImportSample::default();
     // Definitions stay per file until every file has been parsed: the merge is
     // collision-aware (#582) and can only tell a colliding key from a unique
     // one once it can see them all.
@@ -6466,12 +6466,11 @@ fn discover_files_and_symbols(
             let mut import_extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut import_extractor);
             let file_imports = import_extractor.imported_symbols;
-            all_import_facts.extend(file_imports.values().cloned());
+            all_import_facts.add_file(&module, &file_imports);
 
             // Call resolution reads the `require` bindings too (carrick#1348).
-            // Merged AFTER the sample above is taken: the framework-detect
-            // body and the analyzer's import table are the ESM facts and
-            // nothing else.
+            // Merged AFTER the sample above is taken: the analyzer's import
+            // table is the ESM facts and nothing else.
             let (call_imports, computed_requires) =
                 crate::call_graph::call_resolution_imports(&module, file_imports);
 
@@ -6572,7 +6571,7 @@ fn discover_files_and_symbols(
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",
-        all_import_facts.len(),
+        all_import_facts.fact_count(),
         all_function_definitions.len(),
         files.len()
     );
@@ -6679,7 +6678,7 @@ fn start_semantics_schedule(
     detection: &DetectionResult,
     schedule: bool,
     packages: &Packages,
-    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
+    import_facts: &crate::framework_detector::ImportSample,
     service_root: &Path,
     repo_root: &Path,
 ) -> SettlingSemantics {
@@ -7601,7 +7600,7 @@ fn enrich_manifest_with_type_resolution(
 struct Discovered {
     cm: Lrc<SourceMap>,
     files: Vec<PathBuf>,
-    import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
+    import_facts: crate::framework_detector::ImportSample,
     function_definitions: HashMap<String, FunctionDefinition>,
     repo_name: String,
     request_inputs: crate::request_summary::RequestSummaryInputs,
@@ -11901,6 +11900,34 @@ mod tests {
         assert!(
             err.to_string().contains("No JS/TS source files"),
             "expected empty-scan error, got: {err}"
+        );
+    }
+
+    /// A CommonJS service states every package it loads to framework
+    /// detection (carrick#1727), which classifies only the packages the
+    /// import list names. Every module here is loaded by `require` or
+    /// `import()`, none by an import declaration, so before the fix the list
+    /// was empty. The computed `require` names no module and adds nothing.
+    #[test]
+    fn discovery_samples_the_modules_a_commonjs_service_loads() {
+        let repo = format!(
+            "{}/tests/fixtures/commonjs-import-sample",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let cm: Lrc<SourceMap> = Default::default();
+        let sample = discover_files_and_symbols(&repo, &Config::default(), cm)
+            .unwrap()
+            .import_facts;
+        assert_eq!(
+            sample.statements(),
+            vec![
+                "import { publishOrder } from './publisher';",
+                "import 'dotenv';",
+                "import * as express from 'express';",
+                "import 'ioredis';",
+                "import { Kafka } from 'kafkajs';",
+                "import 'pino';",
+            ]
         );
     }
 
