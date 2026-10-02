@@ -369,6 +369,18 @@ impl SiteMaker {
             (MakerForm::New, Some(member)) => format!("instance:new:{member}"),
         }
     }
+
+    /// The literal the maker was handed at argument `arg`, or at its key
+    /// `key`: where a maker's `name`, `base` or `prefix` Slot reads
+    /// (contract amendment 2, B2), so `new Queue("emails")` names `emails`.
+    pub fn literal(&self, arg: usize, key: Option<&str>) -> Option<&str> {
+        arg_literal(&self.args, arg, key)
+    }
+
+    /// Whether the maker was handed argument `arg`, or its key `key`.
+    pub fn supplies(&self, arg: usize, key: Option<&str>) -> bool {
+        arg_supplied(&self.args, arg, key)
+    }
 }
 
 /// The receiver a site's call is made through.
@@ -394,12 +406,14 @@ pub enum On {
 }
 
 /// The receiver, member path and member an op claim names (the contract's
-/// `on`, `of`, `path` and `member`).
+/// `on`, `of`, `path` and `member`). `on` and `of` are exclusive (contract
+/// amendment 2, B3): an element carrying both, or neither, selects nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct Selector<'a> {
-    pub on: On,
-    /// The maker whose instances the op acts on, named by its member. `None`:
-    /// every instance.
+    /// The export, every instance of every maker, or both.
+    pub on: Option<On>,
+    /// The one receiver the op acts on, by its receiver id
+    /// ([`SiteMaker::receiver_id`], or `export`).
     pub of: Option<&'a str>,
     pub path: &'a [String],
     pub member: Option<&'a str>,
@@ -550,17 +564,23 @@ impl LibrarySite {
 
     /// Whether an op claim with `selector` acts on this site's call made
     /// through one of its receivers: the export (`through` is `None`), or the
-    /// instance of `through`, one of the site's makers (carrick#1689). An op
-    /// is a call, never a construction.
+    /// instance of `through`, one of the site's makers (carrick#1689). `of`
+    /// names exactly one receiver by its id, and `on` applies otherwise
+    /// (contract amendment 2, B3). An op is a call, never a construction.
     pub fn selected_by(&self, through: Option<&SiteMaker>, selector: &Selector<'_>) -> bool {
-        let receiver = match (&self.receiver, through, selector.on) {
-            (SiteReceiver::Export, None, On::Export | On::Both) => true,
-            (SiteReceiver::Instance(makers), Some(maker), On::Instance | On::Both) => {
-                makers.contains(maker)
-                    && selector
-                        .of
-                        .is_none_or(|of| maker.member.as_deref() == Some(of))
+        let id = match (&self.receiver, through) {
+            (SiteReceiver::Export, None) => "export".to_string(),
+            (SiteReceiver::Instance(makers), Some(maker)) if makers.contains(maker) => {
+                maker.receiver_id()
             }
+            _ => return false,
+        };
+        let receiver = match (selector.on, selector.of) {
+            (None, Some(of)) => of == id,
+            (Some(on), None) => matches!(
+                (through, on),
+                (None, On::Export | On::Both) | (Some(_), On::Instance | On::Both)
+            ),
             _ => false,
         };
         receiver
@@ -2774,7 +2794,7 @@ mod tests {
         assert!(trigger.selected_by(
             None,
             &Selector {
-                on: On::Export,
+                on: Some(On::Export),
                 of: None,
                 path: &path,
                 member: Some("trigger"),
@@ -2783,7 +2803,7 @@ mod tests {
         assert!(!trigger.selected_by(
             None,
             &Selector {
-                on: On::Export,
+                on: Some(On::Export),
                 of: None,
                 path: &[],
                 member: Some("trigger"),
@@ -2791,8 +2811,9 @@ mod tests {
         ));
     }
 
-    /// `on` picks the export or its instances, and `of` the instances of one
-    /// maker, named by its member.
+    /// `on` picks the export or its instances, and `of` exactly one receiver
+    /// by its receiver id; an element carrying both, or neither, picks
+    /// nothing (contract amendment 2, B3).
     #[test]
     fn selectors_pick_the_instances_of_the_maker_they_name() {
         let sites = sites_of(&[(
@@ -2806,9 +2827,15 @@ mod tests {
              \x20 await jobs.trigger(\"nightly\", {});\n\
              }\n",
         )]);
-        let select = |on: On, of: Option<&'static str>, member: &'static str| Selector {
-            on,
-            of,
+        let on = |on: On, member: &'static str| Selector {
+            on: Some(on),
+            of: None,
+            path: &[],
+            member: Some(member),
+        };
+        let of = |of: &'static str, member: &'static str| Selector {
+            on: None,
+            of: Some(of),
             path: &[],
             member: Some(member),
         };
@@ -2816,32 +2843,77 @@ mod tests {
         let on_task = site(&sites, "src/jobs.ts", 5, Some("trigger"));
         assert_eq!(on_task.receiver_ids(), ["instance:task"]);
         let task = Some(maker(on_task));
-        assert!(on_task.selected_by(task, &select(On::Instance, Some("task"), "trigger")));
-        assert!(!on_task.selected_by(task, &select(On::Instance, Some("stream"), "trigger")));
-        assert!(on_task.selected_by(task, &select(On::Instance, None, "trigger")));
-        assert!(on_task.selected_by(task, &select(On::Both, None, "trigger")));
-        assert!(!on_task.selected_by(task, &select(On::Export, None, "trigger")));
+        assert!(on_task.selected_by(task, &of("instance:task", "trigger")));
+        assert!(!on_task.selected_by(task, &of("instance:stream", "trigger")));
         assert!(
-            !on_task.selected_by(None, &select(On::Both, None, "trigger")),
+            !on_task.selected_by(task, &of("task", "trigger")),
+            "`of` is a receiver id, not a maker's member"
+        );
+        assert!(on_task.selected_by(task, &on(On::Instance, "trigger")));
+        assert!(on_task.selected_by(task, &on(On::Both, "trigger")));
+        assert!(!on_task.selected_by(task, &on(On::Export, "trigger")));
+        assert!(
+            !on_task.selected_by(
+                task,
+                &Selector {
+                    on: Some(On::Instance),
+                    of: Some("instance:task"),
+                    path: &[],
+                    member: Some("trigger"),
+                }
+            ),
+            "`on` and `of` together select nothing"
+        );
+        assert!(
+            !on_task.selected_by(
+                task,
+                &Selector {
+                    on: None,
+                    of: None,
+                    path: &[],
+                    member: Some("trigger"),
+                }
+            ),
+            "neither selects nothing"
+        );
+        assert!(
+            !on_task.selected_by(None, &on(On::Both, "trigger")),
             "an instance site's call is not made through the export"
         );
 
         let on_stream = site(&sites, "src/jobs.ts", 6, Some("append"));
         assert_eq!(on_stream.receiver_ids(), ["instance:stream"]);
-        assert!(!on_stream.selected_by(
-            Some(maker(on_stream)),
-            &select(On::Instance, Some("task"), "append")
-        ));
+        assert!(!on_stream.selected_by(Some(maker(on_stream)), &of("instance:task", "append")));
         assert!(
-            !on_stream.selected_by(task, &select(On::Instance, None, "append")),
+            !on_stream.selected_by(task, &on(On::Instance, "append")),
             "a maker of another site is none of this one's"
         );
 
         let on_export = site(&sites, "src/jobs.ts", 7, Some("trigger"));
-        assert!(on_export.selected_by(None, &select(On::Export, None, "trigger")));
-        assert!(on_export.selected_by(None, &select(On::Both, Some("task"), "trigger")));
-        assert!(!on_export.selected_by(None, &select(On::Instance, None, "trigger")));
-        assert!(!on_export.selected_by(task, &select(On::Both, None, "trigger")));
+        assert!(on_export.selected_by(None, &on(On::Export, "trigger")));
+        assert!(on_export.selected_by(None, &on(On::Both, "trigger")));
+        assert!(!on_export.selected_by(None, &of("instance:task", "trigger")));
+        assert!(!on_export.selected_by(None, &on(On::Instance, "trigger")));
+        assert!(!on_export.selected_by(task, &on(On::Both, "trigger")));
+    }
+
+    /// A maker's Slots read what the maker was handed (contract amendment 2,
+    /// B2): a positional name, and a key of an options object.
+    #[test]
+    fn a_maker_slot_reads_what_the_maker_was_handed() {
+        let sites = sites_of(&[(
+            "src/queues.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             const emails = new Queue(\"emails\", { prefix: \"app\" });\n\
+             export async function go() { await emails.add(\"welcome\", {}); }\n",
+        )]);
+        let add = site(&sites, "src/queues.ts", 3, Some("add"));
+        let made = maker(add);
+        assert_eq!(made.literal(0, None), Some("emails"));
+        assert_eq!(made.literal(1, Some("prefix")), Some("app"));
+        assert_eq!(made.literal(1, Some("name")), None);
+        assert!(made.supplies(1, Some("prefix")));
+        assert!(!made.supplies(2, None));
     }
 
     /// A subpath specifier is kept as the service imports it, and names the
@@ -4305,8 +4377,9 @@ mod tests {
     /// export site fold as they read.
     #[test]
     fn a_set_of_makers_states_a_fact_only_when_every_maker_reads_the_same() {
+        // `of` names one receiver; without it the op is on every instance.
         let on = |of: Option<&'static str>, member: &'static str| Selector {
-            on: On::Instance,
+            on: of.is_none().then_some(On::Instance),
             of,
             path: &[],
             member: Some(member),
@@ -4325,7 +4398,11 @@ mod tests {
         );
         let one_maker = Verified {
             makers: &both,
-            ops: vec![(on(Some("Cluster"), "add"), "add", NameAt::Arg(0))],
+            ops: vec![(
+                on(Some("instance:new:Cluster"), "add"),
+                "add",
+                NameAt::Arg(0),
+            )],
         };
         assert_eq!(fact(add, &one_maker), None, "the op claimed on one maker");
         let unverified = Verified {
@@ -4364,7 +4441,7 @@ mod tests {
             makers: &[],
             ops: vec![(
                 Selector {
-                    on: On::Export,
+                    on: Some(On::Export),
                     of: None,
                     path: &[],
                     member: Some("add"),
