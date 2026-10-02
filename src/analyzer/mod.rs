@@ -312,16 +312,55 @@ pub struct ApiEndpointDetails {
     pub handler_span: Option<crate::mount_graph::HandlerSpan>,
     /// On a pub/sub or socket row stated through verified library claims
     /// (`resolution_source: library_claim`, carrick#1662): where its name
-    /// means something. `global` pairs across services, `service` only
-    /// within its own; two namespaces never pair. The operation key keeps
-    /// the literal name. `None` on every other row and on every blob written
-    /// before the field (contract carrick#1564, section 4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name_scope: Option<crate::services::type_sidecar::NameScope>,
+    /// means something. `global` pairs across services, any other scope
+    /// only within its own service; two namespaces never pair
+    /// ([`carrick_match::names_pair`]). The operation key keeps the literal
+    /// name. `None` on every other row and on every blob written before the
+    /// field (contract carrick#1564, section 4). Read as leniently as the
+    /// cloud's `readNameScope` ([`read_name_scope`]): a peer row's
+    /// malformed scope never fails the blob it arrives in.
+    #[serde(
+        default,
+        deserialize_with = "read_name_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name_scope: Option<carrick_match::NameScope>,
     /// The claim ids such a row rests on, every maker of a set included
     /// (carrick#1662). Empty, and skipped on the wire, on every other row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library_semantics: Vec<String>,
+}
+
+/// `name_scope` off a row, read exactly as the cloud's `readNameScope`
+/// (carrick-cloud `lambdas/mcp-server/src/utils/name-scope.ts`) reads it: an
+/// object with a non-empty string `scope` is a scope, and its `namespace` is
+/// the string it holds or `None`; anything else states no scope. A scope
+/// this build has no word for is kept, and restricts like `service`
+/// ([`carrick_match::NameScope::crosses_services`]). Never an error, so one
+/// malformed row from a peer cannot fail the fetch it arrives in.
+fn read_name_scope<'de, D>(deserializer: D) -> Result<Option<carrick_match::NameScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Object(fields) = raw else {
+        return Ok(None);
+    };
+    let Some(scope) = fields
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .filter(|scope| !scope.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(carrick_match::NameScope {
+        scope: scope.to_string(),
+        namespace: fields
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }))
 }
 
 pub struct ApiAnalysisResult {
@@ -5450,7 +5489,7 @@ mod tests {
     #[test]
     fn a_library_claim_row_carries_its_scope_and_claims_and_an_older_row_neither() {
         use crate::agents::file_analyzer_agent::ResolutionSource;
-        use crate::services::type_sidecar::{NameScope, NameScopeKind};
+        use carrick_match::NameScope;
         let older: ApiEndpointDetails = serde_json::from_value(serde_json::json!({
             "owner": null,
             "key": { "protocol": "pubsub", "topic": "send-email" },
@@ -5473,7 +5512,7 @@ mod tests {
         let stated = ApiEndpointDetails {
             resolution_source: Some(ResolutionSource::LibraryClaim),
             name_scope: Some(NameScope {
-                scope: NameScopeKind::Service,
+                scope: "service".to_string(),
                 namespace: Some("task".to_string()),
             }),
             library_semantics: vec!["@fixture/jobs@3:task:make:call:()".to_string()],
@@ -5495,7 +5534,7 @@ mod tests {
         );
         let global = ApiEndpointDetails {
             name_scope: Some(NameScope {
-                scope: NameScopeKind::Global,
+                scope: "global".to_string(),
                 namespace: None,
             }),
             ..stated.clone()
@@ -5509,6 +5548,61 @@ mod tests {
         assert_eq!(back.name_scope, stated.name_scope);
         assert_eq!(back.library_semantics, stated.library_semantics);
         assert!(!ResolutionSource::LibraryClaim.is_candidate());
+    }
+
+    /// `name_scope` is read as the cloud's `readNameScope` reads it
+    /// (carrick#1662, carrick#1663): a scope this build has no word for is
+    /// kept, and anything malformed states no scope, so a peer blob holding
+    /// one malformed row still reads whole.
+    #[test]
+    fn a_peer_row_s_malformed_name_scope_reads_as_none_and_never_fails_the_blob() {
+        let row = |name_scope: serde_json::Value| {
+            serde_json::json!({
+                "owner": null,
+                "key": { "protocol": "pubsub", "topic": "orders.created" },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": "src/orders.ts:3",
+                "provenance": "route",
+                "resolution_source": "library_claim",
+                "name_scope": name_scope
+            })
+        };
+        let rows: Vec<ApiEndpointDetails> = serde_json::from_value(serde_json::json!([
+            row(serde_json::json!({ "scope": "global", "namespace": null })),
+            row(serde_json::json!({ "scope": "tenant", "namespace": "task" })),
+            row(serde_json::json!({ "scope": 3 })),
+            row(serde_json::json!({ "scope": "" })),
+            row(serde_json::json!("global")),
+            row(serde_json::json!(null)),
+            row(serde_json::json!({ "scope": "service", "namespace": 7 })),
+        ]))
+        .expect("one malformed row never fails the blob");
+        let read: Vec<Option<carrick_match::NameScope>> =
+            rows.into_iter().map(|row| row.name_scope).collect();
+        let scope = |scope: &str, namespace: Option<&str>| {
+            Some(carrick_match::NameScope {
+                scope: scope.to_string(),
+                namespace: namespace.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            read,
+            vec![
+                scope("global", None),
+                scope("tenant", Some("task")),
+                None,
+                None,
+                None,
+                None,
+                scope("service", None),
+            ]
+        );
+        assert!(!read[1].as_ref().expect("kept").crosses_services());
     }
 
     /// A non-HTTP verdict names one producer service and one consumer

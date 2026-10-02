@@ -4206,7 +4206,7 @@ fn append_library_operations(
             resolution_source: Some(
                 crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim,
             ),
-            name_scope: Some(row.name_scope.clone()),
+            name_scope: Some(row.wire_scope()),
             library_semantics: row.claim_ids.clone(),
             ..details
         };

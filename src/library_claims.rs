@@ -431,6 +431,22 @@ pub struct LibraryRow {
     pub definition: bool,
 }
 
+impl LibraryRow {
+    /// The row's `name_scope` as the index writes it (carrick#1663's
+    /// [`carrick_match::NameScope`]): the claim's scope spelled `global` or
+    /// `service`, and its namespace.
+    pub fn wire_scope(&self) -> carrick_match::NameScope {
+        carrick_match::NameScope {
+            scope: match self.name_scope.scope {
+                NameScopeKind::Global => carrick_match::GLOBAL_SCOPE,
+                NameScopeKind::Service => carrick_match::SERVICE_SCOPE,
+            }
+            .to_string(),
+            namespace: self.name_scope.namespace.clone(),
+        }
+    }
+}
+
 /// Every row a service's library sites state through verified claims.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibraryRows {
@@ -1348,6 +1364,35 @@ mod tests {
             .expect("an op"),
         );
         assert!(rows_of(&sites, &[both], all).is_empty());
+    }
+
+    /// A row's scope is written as the index reads it (carrick#1663's
+    /// `NameScope`): `global` or `service`, with its namespace.
+    #[test]
+    fn a_row_s_scope_is_written_as_the_index_reads_it() {
+        let sites = sites_of(&[("src/orders.ts", BUS_SERVICE)]);
+        let rows = rows_of(&sites, &[bus()], all);
+        assert_eq!(
+            rows[0].wire_scope(),
+            carrick_match::NameScope {
+                scope: "global".to_string(),
+                namespace: None
+            }
+        );
+        let service = LibraryRow {
+            name_scope: NameScope {
+                scope: NameScopeKind::Service,
+                namespace: Some("task".to_string()),
+            },
+            ..rows[0].clone()
+        };
+        assert_eq!(
+            service.wire_scope(),
+            carrick_match::NameScope {
+                scope: "service".to_string(),
+                namespace: Some("task".to_string())
+            }
+        );
     }
 
     /// Only the message roles state rows here: an HTTP client's export, even
