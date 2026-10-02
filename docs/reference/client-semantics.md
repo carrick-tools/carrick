@@ -308,9 +308,10 @@ an HTTP row.
   the scan asks the library store (`POST /library-claims`) about each
   registry package a library site is made through, at its installed
   version, and each runtime module (`node:events`, at the runtime types
-  package's version). A package goes only when its lockfile and registry
-  configuration show it came from the public npm registry; an in-repo
-  package never goes. A package the store has not finished is asked once
+  package's version). A package goes only when its lockfile (npm, pnpm,
+  Yarn or Deno, carrick#1720) and registry configuration show it came from
+  the public npm registry; an in-repo package, a JSR package and a URL
+  import never go. A package the store has not finished is asked once
   more after the analysis, and again next scan. A failure, a refusal or a
   throttle gives no claims, and the scan carries on. A run with no model,
   or no sidecar, asks nothing.

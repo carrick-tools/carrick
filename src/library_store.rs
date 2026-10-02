@@ -67,11 +67,12 @@ const PUBLIC_REGISTRIES: [&str; 2] = ["registry.npmjs.org", "registry.yarnpkg.co
 const RUNTIME_TYPES: &str = "@types/node";
 
 /// The lockfiles an install writes.
-const LOCKFILES: [&str; 4] = [
+const LOCKFILES: [&str; 5] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
     "yarn.lock",
+    "deno.lock",
 ];
 
 /// A request to the store (contract section 2). `workspace_packages` is
@@ -107,6 +108,9 @@ pub struct Install<'a> {
     pub home: Option<&'a Path>,
     /// `YARN_NPM_REGISTRY_SERVER`, which outranks every `.yarnrc.yml`.
     pub yarn_registry_env: Option<&'a str>,
+    /// `NPM_CONFIG_REGISTRY`, the default registry Deno installs from when
+    /// it is set.
+    pub npm_registry_env: Option<&'a str>,
 }
 
 /// What a service asks, and how to read the answer back onto its imports.
@@ -355,6 +359,7 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
         npm_lock(name, package, &lock_dir, NpmLock::Committed),
         pnpm_lock(name, package, &lock_dir),
         yarn_lock(name, package, &lock_dir, install),
+        deno_lock(name, package, &lock_dir, install),
     ]
     .into_iter()
     .flatten()
@@ -632,6 +637,105 @@ fn yarn_berry(
         .all(|registry| is_public_url(&registry))
 }
 
+/// Deno's answer from `deno.lock`, or `None` when it is absent
+/// (carrick#1720). The lockfile's npm section must list the installed
+/// version with its integrity, and the lockfile must take the name from
+/// nowhere else: not from JSR, where a bare import of it may resolve
+/// instead, and not from a local folder the workspace links in its place.
+///
+/// A Deno lockfile records no host for a package fetched from the default
+/// registry. Format 5 records a `tarball` for any other host, which must
+/// then be public; formats 2 to 4 record none, so the registry is read where
+/// Deno reads it: every `.npmrc` ([`from_public_registry`]) and
+/// `NPM_CONFIG_REGISTRY`, which must be public when set. The formats are
+/// read as Deno's own `deno_lockfile` crate (0.61.0) states them: format 1
+/// holds no npm package, and a format this scanner does not know sends
+/// nothing.
+fn deno_lock(
+    name: &str,
+    package: &Installed,
+    lock_dir: &Path,
+    install: &Install<'_>,
+) -> Option<bool> {
+    let path = lock_dir.join("deno.lock");
+    if !path.is_file() {
+        return None;
+    }
+    if !install.npm_registry_env.is_none_or(is_public_url) {
+        return Some(false);
+    }
+    let Some(lock) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Some(false);
+    };
+    let (npm, jsr) = match lock.get("version").and_then(Value::as_str) {
+        Some("2") => (lock.pointer("/npm/packages"), None),
+        Some("3") => (lock.pointer("/packages/npm"), lock.pointer("/packages/jsr")),
+        Some("4" | "5") => (lock.get("npm"), lock.get("jsr")),
+        version => {
+            debug!(
+                ?version,
+                path = %path.display(),
+                "library store: a deno.lock format this scanner does not read; nothing sent from it"
+            );
+            return Some(false);
+        }
+    };
+    // A link is keyed with its protocol: `npm:name@1.2.3`.
+    let linked = ["/workspace/links", "/workspace/patches"]
+        .into_iter()
+        .filter_map(|pointer| lock.pointer(pointer).and_then(Value::as_object))
+        .flat_map(|links| links.keys())
+        .map(|key| key.split_once(':').map_or(key.as_str(), |(_, rest)| rest));
+    let elsewhere = jsr
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|jsr| jsr.keys().map(String::as_str))
+        .chain(linked)
+        .any(|key| deno_lock_name(key) == name);
+    if elsewhere {
+        return Some(false);
+    }
+    let entries: Vec<&Value> = npm
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| deno_lock_key(key) == Some((name, package.version.as_str())))
+        .map(|(_, entry)| entry)
+        .collect();
+    Some(
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                entry
+                    .get("integrity")
+                    .and_then(Value::as_str)
+                    .is_some_and(|integrity| !integrity.is_empty())
+                    && entry
+                        .get("tarball")
+                        .is_none_or(|tarball| tarball.as_str().is_some_and(is_public_url))
+            }),
+    )
+}
+
+/// The package name a `deno.lock` package key names: `@scope/name` of
+/// `@scope/name@1.2.3`.
+fn deno_lock_name(key: &str) -> &str {
+    key.get(1..)
+        .and_then(|rest| rest.find('@'))
+        .map_or(key, |at| &key[..at + 1])
+}
+
+/// The name and version a `deno.lock` package key names: `name@1.2.3`, or
+/// with the peer dependencies it resolved against after an `_`
+/// (`name@1.2.3_peer@2.0.0`). A version holds no `_`; a name may.
+fn deno_lock_key(key: &str) -> Option<(&str, &str)> {
+    let name = deno_lock_name(key);
+    let version = key.get(name.len() + 1..)?.split('_').next()?;
+    Some((name, version))
+}
+
 /// What the store answered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibraryAnswer {
@@ -877,6 +981,7 @@ mod tests {
             repo_root: root,
             home: None,
             yarn_registry_env: None,
+            npm_registry_env: None,
         }
     }
 
@@ -1081,6 +1186,7 @@ mod tests {
             repo_root: dir.path(),
             home: None,
             yarn_registry_env: None,
+            npm_registry_env: None,
         };
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install)),
@@ -1258,6 +1364,265 @@ mod tests {
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install_at(dir.path()))),
             vec![]
+        );
+    }
+
+    /// The Deno lockfiles of `tests/fixtures/deno-lock` (carrick#1720): each
+    /// lists `chalk` 5.3.0 from npm, and from format 3 `@std/path` from JSR.
+    const DENO_V2: &str = include_str!("../tests/fixtures/deno-lock/v2.lock");
+    const DENO_V3: &str = include_str!("../tests/fixtures/deno-lock/v3.lock");
+    const DENO_V4: &str = include_str!("../tests/fixtures/deno-lock/v4.lock");
+    const DENO_V5: &str = include_str!("../tests/fixtures/deno-lock/v5.lock");
+    const DENO_V5_OTHER_REGISTRY: &str =
+        include_str!("../tests/fixtures/deno-lock/v5-other-registry.lock");
+
+    /// A Deno install in `root`: `chalk` at `version`, and `lock` as its
+    /// `deno.lock`.
+    fn deno_install(root: &Path, version: &str, lock: &str) {
+        install_package(root, "chalk", version);
+        write(&root.join("deno.lock"), lock);
+    }
+
+    /// What a service importing `imports` asks, with `chalk` 5.3.0 installed
+    /// by Deno and `lock` as its `deno.lock`.
+    fn deno_asked(lock: &str, imports: &[&str]) -> Vec<(String, String, Vec<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        deno_install(dir.path(), "5.3.0", lock);
+        asked(request(&specifiers(imports), &install_at(dir.path())))
+    }
+
+    /// `lock` with `entry` added to its npm section under `key`.
+    fn with_npm_entry(lock: &str, pointer: &str, key: &str, entry: Value) -> String {
+        let mut lock: Value = serde_json::from_str(lock).unwrap();
+        lock.pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(key.to_string(), entry);
+        lock.to_string()
+    }
+
+    #[test]
+    fn a_deno_install_sends_its_public_npm_packages_in_every_lockfile_format() {
+        for (format, lock) in [
+            ("2", DENO_V2),
+            ("3", DENO_V3),
+            ("4", DENO_V4),
+            ("5", DENO_V5),
+        ] {
+            assert_eq!(
+                deno_asked(lock, &["chalk"]),
+                one("chalk", "5.3.0", &["chalk"]),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deno_lockfile_this_scanner_cannot_read_sends_nothing() {
+        // Format 1 has no version field and records remote modules only.
+        let format_1 = r#"{"https://deno.land/std@0.71.0/textproto/mod.ts":"3118d7a42c03c242c5a49c2ad91c8396110e14acca1324e7aaefd31a999b71a4"}"#;
+        // A format after 5, laid out as 5 is.
+        let format_6 = DENO_V5.replace(r#""version": "5""#, r#""version": "6""#);
+        assert_ne!(format_6, DENO_V5);
+        for (case, lock) in [
+            ("format 1", format_1),
+            ("format 6", format_6.as_str()),
+            ("not JSON", "{\"version\": \"5\","),
+        ] {
+            assert_eq!(deno_asked(lock, &["chalk"]), vec![], "{case}");
+        }
+    }
+
+    #[test]
+    fn a_deno_package_fetched_from_another_registry_is_not_sent() {
+        // Format 5 records the other host as the package's tarball.
+        assert_eq!(deno_asked(DENO_V5_OTHER_REGISTRY, &["chalk"]), vec![]);
+        let public_tarball = with_npm_entry(
+            DENO_V5,
+            "/npm",
+            "chalk@5.3.0",
+            serde_json::json!({
+                "integrity": "sha512-x",
+                "tarball": "https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz",
+            }),
+        );
+        assert_eq!(
+            deno_asked(&public_tarball, &["chalk"]),
+            one("chalk", "5.3.0", &["chalk"])
+        );
+        // Formats 2 to 4 record no host: the registry Deno was set to is read.
+        let dir = tempfile::tempdir().unwrap();
+        deno_install(dir.path(), "5.3.0", DENO_V4);
+        let with_env = |registry| Install {
+            npm_registry_env: Some(registry),
+            ..install_at(dir.path())
+        };
+        assert_eq!(
+            asked(request(
+                &specifiers(&["chalk"]),
+                &with_env("https://npm.internal.example/")
+            )),
+            vec![]
+        );
+        assert_eq!(
+            asked(request(
+                &specifiers(&["chalk"]),
+                &with_env("https://registry.npmjs.org/")
+            )),
+            one("chalk", "5.3.0", &["chalk"])
+        );
+        write(
+            &dir.path().join(".npmrc"),
+            "registry=https://npm.internal.example/\n",
+        );
+        assert_eq!(
+            asked(request(&specifiers(&["chalk"]), &install_at(dir.path()))),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_deno_entry_without_its_integrity_or_at_another_version_is_not_sent() {
+        for entry in [serde_json::json!({}), serde_json::json!({"integrity": ""})] {
+            let lock = with_npm_entry(DENO_V5, "/npm", "chalk@5.3.0", entry.clone());
+            assert_eq!(deno_asked(&lock, &["chalk"]), vec![], "{entry}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        deno_install(dir.path(), "5.3.1", DENO_V5);
+        assert_eq!(
+            asked(request(&specifiers(&["chalk"]), &install_at(dir.path()))),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_deno_key_is_read_past_its_peer_suffix_and_through_an_underscored_name() {
+        assert_eq!(
+            deno_lock_key("string_decoder@1.3.0"),
+            Some(("string_decoder", "1.3.0"))
+        );
+        assert_eq!(
+            deno_lock_key("@babel/plugin-syntax-jsx@7.28.6_@babel+core@7.29.0"),
+            Some(("@babel/plugin-syntax-jsx", "7.28.6"))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "@acme/plugin", "1.0.0");
+        let lock = with_npm_entry(
+            DENO_V5,
+            "/npm",
+            "@acme/plugin@1.0.0_@acme+core@2.0.0",
+            serde_json::json!({"integrity": "sha512-x"}),
+        );
+        write(&dir.path().join("deno.lock"), &lock);
+        let sent = || {
+            asked(request(
+                &specifiers(&["@acme/plugin"]),
+                &install_at(dir.path()),
+            ))
+        };
+        assert_eq!(sent(), one("@acme/plugin", "1.0.0", &["@acme/plugin"]));
+        // Every entry of the installed version must be public.
+        write(
+            &dir.path().join("deno.lock"),
+            &with_npm_entry(
+                &lock,
+                "/npm",
+                "@acme/plugin@1.0.0_@acme+core@3.0.0",
+                serde_json::json!({
+                    "integrity": "sha512-x",
+                    "tarball": "https://npm.internal.example/@acme/plugin/-/plugin-1.0.0.tgz",
+                }),
+            ),
+        );
+        assert_eq!(sent(), vec![]);
+    }
+
+    #[test]
+    fn a_deno_name_the_lockfile_also_takes_from_jsr_or_a_linked_folder_is_not_sent() {
+        // `@std/path` also in the npm section: a bare import of it may still
+        // resolve to JSR.
+        for (format, lock, npm, jsr_parent) in [
+            ("3", DENO_V3, "/packages/npm", "/packages"),
+            ("5", DENO_V5, "/npm", ""),
+        ] {
+            let lock = with_npm_entry(
+                lock,
+                npm,
+                "@std/path@1.1.6",
+                serde_json::json!({"integrity": "sha512-x"}),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            install_package(dir.path(), "@std/path", "1.1.6");
+            write(&dir.path().join("deno.lock"), &lock);
+            assert_eq!(
+                asked(request(
+                    &specifiers(&["@std/path"]),
+                    &install_at(dir.path())
+                )),
+                vec![],
+                "format {format}"
+            );
+            // The npm entry alone would be sent.
+            let mut without_jsr: Value = serde_json::from_str(&lock).unwrap();
+            without_jsr
+                .pointer_mut(jsr_parent)
+                .and_then(Value::as_object_mut)
+                .and_then(|parent| parent.remove("jsr"))
+                .unwrap();
+            write(&dir.path().join("deno.lock"), &without_jsr.to_string());
+            assert_eq!(
+                asked(request(
+                    &specifiers(&["@std/path"]),
+                    &install_at(dir.path())
+                )),
+                one("@std/path", "1.1.6", &["@std/path"]),
+                "format {format} without JSR"
+            );
+        }
+        // A link, under either name the workspace section has used.
+        for links in ["links", "patches"] {
+            let mut lock: Value = serde_json::from_str(DENO_V5).unwrap();
+            lock["workspace"][links] = serde_json::json!({"npm:chalk@5.3.0": {}});
+            assert_eq!(deno_asked(&lock.to_string(), &["chalk"]), vec![], "{links}");
+        }
+    }
+
+    #[test]
+    fn a_jsr_or_url_import_is_never_sent() {
+        assert_eq!(
+            deno_asked(
+                DENO_V5,
+                &[
+                    "jsr:@std/path@1",
+                    "@std/path",
+                    "https://deno.land/x/lib/mod.ts",
+                    "chalk"
+                ]
+            ),
+            one("chalk", "5.3.0", &["chalk"])
+        );
+    }
+
+    /// Deno installs each package under `node_modules/.deno` and links the
+    /// ones the service imports into `node_modules`.
+    #[cfg(unix)]
+    #[test]
+    fn a_deno_node_modules_is_read_through_its_links() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path()
+                .join("node_modules/.deno/chalk@5.3.0/node_modules/chalk/package.json"),
+            r#"{"name":"chalk","version":"5.3.0"}"#,
+        );
+        std::os::unix::fs::symlink(
+            ".deno/chalk@5.3.0/node_modules/chalk",
+            dir.path().join("node_modules/chalk"),
+        )
+        .unwrap();
+        write(&dir.path().join("deno.lock"), DENO_V5);
+        assert_eq!(
+            asked(request(&specifiers(&["chalk"]), &install_at(dir.path()))),
+            one("chalk", "5.3.0", &["chalk"])
         );
     }
 

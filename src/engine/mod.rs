@@ -3828,6 +3828,7 @@ impl LibraryAsk {
         let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
         let home = dirs::home_dir();
         let yarn_registry_env = std::env::var("YARN_NPM_REGISTRY_SERVER").ok();
+        let npm_registry_env = std::env::var("NPM_CONFIG_REGISTRY").ok();
         let asked = crate::library_store::request(
             &specifiers,
             &crate::library_store::Install {
@@ -3835,6 +3836,7 @@ impl LibraryAsk {
                 repo_root,
                 home: home.as_deref(),
                 yarn_registry_env: yarn_registry_env.as_deref(),
+                npm_registry_env: npm_registry_env.as_deref(),
             },
         )?;
         Some(Self { sites, asked })

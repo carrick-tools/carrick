@@ -122,6 +122,25 @@ fn run_git(dir: &Path, args: &[&str]) {
 fn fixture_copy(tmp: &Path) -> (PathBuf, PathBuf) {
     let repo = tmp.join("relay");
     copy_dir(&fixture_root(), &repo);
+    commit_fixture(repo)
+}
+
+/// The same fixture as Deno installs it (carrick#1720): its `package-lock.json`
+/// replaced by `tests/fixtures/library-store-deno/deno.lock`.
+fn deno_fixture_copy(tmp: &Path) -> (PathBuf, PathBuf) {
+    let repo = tmp.join("relay");
+    copy_dir(&fixture_root(), &repo);
+    std::fs::remove_file(repo.join("package-lock.json")).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/library-store-deno/deno.lock"),
+        repo.join("deno.lock"),
+    )
+    .unwrap();
+    commit_fixture(repo)
+}
+
+fn commit_fixture(repo: PathBuf) -> (PathBuf, PathBuf) {
     std::fs::remove_file(repo.join("README.md")).ok();
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A", "-f"]);
@@ -141,6 +160,7 @@ fn mock_env(cassette: &Path) {
         std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         std::env::remove_var("CARRICK_NO_MODEL");
         std::env::remove_var("YARN_NPM_REGISTRY_SERVER");
+        std::env::remove_var("NPM_CONFIG_REGISTRY");
         std::env::remove_var("GITHUB_EVENT_NAME");
         std::env::remove_var("GITHUB_REF");
         std::env::remove_var("CARRICK_OUTPUT_JSON");
@@ -347,6 +367,44 @@ async fn the_store_s_claims_state_library_rows_and_fold_the_socket_pass_rows() {
     let (without, typing) = typed_emit_without_claims(&repo, &sidecar).await;
     assert!(bundled(&without).contains(&typing), "{}", bundled(&without));
     assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
+}
+
+/// A Deno install proves the same packages public (carrick#1720): its
+/// `deno.lock` lists each at its installed version with its integrity, and
+/// the scan asks about them and states the same rows. The package Deno took
+/// from another host is never sent: a request naming it fails here.
+#[tokio::test]
+#[serial]
+async fn a_deno_install_asks_the_store_about_its_public_packages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = deno_fixture_copy(tmp.path());
+    mock_env(&cassette);
+    carrick::agent_service::inject_mock_failure(ROUTE, "fixture-private-bus", 1);
+    let sidecar = real_sidecar(&repo);
+    let before = store_requests();
+    let data = scan(&repo, Some(&sidecar)).await;
+    assert_eq!(store_requests() - before, 1, "one ask, nothing pending");
+    assert_eq!(message_rows(&data, &repo), rows_with_claims());
+}
+
+/// With `NPM_CONFIG_REGISTRY` naming another host, the Deno install proves
+/// no package public: the store is asked nothing, and the rows are those of
+/// no claims.
+#[tokio::test]
+#[serial]
+async fn a_deno_install_set_to_another_registry_asks_the_store_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = deno_fixture_copy(tmp.path());
+    mock_env(&cassette);
+    // SAFETY: every test in this binary is `#[serial]`; `mock_env` removes it.
+    unsafe { std::env::set_var("NPM_CONFIG_REGISTRY", "https://npm.internal.example/") };
+    let sidecar = real_sidecar(&repo);
+    let before = store_requests();
+    let data = scan(&repo, Some(&sidecar)).await;
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("NPM_CONFIG_REGISTRY") };
+    assert_eq!(store_requests() - before, 0, "nothing qualifies");
+    assert_eq!(message_rows(&data, &repo), rows_without_claims());
 }
 
 /// A scan of `repo` with no claims, and the alias the socket pass's typed
