@@ -278,11 +278,37 @@ an HTTP row.
   an optional chain, and no module reaches its module through a namespace
   import or another load. A module the scan cannot follow turns every
   imported name off.
-- **Not read yet.** A factory that builds one of two makers' instances by a
-  flag (carrick#1689), a client handed in as a parameter or a constructor
-  argument (carrick#1693), and a builder that picks its return by a
-  parameter (carrick#1694). A call the call graph resolves to a function of
-  the service (an in-repo package) is that function's (carrick#1666).
+- **Rows** (carrick#1662, `src/library_claims.rs`). A site states a row
+  only through claims that verified on every receiver it may be made
+  through, and only when nothing contests the receiver. Calls are
+  classified by the export's own lists (contract amendment 2, B1): a
+  claimed maker, op or scope member is on the wire, an `off_wire` call
+  contests nothing, and a `mutator`, or a member no list names, contests.
+  - `broker` and `in_process_bus`: a `send` is a publisher row, a `receive`
+    a subscriber row, and a broker definition (the export's maker called
+    with a name and a handler) a subscriber row.
+  - `socket`: the export's `side` and the op give the direction, and a
+    `receive` is the listener. An export that serves both sides, or says
+    nothing, states nothing.
+  - Every other role, HTTP included, states nothing here.
+
+  Each row is a `library_claim` fact with `library_semantics` (its claim
+  ids, `<specifier>@<major>:<export>:<kind>:…`) and `name_scope`. An
+  in-process row is always `service`-scoped, and a listener nothing in the
+  service sends to on the same receiver states nothing. A name that is no
+  literal, holds one of the library's wildcard characters, is a name the
+  library emits itself, or sits beside a missing part the claim positions
+  states nothing, and so does a row in a mock or test tree. A model pub/sub
+  row at the same file, line, topic and role folds into the library row,
+  and so does an event-bus row at the same site; a model route at exactly a
+  verified definition's span is withdrawn. Until the scan asks the library
+  store (carrick#1664), no service has claims and nothing is read.
+- **Not read yet.** A client handed in as a parameter or a constructor
+  argument (carrick#1693), a builder that picks its return by a parameter
+  (carrick#1694), a set of makers of two exports (carrick#1704), and a
+  conditional of two makers' instances in a return (carrick#1705). A call
+  the call graph resolves to a function of the service (an in-repo package)
+  is that function's (carrick#1666).
 
 ## Asking again
 
