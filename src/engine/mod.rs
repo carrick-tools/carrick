@@ -4300,18 +4300,27 @@ impl LibrarySiteIndex {
             .contains(&(self.relative(file), line, name.to_string(), role))
     }
 
-    /// Whether a socket row, listening or not, on `key` was stated here.
+    /// Whether a library socket row on the same side (listening or not) was
+    /// stated here for `key`'s event: in `key`'s direction, or, when the pass
+    /// could not read one (`Unknown`), in either (ruled on carrick#1664: the
+    /// library row's direction wins).
     fn states_socket(&self, file: &Path, line: u32, key: &OperationKey, listener: bool) -> bool {
+        use crate::operation::SocketDirection;
         let OperationKey::Socket { event, direction } = key else {
             return false;
         };
-        self.socket.contains(&(
-            self.relative(file),
-            line,
-            event.clone(),
-            *direction,
-            listener,
-        ))
+        let directions: &[SocketDirection] = match direction {
+            SocketDirection::Unknown => &[
+                SocketDirection::ClientToServer,
+                SocketDirection::ServerToClient,
+            ],
+            known => std::slice::from_ref(known),
+        };
+        let file = self.relative(file);
+        directions.iter().any(|direction| {
+            self.socket
+                .contains(&(file.clone(), line, event.clone(), *direction, listener))
+        })
     }
 
     fn states_name(&self, file: &Path, line: u32, name: &str) -> bool {
@@ -16109,10 +16118,12 @@ mod tests {
 
     /// Ruled on carrick#1664: a socket pass row folds into the verified
     /// library socket row at the same file, line, name, direction and side,
-    /// as an event-bus row does. Any other socket row stands, and with no
-    /// library row the pass's row stands. The repo path is absolute and the
-    /// pass's files are too, as a full scan walks them; the library rows are
-    /// relative.
+    /// as an event-bus row does; a row whose direction the pass could not
+    /// read folds into one at the same file, line, name and side, whose
+    /// direction wins. Any other socket row stands, the opposite side at the
+    /// same site included, and with no library row the pass's row stands.
+    /// The repo path is absolute and the pass's files are too, as a full scan
+    /// walks them; the library rows are relative.
     #[test]
     fn a_socket_pass_row_folds_into_the_library_row_at_its_site_and_no_other() {
         use crate::agents::file_analyzer_agent::ResolutionSource;
@@ -16147,14 +16158,18 @@ mod tests {
                 listeners: vec![
                     socket_op_at(live, 4, "chat", ClientToServer),
                     socket_op_at(live, 4, "chat", Unknown),
+                    socket_op_at(live, 4, "chat", ServerToClient),
                     socket_op_at(live, 9, "chat", ClientToServer),
                     socket_op_at("/repo/svc/src/other.ts", 4, "chat", ClientToServer),
                     socket_op_at(live, 4, "chat-room", ClientToServer),
                     socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
                 ],
                 emitters: vec![
                     socket_op_at(live, 5, "typing", ServerToClient),
+                    socket_op_at(live, 5, "typing", Unknown),
                     socket_op_at(live, 4, "chat", ClientToServer),
+                    socket_op_at(live, 4, "chat", Unknown),
                 ],
             },
             ..ProtocolExtractions::default()
@@ -16187,6 +16202,7 @@ mod tests {
         let row = |key: &str, at: &str, source: Option<ResolutionSource>| {
             (key.to_string(), at.to_string(), source)
         };
+        let (live4, live5) = ("/repo/svc/src/live.ts:4", "/repo/svc/src/live.ts:5");
         assert_eq!(
             rows(&cloud_data.endpoints),
             vec![
@@ -16201,31 +16217,22 @@ mod tests {
                     None
                 ),
                 row("socket|CLIENT->SERVER|chat", "svc/src/live.ts:4", fact),
-                row(
-                    "socket|CLIENT->SERVER|chat-room",
-                    "/repo/svc/src/live.ts:4",
-                    None
-                ),
-                row(
-                    "socket|SERVER->CLIENT|typing",
-                    "/repo/svc/src/live.ts:5",
-                    None
-                ),
-                row("socket|UNKNOWN|chat", "/repo/svc/src/live.ts:4", None),
+                row("socket|CLIENT->SERVER|chat-room", live4, None),
+                row("socket|SERVER->CLIENT|chat", live4, None),
+                row("socket|SERVER->CLIENT|typing", live5, None),
+                row("socket|UNKNOWN|typing", live5, None),
             ],
-            "the listener at the library listener's site folds; every other listener stands"
+            "the listeners at the library listener's site in its direction or none fold; \
+             every other listener stands, those at the library emitter's site included"
         );
         assert_eq!(
             rows(&cloud_data.calls),
             vec![
-                row(
-                    "socket|CLIENT->SERVER|chat",
-                    "/repo/svc/src/live.ts:4",
-                    None
-                ),
+                row("socket|CLIENT->SERVER|chat", live4, None),
                 row("socket|SERVER->CLIENT|typing", "svc/src/live.ts:5", fact),
+                row("socket|UNKNOWN|chat", live4, None),
             ],
-            "the emitter at the library emitter's site folds; the emitter at a listener's site stands"
+            "the emitters at the library emitter's site fold; those at a listener's site stand"
         );
     }
 
