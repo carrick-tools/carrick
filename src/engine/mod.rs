@@ -12512,9 +12512,11 @@ mod tests {
     /// back its parsed body unchanged is worth that body, so a row stated
     /// there is not marked: a generic transport helper (`send<T>`), the body
     /// held in a local first, the response parsed where it is awaited, an
-    /// arrow, and a function that returns such a helper's call. A helper that
-    /// hands back the raw response, returns early with something else, or
-    /// makes two requests is marked.
+    /// arrow, and a function that returns such a helper's call (`viaSend`). A
+    /// helper that hands back the raw response, returns early with something
+    /// else, makes two requests, returns a call of a helper that hands back
+    /// the raw response (`viaRaw`), or parses a response its request did not
+    /// answer with (`stored`) is marked.
     #[test]
     fn a_helper_that_hands_back_its_parsed_body_leaves_its_caller_unmarked() {
         let (dir, discovery) = discover_sources(&[
@@ -12546,11 +12548,22 @@ mod tests {
                  \x20 await fetch(`${url}/audit`, { method: \"POST\" });\n\
                  \x20 const res = await fetch(url, { method: \"GET\" });\n\
                  \x20 return res.json();\n\
+                 }\n\
+                 export async function viaSend(url: string) {\n\
+                 \x20 return send<{ id: string }>(url, { method: \"GET\" });\n\
+                 }\n\
+                 export async function viaRaw(url: string) {\n\
+                 \x20 return raw(url);\n\
+                 }\n\
+                 declare const cache: { read(key: string): Promise<Response> };\n\
+                 export async function stored(url: string) {\n\
+                 \x20 await fetch(url, { method: \"GET\" });\n\
+                 \x20 return (await cache.read(url)).json();\n\
                  }\n",
             ),
             (
                 "src/client.ts",
-                "import { send, held, inline, arrow, raw, early, twice } from \"./send\";\n\
+                "import { send, held, inline, arrow, raw, early, twice, viaSend, viaRaw, stored } from \"./send\";\n\
                  const BASE = process.env.API_BASE;\n\
                  export function readWidget(id: string) {\n\
                  \x20 return send<{ id: string }>(`${BASE}/widgets/${id}`, { method: \"GET\" });\n\
@@ -12562,6 +12575,9 @@ mod tests {
                  \x20 raw(`${BASE}/raw`);\n\
                  \x20 early(`${BASE}/early`);\n\
                  \x20 twice(`${BASE}/twice`);\n\
+                 \x20 viaSend(`${BASE}/via-send`);\n\
+                 \x20 viaRaw(`${BASE}/via-raw`);\n\
+                 \x20 stored(`${BASE}/stored`);\n\
                  }\n",
             ),
         ]);
@@ -12590,6 +12606,9 @@ mod tests {
                 (11, "early".to_string(), true),
                 (12, "audit".to_string(), true),
                 (12, "twice".to_string(), true),
+                (13, "via-send".to_string(), false),
+                (14, "via-raw".to_string(), true),
+                (15, "stored".to_string(), true),
             ]
         );
     }
