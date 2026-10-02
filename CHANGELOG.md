@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.102](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.101...carrick-v0.3.102) (2026-10-02)
+
+
+### Features
+
+* **scanner:** ask the library store for registry packages' claims and state library rows ([#1664](https://github.com/carrick-tools/carrick/issues/1664)) ([#1713](https://github.com/carrick-tools/carrick/issues/1713)) ([61a167c](https://github.com/carrick-tools/carrick/commit/61a167c1eef6628df54d1a68e34664361e31d668))
+* **scanner:** send a Deno workspace's public npm packages to the library store ([#1720](https://github.com/carrick-tools/carrick/issues/1720)) ([#1723](https://github.com/carrick-tools/carrick/issues/1723)) ([10e3c82](https://github.com/carrick-tools/carrick/commit/10e3c82739f804ebf0d83289d0931f29e07e980d))
+
+
+### Bug Fixes
+
+* **engine:** a PR shows no endpoint delta against an index another scanner version wrote ([#1712](https://github.com/carrick-tools/carrick/issues/1712)) ([#1714](https://github.com/carrick-tools/carrick/issues/1714)) ([a53e9b3](https://github.com/carrick-tools/carrick/commit/a53e9b3e63ee20523a809d15ceb57e90491cc299))
+* **engine:** incremental scans keep GraphQL consumer located types ([#1726](https://github.com/carrick-tools/carrick/issues/1726)) ([8679027](https://github.com/carrick-tools/carrick/commit/8679027cadddbcede2afa07ea1daacda41772a87))
+* **scanner:** send a pnpm package whose lockfile records a public tarball URL ([#1721](https://github.com/carrick-tools/carrick/issues/1721)) ([#1724](https://github.com/carrick-tools/carrick/issues/1724)) ([4362354](https://github.com/carrick-tools/carrick/commit/43623543de38264e7226d7e9d8d22623365d0496))
+
 ## [0.3.101](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.100...carrick-v0.3.101) (2026-10-02)
 
 

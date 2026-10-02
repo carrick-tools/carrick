@@ -12,7 +12,7 @@
       "name": "carrick",
       "source": "./plugin",
       "description": "Claude Code plugin for Carrick, which indexes TypeScript codebases across service and repository boundaries. After each edit it adds the file's routes, calls, and cross-service type mismatches to the session, and it registers Carrick's language server. It pairs with the Carrick MCP server, which lets agents search functions by intent rather than name.",
-      "version": "0.3.101"
+      "version": "0.3.102"
     }
   ]
 }
