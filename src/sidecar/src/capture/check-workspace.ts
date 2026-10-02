@@ -14,10 +14,10 @@
  */
 
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import type { CheckStubInput } from './api.js';
 import type { ProbePlan } from './check-probe.js';
+import { WriteGuard } from './guarded-fs.js';
 
 const PROBES_PACKAGE = 'carrick-probes';
 
@@ -31,6 +31,8 @@ export interface AssembledStub {
 
 export interface AssembledWorkspace {
   workspaceDir: string;
+  /** Every write and the clean-up are held to `workspaceDir` (carrick#1748). */
+  guard: WriteGuard;
   probesDir: string; // absolute
   /** Relative (forward-slash) probes dir, e.g. packages/carrick-probes. */
   probesRel: string;
@@ -153,14 +155,13 @@ export interface AssembleOptions {
 
 /** Create the scratch workspace and copy in the stub packages. */
 export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
-  const root = opts.workspaceRoot ?? os.tmpdir();
-  fs.mkdirSync(root, { recursive: true });
-  const workspaceDir = fs.mkdtempSync(path.join(root, 'carrick-check-v2-'));
+  // A fresh directory under the caller's root (the OS temp dir by default).
+  const { dir: workspaceDir, guard } = WriteGuard.scratch('carrick-check-v2-', opts.workspaceRoot);
   const packagesDir = path.join(workspaceDir, 'packages');
-  fs.mkdirSync(packagesDir, { recursive: true });
+  guard.mkdir(packagesDir);
 
-  fs.writeFileSync(path.join(workspaceDir, '.npmrc'), NPMRC);
-  fs.writeFileSync(
+  guard.writeFile(path.join(workspaceDir, '.npmrc'), NPMRC);
+  guard.writeFile(
     path.join(workspaceDir, 'pnpm-workspace.yaml'),
     'packages:\n  - "packages/*"\n'
   );
@@ -175,10 +176,7 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
     const packageName = readStubPackageName(stub.stub_dir);
     const packageDir = packageDirOf(packageName);
     const dest = path.join(packagesDir, packageDir);
-    fs.cpSync(stub.stub_dir, dest, {
-      recursive: true,
-      filter: (src) => !src.split(path.sep).includes('node_modules'),
-    });
+    guard.copyTree(stub.stub_dir, dest, (src) => !src.split(path.sep).includes('node_modules'));
     assembled.push({ serviceName: stub.service_name, packageDir, packageName });
     dependencySets.push({ dependencies: readStubDependencies(stub.stub_dir) });
     svcToPkg.set(stub.service_name, packageName);
@@ -188,7 +186,7 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
 
   // Root manifest carries the semver-dedupe overrides.
   const overrides = computeDedupeOverrides(dependencySets);
-  fs.writeFileSync(
+  guard.writeFile(
     path.join(workspaceDir, 'package.json'),
     JSON.stringify(
       {
@@ -203,10 +201,10 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
   );
 
   const probesDir = path.join(packagesDir, PROBES_PACKAGE);
-  fs.mkdirSync(path.join(probesDir, 'probes'), { recursive: true });
+  guard.mkdir(path.join(probesDir, 'probes'));
   const probeDeps: Record<string, string> = {};
   for (const stub of assembled) probeDeps[stub.packageName] = 'workspace:*';
-  fs.writeFileSync(
+  guard.writeFile(
     path.join(probesDir, 'package.json'),
     JSON.stringify(
       {
@@ -219,10 +217,11 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
       2
     ) + '\n'
   );
-  fs.writeFileSync(path.join(probesDir, 'tsconfig.json'), CHECKER_TSCONFIG);
+  guard.writeFile(path.join(probesDir, 'tsconfig.json'), CHECKER_TSCONFIG);
 
   return {
     workspaceDir,
+    guard,
     probesDir,
     probesRel: `packages/${PROBES_PACKAGE}`,
     stubs: assembled,
@@ -239,7 +238,7 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
 /** Write the generated probe files into the assembled probes package. */
 export function writeProbes(ws: AssembledWorkspace, plans: ProbePlan[]): void {
   for (const plan of plans) {
-    fs.writeFileSync(path.join(ws.probesDir, 'probes', plan.fileName), plan.source);
+    ws.guard.writeFile(path.join(ws.probesDir, 'probes', plan.fileName), plan.source);
   }
 }
 

@@ -278,7 +278,7 @@ export async function runCheck(
       ...preGated,
       ...unresolved,
     ]);
-    if (cleanup) safeRm(ws.workspaceDir);
+    if (cleanup) safeRm(ws);
     return {
       success: false,
       workspace_dir: cleanup ? '' : ws.workspaceDir,
@@ -332,7 +332,7 @@ export async function runCheck(
       ...preGated,
       ...unresolved,
     ]);
-    if (cleanup) safeRm(ws.workspaceDir);
+    if (cleanup) safeRm(ws);
     return {
       success: false,
       workspace_dir: cleanup ? '' : ws.workspaceDir,
@@ -390,7 +390,7 @@ export async function runCheck(
   ]);
 
   const workspaceDirOut = cleanup ? '' : ws.workspaceDir;
-  if (cleanup) safeRm(ws.workspaceDir);
+  if (cleanup) safeRm(ws);
 
   return {
     success: true,
@@ -574,9 +574,9 @@ function fnvOfSpec(spec: CheckOptions['pairs'][number]): string {
   return buildProbe(spec, (s) => `@carrick/${s}`).pairId;
 }
 
-function safeRm(dir: string): void {
+function safeRm(ws: AssembledWorkspace): void {
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    ws.guard.remove(ws.workspaceDir);
   } catch {
     /* best effort */
   }

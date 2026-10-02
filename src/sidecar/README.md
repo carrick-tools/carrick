@@ -77,9 +77,9 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `emit_surface`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
-`capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
+`capture_v2`, `check_v2`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
 ### Actions
 
@@ -94,16 +94,13 @@ Every request carries `request_id` and `action`. Every response echoes `request_
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `resolve_definitions` | yes | As-written and structural form of captured aliases |
-| `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
-| `build_workspace` | no | Assemble a synthetic monorepo from repo metadata |
-| `check_compatibility` | no | Assignability checks inside such a workspace |
 | `health` | no | Readiness and init cost |
 | `shutdown` | no | Graceful exit |
 
 #### `init` - Point the sidecar at a project
 
-Resolves which tsconfig (or default patterns) the project will be built from and answers immediately. The ts-morph project itself is built by the first request that reads it — `bundle`, `emit_surface`, `infer` or `resolve_definitions` — and reused after that. So `init` costs the same on a repo with its dependencies installed as on a bare checkout, and the time a large program takes to build is charged to a request's deadline rather than to readiness (carrick#749).
+Resolves which tsconfig (or default patterns) the project will be built from and answers immediately. The ts-morph project itself is built by the first request that reads it — `bundle`, `infer` or `resolve_definitions` — and reused after that. So `init` costs the same on a repo with its dependencies installed as on a bare checkout, and the time a large program takes to build is charged to a request's deadline rather than to readiness (carrick#749).
 
 Re-initialising re-scopes the sidecar to another root, and drops the previous project along with everything built over it.
 
@@ -176,6 +173,8 @@ Response:
 #### `capture_v2` - Emit a service's declaration stubs
 
 The v2 "tsc as serializer" capture. Stateless: it builds its own program from the service's tsconfig, aliases each anchor into a surface entry, and writes a stub package (declaration tree + `carrick-manifest.json` + exact-version pins) into `out_dir`. The full contract is `src/capture/api.ts`.
+
+It writes nowhere else but a temp staging dir, the surface entry (placed inside the service's `rootDir`, where the compiler requires it, and deleted after emit) and, for Deno, `.carrick/deno`. `out_dir` is emptied first, so one that is or contains `repo_root` is refused before anything is written (carrick#1748).
 
 An anchor is one of four kinds, discriminated on `kind`:
 
@@ -722,39 +721,6 @@ Response:
 }
 ```
 
-#### `emit_surface` - Emit a surface `.d.ts`
-
-Writes one file declaring each payload as an alias, with import specifiers rewritten so the file stands alone. Needs an init'd project.
-
-```json
-{
-  "request_id": "6",
-  "action": "emit_surface",
-  "repo_name": "orders-api",
-  "output_path": "/absolute/path/to/.carrick/surface/orders-api.d.ts",
-  "payloads": [
-    {
-      "alias": "Endpoint_a1b2_Response",
-      "type_string": "Order",
-      "source_file": "src/types/order.ts"
-    }
-  ]
-}
-```
-
-Response:
-```json
-{
-  "request_id": "6",
-  "status": "success",
-  "output_path": "/absolute/path/to/.carrick/surface/orders-api.d.ts",
-  "surface_content": "export type Endpoint_a1b2_Response = Order;",
-  "manifest": [
-    { "alias": "Endpoint_a1b2_Response", "type_string": "Order", "rewritten_imports": [] }
-  ]
-}
-```
-
 #### `bundle` - Legacy symbol bundling
 
 Superseded by `capture_v2`, which emits through the compiler instead of reprinting declarations. Kept for the paths that still call it. Needs an init'd project.
@@ -784,76 +750,6 @@ Response:
   "dts_content": "export type Endpoint_1122_Response = { id: string; name: string; }[];",
   "manifest": [{ "alias": "Endpoint_1122_Response", "type_string": "{ id: string; name: string; }[]" }],
   "symbol_failures": []
-}
-```
-
-#### `build_workspace` - Assemble a synthetic monorepo
-
-Writes a workspace holding one stub package per repo, from metadata alone (no checkout required). Stateless.
-
-```json
-{
-  "request_id": "8",
-  "action": "build_workspace",
-  "workspace_root": "/absolute/path/to/.carrick/workspace",
-  "repos": [
-    {
-      "repoName": "orders-api",
-      "dependencies": { "zod": "3.23.8" },
-      "tsconfig": { "compilerOptions": { "module": "ESNext", "strict": true } },
-      "surfaceContent": "export type Endpoint_a1b2_Response = { id: string };"
-    }
-  ]
-}
-```
-
-Response:
-```json
-{
-  "request_id": "8",
-  "status": "success",
-  "workspace_path": "/absolute/path/to/.carrick/workspace",
-  "stub_packages": ["/absolute/path/to/.carrick/workspace/packages/orders-api"],
-  "checker_path": "/absolute/path/to/.carrick/workspace/packages/checker"
-}
-```
-
-#### `check_compatibility` - Assignability inside a built workspace
-
-```json
-{
-  "request_id": "9",
-  "action": "check_compatibility",
-  "workspace_root": "/absolute/path/to/.carrick/workspace",
-  "checks": [
-    {
-      "source_repo": "orders-api",
-      "source_alias": "Endpoint_a1b2_Response",
-      "target_repo": "web",
-      "target_alias": "Endpoint_9f8e_Response",
-      "direction": "source_extends_target"
-    }
-  ]
-}
-```
-
-`direction` is one of `source_extends_target`, `target_extends_source`, `bidirectional`.
-
-Response:
-```json
-{
-  "request_id": "9",
-  "status": "success",
-  "results": [
-    {
-      "source_repo": "orders-api",
-      "source_alias": "Endpoint_a1b2_Response",
-      "target_repo": "web",
-      "target_alias": "Endpoint_9f8e_Response",
-      "compatible": true
-    }
-  ],
-  "diagnostics": []
 }
 ```
 
@@ -888,11 +784,11 @@ Response, written before the process exits:
 │  stdin ──► JSON parse ──► validate (zod) ──► route ──► stdout    │
 │                                                                  │
 │  project-backed (built lazily after init):                       │
-│    TypeBundler · SurfaceEmitter · TypeInferrer                   │
+│    TypeBundler · TypeInferrer                                    │
 │    DefinitionResolver                                            │
 │                                                                  │
 │  stateless (own program / own workspace per request):            │
-│    capture/ (capture_v2, check_v2) · MonorepoBuilder             │
+│    capture/ (capture_v2, check_v2)                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -904,14 +800,14 @@ Response, written before the process exits:
 | `src/types.ts` | Request/response interfaces |
 | `src/validators.ts` | Zod schemas; the authority on request shape |
 | `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |
-| `src/bundler.ts` | Legacy symbol bundling and surface emission |
+| `src/bundler.ts` | Legacy symbol bundling |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
 | `src/library-claims.ts` | `verify_library_claims`, `verify_client_semantics` and `list_library_surface`: library claims against a package's own declarations, and the surface they are read from |
 | `lister/build.mjs` | Bundles the sidecar into the surface lister artifact and writes its manifest; esbuild is installed by `lister/package.json`, not the sidecar's own |
 | `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
-| `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
 | `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |
+| `src/capture/guarded-fs.ts` | The write guard: every file the sidecar writes or deletes goes through it, held to the request's own roots |
 | `test/` | Compiled and run by `npm test` |
 
 ## Error Handling

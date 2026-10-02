@@ -78,18 +78,6 @@ const TsconfigSnapshotSchema = z.object({
 const PinnedDependencySnapshotSchema = z.record(z.string());
 
 // ============================================================================
-// Repo Metadata Schema
-// ============================================================================
-
-const RepoMetadataSchema = z.object({
-  repoName: z.string().min(1, 'Repo name cannot be empty'),
-  dependencies: PinnedDependencySnapshotSchema,
-  tsconfig: TsconfigSnapshotSchema,
-  extractionConfig: ExtractionConfigSchema.optional(),
-  surfaceContent: z.string().optional(),
-});
-
-// ============================================================================
 // Symbol Request Schema
 // ============================================================================
 
@@ -164,37 +152,6 @@ export function validateInferRequestItem(item: InferRequestItem): string | null 
 }
 
 // ============================================================================
-// Payload Definition Schema (New)
-// ============================================================================
-
-const SourceLocationSchema = z.object({
-  file_path: z.string(),
-  start_line: z.number(),
-  end_line: z.number(),
-  start_column: z.number().optional(),
-  end_column: z.number().optional(),
-});
-
-const PayloadDefinitionSchema = z.object({
-  alias: z.string().min(1, 'Alias cannot be empty'),
-  type_string: z.string().min(1, 'Type string cannot be empty'),
-  source_file: z.string().optional(),
-  source_location: SourceLocationSchema.optional(),
-});
-
-// ============================================================================
-// Compatibility Check Schema (New)
-// ============================================================================
-
-const CompatibilityCheckSchema = z.object({
-  source_repo: z.string().min(1, 'Source repo cannot be empty'),
-  source_alias: z.string().min(1, 'Source alias cannot be empty'),
-  target_repo: z.string().min(1, 'Target repo cannot be empty'),
-  target_alias: z.string().min(1, 'Target alias cannot be empty'),
-  direction: z.enum(['source_extends_target', 'target_extends_source', 'bidirectional']),
-});
-
-// ============================================================================
 // Action-specific Request Schemas
 // ============================================================================
 
@@ -213,13 +170,6 @@ export const InitRequestSchema = BaseRequestSchema.extend({
 export const BundleRequestSchema = BaseRequestSchema.extend({
   action: z.literal('bundle'),
   symbols: z.array(SymbolRequestSchema).min(1, 'At least one symbol is required'),
-});
-
-export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
-  action: z.literal('emit_surface'),
-  repo_name: z.string().min(1, 'Repo name cannot be empty'),
-  payloads: z.array(PayloadDefinitionSchema).min(1, 'At least one payload is required'),
-  output_path: z.string().min(1, 'Output path cannot be empty'),
 });
 
 /** v2 "tsc as serializer" capture (contract in ./capture/api.ts). */
@@ -305,18 +255,6 @@ export const InferRequestSchema = BaseRequestSchema.extend({
   action: z.literal('infer'),
   requests: z.array(InferRequestItemSchema).min(1, 'At least one infer request is required'),
   extraction_config: ExtractionConfigSchema.optional(),
-});
-
-export const BuildWorkspaceRequestSchema = BaseRequestSchema.extend({
-  action: z.literal('build_workspace'),
-  repos: z.array(RepoMetadataSchema).min(1, 'At least one repo is required'),
-  workspace_root: z.string().optional(),
-});
-
-export const CheckCompatibilityRequestSchema = BaseRequestSchema.extend({
-  action: z.literal('check_compatibility'),
-  workspace_root: z.string().min(1, 'Workspace root cannot be empty'),
-  checks: z.array(CompatibilityCheckSchema).min(1, 'At least one check is required'),
 });
 
 export const HealthRequestSchema = BaseRequestSchema.extend({
@@ -535,12 +473,9 @@ export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({
 export const SidecarRequestSchema = z.discriminatedUnion('action', [
   InitRequestSchema,
   BundleRequestSchema,
-  EmitSurfaceRequestSchema,
   CaptureV2RequestSchema,
   CheckV2RequestSchema,
   InferRequestSchema,
-  BuildWorkspaceRequestSchema,
-  CheckCompatibilityRequestSchema,
   ResolveDefinitionsRequestSchema,
   RetypeCheckRequestSchema,
   VerifyClientSemanticsRequestSchema,
@@ -610,10 +545,7 @@ export function parseRequestOrThrow(json: unknown): SidecarRequest {
 
 export type ValidatedInitRequest = z.infer<typeof InitRequestSchema>;
 export type ValidatedBundleRequest = z.infer<typeof BundleRequestSchema>;
-export type ValidatedEmitSurfaceRequest = z.infer<typeof EmitSurfaceRequestSchema>;
 export type ValidatedInferRequest = z.infer<typeof InferRequestSchema>;
-export type ValidatedBuildWorkspaceRequest = z.infer<typeof BuildWorkspaceRequestSchema>;
-export type ValidatedCheckCompatibilityRequest = z.infer<typeof CheckCompatibilityRequestSchema>;
 export type ValidatedHealthRequest = z.infer<typeof HealthRequestSchema>;
 export type ValidatedShutdownRequest = z.infer<typeof ShutdownRequestSchema>;
 export type ValidatedSidecarRequest = z.infer<typeof SidecarRequestSchema>;
