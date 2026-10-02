@@ -169,6 +169,7 @@ Label conventions the scorer normalizes for you:
 | `CARRICK_EVAL_CORPUS=<dir>` | Corpus fixture dir name under `tests/fixtures/` |
 | `CARRICK_EVAL_CAPTURE=1` | Tier-A: dump raw file-analyzer input/output per run |
 | `CARRICK_EVAL_DUMP_DIR=<dir>` | Persist raw analyzer I/O for prompt diagnosis |
+| `CARRICK_EVAL_KEEP_BLOBS=<dir>` | Cross-repo eval: keep each run's Phase A blobs and its projection in `<dir>/<corpus>/run-<n>/`, for an offline replay that reuses the recorded answers (carrick#1667). `eval-xrepo.yml` sets it and uploads `eval-xrepo-blobs` |
 | `CARRICK_SKIP_INTENTS=1` | Skip intent generation (dominant cost term; no eval dimension consumes intents) |
 | `CARRICK_INTENT_CONCURRENCY=N` | Concurrent `/generate-intent` requests per dependency level (default 20; `CARRICK_CONCURRENCY_LIMIT`, default 28, caps model calls in flight across the scan, shared with file analysis) |
 | `CARRICK_INTENT_BATCH_SIZE=N` | Functions per `/generate-intent` request (default and maximum 20, the lambda's limit; `1` sends one function per request, the request shape from before batching). A function a batch leaves unanswered is sent again on its own |

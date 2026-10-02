@@ -97,6 +97,10 @@ jobs:
           # the exact live prompt for any file can be replayed in the cloud
           # prompt harness. The scanner child processes inherit this env.
           CARRICK_EVAL_DUMP_DIR: ${{ github.workspace }}/target/eval-dump
+          # carrick#1667: keep each run's Phase A blobs and its projection, so
+          # an offline replay can reuse the recorded answers and re-ask one
+          # task at a time without a second paid scan.
+          CARRICK_EVAL_KEEP_BLOBS: ${{ github.workspace }}/target/eval-blobs
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
@@ -109,6 +113,16 @@ jobs:
           name: analyzer-dump
           path: target/eval-dump/
           if-no-files-found: warn
+
+      # carrick#1667: the Phase A blobs and the projection of every run.
+      - name: Upload scan blobs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eval-xrepo-blobs
+          path: target/eval-blobs/
+          if-no-files-found: warn
+          retention-days: 30
 
       # Push the run's record to the durable Axiom history (carrick-cloud
       # eval-ingest). The scanner mints its own OIDC token internally and can't
