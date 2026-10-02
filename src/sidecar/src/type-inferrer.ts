@@ -1292,8 +1292,10 @@ export class TypeInferrer {
     // The resolved node IS the payload subexpression in the MVP schema.
     // Transitional fallback: if a caller still supplies a bare call expression
     // (e.g., `res.json(users)`), drill to its first argument. No method-name list.
+    // A call whose result is a value the repo shapes is not a send: it is the
+    // payload (carrick#1732), and drilling would publish its input instead.
     let payloadNode: Node = node;
-    if (Node.isCallExpression(node)) {
+    if (Node.isCallExpression(node) && !this.callResultIsPayload(node)) {
       const args = node.getArguments();
       // A call that receives a function is a callback registration (e.g. an
       // endpoint registration like `app.get('/path', handler)`) — its first
@@ -1385,6 +1387,32 @@ export class TypeInferrer {
       this.primaryTypeSymbol(anchor.element),
       anchor.depth
     );
+  }
+
+  /**
+   * True when a located call's own result is the route's payload, so the
+   * transitional drill into its first argument must not run (carrick#1732).
+   *
+   * `res.json(users)` reached that drill because nothing above it recognised
+   * the send: its result reads `void`, `any` or `unknown`, and the payload is
+   * the argument. `toPublicView(row)` is the opposite case: a mapper building
+   * the object the route sends. Its first argument is the row it was built
+   * FROM, which carries columns the route never sends.
+   *
+   * The call's result decides, not where its callee is declared. It is the
+   * payload when it reads as one by the rule a response helper's argument is
+   * read with (`nodeCarriesPayloadContract`: object-shaped, not machinery,
+   * not `void`/`any`/`unknown`) and the object is not a library's own: a
+   * codec's writer from `encode(message)` or a reply builder from a send is
+   * the library describing itself, and keeps the drill. A library call that
+   * returns the repo's own type (`toInstance(View, plain)`) is the payload.
+   */
+  private callResultIsPayload(call: CallExpression): boolean {
+    const { element } = this.unwrapArrayLevels(this.unwrapPromiseType(call.getType()));
+    if (this.symbolIsLibOrExternalOrigin(element.getSymbol() ?? element.getAliasSymbol())) {
+      return false;
+    }
+    return this.nodeCarriesPayloadContract(call, false);
   }
 
   /**
