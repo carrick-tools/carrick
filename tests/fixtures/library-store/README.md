@@ -32,9 +32,10 @@ Answer key, with the store's answer:
 | `src/emails.ts:3` | `pubsub|orders.created` subscriber, a library row (the bus pass's row folds into it) |
 | `src/orders.ts:4` | `pubsub|orders.created` publisher, a library row |
 | `src/live.ts:5` | `socket|SERVER->CLIENT|chat` listener, a library row (the socket pass's `UNKNOWN` row folds into it) |
-| `src/live.ts:10`, `:14` | `socket|CLIENT->SERVER|typing` and `join` emitters, library rows |
+| `src/live.ts:10`, `:14` | `socket|CLIENT->SERVER|typing` and `join` emitters, library rows; the pass's anchors for the folded rows are gone, so `Typing` (`src/events.ts`) is not resolved for them |
 | `src/presence.ts:5` | `socket|UNKNOWN|presence`, the socket pass's row: no claims for its package |
 | `src/audit.ts` | nothing: its package is never sent |
 
 With no claims, or a refusal, the same scan states the socket pass's four
-`UNKNOWN` rows and the bus pass's subscriber, and nothing else changes.
+`UNKNOWN` rows, each anchored, with `Typing` resolved for the `typing` emit,
+and the bus pass's subscriber, and nothing else changes.

@@ -26,7 +26,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// In-memory storage: an upload replaces the stored row for its repo.
+/// In-memory storage: an upload replaces the stored row for its repo, so the
+/// next scan's previous generation is the scan before it.
 #[derive(Default, Clone)]
 struct StubStorage {
     repos: Arc<Mutex<Vec<CloudRepoData>>>,
@@ -58,7 +59,7 @@ impl CloudStorage for StubStorage {
     async fn download_all_repo_data(
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
-        Ok((Vec::new(), HashMap::new()))
+        Ok((self.repos.lock().unwrap().clone(), HashMap::new()))
     }
     async fn upload_type_file(
         &self,
@@ -162,8 +163,17 @@ fn real_sidecar(repo: &Path) -> TypeSidecar {
     sidecar
 }
 
+/// A scan of `repo` with no previous generation: the full analysis.
 async fn scan(repo: &Path, sidecar: Option<&TypeSidecar>) -> CloudRepoData {
-    let storage = StubStorage::default();
+    scan_into(&StubStorage::default(), repo, sidecar).await
+}
+
+/// A scan of `repo` into `storage`, whose previous generation it reads.
+async fn scan_into(
+    storage: &StubStorage,
+    repo: &Path,
+    sidecar: Option<&TypeSidecar>,
+) -> CloudRepoData {
     run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), sidecar, false)
         .await
         .expect("the scan failed");
@@ -286,6 +296,19 @@ fn rows_without_claims() -> (Vec<Row>, Vec<Row>) {
     )
 }
 
+/// Where the blob's type manifest anchors a socket operation, sorted.
+fn socket_anchors(data: &CloudRepoData) -> Vec<(String, u32)> {
+    let mut anchors: Vec<(String, u32)> = data
+        .type_manifest
+        .iter()
+        .flatten()
+        .filter(|entry| entry.key.canonical().starts_with("socket|"))
+        .map(|entry| (entry.file_path.clone(), entry.line_number))
+        .collect();
+    anchors.sort();
+    anchors
+}
+
 /// Every producer and call of the blob, of every protocol, as JSON: what a
 /// change to the library rows must leave alone.
 fn all_rows(data: &CloudRepoData) -> Vec<String> {
@@ -314,6 +337,25 @@ async fn the_store_s_claims_state_library_rows_and_fold_the_socket_pass_rows() {
     let data = scan(&repo, Some(&sidecar)).await;
     assert_eq!(store_requests() - before, 1, "one ask, nothing pending");
     assert_eq!(message_rows(&data, &repo), rows_with_claims());
+    // The folded rows' anchors went with their keys; the row that stands
+    // keeps its own. The typed emit's payload is resolved only while an
+    // operation has its key.
+    assert_eq!(
+        socket_anchors(&data),
+        vec![("src/presence.ts".to_string(), 5)]
+    );
+    carrick::agent_service::inject_mock_answer(ROUTE, "", 1, r#"{"library_claims":[]}"#);
+    let without = scan(&repo, Some(&sidecar)).await;
+    let typing = without
+        .type_manifest
+        .iter()
+        .flatten()
+        .find(|entry| entry.key.canonical() == "socket|UNKNOWN|typing")
+        .map(|entry| entry.type_alias.clone())
+        .expect("the pass anchors the typed emit");
+    let bundled = |data: &CloudRepoData| data.bundled_types.clone().unwrap_or_default();
+    assert!(bundled(&without).contains(&typing), "{}", bundled(&without));
+    assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
 }
 
 /// A store with nothing to say states nothing, and a refusal (`403
@@ -329,6 +371,15 @@ async fn a_refused_store_leaves_every_row_as_no_claims_leave_it() {
     carrick::agent_service::inject_mock_answer(ROUTE, "", 1, r#"{"library_claims":[]}"#);
     let empty = scan(&repo, Some(&sidecar)).await;
     assert_eq!(message_rows(&empty, &repo), rows_without_claims());
+    assert_eq!(
+        socket_anchors(&empty),
+        vec![
+            ("src/live.ts".to_string(), 5),
+            ("src/live.ts".to_string(), 10),
+            ("src/live.ts".to_string(), 14),
+            ("src/presence.ts".to_string(), 5),
+        ]
+    );
     carrick::agent_service::inject_mock_envelope(
         ROUTE,
         "",
@@ -397,5 +448,41 @@ async fn no_model_or_no_sidecar_asks_the_store_nothing() {
             .iter()
             .chain(&message_rows(&local, &repo).1)
             .all(|row| row.2 != FACT)
+    );
+}
+
+/// A scan that reuses its previous generation (the incremental analysis:
+/// its detection is replayed, not asked for again) asks the store and
+/// states the same rows: verification is never cached, and the answer is
+/// not stored.
+#[tokio::test]
+#[serial]
+async fn an_incremental_scan_asks_again_and_states_the_same_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, cassette) = fixture_copy(tmp.path());
+    mock_env(&cassette);
+    let sidecar = real_sidecar(&repo);
+    let storage = StubStorage::default();
+    scan_into(&storage, &repo, Some(&sidecar)).await;
+    let detect = |counts: &std::collections::BTreeMap<String, usize>| {
+        counts.get("/framework-detect").copied().unwrap_or(0)
+    };
+    let before = carrick::agent_service::request_counts();
+    let data = scan_into(&storage, &repo, Some(&sidecar)).await;
+    let after = carrick::agent_service::request_counts();
+    assert_eq!(
+        detect(&after) - detect(&before),
+        0,
+        "the detection is replayed"
+    );
+    assert_eq!(
+        after.get(ROUTE).copied().unwrap_or(0) - before.get(ROUTE).copied().unwrap_or(0),
+        1,
+        "the store is asked on every scan"
+    );
+    assert_eq!(message_rows(&data, &repo), rows_with_claims());
+    assert_eq!(
+        socket_anchors(&data),
+        vec![("src/presence.ts".to_string(), 5)]
     );
 }

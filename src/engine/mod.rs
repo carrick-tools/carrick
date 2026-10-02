@@ -3207,16 +3207,21 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &service_modules,
             );
-            append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+            let library_sites = LibrarySiteIndex::of(
+                &stated_library_rows(&protocol_extractions.library, repo_path, service),
+                repo_path,
+            );
+            append_protocol_manifest_entries(
+                &mut manifest_entries,
+                &protocol_extractions,
+                &library_sites,
+            );
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
                 &merged_results,
                 &protocol_extractions.sockets,
                 &in_process_pubsub,
-                &LibrarySiteIndex::of(
-                    &stated_library_rows(&protocol_extractions.library, repo_path, service),
-                    repo_path,
-                ),
+                &library_sites,
                 repo_path,
             );
             if !manifest_entries.is_empty() {
@@ -3227,7 +3232,7 @@ async fn analyze_current_repo_incremental(
             // both resolve through the same sidecar bundle path as HTTP explicit
             // symbols (#245/#248). Concatenate both into the extra-explicit slice.
             let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-                &protocol_extractions.sockets,
+                &library_sites.typed_sockets(&protocol_extractions.sockets),
                 repo_path,
                 &service_modules,
             );
@@ -4323,6 +4328,42 @@ impl LibrarySiteIndex {
         })
     }
 
+    /// Whether `op` is a socket pass op of unknown direction folded into a
+    /// library row here: the operation it named is gone, so an anchor for it
+    /// would orphan (the library row's direction replaced its key).
+    fn folds_unknown(&self, op: &crate::socket_io::SocketOp, listener: bool) -> bool {
+        matches!(
+            op.key,
+            OperationKey::Socket {
+                direction: crate::operation::SocketDirection::Unknown,
+                ..
+            }
+        ) && self.states_socket(&op.file_path, op.line, &op.key, listener)
+    }
+
+    /// `sockets` without the ops [`Self::folds_unknown`] names: the ops
+    /// whose payload anchors still type an operation. An op folded in its own
+    /// direction keeps its anchor, which types the library row on its key.
+    fn typed_sockets(
+        &self,
+        sockets: &crate::socket_io::SocketExtraction,
+    ) -> crate::socket_io::SocketExtraction {
+        crate::socket_io::SocketExtraction {
+            listeners: sockets
+                .listeners
+                .iter()
+                .filter(|op| !self.folds_unknown(op, true))
+                .cloned()
+                .collect(),
+            emitters: sockets
+                .emitters
+                .iter()
+                .filter(|op| !self.folds_unknown(op, false))
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn states_name(&self, file: &Path, line: u32, name: &str) -> bool {
         self.named
             .contains(&(self.relative(file), line, name.to_string()))
@@ -5154,7 +5195,9 @@ fn merge_graphql_consumer_locations(
 fn append_protocol_manifest_entries(
     entries: &mut Vec<TypeManifestEntry>,
     extractions: &ProtocolExtractions,
+    library: &LibrarySiteIndex,
 ) {
+    let sockets = library.typed_sockets(&extractions.sockets);
     for op in &extractions.graphql.producers {
         add_protocol_manifest_entry(
             entries,
@@ -5198,7 +5241,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.listeners {
+    for op in &sockets.listeners {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -5209,7 +5252,7 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
-    for op in &extractions.sockets.emitters {
+    for op in &sockets.emitters {
         add_protocol_manifest_entry(
             entries,
             &op.key,
@@ -7750,16 +7793,17 @@ async fn analyze_current_repo(
         repo_path,
         &service_modules,
     );
-    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
+    let library_sites = LibrarySiteIndex::of(
+        &stated_library_rows(&protocol_extractions.library, repo_path, service),
+        repo_path,
+    );
+    append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions, &library_sites);
     append_pubsub_manifest_entries(
         &mut manifest_entries,
         &analysis_result.file_results,
         &protocol_extractions.sockets,
         &in_process_pubsub,
-        &LibrarySiteIndex::of(
-            &stated_library_rows(&protocol_extractions.library, repo_path, service),
-            repo_path,
-        ),
+        &library_sites,
         repo_path,
     );
     if !manifest_entries.is_empty() {
@@ -7776,7 +7820,7 @@ async fn analyze_current_repo(
     // resolve through the same sidecar bundle path as HTTP explicit symbols
     // (#245/#248). Concatenate both into the extra-explicit slice.
     let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
-        &protocol_extractions.sockets,
+        &library_sites.typed_sockets(&protocol_extractions.sockets),
         repo_path,
         &service_modules,
     );
@@ -16234,6 +16278,50 @@ mod tests {
             ],
             "the emitters at the library emitter's site fold; those at a listener's site stand"
         );
+
+        // An op folded in its own direction keeps its payload anchor, which
+        // types the library row on the same key; one of unknown direction
+        // loses it, as no operation has its key any more.
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(
+            &mut entries,
+            &extractions,
+            &LibrarySiteIndex::of(
+                &stated_library_rows(&extractions.library, "/repo", &Config::default()),
+                "/repo",
+            ),
+        );
+        let anchored: Vec<(String, bool, u32)> = {
+            let mut anchored: Vec<(String, bool, u32)> = entries
+                .iter()
+                .filter(|entry| entry.file_path == live && entry.line_number <= 5)
+                .map(|entry| {
+                    (
+                        entry.key.canonical(),
+                        entry.role == ManifestRole::Producer,
+                        entry.line_number,
+                    )
+                })
+                .collect();
+            anchored.sort();
+            anchored
+        };
+        let anchor = |key: &str, listener: bool, line: u32| (key.to_string(), listener, line);
+        assert_eq!(
+            anchored,
+            vec![
+                anchor("socket|CLIENT->SERVER|chat", false, 4),
+                anchor("socket|CLIENT->SERVER|chat", true, 4),
+                anchor("socket|CLIENT->SERVER|chat-room", true, 4),
+                anchor("socket|SERVER->CLIENT|chat", true, 4),
+                anchor("socket|SERVER->CLIENT|typing", false, 5),
+                anchor("socket|SERVER->CLIENT|typing", true, 5),
+                anchor("socket|UNKNOWN|chat", false, 4),
+                anchor("socket|UNKNOWN|typing", true, 5),
+            ],
+            "the folded listener of unknown direction at line 4 and emitter at line 5 \
+             keep no anchor; every other op at those lines does"
+        );
     }
 
     /// carrick#1662: with no claims, or no sidecar to verify them, nothing
@@ -17185,7 +17273,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let socket_entry = entries
             .iter()
@@ -17259,7 +17347,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
 
         let requests: Vec<&TypeManifestEntry> = entries
             .iter()
@@ -17325,7 +17413,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_alias = entries
             .iter()
             .find(|e| e.key.canonical() == "socket|SERVER->CLIENT|payment:settled")
@@ -18168,7 +18256,7 @@ mod tests {
         };
 
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
@@ -18307,7 +18395,7 @@ mod tests {
 
         // The producer manifest entry's alias (Producer, Response).
         let mut entries = Vec::new();
-        append_protocol_manifest_entries(&mut entries, &extractions);
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let manifest_entry = entries
             .iter()
             .find(|e| {
