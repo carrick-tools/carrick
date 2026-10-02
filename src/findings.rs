@@ -70,10 +70,12 @@ pub enum Severity {
 /// it — the producer endpoint and every consumer call site — is one the source
 /// states outright; a single row whose only source is the model makes the whole
 /// pairing a `Candidate`, because a pairing is no better than its weakest side.
+/// So does a consumer call site the scan holds no row for (carrick#1735): a
+/// pairing with a side the scan cannot see is not a fact.
 ///
-/// Absent on the wire when the scan cannot state it (see
-/// [`EdgeSource::fold`]), which readers take as "not stated" — today's
-/// behaviour, never "candidate".
+/// Absent on the wire when every row is held but one states no source (see
+/// [`EdgeSource::fold`]), which readers take as "not stated", never
+/// "candidate"; the cloud's PR check enforces it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeSource {
