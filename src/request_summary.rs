@@ -2332,9 +2332,10 @@ fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<St
 /// or bound at module scope. A computed specifier (`require(name)`, a
 /// template with a hole) names no module and is not here.
 ///
-/// The one reader of these loads: the request summaries' value specifiers
-/// and the framework-detect import sample
-/// ([`crate::framework_detector::ImportSample`], carrick#1727) both read it.
+/// The request summaries' value specifiers and the framework-detect import
+/// sample ([`crate::framework_detector::ImportSample`], carrick#1727) both
+/// read loads through it. [`module_loads`] answers another question (which
+/// loads bind nothing) and keeps its own rules.
 pub(crate) fn literal_loads(module: &Module) -> BTreeSet<String> {
     struct Loads {
         found: BTreeSet<String>,
