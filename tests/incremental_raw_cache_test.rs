@@ -678,3 +678,92 @@ async fn an_answer_about_an_uncommitted_edit_is_never_replayed() {
          the answer about the edit was replayed for the committed code"
     );
 }
+
+/// A GraphQL document consumer whose result type is a co-located interface the
+/// file analyzer names (`graphql_consumer_locates`, #268).
+const GRAPHQL_CONSUMER: &str = "declare function gql(strings: TemplateStringsArray, ...values: unknown[]): string;\n\
+\n\
+export const ON_ORDER_UPDATED = gql`\n  \
+  subscription OnOrderUpdated {\n    \
+    orderUpdated {\n      \
+      id\n      \
+      note\n    \
+    }\n  \
+  }\n\
+`;\n\
+\n\
+export interface OrderUpdate {\n  \
+  id: string;\n  \
+  note: string;\n\
+}\n\
+\n\
+export function renderOrderUpdate(update: OrderUpdate): string {\n  \
+  return `${update.id}: ${update.note}`;\n\
+}\n";
+
+/// The model's answer for that file: the subscription's result type is
+/// `OrderUpdate`.
+const GRAPHQL_CONSUMER_ANSWER: &str = r#"{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_consumer_locates": [
+    {"kind": "subscription", "field": "orderUpdated", "result_type_symbol": "OrderUpdate", "result_type_source": null}
+  ]
+}"#;
+
+/// The type anchor the upload's manifest carries for the consumer of
+/// `subscription orderUpdated`.
+fn order_updated_consumer_anchor(data: &CloudRepoData) -> Option<String> {
+    let blob = serde_json::to_value(data).expect("the upload serializes");
+    let entries = blob["type_manifest"]
+        .as_array()
+        .expect("the upload carries a type manifest");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["field"] == "orderUpdated" && entry["role"] == "consumer")
+        .unwrap_or_else(|| panic!("no manifest entry for the orderUpdated consumer: {entries:#?}"));
+    entry["primary_type_symbol"].as_str().map(str::to_string)
+}
+
+/// carrick#1725: the incremental path keys the replayed answers repo-relative,
+/// and the GraphQL consumer ops carry the path the scan discovered. The locate
+/// joined on both, so on every scan after the first the located result type was
+/// dropped, the consumer's type read `unknown`, and its edges lost their
+/// verdicts. The warm scan must anchor the consumer exactly as the cold one did.
+#[tokio::test]
+#[serial]
+async fn an_unchanged_graphql_consumer_keeps_its_located_result_type() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture_with(
+        tmp.path(),
+        &[
+            ("src/order_feed.ts", GRAPHQL_CONSUMER),
+            (
+                "__llm__/analyze-file/order_feed.json",
+                GRAPHQL_CONSUMER_ANSWER,
+            ),
+        ],
+    );
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (cold, dispatched_cold) = scan(&storage, &repo_path).await;
+    assert!(dispatched_cold > 0, "scan #1 is the cold scan");
+    assert_eq!(
+        order_updated_consumer_anchor(&cold).as_deref(),
+        Some("OrderUpdate"),
+        "the cold scan anchors the consumer on the located type"
+    );
+
+    let (warm, dispatched_warm) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_warm, 0,
+        "an unchanged tree reaches the model zero times"
+    );
+    assert_eq!(
+        order_updated_consumer_anchor(&warm).as_deref(),
+        Some("OrderUpdate"),
+        "the warm scan replays the same answer, so it must anchor the consumer the same way"
+    );
+}
