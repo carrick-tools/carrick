@@ -5383,6 +5383,7 @@ fn add_graphql_request_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        v1_state_before_demotion: None,
     });
 }
 
@@ -5442,6 +5443,7 @@ fn add_protocol_manifest_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        v1_state_before_demotion: None,
     });
 }
 
@@ -6992,13 +6994,18 @@ fn aliases_to_resolve(
 ///    heal it. Those print as a confident name (`Row`,
 ///    `Shape<Options>`) where the truth is that the stub cannot say what the
 ///    name is, and publishing them counts the operation typed.
-///  - **does it settle the state?** Only a shape with no disqualifying top type
-///    anywhere in it, the same notion the check phase uses. That promotion is
-///    scoped to entries whose state is `Unknown` — the ones no layer has said
-///    anything about yet (carrick#449, carrick#1441). What the SOURCE states
-///    about an entry v1 DID answer for is never overwritten from here: a
-///    capture answer cannot make a declared type implicit or an inferred one
-///    explicit.
+///  - **does it settle the state?** A shape with no disqualifying top type
+///    anywhere in it, the same notion the check phase uses, or one whose every
+///    top type the capture's record shows is a member the source declares
+///    `unknown` (carrick#1752): a typed contract with an open field is still a
+///    typed contract. That promotion is scoped to entries whose state is
+///    `Unknown`: the ones v1 never answered, and the ones v1 answered with a
+///    shape whose text carried a top type it could not attribute
+///    (carrick#449, carrick#1441). The second kind returns to the state v1
+///    gave it, because whether the source annotated the type is a fact about
+///    the source, not about which layer printed the shape; the first kind
+///    reads `Implicit`. What the SOURCE states about an entry v1 answered
+///    cleanly is never overwritten from here.
 ///
 /// Returns how many aliases the capture answered for.
 fn apply_resolved_definitions(
@@ -7063,11 +7070,23 @@ fn apply_resolved_definitions(
             })
             .map(|u| u.expanded.clone());
 
-        if v1_unanswered && !type_compat_v2::contains_disqualifying_top_type(&r.expanded) {
-            entry.is_explicit = false;
-            entry.type_state = ManifestTypeState::Implicit;
-            entry.evidence.is_explicit = false;
-            entry.evidence.type_state = ManifestTypeState::Implicit;
+        let settles = !type_compat_v2::contains_disqualifying_top_type(&r.expanded)
+            || records.get(&entry.type_alias).is_some_and(|record| {
+                type_compat_v2::top_types_are_declared_open_members(
+                    &r.expanded,
+                    record,
+                    &entry.any_provenance,
+                )
+            });
+        if v1_unanswered && settles {
+            let state = entry
+                .v1_state_before_demotion
+                .unwrap_or(ManifestTypeState::Implicit);
+            let is_explicit = state == ManifestTypeState::Explicit;
+            entry.is_explicit = is_explicit;
+            entry.type_state = state;
+            entry.evidence.is_explicit = is_explicit;
+            entry.evidence.type_state = state;
         }
     }
     lookup.len()
@@ -7396,6 +7415,7 @@ fn add_manifest_pair(
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            v1_state_before_demotion: None,
         });
     }
 }
@@ -7536,14 +7556,25 @@ fn enrich_manifest_with_type_resolution(
             // placeholder (heals when the check installs the pin). So the two
             // layers agree on every author-baked disqualifier; they diverge
             // only in the fail-closed direction.
-            let is_unknown_type = type_string.trim().is_empty()
-                || type_compat_v2::contains_disqualifying_top_type(type_string)
+            let placeholder = type_string.trim().is_empty()
+                || type_compat_v2::text_is_bare_top_type(type_string)
                 || dts_trivially_unknown(&entry.type_alias);
+            let top_type_inside = type_compat_v2::contains_disqualifying_top_type(type_string);
 
-            if is_unknown_type {
+            if placeholder || top_type_inside {
                 // Downgrade to Unknown so the `= unknown` placeholder gate
                 // (resolve_per_endpoint_definitions, check_v2 pre-gates) stays shut and the
                 // edge is reported unverifiable rather than falsely compatible.
+                //
+                // A real shape with a top type inside it keeps what v1 said
+                // about it beside the demotion: whether the source wrote that
+                // top type is the capture record's to say, and when it did,
+                // the entry returns to this state (carrick#1752).
+                entry.v1_state_before_demotion = (!placeholder).then_some(if *is_explicit {
+                    ManifestTypeState::Explicit
+                } else {
+                    ManifestTypeState::Implicit
+                });
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
                 entry.evidence.is_explicit = false;
@@ -9925,6 +9956,7 @@ mod tests {
                 defined_in: None,
                 any_provenance: Vec::new(),
                 unwidened_definition: None,
+                v1_state_before_demotion: None,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -14707,6 +14739,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            v1_state_before_demotion: None,
         }
     }
 
@@ -15305,6 +15338,262 @@ mod tests {
             manifest[0].resolved_definition.as_deref(),
             Some("{ id: string; }")
         );
+    }
+
+    // ---- carrick#1752: an open member the source declares --------------------
+
+    /// One capture finding, as the sidecar's record writes it.
+    fn finding(path: &str, kind: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({ "path": path, "kind": kind, "reason": reason })
+    }
+
+    /// The capture's record for `alias`, holding `findings`, already joined
+    /// onto `manifest` the way the definitions pass joins it.
+    fn stamp_findings(
+        manifest: &mut [TypeManifestEntry],
+        alias: &str,
+        findings: Vec<serde_json::Value>,
+    ) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
+        let records = records_from(serde_json::json!([record_json(
+            alias,
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "any_provenance": findings
+            }),
+        )]));
+        stamp_capture_provenance(manifest, &records);
+        records
+    }
+
+    /// An entry v1 answered from an explicit annotation with `type_string`,
+    /// after the enrichment step has read it.
+    fn enriched_explicit(type_string: &str) -> Vec<TypeManifestEntry> {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        resolution
+            .explicit_manifest
+            .push(crate::services::type_sidecar::ManifestEntry {
+                alias: "OrderView".to_string(),
+                original_name: "OrderView".to_string(),
+                source_file: "lib/types.ts".to_string(),
+                type_string: type_string.to_string(),
+                is_explicit: true,
+            });
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+        manifest
+    }
+
+    /// carrick#1752: a client casts a response to a declared type with one
+    /// member the declaration itself types `unknown`. That is a typed contract
+    /// with one open field: the row keeps the state the source gave it, and
+    /// the member's provenance says which field is open and why.
+    #[test]
+    fn an_open_member_the_source_declares_leaves_the_contract_v1_stated() {
+        let shape = "{ id: string; notes: unknown; }";
+        let mut manifest = enriched_explicit(shape);
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "v1's text alone cannot say who put the `unknown` there"
+        );
+
+        let records = stamp_findings(
+            &mut manifest,
+            "OrderView",
+            vec![finding("notes", "unknown", "declared")],
+        );
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", shape)], &records);
+
+        assert_eq!(manifest[0].expanded_definition.as_deref(), Some(shape));
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].is_explicit, "the source cast the call to it");
+        assert_eq!(manifest[0].evidence.type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].evidence.is_explicit);
+        assert_eq!(
+            manifest[0]
+                .any_provenance
+                .iter()
+                .map(|p| (p.path.as_str(), p.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("notes", "declared")],
+            "the open field is still named"
+        );
+    }
+
+    /// The same answer for an entry no v1 layer stated settles it as the
+    /// capture's own reading, the way a clean answer does.
+    #[test]
+    fn an_open_member_settles_an_entry_v1_did_not_answer() {
+        let shape = "{ id: string; items: { sku: string; extra: unknown; }[]; }";
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let records = stamp_findings(
+            &mut manifest,
+            "OrderView",
+            vec![finding("items<0>.extra", "unknown", "declared")],
+        );
+
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", shape)], &records);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert!(!manifest[0].is_explicit, "the capture inferred it");
+    }
+
+    /// Everything else that puts a top type in the answer still leaves the
+    /// entry `Unknown`: a pipeline artefact, an `any`, a position that is not
+    /// a member of a typed shape, a list the walk may have cut short, or no
+    /// record to read at all. The answer is still published in every case.
+    #[test]
+    fn a_top_type_the_source_did_not_declare_on_a_member_still_leaves_the_entry_unknown() {
+        let open = finding("notes", "unknown", "declared");
+        let capped: Vec<serde_json::Value> = (0
+            ..crate::engine::type_compat_v2::CAPTURE_FINDINGS_CAP)
+            .map(|i| finding(&format!("m{i}"), "unknown", "declared"))
+            .collect();
+        let capped_shape = format!(
+            "{{ {} }}",
+            (0..crate::engine::type_compat_v2::CAPTURE_FINDINGS_CAP)
+                .map(|i| format!("m{i}: unknown;"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let cases: Vec<(&str, String, Vec<serde_json::Value>)> = vec![
+            (
+                "an unresolved import beside the declared member",
+                "{ notes: unknown; row: unknown; }".to_string(),
+                vec![open.clone(), finding("row", "unknown", "unresolved_import")],
+            ),
+            (
+                "a member the source declares `any`",
+                "{ id: string; notes: any; }".to_string(),
+                vec![finding("notes", "any", "declared")],
+            ),
+            (
+                "an `any` the walk does not read, in a parameter",
+                "{ notes: unknown; run: (input: any) => void; }".to_string(),
+                vec![open.clone()],
+            ),
+            (
+                "a dictionary of anything at the root",
+                "{ [key: string]: unknown; }".to_string(),
+                vec![finding("[index]", "unknown", "declared")],
+            ),
+            (
+                "a list of anything at the root",
+                "unknown[]".to_string(),
+                vec![finding("<0>", "unknown", "declared")],
+            ),
+            (
+                "a walk that ran out of budget",
+                "{ notes: unknown; }".to_string(),
+                vec![
+                    open.clone(),
+                    finding("deep", "budget_exhausted", "budget_exhausted"),
+                ],
+            ),
+            (
+                "a text carrying `unknown` the record never reported",
+                "{ notes: unknown; }".to_string(),
+                vec![],
+            ),
+            (
+                "as many findings as the walk reports before it stops listing",
+                capped_shape,
+                capped,
+            ),
+            (
+                "a finding the record calls `any` where the printed text shows none",
+                "{ id: string; notes: unknown; }".to_string(),
+                vec![finding("notes", "any", "declared")],
+            ),
+        ];
+        for (why, shape, findings) in cases {
+            let mut manifest = enriched_explicit(&shape);
+            let records = stamp_findings(&mut manifest, "OrderView", findings);
+            apply_resolved_definitions(
+                &mut manifest,
+                vec![captured("OrderView", &shape)],
+                &records,
+            );
+            assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown, "{why}");
+            assert!(!manifest[0].is_explicit, "{why}");
+            assert_eq!(
+                manifest[0].expanded_definition.as_deref(),
+                Some(shape.as_str()),
+                "{why}: still published"
+            );
+        }
+
+        let shape = "{ id: string; notes: unknown; }";
+        let mut manifest = enriched_explicit(shape);
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", shape)],
+            &HashMap::new(),
+        );
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "no capture record: nothing says who declared the member"
+        );
+
+        let mut manifest = enriched_explicit(shape);
+        manifest[0].any_provenance.push(
+            serde_json::from_value(finding("notes", "unknown", "unresolved_import"))
+                .expect("a finding"),
+        );
+        let records = stamp_findings(&mut manifest, "OrderView", vec![open]);
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", shape)], &records);
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "another layer on the entry says the member did not resolve"
+        );
+    }
+
+    /// A v1 answer demoted for a top type in its own text, then answered
+    /// cleanly by the capture, keeps the explicitness the source gave it: the
+    /// annotation is a fact about the source, not about which layer printed
+    /// the shape.
+    #[test]
+    fn a_clean_capture_answer_keeps_the_explicit_state_v1_stated() {
+        let mut manifest = enriched_explicit("{ relation: any; id: string; }");
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured(
+                "OrderView",
+                "{ relation: { id: string; }; id: string; }",
+            )],
+            &HashMap::new(),
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].is_explicit);
+    }
+
+    /// A v1 answer that printed no shape at all states nothing about the
+    /// source to return to: the symbol it named may not be the type, so the
+    /// capture's clean answer reads as the capture's own.
+    #[test]
+    fn a_v1_answer_with_no_shape_leaves_the_capture_answer_implicit() {
+        for placeholder in ["unknown", "any", ""] {
+            let mut manifest = enriched_explicit(placeholder);
+            assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+
+            apply_resolved_definitions(
+                &mut manifest,
+                vec![captured("OrderView", "{ id: string; }")],
+                &HashMap::new(),
+            );
+
+            assert_eq!(
+                manifest[0].type_state,
+                ManifestTypeState::Implicit,
+                "v1 answered {placeholder:?}"
+            );
+            assert!(!manifest[0].is_explicit, "v1 answered {placeholder:?}");
+        }
     }
 
     // ---- carrick#1165: answers that name what does not resolve -------------

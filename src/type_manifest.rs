@@ -762,6 +762,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            v1_state_before_demotion: None,
         }
     }
 }

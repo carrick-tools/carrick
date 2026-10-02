@@ -1,0 +1,34 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/statements/${number}",
+      "method": "GET",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch(`/statements/${number}`)",
+      "call_expression_text": "fetch(`/statements/${number}`)",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Statement",
+      "type_import_source": "@invoicing/contracts/statement"
+    },
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "/ledgers/${number}",
+      "method": "GET",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch(`/ledgers/${number}`)",
+      "call_expression_text": "fetch(`/ledgers/${number}`)",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Ledger",
+      "type_import_source": "@invoicing/contracts/ledger"
+    }
+  ]
+}

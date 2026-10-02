@@ -54,34 +54,40 @@ use crate::services::type_sidecar::{
 /// unverifiable; a false negative is a false-compatible.
 pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
     let scrubbed = strip_string_literal_contents(text);
+    ["any", "unknown"]
+        .into_iter()
+        .any(|keyword| scrubbed_text_uses_keyword_as_type(&scrubbed, keyword))
+}
+
+/// [`contains_disqualifying_top_type`] for one of the two keywords, over text
+/// whose string literals are already emptied.
+fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
     let bytes = scrubbed.as_bytes();
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    for keyword in ["any", "unknown"] {
-        let mut search_from = 0;
-        while let Some(pos) = scrubbed[search_from..].find(keyword) {
-            let begin = search_from + pos;
-            let end = begin + keyword.len();
-            search_from = begin + 1;
-            // Identifier boundaries (`company`, `unknownField`, `Anything`).
-            if begin > 0 && is_ident(bytes[begin - 1]) {
-                continue;
-            }
-            if end < bytes.len() && is_ident(bytes[end]) {
-                continue;
-            }
-            // Property-name position: printers emit `name: T` / `name?: T`
-            // with the colon immediately after the name.
-            let rest = &bytes[end..];
-            let rest = if rest.first() == Some(&b'?') {
-                &rest[1..]
-            } else {
-                rest
-            };
-            if rest.first() == Some(&b':') {
-                continue;
-            }
-            return true;
+    let mut search_from = 0;
+    while let Some(pos) = scrubbed[search_from..].find(keyword) {
+        let begin = search_from + pos;
+        let end = begin + keyword.len();
+        search_from = begin + 1;
+        // Identifier boundaries (`company`, `unknownField`, `Anything`).
+        if begin > 0 && is_ident(bytes[begin - 1]) {
+            continue;
         }
+        if end < bytes.len() && is_ident(bytes[end]) {
+            continue;
+        }
+        // Property-name position: printers emit `name: T` / `name?: T`
+        // with the colon immediately after the name.
+        let rest = &bytes[end..];
+        let rest = if rest.first() == Some(&b'?') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        if rest.first() == Some(&b':') {
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -230,6 +236,80 @@ fn inference_was_blind(inf: &crate::services::type_sidecar::InferredType) -> boo
 /// the publication question ("is there anything here to show a reader?").
 pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
     matches!(text.trim().trim_end_matches(';').trim(), "any" | "unknown")
+}
+
+/// How many findings the capture's deep walk lists per alias before it stops
+/// listing (`MAX_DEEP_FINDINGS` in `src/sidecar/src/capture/deep-walk.ts`).
+/// A record holding this many may have more positions it never named, so it
+/// cannot show that every top type in its type is accounted for.
+pub(crate) const CAPTURE_FINDINGS_CAP: usize = 32;
+
+/// True when every top type in a capture answer is a member the SOURCE
+/// declares `unknown` (carrick#1752): the answer is a typed contract with open
+/// fields, not a type no layer could see.
+///
+/// [`contains_disqualifying_top_type`] cannot ask this. It reads text, and in
+/// text a member the author typed `unknown` and one the pipeline wrote
+/// `unknown` for an import that did not resolve (carrick#1377, carrick#1397)
+/// are the same word. The capture's record tells them apart: its deep walk
+/// names every position a top type sits at, with a cause. So the answer
+/// qualifies only when all of these hold:
+///
+///  - the text carries no `any`. `any` is bidirectionally assignable, and the
+///    walk does not read parameter positions, so the text is the one place a
+///    parameter `any` shows;
+///  - the record names at least one finding and fewer than the walk lists
+///    before it stops ([`CAPTURE_FINDINGS_CAP`]), so every position the text
+///    holds is accounted for. A root that is itself a top type has no members
+///    to walk, so it names none;
+///  - every finding, the record's and any other layer's on the entry, is an
+///    `unknown` the capture attributes to the declaration (`declared`), at a
+///    position under a named member. `unknown[]` or `Record<string, unknown>`
+///    at the root has no named member, and says nothing about the payload.
+///
+/// This decides the entry's state only. What the compatibility check makes of
+/// an open member is the check phase's own walk, which reads the same record
+/// and is unchanged.
+pub(crate) fn top_types_are_declared_open_members(
+    expanded: &str,
+    record: &CaptureAliasRecord,
+    published: &[crate::services::type_sidecar::TypeProvenance],
+) -> bool {
+    !scrubbed_text_uses_keyword_as_type(&strip_string_literal_contents(expanded), "any")
+        && !record.any_provenance.is_empty()
+        && record.any_provenance.len() < CAPTURE_FINDINGS_CAP
+        && record
+            .any_provenance
+            .iter()
+            .chain(published)
+            .all(is_declared_open_member)
+}
+
+/// An `unknown` the declaration states, under a named member.
+fn is_declared_open_member(finding: &crate::services::type_sidecar::TypeProvenance) -> bool {
+    finding.kind == "unknown" && finding.reason == "declared" && path_names_a_member(&finding.path)
+}
+
+/// True when a deep-walk path passes through a named member. The walk writes
+/// a member as its name (`a`, `a.b`), an element or type argument as `<n>`, an
+/// index signature as `[index]` and a callable return as `()`; a path made of
+/// the last three alone sits at the root of the type or inside a container,
+/// never in a field.
+fn path_names_a_member(path: &str) -> bool {
+    let rest = path.replace("[index]", "").replace("()", "");
+    let mut in_argument = false;
+    rest.chars().any(|c| match c {
+        '<' => {
+            in_argument = true;
+            false
+        }
+        '>' => {
+            in_argument = false;
+            false
+        }
+        '.' => false,
+        _ => !in_argument,
+    })
 }
 
 /// Root `any_provenance` reasons with which the inferrer DECIDED a payload has
@@ -1834,6 +1914,7 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            v1_state_before_demotion: None,
         }
     }
 
