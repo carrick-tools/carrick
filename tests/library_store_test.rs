@@ -344,8 +344,16 @@ async fn the_store_s_claims_state_library_rows_and_fold_the_socket_pass_rows() {
         socket_anchors(&data),
         vec![("src/presence.ts".to_string(), 5)]
     );
+    let (without, typing) = typed_emit_without_claims(&repo, &sidecar).await;
+    assert!(bundled(&without).contains(&typing), "{}", bundled(&without));
+    assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
+}
+
+/// A scan of `repo` with no claims, and the alias the socket pass's typed
+/// `typing` emit is anchored under in it.
+async fn typed_emit_without_claims(repo: &Path, sidecar: &TypeSidecar) -> (CloudRepoData, String) {
     carrick::agent_service::inject_mock_answer(ROUTE, "", 1, r#"{"library_claims":[]}"#);
-    let without = scan(&repo, Some(&sidecar)).await;
+    let without = scan(repo, Some(sidecar)).await;
     let typing = without
         .type_manifest
         .iter()
@@ -353,9 +361,12 @@ async fn the_store_s_claims_state_library_rows_and_fold_the_socket_pass_rows() {
         .find(|entry| entry.key.canonical() == "socket|UNKNOWN|typing")
         .map(|entry| entry.type_alias.clone())
         .expect("the pass anchors the typed emit");
-    let bundled = |data: &CloudRepoData| data.bundled_types.clone().unwrap_or_default();
-    assert!(bundled(&without).contains(&typing), "{}", bundled(&without));
-    assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
+    (without, typing)
+}
+
+/// The type declarations a scan bundled.
+fn bundled(data: &CloudRepoData) -> String {
+    data.bundled_types.clone().unwrap_or_default()
 }
 
 /// A store with nothing to say states nothing, and a refusal (`403
@@ -485,4 +496,6 @@ async fn an_incremental_scan_asks_again_and_states_the_same_rows() {
         socket_anchors(&data),
         vec![("src/presence.ts".to_string(), 5)]
     );
+    let (_, typing) = typed_emit_without_claims(&repo, &sidecar).await;
+    assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
 }
