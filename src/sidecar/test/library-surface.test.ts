@@ -436,8 +436,8 @@ describe('list_library_surface (carrick#1660)', () => {
       keys.map(k => [k.name, k.optional, k.accepts_string, k.function]),
       [
         ['id', false, true, false],
-        ['run', false, false, true],
         ['retries', true, false, false],
+        ['run', false, false, true],
       ]
     );
   });
@@ -458,7 +458,7 @@ describe('list_library_surface (carrick#1660)', () => {
     const broker = nested.exports.find(e => e.export === 'broker')!;
     assert.deepStrictEqual(broker.receivers.map(r => r.receiver), ['export', 'instance:new:Producer']);
     const producer = broker.receivers[1];
-    assert.deepStrictEqual(producer.members.map(m => m.name), ['send', 'inspect']);
+    assert.deepStrictEqual(producer.members.map(m => m.name), ['inspect', 'send']);
 
     // The receiver the listing names is one the verifier reads claims on.
     const check = (claim_id: string, receiver: string, claim: Record<string, unknown>) => ({
@@ -508,8 +508,8 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(emitter.receivers.map(r => r.receiver), [
       'export',
       'instance:new',
-      'instance:from',
       'instance:new:EventEmitter',
+      'instance:from',
     ]);
     const instance = emitter.receivers.find(r => r.receiver === 'instance:new')!;
     // The runtime module's home is the runtime's types package: its members are its own.
@@ -604,8 +604,8 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(events.exports[0].receivers.map(r => r.receiver), [
       'export',
       'instance:new',
-      'instance:from',
       'instance:new:EventEmitter',
+      'instance:from',
     ]);
     assert.deepStrictEqual(nameSlots(events, 'default', 'instance:new', 'emit'), [{ type: 'string | symbol', accepts_string: true }]);
     const verdicts = await client.send<VerdictResponse>(
@@ -773,7 +773,7 @@ describe('list_library_surface (carrick#1660)', () => {
     // Bound only through its own type parameters.
     assert.deepStrictEqual(ownFlags(socket, 'passThrough', 'instance:()'), [['on', false]]);
     // Declared here, with a signature the base package writes.
-    assert.deepStrictEqual(ownFlags(socket, 'Proxy', 'instance:new'), [['relay', false], ['close', true]]);
+    assert.deepStrictEqual(ownFlags(socket, 'Proxy', 'instance:new'), [['close', true], ['relay', false]]);
     // Of a member with two signatures, the one this package writes.
     const mixed = socket.exports.find(e => e.export === 'Mixed')!.receivers.find(r => r.receiver === 'instance:new')!;
     assert.deepStrictEqual(
@@ -858,9 +858,9 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(
       first('route').keys!.map(k => [k.name, k.accepts_string, k.optional]),
       [
-        ['topic', true, true],
-        ['queue', true, true],
         ['durable', false, true],
+        ['queue', true, true],
+        ['topic', true, true],
       ]
     );
     // An overload whose return says nothing makes no instance, as no maker
@@ -919,6 +919,63 @@ describe('list_library_surface (carrick#1660)', () => {
     const [core, after] = (await surface(['@fixture/mapped-core', 'fixture-mapped'])).surfaces;
     assert.deepStrictEqual(members(core), ['get', 'set']);
     assert.deepStrictEqual(members(after), members(alone));
+  });
+
+  it('hashes a union the same in any order its members are declared, inside a callback or a conditional too', async () => {
+    // One package, declared twice with the members of each union written in
+    // the other order: the compiler prints a union in the order it made the
+    // members, so each install would list its own order.
+    // A union long enough that the compiler's printer would cut it short
+    // keeps the members it made first.
+    const kinds = Array.from({ length: 40 }, (_, i) => `'kind_${String(i).padStart(2, '0')}'`);
+    const declare = (a: string, b: string, order: string[]) => `export interface Job {
+  then(onrejected?: ((reason: ${a} | ${b}) => void) | null): Job;
+  pick<K>(key: K): K extends 'one' ? ${a} | ${b} : never;
+  state(): ${a} | ${b};
+  kind(): ${order.join(' | ')};
+}
+export declare function job(): Job;
+`;
+    const install = (text: string) => ({
+      'tsconfig.json': TSCONFIG,
+      'node_modules/fixture-callbacks/package.json': packageJson('fixture-callbacks', '1.0.0'),
+      'node_modules/fixture-callbacks/index.d.ts': text,
+    });
+    const first = await sidecarOn(install(declare("'timeout'", "'closed'", kinds)));
+    const second = await sidecarOn(install(declare("'closed'", "'timeout'", [...kinds].reverse())));
+    const a = await lister(first.client, first.root)(['fixture-callbacks']);
+    const b = await lister(second.client, second.root)(['fixture-callbacks']);
+    const then = a.surfaces[0].exports[0].receivers.find(r => r.receiver === 'instance:()')!.members.find(m => m.name === 'then')!;
+    assert.strictEqual(then.signatures[0].params[0].type, '((reason: "closed" | "timeout") => void) | null | undefined');
+    assert.strictEqual(b.surface_sha256, a.surface_sha256);
+  });
+
+  it('lists members and keys by name, so a mapped type lists the same in any declaration order', async () => {
+    // A client typed by a mapped type over a key map, and an options type
+    // mapped over another: their properties come in key order.
+    const declare = (first: string, second: string) => `export interface Commands {
+  ${first}: unknown;
+  ${second}: unknown;
+}
+export interface Address {
+  ${first === 'get' ? 'host: string;\n  port: number;' : 'port: number;\n  host: string;'}
+}
+export type Client = Record<keyof Commands, (key: string) => void>;
+export declare function connect(options: Partial<Address>): Client;
+`;
+    const install = (text: string) => ({
+      'tsconfig.json': TSCONFIG,
+      'node_modules/fixture-mapped-order/package.json': packageJson('fixture-mapped-order', '1.0.0'),
+      'node_modules/fixture-mapped-order/index.d.ts': text,
+    });
+    const first = await sidecarOn(install(declare('get', 'set')));
+    const second = await sidecarOn(install(declare('set', 'get')));
+    const a = await lister(first.client, first.root)(['fixture-mapped-order']);
+    const b = await lister(second.client, second.root)(['fixture-mapped-order']);
+    const connect = a.surfaces[0].exports[0];
+    assert.deepStrictEqual(connect.receivers.find(r => r.receiver === 'instance:()')!.members.map(m => m.name), ['get', 'set']);
+    assert.deepStrictEqual(connect.receivers[0].call![0].params[0].keys!.map(k => k.name), ['host', 'port']);
+    assert.strictEqual(b.surface_sha256, a.surface_sha256);
   });
 
   it('carries one full-surface hash, the same from any directory and with no directory in it', async () => {

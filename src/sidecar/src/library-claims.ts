@@ -40,7 +40,6 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
-import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
 import type {
   ClaimSlot,
   KeyLabel,
@@ -2348,7 +2347,7 @@ class DeclarationReader {
       const callee = this.ownCallee(holder, [], null, form);
       if ('signatures' in callee) makers.push({ receiver, member: false, signatures: callee.signatures });
     }
-    for (const property of this.namedProperties(type)) {
+    for (const property of sortedByName(this.namedProperties(type))) {
       for (const [form, prefix] of [['call', 'instance:'], ['new', 'instance:new:']] as const) {
         const callee = this.ownCallee(holder, [], property.getName(), form);
         if ('signatures' in callee) {
@@ -2414,7 +2413,7 @@ class DeclarationReader {
     }
     if (this.isOpenTop(type)) return receiver;
     names.push(() => {
-      for (const property of this.namedProperties(type)) {
+      for (const property of sortedByName(this.namedProperties(type))) {
         const library = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
         if (library.length === 0 || !take()) continue;
         // Own when an op claim reads the member at all (`ownCallee`): its
@@ -2468,8 +2467,8 @@ class DeclarationReader {
   }
 
   /**
-   * The keys a claim can name at an object argument: every key of each view
-   * the verifier reads one at a time (`keyViews`), in first-seen order. A
+   * The keys a claim can name at an object argument, by name: every key of
+   * each view the verifier reads one at a time (`keyViews`). A
    * key accepts a string, or is a handler, when it does so in some view, as
    * a keyed name or handler is checked (`viewFor`). It is optional when a
    * call can leave it out: some view marks it optional or does not declare it.
@@ -2499,6 +2498,7 @@ class DeclarationReader {
       }
     }
     return [...keys.values()]
+      .sort((a, b) => byName(a.name, b.name))
       .filter(() => take())
       .map(({ views: declaredIn, ...key }) => ({ ...key, optional: key.optional || declaredIn < views.length }));
   }
@@ -2510,11 +2510,40 @@ class DeclarationReader {
    * so where the cut falls does not depend on where the package is installed.
    */
   private printed(type: ts.Type): string {
-    let text = this.checker.typeToString(type);
+    const node = this.checker.typeToTypeNode(type, undefined, PRINT_FLAGS);
+    const text = node === undefined ? this.checker.typeToString(type) : printTypeNode(this.orderUnions(node));
+    return truncate(this.scrubbed(text));
+  }
+
+  /** `text` with the service root written as `<root>`. */
+  private scrubbed(text: string): string {
     for (const root of this.printedRoots) text = text.split(root).join('<root>');
-    // The compiler prints a union in creation order, which moves with
-    // whatever the program read first: put it in canonical order.
-    return truncate(canonicalizeUnionsInText(text));
+    return text;
+  }
+
+  /**
+   * `node` with the members of every union in it, at every depth (inside a
+   * function or a conditional type too), sorted by their own print with the
+   * root scrubbed, compared by UTF-16 code unit. The compiler prints a union
+   * in the order it made the members, which moves with whatever the program
+   * read first.
+   */
+  private orderUnions(node: ts.TypeNode): ts.TypeNode {
+    const result = ts.transform(node, [
+      context => root => {
+        const visit = (child: ts.Node): ts.Node => {
+          const next = ts.visitEachChild(child, visit, context);
+          if (!ts.isUnionTypeNode(next)) return next;
+          const keyed = next.types.map(member => ({ member, key: this.scrubbed(printTypeNode(member)) }));
+          keyed.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+          return ts.factory.updateUnionTypeNode(next, ts.factory.createNodeArray(keyed.map(({ member }) => member)));
+        };
+        return ts.visitNode(root, visit) as ts.TypeNode;
+      },
+    ]);
+    const [ordered] = result.transformed;
+    result.dispose();
+    return ordered;
   }
 
   // --------------------------------------------------------------------------
@@ -2961,6 +2990,43 @@ class DeclarationReader {
     }
     return this.isOpenTop(rest) ? rest : VARIADIC;
   }
+}
+
+/**
+ * What `typeToString` asks the node builder for, less its length cut: a
+ * union the builder cuts short keeps the members it made first, so the
+ * listing orders every union before its own cut (`truncate`).
+ */
+const PRINT_FLAGS =
+  ts.NodeBuilderFlags.AllowUniqueESSymbolType |
+  ts.NodeBuilderFlags.UseAliasDefinedOutsideCurrentScope |
+  ts.NodeBuilderFlags.IgnoreErrors |
+  ts.NodeBuilderFlags.NoTruncation;
+
+const TYPE_PRINTER = ts.createPrinter({ removeComments: true });
+
+/**
+ * A type node as `typeToString` prints it with no enclosing declaration: with
+ * no source file, so a node the builder reused from a declaration prints its
+ * own text.
+ */
+function printTypeNode(node: ts.Node): string {
+  return TYPE_PRINTER.printNode(ts.EmitHint.Unspecified, node, undefined as unknown as ts.SourceFile);
+}
+
+/** Code-unit order on names. */
+function byName(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Properties by name. A type's own property order is declaration order, but
+ * a mapped type's (`Record<keyof M, F>`, `Partial<A & B>`) follows its key
+ * union, in the order the compiler made the keys: listed as it comes, the
+ * order would move with whatever the program read first.
+ */
+function sortedByName(properties: readonly ts.Symbol[]): ts.Symbol[] {
+  return [...properties].sort((a, b) => byName(a.getName(), b.getName()));
 }
 
 /** A printed type, cut to a length a listing can carry. */
