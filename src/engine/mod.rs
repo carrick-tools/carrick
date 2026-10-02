@@ -3779,7 +3779,7 @@ fn scan_protocol_extractions(
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
-    merge_graphql_consumer_locations(&mut graphql, file_results);
+    merge_graphql_consumer_locations(&mut graphql, file_results, repo_path);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
     // through a relative specifier.
@@ -5196,14 +5196,18 @@ fn merge_graphql_resolver_locations(
 fn merge_graphql_consumer_locations(
     graphql: &mut crate::graphql::GraphqlExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
 ) {
     // (file_path, canonical_key) -> index. A consumer op's identity for this
     // join is its file AND its operation key together — never the key alone.
+    // Both sides are read repo-relative: the op carries the path the scan
+    // discovered, and the incremental path's answers are keyed repo-relative
+    // (carrick#1725).
     let mut by_file_key: HashMap<(String, String), usize> = HashMap::new();
     for (idx, op) in graphql.consumers.iter().enumerate() {
         by_file_key.insert(
             (
-                op.file_path.to_string_lossy().to_string(),
+                repo_relative(&op.file_path.to_string_lossy(), repo_path),
                 op.key.canonical(),
             ),
             idx,
@@ -5213,7 +5217,8 @@ fn merge_graphql_consumer_locations(
     for (path, result) in file_results {
         for locate in &result.graphql_consumer_locates {
             let key = OperationKey::graphql(locate.kind, locate.field.clone());
-            let Some(&idx) = by_file_key.get(&(path.clone(), key.canonical())) else {
+            let file = repo_relative(path, repo_path);
+            let Some(&idx) = by_file_key.get(&(file, key.canonical())) else {
                 debug!(
                     op = %key.canonical(),
                     file = %path,
@@ -17101,7 +17106,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         let order = &graphql.consumers[0];
         assert_eq!(
@@ -17172,7 +17177,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         let web = graphql
             .consumers
@@ -17193,6 +17198,57 @@ mod tests {
             admin.consumer_located_type_symbol.as_deref(),
             Some("AdminOrderUpdate"),
             "admin-dashboard must get its OWN located type, not web-frontend's"
+        );
+    }
+
+    /// carrick#1725: the op carries the path the scan discovered, absolute
+    /// under an absolute repo path, while the incremental path keys the
+    /// replayed answers repo-relative. Both forms of the answer's key must
+    /// meet the op, and a file outside the repo must not.
+    #[test]
+    fn merge_graphql_consumer_locations_joins_absolute_ops_to_either_key_form() {
+        use crate::agents::file_analyzer_agent::GraphqlConsumerLocate;
+        use crate::operation::GraphqlOperationKind;
+
+        let locate = |symbol: &str| FileAnalysisResult {
+            graphql_consumer_locates: vec![GraphqlConsumerLocate {
+                kind: GraphqlOperationKind::Subscription,
+                field: "orderUpdated".to_string(),
+                result_type_symbol: symbol.to_string(),
+                result_type_source: None,
+            }],
+            ..Default::default()
+        };
+        let located = |key: &str, repo: &str| {
+            let mut graphql = crate::graphql::GraphqlExtraction {
+                producers: vec![],
+                consumers: vec![graphql_consumer_op_at(
+                    GraphqlOperationKind::Subscription,
+                    "orderUpdated",
+                    "/work/web/lib/graphql.ts",
+                    None,
+                )],
+                input_declarations: Default::default(),
+            };
+            let file_results = HashMap::from([(key.to_string(), locate("OrderUpdate"))]);
+            merge_graphql_consumer_locations(&mut graphql, &file_results, repo);
+            graphql.consumers[0].consumer_located_type_symbol.clone()
+        };
+
+        assert_eq!(
+            located("lib/graphql.ts", "/work/web").as_deref(),
+            Some("OrderUpdate"),
+            "the incremental path's repo-relative key"
+        );
+        assert_eq!(
+            located("/work/web/lib/graphql.ts", "/work/web/").as_deref(),
+            Some("OrderUpdate"),
+            "the full path's discovered key, with a trailing slash on the repo"
+        );
+        assert_eq!(
+            located("lib/graphql.ts", "/work/other"),
+            None,
+            "an op outside the repo stays absolute and meets no relative key"
         );
     }
 
@@ -17232,7 +17288,7 @@ mod tests {
             },
         );
 
-        merge_graphql_consumer_locations(&mut graphql, &file_results);
+        merge_graphql_consumer_locations(&mut graphql, &file_results, "");
 
         assert_eq!(graphql.consumers.len(), 1, "no new consumer op was created");
         assert_eq!(
