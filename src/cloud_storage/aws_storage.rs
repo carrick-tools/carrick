@@ -2937,6 +2937,60 @@ mod tests {
         assert!(malformed.staged);
         assert!(malformed.staged_url.is_none());
     }
+
+    /// A peer row whose `name_scope` holds a scope this build has no word for
+    /// (a newer scanner wrote it) never fails the cross-repo fetch: the whole
+    /// response is one parse, so one such row would otherwise drop every
+    /// peer. The value is kept, and the matcher restricts it like `service`
+    /// (carrick#1663).
+    #[test]
+    fn a_peer_row_with_an_unknown_scope_never_fails_the_cross_repo_fetch() {
+        let row = serde_json::json!({
+            "owner": null,
+            "key": { "protocol": "pubsub", "topic": "sync" },
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": null,
+            "request_type": null,
+            "response_type": null,
+            "file_path": "src/sync.ts:1",
+            "name_scope": { "scope": "region", "namespace": null },
+        });
+        let body = serde_json::json!({
+            "repos": [{
+                "repo": "org/svc-a",
+                "hash": "deadbeef",
+                "s3Url": "https://example.invalid/svc-a.json",
+                "filename": "svc-a.json",
+                "lastUpdated": "2026-10-02T00:00:00Z",
+                "metadata": {
+                    "repo_name": "org/svc-a",
+                    "service_name": "svc-a",
+                    "endpoints": [row.clone()],
+                    "calls": [row],
+                    "mounts": [], "apps": {},
+                    "imported_handlers": [], "function_definitions": {},
+                    "last_updated": "2026-10-02T00:00:00Z",
+                    "commit_hash": "deadbeef"
+                }
+            }]
+        });
+        let parsed: CrossRepoResponse =
+            serde_json::from_value(body).expect("an unknown scope never fails the fetch");
+        let metadata = parsed.repos[0]
+            .metadata
+            .as_ref()
+            .expect("the peer's metadata");
+        for row in metadata.endpoints.iter().chain(&metadata.calls) {
+            let scope = row
+                .name_scope
+                .as_ref()
+                .expect("the row keeps its name_scope");
+            assert_eq!(scope.scope, "region");
+            assert!(!scope.crosses_services());
+        }
+    }
     /// One request against a local server, with the laptop credential. Returns
     /// the raw request the server saw, so the headers and the body are both
     /// assertable.

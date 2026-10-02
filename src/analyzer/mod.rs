@@ -363,6 +363,26 @@ where
     }))
 }
 
+impl ApiEndpointDetails {
+    /// The service this row belongs to, `service_name ?? repo_name`, as the
+    /// cross-repo merge stamps it and the cloud reads it. `None` outside
+    /// cross-repo mode, where every row is the one scanned service's.
+    fn service_id(&self) -> Option<&str> {
+        self.service_name.as_deref().or(self.repo_name.as_deref())
+    }
+
+    /// This row as one side of a name-scope pairing
+    /// ([`carrick_match::names_pair`]). An unattributed row reads as the
+    /// empty service, so two of them are one service, as they are in a
+    /// single-service run.
+    fn scoped(&self) -> carrick_match::ScopedRow<'_> {
+        carrick_match::ScopedRow {
+            service: self.service_id().unwrap_or_default(),
+            name_scope: self.name_scope.as_ref(),
+        }
+    }
+}
+
 pub struct ApiAnalysisResult {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
@@ -490,6 +510,17 @@ fn exact_key_protocol(pseudo_method: &str) -> Option<crate::operation::Protocol>
 /// HTTP row's service and identity are empty: it is keyed by its call site
 /// alone, as before.
 type ConsumerRowKey = (crate::operation::Protocol, String, String, String, u32);
+
+/// What a verdict's fold reads off its consumer row: the source that stated
+/// it, and the scope its name states, which decides the producer rows it
+/// pairs with (carrick#1663). Two rows on one line with one key and two
+/// namespaces share a [`ConsumerRowKey`], and the verdict cannot say which
+/// it is about; the last one read wins.
+#[derive(Clone, Copy)]
+struct ConsumerRow<'a> {
+    source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    name_scope: Option<&'a carrick_match::NameScope>,
+}
 
 /// Reconstruct a verified endpoint's DISPLAY `(method_or_label, path_or_name)`
 /// from a canonical `OperationKey` string, matching [`OperationKey::display_labels`]
@@ -2936,9 +2967,16 @@ impl Analyzer {
     }
 
     /// Match consumers against producers of a protocol whose operations have
-    /// exact key identity (GraphQL fields, socket events) — no URL or mount
-    /// hierarchy to normalize. Returns `(findings, verified,
+    /// exact key identity (GraphQL fields, socket events, pub/sub topics) — no
+    /// URL or mount hierarchy to normalize. Returns `(findings, verified,
     /// cross_repo_matches)`.
+    ///
+    /// A call pairs with a producer row when their keys are equal and
+    /// [`carrick_match::names_pair`] allows it: a name scoped to one service
+    /// pairs only inside it, and two namespaces never pair (carrick#1663). A
+    /// row that states no `name_scope` adds no restriction, so an index
+    /// written before the field pairs as it did. The cloud reads the same
+    /// rule, so the PR check and the cloud agree on which rows pair.
     ///
     /// If no producer of the protocol is indexed anywhere, consumers are
     /// skipped silently: the producing service may simply not be scanned,
@@ -2946,119 +2984,134 @@ impl Analyzer {
     /// producers are reported as orphans, the same soft signal REST orphans
     /// get.
     fn analyze_exact_key_matches(&self, protocol: crate::operation::Protocol) -> MatcherOutput {
-        let producer_keys: HashSet<&OperationKey> = self
+        let producers: Vec<&ApiEndpointDetails> = self
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.key.protocol() == protocol)
-            .map(|endpoint| &endpoint.key)
             .collect();
-        if producer_keys.is_empty() {
+        if producers.is_empty() {
             return (Vec::new(), Vec::new(), Vec::new());
         }
-
-        // Producer repo ids (service_name ?? repo_name) per canonical key, so a
-        // matched consumer can be attributed for a `CrossRepoMatch`. A key with
-        // no repo identity yields no edge (the same guard the HTTP path applies).
-        // Multiple producers can legitimately share one exact key — two services
-        // exposing the same GraphQL field, or several listeners for one socket
-        // event — and exact-key matching has no URL to disambiguate them. So
-        // collect ALL distinct producer repos (a `BTreeMap` for deterministic
-        // order) and emit one edge per producer↔consumer pair, rather than
-        // arbitrarily keeping the first by iteration order. Each repo carries
-        // the producer's provenance; when one repo has several producers on the
-        // same key, route-wins (`EndpointProvenance::min`, #380).
-        let mut producer_repos_by_key: HashMap<
-            String,
-            std::collections::BTreeMap<String, crate::operation::EndpointProvenance>,
-        > = HashMap::new();
-        for endpoint in &self.endpoints {
-            if endpoint.key.protocol() != protocol {
-                continue;
-            }
-            if let Some(repo) = endpoint
-                .service_name
-                .clone()
-                .or_else(|| endpoint.repo_name.clone())
-            {
-                producer_repos_by_key
-                    .entry(endpoint.key.canonical())
-                    .or_default()
-                    .entry(repo)
-                    .and_modify(|provenance| *provenance = (*provenance).min(endpoint.provenance))
-                    .or_insert(endpoint.provenance);
-            }
+        // The producer rows under each exact key, by their index in
+        // `producers`. Several rows can legitimately share one key — two
+        // services exposing the same GraphQL field, several listeners for one
+        // socket event — and the name-scope rule decides, row by row, which
+        // of them a call pairs with.
+        let mut producers_by_key: HashMap<&OperationKey, Vec<usize>> = HashMap::new();
+        for (index, endpoint) in producers.iter().enumerate() {
+            producers_by_key
+                .entry(&endpoint.key)
+                .or_default()
+                .push(index);
         }
 
         // (label, name) → call sites, BTree-keyed so same-op call sites
         // collapse into one finding in deterministic order.
         let mut missing: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         let mut cross_repo_matches: Vec<CrossRepoMatch> = Vec::new();
-        let mut matched: HashSet<&OperationKey> = HashSet::new();
+        // Whether some call pairs with each producer row.
+        let mut paired = vec![false; producers.len()];
         let mut seen_calls = HashSet::new();
         for call in &self.calls {
             if call.key.protocol() != protocol {
                 continue;
             }
-            let dedup = format!("{}:{}", call.key.canonical(), call.file_path.display());
+            // One call per site. The call's service and scope are part of the
+            // site: the name-scope rule pairs by them, so neither another
+            // service's call at the same repo-relative path nor another kind of
+            // id on the same line decides this one.
+            let dedup = (
+                format!("{}:{}", call.key.canonical(), call.file_path.display()),
+                call.service_id(),
+                call.name_scope.as_ref(),
+            );
             if !seen_calls.insert(dedup) {
                 continue;
             }
-            if producer_keys.contains(&call.key) {
-                matched.insert(&call.key);
-                // Emit the cross-repo edge. Exact-key protocols share one key on
-                // both sides, so producer_key == consumer_key. For sockets the
-                // producer is the listener (an endpoint) and the consumer is the
-                // emitter (a call); this attribution follows directly from which
-                // side the op sits on. `type_compatible` is left `None` —
-                // `overlay_compat_verdicts` fills it in if compat ran.
-                let consumer_repo = call.service_name.clone().or_else(|| call.repo_name.clone());
-                let canonical = call.key.canonical();
-                if let (Some(producer_repos), Some(consumer_repo)) =
-                    (producer_repos_by_key.get(&canonical), consumer_repo)
-                {
-                    for (producer_repo, producer_provenance) in producer_repos {
-                        // Same-repo publisher↔subscriber (or listener↔emitter) is
-                        // an intra-repo self-loop, not a cross-repo contract edge.
-                        // Drop it structurally on repo identity alone (never on
-                        // topic-name or library patterns) so a dead-letter retry
-                        // loop or any in-process fan-out doesn't surface as a
-                        // self-match. A key that OTHER repos also participate on
-                        // still emits its genuine cross-repo edges — only the
-                        // producer==consumer pair is skipped.
-                        if *producer_repo == consumer_repo {
-                            continue;
-                        }
-                        cross_repo_matches.push(CrossRepoMatch {
-                            producer_repo: producer_repo.clone(),
-                            producer_key: canonical.clone(),
-                            consumer_repo: consumer_repo.clone(),
-                            consumer_key: canonical.clone(),
-                            // Exact-key producers are definition-side entries
-                            // (SDL root fields, socket listeners, pub/sub
-                            // subscribers), so the pair is a real
-                            // producer/consumer edge.
-                            relationship: carrick_match::classify_relationship(
-                                carrick_match::MatchEvidence::RouteDefinition,
-                                carrick_match::MatchEvidence::CallSite,
-                            ),
-                            // Exact-key protocols (GraphQL/socket) ARE
-                            // type-checked, so this consumer location feeds the
-                            // compat overlay (`apply_pair_outcomes`) and also
-                            // keeps the dedup identity precise.
-                            consumer_location: Some(call.file_path.display().to_string()),
-                            match_score: 1.0,
-                            type_compatible: None,
-                            type_verdict: None,
-                            mismatch_reason: None,
-                            producer_provenance: *producer_provenance,
-                        });
-                    }
-                }
-            } else {
+            let pairs_with: Vec<usize> = producers_by_key
+                .get(&call.key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&index| {
+                    carrick_match::names_pair(call.scoped(), producers[index].scoped())
+                })
+                .collect();
+            if pairs_with.is_empty() {
                 let (label, name) = call.key.display_labels();
                 missing.entry((label, name)).or_default().insert(
                     strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string(),
                 );
+                continue;
+            }
+            // Producer repo ids (service_name ?? repo_name) of the rows this
+            // call pairs with, so the pair can be attributed for a
+            // `CrossRepoMatch`. A row with no repo identity yields no edge (the
+            // same guard the HTTP path applies). Collect ALL distinct producer
+            // repos (a `BTreeMap` for deterministic order) and emit one edge per
+            // producer↔consumer pair, rather than arbitrarily keeping the first
+            // by iteration order. Each repo carries the producer's provenance;
+            // when one repo has several paired rows, route-wins
+            // (`EndpointProvenance::min`, #380).
+            let mut producer_repos: BTreeMap<&str, crate::operation::EndpointProvenance> =
+                BTreeMap::new();
+            for &index in &pairs_with {
+                paired[index] = true;
+                let producer = producers[index];
+                if let Some(repo) = producer.service_id() {
+                    producer_repos
+                        .entry(repo)
+                        .and_modify(|provenance| {
+                            *provenance = (*provenance).min(producer.provenance)
+                        })
+                        .or_insert(producer.provenance);
+                }
+            }
+            // Emit the cross-repo edge. Exact-key protocols share one key on
+            // both sides, so producer_key == consumer_key. For sockets the
+            // producer is the listener (an endpoint) and the consumer is the
+            // emitter (a call); this attribution follows directly from which
+            // side the op sits on. `type_compatible` is left `None` —
+            // `overlay_compat_verdicts` fills it in if compat ran.
+            let Some(consumer_repo) = call.service_id() else {
+                continue;
+            };
+            let canonical = call.key.canonical();
+            for (producer_repo, producer_provenance) in producer_repos {
+                // Same-repo publisher↔subscriber (or listener↔emitter) is an
+                // intra-repo self-loop, not a cross-repo contract edge. Drop it
+                // structurally on repo identity alone (never on topic-name or
+                // library patterns) so a dead-letter retry loop or any
+                // in-process fan-out doesn't surface as a self-match. A key that
+                // OTHER repos also participate on still emits its genuine
+                // cross-repo edges — only the producer==consumer pair is
+                // skipped.
+                if producer_repo == consumer_repo {
+                    continue;
+                }
+                cross_repo_matches.push(CrossRepoMatch {
+                    producer_repo: producer_repo.to_string(),
+                    producer_key: canonical.clone(),
+                    consumer_repo: consumer_repo.to_string(),
+                    consumer_key: canonical.clone(),
+                    // Exact-key producers are definition-side entries (SDL
+                    // root fields, socket listeners, pub/sub subscribers), so
+                    // the pair is a real producer/consumer edge.
+                    relationship: carrick_match::classify_relationship(
+                        carrick_match::MatchEvidence::RouteDefinition,
+                        carrick_match::MatchEvidence::CallSite,
+                    ),
+                    // Exact-key protocols (GraphQL/socket) ARE type-checked,
+                    // so this consumer location feeds the compat overlay
+                    // (`apply_pair_outcomes`) and also keeps the dedup
+                    // identity precise.
+                    consumer_location: Some(call.file_path.display().to_string()),
+                    match_score: 1.0,
+                    type_compatible: None,
+                    type_verdict: None,
+                    mismatch_reason: None,
+                    producer_provenance,
+                });
             }
         }
 
@@ -3068,17 +3121,25 @@ impl Analyzer {
                 Finding::missing_endpoint(label, name, None, sites.into_iter().collect())
             })
             .collect();
+        // One verified entry for a key some call pairs with a row of, and one
+        // orphan for a key with a row no call pairs with, each carrying the
+        // provenance of the first such row. Without a stated scope every row
+        // of a key is paired or none is, so a key is one or the other; with
+        // one, a task and a stream sharing a name can be both.
         let mut verified = Vec::new();
-        let mut seen_producers = HashSet::new();
-        for endpoint in &self.endpoints {
-            if endpoint.key.protocol() != protocol {
-                continue;
-            }
-            if !seen_producers.insert(endpoint.key.canonical()) {
+        let mut seen_verified = HashSet::new();
+        let mut seen_orphans = HashSet::new();
+        for (index, endpoint) in producers.iter().enumerate() {
+            let first = if paired[index] {
+                seen_verified.insert(&endpoint.key)
+            } else {
+                seen_orphans.insert(&endpoint.key)
+            };
+            if !first {
                 continue;
             }
             let (label, name) = endpoint.key.display_labels();
-            if matched.contains(&endpoint.key) {
+            if paired[index] {
                 verified.push(VerifiedEndpointEntry::new(label, name, endpoint.provenance));
             } else {
                 // GraphQL/socket producers are not repo-tagged at this layer, so
@@ -3449,7 +3510,7 @@ impl Analyzer {
                 .unwrap_or_else(|| alias.to_string())
         };
 
-        let consumer_sources = self.consumer_resolution_sources();
+        let consumer_rows = self.consumer_rows();
 
         outcomes
             .iter()
@@ -3463,8 +3524,6 @@ impl Analyzer {
                 // the risk row cites the repo-relative file.
                 let location = format!("{}:{}", outcome.consumer_file, outcome.consumer_line);
                 let call_sites = vec![strip_ci_workspace_prefix(&location).to_string()];
-                let producer_provenance =
-                    self.producer_provenance_for(&method, &path, &outcome.producer_service);
                 // The edge is the producer rows plus the one consumer call
                 // this verdict was reached at. The consumer key is the stored
                 // (unstripped) location, matching how the data calls are keyed;
@@ -3489,10 +3548,29 @@ impl Analyzer {
                         outcome.consumer_line.max(1),
                     ),
                 };
-                let mut sources =
-                    self.producer_resolution_sources_for(&method, &path, &outcome.producer_service);
-                match consumer_sources.get(&consumer_key) {
-                    Some(source) => sources.push(*source),
+                let consumer_row = consumer_rows.get(&consumer_key).copied();
+                // The consumer as a side of a name-scope pairing: the
+                // producer rows this verdict rests on are the ones it pairs
+                // with (carrick#1663), as the cloud folds a pair. A consumer
+                // row not in this graph states no scope of its own.
+                let consumer = carrick_match::ScopedRow {
+                    service: &outcome.consumer_service,
+                    name_scope: consumer_row.and_then(|row| row.name_scope),
+                };
+                let producer_provenance = self.producer_provenance_for(
+                    &method,
+                    &path,
+                    &outcome.producer_service,
+                    consumer,
+                );
+                let mut sources = self.producer_resolution_sources_for(
+                    &method,
+                    &path,
+                    &outcome.producer_service,
+                    consumer,
+                );
+                match consumer_row {
+                    Some(row) => sources.push(row.source),
                     // The consumer row is not in this graph (a peer whose
                     // calls did not merge). One side unknown is not a fact.
                     None => sources.push(None),
@@ -3548,13 +3626,17 @@ impl Analyzer {
     /// identity)` through [`parse_producer_key`], the join the edge overlay
     /// already uses, with the same param-agnostic normalization. Another
     /// service's producer of the same topic, event or field is not a row this
-    /// verdict rests on; the cloud folds a pair the same way. Empty for an
-    /// HTTP verb, whose producers are the mount graph's routes.
+    /// verdict rests on; the cloud folds a pair the same way. Of the named
+    /// service's rows, only those the consumer pairs with under the
+    /// name-scope rule count ([`carrick_match::names_pair`], carrick#1663),
+    /// so a task and a stream sharing a name are never folded together.
+    /// Empty for an HTTP verb, whose producers are the mount graph's routes.
     fn exact_key_producers<'a>(
         &'a self,
         pseudo_method: &'a str,
         identity: &str,
         producer_service: &'a str,
+        consumer: carrick_match::ScopedRow<'a>,
     ) -> impl Iterator<Item = &'a ApiEndpointDetails> + 'a {
         let want = exact_key_protocol(pseudo_method).map(|_| normalize_compat_path(identity));
         self.endpoints.iter().filter(move |endpoint| {
@@ -3562,14 +3644,11 @@ impl Analyzer {
                 return false;
             };
             endpoint.key.protocol() != crate::operation::Protocol::Http
-                && endpoint
-                    .service_name
-                    .as_deref()
-                    .or(endpoint.repo_name.as_deref())
-                    == Some(producer_service)
+                && endpoint.service_id() == Some(producer_service)
                 && parse_producer_key(&endpoint.key.canonical()).is_some_and(|(method, path)| {
                     method == pseudo_method && normalize_compat_path(&path) == want
                 })
+                && carrick_match::names_pair(consumer, endpoint.scoped())
         })
     }
 
@@ -3585,10 +3664,11 @@ impl Analyzer {
         method: &str,
         path: &str,
         producer_service: &str,
+        consumer: carrick_match::ScopedRow<'_>,
     ) -> crate::operation::EndpointProvenance {
         if exact_key_protocol(method).is_some() {
             return self
-                .exact_key_producers(method, path, producer_service)
+                .exact_key_producers(method, path, producer_service, consumer)
                 .map(|endpoint| endpoint.provenance)
                 .min()
                 .unwrap_or_default();
@@ -3626,10 +3706,11 @@ impl Analyzer {
         method: &str,
         path: &str,
         producer_service: &str,
+        consumer: carrick_match::ScopedRow<'_>,
     ) -> Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
         if exact_key_protocol(method).is_some() {
             return self
-                .exact_key_producers(method, path, producer_service)
+                .exact_key_producers(method, path, producer_service, consumer)
                 .map(|endpoint| endpoint.resolution_source)
                 .collect();
         }
@@ -3659,10 +3740,8 @@ impl Analyzer {
     /// under their protocol and, for socket, GraphQL and pub/sub rows, their
     /// service and operation ([`ConsumerRowKey`], carrick#1626). HTTP rows
     /// come from the mount graph's data calls; the others are the index's own
-    /// call rows.
-    fn consumer_resolution_sources(
-        &self,
-    ) -> HashMap<ConsumerRowKey, Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+    /// call rows, with the scope their names state.
+    fn consumer_rows(&self) -> HashMap<ConsumerRowKey, ConsumerRow<'_>> {
         let mut rows = HashMap::new();
         if let Some(mount_graph) = self.mount_graph.as_ref() {
             for call in mount_graph.get_data_calls() {
@@ -3675,7 +3754,10 @@ impl Analyzer {
                         file,
                         line,
                     ),
-                    call.resolution_source,
+                    ConsumerRow {
+                        source: call.resolution_source,
+                        name_scope: None,
+                    },
                 );
             }
         }
@@ -3684,7 +3766,7 @@ impl Analyzer {
             if protocol == crate::operation::Protocol::Http {
                 continue;
             }
-            let Some(service) = call.service_name.as_ref().or(call.repo_name.as_ref()) else {
+            let Some(service) = call.service_id() else {
                 continue;
             };
             let Some((_, identity)) = parse_producer_key(&call.key.canonical()) else {
@@ -3694,12 +3776,15 @@ impl Analyzer {
             rows.insert(
                 (
                     protocol,
-                    service.clone(),
+                    service.to_string(),
                     normalize_compat_path(&identity),
                     file,
                     line,
                 ),
-                call.resolution_source,
+                ConsumerRow {
+                    source: call.resolution_source,
+                    name_scope: call.name_scope.as_ref(),
+                },
             );
         }
         rows
@@ -4730,6 +4815,286 @@ mod tests {
         assert_eq!(edges[0].consumer_repo, "orders-engine");
     }
 
+    /// The name-scope vectors carrick-match and the cloud run (carrick#1663),
+    /// unchanged, through the scanner's own exact-key join.
+    const NAME_SCOPE_VECTORS: &str =
+        include_str!("../../crates/carrick-match/tests/fixtures/name-scope-pairing.vectors.json");
+
+    /// One exact-key row as a peer blob carries it: the key in its wire shape
+    /// and the `name_scope` object only when the row states one, read
+    /// through the row's own deserializer. The service is stamped as the
+    /// cross-repo merge stamps it.
+    fn peer_row(
+        key: serde_json::Value,
+        file_path: &str,
+        service: &str,
+        name_scope: Option<&serde_json::Value>,
+    ) -> ApiEndpointDetails {
+        let mut row = serde_json::json!({
+            "owner": null,
+            "key": key,
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": null,
+            "request_type": null,
+            "response_type": null,
+            "file_path": file_path,
+        });
+        if let Some(name_scope) = name_scope {
+            row["name_scope"] = name_scope.clone();
+        }
+        let mut row: ApiEndpointDetails = serde_json::from_value(row).expect("a peer row reads");
+        row.service_name = Some(service.to_string());
+        row
+    }
+
+    /// Every case of the vectors, through `analyze_exact_key_matches`. Each
+    /// row sits in its own file under its own service. A pair across services
+    /// is an edge from the call's site to the producer's service; a pair
+    /// inside one service draws no edge but still uses its call and its
+    /// producer. A call in no pair is missing, and a producer row in no pair
+    /// leaves its operation orphaned.
+    #[test]
+    fn the_name_scope_vectors_pair_through_the_exact_key_join() {
+        use crate::operation::Protocol;
+        let vectors: serde_json::Value =
+            serde_json::from_str(NAME_SCOPE_VECTORS).expect("the vector file is JSON");
+        let cases = vectors["cases"].as_array().expect("`cases` is an array");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let id = case["id"].as_str().expect("a case id");
+            let text = |row: &serde_json::Value, field: &str| -> String {
+                row[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{id}: `{field}` is not a string"))
+                    .to_string()
+            };
+            let file_of = |row_id: &str| format!("src/{row_id}.ts:1");
+            let mut analyzer = Analyzer::new(Config::default());
+            // Row id -> (is a producer, service, display labels).
+            let mut rows: HashMap<String, (bool, String, (String, String))> = HashMap::new();
+            for row in case["rows"].as_array().expect("`rows` is an array") {
+                let row_id = text(row, "id");
+                let service = text(row, "service");
+                let name = text(row, "name");
+                let key = match text(row, "protocol").as_str() {
+                    "pubsub" => serde_json::json!({ "protocol": "pubsub", "topic": name }),
+                    "socket" => serde_json::json!({
+                        "protocol": "socket",
+                        "event": name,
+                        "direction": row.get("direction").cloned().unwrap_or("unknown".into()),
+                    }),
+                    other => panic!("{id}: protocol {other}"),
+                };
+                let details = peer_row(key, &file_of(&row_id), &service, row.get("name_scope"));
+                let producer = match text(row, "side").as_str() {
+                    "producer" => true,
+                    "consumer" => false,
+                    other => panic!("{id}: side {other}"),
+                };
+                rows.insert(row_id, (producer, service, details.key.display_labels()));
+                if producer {
+                    analyzer.endpoints.push(details);
+                } else {
+                    analyzer.calls.push(details);
+                }
+            }
+            let pairs: BTreeSet<(String, String)> = case["pairs"]
+                .as_array()
+                .expect("`pairs` is an array")
+                .iter()
+                .map(|pair| {
+                    (
+                        pair[0].as_str().expect("a consumer id").to_string(),
+                        pair[1].as_str().expect("a producer id").to_string(),
+                    )
+                })
+                .collect();
+
+            let mut edges = BTreeSet::new();
+            let mut missing = BTreeSet::new();
+            let mut orphaned = BTreeSet::new();
+            let mut verified = BTreeSet::new();
+            for protocol in [Protocol::Pubsub, Protocol::Websocket] {
+                let (findings, verified_entries, matches) =
+                    analyzer.analyze_exact_key_matches(protocol);
+                for edge in matches {
+                    edges.insert((
+                        edge.consumer_location
+                            .expect("an exact-key edge names its call"),
+                        edge.producer_repo,
+                    ));
+                }
+                for finding in findings {
+                    match finding {
+                        Finding::MissingEndpoint { call_sites, .. } => missing.extend(call_sites),
+                        Finding::OrphanedEndpoint { method, path, .. } => {
+                            orphaned.insert((method, path));
+                        }
+                        other => panic!("{id}: unexpected finding {other:?}"),
+                    }
+                }
+                verified.extend(verified_entries.into_iter().map(|v| (v.method, v.path)));
+            }
+
+            let row = |row_id: &str| &rows[row_id];
+            let expected_edges: BTreeSet<(String, String)> = pairs
+                .iter()
+                .filter(|(call, producer)| row(call).1 != row(producer).1)
+                .map(|(call, producer)| (file_of(call), row(producer).1.clone()))
+                .collect();
+            assert_eq!(edges, expected_edges, "{id}: edges");
+            let paired_calls: BTreeSet<&str> =
+                pairs.iter().map(|(call, _)| call.as_str()).collect();
+            let paired_producers: BTreeSet<&str> = pairs
+                .iter()
+                .map(|(_, producer)| producer.as_str())
+                .collect();
+            let expected_missing: BTreeSet<String> = rows
+                .iter()
+                .filter(|(row_id, (producer, ..))| {
+                    !producer && !paired_calls.contains(row_id.as_str())
+                })
+                .map(|(row_id, _)| file_of(row_id))
+                .collect();
+            assert_eq!(missing, expected_missing, "{id}: missing calls");
+            let labels_of = |paired: bool| -> BTreeSet<(String, String)> {
+                rows.iter()
+                    .filter(|(row_id, (producer, ..))| {
+                        *producer && paired_producers.contains(row_id.as_str()) == paired
+                    })
+                    .map(|(_, (_, _, labels))| labels.clone())
+                    .collect()
+            };
+            assert_eq!(verified, labels_of(true), "{id}: verified operations");
+            assert_eq!(orphaned, labels_of(false), "{id}: orphaned operations");
+        }
+    }
+
+    /// A call is one site per service and per scope (carrick#1663). Two
+    /// services can hold a call at the same repo-relative path, and one line
+    /// can trigger a task and send to a stream of one name: each is decided by
+    /// its own service and scope, never folded into the other.
+    #[test]
+    fn a_call_site_is_one_per_service_and_scope() {
+        use crate::operation::Protocol;
+        let topic = || serde_json::json!({ "protocol": "pubsub", "topic": "child" });
+        let task = serde_json::json!({ "scope": "service", "namespace": "task" });
+        let stream = serde_json::json!({ "scope": "service", "namespace": "input_stream" });
+        let mut analyzer = Analyzer::new(Config::default());
+        // Each service defines its own task `child`, triggers it from the same
+        // repo-relative file, and svc-a also sends to a stream `child` that no
+        // one reads, from the same line.
+        for service in ["svc-a", "svc-b"] {
+            analyzer
+                .endpoints
+                .push(peer_row(topic(), "src/tasks.ts:1", service, Some(&task)));
+            analyzer
+                .calls
+                .push(peer_row(topic(), "src/trigger.ts:3", service, Some(&task)));
+        }
+        analyzer.calls.push(peer_row(
+            topic(),
+            "src/trigger.ts:3",
+            "svc-a",
+            Some(&stream),
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_exact_key_matches(Protocol::Pubsub);
+        assert!(
+            edges.is_empty(),
+            "a service-scoped task never crosses: {edges:?}"
+        );
+        assert_eq!(
+            findings,
+            vec![Finding::missing_endpoint(
+                "PUBSUB",
+                "child",
+                None,
+                vec!["src/trigger.ts:3".to_string()]
+            )],
+            "both tasks are used, and the stream send pairs with nothing"
+        );
+        assert_eq!(
+            verified
+                .iter()
+                .map(|v| (v.method.as_str(), v.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("PUBSUB", "child")]
+        );
+    }
+
+    /// With no `name_scope` anywhere, two services that publish one topic
+    /// from the same repo-relative path are two calls, each with its own
+    /// edge (carrick#1663). Before the call site carried its service, the
+    /// second service's call was folded into the first's and drew no edge.
+    #[test]
+    fn two_services_publishing_from_one_path_each_draw_an_edge() {
+        use crate::operation::Protocol;
+        let topic = || serde_json::json!({ "protocol": "pubsub", "topic": "orders.created" });
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer
+            .endpoints
+            .push(peer_row(topic(), "src/subscribe.ts:1", "billing", None));
+        for service in ["web", "admin"] {
+            analyzer
+                .calls
+                .push(peer_row(topic(), "src/index.ts:3", service, None));
+        }
+
+        let (findings, _verified, edges) = analyzer.analyze_exact_key_matches(Protocol::Pubsub);
+        assert!(findings.is_empty(), "{findings:?}");
+        let pairs: BTreeSet<(&str, &str)> = edges
+            .iter()
+            .map(|edge| (edge.consumer_repo.as_str(), edge.producer_repo.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            BTreeSet::from([("admin", "billing"), ("web", "billing")])
+        );
+    }
+
+    /// A row with a scope this build has no word for, read off a peer blob,
+    /// keeps its value and pairs only inside its own service (carrick#1663:
+    /// a false edge costs more than a lost one).
+    #[test]
+    fn a_peer_row_with_an_unknown_scope_restricts_like_service() {
+        use crate::operation::Protocol;
+        let topic = || serde_json::json!({ "protocol": "pubsub", "topic": "sync" });
+        let region = serde_json::json!({ "scope": "region", "namespace": null });
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer
+            .endpoints
+            .push(peer_row(topic(), "src/sync.ts:1", "svc-a", Some(&region)));
+        analyzer
+            .calls
+            .push(peer_row(topic(), "src/push.ts:2", "svc-b", Some(&region)));
+        assert_eq!(
+            analyzer.calls[0]
+                .name_scope
+                .as_ref()
+                .map(|scope| scope.scope.as_str()),
+            Some("region")
+        );
+
+        let (findings, verified, edges) = analyzer.analyze_exact_key_matches(Protocol::Pubsub);
+        assert!(edges.is_empty(), "{edges:?}");
+        assert!(verified.is_empty(), "{verified:?}");
+        assert_eq!(
+            findings,
+            vec![
+                Finding::missing_endpoint(
+                    "PUBSUB",
+                    "sync",
+                    None,
+                    vec!["src/push.ts:2".to_string()]
+                ),
+                Finding::orphaned_endpoint("PUBSUB", "sync", None),
+            ]
+        );
+    }
+
     #[test]
     fn test_exact_key_matches_emit_edge_per_producer_repo() {
         use crate::operation::GraphqlOperationKind;
@@ -5611,6 +5976,53 @@ mod tests {
     /// repo, lends the verdict nothing. The cloud's dashboard and
     /// `check_compatibility` fold the same way, so the PR check and they
     /// agree.
+    /// A verdict rests only on the producer rows its call pairs with under
+    /// the name-scope rule (carrick#1663), as the cloud folds a pair. The
+    /// producer service holds two global `jobs.done` rows of two kinds; the
+    /// call states a null namespace, so the task row is another operation:
+    /// neither its source nor its provenance reaches the finding.
+    #[test]
+    fn a_non_http_type_mismatch_folds_only_the_rows_its_call_pairs_with() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{LibraryClaim, Model};
+        use crate::findings::EdgeSource;
+        use crate::operation::EndpointProvenance;
+
+        let topic = || serde_json::json!({ "protocol": "pubsub", "topic": "jobs.done" });
+        let null = serde_json::json!({ "scope": "global", "namespace": null });
+        let task = serde_json::json!({ "scope": "global", "namespace": "task" });
+        let mut analyzer = analyzer_with_outcomes(vec![outcome(
+            "PUBSUB",
+            "jobs.done",
+            "src/client.ts:9",
+            VerdictBucket::Incompatible,
+            None,
+        )]);
+        let mut task_row = peer_row(topic(), "src/tasks.ts:4", "producer-svc", Some(&task));
+        task_row.resolution_source = Some(Model);
+        task_row.provenance = EndpointProvenance::Route;
+        let mut topic_row = peer_row(topic(), "src/subscribe.ts:7", "producer-svc", Some(&null));
+        topic_row.resolution_source = Some(LibraryClaim);
+        topic_row.provenance = EndpointProvenance::Mock;
+        analyzer.endpoints.extend([task_row, topic_row]);
+        let mut call = peer_row(topic(), "src/client.ts:9", "consumer-svc", Some(&null));
+        call.resolution_source = Some(LibraryClaim);
+        analyzer.calls.push(call);
+
+        let findings = analyzer.get_type_mismatch_findings();
+        let [
+            Finding::TypeMismatch {
+                edge_source,
+                producer_provenance,
+                ..
+            },
+        ] = findings.as_slice()
+        else {
+            panic!("expected one TypeMismatch finding, got {findings:?}");
+        };
+        assert_eq!(*edge_source, Some(EdgeSource::Fact));
+        assert_eq!(*producer_provenance, EndpointProvenance::Mock);
+    }
+
     #[test]
     fn a_non_http_type_mismatch_folds_only_the_named_services_rows() {
         use crate::agents::file_analyzer_agent::ResolutionSource::Model;
