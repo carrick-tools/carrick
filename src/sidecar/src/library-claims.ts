@@ -40,6 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
+import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
 import type {
   ClaimSlot,
   KeyLabel,
@@ -957,6 +958,8 @@ class DeclarationReader {
   private augmentedNames: ReadonlyMap<string, ReadonlySet<string>> | undefined;
   /** The package of the check being judged; see `serviceAugmentedNames`. */
   private currentPackage = '';
+  /** `declaredProperties` per type, for `currentPackage` (its augmentations decide them). */
+  private readonly declared = new Map<ts.Type, ts.Symbol[]>();
   /** The service root as given and as a realpath, longest first: what a listing prints as `<root>`. */
   private readonly printedRoots: readonly string[];
 
@@ -1718,8 +1721,7 @@ class DeclarationReader {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
     }
-    const parts = this.parts(slot);
-    const views = parts.length > 1 ? parts.filter(part => this.isPlainObject(part)) : [slot];
+    const views = this.keyViews(slot);
     let best: RankedFailure | undefined;
     if (views.length === 0) best = { rank: 2, outcome: failed('key_missing') };
     for (const view of views) {
@@ -1751,6 +1753,16 @@ class DeclarationReader {
       best = furthest(best, failure.rank, failure.outcome);
     }
     return best!;
+  }
+
+  /**
+   * The objects a claim's keys at one argument are read from, one at a time:
+   * the whole type, or each union member that is an object type and not a
+   * function type.
+   */
+  private keyViews(slot: ts.Type): readonly ts.Type[] {
+    const parts = this.parts(slot);
+    return parts.length > 1 ? parts.filter(part => this.isPlainObject(part)) : [slot];
   }
 
   /**
@@ -2242,7 +2254,7 @@ class DeclarationReader {
       const receiverOf = (receiverName: string, receiverType: ts.Type): void => {
         if (!take()) return;
         const home = this.homeOf(pkg, [target, ...typeSymbols(receiverType)]);
-        entry.receivers.push(this.outlineReceiver(receiverName, receiverType, home, take, names, fills));
+        entry.receivers.push(this.outlineReceiver(pkg, receiverName, receiverType, home, take, names, fills));
       };
       receiverOf('export', type);
       for (const maker of this.makers(pkg, target, type)) {
@@ -2323,41 +2335,47 @@ class DeclarationReader {
   /**
    * The ways an export makes a receiver, in listing order: calling it
    * (`instance:()`), constructing it (`instance:new`), then calling or
-   * constructing each member the export's home declares
-   * (`instance:<member>`, `instance:new:<member>`). A static a class only
-   * inherits from another package is no maker the verifier reads
+   * constructing each member (`instance:<member>`, `instance:new:<member>`),
+   * each through the signatures a maker claim reads there (`ownCallee`): its
+   * home's own, or a base's it binds with its own type. A maker the export
+   * only inherits from another package is none the verifier reads
    * (`member_inherited`).
    */
   private makers(pkg: string, target: ts.Symbol, type: ts.Type): Maker[] {
+    const holder = this.surfaceHolder(pkg, type, this.homeOf(pkg, [target, ...typeSymbols(type)]));
     const makers: Maker[] = [];
-    const call = this.librarySignatures(type, 'call');
-    if (call.length > 0) makers.push({ receiver: 'instance:()', member: false, signatures: call });
-    const construct = this.librarySignatures(type, 'new');
-    if (construct.length > 0) makers.push({ receiver: 'instance:new', member: false, signatures: construct });
-    const exportHome = this.homeOf(pkg, [target, ...typeSymbols(type)]);
-    const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
+    for (const [form, receiver] of [['call', 'instance:()'], ['new', 'instance:new']] as const) {
+      const callee = this.ownCallee(holder, [], null, form);
+      if ('signatures' in callee) makers.push({ receiver, member: false, signatures: callee.signatures });
+    }
     for (const property of this.namedProperties(type)) {
-      if (!this.isOwnMember(property, apparent, exportHome)) continue;
-      const memberType = this.checker.getTypeOfSymbol(property);
       for (const [form, prefix] of [['call', 'instance:'], ['new', 'instance:new:']] as const) {
-        const signatures = this.librarySignatures(memberType, form);
-        if (signatures.length > 0) makers.push({ receiver: `${prefix}${property.getName()}`, member: true, signatures });
+        const callee = this.ownCallee(holder, [], property.getName(), form);
+        if ('signatures' in callee) {
+          makers.push({ receiver: `${prefix}${property.getName()}`, member: true, signatures: callee.signatures });
+        }
       }
     }
     return makers;
   }
 
+  /** A receiver read for the listing as a message claim reads it (`ownCallee`). */
+  private surfaceHolder(pkg: string, type: ts.Type, home: ReadonlySet<string>): MessageReceiver {
+    return { type, pkg, home, makerBindsName: false, scoped: false };
+  }
+
   /**
-   * What a maker builds, when its overloads agree on one object type that
-   * says something: each read at its declared type-parameter defaults where
-   * `built` (the probe's no-argument build of the receiver) instantiates it,
-   * as the verifier reads an instance (`returnOf`).
+   * What a maker builds: each overload's return, read at its declared
+   * type-parameter defaults where `built` (the probe's no-argument build of
+   * the receiver) instantiates it (`returnOf`), less the returns that say
+   * nothing, which no maker claim holds on. Listed when what is left is one
+   * object type.
    */
   private madeBy(signatures: readonly ts.Signature[], built: ts.Signature | undefined): ts.Type | undefined {
-    const returns = [...new Set(signatures.map(sig => this.returnOf(sig, built)))];
-    return returns.length === 1 && !this.returnSaysNothing(returns[0]) && this.isObjectType(returns[0])
-      ? returns[0]
-      : undefined;
+    const returns = [
+      ...new Set(signatures.map(sig => this.returnOf(sig, built)).filter(type => !this.returnSaysNothing(type))),
+    ];
+    return returns.length === 1 && this.isObjectType(returns[0]) ? returns[0] : undefined;
   }
 
   /** The call (or construct) signatures of `type` an installed package or the default library declares. */
@@ -2376,6 +2394,7 @@ class DeclarationReader {
    * signatures last (`fills`), once every name is.
    */
   private outlineReceiver(
+    pkg: string,
     receiverName: string,
     type: ts.Type,
     home: ReadonlySet<string>,
@@ -2384,23 +2403,29 @@ class DeclarationReader {
     fills: Array<() => void>
   ): SurfaceReceiver {
     const receiver: SurfaceReceiver = { receiver: receiverName, members: [] };
-    const call = this.librarySignatures(type, 'call');
-    if (call.length > 0) fills.push(() => (receiver.call = this.listSignatures(call, take)));
-    const construct = this.librarySignatures(type, 'new');
-    if (construct.length > 0) fills.push(() => (receiver.construct = this.listSignatures(construct, take)));
+    const holder = this.surfaceHolder(pkg, type, home);
+    // The receiver's own call and construct signatures, as a claim with a
+    // null member reads them.
+    const call = this.ownCallee(holder, [], null, 'call');
+    if ('signatures' in call) fills.push(() => (receiver.call = this.listSignatures(call.signatures, take)));
+    const construct = this.ownCallee(holder, [], null, 'new');
+    if ('signatures' in construct) {
+      fills.push(() => (receiver.construct = this.listSignatures(construct.signatures, take)));
+    }
     if (this.isOpenTop(type)) return receiver;
     names.push(() => {
-      const apparent = this.checker.getApparentType(this.checker.getNonNullableType(type));
       for (const property of this.namedProperties(type)) {
-        const signatures = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
-        if (signatures.length === 0 || !take()) continue;
-        const member: SurfaceMember = {
-          name: property.getName(),
-          own: this.isOwnMember(property, apparent, home),
-          signatures: [],
-        };
+        const library = this.librarySignatures(this.checker.getTypeOfSymbol(property), 'call');
+        if (library.length === 0 || !take()) continue;
+        // Own when an op claim reads the member at all (`ownCallee`): its
+        // home declares it, or it sits on a base the receiver binds with its
+        // own type, and its home writes a signature of it. An inherited
+        // member is listed with every library signature.
+        const callee = this.ownCallee(holder, [], property.getName(), 'call');
+        const own = 'signatures' in callee;
+        const member: SurfaceMember = { name: property.getName(), own, signatures: [] };
         receiver.members.push(member);
-        fills.push(() => (member.signatures = this.listSignatures(signatures, take)));
+        fills.push(() => (member.signatures = this.listSignatures(own ? callee.signatures : library, take)));
       }
     });
     return receiver;
@@ -2411,44 +2436,71 @@ class DeclarationReader {
     for (const signature of signatures) {
       if (!take()) continue;
       const params: SurfaceParam[] = [];
-      for (const parameter of signature.getParameters()) {
+      const parameters = signature.getParameters();
+      for (let index = 0; index < parameters.length; index++) {
         if (!take()) continue;
+        const parameter = parameters[index];
         const declaration = parameter.valueDeclaration;
         const isParameter = declaration !== undefined && ts.isParameter(declaration);
-        const type = this.checker.getTypeOfSymbol(parameter);
-        const slot = this.throughConstraint(type);
+        // What a claim part at this argument is checked against: a rest's
+        // element, a type parameter's constraint (`keyParameterAt`).
+        const slot = this.keyParameterAt(signature, index);
         const param: SurfaceParam = {
           name: parameter.getName(),
           optional: isParameter && (declaration.questionToken !== undefined || declaration.initializer !== undefined),
           rest: isParameter && declaration.dotDotDotToken !== undefined,
-          type: this.printed(type),
-          accepts_string: this.acceptsString(type),
-          function: this.handlerFailure(type) === undefined,
+          type: this.printed(this.checker.getTypeOfSymbol(parameter)),
+          // The checks a positional name and a positional handler pass there.
+          accepts_string: slot !== undefined && this.acceptsString(this.throughConditional(slot)),
+          function: this.handlerFailure(slot) === undefined,
         };
-        if (slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
-          const keys: SurfaceKey[] = [];
-          for (const property of this.namedProperties(slot)) {
-            if (!take()) continue;
-            const keyType = this.checker.getTypeOfSymbol(property);
-            keys.push({
-              name: property.getName(),
-              optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
-              accepts_string: this.acceptsString(keyType),
-              function: this.handlerFailure(keyType) === undefined,
-            });
-          }
+        if (slot !== undefined && slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
+          const keys = this.listKeys(slot, take);
           if (keys.length > 0) param.keys = keys;
         }
-        const literals = new Set<string>();
-        this.spell(type, literals, 0);
-        const node = isParameter ? declaration.type : undefined;
-        if (node) this.spell(this.checker.getTypeFromTypeNode(node), literals, 0);
+        const literals = this.literalsAt(signature, { arg: index });
         if (literals.size > 0) param.literals = [...literals].sort();
         params.push(param);
       }
       listed.push({ params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) });
     }
     return listed;
+  }
+
+  /**
+   * The keys a claim can name at an object argument: every key of each view
+   * the verifier reads one at a time (`keyViews`), in first-seen order. A
+   * key accepts a string, or is a handler, when it does so in some view, as
+   * a keyed name or handler is checked (`viewFor`). It is optional when a
+   * call can leave it out: some view marks it optional or does not declare it.
+   */
+  private listKeys(slot: ts.Type, take: () => boolean): SurfaceKey[] {
+    const views = this.keyViews(slot);
+    const keys = new Map<string, SurfaceKey & { views: number }>();
+    for (const view of views) {
+      for (const property of this.namedProperties(view)) {
+        const type = this.checker.getTypeOfSymbol(property);
+        const read = {
+          name: property.getName(),
+          optional: (property.flags & ts.SymbolFlags.Optional) !== 0,
+          accepts_string: this.acceptsString(this.throughConditional(type)),
+          function: this.handlerFailure(type) === undefined,
+          views: 1,
+        };
+        const seen = keys.get(read.name);
+        if (!seen) {
+          keys.set(read.name, read);
+          continue;
+        }
+        seen.optional = seen.optional || read.optional;
+        seen.accepts_string = seen.accepts_string || read.accepts_string;
+        seen.function = seen.function || read.function;
+        seen.views += 1;
+      }
+    }
+    return [...keys.values()]
+      .filter(() => take())
+      .map(({ views: declaredIn, ...key }) => ({ ...key, optional: key.optional || declaredIn < views.length }));
   }
 
   /**
@@ -2460,7 +2512,9 @@ class DeclarationReader {
   private printed(type: ts.Type): string {
     let text = this.checker.typeToString(type);
     for (const root of this.printedRoots) text = text.split(root).join('<root>');
-    return truncate(text);
+    // The compiler prints a union in creation order, which moves with
+    // whatever the program read first: put it in canonical order.
+    return truncate(canonicalizeUnionsInText(text));
   }
 
   // --------------------------------------------------------------------------
@@ -2577,8 +2631,10 @@ class DeclarationReader {
 
   private declaredProperties(slot: Slot): ts.Symbol[] {
     if (slot === VARIADIC) return [];
+    const cached = this.declared.get(slot);
+    if (cached) return cached;
     const apparent = this.checker.getApparentType(this.checker.getNonNullableType(slot));
-    return this.checker
+    const declared = this.checker
       .getPropertiesOfType(apparent)
       .filter(
         property =>
@@ -2586,6 +2642,8 @@ class DeclarationReader {
           this.isLibraryDeclared(property, apparent) &&
           !this.isAbsent(property)
       );
+    this.declared.set(slot, declared);
+    return declared;
   }
 
   /**
@@ -2607,7 +2665,9 @@ class DeclarationReader {
 
   /** Judge the next check as a claim about `pkg`. */
   setPackage(pkg: string): void {
-    this.currentPackage = packageNameOf(pkg);
+    const named = packageNameOf(pkg);
+    if (named !== this.currentPackage) this.declared.clear();
+    this.currentPackage = named;
   }
 
   /**

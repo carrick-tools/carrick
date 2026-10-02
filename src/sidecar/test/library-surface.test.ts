@@ -146,11 +146,14 @@ export declare class Stream {
   [Symbol.asyncIterator](): AsyncIterator<unknown>;
   [tag](name: string): void;
   read(name: string): void;
+  wait(state: 'pending' | 'processed'): void;
 }
 `;
 
-// An unrelated package with symbol-keyed members of its own.
+// An unrelated package with symbol-keyed members of its own, and the second
+// member of the union above, read first.
 const OTHER = `export declare const mark: unique symbol;
+export declare function settle(state: 'processed'): void;
 export declare class Other {
   [Symbol.iterator](): Iterator<unknown>;
   [Symbol.asyncIterator](): AsyncIterator<unknown>;
@@ -160,12 +163,89 @@ export declare class Other {
 }
 `;
 
-// A library class that extends the runtime's emitter and adds one own member.
+// A library class that extends the runtime's emitter and adds one own member,
+// and the runtime's emitter class itself, exported under another name.
 const BUS = `/// <reference types="node" />
 import EventEmitter = require('events');
 export declare class Bus extends EventEmitter {
   publishLocal(topic: string, payload: unknown): void;
 }
+export declare const Runtime: typeof EventEmitter;
+export declare const kit: {
+  Runtime: typeof EventEmitter;
+  Bus: typeof Bus;
+};
+export declare const waitFor: typeof EventEmitter.from;
+`;
+
+// A client typed by a mapped type over a key map the service augments, and a
+// package that re-exports it.
+const MAPPED_CORE = `export interface Commands {
+  get: unknown;
+  set: unknown;
+}
+export type Client = Record<keyof Commands, (key: string) => Promise<unknown>>;
+export declare function createClient(): Client;
+`;
+
+// An emitter base one package declares, and a client package that binds it
+// with its own event map (\`Wire\`) or only through its own type parameters
+// (\`PassThrough\`).
+const TYPED_EMITTER = `export interface EventsMap {
+  [event: string]: any;
+}
+export interface DefaultEventsMap {
+  [event: string]: (...args: any[]) => void;
+}
+export declare class Emitter<Listen extends EventsMap, Emit extends EventsMap, Reserved extends EventsMap = {}> {
+  on<Ev extends keyof Listen | keyof Reserved>(ev: Ev, listener: (payload: unknown) => void): this;
+}
+export declare class Plain<Reserved extends EventsMap = {}> {
+  on(ev: string, listener: (payload: unknown) => void): this;
+}
+export declare class Sender {
+  send(topic: string, payload: unknown): void;
+}
+`;
+const TYPED_SOCKET = `import { Emitter, DefaultEventsMap, EventsMap, Plain, Sender } from '@fixture/typed-emitter';
+interface ReservedEvents {
+  connect: () => void;
+}
+export declare class PassThrough<Listen extends EventsMap = DefaultEventsMap> extends Emitter<Listen, Listen> {}
+export declare class Wire extends Plain<ReservedEvents> {}
+export declare function passThrough(): PassThrough;
+export declare function wire(): Wire;
+// A member declared here whose signature the base package writes.
+export declare class Proxy {
+  relay: Sender['send'];
+  close(): void;
+}
+// A member declared here with one signature of its own and one the base package writes.
+export declare class Mixed {
+  send: ((topic: string) => void) & Sender['send'];
+}
+`;
+
+// Slots the verifier reads through a rest's element, a conditional's
+// branches, or one member of a union at a time.
+const SLOTS = `export interface Definition<Id extends string> {
+  id: Id;
+}
+export type IdOf<D> = D extends Definition<infer Id> ? Id : never;
+export interface Slots {
+  subscribeAll(...topics: string[]): void;
+  onEach(...listeners: Array<(payload: unknown) => void>): void;
+  triggerById<D extends Definition<string>>(id: IdOf<D>, payload: unknown): void;
+  dispatch<D extends Definition<string>>(options: { id: IdOf<D>; run: () => void }): void;
+  route(target: { topic: string } | { queue: string; durable?: boolean }, payload: unknown): void;
+  watch(...events: Array<'open' | 'close'>): void;
+}
+export declare const slots: Slots;
+export interface Client {
+  send(topic: string, payload: unknown): void;
+}
+export declare function open(): Client;
+export declare function open(raw: true): any;
 `;
 
 function writeTree(root: string, files: Record<string, string>): void {
@@ -202,6 +282,16 @@ function installed(socket = SOCKET): Record<string, string> {
     'node_modules/fixture-symbols/index.d.ts': SYMBOLS,
     'node_modules/fixture-other/package.json': packageJson('fixture-other', '1.0.0'),
     'node_modules/fixture-other/index.d.ts': OTHER,
+    'node_modules/@fixture/typed-emitter/package.json': packageJson('@fixture/typed-emitter', '3.0.0'),
+    'node_modules/@fixture/typed-emitter/index.d.ts': TYPED_EMITTER,
+    'node_modules/fixture-typed-socket/package.json': packageJson('fixture-typed-socket', '4.0.0'),
+    'node_modules/fixture-typed-socket/index.d.ts': TYPED_SOCKET,
+    'node_modules/fixture-slots/package.json': packageJson('fixture-slots', '1.0.0'),
+    'node_modules/fixture-slots/index.d.ts': SLOTS,
+    'node_modules/@fixture/mapped-core/package.json': packageJson('@fixture/mapped-core', '2.0.0'),
+    'node_modules/@fixture/mapped-core/index.d.ts': MAPPED_CORE,
+    'node_modules/fixture-mapped/package.json': packageJson('fixture-mapped', '2.0.0'),
+    'node_modules/fixture-mapped/index.d.ts': "export * from '@fixture/mapped-core';\n",
   };
 }
 
@@ -295,6 +385,9 @@ describe('list_library_surface (carrick#1660)', () => {
       // The service compiles against the runtime's types, as a real Node service does.
       'src/runtime.ts': '/// <reference types="node" />\nexport {};\n',
       'types/shims.d.ts': "declare module 'node:shim' {\n  export function publish(topic: string, payload: unknown): void;\n}\n",
+      // The service adds a command to the core package's key map for itself.
+      'src/augment.ts':
+        "import '@fixture/mapped-core';\ndeclare module '@fixture/mapped-core' {\n  interface Commands {\n    broadcast: unknown;\n  }\n}\n",
       ...installed(),
     }));
     surface = lister(client, root);
@@ -585,7 +678,7 @@ describe('list_library_surface (carrick#1660)', () => {
     assert.deepStrictEqual(stream.receivers.map(r => r.receiver), ['export', 'instance:new']);
     const instance = stream.receivers.find(r => r.receiver === 'instance:new')!;
     // \`[Symbol.asyncIterator]\` and \`[tag]\` have no name a claim can carry.
-    assert.deepStrictEqual(instance.members.map(m => m.name), ['read']);
+    assert.deepStrictEqual(instance.members.map(m => m.name), ['read', 'wait']);
     const constructor = stream.receivers.find(r => r.receiver === 'export')!.construct![0];
     assert.deepStrictEqual(constructor.params[1].keys!.map(k => k.name), ['prefix']);
     assert.ok(!JSON.stringify(symbols.exports).includes('__@'), JSON.stringify(symbols.exports));
@@ -655,9 +748,177 @@ describe('list_library_surface (carrick#1660)', () => {
     const second = await lister(after.client, after.root)(['fixture-symbols']);
     assert.strictEqual(second.surface_sha256, first.surface_sha256);
 
-    // One program that imports the unrelated package earlier.
+    // One program that imports the unrelated package earlier, and so makes
+    // the literal \`'processed'\` before \`'pending'\`: a union prints in one order.
     const together = await lister(after.client, after.root)(['fixture-other', 'fixture-symbols']);
     assert.deepStrictEqual(together.surfaces[1].exports, first.surfaces[0].exports);
+    const wait = first.surfaces[0].exports
+      .find(e => e.export === 'Stream')!
+      .receivers.find(r => r.receiver === 'instance:new')!
+      .members.find(m => m.name === 'wait')!;
+    assert.strictEqual(wait.signatures[0].params[0].type, '"pending" | "processed"');
+  });
+
+  /** Member name to its own flag, on one receiver of one export. */
+  function ownFlags(listed: Surface, exportName: string, receiver: string): [string, boolean][] {
+    const made = listed.exports.find(e => e.export === exportName)!.receivers.find(r => r.receiver === receiver);
+    assert.ok(made, `${exportName} lists no ${receiver}`);
+    return made.members.map(m => [m.name, m.own]);
+  }
+
+  it("marks a member own exactly when the verifier reads it as the receiver's own", async () => {
+    const [socket, bus] = (await surface(['fixture-typed-socket', 'fixture-bus'])).surfaces;
+    // Another package's emitter, bound with this package's own event map.
+    assert.deepStrictEqual(ownFlags(socket, 'wire', 'instance:()'), [['on', true]]);
+    // Bound only through its own type parameters.
+    assert.deepStrictEqual(ownFlags(socket, 'passThrough', 'instance:()'), [['on', false]]);
+    // Declared here, with a signature the base package writes.
+    assert.deepStrictEqual(ownFlags(socket, 'Proxy', 'instance:new'), [['relay', false], ['close', true]]);
+    // Of a member with two signatures, the one this package writes.
+    const mixed = socket.exports.find(e => e.export === 'Mixed')!.receivers.find(r => r.receiver === 'instance:new')!;
+    assert.deepStrictEqual(
+      mixed.members.map(m => [m.name, m.own, m.signatures.length]),
+      [['send', true, 1]]
+    );
+    // The runtime's emitter exported under another name is built through the
+    // runtime's constructor, which is no maker of this package's, at the
+    // export or one level below it.
+    const runtime = bus.exports.find(e => e.export === 'Runtime')!;
+    assert.deepStrictEqual(runtime.receivers.map(r => r.receiver), ['export']);
+    assert.strictEqual(runtime.receivers[0].construct, undefined);
+    const kit = bus.exports.find(e => e.export === 'kit')!;
+    assert.deepStrictEqual(kit.receivers.map(r => r.receiver), ['export', 'instance:new:Bus']);
+    // The runtime's function exported under another name: no call of this package's.
+    const waitFor = bus.exports.find(e => e.export === 'waitFor')!;
+    assert.deepStrictEqual(waitFor.receivers.map(r => r.receiver), ['export']);
+    assert.strictEqual(waitFor.receivers[0].call, undefined);
+
+    const at = (claim_id: string, pkg: string, exportName: string, receiver: string, claim: Record<string, unknown>) => ({
+      claim_id,
+      package: pkg,
+      export: exportName,
+      role: 'socket',
+      receiver,
+      claim,
+    });
+    const on = (of: string) => ({ kind: 'op', op: 'receive', member: 'on', of, name: { arg: 0 }, handler: { arg: 1 } });
+    const verdicts = await client.send<VerdictResponse>(
+      {
+        request_id: `claims-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          at('wire', 'fixture-typed-socket', 'wire', 'export', { kind: 'make', form: 'call', member: null }),
+          at('wire-on', 'fixture-typed-socket', 'wire', 'instance:()', on('instance:()')),
+          at('pass', 'fixture-typed-socket', 'passThrough', 'export', { kind: 'make', form: 'call', member: null }),
+          at('pass-on', 'fixture-typed-socket', 'passThrough', 'instance:()', on('instance:()')),
+          at('proxy', 'fixture-typed-socket', 'Proxy', 'export', { kind: 'make', form: 'new', member: null }),
+          at('relay', 'fixture-typed-socket', 'Proxy', 'instance:new', { kind: 'op', op: 'send', member: 'relay', of: 'instance:new', name: { arg: 0 }, payload: { arg: 1 } }),
+          at('runtime', 'fixture-bus', 'Runtime', 'export', { kind: 'make', form: 'new', member: null }),
+          at('kit-runtime', 'fixture-bus', 'kit', 'export', { kind: 'make', form: 'new', member: 'Runtime' }),
+          at('kit-bus', 'fixture-bus', 'kit', 'export', { kind: 'make', form: 'new', member: 'Bus' }),
+        ],
+      },
+      60_000
+    );
+    assert.deepStrictEqual(
+      verdicts.verdicts.map(v => `${v.verdict}${v.reason ? ` ${v.reason}` : ''}`),
+      [
+        'verified',
+        'verified',
+        'verified',
+        'failed member_inherited',
+        'verified',
+        'failed member_inherited',
+        'failed member_inherited',
+        'failed member_inherited',
+        'verified',
+      ]
+    );
+  });
+
+  it('reads each parameter as the verifier reads a part there: through a rest, a conditional, and each member of a union', async () => {
+    const slots = (await surface(['fixture-slots'])).surfaces[0];
+    const members = slots.exports.find(e => e.export === 'slots')!.receivers.find(r => r.receiver === 'export')!.members;
+    const first = (member: string) => members.find(m => m.name === member)!.signatures[0].params[0];
+    // A name among \`...topics: string[]\` is a string; a handler among \`...listeners\` a function.
+    assert.strictEqual(first('subscribeAll').accepts_string, true);
+    assert.strictEqual(first('onEach').function, true);
+    // \`IdOf<D>\` takes what its branches allow: a string, as a parameter or a key.
+    assert.strictEqual(first('triggerById').accepts_string, true);
+    assert.deepStrictEqual(
+      first('dispatch').keys!.map(k => [k.name, k.accepts_string, k.function]),
+      [
+        ['id', true, false],
+        ['run', false, true],
+      ]
+    );
+    // Every key of either object a claim can name.
+    // Each key can be left out: by the other object, or as declared.
+    assert.deepStrictEqual(
+      first('route').keys!.map(k => [k.name, k.accepts_string, k.optional]),
+      [
+        ['topic', true, true],
+        ['queue', true, true],
+        ['durable', false, true],
+      ]
+    );
+    // An overload whose return says nothing makes no instance, as no maker
+    // claim holds on it: the other builds the client.
+    const open = slots.exports.find(e => e.export === 'open')!;
+    assert.deepStrictEqual(open.receivers.map(r => r.receiver), ['export', 'instance:()']);
+    // The names a rest of literals spells, none of them any string.
+    assert.deepStrictEqual(first('watch').literals, ['close', 'open']);
+    assert.strictEqual(first('watch').accepts_string, false);
+
+    const send = (claim_id: string, member: string, extra: Record<string, unknown>) => ({
+      claim_id,
+      package: 'fixture-slots',
+      export: 'slots',
+      role: 'broker',
+      receiver: 'export',
+      claim: { kind: 'op', on: 'export', member, ...extra },
+    });
+    const verdicts = await client.send<VerdictResponse>(
+      {
+        request_id: `claims-${requestId++}`,
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          send('trigger', 'triggerById', { op: 'send', name: { arg: 0 }, payload: { arg: 1 } }),
+          send('route', 'route', { op: 'send', name: { arg: 0, key: 'queue' }, payload: { arg: 1 } }),
+          send('watch', 'watch', { op: 'receive', name: { arg: 0 } }),
+          send('dispatch', 'dispatch', { op: 'receive', name: { arg: 0, key: 'id' }, handler: { arg: 0, key: 'run' } }),
+          { claim_id: 'reserved', package: 'fixture-slots', export: 'slots', role: 'broker', receiver: 'export', claim: { kind: 'reserved', on: 'export', member: 'watch', name: 'open' } },
+          { claim_id: 'open', package: 'fixture-slots', export: 'open', role: 'broker', receiver: 'export', claim: { kind: 'make', form: 'call', member: null } },
+          {
+            claim_id: 'open-send',
+            package: 'fixture-slots',
+            export: 'open',
+            role: 'broker',
+            receiver: 'instance:()',
+            claim: { kind: 'op', op: 'send', member: 'send', of: 'instance:()', name: { arg: 0 }, payload: { arg: 1 } },
+          },
+        ],
+      },
+      60_000
+    );
+    assert.deepStrictEqual(
+      verdicts.verdicts.map(v => `${v.verdict}${v.reason ? ` ${v.reason}` : ''}`),
+      ['verified', 'verified', 'failed name_not_string', 'verified', 'verified', 'verified', 'verified']
+    );
+  });
+
+  it("reads a re-exported type under the re-exporting package's own augmentations, whatever was listed before", async () => {
+    const members = (listed: Surface) =>
+      listed.exports.find(e => e.export === 'createClient')!.receivers.find(r => r.receiver === 'instance:()')!.members.map(m => m.name);
+    // The service augments the core package's key map, so under the core
+    // package the added command is the service's; the re-exporting package
+    // is read under its own augmentations, which add none.
+    const alone = (await surface(['fixture-mapped'])).surfaces[0];
+    const [core, after] = (await surface(['@fixture/mapped-core', 'fixture-mapped'])).surfaces;
+    assert.deepStrictEqual(members(core), ['get', 'set']);
+    assert.deepStrictEqual(members(after), members(alone));
   });
 
   it('carries one full-surface hash, the same from any directory and with no directory in it', async () => {
