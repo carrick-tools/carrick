@@ -1094,7 +1094,7 @@ mod tests {
              const emails = new Queue(\"emails\");\n\
              export async function welcome() { await emails.add(\"welcome\", {}); }\n",
         )]);
-        let rows = rows_of(&sites, &[queue.clone()], all);
+        let rows = rows_of(&sites, std::slice::from_ref(&queue), all);
         assert_eq!(rows.len(), 1, "{rows:#?}");
         assert_eq!(rows[0].name, "emails");
         assert_eq!(rows[0].line, 3);
@@ -1275,7 +1275,7 @@ mod tests {
             ])
         };
         let sites = service("events");
-        let rows: Vec<LibraryRow> = rows_of(&sites, &[queue.clone()], all)
+        let rows: Vec<LibraryRow> = rows_of(&sites, std::slice::from_ref(&queue), all)
             .into_iter()
             .filter(|row| row.file.ends_with("src/use.ts"))
             .collect();
@@ -1289,7 +1289,7 @@ mod tests {
                 "@fixture/queue@2:Queue:op:send:add:on:instance",
             ]
         );
-        let one_maker = rows_of(&sites, &[queue.clone()], |check| {
+        let one_maker = rows_of(&sites, std::slice::from_ref(&queue), |check| {
             !check.claim_id.ends_with(":make:new:Cluster")
         });
         assert!(

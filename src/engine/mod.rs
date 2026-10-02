@@ -3084,6 +3084,17 @@ async fn analyze_current_repo_incremental(
                 service,
                 graphql_schemas,
             );
+            protocol_extractions.library =
+                library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &semantics_root);
+            let withdrawn = withdraw_model_routes_at_definitions(
+                &mut mount_graph,
+                &merged_results,
+                &protocol_extractions.library,
+                repo_path,
+            );
+            if withdrawn > 0 {
+                debug!("Model routes withdrawn at library definitions: {withdrawn}");
+            }
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -3190,6 +3201,10 @@ async fn analyze_current_repo_incremental(
                 &merged_results,
                 &protocol_extractions.sockets,
                 &in_process_pubsub,
+                &LibrarySiteIndex::of(
+                    &stated_library_rows(&protocol_extractions.library, repo_path, service),
+                    repo_path,
+                ),
                 repo_path,
             );
             if !manifest_entries.is_empty() {
@@ -3635,6 +3650,10 @@ struct ProtocolExtractions {
     /// In-process EventEmitter contracts (carrick#676). Scanned after
     /// `sockets`, which it needs to know which spans are already socket ops.
     event_bus: crate::event_emitter::BusExtraction,
+    /// Broker, socket and in-process rows read through verified library
+    /// claims (carrick#1662, [`library_rows`]). Read once the request inputs
+    /// and the sidecar are at hand, after the scan above.
+    library: crate::library_claims::LibraryRows,
 }
 
 /// The directories to walk for a service's own GraphQL SDL files: its
@@ -3698,9 +3717,99 @@ fn scan_protocol_extractions(
             graphql,
             sockets,
             event_bus,
+            library: crate::library_claims::LibraryRows::default(),
         },
         document_sites,
     )
+}
+
+/// The library claims a service's imported packages answer, by export
+/// (carrick#1662). None yet: the scan asks the library store for them in
+/// carrick#1664, and passes them to [`library_rows`] in place of this.
+const NO_LIBRARY_CLAIMS: &[crate::library_claims::ExportClaims] = &[];
+
+/// The service's library sites read through `claims`, each verified by the
+/// sidecar against the package's own declarations, from `from_dir` (the
+/// service root, as for the client semantics). Verification runs on every
+/// scan and is never cached. No claims, or no sidecar, read nothing, and the
+/// sites are not even collected.
+fn library_rows(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    claims: &[crate::library_claims::ExportClaims],
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> crate::library_claims::LibraryRows {
+    let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
+        return crate::library_claims::LibraryRows::default();
+    };
+    let sites = crate::request_summary::library_sites(inputs);
+    crate::library_claims::read(&sites, claims, |checks| {
+        sidecar
+            .verify_library_claims(from_dir, checks)
+            .map(|answer| answer.verdicts)
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Withdraw every model route stated at exactly the span of a definition
+/// read through a verified library claim (carrick#1662): the call
+/// registers a handler under a name, which the library row states, and is
+/// no HTTP route. Fails closed: a model route at any other span, a route a
+/// pass stated, or a definition the scan cannot place keeps its row.
+fn withdraw_model_routes_at_definitions(
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    library: &crate::library_claims::LibraryRows,
+    repo_path: &str,
+) -> usize {
+    let repo_root = normalize_protocol_file(Path::new(repo_path));
+    let relative = |file: &Path| {
+        let file = normalize_protocol_file(file);
+        file.strip_prefix(&repo_root)
+            .map(Path::to_path_buf)
+            .unwrap_or(file)
+    };
+    let definitions: HashSet<(PathBuf, u32, u32)> = library
+        .rows
+        .iter()
+        .filter(|row| row.definition)
+        .map(|row| (relative(&row.file), row.span_start, row.span_end))
+        .collect();
+    if definitions.is_empty() {
+        return 0;
+    }
+    let mut withdrawn: HashSet<(String, String, String)> = HashSet::new();
+    for (path, result) in file_results {
+        let file = relative(Path::new(path));
+        for endpoint in &result.endpoints {
+            let (Some(start), Some(end)) = (
+                endpoint.call_expression_span_start,
+                endpoint.call_expression_span_end,
+            ) else {
+                continue;
+            };
+            if definitions.contains(&(file.clone(), start, end)) {
+                withdrawn.insert((
+                    format!("{}:{}", file.display(), endpoint.line_number),
+                    endpoint.method.to_uppercase(),
+                    endpoint.path.clone(),
+                ));
+            }
+        }
+    }
+    let before = mount_graph.endpoints.len();
+    mount_graph.endpoints.retain(|endpoint| {
+        endpoint.resolution_source
+            != Some(crate::agents::file_analyzer_agent::ResolutionSource::Model)
+            || !withdrawn.contains(&(
+                normalize_protocol_file(Path::new(&endpoint.file_location))
+                    .display()
+                    .to_string(),
+                endpoint.method.to_uppercase(),
+                endpoint.path.clone(),
+            ))
+    });
+    before - mount_graph.endpoints.len()
 }
 
 /// Attribute a service's GraphQL documents to schema identities, fold the
@@ -3991,10 +4100,19 @@ fn append_deterministic_protocol_operations(
         );
     }
 
+    let library = append_library_operations(
+        cloud_data,
+        &extractions.library,
+        repo_path,
+        service,
+        &to_producer,
+        &to_call,
+    );
     append_event_bus_operations(
         cloud_data,
         &extractions.event_bus,
         file_results,
+        &library,
         &to_producer,
         &to_call,
     );
@@ -4003,9 +4121,145 @@ fn append_deterministic_protocol_operations(
         file_results,
         &extractions.sockets,
         in_process,
+        &library,
         &to_producer,
         &to_call,
     );
+}
+
+/// Where library rows were stated (carrick#1662), by normalized file and
+/// line: each name, and each pub/sub name with its role. A model pub/sub row
+/// at the same file, line, topic and role is the same call read again and
+/// folds into the library row; so does an event-bus row at the same file,
+/// line and name.
+#[derive(Debug, Default)]
+struct LibrarySiteIndex {
+    /// Files are keyed relative to this root, whichever form a caller holds.
+    repo_root: PathBuf,
+    named: HashSet<(PathBuf, u32, String)>,
+    pubsub: HashSet<(PathBuf, u32, String, crate::operation::PubsubRole)>,
+}
+
+impl LibrarySiteIndex {
+    fn of(library: &crate::library_claims::LibraryRows, repo_path: &str) -> Self {
+        use crate::library_claims::LibraryRowKind;
+        let mut index = LibrarySiteIndex {
+            repo_root: normalize_protocol_file(Path::new(repo_path)),
+            ..LibrarySiteIndex::default()
+        };
+        for row in &library.rows {
+            let file = index.relative(&row.file);
+            index
+                .named
+                .insert((file.clone(), row.line, row.name.clone()));
+            if let LibraryRowKind::Pubsub(role) = row.kind {
+                index
+                    .pubsub
+                    .insert((file, row.line, row.name.clone(), role));
+            }
+        }
+        index
+    }
+
+    fn relative(&self, file: &Path) -> PathBuf {
+        let file = normalize_protocol_file(file);
+        file.strip_prefix(&self.repo_root)
+            .map(Path::to_path_buf)
+            .unwrap_or(file)
+    }
+
+    fn states_pubsub(
+        &self,
+        file: &Path,
+        line: u32,
+        name: &str,
+        role: crate::operation::PubsubRole,
+    ) -> bool {
+        self.pubsub
+            .contains(&(self.relative(file), line, name.to_string(), role))
+    }
+
+    fn states_name(&self, file: &Path, line: u32, name: &str) -> bool {
+        self.named
+            .contains(&(self.relative(file), line, name.to_string()))
+    }
+}
+
+/// The library rows (carrick#1662): a pub/sub subscriber or a socket
+/// listener is a producer, a publisher or an emitter a call, each a
+/// `library_claim` fact carrying its claim ids and its name's scope. A row in
+/// a mock or test tree of the service states nothing. Returns where the rows
+/// that were stated sit.
+fn append_library_operations(
+    cloud_data: &mut CloudRepoData,
+    library: &crate::library_claims::LibraryRows,
+    repo_path: &str,
+    service: &Config,
+    to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+    to_call: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+) -> LibrarySiteIndex {
+    use crate::library_claims::LibraryRowKind;
+    use crate::operation::PubsubRole;
+    let stated = stated_library_rows(library, repo_path, service);
+    for row in &stated.rows {
+        let claimed = |details: ApiEndpointDetails| ApiEndpointDetails {
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim,
+            ),
+            name_scope: Some(row.name_scope.clone()),
+            library_semantics: row.claim_ids.clone(),
+            ..details
+        };
+        match row.kind {
+            LibraryRowKind::Pubsub(PubsubRole::Subscriber) => cloud_data.endpoints.push(claimed(
+                to_producer(OperationKey::pubsub(row.name.clone()), &row.file, row.line),
+            )),
+            LibraryRowKind::Pubsub(PubsubRole::Publisher) => cloud_data.calls.push(claimed(
+                to_call(OperationKey::pubsub(row.name.clone()), &row.file, row.line),
+            )),
+            LibraryRowKind::Socket {
+                direction,
+                listener: true,
+            } => cloud_data.endpoints.push(claimed(to_producer(
+                OperationKey::socket(row.name.clone(), direction),
+                &row.file,
+                row.line,
+            ))),
+            LibraryRowKind::Socket {
+                direction,
+                listener: false,
+            } => cloud_data.calls.push(claimed(to_call(
+                OperationKey::socket(row.name.clone(), direction),
+                &row.file,
+                row.line,
+            ))),
+        }
+    }
+    if !stated.rows.is_empty() {
+        debug!(
+            rows = stated.rows.len(),
+            "Indexing library-claim operations (carrick#1662)"
+        );
+    }
+    LibrarySiteIndex::of(&stated, repo_path)
+}
+
+/// The library rows the service states: every one outside a mock or test
+/// tree of the service (design section 9; the tree rule is the one a
+/// producer's provenance reads, carrick#380).
+fn stated_library_rows(
+    library: &crate::library_claims::LibraryRows,
+    repo_path: &str,
+    service: &Config,
+) -> crate::library_claims::LibraryRows {
+    crate::library_claims::LibraryRows {
+        rows: library
+            .rows
+            .iter()
+            .filter(|row| !protocol_producer_provenance(&row.file, repo_path, service).is_mock())
+            .cloned()
+            .collect(),
+    }
 }
 
 /// The model's pub/sub rows that are calls into an in-process wrapper with
@@ -4085,6 +4339,7 @@ fn append_event_bus_operations(
     cloud_data: &mut CloudRepoData,
     event_bus: &crate::event_emitter::BusExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    library: &LibrarySiteIndex,
     to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
     to_call: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
@@ -4103,6 +4358,11 @@ fn append_event_bus_operations(
                     into: &mut Vec<ApiEndpointDetails>,
                     counter: &mut usize| {
         for op in ops {
+            // A library row stated this call (carrick#1662).
+            if library.states_name(&op.file_path, op.line, &op.event) {
+                deferred += 1;
+                continue;
+            }
             let site = (
                 normalize_protocol_file(&op.file_path),
                 op.event.clone(),
@@ -4249,6 +4509,7 @@ fn append_pubsub_operations(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
+    library: &LibrarySiteIndex,
     to_producer: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
     to_call: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
 ) {
@@ -4287,6 +4548,15 @@ fn append_pubsub_operations(
                 continue;
             }
             let line = u32::try_from(op.line_number).unwrap_or(0);
+            // A library row stated this call: same file, line, topic and
+            // role (carrick#1662). A model row for the topic at any other
+            // line stands.
+            if let Some(role) = op.role
+                && library.states_pubsub(Path::new(path), line, &op.topic, role)
+            {
+                folded += 1;
+                continue;
+            }
             let file_path = PathBuf::from(path);
             let key = OperationKey::pubsub(op.topic.clone());
             // The model's row says so (carrick#1626). A row the scanner's own
@@ -4371,6 +4641,7 @@ fn append_pubsub_manifest_entries(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     sockets: &crate::socket_io::SocketExtraction,
     in_process: &crate::in_process_pubsub::InProcessPubsub,
+    library: &LibrarySiteIndex,
     repo_root: &str,
 ) {
     use crate::operation::PubsubRole;
@@ -4390,6 +4661,17 @@ fn append_pubsub_manifest_entries(
             }
             if let Some(pubsub_role) = op.role
                 && in_process.is_withdrawn(Path::new(path), op.line_number, &op.topic, pubsub_role)
+            {
+                continue;
+            }
+            // Folded into the library row at the same site (carrick#1662).
+            if let Some(pubsub_role) = op.role
+                && library.states_pubsub(
+                    Path::new(path),
+                    u32::try_from(op.line_number).unwrap_or(0),
+                    &op.topic,
+                    pubsub_role,
+                )
             {
                 continue;
             }
@@ -7243,6 +7525,17 @@ async fn analyze_current_repo(
         service,
         graphql_schemas,
     );
+    protocol_extractions.library =
+        library_rows(&request_inputs, NO_LIBRARY_CLAIMS, sidecar, &service_root);
+    let withdrawn = withdraw_model_routes_at_definitions(
+        &mut analysis_result.mount_graph,
+        &analysis_result.file_results,
+        &protocol_extractions.library,
+        repo_path,
+    );
+    if withdrawn > 0 {
+        debug!("Model routes withdrawn at library definitions: {withdrawn}");
+    }
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
@@ -7312,6 +7605,10 @@ async fn analyze_current_repo(
         &analysis_result.file_results,
         &protocol_extractions.sockets,
         &in_process_pubsub,
+        &LibrarySiteIndex::of(
+            &stated_library_rows(&protocol_extractions.library, repo_path, service),
+            repo_path,
+        ),
         repo_path,
     );
     if !manifest_entries.is_empty() {
@@ -15304,6 +15601,354 @@ mod tests {
     /// A pub/sub op the file-analyzer would emit: topic + side + decoded-payload
     /// `primary_type_symbol`. Mirrors `socket_op`/`graphql_op` for the manifest
     /// tests.
+    /// One library row for the engine tests (carrick#1662).
+    fn library_row(
+        file: &str,
+        line: u32,
+        name: &str,
+        kind: crate::library_claims::LibraryRowKind,
+    ) -> crate::library_claims::LibraryRow {
+        crate::library_claims::LibraryRow {
+            file: PathBuf::from(file),
+            line,
+            span_start: 10,
+            span_end: 40,
+            kind,
+            name: name.to_string(),
+            name_scope: crate::services::type_sidecar::NameScope {
+                scope: crate::services::type_sidecar::NameScopeKind::Service,
+                namespace: Some("task".to_string()),
+            },
+            claim_ids: vec![format!("@fixture/jobs@3:task:op:{name}")],
+            definition: false,
+        }
+    }
+
+    /// carrick#1662: a library row is a `library_claim` fact carrying its
+    /// name's scope and its claim ids, on the producer side for a subscriber
+    /// or a listener and the call side for a publisher or an emitter. A row
+    /// in a mock tree of the service states nothing. A model pub/sub row at
+    /// the same file, line, topic and role folds into the library row, in
+    /// the operations and in the type manifest; one at another line stands.
+    #[test]
+    fn library_rows_are_stated_as_facts_and_fold_the_model_s_row_at_their_site() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::library_claims::{LibraryRowKind, LibraryRows};
+        use crate::operation::{PubsubRole, SocketDirection};
+
+        let extractions = ProtocolExtractions {
+            library: LibraryRows {
+                rows: vec![
+                    library_row(
+                        "svc/src/tasks.ts",
+                        2,
+                        "send-email",
+                        LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                    ),
+                    library_row(
+                        "svc/src/orders.ts",
+                        14,
+                        "orders.created",
+                        LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                    ),
+                    library_row(
+                        "svc/src/live.ts",
+                        4,
+                        "chat",
+                        LibraryRowKind::Socket {
+                            direction: SocketDirection::ClientToServer,
+                            listener: true,
+                        },
+                    ),
+                    library_row(
+                        "svc/src/live.ts",
+                        5,
+                        "typing",
+                        LibraryRowKind::Socket {
+                            direction: SocketDirection::ServerToClient,
+                            listener: false,
+                        },
+                    ),
+                    library_row(
+                        "svc/src/__mocks__/tasks.ts",
+                        3,
+                        "mocked",
+                        LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                    ),
+                ],
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut elsewhere = pubsub_op("orders.created", PubsubRole::Publisher, None, None);
+        elsewhere.line_number = 20;
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/orders.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![
+                    pubsub_op("orders.created", PubsubRole::Publisher, None, None),
+                    elsewhere,
+                ],
+                ..Default::default()
+            },
+        );
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+
+        let task = cloud_data
+            .endpoints
+            .iter()
+            .find(|row| row.key.canonical() == "pubsub|send-email")
+            .expect("the subscriber is a producer");
+        assert_eq!(task.resolution_source, Some(ResolutionSource::LibraryClaim));
+        assert_eq!(
+            task.name_scope
+                .as_ref()
+                .map(|scope| scope.namespace.clone()),
+            Some(Some("task".to_string()))
+        );
+        assert_eq!(
+            task.library_semantics,
+            vec!["@fixture/jobs@3:task:op:send-email"]
+        );
+        assert_eq!(task.file_path, PathBuf::from("svc/src/tasks.ts:2"));
+        let published: Vec<(&PathBuf, Option<ResolutionSource>)> = cloud_data
+            .calls
+            .iter()
+            .filter(|row| row.key.canonical() == "pubsub|orders.created")
+            .map(|row| (&row.file_path, row.resolution_source))
+            .collect();
+        assert_eq!(
+            published,
+            vec![
+                (
+                    &PathBuf::from("svc/src/orders.ts:14"),
+                    Some(ResolutionSource::LibraryClaim)
+                ),
+                (
+                    &PathBuf::from("svc/src/orders.ts:20"),
+                    Some(ResolutionSource::Model)
+                ),
+            ],
+            "the model's row at the library row's site folds; the other stands"
+        );
+        assert!(cloud_data.endpoints.iter().any(|row| row.key
+            == OperationKey::socket("chat", SocketDirection::ClientToServer)
+            && row.resolution_source == Some(ResolutionSource::LibraryClaim)));
+        assert!(cloud_data.calls.iter().any(|row| row.key
+            == OperationKey::socket("typing", SocketDirection::ServerToClient)
+            && row.resolution_source == Some(ResolutionSource::LibraryClaim)));
+        assert!(
+            !cloud_data
+                .endpoints
+                .iter()
+                .any(|row| row.key.canonical() == "pubsub|mocked"),
+            "a mock tree states nothing"
+        );
+
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &crate::socket_io::SocketExtraction::default(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::of(
+                &stated_library_rows(&extractions.library, ".", &Config::default()),
+                ".",
+            ),
+            ".",
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the model row that stands is anchored"
+        );
+    }
+
+    /// carrick#1662: an event-bus row at a library row's file, line and name
+    /// is the same call read again, and is left out; one elsewhere stands.
+    #[test]
+    fn an_event_bus_row_at_a_library_row_s_site_is_left_out() {
+        use crate::library_claims::{LibraryRowKind, LibraryRows};
+        use crate::operation::PubsubRole;
+
+        let bus_op = |line: u32| crate::event_emitter::BusOp {
+            key: OperationKey::pubsub("ready"),
+            event: "ready".to_string(),
+            file_path: PathBuf::from("svc/src/events.ts"),
+            line,
+        };
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![bus_op(4), bus_op(9)],
+                publishers: Vec::new(),
+            },
+            library: LibraryRows {
+                rows: vec![library_row(
+                    "svc/src/events.ts",
+                    4,
+                    "ready",
+                    LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                )],
+            },
+            ..ProtocolExtractions::default()
+        };
+        let mut cloud_data = repo_with_bundle("svc", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &HashMap::new(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            ".",
+            &Config::default(),
+        );
+        let lines: Vec<(
+            &PathBuf,
+            Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+        )> = cloud_data
+            .endpoints
+            .iter()
+            .filter(|row| row.key.canonical() == "pubsub|ready")
+            .map(|row| (&row.file_path, row.resolution_source))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    &PathBuf::from("svc/src/events.ts:4"),
+                    Some(crate::agents::file_analyzer_agent::ResolutionSource::LibraryClaim)
+                ),
+                (&PathBuf::from("svc/src/events.ts:9"), None),
+            ]
+        );
+    }
+
+    /// carrick#1662: a model route at exactly a verified definition's span is
+    /// withdrawn. It fails closed: a model route at another span, a route a
+    /// pass stated, and a row that is no definition keep their routes.
+    #[test]
+    fn a_model_route_at_a_definition_s_span_is_withdrawn_and_nothing_else() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::library_claims::{LibraryRowKind, LibraryRows};
+        use crate::operation::PubsubRole;
+
+        let endpoint = |line: i32, path: &str, span: (u32, u32)| EndpointResult {
+            line_number: line,
+            method: "POST".to_string(),
+            path: path.to_string(),
+            call_expression_span_start: Some(span.0),
+            call_expression_span_end: Some(span.1),
+            ..endpoint_with_handler("run")
+        };
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        file_results.insert(
+            "svc/src/tasks.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![
+                    endpoint(2, "/send-email", (10, 40)),
+                    endpoint(5, "/awaited", (60, 98)),
+                    endpoint(8, "/stated", (120, 150)),
+                    endpoint(11, "/not-a-definition", (170, 200)),
+                ],
+                ..Default::default()
+            },
+        );
+        let route = |line: u32, path: &str, source| crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
+            method: "POST".to_string(),
+            path: path.to_string(),
+            full_path: path.to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: format!("svc/src/tasks.ts:{line}"),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(source),
+            dispatch: None,
+            handler_span: None,
+        };
+        let mut mount_graph = crate::mount_graph::MountGraph::new();
+        mount_graph.endpoints = vec![
+            route(2, "/send-email", ResolutionSource::Model),
+            route(5, "/awaited", ResolutionSource::Model),
+            route(8, "/stated", ResolutionSource::FileBasedRoute),
+            route(11, "/not-a-definition", ResolutionSource::Model),
+        ];
+        let definition = |line: u32, name: &str, span: (u32, u32), definition: bool| {
+            crate::library_claims::LibraryRow {
+                span_start: span.0,
+                span_end: span.1,
+                definition,
+                ..library_row(
+                    "svc/src/tasks.ts",
+                    line,
+                    name,
+                    LibraryRowKind::Pubsub(PubsubRole::Subscriber),
+                )
+            }
+        };
+        let library = LibraryRows {
+            rows: vec![
+                definition(2, "send-email", (10, 40), true),
+                // `await task(…)`: the model's span holds the `await`.
+                definition(5, "awaited", (66, 98), true),
+                definition(8, "stated", (120, 150), true),
+                definition(11, "not-a-definition", (170, 200), false),
+            ],
+        };
+        let withdrawn =
+            withdraw_model_routes_at_definitions(&mut mount_graph, &file_results, &library, ".");
+        assert_eq!(withdrawn, 1);
+        let kept: Vec<&str> = mount_graph
+            .endpoints
+            .iter()
+            .map(|route| route.path.as_str())
+            .collect();
+        assert_eq!(kept, vec!["/awaited", "/stated", "/not-a-definition"]);
+    }
+
+    /// carrick#1662: with no claims (every scan until carrick#1664 asks the
+    /// library store), or no sidecar to verify them, nothing is read.
+    #[test]
+    fn no_claims_or_no_sidecar_read_no_library_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let inputs = discover_request_inputs(dir.path());
+        assert!(
+            library_rows(&inputs, NO_LIBRARY_CLAIMS, None, dir.path())
+                .rows
+                .is_empty()
+        );
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        assert!(
+            library_rows(&inputs, &claims, None, dir.path())
+                .rows
+                .is_empty()
+        );
+    }
+
     fn pubsub_op(
         topic: &str,
         role: crate::operation::PubsubRole,
@@ -15423,6 +16068,7 @@ mod tests {
                 ],
                 publishers: vec![bus("job.retry", "/repo/apps/api/src/mocks/jobs.ts")],
             },
+            library: Default::default(),
         };
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
@@ -16216,6 +16862,7 @@ mod tests {
                     Some("./types/payment"),
                 )],
             },
+            library: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -16289,6 +16936,7 @@ mod tests {
             event_bus: crate::event_emitter::BusExtraction::default(),
             graphql,
             sockets: crate::socket_io::SocketExtraction::default(),
+            library: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -16354,6 +17002,7 @@ mod tests {
                 listeners: vec![],
                 emitters: vec![emitter.clone()],
             },
+            library: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -16421,6 +17070,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
         let manifest_alias = entries
@@ -16504,6 +17154,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
         let manifest_aliases: HashSet<String> = entries
@@ -16620,6 +17271,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
         let manifest_aliases: HashMap<ManifestRole, String> = entries
@@ -16794,6 +17446,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             &to_details,
             &to_details,
         );
@@ -16823,6 +17476,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
 
@@ -16889,6 +17543,7 @@ mod tests {
                     payload_type_source: Some("../src/types".to_string()),
                 }],
             },
+            library: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -16969,6 +17624,7 @@ mod tests {
             &file_results,
             &extractions.sockets,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
         assert_eq!(
@@ -17104,6 +17760,7 @@ mod tests {
             &file_results,
             &extractions.sockets,
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
         assert_eq!(
@@ -17152,6 +17809,7 @@ mod tests {
             &file_results,
             &crate::socket_io::SocketExtraction::default(),
             &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::default(),
             ".",
         );
 
@@ -17187,6 +17845,7 @@ mod tests {
                 input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
+            library: Default::default(),
         };
 
         let mut entries = Vec::new();
@@ -17324,6 +17983,7 @@ mod tests {
                 input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
+            library: Default::default(),
         };
 
         // The producer manifest entry's alias (Producer, Response).
@@ -17388,6 +18048,7 @@ mod tests {
                 input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
+            library: Default::default(),
         };
         assert!(
             orchestrator
