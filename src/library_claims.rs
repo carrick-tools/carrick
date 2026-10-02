@@ -450,16 +450,10 @@ pub fn read(
     if checks.is_empty() {
         return LibraryRows::default();
     }
+    // A verdict counts only for the check at its own position that it names
+    // (the sidecar client also refuses an answer of another length).
     let verdicts = match verify(&checks) {
-        Ok(verdicts) if verdicts.len() == checks.len() => verdicts,
-        Ok(verdicts) => {
-            warn!(
-                asked = checks.len(),
-                answered = verdicts.len(),
-                "library claims: the verifier answered another number of checks; no rows"
-            );
-            return LibraryRows::default();
-        }
+        Ok(verdicts) => verdicts,
         Err(error) => {
             warn!(%error, "library claims: verification failed; no rows");
             return LibraryRows::default();
@@ -1065,14 +1059,27 @@ mod tests {
     /// and a member no list names, contest the receiver.
     #[test]
     fn calls_are_classified_by_the_claims_own_lists() {
+        let mut claims = bus();
+        claims.claims.push(
+            serde_json::from_value(json!({
+                "kind": "op", "op": "send", "member": "ack", "on": "instance",
+                "name": { "arg": 0 }, "payload": { "arg": 1 }
+            }))
+            .expect("an instance op"),
+        );
         let with = |extra: &str| {
             let source = format!("{BUS_SERVICE}export function stop() {{ {extra} }}\n");
             let sites = sites_of(&[("src/orders.ts", source.as_str())]);
-            rows_of(&sites, &[bus()], all).len()
+            rows_of(&sites, std::slice::from_ref(&claims), all).len()
         };
         assert_eq!(with("bus.close();"), 2, "off the wire");
         assert_eq!(with("bus.setPrefix(\"staging\");"), 0, "a mutator");
         assert_eq!(with("bus.flush();"), 0, "a member no list names");
+        assert_eq!(
+            with("bus.ack();"),
+            0,
+            "a member claimed on instances only is unlisted on the export"
+        );
     }
 
     /// A queue's maker binds the name its instance's ops send to (`{
@@ -1138,12 +1145,19 @@ mod tests {
             .is_empty(),
             "an unverified maker defines nothing"
         );
-        let rows = rows_of(&sites, &[jobs], all);
+        let rows = rows_of(&sites, std::slice::from_ref(&jobs), all);
         assert_eq!(rows.len(), 1, "{rows:#?}");
         assert_eq!(rows[0].name, "send-email");
         assert!(rows[0].definition);
         assert_eq!(rows[0].kind, LibraryRowKind::Pubsub(PubsubRole::Subscriber));
         assert_eq!(rows[0].name_scope.scope, NameScopeKind::Service);
+        let mut socket = jobs.clone();
+        socket.role = LibraryRole::Socket;
+        socket.side = Some(Side::Server);
+        assert!(
+            rows_of(&sites, &[socket], all).is_empty(),
+            "only a broker's maker defines"
+        );
     }
 
     /// A socket's direction is its export's side's; one that serves both
