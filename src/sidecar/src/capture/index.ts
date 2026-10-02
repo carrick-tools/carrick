@@ -50,6 +50,7 @@ import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
+import { placeEmittedTree } from './outside-root.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
@@ -360,14 +361,18 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   fs.rmSync(stubDir, { recursive: true, force: true });
   fs.mkdirSync(typesDir, { recursive: true });
 
+  // A declaration for a source outside rootDir arrives at the source's own
+  // path; it is placed under the tree too (carrick#1770).
+  const placed = placeEmittedTree({ emitted, staging, entryDir, surfaceDeclaration });
   const emittedFiles: string[] = [];
   let surfaceAbsPath = '';
-  for (const [fileName, text] of emitted) {
-    let rel = path.relative(staging, fileName).split(path.sep).join('/');
-    if (path.basename(rel) === surfaceDeclaration) {
-      const source = sourceByEmitted.get(rel);
-      sourceByEmitted.delete(rel);
-      rel = 'surface.d.ts';
+  for (const fileName of emitted.keys()) {
+    const stagingRel = path.relative(staging, fileName).split(path.sep).join('/');
+    const rel = placed.relOf.get(fileName)!;
+    const text = placed.textOf.get(fileName)!;
+    if (rel !== stagingRel) {
+      const source = sourceByEmitted.get(stagingRel);
+      sourceByEmitted.delete(stagingRel);
       if (source) sourceByEmitted.set(rel, source);
     }
     const dest = path.join(typesDir, rel);
@@ -394,6 +399,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     .map((abs) => {
       const noDts = abs.replace(/\.d\.ts$/, '');
       const noExt = noDts === abs ? abs.replace(/\.(ts|tsx|mts|cts)$/, '') : noDts;
+      const outside = placed.outside.get(path.resolve(noExt));
+      if (outside !== undefined) return outside;
       const rel = path.relative(entryDir, noExt).split(path.sep).join('/');
       return `${rel}.d.ts`;
     })
@@ -408,13 +415,14 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
   const rewritten = rewriteEmittedSpecifiers({
+    outside: placed.outside,
     typesDir,
     files: emittedFiles,
     options: parsed.options,
     configPath: projectConfigPath,
     entryDir,
   });
-  const specifierRewrites = denoRewrites + rewritten.rewrites;
+  const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
 
   // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths

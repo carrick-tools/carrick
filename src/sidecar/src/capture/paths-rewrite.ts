@@ -36,6 +36,11 @@ export interface RewriteArgs {
   configPath: string;
   /** Effective rootDir the emit ran with (tree layout mirrors it). */
   entryDir: string;
+  /**
+   * Declarations of sources outside rootDir, placed under the tree
+   * (carrick#1770): absolute source-side path without extension -> tree path.
+   */
+  outside: Map<string, string>;
 }
 
 export function parsePathsPatterns(
@@ -67,11 +72,15 @@ export function parsePathsPatterns(
 function treeFileFor(
   absSource: string,
   entryDir: string,
-  emitted: Set<string>
+  emitted: Set<string>,
+  outside: Map<string, string>
 ): string | undefined {
   const noExt = absSource.replace(/\.(d\.ts|ts|tsx|mts|cts)$/, '');
   const rel = path.relative(entryDir, noExt).split(path.sep).join('/');
-  if (rel.startsWith('..')) return undefined;
+  if (rel.startsWith('..')) {
+    const resolved = path.resolve(noExt);
+    return outside.get(resolved) ?? outside.get(path.join(resolved, 'index'));
+  }
   for (const candidate of [`${rel}.d.ts`, `${rel}/index.d.ts`]) {
     if (emitted.has(candidate)) return candidate;
   }
@@ -138,7 +147,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
     const text = original.replace(
       ABSOLUTE_IMPORT_TYPE,
       (whole, open: string, quote: string, spec: string, close: string, dot: string, name: string) => {
-        if (treeFileFor(spec, args.entryDir, emitted)) return whole;
+        if (treeFileFor(spec, args.entryDir, emitted, args.outside)) return whole;
         const replacement = installed(spec, name);
         if (replacement === undefined) return whole;
         importTypeRewrites++;
@@ -148,7 +157,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
     const { text: rewritten, rewrites } = rewriteSpecifiers(text, (spec) => {
       // Absolute paths: an emitted tree file, else an installed package.
       if (spec.startsWith('/')) {
-        const target = treeFileFor(spec, args.entryDir, emitted);
+        const target = treeFileFor(spec, args.entryDir, emitted, args.outside);
         return target ? relativeSpecifier(file, target) : installed(spec);
       }
       if (isRelative(spec)) return undefined;
@@ -159,7 +168,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
         if (star === undefined) continue;
         for (const targetTemplate of pattern.targets) {
           const absTarget = targetTemplate.replace('*', star);
-          const target = treeFileFor(absTarget, args.entryDir, emitted);
+          const target = treeFileFor(absTarget, args.entryDir, emitted, args.outside);
           if (target) return relativeSpecifier(file, target);
         }
         // Matched a pattern but no in-tree target: leave it for the
