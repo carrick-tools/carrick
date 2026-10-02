@@ -200,7 +200,7 @@ pub struct AgentCallError {
 
 impl AgentCallError {
     /// A permanent, non-retriable failure (server-side bug, malformed response).
-    fn permanent(code: &str, message: String) -> Self {
+    pub(crate) fn permanent(code: &str, message: String) -> Self {
         Self {
             code: code.to_string(),
             message,
@@ -683,6 +683,35 @@ impl AgentService {
         body: &B,
         mock_seed: &str,
     ) -> Result<LambdaOutcome, AgentCallError> {
+        self.post_reading(task_path, body, mock_seed, SuccessBody::Envelope)
+            .await
+    }
+
+    /// As [`Self::post_to_lambda`], for a route whose 2xx body is the answer
+    /// itself rather than the envelope: `POST /library-claims`
+    /// ([`SuccessBody::Json`]). Its errors are read from the envelope, as
+    /// every route's are.
+    pub async fn post_json_to_lambda<B: Serialize + ?Sized>(
+        &self,
+        task_path: &str,
+        body: &B,
+        mock_seed: &str,
+    ) -> Result<String, AgentCallError> {
+        self.post_reading(task_path, body, mock_seed, SuccessBody::Json)
+            .await
+            .map(|outcome| outcome.text)
+    }
+
+    /// The one path every lambda call takes: the mock short-circuit, the
+    /// credential, then [`Self::post_with_retry_reading`]. `reading` says
+    /// how the route's 2xx body is read, and nothing else differs.
+    async fn post_reading<B: Serialize + ?Sized>(
+        &self,
+        task_path: &str,
+        body: &B,
+        mock_seed: &str,
+        reading: SuccessBody,
+    ) -> Result<LambdaOutcome, AgentCallError> {
         // Counted here, before the mock short-circuit: this is every request
         // the scan would put on the wire. The concurrency permit is taken per
         // HTTP attempt inside `post_with_retry`, so an offline run takes none.
@@ -715,8 +744,14 @@ impl AgentService {
             ),
             crate::credentials::CloudAuth::Bearer(token) => RequestAuth::Bearer(token),
         };
-        self.post_with_retry(&auth, env!("CARRICK_API_ENDPOINT"), task_path, body)
-            .await
+        self.post_with_retry_reading(
+            &auth,
+            env!("CARRICK_API_ENDPOINT"),
+            task_path,
+            body,
+            reading,
+        )
+        .await
     }
 
     /// Shared HTTP + retry implementation for all lambda calls. Sends
@@ -727,12 +762,29 @@ impl AgentService {
     /// `auth` and `api_base` are parameters rather than the globals the
     /// public entry point reads, so the retry loop can be driven against a
     /// stub in tests.
+    #[cfg(test)]
     async fn post_with_retry<B>(
         &self,
         auth: &RequestAuth<'_>,
         api_base: &str,
         path: &str,
         body: &B,
+    ) -> Result<LambdaOutcome, AgentCallError>
+    where
+        B: Serialize + ?Sized,
+    {
+        self.post_with_retry_reading(auth, api_base, path, body, SuccessBody::Envelope)
+            .await
+    }
+
+    /// [`Self::post_with_retry`], reading a 2xx body as `reading` says.
+    async fn post_with_retry_reading<B>(
+        &self,
+        auth: &RequestAuth<'_>,
+        api_base: &str,
+        path: &str,
+        body: &B,
+        reading: SuccessBody,
     ) -> Result<LambdaOutcome, AgentCallError>
     where
         B: Serialize + ?Sized,
@@ -959,6 +1011,31 @@ impl AgentService {
                         })?;
                         reminted = true;
                         continue;
+                    }
+
+                    // A route whose 2xx body is the answer itself. A body
+                    // that is not JSON is a bad response, never retried, as
+                    // an unparseable envelope on a 2xx is below; every
+                    // non-2xx is read from the envelope like any route's.
+                    if reading == SuccessBody::Json && status.is_success() {
+                        if let Err(e) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                            return Err(AgentCallError::permanent(
+                                "bad_response",
+                                format!(
+                                    "Agent proxy returned status {} with unparseable body ({}): {}",
+                                    status,
+                                    e,
+                                    body_excerpt(&response_text)
+                                ),
+                            ));
+                        }
+                        drop(permit);
+                        route_slot.succeeded();
+                        self.pacer.admitted();
+                        return Ok(LambdaOutcome {
+                            text: response_text,
+                            guidance_key: None,
+                        });
                     }
 
                     let is_transient_gateway_status =
@@ -1333,6 +1410,18 @@ struct AgentResponse {
     guidance_key: Option<String>,
 }
 
+/// How a route's 2xx body is read. A non-2xx body is read as the error
+/// envelope on every route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuccessBody {
+    /// `{success: true, text}`: the prompt lambdas.
+    Envelope,
+    /// The answer itself, which must be JSON: `POST /library-claims`, whose
+    /// 200 is the store's answer in the shape carrick#1564 section 2 pins
+    /// (ruled on carrick#1664, 2026-10-02).
+    Json,
+}
+
 /// What a lambda answered: the text, plus the envelope fields a caller may
 /// need beside it.
 #[derive(Debug, Clone)]
@@ -1413,6 +1502,8 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
     }
     match task_path {
         "/generate-intent" => mock_intent_answer(body),
+        // The store knows nothing offline: no claims, no library rows.
+        crate::library_store::ROUTE => r#"{"library_claims":[]}"#.to_string(),
         _ => {
             // Tasks that send a schema (file-analyzer, framework-guidance)
             // dispatch by inspecting the schema shape. Tasks that don't but
@@ -4518,6 +4609,113 @@ pub(crate) mod tests {
             key.eq_ignore_ascii_case(name)
                 .then(|| value.trim().to_string())
         })
+    }
+
+    /// The library store's 200 is its answer, not the envelope (ruled on
+    /// carrick#1664): read through the one transport, it arrives as sent,
+    /// on the store's route, carrying the scan slot and the scanner version
+    /// a prompt call carries.
+    #[tokio::test]
+    async fn the_store_s_raw_answer_rides_the_one_transport_with_the_scan_slot() {
+        use crate::library_store::store_bodies::ANSWERED;
+        crate::credentials::set_scan_id("scan_01J");
+        let (api_base, server) = stub_server(vec![(200, ANSWERED.to_string())]);
+        let text = AgentService::new()
+            .post_with_retry_reading(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                crate::library_store::ROUTE,
+                &serde_json::json!({"roles": ["broker"], "packages": []}),
+                SuccessBody::Json,
+            )
+            .await
+            .expect("the store's answer is read")
+            .text;
+        assert_eq!(text, ANSWERED);
+        assert_eq!(crate::library_store::parse_answer(&text).exports.len(), 1);
+        let request = &server.join().unwrap()[0];
+        assert!(
+            request.starts_with("POST /library-claims "),
+            "the store's route: {request}"
+        );
+        assert!(header_of(request, "x-carrick-scan-id").is_some());
+        assert_eq!(
+            header_of(request, "x-carrick-scanner-version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// A raw 2xx that is not JSON is a bad response, as an unparseable
+    /// envelope is, and is never sent again: the stub's second answer would
+    /// be read if it were.
+    #[tokio::test]
+    async fn a_raw_answer_that_is_not_json_is_a_bad_response_never_retried() {
+        let (api_base, _server) = stub_server(vec![
+            (200, "<html>gateway</html>".to_string()),
+            (200, r#"{"library_claims":[]}"#.to_string()),
+        ]);
+        let err = AgentService::new()
+            .post_with_retry_reading(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                crate::library_store::ROUTE,
+                &serde_json::json!({}),
+                SuccessBody::Json,
+            )
+            .await
+            .expect_err("a body that is not JSON is no answer");
+        assert_eq!(err.code, "bad_response");
+        assert!(!err.retriable);
+    }
+
+    /// A refusal on the store's route is read from the envelope, as on every
+    /// route: a laptop scan with no scan started is told so, and the store
+    /// gives no claims.
+    #[tokio::test]
+    async fn a_store_refusal_is_read_from_the_envelope() {
+        let (api_base, server) = stub_server(vec![(
+            403,
+            r#"{"success":false,"error":{"code":"scan_not_started","message":"Start a scan first","retriable":false}}"#
+                .to_string(),
+        )]);
+        let err = AgentService::new()
+            .post_with_retry_reading(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                crate::library_store::ROUTE,
+                &serde_json::json!({}),
+                SuccessBody::Json,
+            )
+            .await
+            .expect_err("a refusal is an error");
+        assert_eq!(err.code, "scan_not_started");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// The prompt lambdas read the envelope exactly as before: its `text` on
+    /// success, and a raw body, the store's included, is no answer there.
+    #[tokio::test]
+    async fn an_enveloped_route_still_reads_the_envelope_and_refuses_a_raw_body() {
+        let (api_base, server) = stub_server(vec![
+            (200, r#"{"success":true,"text":"analysed"}"#.to_string()),
+            (
+                200,
+                crate::library_store::store_bodies::ANSWERED.to_string(),
+            ),
+        ]);
+        let service = AgentService::new();
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let enveloped = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &serde_json::json!({}))
+            .await
+            .expect("the envelope is read");
+        assert_eq!(enveloped.text, "analysed");
+        let raw = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &serde_json::json!({}))
+            .await
+            .expect_err("a raw body is not an envelope");
+        assert_eq!(raw.code, "bad_response");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     /// The laptop branch of a prompt-lambda call: the credential goes in
