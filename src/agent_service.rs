@@ -4650,6 +4650,21 @@ pub(crate) mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
+    /// Offline, the store knows nothing: its answer is the contract's shape
+    /// with no claims, not another lambda's shape read as a malformed one.
+    #[test]
+    fn the_offline_store_answers_no_claims_in_its_own_shape() {
+        let text = generate_mock_for_task(
+            crate::library_store::ROUTE,
+            &serde_json::json!({}),
+            crate::library_store::MOCK_SEED,
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!({"library_claims": []})
+        );
+    }
+
     /// Each route's 2xx reader is its own: the store's raw, the prompt
     /// lambdas' the envelope.
     #[test]

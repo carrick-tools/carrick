@@ -448,12 +448,11 @@ fn npm_lock(name: &str, package: &Installed, lock_dir: &Path, which: NpmLock) ->
             .and_then(|key| packages.get(key.to_string_lossy().replace('\\', "/"))),
         None => lock.get("dependencies").and_then(|deps| deps.get(name)),
     };
+    // A linked workspace package's `resolved` is its path, which is no
+    // public URL.
     let Some(entry) = entry else {
         return Some(false);
     };
-    if entry.get("link").and_then(Value::as_bool) == Some(true) {
-        return Some(false);
-    }
     Some(
         entry
             .get("resolved")
@@ -1140,7 +1139,7 @@ mod tests {
         pnpm_install(
             tarball.path(),
             "  default: https://registry.npmjs.org/\n",
-            "{tarball: https://npm.acme.dev/lib.tgz}",
+            "{integrity: sha512-abc, tarball: https://npm.acme.dev/lib.tgz}",
         );
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install_at(tarball.path()))),
@@ -1172,11 +1171,15 @@ mod tests {
             asked(request(&specifiers(&["lib"]), &install_at(public.path()))),
             one("lib", "1.0.0", &["lib"])
         );
+        // The installed version's block is the one read: another version's
+        // public URL says nothing about it.
         let private = tempfile::tempdir().unwrap();
         install_package(private.path(), "lib", "1.0.0");
         write(
             &private.path().join("yarn.lock"),
-            "lib@^1.0.0:\n  version \"1.0.0\"\n  resolved \"https://npm.acme.dev/lib.tgz\"\n",
+            &format!(
+                "lib@^0.9.0:\n  version \"0.9.0\"\n  resolved \"{PUBLIC_TGZ}\"\n\nlib@^1.0.0:\n  version \"1.0.0\"\n  resolved \"https://npm.acme.dev/lib.tgz\"\n"
+            ),
         );
         assert_eq!(
             asked(request(&specifiers(&["lib"]), &install_at(private.path()))),
@@ -1258,12 +1261,17 @@ mod tests {
         );
     }
 
-    /// `@types/node` at 22.5.0, declaring the `events` module.
+    /// `@types/node` at 22.5.0, declaring the `events` module and the
+    /// `fs/promises` subpath, as the real package does.
     fn install_runtime_types(root: &Path) {
         install_package(root, "@types/node", "22.5.0");
         write(
             &root.join("node_modules/@types/node/events.d.ts"),
             "declare module \"events\" {}\n",
+        );
+        write(
+            &root.join("node_modules/@types/node/fs/promises.d.ts"),
+            "declare module \"fs/promises\" {}\n",
         );
     }
 
