@@ -63,7 +63,12 @@
 //!   - an own factory's return ([`super::FnIr::returned`]), followed where
 //!     the call graph resolves the call (`SiteReader::made`), so
 //!     `this.queue = createQueue("emails")` holds the factory's maker's
-//!     instance, handed `"emails"` ([`SiteMaker::factory`]);
+//!     instance, handed `"emails"` ([`SiteMaker::factory`]). A factory that
+//!     builds one of a few makers' instances on every path (a `let` set on
+//!     each branch, a return per branch) holds the set of those makers
+//!     (carrick#1689, [`SiteReceiver::Instance`]), and a site through it
+//!     states a fact only when every maker reads the same
+//!     ([`LibrarySite::fold`]);
 //!   - a name taken from a parameter, stated again at each call that fills
 //!     it with text ([`LibrarySite::origin`]);
 //!   - an entry of a constant object, an imported constant, and what a
@@ -75,9 +80,10 @@
 //! - **In-repo packages** (carrick#1666): a call the call graph resolves to a
 //!   function of this service is that function's, and is no site here, which
 //!   is where a workspace package's calls go today.
-//! - **A factory that builds one of two makers' instances** (carrick#1689)
-//!   and **a client handed in as a parameter** (carrick#1693) are read as
-//!   nothing.
+//! - **A client handed in as a parameter** (carrick#1693) is read as
+//!   nothing, and so are a set of makers of more than one export
+//!   (carrick#1704) and a conditional of two makers' instances
+//!   (carrick#1705).
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
@@ -368,8 +374,13 @@ impl SiteMaker {
 pub enum SiteReceiver {
     /// The package export itself.
     Export,
-    /// An instance one of the export's makers built.
-    Instance(SiteMaker),
+    /// An instance one of the export's makers built: one maker, or each of
+    /// up to [`MAX_MAKERS`] when every path to the instance yields one of
+    /// theirs and nothing else (carrick#1689, contract amendment 3 on
+    /// carrick#1564), in the order the source writes them. Never empty. Two
+    /// makers may share a receiver id and differ in what they were handed. A
+    /// one-maker site is a set of one, read as before.
+    Instance(Vec<SiteMaker>),
 }
 
 /// Which receivers a claim acts on (the contract's `on`).
@@ -466,13 +477,59 @@ pub struct LibrarySite {
 }
 
 impl LibrarySite {
-    /// The contract's receiver id: `export`, or the instance's maker's
-    /// ([`SiteMaker::receiver_id`]).
-    pub fn receiver_id(&self) -> String {
+    /// The contract's receiver ids the call may be made through, one check
+    /// each (carrick#1689): `export`, or each of the set's makers'
+    /// ([`SiteMaker::receiver_id`]), once, in the set's order.
+    pub fn receiver_ids(&self) -> Vec<String> {
         match &self.receiver {
-            SiteReceiver::Export => "export".to_string(),
-            SiteReceiver::Instance(maker) => maker.receiver_id(),
+            SiteReceiver::Export => vec!["export".to_string()],
+            SiteReceiver::Instance(makers) => {
+                let mut ids: Vec<String> = Vec::new();
+                for id in makers.iter().map(SiteMaker::receiver_id) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            }
         }
+    }
+
+    /// The makers whose instance the call may be made through: none for the
+    /// export, one or more for an instance (carrick#1689).
+    pub fn makers(&self) -> &[SiteMaker] {
+        match &self.receiver {
+            SiteReceiver::Export => &[],
+            SiteReceiver::Instance(makers) => makers,
+        }
+    }
+
+    /// What a message role reads off this site (carrick#1689, contract
+    /// amendment 3): `read` is asked once for each receiver the call may be
+    /// made through (`None`: the export; otherwise each maker of the set)
+    /// and answers what a fact through that receiver states, or `None` when
+    /// its maker, or every op element that applies to it, is unverified, or
+    /// the elements it verifies read different names. A fact only when every
+    /// receiver answers and all answer the same (op, name text, role, name
+    /// scope); otherwise `None`, and the site stays a candidate.
+    pub fn fold<R: PartialEq>(
+        &self,
+        mut read: impl FnMut(Option<&SiteMaker>) -> Option<R>,
+    ) -> Option<R> {
+        let readings: Vec<Option<R>> = match &self.receiver {
+            SiteReceiver::Export => vec![read(None)],
+            SiteReceiver::Instance(makers) => {
+                makers.iter().map(|maker| read(Some(maker))).collect()
+            }
+        };
+        let mut readings = readings.into_iter();
+        let first = readings.next().flatten()?;
+        for reading in readings {
+            if reading? != first {
+                return None;
+            }
+        }
+        Some(first)
     }
 
     /// The package the specifier names ([`package_name`]).
@@ -489,14 +546,19 @@ impl LibrarySite {
             && self.member.as_deref() == member
     }
 
-    /// Whether an op claim with `selector` acts on this site's call. An op is
-    /// a call, never a construction.
-    pub fn selected_by(&self, selector: &Selector<'_>) -> bool {
-        let receiver = match (&self.receiver, selector.on) {
-            (SiteReceiver::Export, On::Export | On::Both) => true,
-            (SiteReceiver::Instance(maker), On::Instance | On::Both) => selector
-                .of
-                .is_none_or(|of| maker.member.as_deref() == Some(of)),
+    /// Whether an op claim with `selector` acts on this site's call made
+    /// through one of its receivers: the export (`through` is `None`), or the
+    /// instance of `through`, one of the site's makers (carrick#1689). An op
+    /// is a call, never a construction.
+    pub fn selected_by(&self, through: Option<&SiteMaker>, selector: &Selector<'_>) -> bool {
+        let receiver = match (&self.receiver, through, selector.on) {
+            (SiteReceiver::Export, None, On::Export | On::Both) => true,
+            (SiteReceiver::Instance(makers), Some(maker), On::Instance | On::Both) => {
+                makers.contains(maker)
+                    && selector
+                        .of
+                        .is_none_or(|of| maker.member.as_deref() == Some(of))
+            }
             _ => false,
         };
         receiver
@@ -518,19 +580,21 @@ impl LibrarySite {
     /// Why a message-role reading of this site must state nothing, whatever
     /// the claims say: `None` when nothing contests it.
     ///
-    /// `classify` says what one member use is on a receiver (`receiver`: the
-    /// site's id, or `export` for the export an instance was made from). A use
-    /// that can change a name, a prefix or a base contests, and so does one
-    /// the package's surface does not list: nothing says it cannot.
+    /// `classify` says what one member use is on a receiver (`receiver`: each
+    /// of the site's ids, or `export` for the export an instance was made
+    /// from). A use that can change a name, a prefix or a base contests, and
+    /// so does one the package's surface does not list: nothing says it
+    /// cannot. A use on an instance of a set is classified on every maker's
+    /// receiver (carrick#1689).
     pub fn contest(&self, classify: impl Fn(&str, &MemberUse) -> MemberWire) -> Option<Contest> {
         if self.contested {
             return Some(Contest::Used);
         }
-        let receiver = self.receiver_id();
+        let receivers = self.receiver_ids();
         let uses = self
             .uses
             .iter()
-            .map(|used| (receiver.as_str(), used))
+            .flat_map(|used| receivers.iter().map(move |on| (on.as_str(), used)))
             .chain(self.export_uses.iter().map(|used| ("export", used)));
         for (on, used) in uses {
             let wire = classify(on, used);
@@ -586,6 +650,10 @@ pub fn package_name(specifier: &str) -> &str {
 /// callers up a name's hole is filled through (carrick#1562): the call
 /// graph's re-export cap, for the same reason.
 const MAX_VALUE_HOPS: usize = super::MAX_REEXPORT_HOPS;
+
+/// How many makers' instances a receiver may be one of (carrick#1689,
+/// contract amendment 3 on carrick#1564): more reads as nothing.
+pub(super) const MAX_MAKERS: usize = 4;
 
 /// Every call and construction the service makes through a package export or
 /// an instance of one ([`LibrarySite`]), with every call to one of the
@@ -657,6 +725,26 @@ struct Made {
     export_uses: BTreeSet<MemberUse>,
 }
 
+impl Made {
+    /// Whether two are one export's maker, handed the same arguments: one
+    /// maker of a set (carrick#1689), wherever each was written.
+    fn same_maker(&self, other: &Made) -> bool {
+        self.package == other.package
+            && self.export == other.export
+            && self.instance.form == other.instance.form
+            && self.instance.member == other.instance.member
+            && self.instance.args == other.instance.args
+    }
+
+    /// `other`'s contest and uses added to these: the first one written
+    /// stands for both.
+    fn absorb(&mut self, other: Made) {
+        self.contested |= other.contested;
+        self.uses.extend(other.uses);
+        self.export_uses.extend(other.export_uses);
+    }
+}
+
 impl SiteReader<'_> {
     /// Every library site `ir` writes, and those its callers fill. `key` is
     /// the function's definition key when `ir` is a keyed function's own
@@ -715,42 +803,62 @@ impl SiteReader<'_> {
                     // What an own call holds is what the function returns,
                     // and a call to one that is no own factory holds nothing
                     // a package made.
-                    let Some(made) = self.made(declared_in, client, 0) else {
+                    let made = self.made(declared_in, client, 0);
+                    let Some(first) = made.first() else {
                         continue;
                     };
+                    // The makers of a set are one export's (carrick#1689): a
+                    // set across exports or packages is read as nothing.
+                    let (specifier, export) = (first.package.clone(), first.export.clone());
+                    if made
+                        .iter()
+                        .any(|made| made.package != specifier || made.export != export)
+                    {
+                        continue;
+                    }
                     // A call made on what a package's maker returns
                     // (`z.string().min(1)`) is no receiver form the contract
                     // names; one made on what an own factory returns is
                     // (carrick#1562).
-                    if holder == Holder::Chained && made.factory.is_none() {
+                    if holder == Holder::Chained && first.factory.is_none() {
                         continue;
                     }
                     let mut uses = client.member_uses.clone();
-                    uses.extend(made.uses);
+                    let mut export_uses = BTreeSet::new();
+                    let mut made_contested = false;
+                    let makers = made
+                        .into_iter()
+                        .map(|made| {
+                            uses.extend(made.uses);
+                            export_uses.extend(made.export_uses);
+                            made_contested |= made.contested;
+                            SiteMaker {
+                                form: made.instance.form,
+                                member: made.instance.member,
+                                args: made.instance.args,
+                                file: made.file,
+                                span_start: made.instance.site.span_start,
+                                line: made.instance.site.line,
+                                holder,
+                                factory: made.factory,
+                            }
+                        })
+                        .collect();
                     LibrarySite {
                         file: self.file.to_path_buf(),
                         span_start: site.site.span_start,
                         span_end: site.site.span_end,
                         line: site.op_line,
                         form: site.form,
-                        specifier: made.package,
-                        export: made.export,
-                        receiver: SiteReceiver::Instance(SiteMaker {
-                            form: made.instance.form,
-                            member: made.instance.member.clone(),
-                            args: made.instance.args.clone(),
-                            file: made.file,
-                            span_start: made.instance.site.span_start,
-                            line: made.instance.site.line,
-                            holder,
-                            factory: made.factory,
-                        }),
+                        specifier,
+                        export,
+                        receiver: SiteReceiver::Instance(makers),
                         path: site.path.clone(),
                         member: site.member.clone(),
                         args,
-                        contested: contested || made.contested,
+                        contested: contested || made_contested,
                         uses,
-                        export_uses: made.export_uses,
+                        export_uses,
                         origin: None,
                     }
                 }
@@ -778,21 +886,27 @@ impl SiteReader<'_> {
     }
 
     /// The instance `client` (held in `file`) holds, where a package's maker
-    /// made it (carrick#1562). A maker call the call graph resolves to a
-    /// function of the service is an own call: what it holds is what that
-    /// function returns ([`super::FnIr::returned`]), with the function's
-    /// parameters filled by this call's arguments, through as many own
-    /// factories as it took. An own call to anything else, an async factory
-    /// called without `await`, and one past the hop cap hold nothing.
-    fn made(&self, file: &Path, client: &ClientRef, depth: usize) -> Option<Made> {
-        let instance = client.instance.as_ref()?;
+    /// made it (carrick#1562): one per maker it may come from (carrick#1689),
+    /// empty when it holds nothing a package made. A maker call the call
+    /// graph resolves to a function of the service is an own call: what it
+    /// holds is what that function returns ([`super::FnIr::returned`]), with
+    /// the function's parameters filled by this call's arguments, through as
+    /// many own factories as it took. An own call to anything else, an async
+    /// factory called without `await`, one past the hop cap, and one whose
+    /// makers come to more than [`MAX_MAKERS`] hold nothing. One maker,
+    /// handed the same arguments, reached twice is one maker, used as both
+    /// are.
+    fn made(&self, file: &Path, client: &ClientRef, depth: usize) -> Vec<Made> {
+        let Some(instance) = client.instance.as_ref() else {
+            return Vec::new();
+        };
         let target = match instance.form {
             MakerForm::Call => self.resolves(file, &instance.site),
             MakerForm::New => None,
         };
         let Some((target_file, key)) = target else {
             return match instance.made_by {
-                MadeBy::Export => Some(Made {
+                MadeBy::Export => vec![Made {
                     package: client.package.clone(),
                     export: client.export.clone(),
                     instance: ClientInstance {
@@ -804,44 +918,61 @@ impl SiteReader<'_> {
                     contested: false,
                     uses: BTreeSet::new(),
                     export_uses: client.export_uses.clone(),
-                }),
-                MadeBy::Call(_) => None,
+                }],
+                MadeBy::Call(_) => Vec::new(),
             };
         };
         if depth >= MAX_VALUE_HOPS {
-            return None;
+            return Vec::new();
         }
-        let returned = self
+        let Some(returned) = self
             .inputs
             .files
-            .get(target_file)?
-            .functions
-            .get(key)?
-            .returned
-            .as_ref()?;
+            .get(target_file)
+            .and_then(|ir| ir.functions.get(key))
+            .and_then(|function| function.returned.as_ref())
+        else {
+            return Vec::new();
+        };
         if returned.is_async && !instance.awaited {
-            return None;
+            return Vec::new();
         }
-        let product = &returned.client;
-        let mut made = self.made(target_file, product, depth + 1)?;
         let passed = self.names.resolved_all(file, &instance.args);
-        made.instance.args = made
-            .instance
-            .args
-            .iter()
-            .map(|arg| arg.filled(&passed, true).0)
-            .collect();
-        // The factory's binding is used to change the instance, or returned
-        // somewhere the factory's own returns are not: a caller of that
-        // other function may hold it too.
-        made.contested |= product.contested_message || !product.returned.is_subset(&returned.at);
-        made.uses.extend(product.member_uses.iter().cloned());
-        made.factory = Some(SiteCall {
+        let factory = SiteCall {
             file: file.to_path_buf(),
             span_start: instance.site.span_start,
             line: instance.site.line,
-        });
-        Some(made)
+        };
+        let mut out: Vec<Made> = Vec::new();
+        for product in &returned.makers {
+            let inner = self.made(target_file, product, depth + 1);
+            if inner.is_empty() {
+                return Vec::new();
+            }
+            // The factory's binding is used to change the instance, or
+            // returned somewhere the factory's own returns are not: a caller
+            // of that other function may hold it too.
+            let contested = product.contested_message || !product.returned.is_subset(&returned.at);
+            for mut made in inner {
+                made.instance.args = made
+                    .instance
+                    .args
+                    .iter()
+                    .map(|arg| arg.filled(&passed, true).0)
+                    .collect();
+                made.contested |= contested;
+                made.uses.extend(product.member_uses.iter().cloned());
+                made.factory = Some(factory.clone());
+                match out.iter_mut().find(|known| known.same_maker(&made)) {
+                    Some(known) => known.absorb(made),
+                    None => out.push(made),
+                }
+            }
+        }
+        if out.len() > MAX_MAKERS {
+            return Vec::new();
+        }
+        out
     }
 
     /// Every call of `function` that fills a hole in `args` (the arguments of
@@ -1325,16 +1456,77 @@ impl Reader<'_> {
     }
 
     /// What a `return` hands its caller, when it is an instance each call
-    /// builds anew (carrick#1562): one [`Reader::written_instance`] reads, or
-    /// a local that holds one. A parameter, a module's instance and a class
-    /// field are shared by every call, and are none. Only a function the
-    /// call graph keys is followed as a factory, and such a function is
-    /// never written inside another, so every local it holds is its own.
-    pub(super) fn returned_instance(&self, expr: &Expr, scope: &Scope<'_>) -> Option<ClientRef> {
+    /// builds anew (carrick#1562): one [`Reader::written_instance`] reads, a
+    /// local that holds one, or a `let` set on every path to one of a few
+    /// makers' (carrick#1689, [`Reader::let_makers`]), one per maker. Empty
+    /// for anything else: a parameter, a module's instance and a class field
+    /// are shared by every call. Only a function the call graph keys is
+    /// followed as a factory, and such a function is never written inside
+    /// another, so every local it holds is its own.
+    pub(super) fn returned_instances(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<ClientRef> {
         if let Expr::Ident(ident) = unwrap_expression(expr) {
-            return scope.local_receivers.get(&ident_key(ident)).cloned();
+            let key = ident_key(ident);
+            if let Some(makers) = scope.let_makers.get(&key) {
+                return makers.clone();
+            }
+            return scope
+                .local_receivers
+                .get(&key)
+                .cloned()
+                .into_iter()
+                .collect();
         }
-        self.written_instance(expr, scope)
+        self.written_instance(expr, scope).into_iter().collect()
+    }
+
+    /// The instances a `let` (or `var`) holds wherever the function returns
+    /// it, when the body sets it to an instance on every path (carrick#1689),
+    /// one per write: `binding` is declared once, by the statement before
+    /// `after`, with no initialiser or an instance; every other write is a
+    /// plain `binding = <instance>` statement in the function's own
+    /// statements, or in blocks and `if` branches among them; and every
+    /// `return binding` in the body is one of those statements too, reached
+    /// only once the binding is set. A write anywhere else (a loop, a `try`,
+    /// a `switch`, a nested function, `||=`, `++`) leaves it read as nothing,
+    /// and so does a return the walk does not reach, a nested function's
+    /// included. Every maker is
+    /// read in the scope the binding is declared in. How many makers that
+    /// comes to is [`super::FnIr::settle_returned`]'s to judge.
+    ///
+    /// A path may set the binding twice; both makers are in the set, which a
+    /// fold over the set reads as strictly as it reads each of them.
+    pub(super) fn let_makers<'s>(
+        &self,
+        body: &'s [Stmt],
+        after: &'s [Stmt],
+        binding: &Ident,
+        init: Option<&'s Expr>,
+        scope: &Scope<'_>,
+    ) -> Option<Vec<ClientRef>> {
+        let key = ident_key(binding);
+        let mut flow = LetFlow {
+            key: &key,
+            writes: init.into_iter().collect(),
+            claimed: HashSet::new(),
+            returns: 0,
+        };
+        flow.block(after, init.is_some())?;
+        let mut uses = LetUses {
+            key: &key,
+            claimed: &flow.claimed,
+            unclaimed: false,
+            returns: 0,
+        };
+        for stmt in body {
+            stmt.visit_with(&mut uses);
+        }
+        if uses.unclaimed || uses.returns != flow.returns {
+            return None;
+        }
+        flow.writes
+            .into_iter()
+            .map(|write| self.written_instance(write, scope))
+            .collect()
     }
 
     /// A call to a function the service may declare, as a holder's value
@@ -1489,6 +1681,143 @@ fn own_callee(callee: &Expr, scope: &Scope<'_>) -> Option<OwnCallee> {
             _ => return None,
         }
     }
+}
+
+/// The walk [`Reader::let_makers`] makes of a function's own statements
+/// after a `let`'s declaration: what each plain write sets it to, and the
+/// `return`s of it reached once it is set (carrick#1689).
+struct LetFlow<'a> {
+    key: &'a BindingKey,
+    /// What the binding is set to: its initialiser, then each write the walk
+    /// claims.
+    writes: Vec<&'a Expr>,
+    /// Where each claimed write starts.
+    claimed: HashSet<u32>,
+    /// The `return <binding>` statements reached with the binding set.
+    returns: usize,
+}
+
+/// How a run of statements ends: the binding set or not, or every path out
+/// of it a `return` or a `throw`.
+enum Reach {
+    Set(bool),
+    Exits,
+}
+
+impl<'a> LetFlow<'a> {
+    /// `stmts` in order, from `set`. `None` when a `return` of the binding
+    /// may run before it is set. Statements after an exit are never reached.
+    fn block(&mut self, stmts: &'a [Stmt], set: bool) -> Option<Reach> {
+        let mut set = set;
+        for stmt in stmts {
+            match self.stmt(stmt, set)? {
+                Reach::Exits => return Some(Reach::Exits),
+                Reach::Set(now) => set = now,
+            }
+        }
+        Some(Reach::Set(set))
+    }
+
+    fn stmt(&mut self, stmt: &'a Stmt, set: bool) -> Option<Reach> {
+        match stmt {
+            Stmt::Expr(ExprStmt { expr, .. }) => {
+                if let Expr::Assign(assign) = unwrap_expression(expr)
+                    && assign.op == AssignOp::Assign
+                    && let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left
+                    && ident_key(&target.id) == *self.key
+                {
+                    self.writes.push(&assign.right);
+                    self.claimed.insert(assign.span.lo.0);
+                    return Some(Reach::Set(true));
+                }
+                Some(Reach::Set(set))
+            }
+            Stmt::Return(ret) => {
+                if ret
+                    .arg
+                    .as_deref()
+                    .is_some_and(|arg| names_binding(arg, self.key))
+                {
+                    if !set {
+                        return None;
+                    }
+                    self.returns += 1;
+                }
+                Some(Reach::Exits)
+            }
+            Stmt::Throw(_) => Some(Reach::Exits),
+            Stmt::Block(block) => self.block(&block.stmts, set),
+            Stmt::If(branch) => {
+                let cons = self.stmt(&branch.cons, set)?;
+                let alt = match &branch.alt {
+                    Some(alt) => self.stmt(alt, set)?,
+                    None => Reach::Set(set),
+                };
+                Some(match (cons, alt) {
+                    (Reach::Exits, other) | (other, Reach::Exits) => other,
+                    (Reach::Set(a), Reach::Set(b)) => Reach::Set(a && b),
+                })
+            }
+            // Anything else leaves the binding as it was: a write or a
+            // `return` of it inside is one the walk does not claim, which
+            // [`LetUses`] finds.
+            _ => Some(Reach::Set(set)),
+        }
+    }
+}
+
+/// Every write of a `let` anywhere in a function body, and every `return
+/// <binding>`, nested functions included (carrick#1689): a write
+/// [`LetFlow`] did not claim, or a return it did not reach, leaves the
+/// binding read as nothing. A destructuring write or a
+/// `for (x of …)` head names the binding in a pattern, which
+/// [`crate::binding_scope::Declarations`] counts as a second declaration, so
+/// such a binding never reaches [`Reader::let_makers`].
+struct LetUses<'a> {
+    key: &'a BindingKey,
+    claimed: &'a HashSet<u32>,
+    unclaimed: bool,
+    returns: usize,
+}
+
+impl Visit for LetUses<'_> {
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        // [`LetFlow`] claims only a plain `=`.
+        if let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left
+            && ident_key(&target.id) == *self.key
+            && !self.claimed.contains(&assign.span.lo.0)
+        {
+            self.unclaimed = true;
+        }
+        assign.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        if names_binding(&update.arg, self.key) {
+            self.unclaimed = true;
+        }
+        update.visit_children_with(self);
+    }
+
+    // A nested function's `return binding` is counted too: the walk never
+    // reaches it, so the binding is read as nothing. Read or not, a closure
+    // that returns it hands it on ([`super::BindingUse::returned_at`]).
+    fn visit_return_stmt(&mut self, ret: &ReturnStmt) {
+        if ret
+            .arg
+            .as_deref()
+            .is_some_and(|arg| names_binding(arg, self.key))
+        {
+            self.returns += 1;
+        }
+        ret.visit_children_with(self);
+    }
+}
+
+/// Whether `expr` is the binding `key`, through parentheses and type
+/// assertions.
+fn names_binding(expr: &Expr, key: &BindingKey) -> bool {
+    matches!(unwrap_expression(expr), Expr::Ident(ident) if ident_key(ident) == *key)
 }
 
 /// The binding a constructor parameter introduces: a parameter property's
@@ -2324,10 +2653,11 @@ mod tests {
         }
     }
 
+    /// The one maker of an instance site.
     fn maker(site: &LibrarySite) -> &SiteMaker {
         match &site.receiver {
-            SiteReceiver::Instance(maker) => maker,
-            SiteReceiver::Export => panic!("expected an instance receiver: {site:#?}"),
+            SiteReceiver::Instance(makers) if makers.len() == 1 => &makers[0],
+            _ => panic!("expected an instance of one maker: {site:#?}"),
         }
     }
 
@@ -2368,7 +2698,7 @@ mod tests {
         assert_eq!(definition.literal(0, Some("run")), None);
 
         let trigger = site(&sites, "src/api.ts", 3, Some("trigger"));
-        assert_eq!(trigger.receiver_id(), "instance:()");
+        assert_eq!(trigger.receiver_ids(), ["instance:()"]);
         let made = maker(trigger);
         assert!(made.file.ends_with("src/tasks.ts"));
         assert_eq!(made.line, 2);
@@ -2406,7 +2736,7 @@ mod tests {
         assert!(!constructed.contested);
 
         let add = site(&sites, "src/mail.ts", 4, Some("add"));
-        assert_eq!(add.receiver_id(), "instance:new");
+        assert_eq!(add.receiver_ids(), ["instance:new"]);
         assert_eq!(maker(add).args[0].text.as_deref(), Some("emails"));
         assert_eq!(add.literal(0, None), Some("welcome"));
         assert!(add.export_uses.contains(&MemberUse {
@@ -2439,18 +2769,24 @@ mod tests {
             member: Some("trigger".to_string()),
         }));
         let path = ["tasks".to_string()];
-        assert!(trigger.selected_by(&Selector {
-            on: On::Export,
-            of: None,
-            path: &path,
-            member: Some("trigger"),
-        }));
-        assert!(!trigger.selected_by(&Selector {
-            on: On::Export,
-            of: None,
-            path: &[],
-            member: Some("trigger"),
-        }));
+        assert!(trigger.selected_by(
+            None,
+            &Selector {
+                on: On::Export,
+                of: None,
+                path: &path,
+                member: Some("trigger"),
+            }
+        ));
+        assert!(!trigger.selected_by(
+            None,
+            &Selector {
+                on: On::Export,
+                of: None,
+                path: &[],
+                member: Some("trigger"),
+            }
+        ));
     }
 
     /// `on` picks the export or its instances, and `of` the instances of one
@@ -2476,21 +2812,34 @@ mod tests {
         };
 
         let on_task = site(&sites, "src/jobs.ts", 5, Some("trigger"));
-        assert_eq!(on_task.receiver_id(), "instance:task");
-        assert!(on_task.selected_by(&select(On::Instance, Some("task"), "trigger")));
-        assert!(!on_task.selected_by(&select(On::Instance, Some("stream"), "trigger")));
-        assert!(on_task.selected_by(&select(On::Instance, None, "trigger")));
-        assert!(on_task.selected_by(&select(On::Both, None, "trigger")));
-        assert!(!on_task.selected_by(&select(On::Export, None, "trigger")));
+        assert_eq!(on_task.receiver_ids(), ["instance:task"]);
+        let task = Some(maker(on_task));
+        assert!(on_task.selected_by(task, &select(On::Instance, Some("task"), "trigger")));
+        assert!(!on_task.selected_by(task, &select(On::Instance, Some("stream"), "trigger")));
+        assert!(on_task.selected_by(task, &select(On::Instance, None, "trigger")));
+        assert!(on_task.selected_by(task, &select(On::Both, None, "trigger")));
+        assert!(!on_task.selected_by(task, &select(On::Export, None, "trigger")));
+        assert!(
+            !on_task.selected_by(None, &select(On::Both, None, "trigger")),
+            "an instance site's call is not made through the export"
+        );
 
         let on_stream = site(&sites, "src/jobs.ts", 6, Some("append"));
-        assert_eq!(on_stream.receiver_id(), "instance:stream");
-        assert!(!on_stream.selected_by(&select(On::Instance, Some("task"), "append")));
+        assert_eq!(on_stream.receiver_ids(), ["instance:stream"]);
+        assert!(!on_stream.selected_by(
+            Some(maker(on_stream)),
+            &select(On::Instance, Some("task"), "append")
+        ));
+        assert!(
+            !on_stream.selected_by(task, &select(On::Instance, None, "append")),
+            "a maker of another site is none of this one's"
+        );
 
         let on_export = site(&sites, "src/jobs.ts", 7, Some("trigger"));
-        assert!(on_export.selected_by(&select(On::Export, None, "trigger")));
-        assert!(on_export.selected_by(&select(On::Both, Some("task"), "trigger")));
-        assert!(!on_export.selected_by(&select(On::Instance, None, "trigger")));
+        assert!(on_export.selected_by(None, &select(On::Export, None, "trigger")));
+        assert!(on_export.selected_by(None, &select(On::Both, Some("task"), "trigger")));
+        assert!(!on_export.selected_by(None, &select(On::Instance, None, "trigger")));
+        assert!(!on_export.selected_by(task, &select(On::Both, None, "trigger")));
     }
 
     /// A subpath specifier is kept as the service imports it, and names the
@@ -2820,7 +3169,7 @@ mod tests {
         assert_eq!(maker(local).holder, Holder::Local);
         assert_eq!(local.contest(on_wire), None);
         let field = site(&sites, "src/mail.ts", 8, Some("add"));
-        assert_eq!(field.receiver_id(), "instance:new");
+        assert_eq!(field.receiver_ids(), ["instance:new"]);
         assert_eq!(maker(field).holder, Holder::Field);
         assert_eq!(maker(field).line, 7);
         assert_eq!(maker(field).args[0].text.as_deref(), Some("emails"));
@@ -2891,7 +3240,7 @@ mod tests {
         );
 
         let in_method = add_at(&sites, 9).expect("a field written in a method");
-        assert_eq!(in_method.receiver_id(), "instance:new");
+        assert_eq!(in_method.receiver_ids(), ["instance:new"]);
         assert_eq!(maker(in_method).holder, Holder::Field);
         assert_eq!(maker(in_method).line, 7);
         assert_eq!(maker(in_method).args[0].text.as_deref(), Some("emails"));
@@ -3334,7 +3683,7 @@ mod tests {
             ("src/use.ts", 19, "named", Holder::Chained, 19),
         ] {
             let (add, made) = through(&sites, file, line, "add");
-            assert_eq!(add.receiver_id(), "instance:new", "{file}:{line}");
+            assert_eq!(add.receiver_ids(), ["instance:new"], "{file}:{line}");
             assert_eq!(add.specifier, "@fixture/queue", "{file}:{line}");
             assert_eq!(add.export, "Queue", "{file}:{line}");
             assert!(made.file.ends_with("src/queues.ts"), "{file}:{line}");
@@ -3472,15 +3821,16 @@ mod tests {
         assert_eq!(trigger.literal(0, None), Some("nightly"));
     }
 
-    /// What is not one fresh instance of one maker is no factory's
-    /// (carrick#1562), and a call holding it reads nothing: two makers, or
-    /// one maker handed other arguments, on two paths; a binding assigned on
-    /// each path; a module's instance or a field, which every call shares; a
-    /// path that returns something else; a generator; an `async` factory
-    /// called without `await`. A factory that hands its instance on, or
+    /// What is not a fresh instance is no factory's (carrick#1562), and a
+    /// call holding it reads nothing: a module's instance or a field, which
+    /// every call shares; a path that returns something else; a generator;
+    /// an `async` factory called without `await`; makers of two exports on
+    /// two paths (carrick#1689). A factory that hands its instance on, or
     /// returns it from anywhere but its own body, leaves the instance taken
     /// away. Uses are kept by name across a file, so each factory names its
-    /// binding apart from every other.
+    /// binding apart from every other. One maker handed other arguments on
+    /// two paths, and a binding set on each path, are read since
+    /// carrick#1689, as a set of makers.
     #[test]
     fn what_is_not_one_fresh_instance_is_no_factory_s() {
         let factories = "import { Queue, Worker } from \"@fixture/queue\";\n\
@@ -3529,17 +3879,15 @@ mod tests {
         let read = add_in_use(&control).expect("the control reads through its factory");
         assert_eq!(read.contest(on_wire), None);
 
-        for factory in [
-            "perBranch",
-            "perArgs",
-            "assigned",
-            "getShared",
-            "maybe",
-            "generated",
-            "later",
-        ] {
+        for factory in ["perBranch", "getShared", "maybe", "generated", "later"] {
             let sites = sites_with(factory);
             assert!(add_in_use(&sites).is_none(), "{factory}: {sites:#?}");
+        }
+        for (factory, makers) in [("perArgs", 2), ("assigned", 1)] {
+            let sites = sites_with(factory);
+            let add = add_in_use(&sites).expect(factory);
+            assert_eq!(add.makers().len(), makers, "{factory} (carrick#1689)");
+            assert_eq!(add.contest(on_wire), None, "{factory}");
         }
         for factory in ["handedOff", "escapes"] {
             let sites = sites_with(factory);
@@ -3577,6 +3925,357 @@ mod tests {
             site(&control, "src/factories.ts", 8, Some("add")).contest(on_wire),
             Some(Contest::Used),
             "`return shared` hands the module's instance on"
+        );
+    }
+
+    /// Own factories that build one of a few makers' instances, each binding
+    /// named apart from every other (uses are kept by name across a file).
+    const MAKER_SETS: &str = "import { Queue, Worker } from \"@fixture/queue\";\n\
+         import { register } from \"./registry\";\n\
+         export function createClient(flag: boolean) {\n\
+         \x20 let client;\n\
+         \x20 if (flag) {\n\
+         \x20   client = new Queue.Cluster(\"events\", { cluster: true });\n\
+         \x20 } else {\n\
+         \x20   client = new Queue(\"events\");\n\
+         \x20 }\n\
+         \x20 client.on(\"error\", () => {});\n\
+         \x20 return client;\n\
+         }\n\
+         export function byReturn(flag: boolean) { if (flag) { return new Queue.Cluster(\"events\"); } return new Queue(\"events\"); }\n\
+         export function byArgs(flag: boolean) { if (flag) { return new Queue(\"a\"); } return new Queue(\"b\"); }\n\
+         export function earlyThrow(flag: boolean) { let thrown; if (flag) { thrown = new Queue(\"t\"); } else { throw new Error(\"no\"); } return thrown; }\n\
+         export function fourMakers(n: number) { if (n === 1) { return new Queue(\"m1\"); } if (n === 2) { return new Queue(\"m2\"); } if (n === 3) { return new Queue(\"m3\"); } return new Queue(\"m4\"); }\n\
+         export function twoBindings(flag: boolean) { const first = new Queue(\"x\"); const second = new Queue(\"x\"); register(second); if (flag) { return first; } return second; }\n\
+         export function handedLet(flag: boolean) { let handed; if (flag) { handed = new Queue(\"h1\"); } else { handed = new Queue(\"h2\"); } register(handed); return handed; }\n\
+         export function unsetPath(flag: boolean) { let unset; if (flag) { unset = new Queue(\"u\"); } return unset; }\n\
+         export function inLoop(items: string[]) { let looped = new Queue(\"l0\"); for (const item of items) { looped = new Queue(item); } return looped; }\n\
+         export function inClosure() { let closed = new Queue(\"c0\"); const swap = () => { closed = new Queue(\"c1\"); }; swap(); return closed; }\n\
+         export function compound() { let joined; joined ||= new Queue(\"j\"); return joined; }\n\
+         export function nonInstance(flag: boolean) { let mixed; if (flag) { mixed = new Queue(\"o\"); } else { mixed = null; } return mixed; }\n\
+         export function thirdPath(n: number) { if (n === 1) { return new Queue.Cluster(\"p\"); } if (n === 2) { return new Queue(\"p\"); } return null; }\n\
+         export function tooMany(n: number) { if (n === 1) { return new Queue(\"n1\"); } if (n === 2) { return new Queue(\"n2\"); } if (n === 3) { return new Queue(\"n3\"); } if (n === 4) { return new Queue(\"n4\"); } return new Queue(\"n5\"); }\n\
+         export function returnedEarly(flag: boolean) { let early; if (flag) { return early; } early = new Queue(\"e\"); return early; }\n\
+         export function inTry() { let tried; try { tried = new Queue(\"t1\"); } catch { tried = new Queue(\"t2\"); } return tried; }\n\
+         export function destructured() { let unpacked; [unpacked] = [new Queue(\"d\")]; return unpacked; }\n\
+         export function twoExports(flag: boolean) { if (flag) { return new Queue(\"w\"); } return new Worker(\"w\"); }\n\
+         export function helper() { return 42; }\n\
+         export function ownMixed(flag: boolean) { if (flag) { return new Queue(\"om\"); } return helper(); }\n\
+         export function threeA(n: number) { if (n === 1) { return new Queue(\"a1\"); } if (n === 2) { return new Queue(\"a2\"); } return new Queue(\"a3\"); }\n\
+         export function threeB(n: number) { if (n === 1) { return new Queue(\"b1\"); } if (n === 2) { return new Queue(\"b2\"); } return new Queue(\"b3\"); }\n\
+         export function nestedTooMany(n: number) { if (n > 3) { return threeA(n); } return threeB(n); }\n\
+         export function plainA() { return new Queue(\"z\"); }\n\
+         export function handA() { const handedA = new Queue(\"z\"); register(handedA); return handedA; }\n\
+         export function eitherA(flag: boolean) { if (flag) { return plainA(); } return handA(); }\n\
+         export function updated() { let counter: any = new Queue(\"c\"); counter++; return counter; }\n\
+         export function returnInLoop(items: string[]) { let looping; for (const item of items) { return looping; } looping = new Queue(\"lr\"); return looping; }\n\
+         export function nestedReturn(flag: boolean) { let inner; if (flag) { inner = new Queue(\"i1\"); } else { inner = new Queue(\"i2\"); } const get = () => { return inner; }; get(); return inner; }\n\
+         export function exitByReturn(flag: boolean) { let exiting; if (flag) { exiting = new Queue.Cluster(\"x1\"); } else { return new Queue(\"x2\"); } return exiting; }\n\
+         export function twiceVar(flag: boolean) { var dup = new Queue(\"v1\"); if (flag) { dup = new Queue(\"v2\"); } var dup = new Queue(\"v3\"); return dup; }\n\
+         export function usesApart(flag: boolean) { const u1 = new Queue.Cluster(\"ua\"); u1.on(\"error\", () => {}); const u2 = new Queue(\"ua\"); u2.pause(); if (flag) { return u1; } return u2; }\n\
+         export function handedSecond(flag: boolean) { if (flag) { return new Queue.Cluster(\"hs\"); } const hs = new Queue(\"hs\"); register(hs); return hs; }\n\
+         export function crossModule(flag: boolean) { if (flag) { return new Queue(\"cm\"); } return otherQueue(); }\n\
+         import { otherQueue } from \"./other\";\n";
+
+    /// The sites of a service whose `src/use.ts` calls `factory(…)` and then
+    /// `add` through what it returns, on line 4.
+    fn through_set(factory: &str) -> Vec<LibrarySite> {
+        let user = format!(
+            "import {{ {factory} }} from \"./factories\";\n\
+             export async function go() {{\n\
+             \x20 const held = {factory}(1 as any);\n\
+             \x20 await held.add(\"tick\", {{}});\n\
+             }}\n"
+        );
+        sites_of(&[
+            ("src/factories.ts", MAKER_SETS),
+            ("src/use.ts", user.as_str()),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+            (
+                "src/other.ts",
+                "import { Queue } from \"@fixture/queue\";\n\
+                 Queue.defaults({ prefix: \"other\" });\n\
+                 export function otherQueue() { return new Queue(\"oq\"); }\n",
+            ),
+        ])
+    }
+
+    fn add_through(sites: &[LibrarySite]) -> Option<&LibrarySite> {
+        sites
+            .iter()
+            .find(|site| site.file.ends_with("src/use.ts") && site.line == 4)
+    }
+
+    /// An own factory that builds one of a few makers' instances, on every
+    /// path, is read as the set of those makers (carrick#1689, contract
+    /// amendment 3): a `let` set on each branch (the ticket's own shape), a
+    /// return per branch, one maker handed other arguments on two paths, a
+    /// branch that throws, and four makers. Each maker is read where it is
+    /// written, in source order, and the factory's own uses of its binding
+    /// are the set's. A `let` is read only where it is returned: no call is
+    /// read through it, for any role.
+    #[test]
+    fn an_instance_of_one_of_a_few_makers_is_read_as_the_set() {
+        let sites = through_set("createClient");
+        let add = add_through(&sites).expect("a site through the let factory");
+        assert_eq!(add.receiver_ids(), ["instance:new:Cluster", "instance:new"]);
+        assert_eq!(add.specifier, "@fixture/queue");
+        assert_eq!(add.export, "Queue");
+        let lines: Vec<u32> = add.makers().iter().map(|maker| maker.line).collect();
+        assert_eq!(lines, vec![6, 8]);
+        for maker in add.makers() {
+            assert_eq!(maker.args[0].text.as_deref(), Some("events"));
+            assert_eq!(maker.holder, Holder::Local);
+            assert_eq!(maker.factory.as_ref().map(|call| call.line), Some(3));
+        }
+        assert!(add.uses.contains(&MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("on".to_string()),
+        }));
+        assert_eq!(add.contest(on_wire), None);
+        assert!(
+            sites
+                .iter()
+                .all(|site| !(site.file.ends_with("src/factories.ts") && site.line == 10)),
+            "no call is read through the let itself: {sites:#?}"
+        );
+
+        let by_return = through_set("byReturn");
+        let add = add_through(&by_return).expect("byReturn");
+        assert_eq!(add.receiver_ids(), ["instance:new:Cluster", "instance:new"]);
+
+        let by_args = through_set("byArgs");
+        let add = add_through(&by_args).expect("byArgs");
+        assert_eq!(add.receiver_ids(), ["instance:new"], "one id, checked once");
+        let names: Vec<Option<&str>> = add
+            .makers()
+            .iter()
+            .map(|maker| maker.args[0].text.as_deref())
+            .collect();
+        assert_eq!(names, vec![Some("a"), Some("b")]);
+
+        let thrown = through_set("earlyThrow");
+        let add = add_through(&thrown).expect("a branch that throws returns nothing");
+        assert_eq!(add.makers().len(), 1);
+
+        let exits = through_set("exitByReturn");
+        let add = add_through(&exits).expect("a branch that returns another instance");
+        assert_eq!(add.receiver_ids(), ["instance:new", "instance:new:Cluster"]);
+
+        let four = through_set("fourMakers");
+        assert_eq!(add_through(&four).expect("fourMakers").makers().len(), 4);
+    }
+
+    /// A member use on an instance of a set is classified on every maker's
+    /// receiver, and the set's uses are every binding's that holds one of
+    /// its makers (carrick#1689).
+    #[test]
+    fn a_use_on_a_set_is_classified_on_every_maker() {
+        let sites = through_set("createClient");
+        let add = add_through(&sites).expect("createClient");
+        let on_plain = |on: &str, used: &MemberUse| match (on, used.member.as_deref()) {
+            ("instance:new", Some("on")) => MemberWire::Unlisted,
+            _ => MemberWire::OnWire,
+        };
+        assert!(
+            matches!(
+                add.contest(on_plain),
+                Some(Contest::Member { ref on, .. }) if on == "instance:new"
+            ),
+            "{add:#?}"
+        );
+
+        let sites = through_set("usesApart");
+        let add = add_through(&sites).expect("usesApart");
+        let pause = |_: &str, used: &MemberUse| match used.member.as_deref() {
+            Some("pause") => MemberWire::ChangesName,
+            _ => MemberWire::OnWire,
+        };
+        assert!(add.contest(pause).is_some(), "{add:#?}");
+        assert_eq!(add.contest(on_wire), None);
+
+        // The second maker is written in another module, which configures
+        // the export there.
+        let sites = through_set("crossModule");
+        let add = add_through(&sites).expect("crossModule");
+        assert_eq!(add.makers().len(), 2);
+        let defaults = |on: &str, used: &MemberUse| match (on, used.member.as_deref()) {
+            ("export", Some("defaults")) => MemberWire::ChangesName,
+            _ => MemberWire::OnWire,
+        };
+        assert!(add.contest(defaults).is_some(), "{add:#?}");
+        assert_eq!(add.contest(on_wire), None);
+    }
+
+    /// What is not one of a few makers' instances on every path stays read as
+    /// nothing (carrick#1689): a `let` left unset on a path, set in a loop, in
+    /// a closure, by `||=`, by `++`, in a `try`, by a destructuring, returned
+    /// before it is set, from a loop or from a closure, or a `var` declared
+    /// twice; a path that returns `null`, or calls a function that is no
+    /// factory; five makers, directly or through two factories; and makers of
+    /// two exports. A hand-off of any binding of the set contests it: the
+    /// second binding of one maker (before, only the first binding's uses
+    /// were read), one maker reached through two factories, and a second
+    /// maker's binding.
+    #[test]
+    fn what_is_not_one_of_a_few_makers_on_every_path_is_read_as_nothing() {
+        for factory in [
+            "unsetPath",
+            "inLoop",
+            "inClosure",
+            "compound",
+            "updated",
+            "nonInstance",
+            "thirdPath",
+            "ownMixed",
+            "tooMany",
+            "nestedTooMany",
+            "returnedEarly",
+            "returnInLoop",
+            "nestedReturn",
+            "inTry",
+            "destructured",
+            "twiceVar",
+            "twoExports",
+        ] {
+            let sites = through_set(factory);
+            assert!(add_through(&sites).is_none(), "{factory}: {sites:#?}");
+        }
+        for factory in ["twoBindings", "handedLet", "eitherA", "handedSecond"] {
+            let sites = through_set(factory);
+            let add = add_through(&sites).expect(factory);
+            assert_eq!(add.contest(on_wire), Some(Contest::Used), "{factory}");
+        }
+    }
+
+    /// Where a site's name is read, as a stand-in for the verified claims
+    /// carrick#1662 reads: an argument of the call, or one of the maker's.
+    enum NameAt {
+        Arg(usize),
+        MakerArg(usize),
+    }
+
+    /// The receiver ids whose maker verified, and the op elements that
+    /// verified, each with its op and where its name is read.
+    struct Verified<'a> {
+        makers: &'a [&'a str],
+        ops: Vec<(Selector<'a>, &'a str, NameAt)>,
+    }
+
+    /// What a site states under `verified`, folded over its receivers
+    /// ([`LibrarySite::fold`]): through each, its maker verified, and every
+    /// op element that applies to it read the same op and name.
+    fn fact(site: &LibrarySite, verified: &Verified<'_>) -> Option<(String, String)> {
+        site.fold(|through| {
+            if let Some(maker) = through
+                && !verified.makers.contains(&maker.receiver_id().as_str())
+            {
+                return None;
+            }
+            let mut read: Option<(String, String)> = None;
+            for (selector, op, at) in &verified.ops {
+                if !site.selected_by(through, selector) {
+                    continue;
+                }
+                let name = match at {
+                    NameAt::Arg(index) => site.literal(*index, None),
+                    NameAt::MakerArg(index) => through
+                        .and_then(|maker| maker.args.get(*index))
+                        .and_then(|arg| arg.text.as_deref()),
+                }?;
+                let this = (op.to_string(), name.to_string());
+                match &read {
+                    Some(seen) if *seen != this => return None,
+                    _ => read = Some(this),
+                }
+            }
+            read
+        })
+    }
+
+    /// A site through a set of makers states a fact only when every maker
+    /// verified, an op element verified on each, and each reads the same op
+    /// and name (carrick#1689, contract amendment 3): the op claimed on one
+    /// maker only, a maker left unverified, and a name each maker's slot
+    /// reads differently all leave it a candidate. A one-maker site and an
+    /// export site fold as they read.
+    #[test]
+    fn a_set_of_makers_states_a_fact_only_when_every_maker_reads_the_same() {
+        let on = |of: Option<&'static str>, member: &'static str| Selector {
+            on: On::Instance,
+            of,
+            path: &[],
+            member: Some(member),
+        };
+        let both = ["instance:new", "instance:new:Cluster"];
+
+        let sites = through_set("createClient");
+        let add = add_through(&sites).expect("createClient");
+        let claimed = Verified {
+            makers: &both,
+            ops: vec![(on(None, "add"), "add", NameAt::Arg(0))],
+        };
+        assert_eq!(
+            fact(add, &claimed),
+            Some(("add".to_string(), "tick".to_string()))
+        );
+        let one_maker = Verified {
+            makers: &both,
+            ops: vec![(on(Some("Cluster"), "add"), "add", NameAt::Arg(0))],
+        };
+        assert_eq!(fact(add, &one_maker), None, "the op claimed on one maker");
+        let unverified = Verified {
+            makers: &["instance:new"],
+            ops: vec![(on(None, "add"), "add", NameAt::Arg(0))],
+        };
+        assert_eq!(fact(add, &unverified), None, "a maker unverified");
+
+        let sites = through_set("byArgs");
+        let add = add_through(&sites).expect("byArgs");
+        let from_maker = Verified {
+            makers: &both,
+            ops: vec![(on(None, "add"), "add", NameAt::MakerArg(0))],
+        };
+        assert_eq!(fact(add, &from_maker), None, "each maker names another");
+        assert_eq!(
+            fact(add, &claimed),
+            Some(("add".to_string(), "tick".to_string())),
+            "a name the call writes reads the same through each"
+        );
+
+        let sites = through_set("earlyThrow");
+        let add = add_through(&sites).expect("earlyThrow");
+        assert_eq!(
+            fact(add, &from_maker),
+            Some(("add".to_string(), "t".to_string()))
+        );
+
+        let sites = sites_of(&[(
+            "src/direct.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             export async function go() { await Queue.add(\"direct\", {}); }\n",
+        )]);
+        let direct = site(&sites, "src/direct.ts", 2, Some("add"));
+        let on_export = Verified {
+            makers: &[],
+            ops: vec![(
+                Selector {
+                    on: On::Export,
+                    of: None,
+                    path: &[],
+                    member: Some("add"),
+                },
+                "add",
+                NameAt::Arg(0),
+            )],
+        };
+        assert_eq!(
+            fact(direct, &on_export),
+            Some(("add".to_string(), "direct".to_string()))
         );
     }
 

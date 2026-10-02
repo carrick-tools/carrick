@@ -368,6 +368,20 @@ impl ClientRef {
         self.returned.extend(used.returned_at.iter().copied());
         self
     }
+
+    /// `other`'s uses added to this client's: one maker's instance, handed
+    /// the same arguments, held by two bindings an own factory returns is
+    /// one maker, used as both are (carrick#1689). Before, the second
+    /// binding's uses were dropped.
+    fn absorb(&mut self, other: &ClientRef) {
+        self.contested |= other.contested;
+        self.called.extend(other.called.iter().cloned());
+        self.called_computed |= other.called_computed;
+        self.contested_message |= other.contested_message;
+        self.member_uses.extend(other.member_uses.iter().cloned());
+        self.export_uses.extend(other.export_uses.iter().cloned());
+        self.returned.extend(other.returned.iter().copied());
+    }
 }
 
 /// How an instance was made from a package export (carrick#1564,
@@ -550,22 +564,27 @@ struct FnIr {
     /// send only that.
     unfollowed: bool,
     /// Every `return` the body makes (an arrow's expression body included),
-    /// by where it starts, with the instance it returns when it returns one
-    /// built here ([`Reader::returned_instance`]). Settled into `returned`.
-    returns: Vec<(u32, Option<ClientRef>)>,
+    /// by where it starts, with the instances it may return when it returns
+    /// one built here ([`Reader::returned_instances`]): one, or one per path
+    /// for a `let` set on every path (carrick#1689). None for anything else.
+    /// Settled into `returned`.
+    returns: Vec<(u32, Vec<ClientRef>)>,
     /// What a call of this function returns, when it is an own factory
-    /// (carrick#1562): every `return` returns an instance of one maker,
-    /// handed the same arguments, that the call builds anew.
+    /// (carrick#1562): every `return` returns an instance the call builds
+    /// anew, of one of its makers, each handed its own arguments
+    /// (carrick#1689).
     returned: Option<Returned>,
 }
 
 /// The instance an own factory returns (carrick#1562).
 #[derive(Debug, Clone)]
 struct Returned {
-    /// The instance, as the factory's body holds it: its maker (or the
-    /// own call it came from), what it was handed in the factory's scope,
-    /// and the factory's own uses of the binding that holds it.
-    client: ClientRef,
+    /// Each maker the instance may come from (carrick#1689), as the
+    /// factory's body holds it: the maker (or the own call it came from),
+    /// what it was handed in the factory's scope, and the factory's own uses
+    /// of the bindings that hold it. One maker's instance returned through
+    /// two bindings is one maker, used as both are.
+    makers: Vec<ClientRef>,
     /// Where each `return` starts ([`BindingUse::returned_at`]): a return
     /// of the holder anywhere else hands the instance on unseen.
     at: BTreeSet<u32>,
@@ -575,29 +594,31 @@ struct Returned {
 }
 
 impl FnIr {
-    /// Settle `returns` into `returned`: one maker's instance on every
-    /// `return`, handed the same arguments. A generator returns no instance
-    /// to its caller.
+    /// Settle `returns` into `returned`: an instance on every `return`, of
+    /// one or more makers, each handed its own arguments (carrick#1689; one
+    /// maker before). How many makers that comes to once own calls are
+    /// followed is the reader's to judge ([`library_sites::MAX_MAKERS`]). A
+    /// generator returns no instance to its caller.
     fn settle_returned(&mut self, is_async: bool, is_generator: bool) {
         let returns = std::mem::take(&mut self.returns);
-        if is_generator {
+        if is_generator || returns.is_empty() || returns.iter().any(|(_, made)| made.is_empty()) {
             return;
         }
-        let Some(first) = returns.first().and_then(|(_, client)| client.clone()) else {
-            return;
-        };
-        let every = returns.iter().all(|(_, client)| {
-            client
-                .as_ref()
-                .is_some_and(|client| library_sites::same_maker(client, &first))
+        let mut makers: Vec<ClientRef> = Vec::new();
+        for client in returns.iter().flat_map(|(_, made)| made) {
+            match makers
+                .iter_mut()
+                .find(|known| library_sites::same_maker(known, client))
+            {
+                Some(known) => known.absorb(client),
+                None => makers.push(client.clone()),
+            }
+        }
+        self.returned = Some(Returned {
+            makers,
+            at: returns.iter().map(|(at, _)| *at).collect(),
+            is_async,
         });
-        if every {
-            self.returned = Some(Returned {
-                client: first,
-                at: returns.iter().map(|(at, _)| *at).collect(),
-                is_async,
-            });
-        }
     }
 }
 
@@ -2435,6 +2456,11 @@ struct Scope<'a> {
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
     /// Locals holding a library client's instance (carrick#1564).
     local_receivers: HashMap<BindingKey, ClientRef>,
+    /// `let` locals the body sets, on every path to each `return` of them,
+    /// to an instance of one of these makers (carrick#1689,
+    /// [`Reader::let_makers`]). Read only where they are returned: no call
+    /// is read through one, for any role.
+    let_makers: HashMap<BindingKey, Vec<ClientRef>>,
     /// Parameters, the enclosing function's included, that hold the
     /// platform's `fetch` unless a caller hands another (`fetchImpl =
     /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
@@ -2451,6 +2477,7 @@ impl<'a> Scope<'a> {
             locals: HashMap::new(),
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
+            let_makers: HashMap::new(),
             fetches: HashSet::new(),
             fields: None,
             module,
@@ -2812,6 +2839,7 @@ impl Reader<'_> {
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
+            let_makers: HashMap::new(),
             fetches,
             fields,
             module,
@@ -2842,6 +2870,7 @@ impl Reader<'_> {
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
+            let_makers: HashMap::new(),
             fetches,
             fields,
             module,
@@ -2852,7 +2881,7 @@ impl Reader<'_> {
             // The expression body is what the arrow returns, where it starts
             // ([`BindingUses::visit_arrow_expr`] keys it the same way).
             BlockStmtOrExpr::Expr(expr) => {
-                let returned = self.returned_instance(expr, &scope);
+                let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
                 self.walk(expr, &scope, &mut ir);
             }
@@ -2880,11 +2909,36 @@ impl Reader<'_> {
         scope
             .fetches
             .retain(|(name, _)| !reassigned.names.contains(name));
-        for stmt in stmts {
+        for (index, stmt) in stmts.iter().enumerate() {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
                     if let Some(init) = &declarator.init {
                         self.walk(init, scope, ir);
+                    }
+                    // A `let` set again on every path to one of a few makers'
+                    // instances, read where it is returned (carrick#1689).
+                    // One never set again is a local receiver, below. Its
+                    // uses are kept by name, so it is read only where the
+                    // body declares the name once; a `var` declared twice
+                    // is set by each declaration too, and a destructuring or
+                    // a `for (x of …)` head declares it again.
+                    if let Pat::Ident(ident) = &declarator.name
+                        && reassigned.names.contains(ident.id.sym.as_ref())
+                        && reassigned.declared_once(&declared, ident.id.sym.as_ref())
+                        && let Some(makers) = self.let_makers(
+                            stmts,
+                            &stmts[index + 1..],
+                            &ident.id,
+                            declarator.init.as_deref(),
+                            scope,
+                        )
+                    {
+                        let name = ident.id.sym.as_ref();
+                        let makers = makers
+                            .into_iter()
+                            .map(|client| scope.module.with_uses(client, name))
+                            .collect();
+                        scope.let_makers.insert(ident_key(&ident.id), makers);
                     }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
@@ -3926,7 +3980,8 @@ impl Visit for CallWalker<'_, '_, '_> {
         let returned = ret
             .arg
             .as_deref()
-            .and_then(|arg| self.reader.returned_instance(arg, self.scope));
+            .map(|arg| self.reader.returned_instances(arg, self.scope))
+            .unwrap_or_default();
         self.ir.returns.push((ret.span.lo.0, returned));
         ret.visit_children_with(self);
     }
@@ -3983,12 +4038,25 @@ impl CallWalker<'_, '_, '_> {
 #[derive(Default)]
 struct Reassigned {
     names: HashSet<String>,
+    /// How many assignments name each binding as their whole target
+    /// (`x = …`, `x += …`): [`Declarations`] counts each such target among a
+    /// name's declarations, since it is a binding identifier too.
+    targets: HashMap<String, usize>,
+}
+
+impl Reassigned {
+    /// Whether the body declares `name` once, whatever it assigns to it
+    /// (carrick#1689).
+    fn declared_once(&self, declared: &Declarations, name: &str) -> bool {
+        declared.name_count(name) == 1 + self.targets.get(name).copied().unwrap_or(0)
+    }
 }
 
 impl Visit for Reassigned {
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
         if let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &assign.left {
             self.names.insert(ident.id.sym.to_string());
+            *self.targets.entry(ident.id.sym.to_string()).or_default() += 1;
         }
         assign.visit_children_with(self);
     }
