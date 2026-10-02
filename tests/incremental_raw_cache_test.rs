@@ -88,6 +88,10 @@ impl CloudStorage for StubStorage {
     ) -> Result<(), StorageError> {
         Ok(())
     }
+    /// One row per service, as the index stores a monorepo.
+    fn supports_multi_service(&self) -> bool {
+        true
+    }
 }
 
 fn run_git(dir: &Path, args: &[&str]) {
@@ -432,6 +436,100 @@ async fn guidance_without_an_id_is_asked_for_again_instead_of_replayed() {
             .all(Option::is_some),
         "the scan that re-asked must persist the id, so the next scan replays again"
     );
+}
+
+/// Two services: the fixture's own files, and one whose only file raises no
+/// candidate, so the analyzer is never asked about it.
+const TWO_SERVICES: &str = r#"{
+  "services": [
+    { "name": "helpdesk", "directory": "src" },
+    { "name": "slugs", "directory": "slugs" }
+  ]
+}
+"#;
+
+/// A service whose scan asked the analyzer about no file stores no answers,
+/// and that is an empty answer cache, not a missing generation: the next scan
+/// of the unchanged tree replays its detection and guidance like any other
+/// service's. Before carrick#1746 it ran a full analysis instead, which asks
+/// detection and every guidance section again, on every scan.
+#[tokio::test]
+#[serial]
+async fn a_service_with_no_answered_file_replays_its_detection_and_guidance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture_with(
+        tmp.path(),
+        &[
+            ("carrick.json", TWO_SERVICES),
+            ("slugs/slugify.ts", NO_CANDIDATES),
+        ],
+    );
+    mock_env(&cassette);
+
+    let storage = StubStorage::default();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
+    let first = stored_service(&storage, "slugs");
+    // The shape this test is about. Should the writer ever store an empty map
+    // instead, the replay below proves nothing about a stored null.
+    assert!(
+        first.file_results.is_none(),
+        "the service analysed no file, so it stores no answers: {:?}",
+        first.file_results
+    );
+    assert!(
+        first.cached_detection.is_some()
+            && first.cached_guidance.is_some()
+            && first.cached_extraction_config.is_some(),
+        "scan #1 must store the setup the next scan replays"
+    );
+    assert!(
+        stored_service(&storage, "helpdesk").file_results.is_some(),
+        "the other service's answers are stored as before"
+    );
+
+    let detect = requests_to("/framework-detect");
+    let guidance = requests_to("/framework-guidance");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
+    assert_eq!(
+        (
+            requests_to("/framework-detect") - detect,
+            requests_to("/framework-guidance") - guidance,
+        ),
+        (0, 0),
+        "an unchanged tree replays every service's detection and guidance, \
+         including one that stored no answers"
+    );
+    let second = stored_service(&storage, "slugs");
+    assert_eq!(
+        serde_json::to_value(&second.cached_detection).unwrap(),
+        serde_json::to_value(&first.cached_detection).unwrap(),
+        "the stored detection is carried forward unchanged"
+    );
+    assert_eq!(
+        serde_json::to_value(&second.cached_guidance).unwrap(),
+        serde_json::to_value(&first.cached_guidance).unwrap(),
+        "the stored guidance is carried forward unchanged"
+    );
+}
+
+/// The blob stored for `service`.
+fn stored_service(storage: &StubStorage, service: &str) -> CloudRepoData {
+    let repos = storage.repos.lock().unwrap();
+    repos
+        .iter()
+        .find(|stored| stored.service_name.as_deref() == Some(service))
+        .cloned()
+        .unwrap_or_else(|| {
+            let held: Vec<_> = repos
+                .iter()
+                .map(|stored| (&stored.repo_name, &stored.service_name))
+                .collect();
+            panic!("no blob stored for service {service}; the store holds {held:?}")
+        })
 }
 
 /// The guidance id each protocol's persisted answer carries, `None` for an

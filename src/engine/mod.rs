@@ -2840,25 +2840,22 @@ async fn analyze_current_repo_incremental(
     } = discover_files_and_symbols(repo_path, config, cm.clone())?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
-    // 3. Check if we can use incremental mode
-    let can_use_incremental = previous_data.and_then(|prev| {
-        // Must have file_results and matching cache_version
-        let has_cache = prev.file_results.is_some();
+    // 3. Check if we can use incremental mode. The cache version is the whole
+    // test. A generation that stored no file answers (none of its files was
+    // asked about, or every answered file was edited when it was written)
+    // holds an empty answer cache, not no generation: its detection and
+    // guidance replay under the same manifest gate as any other service's.
+    // Reading it as no generation asked detection and every guidance section
+    // again on every scan (carrick#1746).
+    let can_use_incremental = previous_data.filter(|prev| {
         let version_matches = prev.cache_version == Some(CACHE_VERSION);
-        if has_cache && version_matches {
-            Some(prev)
-        } else {
-            if !has_cache {
-                debug!("No cached file_results found, running full analysis");
-            }
-            if !version_matches {
-                debug!(
-                    "Cache version mismatch (expected {}, got {:?}), running full analysis",
-                    CACHE_VERSION, prev.cache_version
-                );
-            }
-            None
+        if !version_matches {
+            debug!(
+                "Cache version mismatch (expected {}, got {:?}), running full analysis",
+                CACHE_VERSION, prev.cache_version
+            );
         }
+        version_matches
     });
 
     if let Some(prev) = can_use_incremental {
@@ -2890,7 +2887,8 @@ async fn analyze_current_repo_incremental(
                 run_intents.clone(),
             );
 
-            let prev_file_results = prev.file_results.as_ref().unwrap();
+            let no_answers = HashMap::new();
+            let prev_file_results = prev.file_results.as_ref().unwrap_or(&no_answers);
             let repo_prefix = format!("{}/", repo_path);
 
             // Helper to normalize a file path to repo-relative
