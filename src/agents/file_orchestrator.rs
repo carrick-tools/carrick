@@ -3799,57 +3799,66 @@ impl FileOrchestrator {
                     Some(&call_id),
                 );
 
-                if let (Some(symbol), Some(import_source)) = (
-                    &data_call.primary_type_symbol,
-                    &data_call.type_import_source,
-                ) {
-                    // Explicit type with import source - bundle it
-                    push_explicit(
-                        symbol.clone(),
-                        Self::resolve_import_path(&file_path_absolute, import_source, modules),
-                        Some(response_alias.clone()),
-                    );
-                } else if data_call.primary_type_symbol.is_some()
-                    && data_call.type_import_source.is_none()
-                {
-                    // Type symbol exists but no import - it might be in the same file
-                    if let Some(ref symbol) = data_call.primary_type_symbol {
+                // A row restated at a call to a function the service declares
+                // (carrick#1601) carries that function's call, and a model row
+                // folded onto it carries the same call's text and its type
+                // symbol: the value there is what the function returns, not
+                // the response body. Such a row states no consumer response
+                // type from any of them, so it gets no response verdict and
+                // leaves the check-time retype no locator to rewrite.
+                if !data_call.at_caller {
+                    if let (Some(symbol), Some(import_source)) = (
+                        &data_call.primary_type_symbol,
+                        &data_call.type_import_source,
+                    ) {
+                        // Explicit type with import source - bundle it
                         push_explicit(
                             symbol.clone(),
-                            file_path_absolute.clone(),
+                            Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
                         );
+                    } else if data_call.primary_type_symbol.is_some()
+                        && data_call.type_import_source.is_none()
+                    {
+                        // Type symbol exists but no import - it might be in the same file
+                        if let Some(ref symbol) = data_call.primary_type_symbol {
+                            push_explicit(
+                                symbol.clone(),
+                                file_path_absolute.clone(),
+                                Some(response_alias.clone()),
+                            );
+                        }
+                    } else if data_call.type_import_source.is_some()
+                        && data_call.primary_type_symbol.is_none()
+                    {
+                        warn!(
+                            "[FileOrchestrator] Data call at {}:{} has import source {:?} but no symbol; relying on inference",
+                            file_path, line_number, data_call.type_import_source
+                        );
                     }
-                } else if data_call.type_import_source.is_some()
-                    && data_call.primary_type_symbol.is_none()
-                {
-                    warn!(
-                        "[FileOrchestrator] Data call at {}:{} has import source {:?} but no symbol; relying on inference",
-                        file_path, line_number, data_call.type_import_source
-                    );
-                }
 
-                let call_inferred = push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::CallResult,
-                    response_alias.clone(),
-                    InferLocator::Text {
-                        expression_text: data_call.call_expression_text.as_deref(),
-                        expression_line: data_call.call_expression_line,
-                    },
-                ) || push_infer(
-                    &file_path_absolute,
-                    line_number,
-                    InferKind::CallResult,
-                    response_alias.clone(),
-                    InferLocator::Span {
-                        span_start: data_call.call_expression_span_start,
-                        span_end: data_call.call_expression_span_end,
-                    },
-                );
-                if !call_inferred && let Some(symbol) = data_call.primary_type_symbol.as_ref() {
-                    inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    let call_inferred = push_infer(
+                        &file_path_absolute,
+                        line_number,
+                        InferKind::CallResult,
+                        response_alias.clone(),
+                        InferLocator::Text {
+                            expression_text: data_call.call_expression_text.as_deref(),
+                            expression_line: data_call.call_expression_line,
+                        },
+                    ) || push_infer(
+                        &file_path_absolute,
+                        line_number,
+                        InferKind::CallResult,
+                        response_alias.clone(),
+                        InferLocator::Span {
+                            span_start: data_call.call_expression_span_start,
+                            span_end: data_call.call_expression_span_end,
+                        },
+                    );
+                    if !call_inferred && let Some(symbol) = data_call.primary_type_symbol.as_ref() {
+                        inline_aliases.push((response_alias.clone(), symbol.clone()));
+                    }
                 }
 
                 if should_infer_request_body(&method) {
@@ -6452,6 +6461,7 @@ impl FileOrchestrator {
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 })),
             });
         }
@@ -6576,6 +6586,7 @@ impl FileOrchestrator {
                 reaches_request: row.reaches_request.clone(),
                 body_literals: row.body_literals.clone(),
                 library_semantics: row.library_semantics.clone(),
+                at_caller: row.at_caller,
             })),
         }
     }
@@ -6771,6 +6782,7 @@ impl FileOrchestrator {
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }
     }
 
@@ -11620,6 +11632,7 @@ export * from "./aFetch.js";"#,
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -11678,6 +11691,7 @@ export * from "./aFetch.js";"#,
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 }
             };
 
@@ -11764,6 +11778,7 @@ export * from "./aFetch.js";"#,
                     reaches_request: Some("src/lib/things.ts:12".to_string()),
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 }],
                 ..Default::default()
             },
@@ -11934,6 +11949,7 @@ export * from "./aFetch.js";"#,
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }
     }
 
@@ -12390,6 +12406,7 @@ export * from "./aFetch.js";"#,
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             }],
             ..Default::default()
         };
@@ -12484,6 +12501,7 @@ export * from "./aFetch.js";"#,
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         };
 
         let mut file_results = HashMap::new();
@@ -12610,6 +12628,7 @@ export * from "./aFetch.js";"#,
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         };
 
         let mut file_results = HashMap::new();
@@ -12709,6 +12728,7 @@ export * from "./aFetch.js";"#,
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -12802,6 +12822,7 @@ export * from "./aFetch.js";"#,
                         reaches_request: None,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
+                        at_caller: false,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12827,6 +12848,7 @@ export * from "./aFetch.js";"#,
                         reaches_request: None,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
+                        at_caller: false,
                     },
                 ],
                 graphql_operations: vec![],
@@ -12889,6 +12911,7 @@ export * from "./aFetch.js";"#,
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -12954,6 +12977,7 @@ export * from "./aFetch.js";"#,
                         reaches_request: None,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
+                        at_caller: false,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -12979,6 +13003,7 @@ export * from "./aFetch.js";"#,
                         reaches_request: None,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
+                        at_caller: false,
                     },
                 ],
                 graphql_operations: vec![],
@@ -13009,6 +13034,139 @@ export * from "./aFetch.js";"#,
         assert!(aliases[0].contains("_Call"));
         assert!(aliases[1].contains("_Call"));
         assert_ne!(aliases[0], aliases[1]);
+    }
+
+    /// carrick#1601: a row restated at a call to a function the service
+    /// declares carries that function's call, whose value is the function's
+    /// return value (a boolean, a token), not the response body. It asks for
+    /// no consumer response type from any source: not the call's result, not
+    /// the type symbol a model row folded onto it carries, not an inline
+    /// alias. The request line's own row beside it still asks, and so does
+    /// the caller row's request side.
+    #[test]
+    fn a_row_restated_at_a_helper_s_caller_asks_for_no_response_type() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/service.ts", 700);
+        let call = |line: i32, span: u32, method: &str, at_caller: bool| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{span}-{}", span + 50),
+            line_number: line,
+            target: "https://api.example.com/orders".to_string(),
+            method: Some(method.to_string()),
+            pattern_matched: "checkOrder".to_string(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: Some(span + 50),
+            // What a model row at the same site folds on: the helper call's
+            // text, its payload, and the symbol the caller annotated.
+            call_expression_text: Some("checkOrder({ id })".to_string()),
+            call_expression_line: Some(line),
+            payload_expression_text: Some("{ id }".to_string()),
+            payload_expression_line: Some(line),
+            primary_type_symbol: Some("OrderCheck".to_string()),
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::RequestSummary),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    call(10, 470, "GET", true),
+                    call(20, 530, "GET", false),
+                    call(30, 590, "POST", true),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (explicit, infer, inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        let responses: Vec<u32> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::CallResult)
+            .map(|item| item.line_number)
+            .collect();
+        assert_eq!(
+            responses,
+            vec![20],
+            "only the request line's own row asks for the call's result"
+        );
+        let symbol_aliases: Vec<String> = explicit
+            .iter()
+            .filter_map(|request| request.alias.clone())
+            .chain(inline.iter().map(|(alias, _)| alias.clone()))
+            .collect();
+        assert_eq!(
+            symbol_aliases.len(),
+            1,
+            "only the request line's own row states its symbol: {symbol_aliases:?}"
+        );
+        let requests: Vec<u32> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::RequestBody)
+            .map(|item| item.line_number)
+            .collect();
+        assert_eq!(
+            requests,
+            vec![30],
+            "the caller row's request side is not this guard's"
+        );
+    }
+
+    /// carrick#1601: the mark a summary row carries reaches the call row the
+    /// type layer reads, on a caller row and on a request line's own row.
+    #[test]
+    fn a_summary_row_restated_at_a_caller_stays_marked_as_a_call_row() {
+        let summary = |at_caller: bool| crate::request_summary::SummaryRow {
+            callee: "checkAvailability".to_string(),
+            span_start: 100,
+            span_end: 160,
+            line: 4,
+            method: "GET".to_string(),
+            target: "${process.env.API_URL}/things/${id}/availability".to_string(),
+            body_literals: Default::default(),
+            reaches_request: Some("src/availability.ts:3".to_string()),
+            own_site: !at_caller,
+            at_caller,
+            library_semantics: Vec::new(),
+            base_fallbacks: None,
+        };
+        for at_caller in [true, false] {
+            let resolved = FileOrchestrator::summary_resolved(
+                &summary(at_caller),
+                None,
+                &EnvSchemaIndex::default(),
+            );
+            let ResolvedRow::Call(call) = resolved.row else {
+                panic!("a summary row is a call row");
+            };
+            assert_eq!(call.at_caller, at_caller);
+        }
     }
 
     #[test]
@@ -13588,6 +13746,7 @@ export * from "./aFetch.js";"#,
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -13696,6 +13855,7 @@ export * from "./aFetch.js";"#,
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -14063,6 +14223,7 @@ export * from "./aFetch.js";"#,
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -16553,6 +16714,7 @@ export { routes };
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }
     }
 
@@ -18787,6 +18949,7 @@ export function publishWrapped(order: OrderPlaced): void {
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }
     }
 

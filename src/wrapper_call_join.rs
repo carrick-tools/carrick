@@ -499,6 +499,7 @@ export function useShelves() {
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }
     }
 

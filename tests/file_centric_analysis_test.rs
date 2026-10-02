@@ -162,6 +162,7 @@ fn test_file_analysis_result_structures() {
         reaches_request: None,
         body_literals: Default::default(),
         library_semantics: Vec::new(),
+        at_caller: false,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -261,6 +262,7 @@ fn test_file_analysis_result_serialization() {
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         }],
         dispatch_tables: Vec::new(),
     };
@@ -622,6 +624,7 @@ fn test_data_call_extraction() {
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             },
             DataCallResult {
                 call_kind: None,
@@ -647,6 +650,7 @@ fn test_data_call_extraction() {
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             },
             DataCallResult {
                 call_kind: None,
@@ -672,6 +676,7 @@ fn test_data_call_extraction() {
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             },
         ],
         dispatch_tables: Vec::new(),

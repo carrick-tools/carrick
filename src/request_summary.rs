@@ -4424,6 +4424,12 @@ pub struct SummaryRow {
     /// The request primitive's own line (`fetch(...)` itself), where the
     /// passes that read a site's own source state it too and are kept.
     pub own_site: bool,
+    /// The row is restated at a call to a function the service declares,
+    /// which makes the request inside it (carrick#1601). The call at this
+    /// site is that function's call, not the request's, so its value is
+    /// whatever the function returns (a boolean, a token, a mapped object)
+    /// and says nothing about the response body.
+    pub at_caller: bool,
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), sorted. Empty on every other row.
     pub library_semantics: Vec<String>,
@@ -4897,7 +4903,14 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         // already states it.
                         continue;
                     };
-                    match row(&instantiated, file, composer.files, call, reaches, false) {
+                    match row(
+                        &instantiated,
+                        file,
+                        composer.files,
+                        call,
+                        reaches,
+                        RowSite::Caller,
+                    ) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -4928,7 +4941,12 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
                         if !effect.has_params() {
-                            match row(&effect, file, composer.files, call, None, !library) {
+                            let at = if library {
+                                RowSite::Library
+                            } else {
+                                RowSite::Own
+                            };
+                            match row(&effect, file, composer.files, call, None, at) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -4952,6 +4970,18 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
     }
 }
 
+/// Where a row's call expression sits relative to the request it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSite {
+    /// The request primitive itself (`fetch(...)`).
+    Own,
+    /// A call through a verified library client: the call is the request.
+    Library,
+    /// A call to a function the service declares, which makes the request
+    /// inside it (carrick#1601).
+    Caller,
+}
+
 /// The row an effect supports at `site`, when its URL and method are both
 /// stated.
 fn row(
@@ -4960,7 +4990,7 @@ fn row(
     files: &HashMap<PathBuf, FileIr>,
     call: &CallIr,
     reaches_request: Option<String>,
-    own_site: bool,
+    at: RowSite,
 ) -> Option<SummaryRow> {
     let site = call.site;
     let MethodValue::Lit(method) = &effect.method else {
@@ -4987,7 +5017,8 @@ fn row(
         target,
         body_literals,
         reaches_request,
-        own_site,
+        own_site: at == RowSite::Own,
+        at_caller: at == RowSite::Caller,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
             .base_scope

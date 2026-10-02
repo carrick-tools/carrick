@@ -3189,6 +3189,7 @@ async fn analyze_current_repo_incremental(
             //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
+            drop_caller_response_entries(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(
                 &mut manifest_entries,
                 &merged_results,
@@ -6962,6 +6963,57 @@ fn build_type_manifest_entries(
     entries
 }
 
+/// Drop the consumer response entry of every row restated at a call to a
+/// function the service declares (carrick#1601).
+///
+/// The call at such a site is the function's call, and its value is what the
+/// function returns, not the response body: the site states no response
+/// contract. An entry left at `unknown` would still make the site a party to
+/// the type check, read `unverifiable` there and carry that up to its pair, so
+/// the entry goes, as it does for a call with no internal producer. The
+/// request entry stays: what the caller hands the function is not this rule's.
+///
+/// Joined to the call rows the way [`stamp_manifest_anchor_symbols`] joins
+/// them, by `(file_path, line)`, and by the verb, so another row on the same
+/// line keeps its entry.
+fn drop_caller_response_entries(
+    manifest: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
+    let callers: HashSet<(&str, u32, String)> = file_results
+        .iter()
+        .flat_map(|(file_path, result)| {
+            result
+                .data_calls
+                .iter()
+                .filter(|call| call.at_caller)
+                .map(move |call| {
+                    (
+                        file_path.as_str(),
+                        normalize_line(call.line_number),
+                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                    )
+                })
+        })
+        .collect();
+    if callers.is_empty() {
+        return;
+    }
+    manifest.retain(|entry| {
+        let restated = entry.role == ManifestRole::Consumer
+            && entry.type_kind == ManifestTypeKind::Response
+            && entry.key.as_http().is_some_and(|(method, _)| {
+                callers.contains(&(
+                    entry.file_path.as_str(),
+                    entry.line_number,
+                    method.to_string(),
+                ))
+            });
+        !restated
+    });
+}
+
 /// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
 ///
 /// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
@@ -7596,6 +7648,7 @@ async fn analyze_current_repo(
     // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
+    drop_caller_response_entries(&mut manifest_entries, &analysis_result.file_results);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
         &analysis_result.file_results,
@@ -10184,6 +10237,7 @@ mod tests {
                     reaches_request: None,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
+                    at_caller: false,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -10274,6 +10328,120 @@ mod tests {
             consumer_paths.contains(&"/api/notifications/status"),
             "expected normalized notification path, got {:?}",
             consumer_paths
+        );
+    }
+
+    /// carrick#1601: a row restated at a helper's caller states no response
+    /// contract, so its consumer response entry goes and the site is no party
+    /// to a response verdict. Its request entry stays, and so does every entry
+    /// of a request line's own row, including another verb on the caller's
+    /// line.
+    #[test]
+    fn a_row_restated_at_a_helper_s_caller_has_no_response_entry() {
+        let config = Config::default();
+        let call = |method: &str, path: &str, line: u32| crate::mount_graph::DataFetchingCall {
+            method: method.to_string(),
+            canonical_path: path.to_string(),
+            target_url: path.to_string(),
+            client: "fetch".to_string(),
+            file_location: format!("src/page.ts:{line}"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+        };
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            call("GET", "/things/:id/availability", 4),
+            call("POST", "/pdf", 9),
+            call("GET", "/orders", 9),
+            call("GET", "/orders", 12),
+        ];
+        let row = |method: &str, line: i32, at_caller: bool| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{line}"),
+            line_number: line,
+            target: "/x".to_string(),
+            method: Some(method.to_string()),
+            pattern_matched: "helper".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::RequestSummary,
+            ),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    row("GET", 4, true),
+                    row("POST", 9, true),
+                    row("GET", 9, false),
+                    row("GET", 12, false),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+
+        let mut entries = build_type_manifest_entries(&mount_graph, &config, ".");
+        drop_caller_response_entries(&mut entries, &file_results);
+
+        let mut kept: Vec<(u32, String, ManifestTypeKind)> = entries
+            .iter()
+            .filter(|entry| entry.role == ManifestRole::Consumer)
+            .map(|entry| {
+                (
+                    entry.line_number,
+                    entry
+                        .key
+                        .as_http()
+                        .map(|(method, _)| method.to_string())
+                        .unwrap_or_default(),
+                    entry.type_kind,
+                )
+            })
+            .collect();
+        kept.sort_by_key(|(line, method, kind)| {
+            (*line, method.clone(), *kind == ManifestTypeKind::Response)
+        });
+        assert_eq!(
+            kept,
+            vec![
+                (4, "GET".to_string(), ManifestTypeKind::Request),
+                (9, "GET".to_string(), ManifestTypeKind::Request),
+                (9, "GET".to_string(), ManifestTypeKind::Response),
+                (9, "POST".to_string(), ManifestTypeKind::Request),
+                (12, "GET".to_string(), ManifestTypeKind::Request),
+                (12, "GET".to_string(), ManifestTypeKind::Response),
+            ]
         );
     }
 
@@ -12003,6 +12171,81 @@ mod tests {
                 (27, get("${process.env.API_BASE}/ping")),
                 (28, get("${process.env.API_BASE}/pong")),
             ]
+        );
+    }
+
+    /// carrick#1601: a row the summaries state at a call to a function the
+    /// service declares is restated at that caller, and says so, wherever the
+    /// function is: in the same module (the issue's token exchange, where the
+    /// caller fills the URL's holes) or in another (a helper handed the
+    /// platform's `fetch` by default, called with its base). The function's
+    /// own request line is no caller.
+    #[test]
+    fn a_row_stated_at_a_helper_s_caller_is_marked_as_restated_there() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/tools.ts",
+                "async function exchangeToken(origin: string, token: string, account: string): Promise<string | null> {\n\
+                 \x20 const res = await fetch(`${origin}/api/v1/accounts/${account}/token`, {\n\
+                 \x20   method: \"POST\",\n\
+                 \x20   headers: { Authorization: `Bearer ${token}` },\n\
+                 \x20   body: JSON.stringify({ scopes: [\"read\"] }),\n\
+                 \x20 });\n\
+                 \x20 if (!res.ok) return null;\n\
+                 \x20 const data = (await res.json()) as { token?: string };\n\
+                 \x20 return data.token ?? null;\n\
+                 }\n\
+                 export function buildTools(ctx: { token: string; account: string }) {\n\
+                 \x20 const origin = process.env.API_ORIGIN;\n\
+                 \x20 let pending: Promise<string | null> | undefined;\n\
+                 \x20 function getToken(): Promise<string | null> {\n\
+                 \x20   pending ??= exchangeToken(origin, ctx.token, ctx.account);\n\
+                 \x20   return pending;\n\
+                 \x20 }\n\
+                 \x20 return { getToken };\n\
+                 }\n",
+            ),
+            (
+                "src/availability.ts",
+                "type Params = { id: string; apiUrl: string; fetchFn?: typeof fetch };\n\
+                 export const checkAvailability = async ({ id, apiUrl, fetchFn = fetch }: Params) => {\n\
+                 \x20 const response = await fetchFn(`${apiUrl}/things/${encodeURIComponent(id)}/availability`);\n\
+                 \x20 if (!response.ok) throw new Error(`HTTP ${response.status}`);\n\
+                 \x20 const data = (await response.json()) as { available: boolean };\n\
+                 \x20 return data.available === true;\n\
+                 };\n",
+            ),
+            (
+                "src/page.ts",
+                "import { checkAvailability } from \"./availability\";\n\
+                 const API_URL = process.env.API_URL;\n\
+                 export function onBlur(id: string) {\n\
+                 \x20 return checkAvailability({ id, apiUrl: API_URL });\n\
+                 }\n",
+            ),
+        ]);
+        let marks = |file: &str| -> Vec<(u32, String, bool, bool)> {
+            summary_rows_of(&dir, &discovery, file)
+                .into_iter()
+                .map(|row| (row.line, row.method, row.at_caller, row.own_site))
+                .collect()
+        };
+        assert_eq!(
+            marks("src/tools.ts"),
+            vec![(15, "POST".to_string(), true, false)],
+            "the token exchange is stated at the caller that fills its holes, and is marked so"
+        );
+        assert_eq!(
+            marks("src/page.ts"),
+            vec![(4, "GET".to_string(), true, false)],
+            "the availability check is stated at its caller in another module, and is marked so"
+        );
+        assert!(
+            marks("src/availability.ts")
+                .iter()
+                .all(|(_, _, at_caller, _)| !at_caller),
+            "the helper's own request line is no caller: {:?}",
+            marks("src/availability.ts")
         );
     }
 

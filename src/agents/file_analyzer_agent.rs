@@ -554,6 +554,16 @@ pub struct DataCallResult {
     /// through a library client.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library_semantics: Vec<String>,
+    /// The row is restated at a call to a function the service declares,
+    /// which makes the request inside it ([`crate::request_summary`],
+    /// carrick#1601). The call expression this row carries is that
+    /// function's call, so its value is the function's return value, not the
+    /// response body: the type layer infers no consumer response type here.
+    ///
+    /// Never from the model. False on every row the summaries did not
+    /// restate at a caller.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_caller: bool,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1975,6 +1985,7 @@ mod tests {
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
+            at_caller: false,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -2038,6 +2049,7 @@ mod tests {
                 reaches_request: None,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
+                at_caller: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
