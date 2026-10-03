@@ -3760,22 +3760,26 @@ export class TypeInferrer {
         return { kind: 'no-match' };
       }
 
-      // The rule named neither of the type's names, so its index is read
-      // against a name its modules declare: the first such reading that
-      // states arguments. An alias declared elsewhere (a service's own alias
-      // around the library's object) has its own parameter list, which the
-      // rule says nothing about, and lends none.
-      const globs = rule.originModuleGlobs;
-      const verified = readings.filter((reading) =>
-        this.symbolOriginatesFromModules(reading.symbol, globs)
-      );
-      if (verified.length === 0) {
+      // The rule named neither of the type's names, so this branch reads
+      // what it always read: the first symbol the type has, and the type's
+      // own arguments. An alias the rule did not name says nothing about
+      // where a payload is, whoever declares it (carrick#1843):
+      // `Omit<Response, 'json'>` is written through a library alias whose
+      // first argument is the transport itself, and a service's own alias
+      // around a library's object orders its parameters as it likes.
+      const symbol = type.getSymbol() || type.getAliasSymbol();
+      if (!symbol || !this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs)) {
         return { kind: 'no-match' };
       }
 
-      const reading =
-        verified.find((candidate) => candidate.typeArguments.length > 0) ?? verified[0];
-      const extracted = this.extractPayloadFromWrapper(type, reading, node, rule, config, depth);
+      const extracted = this.extractPayloadFromWrapper(
+        type,
+        { symbol, typeArguments: type.getTypeArguments(), viaAlias: false },
+        node,
+        rule,
+        config,
+        depth
+      );
       if (extracted) {
         return { kind: 'extracted', result: extracted };
       }

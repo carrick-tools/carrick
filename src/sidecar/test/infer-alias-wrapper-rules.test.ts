@@ -87,6 +87,12 @@ declare function stamped(url: string): Stamped<"v2", Invoice>;
 export function loadStamped(id: string) {
   return stamped(\`/v1/stamped/\${id}\`);
 }
+
+declare function trimmed(url: string): Omit<Reply<Invoice>, "url">;
+
+export function loadTrimmed(id: string) {
+  return trimmed(\`/v1/trimmed/\${id}\`);
+}
 `;
 
 /** A service's own alias that only shares a library wrapper's name. */
@@ -345,6 +351,24 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
         [],
         'only a carrier of verified transport is a decided abstain'
       );
+    });
+
+    it('lends no arguments from a utility alias around the transport', async () => {
+      // `Omit<Reply<Invoice>, "url">` has the transport's members, and is
+      // written through an alias whose first argument is the transport
+      // itself. A rule whose modules include the utility's home (as a rule
+      // for a platform type does) named neither name, so it reads no alias
+      // argument: argument 0 here is the response object, not a body.
+      const inferred = await infer('Trimmed_Response', 'trimmed(`', [
+        {
+          wrapperSymbols: ['Reply'],
+          machineryIndicators: ['headers', 'status', 'statusText', 'ok', 'body'],
+          originModuleGlobs: [...WIRE_ORIGIN, 'typescript/lib/*'],
+          unwrapRecursively: false,
+        },
+      ]);
+      assert.strictEqual(collapse(inferred.type_string), 'unknown');
+      assert.strictEqual(inferred.primary_type_symbol, undefined);
     });
 
     it("leaves a service's own alias alone when the rule's modules do not declare it", async () => {
