@@ -1990,10 +1990,12 @@ export class TypeInferrer {
       symbol = symbol.getAliasedSymbol() ?? symbol;
     }
     const source = symbol?.getDeclarations()[0]?.getSourceFile().getFilePath();
+    const typeArguments = node.getTypeArguments().length;
     return {
       root: nameNode.getText(),
       ...(source ? { root_source: source } : {}),
       ...depthField,
+      ...(typeArguments > 0 ? { root_type_arguments: typeArguments } : {}),
     };
   }
 

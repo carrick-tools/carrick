@@ -960,6 +960,11 @@ export interface StatedBody {
   root_source?: string;
   /** Array levels peeled on the way to `root`. Omitted when 0. */
   array_depth?: number;
+  /**
+   * Type arguments written at `root` (`Page<Order>` → 1). Omitted when 0.
+   * `root` alone does not name the body such a statement states.
+   */
+  root_type_arguments?: number;
 }
 
 /**

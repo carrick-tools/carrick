@@ -52,6 +52,13 @@ export const getMember = async (): Promise<Member> => {
   return response.json() as Promise<Member>;
 };
 
+export type Envelope<T> = { data: T; total: number };
+
+export const listEnveloped = async (): Promise<Envelope<Member[]>> => {
+  const response = await fetchReply("/v1/members-enveloped");
+  return response.json() as Promise<Envelope<Member[]>>;
+};
+
 export const findMember = async (): Promise<Member | null> => {
   const response = await fetchReply("/v1/member-or-none");
   const found: Member[] | null = await response.json();
@@ -145,7 +152,12 @@ interface InferShape {
     alias: string;
     type_string: string;
     is_explicit: boolean;
-    stated_body?: { root?: string; root_source?: string; array_depth?: number };
+    stated_body?: {
+      root?: string;
+      root_source?: string;
+      array_depth?: number;
+      root_type_arguments?: number;
+    };
   }>;
 }
 
@@ -231,6 +243,21 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       assert.strictEqual(inferred.stated_body?.root, 'Member');
       assert.strictEqual(inferred.stated_body?.root_source, servicePath);
       assert.strictEqual(inferred.stated_body?.array_depth, undefined);
+      assert.strictEqual(inferred.stated_body?.root_type_arguments, undefined);
+    });
+
+    it('says when the named root is written with type arguments', async () => {
+      // carrick#1817: `Envelope` alone is not the body `Envelope<Member[]>`
+      // is, so the scanner must be able to tell the two apart.
+      const inferred = await infer('Enveloped_Response', 'fetchReply("/v1/members-enveloped")');
+      assert.strictEqual(inferred.stated_body?.root, 'Envelope');
+      assert.strictEqual(inferred.stated_body?.root_source, servicePath);
+      assert.strictEqual(inferred.stated_body?.root_type_arguments, 1);
+      assert.strictEqual(
+        inferred.stated_body?.array_depth,
+        undefined,
+        'an array inside a type argument is not an array level of the body'
+      );
     });
 
     it('peels arrays and null from an annotated declaration the read initializes', async () => {

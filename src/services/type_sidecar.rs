@@ -1157,6 +1157,10 @@ pub struct StatedBody {
     /// Array levels peeled on the way to `root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
+    /// Type arguments written at `root` (`Page<Order>` → 1), `None` when 0.
+    /// `root` alone does not name the body such a statement states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_type_arguments: Option<u32>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -4088,6 +4092,7 @@ mod tests {
                 root: Some("SearchResponse".to_string()),
                 root_source: Some("/repo/src/search.ts".to_string()),
                 array_depth: None,
+                root_type_arguments: None,
             },
         )];
 
@@ -4109,6 +4114,7 @@ mod tests {
                 root: Some("Member".to_string()),
                 root_source: Some("/repo/src/members.ts".to_string()),
                 array_depth: None,
+                root_type_arguments: None,
             },
         )];
 
@@ -4132,6 +4138,7 @@ mod tests {
                 root: Some("MemberPage".to_string()),
                 root_source: Some("/repo/src/pages.ts".to_string()),
                 array_depth: Some(1),
+                root_type_arguments: None,
             },
         )];
 
@@ -4157,6 +4164,7 @@ mod tests {
                 root: Some("Response".to_string()),
                 root_source: Some("/repo/node_modules/types/fetch.d.ts".to_string()),
                 array_depth: None,
+                root_type_arguments: None,
             },
         )];
 
@@ -4253,6 +4261,7 @@ mod tests {
                 root: Some("MemberPage".to_string()),
                 root_source: Some("/repo/src/pages.ts".to_string()),
                 array_depth: Some(1),
+                root_type_arguments: None,
             },
         );
         let borrowed = inferred_with_anchor(
@@ -4311,6 +4320,7 @@ mod tests {
                     root: Some("Member".to_string()),
                     root_source: Some("/repo/src/members.ts".to_string()),
                     array_depth: None,
+                    root_type_arguments: None,
                 },
             ),
             stated_call_result(
