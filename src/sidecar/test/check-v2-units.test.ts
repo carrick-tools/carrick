@@ -492,6 +492,36 @@ describe('four-bucket classifier precedence', () => {
     );
   });
 
+  it('raw-text side: unverifiable whether or not the sides agree, below top types and bytes (carrick#1842)', () => {
+    const line = (name: string) => [...plan.gateLines].find(([, n]) => n === name)![0];
+    const classify = (gates: string[], mismatch: boolean, onPlan = plan) =>
+      classifyPair({
+        plan: onPlan,
+        probeDiags: [
+          ...gates.map((g) => diag(line(g), 2344)),
+          ...(mismatch ? [diag(decisiveAssignmentLine(onPlan), 2322)] : []),
+        ],
+        poisonReason: noPoison,
+        scrubCtx,
+        rawTextSide: 'consumer',
+      });
+    const mismatched = classify([], true);
+    assert.strictEqual(mismatched.bucket, 'unverifiable');
+    assert.strictEqual(mismatched.gate, 'consumer:text');
+    assert.strictEqual(mismatched.resolved, false);
+    assert.strictEqual(mismatched.unresolved_side, 'consumer');
+    const agreed = classify([], false);
+    assert.strictEqual(agreed.bucket, 'unverifiable');
+    assert.strictEqual(agreed.gate, 'consumer:text');
+    // A top type keeps its own reason, and so do bytes.
+    assert.strictEqual(classify(['sent:any'], true).gate, 'producer:any');
+    assert.strictEqual(classify(['sent:bytes'], true).gate, 'producer:bytes');
+    // Only an http body is read as text.
+    const socket = buildProbe(spec({ protocol: 'socket' }), PKG);
+    const onSocket = classify([], true, socket);
+    assert.strictEqual(onSocket.bucket, 'incompatible');
+  });
+
   it('a top-type gate outranks a void or form gate on the same side (carrick#1162)', () => {
     const request = buildProbe(spec({ type_kind: 'request' }), PKG);
     const line = (name: string) => [...request.gateLines].find(([, n]) => n === name)![0];

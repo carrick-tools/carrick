@@ -13,6 +13,7 @@
  *   IsVoid gate fired (TS2344)            -> unverifiable (no body read)
  *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
  *   IsByteBody gate fired (TS2344)        -> unverifiable (bytes, even agreeing)
+ *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
  *   assignment-class error                -> incompatible
  *   no diagnostics                        -> compatible     [lowest precedence]
  *
@@ -117,6 +118,13 @@ export interface ClassifyInput {
    * run, in which case the tsc text stands alone.
    */
   fieldReport?: PairFieldReport;
+  /**
+   * The side whose capture record says it reads the body as raw text
+   * (carrick#1842), the sent side when both do. Read from the record, not the
+   * type: a text read publishes `string`, which no type gate can tell from a
+   * JSON body that is a string.
+   */
+  rawTextSide?: Side;
 }
 
 /** Classify one pair into exactly one bucket, honouring the precedence order. */
@@ -252,6 +260,21 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       gate: `${side}:bytes`,
       diagnostic: `the ${side} body is bytes (a blob, a buffer or a stream), which has no JSON shape to compare with the other side.`,
       ...notAFact(`the ${side} body is bytes`, side),
+    };
+  }
+
+  // 4d. A body read as raw text (carrick#1842): a `.text()` read, or a request
+  //     library's text format, takes the body unparsed, so `string` there
+  //     states no structural contract. Like bytes, the pair is not compared,
+  //     whether or not the other side's type assigns to `string`.
+  if (input.rawTextSide && plan.spec.protocol === 'http') {
+    const side = input.rawTextSide;
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${side}:text`,
+      diagnostic: `the ${side} reads the body as raw text, which has no JSON shape to compare with the other side.`,
+      ...notAFact(`the ${side} reads the body as raw text`, side),
     };
   }
 

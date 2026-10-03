@@ -939,6 +939,15 @@ export interface InferredType {
    * stated, or when the only annotation is further away than the read.
    */
   stated_body?: StatedBody;
+  /**
+   * carrick#1842, `call_result` only: the published `string` is the body read
+   * as raw text, by a `.text()` read of the call's response or by a call whose
+   * signature takes the literal `'text'` the source passes as its body format.
+   * Raw text states no structural contract, so the check phase reads the pair
+   * unverifiable rather than comparing `string` with the other side's body.
+   * Absent when the body is not a raw-text read.
+   */
+  raw_text_read?: true;
 }
 
 /**

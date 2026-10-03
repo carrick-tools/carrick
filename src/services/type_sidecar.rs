@@ -254,6 +254,11 @@ pub enum CaptureAnchor {
         /// rather than recorded undeclared (#1165). LLM inline text has none.
         #[serde(skip_serializing_if = "Option::is_none")]
         source_file: Option<String>,
+        /// carrick#1842: the text is a body its call site reads as raw text.
+        /// The capture copies it onto the alias's record, which the check
+        /// phase reads from every stored stub.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        raw_text_read: bool,
     },
 }
 
@@ -1140,6 +1145,13 @@ pub struct InferredType {
     /// statement's root names something other than the body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stated_body: Option<StatedBody>,
+    /// carrick#1842, `call_result` only: `type_string` is a body the call
+    /// site reads as raw text (a `.text()` read, or a request library's text
+    /// format). Raw text states no structural contract, so
+    /// `derive_capture_anchors` carries the mark onto the literal anchor and
+    /// the check phase reads the pair unverifiable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_text_read: bool,
 }
 
 /// What the source states a body read to be (carrick#1749).
@@ -3075,6 +3087,7 @@ mod tests {
             type_text: "{ id: string }".into(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             source_file: None,
+            raw_text_read: false,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
@@ -3086,6 +3099,7 @@ mod tests {
             type_text: "{ status: Status }".into(),
             anchor_origin: AnchorOrigin::DeterministicInfer,
             source_file: Some("src/routes.ts".into()),
+            raw_text_read: false,
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
@@ -3759,6 +3773,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            raw_text_read: false,
         }
     }
 
