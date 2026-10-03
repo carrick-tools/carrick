@@ -1,6 +1,9 @@
+scalar JSON
+
 type Query {
   invoice(id: ID!): Invoice
   note(id: ID!): Note
+  ledger: Ledger
 }
 
 type Mutation {
@@ -16,4 +19,9 @@ type Invoice {
 type Note {
   id: ID!
   body: String!
+}
+
+type Ledger {
+  id: ID!
+  entries: JSON
 }

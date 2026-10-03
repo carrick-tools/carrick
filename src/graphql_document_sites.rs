@@ -786,6 +786,13 @@ fn module_object_types(module: &Module) -> HashMap<String, &[TsTypeElement]> {
 /// more or fewer than one operation, a type with no such argument or with two
 /// of them (a variables type that happens to declare the same keys), or a
 /// field the operation selects under two response keys.
+///
+/// A field whose declared type writes `unknown` or `any` anywhere in it (a
+/// JSON scalar inlined by the generator) is withheld: the capture cannot
+/// place a type node yet, and for such a type it falls back to the line and
+/// serves the whole operation result instead (carrick#1775). The row keeps
+/// whatever it had, which is the model's locate or nothing. Remove this once
+/// the capture places the node.
 fn declared_field_types(
     declarator: &VarDeclarator,
     operations: &[DocumentOperation],
@@ -832,7 +839,16 @@ fn declared_field_types(
         {
             continue;
         }
-        let span = properties[key].span();
+        let declared_type = properties[key];
+        if states_top_type(declared_type) {
+            debug!(
+                field = %field,
+                file = %file.display(),
+                "declared GraphQL field type states unknown or any; withheld until the capture can place a type node (carrick#1775)"
+            );
+            continue;
+        }
+        let span = declared_type.span();
         let offset = |pos| {
             source_map
                 .lookup_byte_offset(pos)
@@ -854,6 +870,20 @@ fn declared_field_types(
         );
     }
     field_types
+}
+
+/// Whether a written type states `unknown` or `any` anywhere in it.
+fn states_top_type(ty: &TsType) -> bool {
+    struct TopType(bool);
+    impl Visit for TopType {
+        fn visit_ts_keyword_type(&mut self, node: &swc_ecma_ast::TsKeywordType) {
+            use swc_ecma_ast::TsKeywordTypeKind::{TsAnyKeyword, TsUnknownKeyword};
+            self.0 |= matches!(node.kind, TsAnyKeyword | TsUnknownKeyword);
+        }
+    }
+    let mut found = TopType(false);
+    ty.visit_with(&mut found);
+    found.0
 }
 
 /// The type a variable declaration states for its value: its annotation, or
@@ -1892,6 +1922,21 @@ export const TwoDocument = gql`query Two { a: invoice(id: 1) { id } b: invoice(i
         assert_eq!(
             declared_field_text(source, "TwoDocument"),
             texts(&[("total", "number")])
+        );
+    }
+
+    /// carrick#1775: the capture serves the whole operation for a declared
+    /// field type that writes `unknown` or `any`, so such a field is withheld;
+    /// its sibling still reads.
+    #[test]
+    fn a_field_whose_declared_type_writes_unknown_or_any_is_withheld() {
+        let source = r#"import { gql } from "@example/gql";
+type LedgerQuery = { ledger?: { id: string, entries?: Array<{ value?: unknown | null }> | null } | null, raw: any, owner: { id: string } };
+export const LedgerDocument = gql`query Ledger { ledger { id entries { value } } raw owner { id } }` as unknown as DocumentNode<LedgerQuery, {}>;
+"#;
+        assert_eq!(
+            declared_field_text(source, "LedgerDocument"),
+            texts(&[("owner", "{ id: string }")])
         );
     }
 }
