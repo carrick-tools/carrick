@@ -194,6 +194,7 @@ jobs:
           --test spread_options_verb_test
           --test undeclared_external_host_test
           --test unprepared_refusal_test
+          --test wrapper_call_route_test
           --test xrepo_harness_test
 
   # local_mode_test on its own: at 2.4 minutes it is the longest single
