@@ -51,6 +51,7 @@ import type {
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
+import { reachedOnlyOnFailure } from './failure-path.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -2499,6 +2500,19 @@ export class TypeInferrer {
       for (const expr of candidates) {
         if (expr.getStart() <= startPos) continue;
 
+        // carrick#1796: what the source does with the response once it has
+        // FAILED describes the failure, not the payload. `if (res.ok) {
+        // return ... } const errorText = await res.text()` published the error
+        // text as the response contract because the walk keeps the LAST whole
+        // read, and the failure path's read comes after the success path's
+        // return. A read there is neither the payload nor a part of it.
+        if (
+          this.usesTrackedNames(expr, currentNames) &&
+          reachedOnlyOnFailure(expr, func, (node) => this.isIdentifierUsage(node, currentNames))
+        ) {
+          continue;
+        }
+
         // carrick#1017: a comparison is `boolean` by construction, so it is
         // never the payload a call yields. `const res = await fetch(url); if
         // (res.status === 404) return null; return await res.json() as Entry`
@@ -3114,6 +3128,13 @@ export class TypeInferrer {
   private expressionUsesNames(expr: Node, names: string[]): boolean {
     const identifiers = expr.getDescendantsOfKind(SyntaxKind.Identifier);
     return identifiers.some((id) => this.isIdentifierUsage(id, names));
+  }
+
+  /** `expr` is a use of a tracked name, or contains one. */
+  private usesTrackedNames(expr: Node, names: string[]): boolean {
+    return Node.isIdentifier(expr)
+      ? this.isIdentifierUsage(expr, names)
+      : this.expressionUsesNames(expr, names);
   }
 
   private isIdentifierUsage(id: Node, names: string[]): boolean {
