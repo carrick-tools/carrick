@@ -840,10 +840,23 @@ function branchSide(
 }
 
 /**
+ * The success statuses whose response carries no content (RFC 9110: 204 No
+ * Content, 205 Reset Content).
+ */
+const NO_CONTENT_STATUSES: ReadonlySet<number> = new Set([204, 205]);
+
+/**
  * Whether `condition` being true means the response succeeded: `res.ok`,
  * `res.status === 200`, `res.status !== 200`, `res.status >= 400` and their
  * negations. Any other test of the response is `'unclear'`; a condition that does not
  * test the response is `undefined`.
+ *
+ * An equality or inequality with a no-content status is `undefined` too
+ * (carrick#1813). The retype only runs against a producer that publishes a
+ * response body, and that body never arrives with a 204 or 205, so
+ * `if (res.status === 204) return null` only takes away a status the body
+ * cannot come with. The read after it sits where a read no test decides
+ * sits, not on the error path.
  */
 function okWhenTrue(condition: Node, isResponse: (node: Node) => boolean): boolean | 'unclear' | undefined {
   let e = condition;
@@ -862,13 +875,14 @@ function okWhenTrue(condition: Node, isResponse: (node: Node) => boolean): boole
         : undefined;
     if (value !== undefined) {
       const success = value >= 200 && value < 300;
+      const noContent = NO_CONTENT_STATUSES.has(value);
       switch (op) {
         case SyntaxKind.EqualsEqualsEqualsToken:
         case SyntaxKind.EqualsEqualsToken:
-          return success;
+          return noContent ? undefined : success;
         case SyntaxKind.ExclamationEqualsEqualsToken:
         case SyntaxKind.ExclamationEqualsToken:
-          return !success;
+          return noContent ? undefined : !success;
         case SyntaxKind.GreaterThanEqualsToken:
           if (value >= 300) return false;
           break;

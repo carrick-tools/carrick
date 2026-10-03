@@ -284,6 +284,52 @@ export async function destructured(): Promise<number> {
   if (!res.ok) throw new Error(message);
   return x;
 }
+
+export async function noContent(): Promise<number | null> {
+  const res = await fetch('/p');
+  if (res.status === 204) return null;
+  const body = await res.json();
+  return body.x;
+}
+
+export async function resetContent(): Promise<number | null> {
+  const res = await fetch('/p');
+  if (res.status === 205) return null;
+  const body = await res.json();
+  return body.x;
+}
+
+export async function noContentTernary(): Promise<number | null> {
+  const res = await fetch('/p');
+  return res.status === 204 ? null : (await res.json()).x;
+}
+
+export async function noContentThenError(): Promise<number | null> {
+  const res = await fetch('/p');
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    const e = await res.json();
+    throw new Error(e.message);
+  }
+  const body = await res.json();
+  return body.x;
+}
+
+export async function okStatusFirst(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status === 200) return (await res.json()).x;
+  const e = await res.json();
+  throw new Error(e.message);
+}
+
+export async function hasContent(): Promise<number | null> {
+  const res = await fetch('/p');
+  if (res.status !== 204) {
+    const body = await res.json();
+    return body.x;
+  }
+  return null;
+}
 `;
 
 const CASES = {
@@ -323,6 +369,12 @@ const CASES = {
   okBlockFirst: { line: 248, text: "fetch('/p')", read: 251 },
   destructured: { line: 258, text: "fetch('/p')" },
   compoundTest: { line: 239, text: "fetch('/p')" },
+  noContent: { line: 265, text: "fetch('/p')", read: 268 },
+  resetContent: { line: 272, text: "fetch('/p')", read: 275 },
+  noContentTernary: { line: 279, text: "fetch('/p')", read: 280 },
+  noContentThenError: { line: 284, text: "fetch('/p')", read: 291 },
+  okStatusFirst: { line: 295, text: "fetch('/p')", read: 296 },
+  hasContent: { line: 302, text: "fetch('/p')", read: 305 },
 } as const;
 
 interface Outcome {
@@ -403,6 +455,17 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     'statusNot200',
     'ternary',
     'okBlockFirst',
+    // carrick#1813: a test of a status that carries no body (204, 205) says
+    // nothing about which side the producer's body is read on, so the read
+    // after it is retyped like a read no status test decides.
+    'noContent',
+    'resetContent',
+    'noContentTernary',
+    'noContentThenError',
+    'hasContent',
+    // ...while a read after an early return on a status that does carry a
+    // body is still the error path, and only the first read is judged.
+    'okStatusFirst',
   ] as const) {
     it(`(${name}) flags the read of a field the producer does not return`, async () => {
       const out = await retype(name, '{ y: number; }');
