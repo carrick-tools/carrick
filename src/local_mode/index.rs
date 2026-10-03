@@ -1311,8 +1311,8 @@ pub(super) fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
     for path in paths {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        let blob: CloudRepoData = serde_json::from_str(&text)
-            .map_err(|e| format!("could not parse {}: {e}", path.display()))?;
+        let blob = crate::cloud_storage::read_peer_blob(&text)
+            .map_err(|e| format!("{e} ({})", path.display()))?;
         blobs.push(blob);
     }
     Ok(blobs)

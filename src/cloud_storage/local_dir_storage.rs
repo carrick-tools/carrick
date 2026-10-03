@@ -24,7 +24,7 @@
 //! it is in eval mode — same contract as `MockStorage`.
 
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, JobSubmission, StorageError, UploadOutcome,
+    CloudRepoData, CloudStorage, JobSubmission, StorageError, UploadOutcome, read_peer_blob,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -241,8 +241,8 @@ impl CloudStorage for LocalDirStorage {
             let content = std::fs::read_to_string(&path).map_err(|e| {
                 StorageError::ConnectionError(format!("Failed to read {}: {e}", path.display()))
             })?;
-            let data: CloudRepoData = serde_json::from_str(&content).map_err(|e| {
-                StorageError::SerializationError(format!("Failed to parse {}: {e}", path.display()))
+            let data = read_peer_blob(&content).map_err(|e| {
+                StorageError::SerializationError(format!("{e} ({})", path.display()))
             })?;
             repos.push(data);
         }
@@ -392,5 +392,46 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    /// carrick#1740: the read the #1734 bisect died on. A peer blob carrying a
+    /// value this build does not know stops the read, and the error names the
+    /// sibling, the later release that wrote it, the upgrade, and the file.
+    #[tokio::test]
+    async fn a_peer_blob_from_a_later_release_names_the_sibling_and_the_upgrade() {
+        let cache = tempfile::tempdir().unwrap();
+        let peers = tempfile::tempdir().unwrap();
+        let path = peers.path().join("ledger.json");
+        let store = LocalDirStorage::new(
+            cache.path().to_path_buf(),
+            CrossRepoReads::Peers(peers.path().to_path_buf()),
+        )
+        .unwrap();
+
+        let known = crate::cloud_storage::sibling_blob_with_source(Some("99.0.0"), "whole_url_env");
+        std::fs::write(&path, known.to_string()).unwrap();
+        assert_eq!(store.download_all_repo_data().await.unwrap().0.len(), 1);
+
+        let later = crate::cloud_storage::sibling_blob_with_source(
+            Some("99.0.0"),
+            "a_source_from_a_later_release",
+        );
+        std::fs::write(&path, later.to_string()).unwrap();
+        let error = store
+            .download_all_repo_data()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "The index of service `ledger` of `org/ledger` was written by carrick 99.0.0"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("Upgrade carrick to 99.0.0 or later"),
+            "{error}"
+        );
+        assert!(error.contains(&path.display().to_string()), "{error}");
     }
 }

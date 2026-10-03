@@ -43,7 +43,7 @@ regex = "1.11.1"
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 semver = "1.0"
 serde = "1.0.219"
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 swc_common = { version = "12.0.1", features = ["tty-emitter"] }

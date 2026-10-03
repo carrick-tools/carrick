@@ -943,6 +943,173 @@ impl CloudRepoData {
     }
 }
 
+/// Read one sibling's index blob, or say whose blob could not be read and
+/// why (carrick#1740).
+///
+/// Every reader of another service's blob goes through here or
+/// [`read_peer_blob_value`]: the cloud download, the offline and laptop peer
+/// directories, the local index's cache, and the hosted read. A field this
+/// build does not know is ignored (carrick#1516), but a VALUE it does not know
+/// is not: every enum on the blob is strict, so a `resolution_source` added by
+/// a later release fails the parse here. That is deliberate. A catch-all
+/// variant would drop rows the sibling stated and change the cross-service
+/// findings without a word, and on `ResolutionSource` it would itself be a
+/// new value, which the cloud's vocabulary check refuses. Mixed versions are
+/// not supported, so the reader stops, and the error names the sibling, the
+/// release that wrote it and, when that release is newer, the upgrade.
+pub(crate) fn read_peer_blob(text: &str) -> Result<CloudRepoData, UnreadablePeerBlob> {
+    serde_json::from_str(text).map_err(|error| {
+        let writer = serde_json::from_str(text).unwrap_or_default();
+        UnreadablePeerBlob::new(writer, &error, env!("CARGO_PKG_VERSION"))
+    })
+}
+
+/// [`read_peer_blob`], for a blob the caller already holds as a JSON value.
+pub(crate) fn read_peer_blob_value(
+    blob: serde_json::Value,
+) -> Result<CloudRepoData, UnreadablePeerBlob> {
+    let writer = PeerBlobWriter::deserialize(&blob).unwrap_or_default();
+    serde_json::from_value(blob)
+        .map_err(|error| UnreadablePeerBlob::new(writer, &error, env!("CARGO_PKG_VERSION")))
+}
+
+/// Who wrote a sibling's blob, read apart from the blob so that a blob this
+/// build cannot read can still be named.
+#[derive(Debug, Default, Deserialize)]
+struct PeerBlobWriter {
+    repo_name: Option<String>,
+    service_name: Option<String>,
+    scanner_version: Option<String>,
+}
+
+/// A sibling's index blob this build could not read (carrick#1740).
+#[derive(Debug)]
+pub(crate) struct UnreadablePeerBlob {
+    /// The sibling, as a reader names it: "`org/api`", or "service `billing`
+    /// of `org/platform`" for one service of several.
+    sibling: String,
+    /// The release that wrote the blob, when the blob states one.
+    written_by: Option<String>,
+    /// Whether that release is later than this one.
+    written_by_a_later_release: bool,
+    /// This build's release.
+    this_release: String,
+    /// The parse error's first clause. An unknown enum value's message goes on
+    /// to list every value this build knows, which is no use to the reader.
+    detail: String,
+}
+
+impl UnreadablePeerBlob {
+    fn new(writer: PeerBlobWriter, error: &serde_json::Error, this_release: &str) -> Self {
+        let sibling = match (writer.repo_name, writer.service_name) {
+            (Some(repo), Some(service)) if service != repo => {
+                format!("service `{service}` of `{repo}`")
+            }
+            (Some(repo), _) => format!("`{repo}`"),
+            (None, Some(service)) => format!("service `{service}`"),
+            (None, None) => "a sibling service".to_string(),
+        };
+        let written_by_a_later_release = writer
+            .scanner_version
+            .as_deref()
+            .and_then(|theirs| semver::Version::parse(theirs).ok())
+            .zip(semver::Version::parse(this_release).ok())
+            .is_some_and(|(theirs, ours)| theirs > ours);
+        let message = error.to_string();
+        let mut detail = message
+            .split(", expected")
+            .next()
+            .and_then(|clause| clause.split(" at line ").next())
+            .unwrap_or(&message)
+            .to_string();
+        if error.line() > 0 {
+            detail.push_str(&format!(
+                " at line {} column {}",
+                error.line(),
+                error.column()
+            ));
+        }
+        Self {
+            sibling,
+            written_by: writer.scanner_version,
+            written_by_a_later_release,
+            this_release: this_release.to_string(),
+            detail,
+        }
+    }
+
+    /// What to do about it, when the answer is to upgrade: the blob was
+    /// written by a later release than this one. Nothing from the parse error
+    /// is in it, so a reader that never echoes what the server sent can still
+    /// print it.
+    pub(crate) fn upgrade_sentence(&self) -> Option<String> {
+        let theirs = self.written_by.as_deref()?;
+        self.written_by_a_later_release.then(|| {
+            format!(
+                "The index of {} was written by carrick {theirs}, which is newer than this \
+                 carrick ({}) and states something this version cannot read. Upgrade carrick \
+                 to {theirs} or later: the CLI, or the ref the workflow pins the Carrick Action \
+                 to.",
+                self.sibling, self.this_release
+            )
+        })
+    }
+}
+
+impl std::fmt::Display for UnreadablePeerBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(upgrade) = self.upgrade_sentence() {
+            return write!(f, "{upgrade} ({})", self.detail);
+        }
+        match &self.written_by {
+            Some(theirs) => write!(
+                f,
+                "The index of {}, written by carrick {theirs}, could not be read: {}",
+                self.sibling, self.detail
+            ),
+            None => write!(
+                f,
+                "The index of {} could not be read: {}",
+                self.sibling, self.detail
+            ),
+        }
+    }
+}
+
+/// A sibling's blob as a later release would write it: one data call whose
+/// `resolution_source` no value of this build's enum spells, stamped with
+/// `scanner_version` when one is given (carrick#1740). `source` swaps the
+/// value, so a test can show the same blob reads when the value is known.
+#[cfg(test)]
+pub(crate) fn sibling_blob_with_source(
+    scanner_version: Option<&str>,
+    source: &str,
+) -> serde_json::Value {
+    let mut blob = serde_json::json!({
+        "repo_name": "org/ledger",
+        "service_name": "ledger",
+        "endpoints": [], "calls": [], "mounts": [], "apps": {},
+        "imported_handlers": [], "function_definitions": {},
+        "last_updated": "2026-10-01T00:00:00Z",
+        "commit_hash": "4f2a1c9",
+        "mount_graph": {
+            "nodes": {}, "mounts": [], "endpoints": [],
+            "data_calls": [{
+                "method": "POST",
+                "target_url": "/v1/quote",
+                "canonical_path": "/v1/quote",
+                "client": "fetch",
+                "file_location": "src/quote.ts:31",
+                "resolution_source": source
+            }]
+        }
+    });
+    if let Some(version) = scanner_version {
+        blob["scanner_version"] = serde_json::json!(version);
+    }
+    blob
+}
+
 /// Project a `MountGraph`'s endpoints and consumer calls into the
 /// `ApiEndpointDetails` shape shared by the cloud index. Returns
 /// `(endpoints, calls)`.
@@ -3211,6 +3378,86 @@ mod tests {
         assert_eq!(
             back.compat_verdicts.unwrap()[0].response,
             Some(compatible_direction(false))
+        );
+    }
+
+    /// carrick#1740: an unknown VALUE is not an unknown field. A sibling's
+    /// blob carrying a `resolution_source` this build has no variant for does
+    /// not read, and when a later release wrote it the error names the
+    /// sibling, both releases and the upgrade, from either entry point.
+    #[test]
+    fn a_sibling_blob_from_a_later_release_names_the_sibling_and_the_upgrade() {
+        let known = sibling_blob_with_source(Some("99.0.0"), "whole_url_env");
+        assert!(read_peer_blob_value(known.clone()).is_ok());
+        assert!(read_peer_blob(&known.to_string()).is_ok());
+
+        let later = sibling_blob_with_source(Some("99.0.0"), "a_source_from_a_later_release");
+        let from_value = read_peer_blob_value(later.clone()).unwrap_err();
+        let from_text = read_peer_blob(&later.to_string()).unwrap_err();
+        for error in [&from_value, &from_text] {
+            let message = error.to_string();
+            assert!(
+                message.starts_with(
+                    "The index of service `ledger` of `org/ledger` was written by carrick 99.0.0, \
+                     which is newer than this carrick"
+                ),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("({})", env!("CARGO_PKG_VERSION"))),
+                "{message}"
+            );
+            assert!(
+                message.contains("Upgrade carrick to 99.0.0 or later"),
+                "{message}"
+            );
+            assert!(
+                message.contains("unknown variant `a_source_from_a_later_release`"),
+                "{message}"
+            );
+            // The first clause only: not the list of every value this build knows.
+            assert!(!message.contains("expected one of"), "{message}");
+            // The sentence a reader that never echoes the server prints.
+            let upgrade = error
+                .upgrade_sentence()
+                .expect("a later release says upgrade");
+            assert!(message.starts_with(&upgrade), "{message}");
+            assert!(!upgrade.contains("a_source_from_a_later_release"));
+        }
+        // The text entry point keeps where in the blob the value sits.
+        assert!(from_text.to_string().contains(" at line 1 column "));
+    }
+
+    /// carrick#1740: a blob from this release or an earlier one that does not
+    /// read is a defect, not a version skew, so it is named with its release
+    /// and the error, and says nothing about upgrading.
+    #[test]
+    fn a_sibling_blob_from_this_or_an_earlier_release_is_named_without_an_upgrade() {
+        for version in [env!("CARGO_PKG_VERSION"), "0.0.1", "not-a-version"] {
+            let error = read_peer_blob_value(sibling_blob_with_source(
+                Some(version),
+                "a_source_from_a_later_release",
+            ))
+            .unwrap_err();
+            assert!(error.upgrade_sentence().is_none(), "{version}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "The index of service `ledger` of `org/ledger`, written by carrick {version}, \
+                     could not be read: unknown variant `a_source_from_a_later_release`"
+                )
+            );
+        }
+        let unstamped = read_peer_blob_value(sibling_blob_with_source(
+            None,
+            "a_source_from_a_later_release",
+        ))
+        .unwrap_err();
+        assert!(unstamped.upgrade_sentence().is_none());
+        assert_eq!(
+            unstamped.to_string(),
+            "The index of service `ledger` of `org/ledger` could not be read: \
+             unknown variant `a_source_from_a_later_release`"
         );
     }
 

@@ -737,7 +737,12 @@ struct AdjacentRepo {
     s3_url: String,
     #[allow(dead_code)]
     filename: String,
-    metadata: Option<CloudRepoData>, // Now includes full metadata!
+    /// The sibling's index blob, kept as its own text and read one blob at a
+    /// time by [`crate::cloud_storage::read_peer_blob`], so a blob this build
+    /// cannot read is named rather than failing the whole response
+    /// anonymously (carrick#1740). Raw rather than a parsed value, so holding
+    /// it costs its bytes once.
+    metadata: Option<Box<serde_json::value::RawValue>>,
     #[serde(rename = "lastUpdated")]
     #[allow(dead_code)]
     last_updated: Option<String>,
@@ -2009,6 +2014,8 @@ impl CloudStorage for AwsStorage {
         for adjacent in response.repos {
             if let Some(metadata) = adjacent.metadata {
                 debug!("Processing repo: {} with full metadata", adjacent.repo);
+                let metadata = crate::cloud_storage::read_peer_blob(metadata.get())
+                    .map_err(|e| StorageError::SerializationError(e.to_string()))?;
                 repo_s3_urls.insert(metadata.repo_name.clone(), adjacent.s3_url);
                 all_repo_data.push(metadata);
             } else {
@@ -2940,10 +2947,10 @@ mod tests {
     }
 
     /// A peer row whose `name_scope` holds a scope this build has no word for
-    /// (a newer scanner wrote it) never fails the cross-repo fetch: the whole
-    /// response is one parse, so one such row would otherwise drop every
-    /// peer. The value is kept, and the matcher restricts it like `service`
-    /// (carrick#1663).
+    /// (a newer scanner wrote it) never fails the cross-repo fetch: a peer
+    /// blob that does not read stops the fetch (carrick#1740), so one such row
+    /// would otherwise stop the scan. The value is kept, and the matcher
+    /// restricts it like `service` (carrick#1663).
     #[test]
     fn a_peer_row_with_an_unknown_scope_never_fails_the_cross_repo_fetch() {
         let row = serde_json::json!({
@@ -2978,11 +2985,17 @@ mod tests {
             }]
         });
         let parsed: CrossRepoResponse =
-            serde_json::from_value(body).expect("an unknown scope never fails the fetch");
-        let metadata = parsed.repos[0]
-            .metadata
-            .as_ref()
-            .expect("the peer's metadata");
+            serde_json::from_str(&body.to_string()).expect("the response reads");
+        // Each peer's blob is read on its own (carrick#1740), so that is the
+        // read the unknown scope must not fail.
+        let metadata = crate::cloud_storage::read_peer_blob(
+            parsed.repos[0]
+                .metadata
+                .as_ref()
+                .expect("the peer's metadata")
+                .get(),
+        )
+        .expect("an unknown scope never fails the fetch");
         for row in metadata.endpoints.iter().chain(&metadata.calls) {
             let scope = row
                 .name_scope
@@ -4673,5 +4686,72 @@ mod tests {
             r#"{"code":"repo_not_authorized"}"#
         ));
         assert!(!is_credential_rejection(StatusCode::CONFLICT, kind));
+    }
+
+    /// carrick#1740: the cloud answers every sibling's blob in one response,
+    /// and each is read on its own. One from a later release carrying a value
+    /// this build does not know stops the read with the sibling named and the
+    /// upgrade said, where the whole response used to fail as one anonymous
+    /// parse error; blobs this build can read come through as before.
+    #[tokio::test]
+    async fn a_sibling_blob_from_a_later_release_names_the_sibling_and_the_upgrade() {
+        use crate::cloud_storage::{CloudStorage, sibling_blob_with_source};
+
+        let row = |repo: &str, metadata: serde_json::Value| {
+            serde_json::json!({"repo": repo, "hash": "4f2a1c9",
+                "s3Url": format!("https://example.invalid/{repo}.json"),
+                "filename": format!("{repo}.json"), "metadata": metadata,
+                "lastUpdated": "2026-10-01T00:00:00Z"})
+        };
+        let known = sibling_blob_with_source(Some("99.0.0"), "whole_url_env");
+        let later = sibling_blob_with_source(Some("99.0.0"), "a_source_from_a_later_release");
+        let (base, server) = crate::agent_service::tests::stub_server(vec![
+            (
+                200,
+                serde_json::json!({"repos": [row("org/ledger", known.clone()),
+                    row("org/web", serde_json::Value::Null)]})
+                .to_string(),
+            ),
+            (
+                200,
+                serde_json::json!({"repos": [row("org/web", known), row("org/ledger", later)]})
+                    .to_string(),
+            ),
+        ]);
+        let storage = AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+
+        let (repos, urls) = storage.download_all_repo_data().await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].repo_name, "org/ledger");
+        assert_eq!(
+            repos[0].mount_graph.as_ref().unwrap().data_calls[0].resolution_source,
+            Some(crate::agents::file_analyzer_agent::ResolutionSource::WholeUrlEnv)
+        );
+        assert_eq!(
+            urls["org/ledger"],
+            "https://example.invalid/org/ledger.json"
+        );
+
+        let error = storage
+            .download_all_repo_data()
+            .await
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+        assert!(
+            error.contains(
+                "The index of service `ledger` of `org/ledger` was written by carrick 99.0.0"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("Upgrade carrick to 99.0.0 or later"),
+            "{error}"
+        );
+        assert!(error.contains("a_source_from_a_later_release"), "{error}");
     }
 }

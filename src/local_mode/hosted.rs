@@ -433,7 +433,10 @@ impl Reader {
         }
         #[derive(Deserialize)]
         struct Entry {
-            metadata: CloudRepoData,
+            /// Read one blob at a time below, so a blob written by a later
+            /// release says to upgrade instead of reading as a broken
+            /// response (carrick#1740).
+            metadata: serde_json::Value,
             /// The stored row's `updatedAt`. Optional in the cloud's own type,
             /// and a blob answered without it, or with anything but a string,
             /// is one the next read cannot compare, so it downloads again
@@ -447,24 +450,28 @@ impl Reader {
         }
         let response: Response =
             serde_json::from_value(value).map_err(|_| "Invalid hosted project schema")?;
-        let rows = response
-            .repos
-            .iter()
-            .map(|entry| StoredRow {
-                repo: entry.metadata.repo_name.to_ascii_lowercase(),
-                service: service_of(&entry.metadata),
-                hash: entry.metadata.commit_hash.clone(),
+        let mut blobs = Vec::with_capacity(response.repos.len());
+        let mut rows = Vec::with_capacity(response.repos.len());
+        for entry in response.repos {
+            // Only the upgrade sentence is printed: it names the sibling and
+            // two versions, and never echoes the parse error's text.
+            let blob = crate::cloud_storage::read_peer_blob_value(entry.metadata).map_err(|e| {
+                e.upgrade_sentence()
+                    .unwrap_or_else(|| "Invalid hosted project schema".to_string())
+            })?;
+            rows.push(StoredRow {
+                repo: blob.repo_name.to_ascii_lowercase(),
+                service: service_of(&blob),
+                hash: blob.commit_hash.clone(),
                 updated_at: entry
                     .last_updated
                     .as_ref()
                     .and_then(|at| at.as_str())
                     .map(str::to_string),
-            })
-            .collect();
-        Ok(DownloadedProject {
-            blobs: response.repos.into_iter().map(|r| r.metadata).collect(),
-            rows,
-        })
+            });
+            blobs.push(blob);
+        }
+        Ok(DownloadedProject { blobs, rows })
     }
 
     async fn refresh(
@@ -1568,6 +1575,52 @@ mod tests {
         request.join().unwrap();
         assert_eq!(project.blobs.len(), 2);
         assert!(project.rows.iter().all(|row| row.updated_at.is_none()));
+    }
+
+    /// carrick#1740: a sibling's blob carrying a value this build does not
+    /// know fails the project's read. When a later release wrote it, the
+    /// failure is the upgrade sentence; otherwise it is the fixed one. Neither
+    /// echoes the parse error.
+    #[tokio::test]
+    async fn a_blob_from_a_later_release_fails_the_read_with_the_upgrade() {
+        let answer = |version: Option<&str>, source: &str| {
+            serde_json::to_vec(&json!({"repos":[{"metadata":
+                crate::cloud_storage::sibling_blob_with_source(version, source)}]}))
+            .unwrap()
+        };
+        let (url, request) = serve("200 OK", "", answer(Some("99.0.0"), "whole_url_env"));
+        let read = reader(url).project(&credential("test-secret"), "p").await;
+        request.join().unwrap();
+        assert_eq!(read.unwrap().blobs.len(), 1);
+
+        let later = "a_source_from_a_later_release";
+        let (url, request) = serve("200 OK", "", answer(Some("99.0.0"), later));
+        let error = reader(url)
+            .project(&credential("test-secret"), "p")
+            .await
+            .unwrap_err();
+        request.join().unwrap();
+        assert!(
+            error.starts_with(
+                "The index of service `ledger` of `org/ledger` was written by carrick 99.0.0"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("Upgrade carrick to 99.0.0 or later"),
+            "{error}"
+        );
+        assert!(!error.contains(later), "{error}");
+
+        for version in [Some(env!("CARGO_PKG_VERSION")), None] {
+            let (url, request) = serve("200 OK", "", answer(version, later));
+            let error = reader(url)
+                .project(&credential("test-secret"), "p")
+                .await
+                .unwrap_err();
+            request.join().unwrap();
+            assert_eq!(error, "Invalid hosted project schema", "{version:?}");
+        }
     }
 
     #[tokio::test]
