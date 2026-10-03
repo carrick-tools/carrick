@@ -22,6 +22,13 @@
  * top type is no payload, and the next argument along is not read in its
  * place: on a result carrier that is the error side. An alias the rule does
  * not name and its modules do not declare lends no arguments to it.
+ *
+ * On a result carrier (`Task<Outcome<Reply<T>, E>>`) the rules now reach what
+ * the carrier holds before the carrier read does (carrick#1376,
+ * carrick#1841). The site answers as that read answered: a payload by its
+ * members, anchored on it, and verified transport with no payload as the
+ * decided abstain, whether the service has a rule for every layer, for some,
+ * or for none of the outer ones.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -85,7 +92,7 @@ export function loadStamped(id: string) {
 /** A service's own alias that only shares a library wrapper's name. */
 const LOCAL_TS = `export interface Receipt {
   id: string;
-  paid: boolean;
+  settled: boolean;
 }
 
 type Reply<T> = { status: number; ok: boolean; body: T };
