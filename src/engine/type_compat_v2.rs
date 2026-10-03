@@ -333,12 +333,21 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
 /// locator without the inferrer's kind awareness, so for a redirect-only route
 /// it would read the redirect location back in and publish `string` as the
 /// body, which is the exact answer the inferrer just declined to give.
+///
+/// A call result's root `machinery_envelope` is a decision too: what the
+/// call's result carrier holds is transport the service's wrapper rules verify
+/// and read no payload out of, such as a request library's own response object
+/// (carrick#1841). The capture's re-run would publish the carrier. A handler
+/// return with that reason states that some of its union branches were unread
+/// (carrick#166), and keeps the capture's own read as its recovery.
 fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredType) -> bool {
     text_is_bare_top_type(&inf.type_string)
-        && inf
-            .any_provenance
-            .iter()
-            .any(|p| p.path.is_empty() && DECIDED_ABSTAIN_REASONS.contains(&p.reason.as_str()))
+        && inf.any_provenance.iter().any(|p| {
+            p.path.is_empty()
+                && (DECIDED_ABSTAIN_REASONS.contains(&p.reason.as_str())
+                    || (inf.infer_kind == InferKind::CallResult
+                        && p.reason == "machinery_envelope"))
+        })
 }
 
 /// Aliases whose deterministic inference ran and came back blind for EVERY
@@ -2834,6 +2843,51 @@ mod tests {
         assert!(
             matches!(&anchors[1], CaptureAnchor::Infer { alias, .. } if alias == "Endpoint_blind_Response"),
             "a blind inference without a decision keeps its infer anchor, got {:?}",
+            anchors[1]
+        );
+    }
+
+    /// carrick#1841: a consumer call whose result carries a library's own
+    /// response object is answered `unknown` with `machinery_envelope` at the
+    /// root. That is a decision: the capture's raw locator re-run would resolve
+    /// the call and publish the carrier around the response object. A handler
+    /// return with the same reason (carrick#166, some union branches unread)
+    /// keeps its infer anchor, as before.
+    #[test]
+    fn derive_anchors_keeps_a_call_result_decided_as_transport() {
+        let machinery = || crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "machinery_envelope".to_string(),
+            detail: None,
+        };
+        let mut call = inferred("Endpoint_ping_Response_Call1", "unknown", None, None);
+        call.infer_kind = InferKind::CallResult;
+        call.any_provenance = vec![machinery()];
+        let mut handler = inferred("Endpoint_partial_Response", "unknown", None, None);
+        handler.any_provenance = vec![machinery()];
+        let mut call_request = response_body_infer("Endpoint_ping_Response_Call1");
+        call_request.infer_kind = InferKind::CallResult;
+        let infer = vec![
+            call_request,
+            response_body_infer("Endpoint_partial_Response"),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[call, handler], &[], "/repo");
+
+        assert_eq!(anchors.len(), 2, "{anchors:?}");
+        assert!(
+            matches!(
+                &anchors[0],
+                CaptureAnchor::Literal { alias, type_text, .. }
+                    if alias == "Endpoint_ping_Response_Call1" && type_text == "unknown"
+            ),
+            "a call result decided as transport must stay a literal unknown, got {:?}",
+            anchors[0]
+        );
+        assert!(
+            matches!(&anchors[1], CaptureAnchor::Infer { alias, .. } if alias == "Endpoint_partial_Response"),
+            "a handler return with unread branches keeps its infer anchor, got {:?}",
             anchors[1]
         );
     }

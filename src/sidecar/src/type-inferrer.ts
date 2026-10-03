@@ -1694,16 +1694,66 @@ export class TypeInferrer {
             use.projections,
             `${request.file_path}:${request.line_number}`
           );
+    // carrick#1841: what the carrier holds goes through the service's wrapper
+    // rules before it is published, as the call's own result did. The carrier
+    // is found by its shape, so what it holds can still be a library's
+    // envelope: a request library answers `Task<Outcome<Reply<T>, E>>`, and
+    // `Reply<T>` is that library's response object, a status, a url and
+    // headers around the body. Where a rule reads a payload out of it, that
+    // payload is the body. Where a rule verifies it as the library's transport
+    // and reads nothing out of it, this site states no contract, and the
+    // transport object must not stand in for one: judged against a
+    // producer's body, every member it adds reads as a field the producer
+    // does not send.
+    //
+    // The abstain is decided, so it rides the row (`machinery_envelope` at the
+    // root, no anchor). A plain `null` is re-read by the capture's own
+    // locator, which would resolve the raw call and publish the carrier.
+    const carrierUnwrap = carrierCandidate
+      ? this.unwrapTypeWithConfig(carrierCandidate, terminalNode, extractionConfig)
+      : undefined;
+    if (
+      carrierCandidate &&
+      carrierUnwrap?.wasUnwrapped &&
+      carrierUnwrap.typeString.trim() === 'unknown'
+    ) {
+      const carried = typeText(carrierCandidate, terminalNode);
+      this.log(
+        `Call result at ${request.file_path}:${request.line_number} carries ${carried}, which ` +
+          "the service's wrapper rules verify as transport and read no payload out of; this " +
+          'site states no response contract'
+      );
+      const abstain = this.createInferredType(
+        request,
+        'unknown',
+        false,
+        this.getNodeLocation(callExpr)
+      );
+      abstain.any_provenance = [
+        {
+          path: '',
+          kind: 'unknown',
+          reason: 'machinery_envelope',
+          detail:
+            "what this call's result carries is transport that the service's wrapper rules " +
+            'verify and read no payload out of (a library response object around the body), ' +
+            'so this site states no response contract',
+        },
+      ];
+      return abstain;
+    }
+    const carried =
+      carrierUnwrap?.wasUnwrapped && carrierUnwrap.payloadType
+        ? carrierUnwrap.payloadType
+        : carrierCandidate;
     // The payload rides the row as its own MEMBERS, never as its bare name
     // (#257): `derive_capture_anchors` turns a usable inference into a literal
     // capture anchor, and a bare name is out of scope where the surface
     // declares the alias, so it would decay to a top type and publish nothing
     // — trading a wrong answer for no answer. Where the payload carries no
     // member shape to print, the carrier keeps its own answer.
-    const carrierText = carrierCandidate
-      ? this.structuralTextFromType(carrierCandidate, terminalNode)
-      : null;
-    const carrierPayload = carrierText ? carrierCandidate : undefined;
+    const carrierText = carried ? this.structuralTextFromType(carried, terminalNode) : null;
+    const carrierPayload = carrierText ? carried : undefined;
     if (carrierPayload && carrierText) {
       typeString = carrierText;
     } else if (carrierCandidate) {
