@@ -492,6 +492,31 @@ pub const MANIFEST_SKIP_DIRS: [&str; 6] = [
     ".carrick",
 ];
 
+/// The lockfiles an install writes that this crate reads the answers of:
+/// npm's two, pnpm's, Yarn's and Deno's.
+pub const LOCKFILES: [&str; 5] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "deno.lock",
+];
+
+/// Bun's lockfiles, text and binary. Nothing in this crate parses either; the
+/// Action installs from them (`scripts/install-scanned-deps.sh`) and the type
+/// sidecar reads the text one, so a manifest beside one states an install as
+/// much as a manifest beside any of [`LOCKFILES`] does.
+pub const BUN_LOCKFILES: [&str; 2] = ["bun.lock", "bun.lockb"];
+
+/// Whether `dir` itself states an install: a lockfile of any package manager
+/// the scanner recognises sits in it.
+pub fn holds_lockfile(dir: &Path) -> bool {
+    LOCKFILES
+        .iter()
+        .chain(BUN_LOCKFILES.iter())
+        .any(|name| dir.join(name).is_file())
+}
+
 /// Deno configs that belong to the declared workspace, starting at the root.
 /// Nested configs outside a `workspace` list are intentionally absent.
 pub fn deno_workspace_manifest_paths(repo_root: &Path) -> Result<Vec<PathBuf>, io::Error> {

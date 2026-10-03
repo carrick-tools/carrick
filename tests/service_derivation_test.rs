@@ -685,3 +685,568 @@ fn a_workspace_member_inside_another_member_is_left_out_of_the_outer_walk() {
         ["packages/api/plugins/audit/index.ts"]
     );
 }
+
+/// An application that installs on its own: a manifest, the lockfile its
+/// package manager wrote beside it, and source.
+fn lockfile_rooted_app(root: &Path, directory: &str, name: &str, lockfile: &str) {
+    write(
+        root,
+        &format!("{directory}/package.json"),
+        &format!(r#"{{"name":"{name}","private":true,"dependencies":{{"left-pad":"1.3.0"}}}}"#),
+    );
+    write(root, &format!("{directory}/{lockfile}"), "");
+    write(root, &format!("{directory}/tsconfig.json"), "{}");
+    write(
+        root,
+        &format!("{directory}/src/main.ts"),
+        "export const port = 3000;\n",
+    );
+}
+
+/// A root manifest that installs tooling for the repository and declares no
+/// workspace, with a lockfile of its own.
+fn tooling_root(root: &Path) {
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"scripts":{"dev":"run-p dev:*"},"devDependencies":{"npm-run-all":"^4.1.5"}}"#,
+    );
+    write(root, "package-lock.json", "{}");
+}
+
+fn directories(derived: &carrick::service_derivation::ServiceDerivation) -> Vec<&str> {
+    derived
+        .services
+        .iter()
+        .map(|service| service.directory.as_deref().unwrap_or("."))
+        .collect()
+}
+
+/// Everything a derivation states, for a test that says nothing moved.
+fn stated(derived: &carrick::service_derivation::ServiceDerivation) -> serde_json::Value {
+    serde_json::json!({
+        "reason": derived.reason,
+        "services": derived.service_documents(),
+        "config": derived.config,
+        "warnings": derived.warnings,
+        "notes": derived.notes,
+    })
+}
+
+/// The files a scan of `root` reads through `walk`, relative to the
+/// repository and sorted.
+fn relative_files(root: &Path, files: Vec<std::path::PathBuf>) -> Vec<String> {
+    let mut relative: Vec<String> = files
+        .iter()
+        .map(|file| {
+            file.strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    relative.sort();
+    relative
+}
+
+/// What the service proposed at `directory` reads, with the same walk a scan
+/// uses.
+fn read_by(
+    root: &Path,
+    derived: &carrick::service_derivation::ServiceDerivation,
+    directory: &str,
+) -> Vec<String> {
+    let root = root.canonicalize().unwrap();
+    let service = derived
+        .services
+        .iter()
+        .find(|service| service.directory.as_deref().unwrap_or(".") == directory)
+        .unwrap_or_else(|| panic!("no service proposed at {directory}"));
+    let (files, _) = carrick::file_finder::find_service_files(
+        root.to_str().unwrap(),
+        service,
+        &carrick::packages::MANIFEST_SKIP_DIRS,
+    );
+    relative_files(&root, files)
+}
+
+/// What a proposal has to keep: every file the one service read is read by
+/// exactly one proposed service.
+fn assert_every_file_is_read_once(
+    root: &Path,
+    derived: &carrick::service_derivation::ServiceDerivation,
+) {
+    let canonical = root.canonicalize().unwrap();
+    let (whole, _) = carrick::file_finder::find_files(
+        canonical.to_str().unwrap(),
+        &carrick::packages::MANIFEST_SKIP_DIRS,
+    );
+    let mut read: Vec<String> = directories(derived)
+        .into_iter()
+        .flat_map(|directory| read_by(root, derived, directory))
+        .collect();
+    read.sort();
+    assert_eq!(read, relative_files(&canonical, whole));
+}
+
+/// carrick#1854. A repository whose applications each carry their own
+/// manifest and lockfile, under a root that declares no workspace, is as many
+/// installs as it has lockfiles. It was proposed as one service rooted at the
+/// repository, which folds a client and the server it calls into one.
+#[test]
+fn lockfile_rooted_apps_with_no_declared_workspace_are_each_a_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    tooling_root(root);
+    lockfile_rooted_app(root, "web", "@sample/web", "package-lock.json");
+    lockfile_rooted_app(root, "api", "@sample/api", "pnpm-lock.yaml");
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.reason, "lockfile-rooted packages");
+    assert_eq!(directories(&derived), ["api", "web"]);
+    assert_eq!(
+        derived
+            .services
+            .iter()
+            .map(|service| service.service_name.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("@sample/api"), Some("@sample/web")]
+    );
+    assert!(
+        derived
+            .services
+            .iter()
+            .all(|service| service.tsconfig.as_deref() == Some("tsconfig.json"))
+    );
+    assert_eq!(derived.members.len(), 2);
+    // The root holds no source of its own, so it is not a service: a scan
+    // refuses one with nothing in it.
+    assert_every_file_is_read_once(root, &derived);
+    assert!(derived.warnings.is_empty(), "{:?}", derived.warnings);
+    assert!(
+        derived
+            .notes
+            .iter()
+            .any(|note| note.contains("lockfile") && note.contains("carrick.json")),
+        "{:?}",
+        derived.notes
+    );
+
+    // The proposal is the configuration: written out, it selects the same
+    // services.
+    write(
+        root,
+        "carrick.json",
+        &serde_json::to_string(&derived.config).unwrap(),
+    );
+    let explicit = resolve(root).unwrap();
+    assert_eq!(explicit.reason, "carrick.json");
+    assert_eq!(
+        serde_json::to_value(&derived.services).unwrap(),
+        serde_json::to_value(&explicit.services).unwrap()
+    );
+}
+
+/// The rule reads a lockfile beside a manifest, whichever package manager
+/// wrote it, at whatever depth the application sits.
+#[test]
+fn every_recognised_lockfile_roots_a_service_at_any_depth() {
+    for lockfile in [
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tooling_root(root);
+        lockfile_rooted_app(root, "apps/storefront", "storefront", lockfile);
+        lockfile_rooted_app(root, "services/billing/http", "billing", lockfile);
+        let derived = resolve(root).unwrap();
+        assert_eq!(
+            directories(&derived),
+            ["apps/storefront", "services/billing/http"],
+            "{lockfile}"
+        );
+        assert_eq!(derived.reason, "lockfile-rooted packages", "{lockfile}");
+    }
+
+    // A Deno application states the same thing with its own two files, and is
+    // typed from its manifest rather than a tsconfig.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    tooling_root(root);
+    lockfile_rooted_app(root, "web", "web", "yarn.lock");
+    write(root, "edge/deno.json", r#"{"name":"@sample/edge"}"#);
+    write(root, "edge/deno.lock", "{}");
+    write(root, "edge/main.ts", "export const port = 8000;\n");
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), ["edge", "web"]);
+    assert_eq!(
+        derived.services[0].service_name.as_deref(),
+        Some("@sample/edge")
+    );
+    assert!(derived.services[0].tsconfig.is_none());
+    assert!(
+        derived.notes.iter().any(|note| note.contains("Deno")),
+        "{:?}",
+        derived.notes
+    );
+}
+
+/// What the rule does not read as an install: a manifest with no lockfile
+/// beside it, a lockfile-rooted directory holding no source a scan reads, and
+/// one a scan of the repository never enters. None of them is a service, and
+/// none of their source is lost: it is the root's, which is proposed beside
+/// the package for exactly that. A manifest that declares dependencies with
+/// no lockfile is said, because an uncommitted lockfile is how a package
+/// usually ends up there.
+#[test]
+fn a_manifest_alone_or_a_directory_without_scanned_source_is_not_a_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    tooling_root(root);
+    lockfile_rooted_app(root, "web", "web", "package-lock.json");
+    // A manifest that only marks a subtree: it declares nothing to install.
+    write(root, "worker/package.json", r#"{"name":"worker"}"#);
+    write(root, "worker/index.ts", "export const queue = 'jobs';\n");
+    // A package that declares dependencies and carries no lockfile.
+    write(
+        root,
+        "jobs/package.json",
+        r#"{"name":"jobs","dependencies":{"left-pad":"1.3.0"}}"#,
+    );
+    write(root, "jobs/run.ts", "export const run = 1;\n");
+    // The same inside the lockfile-rooted package: that lockfile may be the
+    // one that installs it, so it is not reported.
+    write(
+        root,
+        "web/plugins/theme/package.json",
+        r#"{"name":"theme","dependencies":{"left-pad":"1.3.0"}}"#,
+    );
+    write(
+        root,
+        "web/plugins/theme/index.ts",
+        "export const theme = 1;\n",
+    );
+    // Source with no manifest of its own.
+    write(root, "shared/format.ts", "export const format = String;\n");
+    // An install with nothing a scan reads in it.
+    write(root, "infra/package.json", r#"{"name":"infra"}"#);
+    write(root, "infra/package-lock.json", "{}");
+    write(root, "infra/stack.json", "{}");
+    // An end-to-end suite: a scan of this repository never reads it.
+    write(root, "e2e/package.json", r#"{"name":"suite"}"#);
+    write(root, "e2e/package-lock.json", "{}");
+    write(root, "e2e/login.ts", "export const login = 1;\n");
+    // An installed dependency ships both files too.
+    write(
+        root,
+        "web/node_modules/dep/package.json",
+        r#"{"name":"dep"}"#,
+    );
+    write(root, "web/node_modules/dep/package-lock.json", "{}");
+    write(
+        root,
+        "web/node_modules/dep/index.js",
+        "module.exports = 1;\n",
+    );
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), [".", "web"]);
+    assert_eq!(
+        read_by(root, &derived, "."),
+        ["jobs/run.ts", "shared/format.ts", "worker/index.ts"]
+    );
+    assert_every_file_is_read_once(root, &derived);
+    assert_eq!(
+        derived.warnings,
+        [
+            "`jobs`: a manifest that declares dependencies with no lockfile beside it, so not proposed as a service and indexed with the repository root. An uncommitted lockfile is the usual cause: commit it, or declare the service in carrick.json."
+        ]
+    );
+}
+
+/// Two root manifests: one that installs tooling and one that is an
+/// application. The rule reads neither for what it declares, only the tree
+/// for where the source sits.
+const ROOT_MANIFESTS: [&str; 2] = [
+    r#"{"private":true,"devDependencies":{"npm-run-all":"^4.1.5"}}"#,
+    r#"{"name":"shop","main":"./src/index.js","dependencies":{"express":"^4.19.2"}}"#,
+];
+
+/// A root that holds source of its own is proposed beside the lockfile-rooted
+/// packages under it, whatever its manifest declares, and stays the unnamed
+/// service the repository already was. It reads its own source and none of
+/// theirs, so every file the one service read is still read, once.
+#[test]
+fn a_root_with_source_of_its_own_is_proposed_beside_its_packages() {
+    for manifest in ROOT_MANIFESTS {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", manifest);
+        write(root, "package-lock.json", "{}");
+        write(root, "tsconfig.json", "{}");
+        write(root, "src/index.ts", "export const shop = 1;\n");
+        let before = resolve(root).unwrap();
+        assert_eq!(before.reason, "single repository", "{manifest}");
+        assert_eq!(directories(&before), ["."], "{manifest}");
+
+        lockfile_rooted_app(root, "functions", "functions", "package-lock.json");
+        lockfile_rooted_app(root, "website", "website", "yarn.lock");
+        let derived = resolve(root).unwrap();
+        assert_eq!(derived.reason, "lockfile-rooted packages", "{manifest}");
+        assert_eq!(
+            directories(&derived),
+            [".", "functions", "website"],
+            "{manifest}"
+        );
+        // The root is the service it was: unnamed, its tsconfig beside it.
+        assert_eq!(
+            serde_json::to_value(&derived.services[0]).unwrap(),
+            serde_json::to_value(&before.services[0]).unwrap(),
+            "{manifest}"
+        );
+        assert_eq!(read_by(root, &derived, "."), ["src/index.ts"], "{manifest}");
+        assert_eq!(
+            read_by(root, &derived, "functions"),
+            ["functions/src/main.ts"],
+            "{manifest}"
+        );
+        assert_every_file_is_read_once(root, &derived);
+        assert!(derived.warnings.is_empty(), "{manifest}");
+
+        // Written out as `carrick.json`, the proposal reads the same files.
+        write(
+            root,
+            "carrick.json",
+            &serde_json::to_string(&derived.config).unwrap(),
+        );
+        let explicit = resolve(root).unwrap();
+        assert_eq!(explicit.reason, "carrick.json", "{manifest}");
+        assert_eq!(
+            read_by(root, &explicit, "."),
+            ["src/index.ts"],
+            "{manifest}"
+        );
+        assert_every_file_is_read_once(root, &explicit);
+    }
+}
+
+/// A root holding no source of its own is not a service, whatever its
+/// manifest declares: a scan refuses a service with nothing in it. A root
+/// with no manifest at all is read the same way as one with a manifest: it
+/// is the service for its loose source.
+#[test]
+fn a_root_is_a_service_only_for_source_of_its_own() {
+    for manifest in ROOT_MANIFESTS {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", manifest);
+        write(root, "package-lock.json", "{}");
+        lockfile_rooted_app(root, "web", "web", "package-lock.json");
+        lockfile_rooted_app(root, "api", "api", "package-lock.json");
+        let derived = resolve(root).unwrap();
+        assert_eq!(directories(&derived), ["api", "web"], "{manifest}");
+        assert_every_file_is_read_once(root, &derived);
+        assert!(derived.warnings.is_empty(), "{manifest}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lockfile_rooted_app(root, "web", "web", "package-lock.json");
+    write(root, "scripts/release.ts", "export const release = 1;\n");
+    write(root, "seed.js", "module.exports = 1;\n");
+    let derived = resolve(root).unwrap();
+    assert_eq!(directories(&derived), [".", "web"]);
+    assert_eq!(
+        read_by(root, &derived, "."),
+        ["scripts/release.ts", "seed.js"]
+    );
+    assert_every_file_is_read_once(root, &derived);
+    assert!(derived.warnings.is_empty(), "{:?}", derived.warnings);
+}
+
+/// A single-package repository is one service whatever sits beside its
+/// manifest: its own lockfile, or a nested manifest that states no install.
+#[test]
+fn a_single_package_repository_with_a_lockfile_does_not_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", r#"{"name":"one","type":"module"}"#);
+    write(root, "src/index.ts", "export const one = 1;\n");
+    let before = stated(&resolve(root).unwrap());
+
+    write(root, "yarn.lock", "");
+    // A marker manifest that only sets the module type of a subtree.
+    write(root, "src/legacy/package.json", r#"{"type":"commonjs"}"#);
+    write(root, "src/legacy/index.js", "module.exports = 1;\n");
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.reason, "single repository");
+    assert_eq!(stated(&derived), before);
+}
+
+/// A repository that declares a workspace is described by its declaration
+/// alone. A lockfile inside a member, and a lockfile-rooted package the
+/// patterns do not claim, change nothing about which services are proposed.
+#[test]
+fn a_declared_workspace_is_not_moved_by_lockfiles_inside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    );
+    write(root, "package-lock.json", "{}");
+    write(
+        root,
+        "packages/api/package.json",
+        r#"{"name":"@sample/api"}"#,
+    );
+    write(root, "packages/api/index.ts", "export const api = 1;\n");
+    write(
+        root,
+        "packages/web/package.json",
+        r#"{"name":"@sample/web"}"#,
+    );
+    write(root, "packages/web/index.ts", "export const web = 1;\n");
+    let before = stated(&resolve(root).unwrap());
+
+    // A member that also carries a lockfile of its own.
+    write(root, "packages/api/package-lock.json", "{}");
+    // A lockfile-rooted package inside a member, and one outside every
+    // pattern.
+    lockfile_rooted_app(root, "packages/web/demo", "demo", "package-lock.json");
+    lockfile_rooted_app(root, "tools/migrate", "migrate", "pnpm-lock.yaml");
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.reason, "npm workspaces");
+    assert_eq!(directories(&derived), ["packages/api", "packages/web"]);
+    assert_eq!(stated(&derived), before);
+
+    // The same holds for a pnpm declaration and for a Deno root.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", "{}");
+    write(root, "pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n");
+    write(root, "apps/api/package.json", r#"{"name":"api"}"#);
+    lockfile_rooted_app(root, "tools/migrate", "migrate", "pnpm-lock.yaml");
+    assert_eq!(directories(&resolve(root).unwrap()), ["apps/api"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "deno.json", r#"{"name":"@sample/root"}"#);
+    write(root, "main.ts", "export const root = 1;\n");
+    lockfile_rooted_app(root, "tools/migrate", "migrate", "pnpm-lock.yaml");
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.reason, "Deno manifests");
+    assert_eq!(directories(&derived), ["."]);
+}
+
+/// Lockfile-rooted packages nested in each other are each proposed, because
+/// a file belongs to the deepest service that holds it (carrick#553): the
+/// outer one reads its own source and not the inner one's. A package holding
+/// no source of its own, only other packages, is not a service: a scan
+/// refuses one with nothing in it.
+#[test]
+fn nested_lockfile_rooted_packages_are_each_proposed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    tooling_root(root);
+    // A package and the playground that ships inside it.
+    lockfile_rooted_app(root, "widgets", "widgets", "package-lock.json");
+    lockfile_rooted_app(
+        root,
+        "widgets/playground",
+        "playground",
+        "package-lock.json",
+    );
+    // A directory that installs tooling for the two applications under it and
+    // holds no source of its own.
+    let tooling = r#"{"private":true,"devDependencies":{"npm-run-all":"^4.1.5"}}"#;
+    write(root, "platform/package.json", tooling);
+    write(root, "platform/package-lock.json", "{}");
+    lockfile_rooted_app(root, "platform/gateway", "gateway", "yarn.lock");
+    lockfile_rooted_app(root, "platform/ledger", "ledger", "yarn.lock");
+    // The same manifest over source of its own: a service for that source.
+    write(root, "studio/package.json", tooling);
+    write(root, "studio/package-lock.json", "{}");
+    write(root, "studio/editor.ts", "export const editor = 1;\n");
+    lockfile_rooted_app(root, "studio/preview", "preview", "yarn.lock");
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        directories(&derived),
+        [
+            "platform/gateway",
+            "platform/ledger",
+            "studio",
+            "studio/preview",
+            "widgets",
+            "widgets/playground"
+        ]
+    );
+    assert_eq!(read_by(root, &derived, "widgets"), ["widgets/src/main.ts"]);
+    assert_eq!(
+        read_by(root, &derived, "widgets/playground"),
+        ["widgets/playground/src/main.ts"]
+    );
+    assert_eq!(read_by(root, &derived, "studio"), ["studio/editor.ts"]);
+    assert_every_file_is_read_once(root, &derived);
+    assert!(derived.warnings.is_empty(), "{:?}", derived.warnings);
+}
+
+/// Applications started from one template share a package name. That was
+/// never an error for the single service this repository used to be, so each
+/// takes its directory instead.
+#[test]
+fn lockfile_rooted_apps_sharing_a_package_name_are_named_by_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lockfile_rooted_app(root, "examples/alpha", "starter", "package-lock.json");
+    lockfile_rooted_app(root, "examples/beta", "starter", "package-lock.json");
+    lockfile_rooted_app(root, "examples/gamma", "gamma", "package-lock.json");
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        derived
+            .services
+            .iter()
+            .map(|service| service.service_name.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("examples/alpha"), Some("examples/beta"), Some("gamma")]
+    );
+}
+
+/// The command and the scan read the same derivation. The applications sit
+/// under `apps/` so the repository itself is what the command is asked about.
+#[test]
+fn the_derive_command_proposes_lockfile_rooted_apps_as_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    tooling_root(root);
+    lockfile_rooted_app(root, "apps/web", "@sample/web", "package-lock.json");
+    lockfile_rooted_app(root, "apps/api", "@sample/api", "package-lock.json");
+    let expected = resolve(root).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["derive", "--workspace"])
+        .arg(root)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual["repos"].as_array().unwrap().len(), 1);
+    assert_eq!(actual["repos"][0]["reason"], "lockfile-rooted packages");
+    assert_eq!(
+        actual["repos"][0]["services"],
+        serde_json::to_value(expected.service_documents()).unwrap()
+    );
+    assert_eq!(actual["repos"][0]["services"][0]["directory"], "apps/api");
+    assert_eq!(actual["repos"][0]["services"][1]["directory"], "apps/web");
+}
