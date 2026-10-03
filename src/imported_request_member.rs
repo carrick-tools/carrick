@@ -84,6 +84,12 @@
 //!   [`crate::local_http_wrapper`] joins by substitution, and asserting the
 //!   member's half of it alone would replace a site's literal path with a
 //!   parameter name.
+//! - What a call through the member sends as its body is read off the same
+//!   request (carrick#1782): the bag's `body` (or `data`), or a verb call's
+//!   argument after the URL. One of the member's parameters sent unchanged is
+//!   the call's argument in that position, typed where the parameter is
+//!   declared; anything the member builds is no body the call's arguments
+//!   state. See [`crate::forwarded_body`].
 //!
 //! The join at the call site is by name: a candidate whose callee names
 //! exactly one indexed member across the modules the file imports. A name
