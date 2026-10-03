@@ -1,0 +1,17 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/api:
+    dependencies:
+      '@ws/shared':
+        specifier: workspace:*
+        version: link:../shared
+
+  packages/shared: {}

@@ -1,0 +1,6 @@
+{
+  "frameworks": ["express"],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "One Express app in a pnpm workspace; its response type reaches a sibling package that imports a module the checkout does not have."
+}

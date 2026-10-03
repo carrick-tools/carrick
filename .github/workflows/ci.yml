@@ -164,6 +164,8 @@ jobs:
   # llm_cassette_hard_gate_test is the frozen-LLM-input golden;
   # undeclared_external_host_test pins the match key of an absolute
   # third-party URL (carrick-cloud#656); neither makes a model call.
+  # scan_leaves_repo_unedited_test checks a whole scan leaves the scanned
+  # git tree as it was (carrick#1823).
   rust-scan:
     name: Rust scan integration
     runs-on: ubuntu-latest
@@ -191,6 +193,7 @@ jobs:
           --test payload_without_method_test
           --test pubsub_wrapper_type_capture_test
           --test run_log_isolation_test
+          --test scan_leaves_repo_unedited_test
           --test spread_options_verb_test
           --test undeclared_external_host_test
           --test unprepared_refusal_test
