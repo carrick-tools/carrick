@@ -18,6 +18,11 @@
  * the export line; carrick#771 stopped the v1 walk answering with the
  * neighbouring helper, so the alias falls to its own capture infer anchor,
  * which resolved the export statement — type `any` — and published it.
+ *
+ * The export line itself now abstains one step earlier: a line whose first
+ * node is a declaration's name (here an export specifier) names no payload
+ * (carrick#1785). This guard keeps its own subject on the factory call that
+ * built the handler, whose binding decays through the same missing package.
  */
 
 import { describe, it } from 'node:test';
@@ -34,6 +39,7 @@ const SOURCE_REL = 'src/http/reexported-binding-route.ts';
 const SOURCE = path.join(BARE, SOURCE_REL);
 
 const DECAYED_ALIAS = 'Endpoint_reexported_Response';
+const EXPORT_LINE_ALIAS = 'Endpoint_exportLine_Response';
 const CLEAN_ALIAS = 'Endpoint_clean_Response';
 const LOCATED_ALIAS = 'Endpoint_located_Response';
 const LINE_ONLY_SHAPE_ALIAS = 'Endpoint_lineOnlyShape_Response';
@@ -77,6 +83,13 @@ function capture(): Captured {
       {
         kind: 'infer',
         alias: DECAYED_ALIAS,
+        source_file: SOURCE_REL,
+        anchor_origin: 'deterministic-infer',
+        line_number: lineOf('const loader = createLoaderRoute('),
+      },
+      {
+        kind: 'infer',
+        alias: EXPORT_LINE_ALIAS,
         source_file: SOURCE_REL,
         anchor_origin: 'deterministic-infer',
         line_number: lineOf('export { action, loader };'),
@@ -170,18 +183,31 @@ describe('an infer anchor that resolves a bare top type abstains (#766)', () => 
       /bare top type/,
       `the reason must say the type was a bare top type: ${reason}`
     );
-    // The reader needs to know WHERE, not just that something failed. On this
-    // shape the locator lands on the export specifier itself, so the reason
-    // names the re-exported binding and its line.
+    // The reader needs to know WHERE, not just that something failed: the
+    // reason names the binding the line resolved and its line.
     assert.match(
       reason,
-      /Identifier at src\/http\/reexported-binding-route\.ts:\d+ \(`action`\)/,
+      /VariableDeclaration at src\/http\/reexported-binding-route\.ts:\d+ \(`loader = createLoaderRoute\(/,
       `the reason must name the node the locator resolved: ${reason}`
     );
     // Repo-relative, never the scanner's checkout directory.
     assert.ok(
       !reason.includes(BARE),
       `the reason must not carry an absolute path: ${reason}`
+    );
+  });
+
+  it('abstains on the export line, naming the export specifier (#1785)', () => {
+    const record = captured.records.get(EXPORT_LINE_ALIAS);
+    assert.ok(record, 'no record for the export-line alias');
+    assert.ok(
+      surfaceDeclares(captured.surface, EXPORT_LINE_ALIAS, 'unknown'),
+      `the export line names no payload:\n${captured.surface}`
+    );
+    assert.strictEqual(record.capture_failure_reason, undefined);
+    assert.match(
+      record.self_check_detail ?? '',
+      /name of ExportSpecifier at src\/http\/reexported-binding-route\.ts:\d+ \(`action`\)/
     );
   });
 

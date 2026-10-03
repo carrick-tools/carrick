@@ -7,7 +7,8 @@
 // The capture's infer anchor therefore resolves a node whose type is a bare
 // `any`. Publishing that as the route's response contract states "a type was
 // inferred and it collapsed", which is a claim the scan cannot back — the
-// honest answer is `unknown` plus the reason.
+// honest answer is `unknown` plus the reason. (On the export line itself the
+// first node is an export specifier's name, which abstains first: carrick#1785.)
 import { createActionRoute, createLoaderRoute } from 'fakelib';
 
 const { action } = createActionRoute({ body: 'CreateBatch' }, async () => ({

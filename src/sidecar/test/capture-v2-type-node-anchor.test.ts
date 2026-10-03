@@ -143,6 +143,12 @@ describe('capture places an infer anchor on a type node its span covers exactly 
         !/export type Endpoint_partial_Response = \{\s*__typename: "Ledger"/.test(surface),
         `a span that names no node is not read as the field:\n${surface}`
       );
+      // Nor as the operation: the line fallback finds only the alias's own
+      // name on this line, and a declaration's name is not a payload (#1785).
+      assert.ok(
+        surface.split('\n').some((l) => l.trim() === 'export type Endpoint_partial_Response = unknown;'),
+        `a span that names no node abstains:\n${surface}`
+      );
     } finally {
       fs.rmSync(outDir, { recursive: true, force: true });
     }

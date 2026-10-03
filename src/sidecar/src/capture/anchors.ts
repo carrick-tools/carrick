@@ -306,10 +306,34 @@ export function resolveAnchor(
       args.repoRoot
     );
   }
-  let located = locateNode(sourceFile, request);
-  if (!located) {
+  const found = locate(sourceFile, request);
+  if (!found) {
     return demote(locatorFailureReason(request));
   }
+  // carrick#1785: the line fallback takes the first expression on the line,
+  // and a declaration's NAME is an expression to `ts.isExpression`. On a line
+  // that declares something, that name is all the fallback finds, and its type
+  // is the declared entity's own (a whole alias, a function, a class), never a
+  // payload. The line names the declaration, so the anchor abstains: an
+  // abstain, not a demotion, because the backfill has nothing better to
+  // re-anchor it with (carrick#766). It does not walk on to the next node
+  // either, which on a function's line is its first parameter.
+  if (found.by === 'line') {
+    const declaration = declarationNamedBy(found.node);
+    if (declaration) {
+      return {
+        request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        abstainReason:
+          `the line fallback resolved the name of ` +
+          `${describeNode(sourceFile, request.source_file, declaration)}; a ` +
+          `declaration's name is not a payload, so the anchor abstains rather ` +
+          `than publish the declared entity's own type`,
+      };
+    }
+  }
+  let located = found.node;
   // carrick#1162: a serialised body is the JSON of its argument. The call's own
   // `string` result is never the payload's contract, and publishing it reads
   // incompatible against every object-typed counterparty.
@@ -394,17 +418,18 @@ function finishInferAnchor(
   // here.
   //
   // A line alone names nothing. `firstExpressionOnLine` picks whatever comes
-  // first on the line, which on a re-export statement is the first exported
-  // binding. When THAT resolves to a top type the capture holds no payload and
-  // no type, and `export type <alias> = any;` states "a type was inferred and
-  // it collapsed" — a claim the scan cannot back. The honest word is `unknown`
-  // ("no contract stated here"), with the node the line resolved as the reason.
+  // first on the line. When THAT resolves to a top type the capture holds no
+  // payload and no type, and `export type <alias> = any;` states "a type was
+  // inferred and it collapsed" — a claim the scan cannot back. The honest word
+  // is `unknown` ("no contract stated here"), with the node the line resolved
+  // as the reason.
   //
   // Live shape: a route whose handlers are built by a framework factory and
   // re-exported at the bottom of the file. Both of the file's operations
-  // anchor at the export statement, the v1 walk abstains there (carrick#771),
-  // and the alias falls to this line-only locator, which resolves the first
-  // exported binding's identifier.
+  // anchor at the export statement and the v1 walk abstains there
+  // (carrick#771). The export line itself now abstains earlier, as a
+  // declaration's name (carrick#1785); this guard still holds for a line whose
+  // first node is a value that decayed, such as the factory call's binding.
   if (isTopType(type) && isLineOnly(request)) {
     return {
       request,
@@ -1204,18 +1229,62 @@ export function locateNode(
   sourceFile: ts.SourceFile,
   request: InferAnchorRequest
 ): ts.Node | undefined {
+  return locate(sourceFile, request)?.node;
+}
+
+/** The node `locateNode` resolves, and which of its three locators found it. */
+function locate(
+  sourceFile: ts.SourceFile,
+  request: InferAnchorRequest
+): { node: ts.Node; by: 'span' | 'text' | 'line' } | undefined {
   if (request.span_start !== undefined && request.span_end !== undefined) {
     const bySpan = tightestCoveringNode(sourceFile, request.span_start, request.span_end);
-    if (bySpan) return bySpan;
+    if (bySpan) return { node: bySpan, by: 'span' };
   }
   if (request.expression_text) {
     const byText = nodeByExpressionText(sourceFile, request.expression_text, request.line_number);
-    if (byText) return byText;
+    if (byText) return { node: byText, by: 'text' };
   }
   if (request.line_number !== undefined) {
-    return firstExpressionOnLine(sourceFile, request.line_number);
+    const byLine = firstExpressionOnLine(sourceFile, request.line_number);
+    if (byLine) return { node: byLine, by: 'line' };
   }
   return undefined;
+}
+
+/**
+ * The declaration `node` is the name of, when it names one (carrick#1785): a
+ * type alias, interface, class, function, method, property, accessor, enum or
+ * enum member, namespace, or an import or export binding (whose `propertyName`
+ * names the binding too: `export { a as b }`).
+ *
+ * Not a binding whose name is also the value read at that position: a
+ * destructured element and a shorthand property keep resolving. A variable,
+ * a parameter and a property assignment never reach here, because each is a
+ * preferred target the line walk takes before its name.
+ */
+function declarationNamedBy(node: ts.Node): ts.Declaration | undefined {
+  const parent = node.parent;
+  if (!parent) return undefined;
+  // A specifier's only children are its names.
+  if (ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)) return parent;
+  const named =
+    ts.isTypeAliasDeclaration(parent) ||
+    ts.isInterfaceDeclaration(parent) ||
+    ts.isClassDeclaration(parent) ||
+    ts.isFunctionDeclaration(parent) ||
+    ts.isMethodDeclaration(parent) ||
+    ts.isMethodSignature(parent) ||
+    ts.isPropertyDeclaration(parent) ||
+    ts.isPropertySignature(parent) ||
+    ts.isGetAccessorDeclaration(parent) ||
+    ts.isSetAccessorDeclaration(parent) ||
+    ts.isEnumDeclaration(parent) ||
+    ts.isEnumMember(parent) ||
+    ts.isModuleDeclaration(parent) ||
+    ts.isImportClause(parent) ||
+    ts.isNamespaceImport(parent);
+  return named && parent.name === node ? parent : undefined;
 }
 
 function isPreferredTarget(node: ts.Node): boolean {
