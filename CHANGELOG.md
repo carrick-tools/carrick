@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.106](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.105...carrick-v0.3.106) (2026-10-03)
+
+
+### Bug Fixes
+
+* **scanner:** a consumer response is anchored at the body type its source states ([#1845](https://github.com/carrick-tools/carrick/issues/1845)) ([e05aa6e](https://github.com/carrick-tools/carrick/commit/e05aa6ef1f2ecaea3dd1f6a3b1045294b22422dd)), closes [#1817](https://github.com/carrick-tools/carrick/issues/1817)
+* **scanner:** the blob's package_json, packages and config_json serialize in one order on every scan ([#1806](https://github.com/carrick-tools/carrick/issues/1806)) ([#1848](https://github.com/carrick-tools/carrick/issues/1848)) ([e145234](https://github.com/carrick-tools/carrick/commit/e145234a3f685f350dfada4d6667ce0f26546e56))
+* **scanner:** the model's type symbol anchors an op's response entry, not its request ([#1840](https://github.com/carrick-tools/carrick/issues/1840)) ([01cc577](https://github.com/carrick-tools/carrick/commit/01cc5778f651d1977f463635764dfdec49511f6b)), closes [#1818](https://github.com/carrick-tools/carrick/issues/1818)
+* **sidecar:** a call result carrier's payload passes the service's wrapper rules ([#1841](https://github.com/carrick-tools/carrick/issues/1841)) ([#1846](https://github.com/carrick-tools/carrick/issues/1846)) ([19a331a](https://github.com/carrick-tools/carrick/commit/19a331a4a4d6122fd642bde620cefcebd73d2692))
+* **sidecar:** a consumer that reads the body as raw text is not judged against a JSON body ([#1842](https://github.com/carrick-tools/carrick/issues/1842)) ([#1852](https://github.com/carrick-tools/carrick/issues/1852)) ([c7c1cc5](https://github.com/carrick-tools/carrick/commit/c7c1cc5d0cd810c249c35e131f42eda46bd8b27d))
+* **sidecar:** a literal anchor's name imported from a package resolves through that package ([#1789](https://github.com/carrick-tools/carrick/issues/1789)) ([#1839](https://github.com/carrick-tools/carrick/issues/1839)) ([936a1ae](https://github.com/carrick-tools/carrick/commit/936a1aeef57ecdcf4a98782e42574e3d102d87f3))
+* **sidecar:** a literal's bare name resolves through the declaration it was printed for ([#1836](https://github.com/carrick-tools/carrick/issues/1836)) ([#1853](https://github.com/carrick-tools/carrick/issues/1853)) ([2ac30ea](https://github.com/carrick-tools/carrick/commit/2ac30ea3e0a3ba94dd0d91d7953d98b3a7b128d5))
+* **sidecar:** the retype check reads the status tests on a read's path together ([#1834](https://github.com/carrick-tools/carrick/issues/1834)) ([#1844](https://github.com/carrick-tools/carrick/issues/1844)) ([cbfbed7](https://github.com/carrick-tools/carrick/commit/cbfbed76e0fe223c4b29e659d6b61703d6493f42))
+
 ## [0.3.105](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.104...carrick-v0.3.105) (2026-10-03)
 
 
