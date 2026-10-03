@@ -199,9 +199,11 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
   describe('a request read through all three aliases', () => {
     it("publishes a typed json request's payload", async () => {
       // `Task<Outcome<Reply<Invoice>, WireError>>`: an alias of a class, of a
-      // union and of an object literal, each named by one rule.
+      // union and of an object literal, each named by one rule. The payload
+      // is what a result carrier holds, so it is printed with its own
+      // members and anchors the row, as the carrier read publishes one.
       const inferred = await infer('Typed_Response', 'Wire.typed<Invoice>', ALL_THREE);
-      assert.strictEqual(collapse(inferred.type_string), 'Invoice');
+      assert.strictEqual(collapse(inferred.type_string), '{ id: string; total: number; }');
       assert.strictEqual(inferred.primary_type_symbol, 'Invoice');
       assert.strictEqual(inferred.raw_text_read, undefined);
     });
@@ -245,7 +247,7 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
 
     it('an alias of a union: the arguments are the alias arguments', async () => {
       const inferred = await infer('Outcome_Response', 'Wire.outcome<Invoice>', [rule('Outcome')]);
-      assert.strictEqual(collapse(inferred.type_string), 'Invoice');
+      assert.strictEqual(collapse(inferred.type_string), '{ id: string; total: number; }');
       assert.strictEqual(inferred.primary_type_symbol, 'Invoice');
     });
 
@@ -292,7 +294,7 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
     // what it holds still passes the rules (#1841).
     const TASK_AND_REPLY = [REPLY_RULE, rule('Task')];
 
-    it('publishes the payload behind the carrier the rule left', async () => {
+    it('publishes the payload behind the carrier the rule left, as all three rules do', async () => {
       const inferred = await infer('PartTyped_Response', 'Wire.typed<Invoice>', TASK_AND_REPLY);
       assert.strictEqual(collapse(inferred.type_string), '{ id: string; total: number; }');
       assert.strictEqual(inferred.primary_type_symbol, 'Invoice');
@@ -324,9 +326,18 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
       // `Stamped<"v2", Invoice>` is the library's response object by its
       // members and origin, written through an alias the service declares.
       // The rule's index says nothing about that alias's parameters, and its
-      // first one is not the payload.
+      // first one is not the payload. The rule verifies the object and reads
+      // nothing out of it, as it did before a rule read alias arguments.
       const inferred = await infer('Stamped_Response', 'stamped(`', [REPLY_RULE]);
-      assertDecidedTransport(inferred);
+      assert.strictEqual(collapse(inferred.type_string), 'unknown');
+      assert.strictEqual(inferred.primary_type_symbol, undefined);
+      // The result is no carrier, so the answer is the one it had: undecided,
+      // which leaves the capture's own read of the call its turn.
+      assert.deepStrictEqual(
+        (inferred.any_provenance ?? []).filter((p) => p.path === ''),
+        [],
+        'only a carrier of verified transport is a decided abstain'
+      );
     });
 
     it("leaves a service's own alias alone when the rule's modules do not declare it", async () => {

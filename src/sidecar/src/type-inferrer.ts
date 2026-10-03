@@ -1738,17 +1738,26 @@ export class TypeInferrer {
       isExplicit = true;
     }
 
-    // carrick#1843: the rules verified the call's own result as transport and
-    // read no payload out of it (`Task<Outcome<Reply<unknown>, E>>`, every
-    // layer named by a rule, the last one holding nothing). That is the
-    // decision carrick#1841 made one step later, on what a carrier holds, and
-    // it is made here for the same reason: left undecided, the capture's own
-    // locator re-reads the raw call and publishes the library's objects.
-    if (unwrapResult.verifiedMachinery && !explicitType) {
+    // carrick#1843: a rule can now match a thenable or a carrier by its alias,
+    // so on a result that is a carrier (`Task<Outcome<Reply<T>, E>>`) the
+    // rules reach what the carrier holds before the carrier read below does.
+    // That changes who finds the payload, never what is published: where the
+    // rules read through the carrier, their answer is given the way the
+    // carrier read gives its own. A result that is no carrier keeps the
+    // answer it had.
+    const where = `${request.file_path}:${request.line_number}`;
+    const resultIsCarrier =
+      !explicitType && this.resultCarrierArguments(returnType, terminalNode) !== undefined;
+
+    // The rules verified what the carrier holds as transport and read no
+    // payload out of it (`Reply<unknown>`). That is the decision carrick#1841
+    // makes below, and it is decided here for the same reason: left
+    // undecided, the capture's own locator re-reads the raw call and
+    // publishes the library's objects.
+    if (unwrapResult.verifiedMachinery && resultIsCarrier) {
       this.log(
-        `Call result at ${request.file_path}:${request.line_number} is ` +
-          `${typeText(returnType, terminalNode)}, which the service's wrapper rules verify as ` +
-          'transport and read no payload out of; this site states no response contract'
+        `Call result at ${where} is a carrier of transport the service's wrapper rules ` +
+          'verify and read no payload out of; this site states no response contract'
       );
       return this.transportAbstain(request, callExpr);
     }
@@ -1761,18 +1770,31 @@ export class TypeInferrer {
     // same class of answer the machinery guard refuses on the producer side.
     //
     // A type the source itself states outranks this: it is what the author
-    // said. A wrapper rule that unwrapped is read first, and the carrier read
-    // takes what the rule left (carrick#1843): a service with a rule for
-    // `Task` and none for `Outcome` leaves `Outcome<Reply<T>, E>`, which is as
-    // much a carrier as it was before the rule could match `Task` by its
-    // alias. A rule that left no single payload (a union join) leaves nothing
-    // to read.
-    const where = `${request.file_path}:${request.line_number}`;
+    // said. A wrapper rule that unwrapped is read first, and on a carrier it
+    // no longer ends the matter (carrick#1843):
+    //
+    //  - a service with a rule for `Task` and none for `Outcome` leaves
+    //    `Outcome<Reply<T>, E>`, which is as much a carrier as it was before
+    //    the rule could match. The carrier read takes what the rule left.
+    //  - a service with a rule for `Outcome` too reads the payload out of the
+    //    carrier itself. That payload is what the carrier holds, and is
+    //    published as the carrier read publishes it, so a site answers the
+    //    same whichever of the two found its payload.
+    //
+    // A rule that left no single payload (a union join) leaves nothing to
+    // read.
     const afterRules = unwrapResult.wasUnwrapped ? unwrapResult.payloadType : returnType;
+    const readThroughCarrier =
+      unwrapResult.wasUnwrapped &&
+      resultIsCarrier &&
+      !!afterRules &&
+      this.resultCarrierArguments(afterRules, terminalNode) === undefined;
     const carrierCandidate =
       explicitType || !afterRules
         ? undefined
-        : this.resultCarrierPayload(afterRules, terminalNode, use.projections, where);
+        : readThroughCarrier
+          ? afterRules
+          : this.resultCarrierPayload(afterRules, terminalNode, use.projections, where);
     // carrick#1841: what the carrier holds goes through the service's wrapper
     // rules before it is published, as the call's own result did. The carrier
     // is found by its shape, so what it holds can still be a library's
@@ -2990,11 +3012,11 @@ export class TypeInferrer {
   }
 
   /**
-   * The decided abstain of a call whose result, or what its result carries,
-   * is transport the service's wrapper rules verify and read no payload out
-   * of (carrick#1841, carrick#1843): `unknown` with `machinery_envelope` at
-   * the root and no anchor. The root reason is what keeps the capture's own
-   * locator from re-reading the raw call (`inference_decided_no_contract`,
+   * The decided abstain of a call whose result carries transport the
+   * service's wrapper rules verify and read no payload out of (carrick#1841,
+   * carrick#1843): `unknown` with `machinery_envelope` at the root and no
+   * anchor. The root reason is what keeps the capture's own locator from
+   * re-reading the raw call (`inference_decided_no_contract`,
    * engine/type_compat_v2.rs).
    */
   private transportAbstain(request: InferRequestItem, callExpr: CallExpression): InferredType {
