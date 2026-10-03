@@ -6,7 +6,6 @@
  */
 
 import ts from 'typescript';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type {
   CaptureAnchorRequest,
@@ -20,6 +19,7 @@ import {
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { isRelative, npmPackageSpecifier } from './specifiers.js';
+import { realPath } from './service-config.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -749,14 +749,6 @@ function packageImportOf(
   const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
   if (exportName === undefined) return { spec, namespaceExports: exported };
   return exported.has(exportName) ? { spec, exportName } : undefined;
-}
-
-function realPath(file: string): string {
-  try {
-    return fs.realpathSync(file);
-  } catch {
-    return path.resolve(file);
-  }
 }
 
 /** The type node of `type __LiteralAnchor = <text>;`, or undefined. */

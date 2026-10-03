@@ -48,7 +48,7 @@ export function findServiceTsconfig(serviceRoot: string, scanRoot?: string): str
 }
 
 /** The path with every symlink resolved; the path as given when it does not exist. */
-function realPath(p: string): string {
+export function realPath(p: string): string {
   try {
     return fs.realpathSync(p);
   } catch {
