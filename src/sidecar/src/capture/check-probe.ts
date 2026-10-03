@@ -276,6 +276,12 @@ export function buildProbe(
     //     or several (ambiguous envelope, or a bare payload whose own fields
     //     include more than one object-shaped property) keep the whole type —
     //     the unwrap never fires on anything but an unambiguous envelope;
+    //   - a consumer that names a field only the outer object has (not the
+    //     payload under its one object-shaped property) reads that object, so
+    //     it keeps the whole type (carrick#1764): a bare payload with one
+    //     object-shaped property is not an envelope around it. A field both
+    //     declare says nothing either way, and neither does `__typename`, which
+    //     the server puts on every object (see below);
     //   - `GqlObjLike` can never select `any`/`unknown`/`never` (top/bottom
     //     types fail both its array and its object arm), and the comparand is
     //     re-gated below anyway — the v2 port of v1's comparand re-guard, so
@@ -295,6 +301,12 @@ export function buildProbe(
     push(
       `type GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([GqlSingleKey<GqlPayloadKeys<S>>] extends [never] ? never : S[GqlSingleKey<GqlPayloadKeys<S>> & keyof S]) : never;`
     );
+    // The field names a reading declares: the keys of every object member, so
+    // a nullable or union consumer names what each member names.
+    push(`type GqlNames<T> = T extends object ? keyof T : never;`);
+    push(
+      `type GqlReadsOuter<S, E> = [Extract<Exclude<GqlNames<S>, GqlNames<GqlPayloadOf<S>>>, Exclude<GqlNames<E>, '__typename'>>] extends [never] ? false : true;`
+    );
     // carrick#1759: the server supplies `__typename` on every object a
     // selection asks for, so the consumer's `__typename` is read as OPTIONAL,
     // at any depth. It keeps its declared type: a producer that states a
@@ -312,9 +324,9 @@ export function buildProbe(
     //     nothing observable, so a consumer with no `__typename` to relax is
     //     judged, and named in the headline, exactly as before.
     //
-    // The envelope short-circuit below tests the RELAXED consumer: a bare
-    // payload with one object-shaped property would otherwise fail it on
-    // `__typename` alone and unwrap onto that property.
+    // The envelope short-circuit below tests the RELAXED consumer: a consumer
+    // that names only fields the payload shares would otherwise fail it on
+    // `__typename` alone and unwrap onto that payload.
     push(`type GqlDepth = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];`);
     push(
       `type GqlTypenameParts<T, D extends number> = { [K in keyof T as K extends '__typename' ? never : K]: GqlTypenameOptional<T[K], GqlDepth[D]> } & { [K in keyof T as K extends '__typename' ? K : never]?: T[K] };`
@@ -326,7 +338,7 @@ export function buildProbe(
       `type GqlExpected = [GqlTypenameOptional<Expected>] extends [Expected] ? Expected : GqlTypenameOptional<Expected>;`
     );
     push(
-      `type GqlComparand = [Sent] extends [GqlExpected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : GqlPayloadOf<Sent>);`
+      `type GqlComparand = [Sent] extends [GqlExpected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : [GqlReadsOuter<Sent, Expected>] extends [true] ? Sent : GqlPayloadOf<Sent>);`
     );
     gateLines.set(
       push(`type _G_comparand_any = Assert<Not<IsAny<GqlComparand>>>;`),

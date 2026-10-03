@@ -16,7 +16,9 @@
  * required widening (the corpus-1 subscription shape) stays incompatible
  * with its field-level diagnostic, an ambiguous envelope is never unwrapped,
  * and the unwrap is graphql-scoped (the same envelope under http keeps its
- * raw comparison).
+ * raw comparison). A bare payload with ONE object-shaped property is not
+ * unwrapped either when the consumer names a field only the outer object has
+ * (carrick#1764), so a mismatch there names the field that differs.
  *
  * The same pairs pin the `__typename` rule (carrick#1759). A consumer type
  * generated from a document that selects `__typename` declares it required,
@@ -81,6 +83,19 @@ const PAIRS: CheckPairSpec[] = [
   gql('gql-bare-widening', 'Bare_Widening_Sent', 'Bare_Widening_Exp'),
   // Two payload-shaped properties: ambiguous envelope, never unwrapped.
   gql('gql-envelope-ambiguous', 'Env_Ambiguous_Sent', 'Env_Ambiguous_Exp'),
+  // carrick#1764: a bare payload with ONE object-shaped property and a real
+  // mismatch. The consumer names fields only the outer object has, so it reads
+  // that object, and the unwrap must not fire onto the one object property.
+  gql('gql-bare-one-object-mismatch', 'Bo_Sel_Sent', 'Bo_Sel_Exp'),
+  // The same, from a consumer that does not select the object property.
+  gql('gql-bare-one-object-subset-mismatch', 'Bo_Sub_Sent', 'Bo_Sub_Exp'),
+  // The same, from a nullable consumer: each member of a union is read.
+  gql('gql-bare-one-object-nullable', 'Bo_Null_Sent', 'Bo_Null_Exp'),
+  // A list envelope whose payload key is also an array method name.
+  gql('gql-envelope-list-consumer', 'Env_List_Sent', 'Env_List_Exp'),
+  // A field the outer object and its payload both declare says nothing either
+  // way, so the unwrap still fires.
+  gql('gql-envelope-shared-field', 'Env_Shared_Sent', 'Env_Shared_Exp'),
   // Protocol scope: the same envelope shape under http keeps the raw compare.
   {
     pair_key: 'http-envelope-scoped',
@@ -96,11 +111,16 @@ const PAIRS: CheckPairSpec[] = [
   gql('gql-typename-nested', 'Tn_Nested_Sent', 'Tn_Nested_Exp'),
   // A connection-shaped selection, `__typename` eleven levels down.
   gql('gql-typename-deep', 'Tn_Deep_Sent', 'Tn_Deep_Exp'),
-  // A bare payload with ONE object-shaped property: the envelope short-circuit
-  // must test the relaxed consumer, or the unwrap fires on that property.
+  // A bare payload with ONE object-shaped property, read whole.
   gql('gql-typename-bare-one-object', 'Tn_BareOne_Sent', 'Tn_BareOne_Exp'),
+  // The envelope short-circuit tests the relaxed consumer: one that names only
+  // a field the payload shares would otherwise unwrap onto the payload.
+  gql('gql-typename-shared-field', 'Tn_Shared_Sent', 'Tn_Shared_Exp'),
   // A real envelope still unwraps when the consumer requires `__typename`.
   gql('gql-typename-envelope', 'Tn_Env_Sent', 'Tn_Env_Exp'),
+  // The same, from an envelope that states its own `__typename`: the
+  // consumer's `__typename` is no sign that it reads the outer object.
+  gql('gql-typename-outer-envelope', 'Tn_OuterEnv_Sent', 'Tn_OuterEnv_Exp'),
   // The producer states `__typename` at the root and not below it.
   gql('gql-typename-stated', 'Tn_Stated_Sent', 'Tn_Stated_Exp'),
   // A real field mismatch beside the meta-field stays incompatible.
@@ -170,12 +190,20 @@ describe('check_v2 graphql envelope unwrap (real pnpm + tsc)', () => {
         'export type Bare_Widening_Sent = { id: string; total: { amountCents: number; currency: string }; status: { kind: "placed"; placedAt: string } | { kind: "refunded"; refundedAt: string }; note?: string };',
         'export type Env_Ambiguous_Sent = { data: { id: string }; meta: { traceId: string }; errors: string[] };',
         'export type Env_Http_Sent = { data: { id: string }; errors: string[] };',
+        // carrick#1764: `qty` is a string here and a number on the consumer.
+        'export type Bo_Sel_Sent = { id: string; qty: string; total: { amountCents: number } };',
+        'export type Bo_Sub_Sent = { id: string; qty: string; total: { amountCents: number } };',
+        'export type Bo_Null_Sent = { id: string; qty: string; total: { amountCents: number } };',
+        'export type Env_List_Sent = { values: { id: string }[]; count: number };',
+        'export type Env_Shared_Sent = { id: string; node: { id: string; name: string } };',
         // A row type: no `__typename`, every field always sent.
         'export type Tn_Root_Sent = { id: string; name: string; email: null | string; createdAt: string };',
         'export type Tn_Nested_Sent = { id: string; lines: { id: string; qty: number }[]; owner: { name: string }; pair: [{ a: number }, string] };',
         `export type Tn_Deep_Sent = ${connectionShape(false)};`,
         'export type Tn_BareOne_Sent = { id: string; total: { amountCents: number; currency: string }; note?: string };',
+        'export type Tn_Shared_Sent = { id: string; node: { id: number } };',
         'export type Tn_Env_Sent = { data: { id: string; total: { amountCents: number; currency: string } }; errors: string[] };',
+        'export type Tn_OuterEnv_Sent = { __typename: "OrderPayload"; data: { id: string; total: { amountCents: number } }; errors: string[] };',
         'export type Tn_Stated_Sent = { __typename: "Order"; id: string; total: { amountCents: number } };',
         'export type Tn_Mismatch_Sent = { id: string; qty: string; createdAt: string };',
         'export type Tn_StatedMismatch_Sent = { __typename: "Line"; id: string; qty: string };',
@@ -195,12 +223,19 @@ describe('check_v2 graphql envelope unwrap (real pnpm + tsc)', () => {
         'export type Bare_Widening_Exp = { id: string; total: { amountCents: number; currency: string }; note: string };',
         'export type Env_Ambiguous_Exp = { id: string };',
         'export type Env_Http_Exp = { id: string };',
+        'export type Bo_Sel_Exp = { id: string; qty: number; total: { amountCents: number } };',
+        'export type Bo_Sub_Exp = { id: string; qty: number };',
+        'export type Bo_Null_Exp = { id: string; qty: number; total: { amountCents: number } } | null;',
+        'export type Env_List_Exp = { id: string }[];',
+        'export type Env_Shared_Exp = { id: string; name: string };',
         // A generated fragment type: `__typename` required, the rest optional.
         'export type Tn_Root_Exp = { __typename: "Contact"; id?: string | null; name?: string | null; email?: string | null };',
         'export type Tn_Nested_Exp = { __typename: "Order"; id: string; lines: Array<{ __typename: "Line"; id: string; qty: number }>; owner: { __typename: "User"; name: string } | null; pair: [{ __typename: "Pair"; a: number }, string] };',
         `export type Tn_Deep_Exp = ${connectionShape(true)};`,
         'export type Tn_BareOne_Exp = { __typename: "Order"; id: string; total: { __typename: "Money"; amountCents: number; currency: string } };',
+        'export type Tn_Shared_Exp = { __typename: "Node"; id: string };',
         'export type Tn_Env_Exp = { __typename: "Order"; id: string; total: { __typename: "Money"; amountCents: number } };',
+        'export type Tn_OuterEnv_Exp = { __typename: "Order"; id: string; total: { __typename: "Money"; amountCents: number } };',
         'export type Tn_Stated_Exp = { __typename: "Order"; id: string; total: { __typename: "Money"; amountCents: number } };',
         'export type Tn_Mismatch_Exp = { __typename: "Line"; id: string; qty: number };',
         'export type Tn_StatedMismatch_Exp = { __typename: "Line"; id: string; qty: number };',
@@ -263,6 +298,34 @@ describe('check_v2 graphql envelope unwrap (real pnpm + tsc)', () => {
     assert.strictEqual(verdicts.get('http-envelope-scoped')!.bucket, 'incompatible');
   });
 
+  // carrick#1764. The verdict was right before the fix; the reason was about
+  // `total` alone ("missing ... id, qty, total"), so it named three fields the
+  // producer does send and hid the one that differs.
+  for (const [key, named] of [
+    ['gql-bare-one-object-mismatch', "'qty' is string on the producer and number on the consumer"],
+    ['gql-bare-one-object-subset-mismatch', "'qty' is string on the producer and number on the consumer"],
+    // The field walk reads no union root, so here tsc's own elaboration names it.
+    ['gql-bare-one-object-nullable', "Types of property 'qty' are incompatible"],
+  ]) {
+    it(`${key}: a bare payload with one object property is compared whole, so the reason names the field that differs`, () => {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      const d = v.diagnostic!;
+      assert.ok(d.includes(named), d);
+      assert.ok(!d.includes('missing the following properties'), d);
+      assert.ok(!/'(id|total|amountCents)' is /.test(d), d);
+    });
+  }
+
+  for (const key of ['gql-envelope-list-consumer', 'gql-envelope-shared-field']) {
+    it(`${key}: an envelope the consumer reads through is still unwrapped -> compatible`, () => {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'compatible', v.diagnostic);
+      assert.deepStrictEqual(v.codes, []);
+      assert.strictEqual(v.diagnostic, undefined);
+    });
+  }
+
   // carrick#1759. Every compatible pair here also asserts an empty `codes`: a
   // diagnostic on one of the probe's helper `type` lines reaches no bucket,
   // so `codes` is the only place it would show.
@@ -271,7 +334,9 @@ describe('check_v2 graphql envelope unwrap (real pnpm + tsc)', () => {
     'gql-typename-nested',
     'gql-typename-deep',
     'gql-typename-bare-one-object',
+    'gql-typename-shared-field',
     'gql-typename-envelope',
+    'gql-typename-outer-envelope',
     // The relaxed `__typename` is the probe's reading, not the consumer's
     // source: a producer that sends it gets no "optional on the consumer" note.
     'gql-typename-stated',
