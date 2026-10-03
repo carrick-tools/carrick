@@ -607,3 +607,81 @@ fn an_npm_member_still_answers_from_its_manifest_alone() {
         .expect("the library is a member");
     assert!(derived.members[lib].workspace_dependents.is_empty());
 }
+
+/// carrick#553. A derived member inside another member is that member's own
+/// source: the outer member's walk leaves it out, as it does for a declared
+/// list, and the proposal written out as `carrick.json` resolves the same way.
+#[test]
+fn a_workspace_member_inside_another_member_is_left_out_of_the_outer_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"workspaces":["packages/*","packages/*/plugins/*"]}"#,
+    );
+    write(
+        root,
+        "packages/api/package.json",
+        r#"{"name":"@sample/api"}"#,
+    );
+    write(root, "packages/api/index.ts", "export const api = 1;\n");
+    write(
+        root,
+        "packages/api/plugins/audit/package.json",
+        r#"{"name":"@sample/audit"}"#,
+    );
+    write(
+        root,
+        "packages/api/plugins/audit/index.ts",
+        "export const audit = 1;\n",
+    );
+
+    let read_by = |services: &[carrick::config::Config], name: &str| -> Vec<String> {
+        let service = services
+            .iter()
+            .find(|service| service.service_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no service named {name}"));
+        let scanned = root.canonicalize().unwrap();
+        let (files, _) = carrick::file_finder::find_service_files(
+            scanned.to_str().unwrap(),
+            service,
+            &carrick::packages::MANIFEST_SKIP_DIRS,
+        );
+        files
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&scanned)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    };
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(
+        read_by(&derived.services, "@sample/api"),
+        ["packages/api/index.ts"]
+    );
+    assert_eq!(
+        read_by(&derived.services, "@sample/audit"),
+        ["packages/api/plugins/audit/index.ts"]
+    );
+
+    write(
+        root,
+        "carrick.json",
+        &serde_json::to_string(&derived.config).unwrap(),
+    );
+    let explicit = resolve(root).unwrap();
+    assert_eq!(explicit.reason, "carrick.json");
+    assert_eq!(
+        read_by(&explicit.services, "@sample/api"),
+        ["packages/api/index.ts"]
+    );
+    assert_eq!(
+        read_by(&explicit.services, "@sample/audit"),
+        ["packages/api/plugins/audit/index.ts"]
+    );
+}

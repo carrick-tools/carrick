@@ -333,6 +333,9 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             ..Config::default()
         });
     }
+    // A derived member inside another member is that member's own source, as
+    // it is for a declared list (carrick#553).
+    Config::resolve_nested(&mut services);
     validate(&root, &services)?;
     let config = serde_json::json!({ "services": services });
     // Both of these are true of every proposal of this shape and neither is

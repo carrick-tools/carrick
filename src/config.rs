@@ -72,6 +72,29 @@ pub struct Config {
     /// into the blob's `config_json`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_operations: Vec<DeclaredOperations>,
+    /// The directories of this repository's other services that sit inside
+    /// this one's `directory`, relative to the `carrick.json` location like
+    /// `directory` itself (carrick#553). A file under one of them is that
+    /// service's source, so this service's walk leaves it out
+    /// ([`crate::file_finder::find_service_files`]).
+    ///
+    /// Resolved from the whole service list by [`Config::resolve_nested`],
+    /// never written in a service entry and never serialized: it restates
+    /// what the other entries say, and the blob's `config_json` stays what the
+    /// repository declared.
+    #[serde(skip)]
+    pub nested_directories: Vec<String>,
+}
+
+/// A service directory as the path segments it names, so `workers/edge`,
+/// `./workers/edge` and `workers/edge/` are one directory and the repository
+/// root (`None`, `.`) is the empty path.
+pub fn directory_segments(directory: Option<&str>) -> Vec<&str> {
+    directory
+        .unwrap_or_default()
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect()
 }
 
 /// One handler's operations, declared rather than inferred (carrick#831).
@@ -355,7 +378,50 @@ impl Config {
 
             services.extend(file_services);
         }
+        Config::resolve_nested(&mut services);
         Ok(services)
+    }
+
+    /// Record on each service the directories of the other services that sit
+    /// inside its own (carrick#553), so one service's walk does not read
+    /// another's source.
+    ///
+    /// Inside means strictly below: two services that declare the same
+    /// directory both read it, because nothing says which of them owns it.
+    /// Only the outermost nested directory is kept, since leaving it out
+    /// leaves out everything under it.
+    ///
+    /// Called wherever a service list is produced: [`Config::load_services`]
+    /// for a declared list and `service_derivation::resolve` for a derived
+    /// one. A list built any other way carries none and walks as it did.
+    pub fn resolve_nested(services: &mut [Config]) {
+        let segments: Vec<Vec<String>> = services
+            .iter()
+            .map(|service| {
+                directory_segments(service.directory.as_deref())
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        for (index, service) in services.iter_mut().enumerate() {
+            let own = &segments[index];
+            let mut inside: Vec<&Vec<String>> = segments
+                .iter()
+                .filter(|other| other.len() > own.len() && other.starts_with(own))
+                .collect();
+            // Shallowest first, so a directory already covered by one kept
+            // before it is dropped.
+            inside.sort();
+            inside.dedup();
+            let mut kept: Vec<&Vec<String>> = Vec::new();
+            for candidate in inside {
+                if !kept.iter().any(|outer| candidate.starts_with(outer)) {
+                    kept.push(candidate);
+                }
+            }
+            service.nested_directories = kept.into_iter().map(|path| path.join("/")).collect();
+        }
     }
 
     /// Union a shared root's declarations into this service's own.
@@ -941,5 +1007,63 @@ mod tests {
         let second = serde_json::to_string(&config_inserted_in(&reversed)).unwrap();
 
         assert_eq!(first, second);
+    }
+
+    /// carrick#553. A declared list states which services sit inside which,
+    /// and the loader resolves it: the outermost nested directory of each,
+    /// whatever the spelling, and nothing for a twin or for a neighbour whose
+    /// name only starts the same way. None of it is serialized, so the blob's
+    /// `config_json` stays what the file declared.
+    #[test]
+    fn test_load_services_resolves_the_services_nested_in_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "services": [
+                    { "name": "storefront", "directory": "." },
+                    { "name": "edge", "directory": "./workers/edge/" },
+                    { "name": "edge-cron", "directory": "workers/edge/cron" },
+                    { "name": "edge-tools", "directory": "workers/edge-tools" },
+                    { "name": "reports", "directory": "tools/reports" },
+                    { "name": "reports-twin", "directory": "tools/reports/" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        let nested = |name: &str| -> Vec<String> {
+            services
+                .iter()
+                .find(|service| service.service_name.as_deref() == Some(name))
+                .unwrap()
+                .nested_directories
+                .clone()
+        };
+        // Outermost only: leaving `workers/edge` out leaves its cron job out.
+        assert_eq!(
+            nested("storefront"),
+            ["tools/reports", "workers/edge", "workers/edge-tools"]
+        );
+        assert_eq!(nested("edge"), ["workers/edge/cron"]);
+        assert!(nested("edge-cron").is_empty());
+        assert!(nested("edge-tools").is_empty());
+        assert!(nested("reports").is_empty());
+        assert!(nested("reports-twin").is_empty());
+
+        let written = serde_json::to_string(&services).unwrap();
+        assert!(!written.contains("nested"), "{written}");
+    }
+
+    /// A flat config is one service at the root with nothing inside it.
+    #[test]
+    fn test_a_single_service_has_nothing_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(&path, r#"{ "name": "single" }"#).unwrap();
+        let services = Config::load_services(vec![path]).unwrap();
+        assert!(services[0].nested_directories.is_empty());
     }
 }

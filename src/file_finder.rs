@@ -218,15 +218,26 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
 /// Sorted so the walk is the same on every host: readdir order differs between
 /// APFS and ext4, and any "first/last one wins" over an unsorted walk is a
 /// host-dependent result (#569 found one).
+///
+/// `left_out` are directories below `root`, relative to it, that the walk
+/// never enters: the services nested in the one being walked (carrick#553).
+/// Pruned for the reason above, and so a nested service's tree is read once.
 fn source_entries<'a>(
     root: &'a Path,
     ignore_patterns: &'a [&'a str],
+    left_out: &'a [PathBuf],
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .sort_by_file_name()
         .follow_links(true)
         .into_iter()
-        .filter_entry(move |entry| !is_ignored(entry.path(), root, ignore_patterns))
+        .filter_entry(move |entry| {
+            !is_ignored(entry.path(), root, ignore_patterns)
+                && !entry
+                    .path()
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| left_out.iter().any(|dir| relative == dir))
+        })
         .filter_map(|e| e.ok())
 }
 
@@ -240,11 +251,20 @@ fn source_entries<'a>(
 /// last on that host. A service's manifest is the one at its root and nowhere
 /// else — see [`find_service_files`].
 pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
+    find_files_leaving_out(dir, ignore_patterns, &[])
+}
+
+/// [`find_files`], never entering the `left_out` directories below `dir`.
+fn find_files_leaving_out(
+    dir: &str,
+    ignore_patterns: &[&str],
+    left_out: &[PathBuf],
+) -> (Vec<PathBuf>, Option<PathBuf>) {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
     let root_path = Path::new(dir);
 
-    for entry in source_entries(root_path, ignore_patterns) {
+    for entry in source_entries(root_path, ignore_patterns, left_out) {
         let path = entry.path();
 
         if !path.is_file() {
@@ -298,6 +318,20 @@ pub fn find_service_manifest(repo_path: &Path, service: &crate::config::Config) 
 ///
 /// A service with `directory: None` scopes to the whole repo, so the
 /// single-service path behaves exactly like a plain [`find_files`] walk.
+///
+/// **A file belongs to the deepest service whose directory holds it**
+/// (carrick#553). The walk of the service's own directory never enters the
+/// directory of another service nested inside it
+/// ([`crate::config::Config::nested_directories`]): that source is the nested
+/// service's, and reading it here indexed its routes and functions under both
+/// names and sent its files to model analysis twice. The same rule the local
+/// read model applies when it names a file's service
+/// (`IndexedRepo::service_for`).
+///
+/// **`include` roots are walked whole.** A root a service names there is
+/// source it declares on purpose, so it is read even where it sits inside a
+/// nested service's directory, and a nested service inside an include root is
+/// read with it.
 pub fn find_service_files(
     repo_path: &str,
     service: &crate::config::Config,
@@ -306,9 +340,21 @@ pub fn find_service_files(
     let root = Path::new(repo_path);
     let service_root = service_root(root, service);
 
+    // The nested services' directories, relative to this service's own, which
+    // is how the walk below sees them.
+    let own = crate::config::directory_segments(service.directory.as_deref());
+    let left_out: Vec<PathBuf> = service
+        .nested_directories
+        .iter()
+        .map(|nested| crate::config::directory_segments(Some(nested)))
+        .filter(|nested| nested.len() > own.len() && nested.starts_with(&own))
+        .map(|nested| nested[own.len()..].iter().collect())
+        .collect();
+
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.
-    let (mut files, _config) = find_files(&service_root.to_string_lossy(), ignore_patterns);
+    let (mut files, _config) =
+        find_files_leaving_out(&service_root.to_string_lossy(), ignore_patterns, &left_out);
 
     let package_json = find_service_manifest(root, service);
 
@@ -509,7 +555,7 @@ mod tests {
         let root = tmp.path();
         installed_workspace(root, 12, 2);
 
-        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES)
+        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[])
             .map(|entry| entry.path().to_path_buf())
             .collect();
 
@@ -931,5 +977,185 @@ mod tests {
         let (_, package) = find_service_files(root.to_str().unwrap(), &service, &[]);
 
         assert_eq!(package, None);
+    }
+
+    /// A service list as a scan holds it: each `(directory, include root)`
+    /// declared, with an empty include for none, and the nested directories
+    /// resolved from them the way `Config::load_services` does.
+    fn resolved(declared: &[(&str, &str)]) -> Vec<crate::config::Config> {
+        let mut services: Vec<crate::config::Config> = declared
+            .iter()
+            .map(|(directory, include)| crate::config::Config {
+                directory: Some((*directory).to_string()),
+                include: (!include.is_empty())
+                    .then(|| (*include).to_string())
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        crate::config::Config::resolve_nested(&mut services);
+        services
+    }
+
+    /// What one service's walk reads, relative to the repo and sorted.
+    fn read_by(root: &Path, service: &crate::config::Config) -> Vec<String> {
+        let (files, _) = find_service_files(root.to_str().unwrap(), service, ARTIFACT_IGNORES);
+        let mut relative: Vec<String> = files
+            .iter()
+            .map(|file| {
+                file.strip_prefix(root)
+                    .expect("a walked file is under the repo")
+                    .components()
+                    .filter_map(|part| match part {
+                        std::path::Component::Normal(name) => name.to_str(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        relative.sort();
+        relative
+    }
+
+    fn touch(root: &Path, file: &str) {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().expect("file parent")).expect("parent dir");
+        File::create(path).expect("file");
+    }
+
+    /// carrick#553. A service at the root beside a service nested in it: the
+    /// nested service's files were read by both walks, so its routes and
+    /// functions were indexed under both names.
+    #[test]
+    fn a_service_walk_leaves_out_a_service_nested_in_it() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, "workers/edge/src/index.ts");
+        // A directory beside the nested one whose name only starts the same
+        // way is not inside it.
+        touch(root, "workers/edge-tools/sync.ts");
+
+        let services = resolved(&[(".", ""), ("workers/edge", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            ["src/orders.ts", "workers/edge-tools/sync.ts"]
+        );
+        assert_eq!(read_by(root, &services[1]), ["workers/edge/src/index.ts"]);
+    }
+
+    /// The same holds at every depth, and however the directories are
+    /// spelled: each file is read by the deepest service that holds it.
+    #[test]
+    fn a_service_nested_two_levels_down_is_left_out_of_both_services_above_it() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "platform/gateway.ts");
+        touch(root, "platform/billing/charge.ts");
+        touch(root, "platform/billing/webhooks/stripe.ts");
+
+        let services = resolved(&[
+            ("./platform/", ""),
+            ("platform/billing", ""),
+            ("platform/billing/webhooks/", ""),
+        ]);
+        assert_eq!(read_by(root, &services[0]), ["platform/gateway.ts"]);
+        assert_eq!(read_by(root, &services[1]), ["platform/billing/charge.ts"]);
+        assert_eq!(
+            read_by(root, &services[2]),
+            ["platform/billing/webhooks/stripe.ts"]
+        );
+    }
+
+    /// An `include` root is source a service declares on purpose, so it is
+    /// read whole: where it sits inside a nested service, where it is the
+    /// nested service's whole directory, and where another service sits inside
+    /// it. The nested service still reads its own tree.
+    #[test]
+    fn an_include_root_is_read_whole_wherever_it_sits() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, "workers/edge/src/index.ts");
+        touch(root, "workers/edge/shared/headers.ts");
+        touch(root, "libs/format.ts");
+        touch(root, "libs/ui/button.ts");
+
+        let services = resolved(&[
+            (".", "workers/edge/shared"),
+            ("workers/edge", "libs"),
+            ("libs/ui", ""),
+        ]);
+        // The root leaves the nested services out and takes back the one
+        // directory it includes.
+        assert_eq!(
+            read_by(root, &services[0]),
+            [
+                "libs/format.ts",
+                "src/orders.ts",
+                "workers/edge/shared/headers.ts"
+            ]
+        );
+        // A service inside an include root is read with the root.
+        assert_eq!(
+            read_by(root, &services[1]),
+            [
+                "libs/format.ts",
+                "libs/ui/button.ts",
+                "workers/edge/shared/headers.ts",
+                "workers/edge/src/index.ts"
+            ]
+        );
+
+        // Including a nested service's whole directory reads all of it.
+        let whole = resolved(&[(".", "workers/edge"), ("workers/edge", ""), ("libs/ui", "")]);
+        assert_eq!(
+            read_by(root, &whole[0]),
+            [
+                "libs/format.ts",
+                "src/orders.ts",
+                "workers/edge/shared/headers.ts",
+                "workers/edge/src/index.ts"
+            ]
+        );
+    }
+
+    /// Two services that declare one directory both read it. Neither is
+    /// inside the other, and nothing says which of them owns the files.
+    #[test]
+    fn two_services_with_the_same_directory_both_read_it() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "tools/reports/build.ts");
+        touch(root, "tools/reports/email/send.ts");
+
+        let services = resolved(&[
+            ("tools/reports", ""),
+            ("./tools/reports/", ""),
+            ("tools/reports/email", ""),
+        ]);
+        assert_eq!(read_by(root, &services[0]), ["tools/reports/build.ts"]);
+        assert_eq!(read_by(root, &services[1]), ["tools/reports/build.ts"]);
+        assert_eq!(read_by(root, &services[2]), ["tools/reports/email/send.ts"]);
+    }
+
+    /// A service list built without the resolution step carries no nested
+    /// directories and walks as it always did.
+    #[test]
+    fn a_service_with_no_resolved_nesting_walks_its_whole_directory() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, "workers/edge/src/index.ts");
+        let alone = crate::config::Config {
+            directory: Some(".".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            read_by(root, &alone),
+            ["src/orders.ts", "workers/edge/src/index.ts"]
+        );
     }
 }

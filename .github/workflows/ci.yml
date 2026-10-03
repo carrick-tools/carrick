@@ -115,6 +115,7 @@ jobs:
           --test log_value_guard_test
           --test mock_storage_test
           --test module_resolution_parity_test
+          --test nested_service_walk_test
           --test new_url_target_test
           --test nonhttp_source_labels_test
           --test object_export_surface_test
