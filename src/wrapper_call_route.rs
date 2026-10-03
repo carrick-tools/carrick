@@ -45,6 +45,19 @@
 //!   parameter the call fills, or a placeholder on either side, is the same
 //!   route.
 //!
+//! The same site states what its value is (carrick#1801). The call is the
+//! function's call, so its value is what the function returns: a mapped copy
+//! of the body, a wrapper, a flag, a raw response. When the function's body
+//! writes the row's path (its last literal segment, read after any correction
+//! above), the request is made in there, and unless the function hands back
+//! that request's parsed body unchanged
+//! ([`crate::request_summary::RequestSummaryIndex::passes_body`]) the row is
+//! marked [`DataCallResult::at_caller`], as the request summaries mark the
+//! rows they restate at a caller (carrick#1601): the type layer infers no
+//! consumer response type there. A site whose own arguments carry the path (a
+//! transport called with a URL) is not this: the function's body does not
+//! write the path.
+//!
 //! The correction moves the row's operation, so it runs before the verb pass
 //! ([`crate::wrapper_call_method`]) and the passes that decide which rows are
 //! the same request ([`crate::consumer_row_fold`],
@@ -88,17 +101,27 @@ pub struct WrapperRouteCorrections {
     /// it writes the path of, or may request the row's own path too. The row
     /// keeps the model's route, and this is how often that happened.
     pub declaration_unreadable: usize,
+    /// Rows at a call of a function whose body writes their path and does
+    /// not hand back its parsed body: the call's value is that function's
+    /// return value, so the row is marked
+    /// [`DataCallResult::at_caller`] (carrick#1801).
+    pub restated_at_caller: usize,
 }
 
 /// Correct the route of every model row at a direct call of an imported
-/// function whose body states another one.
+/// function whose body states another one, and mark every such row whose
+/// value is not the response body.
 ///
 /// `workspace` resolves the specifiers the repo declares (aliases, workspace
 /// packages) as well as relative ones; `None` follows relative specifiers only.
+/// `passes_body` answers, for a declaring module's canonical path and the name
+/// it declares a function under, whether a call of that function is worth its
+/// request's parsed body ([`crate::request_summary::RequestSummaryIndex::passes_body`]).
 pub fn correct_wrapper_call_routes(
     file_results: &mut HashMap<String, FileAnalysisResult>,
     normalizer: &UrlNormalizer,
     workspace: Option<&WorkspaceIndex>,
+    passes_body: &dyn Fn(&Path, &str) -> bool,
 ) -> WrapperRouteCorrections {
     let mut corrections = WrapperRouteCorrections::default();
 
@@ -146,7 +169,7 @@ pub fn correct_wrapper_call_routes(
             continue;
         };
 
-        let mut stated: Vec<(usize, DataCallResult)> = Vec::new();
+        let mut stated: Vec<(usize, Option<DataCallResult>, bool)> = Vec::new();
         for (index, call) in result.data_calls.iter().enumerate() {
             if !is_correctable_row(call) {
                 continue;
@@ -189,8 +212,9 @@ pub fn correct_wrapper_call_routes(
                     }
                 })
                 .clone();
-            let body = match route {
-                BodyRoute::None => continue,
+            let own_path = normalizer.consumer_call_path(&call.target);
+            let corrected = match route {
+                BodyRoute::None => None,
                 BodyRoute::Unreadable => {
                     corrections.declaration_unreadable += 1;
                     debug!(
@@ -200,38 +224,70 @@ pub fn correct_wrapper_call_routes(
                         reached.published,
                         reached.file.display()
                     );
-                    continue;
+                    None
                 }
-                BodyRoute::Stated(body) => body,
+                // The row's path is the body's: nothing to correct.
+                BodyRoute::Stated(body) if paths_match(&body.path, &own_path) => None,
+                // The body writes the row's own path as well: it may request
+                // both, whatever its rows say.
+                BodyRoute::Stated(body)
+                    if last_literal_segment(&own_path)
+                        .is_some_and(|segment| body.segments.contains(&segment)) =>
+                {
+                    corrections.declaration_unreadable += 1;
+                    debug!(
+                        "  - {key}: line {} calls {} in {}, whose body writes {own_path} as \
+                         well as {}; keeping the extracted route",
+                        call.line_number,
+                        reached.published,
+                        reached.file.display(),
+                        body.path
+                    );
+                    None
+                }
+                BodyRoute::Stated(body) => {
+                    debug!(
+                        "  - {key}: line {} calls {} in {}, which requests {} {}; correcting \
+                         {} {own_path}",
+                        call.line_number,
+                        reached.published,
+                        reached.file.display(),
+                        body.row.method.as_deref().unwrap_or_default(),
+                        body.path,
+                        call.method.as_deref().unwrap_or_default(),
+                    );
+                    Some(body.row)
+                }
             };
-            let path = normalizer.consumer_call_path(&call.target);
-            if paths_match(&body.path, &path) {
-                continue;
-            }
-            // The body writes the row's own path as well: it may request
-            // both, whatever its rows say.
-            if last_literal_segment(&path).is_some_and(|segment| body.segments.contains(&segment)) {
-                corrections.declaration_unreadable += 1;
+
+            // The call's value is what the function returns (carrick#1801).
+            // Read once the route is the one the row will carry.
+            let path = corrected
+                .as_ref()
+                .map(|request| normalizer.consumer_call_path(&request.target))
+                .unwrap_or(own_path);
+            let writes_path = modules
+                .get(&reached.file)
+                .and_then(Option::as_ref)
+                .and_then(|functions| functions.functions.get(&local))
+                .is_some_and(|body| {
+                    last_literal_segment(&path)
+                        .is_some_and(|segment| body.segments.contains(&segment))
+                });
+            let at_caller = writes_path && !passes_body(&reached.file, &local);
+            if at_caller {
                 debug!(
-                    "  - {key}: line {} calls {} in {}, whose body writes {path} as well as \
-                     {}; keeping the extracted route",
+                    "  - {key}: line {} calls {} in {}, which writes {path} and hands back \
+                     something other than its parsed body; the call's value is not the \
+                     response",
                     call.line_number,
                     reached.published,
                     reached.file.display(),
-                    body.path
                 );
-                continue;
             }
-            debug!(
-                "  - {key}: line {} calls {} in {}, which requests {} {}; correcting {} {path}",
-                call.line_number,
-                reached.published,
-                reached.file.display(),
-                body.row.method.as_deref().unwrap_or_default(),
-                body.path,
-                call.method.as_deref().unwrap_or_default(),
-            );
-            stated.push((index, body.row));
+            if corrected.is_some() || at_caller {
+                stated.push((index, corrected, at_caller));
+            }
         }
 
         if stated.is_empty() {
@@ -240,14 +296,20 @@ pub fn correct_wrapper_call_routes(
         let Some(result) = file_results.get_mut(&key) else {
             continue;
         };
-        for (index, request) in stated {
+        for (index, corrected, at_caller) in stated {
             let row = &mut result.data_calls[index];
-            row.method = request.method;
-            row.target = request.target;
-            row.base = request.base;
-            row.loopback_default_url = request.loopback_default_url;
-            row.dispatch = request.dispatch;
-            corrections.corrected += 1;
+            if let Some(request) = corrected {
+                row.method = request.method;
+                row.target = request.target;
+                row.base = request.base;
+                row.loopback_default_url = request.loopback_default_url;
+                row.dispatch = request.dispatch;
+                corrections.corrected += 1;
+            }
+            if at_caller {
+                row.at_caller = true;
+                corrections.restated_at_caller += 1;
+            }
         }
     }
 
@@ -594,6 +656,15 @@ export const useSharedStats = (shelfId: string) => {
     fn correct(
         files: Vec<(String, Vec<DataCallResult>)>,
     ) -> (HashMap<String, FileAnalysisResult>, WrapperRouteCorrections) {
+        correct_with(files, &|_, _| false)
+    }
+
+    /// [`correct`], with the summaries' answer to whether a function hands
+    /// back its parsed body.
+    fn correct_with(
+        files: Vec<(String, Vec<DataCallResult>)>,
+        passes_body: &dyn Fn(&Path, &str) -> bool,
+    ) -> (HashMap<String, FileAnalysisResult>, WrapperRouteCorrections) {
         let mut results: HashMap<String, FileAnalysisResult> = files
             .into_iter()
             .map(|(path, data_calls)| {
@@ -606,13 +677,21 @@ export const useSharedStats = (shelfId: string) => {
                 )
             })
             .collect();
-        let corrections =
-            correct_wrapper_call_routes(&mut results, &UrlNormalizer::default_permissive(), None);
+        let corrections = correct_wrapper_call_routes(
+            &mut results,
+            &UrlNormalizer::default_permissive(),
+            None,
+            passes_body,
+        );
         (results, corrections)
     }
 
     fn target(results: &HashMap<String, FileAnalysisResult>, file: &str) -> String {
         results[file].data_calls[0].target.clone()
+    }
+
+    fn at_caller(results: &HashMap<String, FileAnalysisResult>, file: &str) -> bool {
+        results[file].data_calls[0].at_caller
     }
 
     /// carrick#1794's acceptance: a helper requesting one route, its caller
@@ -643,11 +722,16 @@ export const useSharedStats = (shelfId: string) => {
             "/v1/shelves/shared-stats",
             "the helper's body writes and requests the shared route"
         );
+        assert!(
+            at_caller(&results, &site),
+            "the helper maps the body before returning it, so the call is worth the mapped value"
+        );
         assert_eq!(
             corrections,
             WrapperRouteCorrections {
                 corrected: 1,
-                declaration_unreadable: 0
+                declaration_unreadable: 0,
+                restated_at_caller: 1,
             }
         );
         let operations = |rows: &[DataCallResult]| -> Vec<(i32, Option<String>, String)> {
@@ -659,6 +743,13 @@ export const useSharedStats = (shelfId: string) => {
             operations(&results[&shelves].data_calls),
             operations(&shelves_rows(SHELVES)),
             "the declaring module's own rows are never touched"
+        );
+        assert!(
+            results[&shelves]
+                .data_calls
+                .iter()
+                .all(|row| !row.at_caller),
+            "a request line is no caller"
         );
     }
 
@@ -725,7 +816,14 @@ export const useSharedStats = (shelfId: string) => {
         ]);
 
         assert_eq!(target(&results, &site), "/v1/shelves/:id/stats");
-        assert_eq!(corrections, WrapperRouteCorrections::default());
+        assert_eq!(
+            corrections,
+            WrapperRouteCorrections {
+                restated_at_caller: 1,
+                ..Default::default()
+            },
+            "the route stands; the call is the helper's, and the helper's body writes it"
+        );
     }
 
     /// A helper whose body writes two routes, one per branch, may request
@@ -771,8 +869,10 @@ export const useSharedStats = (shelfId: string) => {
             corrections,
             WrapperRouteCorrections {
                 corrected: 0,
-                declaration_unreadable: 1
-            }
+                declaration_unreadable: 1,
+                restated_at_caller: 0,
+            },
+            "the body writes no part of the row's path, so it says nothing about the row"
         );
     }
 
@@ -807,6 +907,10 @@ export const useSharedStats = (shelfId: string) => {
         assert_eq!(target(&results, &site), "/v1/shelves/stats");
         assert_eq!(corrections.corrected, 0);
         assert_eq!(corrections.declaration_unreadable, 1);
+        assert!(
+            !at_caller(&results, &site),
+            "a transport handed its path writes none of it: what it returns is not read here"
+        );
     }
 
     /// The body writes the row's own path too, at a line the model stated no
@@ -838,6 +942,10 @@ export const useSharedStats = (shelfId: string) => {
 
         assert_eq!(target(&results, &site), "/v1/shelves/stats");
         assert_eq!(corrections.declaration_unreadable, 1);
+        assert!(
+            at_caller(&results, &site),
+            "whichever route it takes, the call is the helper's, which writes this path"
+        );
     }
 
     /// The body calls another function the module imports, on a line no row
@@ -992,6 +1100,155 @@ export const useSharedStats = (shelfId: string) => {
         ]);
 
         assert_eq!(target(&results, &site), "/v1/shelves/stats");
+        assert_eq!(corrections, WrapperRouteCorrections::default());
+    }
+
+    /// The helper of carrick#1801's real case: its path is picked by a
+    /// ternary, so the model states no row in its body, and it parses the
+    /// body into a value of its own before handing it back.
+    const MAPPING_HELPER: &str = r#"import { request } from "./transport";
+
+const parseStats = (payload: unknown) => ({ books: Number((payload as { books: unknown }).books) });
+
+export const fetchStats = (shelfId?: string) => {
+  const path = shelfId
+    ? `/v1/shelves/stats?shelfId=${encodeURIComponent(shelfId)}`
+    : "/v1/shelves/stats";
+
+  return request({ path, method: "GET" }).mapOk(parseStats);
+};
+"#;
+
+    const MAPPING_SITE: &str = r#"import { fetchStats } from "../lib/shelves";
+
+export const useStats = (shelfId?: string) => {
+  const request = fetchStats(shelfId);
+  return request;
+};
+"#;
+
+    /// carrick#1801's acceptance: the model's row at the call of a helper that
+    /// writes the path and maps the body keeps its route and is marked, so
+    /// the type layer reads no response type off the helper's return value.
+    #[test]
+    fn a_caller_of_a_helper_that_maps_the_body_is_restated_at_the_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let shelves = write(root, "src/lib/shelves.ts", MAPPING_HELPER);
+        let site = write(root, "src/hooks/useStats.ts", MAPPING_SITE);
+
+        let (results, corrections) = correct(vec![
+            (
+                site.clone(),
+                vec![row(
+                    MAPPING_SITE,
+                    "fetchStats(shelfId)",
+                    "GET",
+                    "/v1/shelves/stats",
+                )],
+            ),
+            (shelves, Vec::new()),
+        ]);
+
+        assert_eq!(target(&results, &site), "/v1/shelves/stats");
+        assert!(at_caller(&results, &site));
+        assert_eq!(
+            corrections,
+            WrapperRouteCorrections {
+                restated_at_caller: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A helper the summaries read as handing back its parsed body makes its
+    /// call worth that body: the row stays typed. The summaries are asked by
+    /// the declaring module's canonical path and the name it declares the
+    /// function under.
+    #[test]
+    fn a_caller_of_a_helper_that_hands_back_its_parsed_body_is_left_unmarked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let shelves = write(root, "src/lib/shelves.ts", MAPPING_HELPER);
+        let site = write(root, "src/hooks/useStats.ts", MAPPING_SITE);
+        let declaring = Path::new(&shelves).canonicalize().unwrap();
+
+        let (results, corrections) = correct_with(
+            vec![
+                (
+                    site.clone(),
+                    vec![row(
+                        MAPPING_SITE,
+                        "fetchStats(shelfId)",
+                        "GET",
+                        "/v1/shelves/stats",
+                    )],
+                ),
+                (shelves, Vec::new()),
+            ],
+            &|file, function| file == declaring && function == "fetchStats",
+        );
+
+        assert!(!at_caller(&results, &site));
+        assert_eq!(corrections, WrapperRouteCorrections::default());
+    }
+
+    /// Exported under another name: the summaries know the function by the
+    /// name its module declares it under.
+    #[test]
+    fn the_summaries_are_asked_by_the_declared_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = MAPPING_HELPER.replace("export const fetchStats", "const loadStats")
+            + "\nexport { loadStats as fetchStats };\n";
+        let shelves = write(root, "src/lib/shelves.ts", &source);
+        let site = write(root, "src/hooks/useStats.ts", MAPPING_SITE);
+
+        let (results, _) = correct_with(
+            vec![
+                (
+                    site.clone(),
+                    vec![row(
+                        MAPPING_SITE,
+                        "fetchStats(shelfId)",
+                        "GET",
+                        "/v1/shelves/stats",
+                    )],
+                ),
+                (shelves, Vec::new()),
+            ],
+            &|_, function| function == "loadStats",
+        );
+
+        assert!(!at_caller(&results, &site));
+    }
+
+    /// A transport called with the URL: the site writes the path, the
+    /// transport's body writes none of it, and what the transport returns is
+    /// read where the site reads it.
+    #[test]
+    fn a_transport_called_with_its_url_is_left_unmarked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = "export const send = async (path: string) => {\n  const response = await fetch(path, { method: \"GET\" });\n  return response;\n};\n";
+        let transport = write(root, "src/lib/send.ts", source);
+        let site_source = "import { send } from \"../lib/send\";\n\nexport const useStats = () => {\n  return send(\"/v1/shelves/stats\");\n};\n";
+        let site = write(root, "src/hooks/useStats.ts", site_source);
+
+        let (results, corrections) = correct(vec![
+            (
+                site.clone(),
+                vec![row(
+                    site_source,
+                    "send(\"/v1/shelves/stats\")",
+                    "GET",
+                    "/v1/shelves/stats",
+                )],
+            ),
+            (transport, Vec::new()),
+        ]);
+
+        assert!(!at_caller(&results, &site));
         assert_eq!(corrections, WrapperRouteCorrections::default());
     }
 

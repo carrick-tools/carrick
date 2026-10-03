@@ -12721,6 +12721,48 @@ mod tests {
         );
     }
 
+    /// carrick#1801: the summaries answer whether a function hands back its
+    /// parsed body for every function they read, by the file's canonical path
+    /// (the temp dir is reached through a link on macOS), including one no
+    /// call in the service reaches: a caller only the model states is read
+    /// against its callee by the module graph, not the call graph.
+    #[test]
+    fn the_summaries_say_which_functions_hand_back_their_parsed_body() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/send.ts",
+            "export async function held(url: string) {\n\
+             \x20 const res = await fetch(url, { method: \"GET\" });\n\
+             \x20 const data = (await res.json()) as { id: string };\n\
+             \x20 return data;\n\
+             }\n\
+             export const arrow = async (url: string) => (await fetch(url, { method: \"GET\" })).json();\n\
+             export async function raw(url: string) {\n\
+             \x20 return fetch(url, { method: \"GET\" });\n\
+             }\n\
+             export async function mapped(url: string) {\n\
+             \x20 const res = await fetch(url, { method: \"GET\" });\n\
+             \x20 const data = (await res.json()) as { id: string };\n\
+             \x20 return { id: data.id };\n\
+             }\n",
+        )]);
+        let summaries = summaries_of(&discovery);
+        let file = dir.path().join("src/send.ts").canonicalize().unwrap();
+        let passes: Vec<(&str, bool)> = ["held", "arrow", "raw", "mapped", "missing"]
+            .into_iter()
+            .map(|name| (name, summaries.passes_body(&file, name)))
+            .collect();
+        assert_eq!(
+            passes,
+            vec![
+                ("held", true),
+                ("arrow", true),
+                ("raw", false),
+                ("mapped", false),
+                ("missing", false),
+            ]
+        );
+    }
+
     /// carrick#1562: a call to a module-scope builder is what the builder
     /// returns, with the call's arguments in its parameters: an arrow, a
     /// function declaration, and one held in a constant object. A function

@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "fetchShelfStats",
+      "line_number": 4,
+      "target": "/v1/shelves/stats",
+      "method": "GET",
+      "pattern_matched": "import { fetchShelfStats } from \"../lib/shelves\";",
+      "call_expression_text": "fetchShelfStats(shelfId)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "ShelfStats",
+      "type_import_source": "../lib/shelves"
+    }
+  ]
+}

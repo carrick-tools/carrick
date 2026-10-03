@@ -3136,11 +3136,14 @@ impl FileOrchestrator {
         // function per sibling route it can name the sibling. Before the verb
         // pass, so the verb its AST states still has the last word, and before
         // the two passes after it, which decide which rows state one
-        // operation.
+        // operation. The same site's value is the function's return value, so
+        // a row there is marked `at_caller` unless the function hands back its
+        // parsed body (carrick#1801), before the type requests read the mark.
         let wrapper_route_corrections = crate::wrapper_call_route::correct_wrapper_call_routes(
             &mut file_results,
             normalizer,
             Some(service_modules),
+            &|file, function| summaries.passes_body(file, function),
         );
         stats.wrapper_route_corrections = wrapper_route_corrections;
         if wrapper_route_corrections
@@ -3148,9 +3151,11 @@ impl FileOrchestrator {
         {
             debug!(
                 "  - Routes read off the body of the function the call reaches: {} (body states \
-                 no single route it writes: {})",
+                 no single route it writes: {}); rows whose value is that function's return \
+                 value: {}",
                 wrapper_route_corrections.corrected,
-                wrapper_route_corrections.declaration_unreadable
+                wrapper_route_corrections.declaration_unreadable,
+                wrapper_route_corrections.restated_at_caller
             );
         }
 

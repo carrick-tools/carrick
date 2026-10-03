@@ -4846,11 +4846,25 @@ fn declared_client(
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
+    /// Every function that hands back its one request's parsed body
+    /// ([`Summary::passes_body`]), by its file's canonical path and the name
+    /// the file declares it under.
+    passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
 }
 
 impl RequestSummaryIndex {
+    /// Whether a call of `function`, declared at top level in the file whose
+    /// canonical path is `file`, is worth its one request's parsed body
+    /// (carrick#1601): the function sends one request and every `return`
+    /// hands back that request's body unchanged. False for a function this
+    /// pass did not read.
+    pub fn passes_body(&self, file: &Path, function: &str) -> bool {
+        self.passes_body
+            .contains(&(file.to_path_buf(), function.to_string()))
+    }
+
     /// Rows read through library semantics (carrick#1564).
     pub fn library_row_count(&self) -> usize {
         self.rows
@@ -5031,12 +5045,31 @@ pub fn summarize(
 
     let mut paths: Vec<&PathBuf> = files.keys().collect();
     paths.sort();
-    for path in paths {
-        let mut keys: Vec<&String> = files[path].functions.keys().collect();
+    for path in &paths {
+        let mut keys: Vec<&String> = files[*path].functions.keys().collect();
         keys.sort();
         for key in keys {
-            let ir = &files[path].functions[key];
+            let ir = &files[*path].functions[key];
             emit(&mut composer, path, ir, &mut index);
+        }
+    }
+    // Every function, not only the ones a resolved call site composed: a
+    // caller the model states is read against its callee by the module graph
+    // (carrick#1801), whether or not the call graph resolved that call.
+    for path in &paths {
+        let mut canonical = None;
+        for key in files[*path].functions.keys() {
+            if composer
+                .summary(path, key)
+                .is_some_and(|summary| summary.passes_body)
+            {
+                let file = canonical
+                    .get_or_insert_with(|| {
+                        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+                    })
+                    .clone();
+                index.passes_body.insert((file, key.clone()));
+            }
         }
     }
     for sites in index.rows.values_mut() {
