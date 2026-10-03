@@ -280,6 +280,71 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
       `expected a fact, got: ${cleanVerdict.unresolved_reason}`
     );
   });
+
+  // carrick#1833: a check that cannot install still answers every pair, and
+  // the scanner reads each pair's own verdict. A pair the capture decided
+  // keeps that verdict whatever the install did; a pair the install stopped
+  // says so in the installer's words.
+  const twoPairs = (): Parameters<typeof runCheck>[0] => ({
+    stubs: [
+      { service_name: 'deep-producer', stub_dir: producerStub },
+      { service_name: 'deep-consumer', stub_dir: consumerStub },
+    ],
+    pairs: [
+      {
+        pair_key: 'any-pair',
+        protocol: 'http',
+        type_kind: 'response',
+        producer: { service_name: 'deep-producer', alias: 'P_MemberAny' },
+        consumer: { service_name: 'deep-consumer', alias: 'C_Concrete' },
+      },
+      {
+        pair_key: 'clean-pair',
+        protocol: 'http',
+        type_kind: 'response',
+        producer: { service_name: 'deep-producer', alias: 'P_Clean' },
+        consumer: { service_name: 'deep-consumer', alias: 'C_Concrete3' },
+      },
+    ],
+  });
+
+  it('a failed install keeps the capture verdict and names the installer output on the rest', async () => {
+    const pnpmPath = path.join(checkRoot, 'pnpm-fail');
+    fs.writeFileSync(pnpmPath, '#!/bin/sh\necho "ERR_FAKE_INSTALL no such package" >&2\nexit 1\n');
+    fs.chmodSync(pnpmPath, 0o755);
+    const result = await runCheck({ ...twoPairs(), pnpmPath });
+    assert.strictEqual(result.success, false);
+    const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+
+    const anyVerdict = byKey.get('any-pair')!;
+    assert.strictEqual(anyVerdict.bucket, 'gate_caught_baked_any', JSON.stringify(anyVerdict));
+    assert.strictEqual(anyVerdict.gate, 'capture:producer:any');
+    assert.doesNotMatch(anyVerdict.unresolved_reason ?? '', /install/);
+
+    const stopped = byKey.get('clean-pair')!;
+    assert.strictEqual(stopped.bucket, 'unverifiable', JSON.stringify(stopped));
+    assert.strictEqual(stopped.gate, 'install:failed');
+    assert.match(stopped.diagnostic ?? '', /workspace dependency install failed/);
+    assert.match(stopped.diagnostic ?? '', /ERR_FAKE_INSTALL no such package/);
+    assert.strictEqual(stopped.unresolved_reason, stopped.diagnostic);
+  });
+
+  it('a missing pnpm keeps the capture verdict', async () => {
+    const result = await runCheck({
+      ...twoPairs(),
+      pnpmPath: path.join(checkRoot, 'no-such-pnpm'),
+    });
+    assert.strictEqual(result.isolation, 'unavailable');
+    const byKey = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+
+    const anyVerdict = byKey.get('any-pair')!;
+    assert.strictEqual(anyVerdict.bucket, 'gate_caught_baked_any', JSON.stringify(anyVerdict));
+    assert.strictEqual(anyVerdict.gate, 'capture:producer:any');
+
+    const stopped = byKey.get('clean-pair')!;
+    assert.strictEqual(stopped.bucket, 'unverifiable', JSON.stringify(stopped));
+    assert.strictEqual(stopped.gate, 'isolation:unavailable');
+  });
 });
 
 /**

@@ -1241,9 +1241,12 @@ pub(crate) fn materialize_stubs(
 
 /// Run the v2 check over the built pairs and produce the analyzer's pair
 /// outcomes. Pairs with a pre-set verdict (no surface / unresolved side)
-/// never reach the sidecar. When the check itself fails, every probing pair
-/// degrades to unverifiable with the failure as the reason — never fatal to
-/// the scan, and never read as compatible.
+/// never reach the sidecar. A check that failed part way (an install, an
+/// abnormal tsc) still returns each pair's verdict: the pairs it stopped are
+/// unverifiable and say why, and the pairs the capture had already decided
+/// keep that verdict. Only when the sidecar returns no verdicts at all does
+/// every probing pair degrade to unverifiable with the failure as the reason.
+/// Never fatal to the scan, and never read as compatible.
 pub(crate) fn run_check(
     sidecar: &TypeSidecar,
     all_repo_data: &[CloudRepoData],
@@ -1303,6 +1306,12 @@ pub(crate) fn run_check(
 
         match check_result {
             Ok(result) => {
+                if !result.success {
+                    warn!(
+                        "v2 check failed; each pair keeps the verdict the sidecar returned: {}",
+                        result.errors.join("; ")
+                    );
+                }
                 let by_key: BTreeMap<&str, &crate::services::type_sidecar::CheckVerdict> = result
                     .verdicts
                     .iter()
@@ -1344,7 +1353,7 @@ pub(crate) fn run_check(
             }
             Err(e) => {
                 warn!(
-                    "v2 check failed; all probing pairs degrade to unverifiable: {}",
+                    "v2 check returned no verdicts; all probing pairs degrade to unverifiable: {}",
                     e
                 );
                 let reason = format!("type check did not run: {}", e);
@@ -3810,6 +3819,22 @@ mod tests {
     /// operation, and both services' repo data. `None` when the sidecar is
     /// not built.
     fn corpus_pair() -> Option<(TypeSidecar, OperationKey, Vec<CloudRepoData>)> {
+        corpus_pair_with(&[])
+    }
+
+    /// One more response pair beside the corpus-2 pair: its operation, and the
+    /// literal type text each side is captured from.
+    struct LiteralPair {
+        key: OperationKey,
+        producer_type: &'static str,
+        consumer_type: &'static str,
+    }
+
+    /// `corpus_pair`, with each of `extra` captured into the same two stubs as
+    /// one more matched pair.
+    fn corpus_pair_with(
+        extra: &[LiteralPair],
+    ) -> Option<(TypeSidecar, OperationKey, Vec<CloudRepoData>)> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
         if !sidecar_path.exists() {
@@ -3845,17 +3870,93 @@ mod tests {
         );
 
         // Capture both services (symbol anchors on each side's OrderPlaced).
+        let mut orders_anchors = vec![CaptureAnchor::Symbol {
+            alias: producer_alias.clone(),
+            symbol_name: "OrderPlaced".to_string(),
+            source_file: "src/types/order.ts".to_string(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: None,
+        }];
+        let mut billing_anchors = vec![CaptureAnchor::Symbol {
+            alias: consumer_alias.clone(),
+            symbol_name: "OrderPlaced".to_string(),
+            source_file: "src/types/billing.ts".to_string(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: None,
+        }];
+        let mut orders_manifest = vec![entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            &producer_alias,
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Explicit,
+        )];
+        let mut billing_manifest = vec![entry(
+            key.clone(),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            &consumer_alias,
+            "src/billing-call.ts",
+            5,
+            ManifestTypeState::Explicit,
+        )];
+        for (index, pair) in extra.iter().enumerate() {
+            let line = 100 + index as u32;
+            let producer = build_manifest_type_alias(
+                &pair.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            );
+            let site = crate::type_manifest::build_site_id(
+                "src/billing-call.ts",
+                line,
+                &pair.key,
+                billing_repo.to_str().unwrap(),
+            );
+            let consumer = build_manifest_type_alias_with_site_id(
+                &pair.key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                Some(&site),
+            );
+            orders_anchors.push(CaptureAnchor::Literal {
+                alias: producer.clone(),
+                type_text: pair.producer_type.to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+            });
+            billing_anchors.push(CaptureAnchor::Literal {
+                alias: consumer.clone(),
+                type_text: pair.consumer_type.to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+            });
+            orders_manifest.push(entry(
+                pair.key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                &producer,
+                "src/routes.ts",
+                line,
+                ManifestTypeState::Explicit,
+            ));
+            billing_manifest.push(entry(
+                pair.key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                &consumer,
+                "src/billing-call.ts",
+                line,
+                ManifestTypeState::Explicit,
+            ));
+        }
         let (orders_stub, orders_artifact) = run_capture(
             &sidecar,
             orders_repo.to_str().unwrap(),
             "orders-engine",
-            &[CaptureAnchor::Symbol {
-                alias: producer_alias.clone(),
-                symbol_name: "OrderPlaced".to_string(),
-                source_file: "src/types/order.ts".to_string(),
-                anchor_origin: AnchorOrigin::LlmSymbol,
-                array_depth: None,
-            }],
+            &orders_anchors,
             &HashMap::new(),
             None,
         )
@@ -3864,13 +3965,7 @@ mod tests {
             &sidecar,
             billing_repo.to_str().unwrap(),
             "billing-svc",
-            &[CaptureAnchor::Symbol {
-                alias: consumer_alias.clone(),
-                symbol_name: "OrderPlaced".to_string(),
-                source_file: "src/types/billing.ts".to_string(),
-                anchor_origin: AnchorOrigin::LlmSymbol,
-                array_depth: None,
-            }],
+            &billing_anchors,
             &HashMap::new(),
             None,
         )
@@ -3882,29 +3977,13 @@ mod tests {
             repo(
                 "orders-engine",
                 None,
-                vec![entry(
-                    key.clone(),
-                    ManifestRole::Producer,
-                    ManifestTypeKind::Response,
-                    &producer_alias,
-                    "src/routes.ts",
-                    3,
-                    ManifestTypeState::Explicit,
-                )],
+                orders_manifest,
                 Some(orders_artifact),
             ),
             repo(
                 "billing-svc",
                 None,
-                vec![entry(
-                    key.clone(),
-                    ManifestRole::Consumer,
-                    ManifestTypeKind::Response,
-                    &consumer_alias,
-                    "src/billing-call.ts",
-                    5,
-                    ManifestTypeState::Explicit,
-                )],
+                billing_manifest,
                 Some(billing_artifact),
             ),
         ];
@@ -3922,6 +4001,58 @@ mod tests {
         let Some((sidecar, _key, mut all_repo_data)) = corpus_pair() else {
             return;
         };
+        break_the_install(&mut all_repo_data);
+
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
+        assert_reads_the_installers_words(&outcomes[0]);
+    }
+
+    /// carrick#1833: a failed install leaves standing every verdict the
+    /// capture had already decided. The sidecar still answers one verdict per
+    /// pair when its install fails; a pair whose consumer type carries a deep
+    /// `any` keeps `gate_caught_baked_any`, while the pair the check would
+    /// have probed says the install stopped it.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_failed_install_keeps_the_verdicts_the_capture_decided() {
+        let Some((sidecar, _key, mut all_repo_data)) = corpus_pair_with(&[LiteralPair {
+            key: OperationKey::http("GET", "/orders/summary"),
+            producer_type: "{ id: string; total: number }",
+            consumer_type: "{ id: string; total: any }",
+        }]) else {
+            return;
+        };
+        break_the_install(&mut all_repo_data);
+
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        assert_eq!(outcomes.len(), 2, "two matched pairs: {outcomes:?}");
+        let outcome_of = |path: &str| {
+            outcomes
+                .iter()
+                .find(|o| o.identity == path)
+                .unwrap_or_else(|| panic!("no outcome for {path}: {outcomes:?}"))
+        };
+
+        let decided = outcome_of("/orders/summary");
+        assert_eq!(
+            decided.bucket,
+            VerdictBucket::GateCaughtBakedAny,
+            "the capture's verdict stands: {decided:?}"
+        );
+        assert_eq!(decided.gate.as_deref(), Some("capture:consumer:any"));
+        let reason = decided.unresolved_reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("'any'") && !reason.contains("install"),
+            "the reason is the capture's, not the install's: {reason}"
+        );
+
+        assert_reads_the_installers_words(outcome_of("/orders/latest"));
+    }
+
+    /// Gives the producer's stub a dependency at a directory that does not
+    /// exist, which the vendored pnpm refuses before it reaches any registry.
+    fn break_the_install(all_repo_data: &mut [CloudRepoData]) {
         let manifest = all_repo_data[0]
             .capture_stub
             .as_mut()
@@ -3933,14 +4064,15 @@ mod tests {
         pkg["dependencies"]["carrick-absent-dependency"] =
             serde_json::json!("file:./does-not-exist");
         *manifest = pkg.to_string();
+    }
 
-        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
-        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
-        let outcome = &outcomes[0];
-        assert_eq!(outcome.bucket, VerdictBucket::Unverifiable);
+    /// The pair the install stopped is unverifiable, and says why in the
+    /// installer's own words with no scratch path.
+    fn assert_reads_the_installers_words(outcome: &PairCheckOutcome) {
+        assert_eq!(outcome.bucket, VerdictBucket::Unverifiable, "{outcome:?}");
         let reason = outcome.unresolved_reason.as_deref().unwrap_or("");
         assert!(
-            reason.contains("workspace dependency install failed: ")
+            reason.contains("workspace dependency install failed")
                 && reason.contains("ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND"),
             "the reason must carry the installer's output: {reason}"
         );

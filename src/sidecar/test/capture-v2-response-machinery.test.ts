@@ -367,7 +367,7 @@ describe('carrick#371 check: wrapped response envelope yields no false mismatch'
       workspaceRoot: workRoot,
     });
     assert.strictEqual(res.success, true, JSON.stringify(res.errors));
-    assert.strictEqual(res.install_ok, true, res.install_error);
+    assert.strictEqual(res.install_ok, true, JSON.stringify(res.errors));
     verdicts = new Map(res.verdicts.map((v) => [v.pair_key, v]));
   });
 

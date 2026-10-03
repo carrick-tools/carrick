@@ -321,6 +321,8 @@ Terminal frame (`result` is a `CheckResult`, abbreviated):
 }
 ```
 
+A check that fails part way (no vendored pnpm, a failed install, a compiler that exits with nothing to parse) still answers its `result` beside `status: "error"`, with one verdict per pair. A pair the failure stopped is `unverifiable` and its `diagnostic` names the failure with the installer's or compiler's output. A pair the capture had already decided (a deep `any` or `unknown`) keeps that verdict. `errors` says why the run failed. A frame with no `result` failed before it could judge any pair.
+
 A verdict's `diagnostic` (present on a mismatch) is the compiler's own text, followed by the fields that differ: which side does not send a field the other requires, which field is sent under a name the other does not declare, which are optional on one side and always present on the other, and where two member types disagree. The list is capped and says how many it did not name. It is walked over the same two types the judge compared, with the compiler's own assignability relation, so it never names a field the verdict does not rest on and never changes a verdict.
 
 An `http` pair is judged on the form JSON puts on the wire. A value with a `toJSON()` method travels as what it serialises to, so a producer returning `Date` where the consumer reads `string` is not a drift, and a consumer that sends a `Date` in a request body satisfies a producer declaring `string`. The transform applies to the SENDING side in each direction, which is where serialisation happens: a consumer declaring `Date` for a response is still a mismatch, because no `Date` ever arrives. `bigint` is left alone — `JSON.stringify` throws on one, so it is a real problem, not a wire difference.

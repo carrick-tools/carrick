@@ -924,6 +924,8 @@ pub struct DegradedService {
 /// Result of a `check_v2` action (mirrors `CheckResult`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CheckV2Result {
+    /// `false` when the check failed part way (`errors` says why); every
+    /// verdict still stands, each with its own reason.
     pub success: bool,
     #[serde(default)]
     pub workspace_dir: String,
@@ -2042,6 +2044,13 @@ impl TypeSidecar {
     /// `status: "progress"` keepalive frames before the terminal frame;
     /// `read_result_value` skips them, so the per-frame deadline only has to
     /// outlive the keepalive interval, not the whole install.
+    ///
+    /// A check that failed (an install, an abnormal tsc, no pnpm) still
+    /// answers a result with one verdict per pair, under an `error` frame:
+    /// each pair it stopped says why, and a pair the capture had already
+    /// decided keeps that verdict (carrick#1833). So any frame that carries a
+    /// result is `Ok`, and `result.success` says whether the check ran. Only
+    /// a frame with no result is an error, and its `errors` say why.
     pub fn check_v2(
         &self,
         stubs: &[CheckStubInput],
@@ -2067,18 +2076,11 @@ impl TypeSidecar {
         // Keepalives arrive every ~1.5s during install/check, so a per-frame
         // deadline detects a dead sidecar without capping the install itself.
         let value = self.read_result_value(&request_id, OPERATION_TIMEOUT)?;
-        // The sidecar answers `error` exactly when the check failed, and puts
-        // why (an install's output, an abnormal tsc) in `errors`.
-        if value.get("status").and_then(|s| s.as_str()) != Some("success") {
+        let Some(result) = value.get("result").cloned() else {
             return Err(SidecarError::CheckFailed(frame_errors(&value)));
-        }
-        serde_json::from_value(
-            value
-                .get("result")
-                .cloned()
-                .ok_or_else(|| SidecarError::CheckFailed("no result in response".into()))?,
-        )
-        .map_err(|e| SidecarError::DeserializationError(e.to_string()))
+        };
+        serde_json::from_value(result)
+            .map_err(|e| SidecarError::DeserializationError(e.to_string()))
     }
 
     /// Resolve all types (explicit + inferred) in a single operation.

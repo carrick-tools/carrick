@@ -148,21 +148,25 @@ export async function runCheck(
   // to a flat npm install that manufactures nominal false-incompatibles. Fail
   // explicitly instead (design Check step 2).
   if (!fs.existsSync(pnpmPath)) {
-    const planned = planPairs(opts, (s) => `@carrick/${s}`);
+    // Capture-decay verdicts stand without isolation too (carrick#1833).
+    const { preGated, probing } = preGate(
+      planPairs(opts, (s) => `@carrick/${s}`),
+      readStubAliasRecords(opts.stubs)
+    );
     return {
       success: false,
       workspace_dir: '',
       isolation: 'unavailable',
       install_ok: false,
-      install_error: 'vendored pnpm not found; type isolation is unavailable',
       ts_version: tsVersion,
-      verdicts: sortVerdicts(
-        unverifiableAll(
-          planned,
+      verdicts: sortVerdicts([
+        ...unverifiableAll(
+          probing,
           'isolation:unavailable',
           'type isolation unavailable (pnpm missing); compatibility cannot be verified.'
-        )
-      ),
+        ),
+        ...preGated,
+      ]),
       degraded_services: opts.stubs.map((s) => ({
         service_name: s.service_name,
         reason: 'isolation unavailable',
@@ -209,48 +213,7 @@ export async function runCheck(
     v.pair_id = fnvOfSpec(spec);
   }
 
-  // Capture-time deep-decay pre-gate (adversarial-review finding 1): a
-  // member-level `any`/`unknown` recorded by the capture self-check with no
-  // failing-external explanation. The probe gates below are WHOLE-type only
-  // — `{ orderId: string; metadata: any }` sails through IsAny and the
-  // assignment compiles clean — so such pairs must never reach a probe.
-  // `any` routes to gate_caught_baked_any, `unknown` to unverifiable; both
-  // read as None downstream, never compatible.
-  const aliasRecords = readStubAliasRecords(opts.stubs);
-  const preGated: CheckVerdict[] = [];
-  const probing: ProbePlan[] = [];
-  for (const plan of plans) {
-    const hit = deepDecayOf(plan, aliasRecords);
-    if (!hit) {
-      probing.push(plan);
-      continue;
-    }
-    preGated.push({
-      pair_id: plan.pairId,
-      pair_key: plan.spec.pair_key,
-      // `any` is a confirmed baked top type -> gate_caught_baked_any; `unknown`
-      // and `budget_exhausted` (a subtree the capture walk could not finish)
-      // are "cannot verify" -> unverifiable. All read as None downstream.
-      bucket: hit.kind === 'any' ? 'gate_caught_baked_any' : 'unverifiable',
-      gate: `capture:${hit.side}:${hit.kind}`,
-      diagnostic:
-        hit.kind === 'budget_exhausted'
-          ? `the ${hit.side} type is too deep or wide to verify within the ` +
-            `capture budget (at '${hit.path}'); compatibility cannot be ` +
-            `verified — abstaining so a buried 'any' can never read compatible.`
-          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}' from ` +
-            `capture; compatibility cannot be verified (a partially-unresolved ` +
-            `type would let an arbitrary shape read compatible).`,
-      codes: [],
-      resolved: false,
-      unresolved_side: hit.side,
-      unresolved_reason:
-        hit.kind === 'budget_exhausted'
-          ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`
-          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}'`,
-      notes: [],
-    });
-  }
+  const { preGated, probing } = preGate(plans, readStubAliasRecords(opts.stubs));
   writeProbes(ws, probing);
 
   const errors: string[] = [];
@@ -259,15 +222,14 @@ export async function runCheck(
   // ---- Install (async, off the event loop) --------------------------------
   progress('installing', 'installing pinned dependencies');
   const install = await runProcess(pnpmPath, ['install'], ws.workspaceDir);
-  const installOk = install.code === 0;
-  let installError: string | undefined;
-  if (!installOk) {
-    installError = scrubPaths(
+  if (install.code !== 0) {
+    const installError = scrubPaths(
       (install.stderr || install.stdout).trim().slice(0, 2000),
       scrubCtx
     );
-    // The client reads why a check failed from `errors` (carrick#1821), as it
-    // does for an abnormal tsc below.
+    // `errors` says why the run failed (carrick#1821); each pair the install
+    // stopped says it too, because the client reads every pair's own verdict
+    // on a failed check (carrick#1833).
     errors.push(`workspace dependency install failed${installError ? `: ${installError}` : ''}`);
     for (const s of opts.stubs) {
       degraded.push({ service_name: s.service_name, reason: 'workspace install failed' });
@@ -276,7 +238,8 @@ export async function runCheck(
       ...unverifiableAll(
         probing,
         'install:failed',
-        'workspace dependency install failed; compatibility cannot be verified.'
+        'workspace dependency install failed; compatibility cannot be verified.' +
+          (installError ? ` Installer output: ${installError}` : '')
       ),
       // Capture-decay verdicts stand regardless of the install outcome.
       ...preGated,
@@ -288,7 +251,6 @@ export async function runCheck(
       workspace_dir: cleanup ? '' : ws.workspaceDir,
       isolation: 'pnpm',
       install_ok: false,
-      install_error: installError,
       ts_version: tsVersion,
       verdicts,
       degraded_services: degraded,
@@ -331,7 +293,9 @@ export async function runCheck(
       ...unverifiableAll(
         probing,
         'tsc:abnormal-termination',
-        'the type checker terminated abnormally; compatibility cannot be verified.'
+        `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'}); ` +
+          'compatibility cannot be verified.' +
+          (excerpt ? ` Compiler output: ${excerpt}` : '')
       ),
       ...preGated,
       ...unresolved,
@@ -438,6 +402,57 @@ interface DeepDecayHit {
   side: 'producer' | 'consumer';
   kind: 'any' | 'unknown' | 'budget_exhausted';
   path: string;
+}
+
+/**
+ * Capture-time deep-decay pre-gate (adversarial-review finding 1): a
+ * member-level `any`/`unknown` recorded by the capture self-check with no
+ * failing-external explanation. The probe gates are WHOLE-type only —
+ * `{ orderId: string; metadata: any }` sails through IsAny and the assignment
+ * compiles clean — so such pairs must never reach a probe. `any` routes to
+ * gate_caught_baked_any, `unknown` to unverifiable; both read as None
+ * downstream, never compatible. These verdicts come from the capture alone,
+ * so they stand whatever the install or the compiler then does (carrick#1833).
+ */
+function preGate(
+  plans: ProbePlan[],
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): { preGated: CheckVerdict[]; probing: ProbePlan[] } {
+  const preGated: CheckVerdict[] = [];
+  const probing: ProbePlan[] = [];
+  for (const plan of plans) {
+    const hit = deepDecayOf(plan, aliasRecords);
+    if (!hit) {
+      probing.push(plan);
+      continue;
+    }
+    preGated.push({
+      pair_id: plan.pairId,
+      pair_key: plan.spec.pair_key,
+      // `any` is a confirmed baked top type -> gate_caught_baked_any; `unknown`
+      // and `budget_exhausted` (a subtree the capture walk could not finish)
+      // are "cannot verify" -> unverifiable. All read as None downstream.
+      bucket: hit.kind === 'any' ? 'gate_caught_baked_any' : 'unverifiable',
+      gate: `capture:${hit.side}:${hit.kind}`,
+      diagnostic:
+        hit.kind === 'budget_exhausted'
+          ? `the ${hit.side} type is too deep or wide to verify within the ` +
+            `capture budget (at '${hit.path}'); compatibility cannot be ` +
+            `verified — abstaining so a buried 'any' can never read compatible.`
+          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}' from ` +
+            `capture; compatibility cannot be verified (a partially-unresolved ` +
+            `type would let an arbitrary shape read compatible).`,
+      codes: [],
+      resolved: false,
+      unresolved_side: hit.side,
+      unresolved_reason:
+        hit.kind === 'budget_exhausted'
+          ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`
+          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}'`,
+      notes: [],
+    });
+  }
+  return { preGated, probing };
 }
 
 /** First side (producer, then consumer) whose capture recorded a deep decay. */

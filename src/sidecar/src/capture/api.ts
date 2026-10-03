@@ -486,8 +486,6 @@ export interface CheckResult {
    * missing (soundness over availability — pinned design, Check step 2). */
   isolation: 'pnpm' | 'unavailable';
   install_ok: boolean;
-  /** Scrubbed install-failure summary when install_ok is false. */
-  install_error?: string;
   ts_version: string;
   /** Verdicts, sorted by pair_id for byte-stable output. */
   verdicts: CheckVerdict[];

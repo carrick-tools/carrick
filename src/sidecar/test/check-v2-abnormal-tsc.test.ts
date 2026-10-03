@@ -108,6 +108,11 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
       assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
       assert.strictEqual(v.gate, 'tsc:abnormal-termination');
       assert.match(v.diagnostic ?? '', /terminated abnormally/);
+      // carrick#1833: the scanner reads each pair's own verdict on a failed
+      // check, so the compiler's output rides the verdict, not only `errors`.
+      assert.match(v.diagnostic ?? '', /exit code 1/);
+      assert.match(v.diagnostic ?? '', /TS18003/);
+      assert.strictEqual(v.unresolved_reason, v.diagnostic);
     }
     assert.strictEqual(result.degraded_services.length, 2);
     assert.match(result.errors.join('\n'), /exit code 1/);
@@ -121,6 +126,7 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     for (const v of result.verdicts) {
       assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
       assert.strictEqual(v.gate, 'tsc:abnormal-termination');
+      assert.match(v.diagnostic ?? '', /exit code null/);
     }
     assert.match(result.errors.join('\n'), /exit code null/);
   });
