@@ -152,6 +152,12 @@ export interface InitRequest extends BaseRequest {
   action: 'init';
   repo_root: string;
   tsconfig_path?: string;
+  /**
+   * The scanned repo's root: with no tsconfig named or in `repo_root`, the
+   * nearest `tsconfig.json` above `repo_root` up to this root types the
+   * service (carrick#1776). Without it only `repo_root` is searched.
+   */
+  scan_root?: string;
   /** Optional tsconfig snapshot (closed/merged) - preferred over tsconfig_path */
   tsconfig_snapshot?: TsconfigSnapshot;
   /** Optional pinned dependencies for this repo */
@@ -185,6 +191,8 @@ export interface CaptureV2Request extends BaseRequest {
   out_dir: string;
   /** Optional explicit tsconfig path (defaults to <repo_root>/tsconfig.json) */
   tsconfig_path?: string;
+  /** The scanned repo's root, as on `init` (carrick#1776). */
+  scan_root?: string;
 }
 
 /**

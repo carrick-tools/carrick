@@ -115,6 +115,8 @@ Re-initialising re-scopes the sidecar to another root, and drops the previous pr
 
 `tsconfig_path` is optional and relative to `repo_root`. `tsconfig_snapshot` and `pinned_dependencies` are optional and carry another repo's compiler options / exact versions when the sidecar has to stand in for a tree it cannot see.
 
+With no `tsconfig_path`, the project is built from `tsconfig.json`, `tsconfig.build.json` or `tsconfig.app.json` in `repo_root`, else from the nearest `tsconfig.json` in a directory above it, searched the way `tsc` searches and no higher than `scan_root`, the scanned repo's root. `capture_v2` takes the same `scan_root` and finds the same config. Without `scan_root` only `repo_root` is searched, and a service with no config there is built with default options (carrick#1776).
+
 When the tsconfig `references` other projects, each file is typed under the project that owns it, found the way TypeScript's editor finds a file's project: the named config if it lists the file, else the first project its references reach (depth-first, in declared order) that does. `infer`, `bundle` and `retype_check` are answered by that project's program, built the first time a request needs it. `capture_v2` resolves each anchor in its owner's program and emits the surface once, under the project that owns the most anchors; an anchor from another project whose text names a module is demoted when the two projects' options differ. A file no project lists, and a request that names no file, uses the named tsconfig. A reference that cannot be read is skipped and reported (carrick#1604).
 
 #### Deno projects
@@ -182,7 +184,8 @@ An anchor is one of four kinds, discriminated on `kind`:
 {
   "request_id": "2",
   "action": "capture_v2",
-  "repo_root": "/absolute/path/to/repo",
+  "repo_root": "/absolute/path/to/repo/services/orders-api",
+  "scan_root": "/absolute/path/to/repo",
   "service_name": "orders-api",
   "out_dir": "/absolute/path/to/.carrick/stubs/orders-api",
   "tsconfig_path": "tsconfig.json",

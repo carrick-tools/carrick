@@ -178,6 +178,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
+      scanRoot: request.scan_root,
       tsconfigSnapshot: request.tsconfig_snapshot,
       pinnedDependencies: request.pinned_dependencies,
     });
@@ -279,6 +280,7 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
       anchors: request.anchors,
       outDir: request.out_dir,
       tsconfigPath: request.tsconfig_path,
+      scanRoot: request.scan_root,
     });
     return {
       request_id: request.request_id,

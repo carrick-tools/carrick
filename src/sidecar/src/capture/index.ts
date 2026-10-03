@@ -49,12 +49,14 @@ import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
+import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { serviceConfigPath } from './project-references.js';
+export { findServiceTsconfig } from './service-config.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
@@ -150,9 +152,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const stubDir = path.resolve(opts.outDir);
   const errors: string[] = [];
 
+  // The named config, else the one the init'd project reads too
+  // (carrick#1776). A service with neither is typed under defaults below.
   const configPath = opts.tsconfigPath
     ? path.resolve(repoRoot, opts.tsconfigPath)
-    : path.join(repoRoot, 'tsconfig.json');
+    : findServiceTsconfig(repoRoot, opts.scanRoot) ?? path.join(repoRoot, 'tsconfig.json');
 
   let parsed: ts.ParsedCommandLine | undefined;
   // The config the emit's options came from: the named one, or the project

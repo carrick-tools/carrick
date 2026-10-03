@@ -14,7 +14,7 @@ import { Project, type CompilerOptions } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
-import { DenoProject, findDenoConfig, serviceConfigPath } from './capture/index.js';
+import { DenoProject, findDenoConfig, findServiceTsconfig, serviceConfigPath } from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 
@@ -26,6 +26,12 @@ export interface ProjectLoaderOptions {
   repoRoot: string;
   /** Optional path to tsconfig.json (relative to repo root or absolute) */
   tsconfigPath?: string;
+  /**
+   * The scanned repo's root, the upper bound of the search for a tsconfig
+   * above `repoRoot` when none is named (carrick#1776). Without it only
+   * `repoRoot` is searched.
+   */
+  scanRoot?: string;
   /** Optional tsconfig snapshot (closed/merged) - preferred over tsconfigPath */
   tsconfigSnapshot?: TsconfigSnapshot;
   /** Optional pinned dependencies for this repo */
@@ -156,6 +162,7 @@ export class ProjectLoader {
   private readonly ownerProjects = new Map<string, Project>();
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
+  private readonly scanRoot: string | undefined;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
   private readonly pinnedDependencies: PinnedDependencySnapshot | undefined;
   private initialized: boolean = false;
@@ -174,6 +181,8 @@ export class ProjectLoader {
         ? options.tsconfigPath
         : path.resolve(this.repoRoot, options.tsconfigPath);
     }
+
+    this.scanRoot = options.scanRoot;
 
     // Store snapshot if provided
     this.tsconfigSnapshot = options.tsconfigSnapshot;
@@ -475,33 +484,19 @@ export class ProjectLoader {
   }
 
   /**
-   * Find the tsconfig.json file to use
+   * The tsconfig to build from: the named one when it exists, else the one
+   * `findServiceTsconfig` finds for the service, which capture also reads.
    *
-   * @returns Absolute path to tsconfig.json, or undefined if not found
+   * @returns Absolute path to the tsconfig, or undefined if not found
    */
   private findTsConfig(): string | undefined {
-    // If a specific path was provided, try to use it
     if (this.tsconfigPath) {
       if (fs.existsSync(this.tsconfigPath)) {
         return this.tsconfigPath;
       }
       this.log(`Specified tsconfig not found: ${this.tsconfigPath}`);
     }
-
-    // Try common tsconfig locations
-    const candidates = [
-      path.join(this.repoRoot, 'tsconfig.json'),
-      path.join(this.repoRoot, 'tsconfig.build.json'),
-      path.join(this.repoRoot, 'tsconfig.app.json'),
-    ];
-
-    for (const candidate of candidates) {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    }
-
-    return undefined;
+    return findServiceTsconfig(this.repoRoot, this.scanRoot);
   }
 
   /**

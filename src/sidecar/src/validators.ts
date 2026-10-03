@@ -163,6 +163,7 @@ export const InitRequestSchema = BaseRequestSchema.extend({
   action: z.literal('init'),
   repo_root: z.string().min(1, 'Repo root cannot be empty'),
   tsconfig_path: z.string().optional(),
+  scan_root: z.string().min(1).optional(),
   tsconfig_snapshot: TsconfigSnapshotSchema.optional(),
   pinned_dependencies: PinnedDependencySnapshotSchema.optional(),
 });
@@ -223,6 +224,7 @@ export const CaptureV2RequestSchema = BaseRequestSchema.extend({
   anchors: z.array(CaptureAnchorRequestSchema).min(1, 'At least one anchor is required'),
   out_dir: z.string().min(1, 'Output dir cannot be empty'),
   tsconfig_path: z.string().optional(),
+  scan_root: z.string().min(1).optional(),
 });
 
 const CheckStubInputSchema = z.object({

@@ -323,6 +323,12 @@ export interface CaptureStubOptions {
   /** Directory the stub package is written into (created if missing). */
   outDir: string;
   tsconfigPath?: string;
+  /**
+   * The scanned repo's root, the upper bound of the search for a tsconfig
+   * above `repoRoot` when none is named (carrick#1776). Without it only
+   * `repoRoot` is searched.
+   */
+  scanRoot?: string;
 }
 
 // ===========================================================================

@@ -955,6 +955,8 @@ enum SidecarRequest {
         repo_root: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tsconfig_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_root: Option<String>,
     },
     #[serde(rename = "bundle")]
     Bundle {
@@ -977,6 +979,8 @@ enum SidecarRequest {
         out_dir: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tsconfig_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_root: Option<String>,
     },
     #[serde(rename = "check_v2")]
     CheckV2 {
@@ -1473,6 +1477,10 @@ pub struct TypeSidecar {
     /// that reads the init'd project for one service checks this before
     /// re-initialising, because a re-init drops the built program.
     scope: Mutex<Option<(PathBuf, Option<String>)>>,
+    /// The scanned repo's root, sent with every `init` and `capture_v2`: a
+    /// service with no tsconfig of its own is typed under the nearest one
+    /// above it, searched up to this root and no further (carrick#1776).
+    scan_root: Mutex<Option<PathBuf>>,
 }
 
 impl TypeSidecar {
@@ -1565,7 +1573,23 @@ impl TypeSidecar {
             spawn_time,
             request_counter: Mutex::new(0),
             scope: Mutex::new(None),
+            scan_root: Mutex::new(None),
         })
+    }
+
+    /// Name the scanned repo's root: the upper bound of the sidecar's search
+    /// for a tsconfig above a service that has none of its own (carrick#1776).
+    /// Until it is set, only the service root is searched.
+    pub fn set_scan_root(&self, root: &Path) {
+        *self.scan_root.lock().unwrap() = Some(root.to_path_buf());
+    }
+
+    fn scan_root_arg(&self) -> Option<String> {
+        self.scan_root
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|root| root.to_string_lossy().into_owned())
     }
 
     /// Start initialization of the TypeScript project.
@@ -1595,6 +1619,7 @@ impl TypeSidecar {
             request_id: self.next_request_id(),
             repo_root: repo_root_str,
             tsconfig_path: tsconfig,
+            scan_root: self.scan_root_arg(),
         };
 
         if let Err(e) = self.send_request(&request) {
@@ -1990,6 +2015,7 @@ impl TypeSidecar {
             anchors: anchors.to_vec(),
             out_dir: out_dir.to_string(),
             tsconfig_path: tsconfig_path.map(str::to_owned),
+            scan_root: self.scan_root_arg(),
         };
 
         self.send_request(&request)?;
@@ -2912,13 +2938,15 @@ mod tests {
     fn test_sidecar_request_init_serialization() {
         let request = SidecarRequest::Init {
             request_id: "req-1".to_string(),
-            repo_root: "/path/to/repo".to_string(),
+            repo_root: "/path/to/repo/apps/web".to_string(),
             tsconfig_path: Some("tsconfig.json".to_string()),
+            scan_root: Some("/path/to/repo".to_string()),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""action":"init""#));
         assert!(json.contains(r#""request_id":"req-1""#));
-        assert!(json.contains(r#""repo_root":"/path/to/repo""#));
+        assert!(json.contains(r#""repo_root":"/path/to/repo/apps/web""#));
+        assert!(json.contains(r#""scan_root":"/path/to/repo""#));
     }
 
     #[test]
