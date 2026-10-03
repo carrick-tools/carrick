@@ -1,0 +1,144 @@
+#!/bin/bash
+#
+# Carrick Pre-Commit Hook
+# Runs formatting checks, linter, and tests before allowing a commit.
+#
+# This file is the tracked source. `scripts/install-hooks.sh` copies it into
+# the repository's hooks directory, which every worktree of the clone shares.
+#
+
+set -euo pipefail  # Exit on error and fail pipelines
+
+# Isolate child processes (notably Rust tests that `git init` throwaway repos in
+# tempdirs) from the ambient GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE that git
+# sets for this hook. Without this a test's `git add .` targets THIS repo's
+# index, and inside a linked worktree it corrupts the worktree index mid-commit
+# (it produced bogus "delete the whole repo" trees during the eval work).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "🪢 Carrick Pre-Commit Hook"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# The installed hook is a copy, so a change to this file reaches a committer
+# only after the installer runs again. Say so when the two differ.
+TRACKED_HOOK="$REPO_ROOT/scripts/hooks/pre-commit"
+if [ -f "$TRACKED_HOOK" ] && ! cmp -s "$0" "$TRACKED_HOOK"; then
+    echo "ℹ️  The installed hook differs from scripts/hooks/pre-commit in this checkout."
+    echo "   To install this checkout's copy: ./scripts/install-hooks.sh"
+fi
+
+cd "$REPO_ROOT"
+
+# Check if CARRICK_API_ENDPOINT is set
+if [ -z "${CARRICK_API_ENDPOINT:-}" ]; then
+    echo "⚠️  CARRICK_API_ENDPOINT not set, using default for testing"
+    export CARRICK_API_ENDPOINT="https://test.example.com"
+fi
+
+# Run cargo fmt check
+echo ""
+echo "Checking code formatting..."
+echo ""
+
+if ! cargo fmt --check; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Code formatting issues found! Commit blocked."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Run 'cargo fmt' to fix formatting issues and try again."
+    echo "To bypass this hook (not recommended): git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+echo "✅ Code formatting looks good!"
+
+# Run clippy
+echo ""
+echo "Running clippy linter..."
+echo ""
+
+# Not captured to a file (carrick#740). A fixed path under /tmp is one file
+# shared by every checkout of this repo, so two hooks running at once delete
+# each other's copy mid-run and the second commit fails on a missing file
+# rather than on a failing check. Nothing ever read this one back.
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Clippy warnings found! Commit blocked."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Fix the clippy warnings and try again."
+    echo "To bypass this hook (not recommended): git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+echo "✅ Clippy checks passed!"
+
+# Build the type sidecar first: several integration tests spawn
+# src/sidecar/dist and either fail against a stale build or skip silently
+# when there is none, so a green run on an old dist proves nothing.
+#
+# A fresh `git worktree add` has no src/sidecar/node_modules, and the build
+# died there on `tsc: command not found`, which is why agents committed around
+# this hook (carrick#1363). npm writes node_modules/.package-lock.json on every
+# install: no such file means the checkout was never installed, and one older
+# than package-lock.json means the dependencies changed since.
+if [ -f src/sidecar/package.json ]; then
+    INSTALL_MARKER=src/sidecar/node_modules/.package-lock.json
+    if [ ! -f "$INSTALL_MARKER" ] || [ src/sidecar/package-lock.json -nt "$INSTALL_MARKER" ]; then
+        echo ""
+        echo "Installing sidecar dependencies (npm ci in src/sidecar): this checkout has none, or its lockfile changed..."
+        if ! (cd src/sidecar && npm ci --no-audit --no-fund); then
+            echo ""
+            echo "❌ Sidecar install failed. Run: cd src/sidecar && npm ci"
+            exit 1
+        fi
+    fi
+    echo ""
+    echo "Building type sidecar..."
+    if ! (cd src/sidecar && npm run build --silent); then
+        echo ""
+        echo "❌ Sidecar build failed. Run: cd src/sidecar && npm ci && npm run build"
+        exit 1
+    fi
+    echo "✅ Sidecar built"
+fi
+
+# Run Rust tests
+echo ""
+echo "Running Rust test suite..."
+echo ""
+
+# Not captured either, and for the same reason: the only thing ever read back
+# out of this capture was a count nothing printed.
+if cargo test --quiet 2>&1; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ Rust tests passed!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+else
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Tests failed! Commit blocked."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Fix the failing tests and try again."
+    echo "To bypass this hook (not recommended): git commit --no-verify"
+    echo ""
+
+    exit 1
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ All tests passed!"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+exit 0
