@@ -1705,12 +1705,10 @@ impl Reader<'_> {
         let mut out = HashMap::new();
         for item in &module.body {
             // `export let` publishes the binding: an importer may write it.
+            // A `const` is never written, so it has no write to read.
             let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
                 continue;
             };
-            if var.kind == VarDeclKind::Const {
-                continue;
-            }
             for declarator in &var.decls {
                 let Pat::Ident(ident) = &declarator.name else {
                     continue;
@@ -2097,9 +2095,9 @@ fn holds_nothing(init: &Expr) -> bool {
 }
 
 /// Whether a module `let`'s uses across its file are only tests, comparisons
-/// and returns, with at least one return (carrick#1790): nothing is called,
-/// constructed or read through it, it is handed nowhere, spread, written
-/// through or exported.
+/// and returns (carrick#1790): nothing is called, constructed or read
+/// through it, and it is handed nowhere, spread, written through or
+/// exported.
 fn only_tested_and_returned(used: &BindingUse) -> bool {
     !used.written
         && !used.member_read
@@ -2109,7 +2107,6 @@ fn only_tested_and_returned(used: &BindingUse) -> bool {
         && !used.exported
         && used.called.is_empty()
         && used.library_calls.is_empty()
-        && !used.returned_at.is_empty()
 }
 
 /// Whether `expr` is the binding `key`, through parentheses and type
@@ -4612,6 +4609,23 @@ mod tests {
                 declared,
                 "export function direct() { if (lazy) { lazy.pause(); } }",
             ),
+            (
+                declared,
+                "export function sub() { if (lazy) { lazy.jobs.list(); } }",
+            ),
+            (
+                declared,
+                "export function keyed(k: string) { if (lazy) { lazy[k](); } }",
+            ),
+            (
+                declared,
+                "export function peek() { if (lazy) { register(lazy.name); } }",
+            ),
+            (
+                declared,
+                "export function poke() { if (lazy) { lazy.name = \"x\"; } }",
+            ),
+            (declared, "export function copy() { return { ...lazy }; }"),
             (
                 declared,
                 "export function swap() { lazy = new Queue(\"other\"); }",
