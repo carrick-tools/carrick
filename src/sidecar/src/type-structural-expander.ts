@@ -35,6 +35,7 @@ import {
   foldBooleanLiterals,
 } from './type-text-canonicalizer.js';
 import { isExternalOrigin, type ExternalImports } from './origin.js';
+import { notePrintedType } from './printed-names.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -570,8 +571,17 @@ export function namedText(type: Type): string {
   return canonicalizeUnionsInText(compilerText(type));
 }
 
-/** The compiler's print, with the two fallbacks. */
+/**
+ * The compiler's print, with the two fallbacks. The print writes names bare,
+ * whatever scope reads it, so it is noted for the inference (carrick#1836).
+ */
 function compilerText(type: Type): string {
+  const text = compilerPrint(type);
+  notePrintedType(type, undefined, text);
+  return text;
+}
+
+function compilerPrint(type: Type): string {
   try {
     return type.getText(
       undefined,

@@ -254,6 +254,11 @@ pub enum CaptureAnchor {
         /// rather than recorded undeclared (#1165). LLM inline text has none.
         #[serde(skip_serializing_if = "Option::is_none")]
         source_file: Option<String>,
+        /// carrick#1836: what the text's bare names meant where the inference
+        /// printed them, for the names `source_file` cannot resolve. Copied
+        /// from the inference the text came from; empty for any other text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        printed_names: Vec<PrintedName>,
     },
 }
 
@@ -1140,6 +1145,26 @@ pub struct InferredType {
     /// statement's root names something other than the body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stated_body: Option<StatedBody>,
+    /// carrick#1836: the declarations behind the names `type_string` prints
+    /// that the request's file does not resolve. The sidecar's printer writes
+    /// such names bare, so this is the only record of what they meant;
+    /// `derive_capture_anchors` hands it to the capture with both texts (the
+    /// unwidened reading re-reads the same node). A name printed for two
+    /// declarations is listed twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub printed_names: Vec<PrintedName>,
+}
+
+/// The declaration a bare name in an inference's printed text meant
+/// (carrick#1836): the module that declares it, as an absolute path, and the
+/// export names that reach it there (`["Billing", "Kind"]` for a namespace
+/// member printed as `Kind`). In-process only: it rides from the inference to
+/// the capture request and is never written to an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrintedName {
+    pub name: String,
+    pub file: String,
+    pub export_path: Vec<String>,
 }
 
 /// What the source states a body read to be (carrick#1749).
@@ -3075,20 +3100,31 @@ mod tests {
             type_text: "{ id: string }".into(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             source_file: None,
+            printed_names: Vec::new(),
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
         assert!(json.contains(r#""type_text":"{ id: string }""#));
         assert!(!json.contains("source_file"));
+        assert!(!json.contains("printed_names"));
 
         let located = CaptureAnchor::Literal {
             alias: "D".into(),
             type_text: "{ status: Status }".into(),
             anchor_origin: AnchorOrigin::DeterministicInfer,
             source_file: Some("src/routes.ts".into()),
+            printed_names: vec![PrintedName {
+                name: "Status".into(),
+                file: "/repo/src/enums.ts".into(),
+                export_path: vec!["Status".into()],
+            }],
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
+        // carrick#1836: the shape the sidecar's literal-anchor validator reads.
+        assert!(json.contains(
+            r#""printed_names":[{"name":"Status","file":"/repo/src/enums.ts","export_path":["Status"]}]"#
+        ));
     }
 
     /// Check-pair wire shapes: lowercase protocol/type_kind enums, and the
@@ -3759,6 +3795,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         }
     }
 

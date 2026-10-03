@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import type {
   CaptureAnchorRequest,
   InferAnchorRequest,
+  PrintedName,
   SymbolAnchorRequest,
 } from './api.js';
 import {
@@ -155,10 +156,11 @@ export function resolveAnchor(
     // so a name its source file means by a repo module's export is imported
     // from that module (a string-union alias printed bare read `any`), and
     // (carrick#1789) a name it imports from a package is imported from that
-    // package.
+    // package. carrick#1836: a name the source file cannot see is imported
+    // from the module the inference recorded it was printed for.
     const scoped = siblingSpec
       ? undefined
-      : qualifyNamesFromSource(text, program, request.source_file, args);
+      : qualifyNamesFromSource(text, program, request.source_file, request.printed_names, args);
     const scopedText = scoped ?? text;
     // carrick#1377: rewrite what nothing declares to `unknown` in place, so
     // one member typed by a module the checkout does not have stops taking
@@ -584,6 +586,13 @@ function substituteUndeclaredNamesInText(
  * unexported local, and a type declared outside the repo that no package
  * import reaches.
  *
+ * carrick#1836: a name the source file cannot see at all was printed without
+ * its scope (the inferrer's structural printer writes names bare). When the
+ * inference recorded one declaration for it (`printed`), the name is imported
+ * from that declaration's module, under the same repo rule. A name recorded
+ * for two declarations is left as written: the text no longer says which one
+ * a position meant.
+ *
  * Returns the rewritten text, or undefined when nothing was rewritten, so a
  * text with no such name stays byte-identical.
  */
@@ -591,6 +600,7 @@ function qualifyNamesFromSource(
   text: string,
   program: ts.Program,
   sourceFileRel: string | undefined,
+  printed: readonly PrintedName[] | undefined,
   args: {
     repoRoot: string;
     entryDir: string;
@@ -612,6 +622,13 @@ function qualifyNamesFromSource(
   };
   collect(parsed);
 
+  const specOf = (file: ts.SourceFile): string | undefined => {
+    const rel = path.relative(args.repoRoot, file.fileName);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+    if (rel.split(path.sep).includes('node_modules')) return undefined;
+    return entryRelativeSpecifier(args.entryDir, args.repoRoot, rel.split(path.sep).join('/'));
+  };
+
   const imports = new Map<string, ImportedName | undefined>();
   const importFor = (name: string): ImportedName | undefined => {
     if (imports.has(name)) return imports.get(name);
@@ -619,14 +636,8 @@ function qualifyNamesFromSource(
     const atSource = checker.resolveName(name, source, meaning, false);
     const target = atSource && resolveSymbolAliases(checker, atSource);
     const declaringFile = target?.declarations?.[0]?.getSourceFile();
-    const rel = declaringFile && path.relative(args.repoRoot, declaringFile.fileName);
-    if (
-      target &&
-      declaringFile &&
-      rel &&
-      !rel.startsWith('..') &&
-      !rel.split(path.sep).includes('node_modules')
-    ) {
+    const spec = declaringFile && specOf(declaringFile);
+    if (target && declaringFile && spec) {
       const moduleSymbol = checker.getSymbolAtLocation(declaringFile);
       const exported = moduleSymbol
         ? checker
@@ -634,33 +645,36 @@ function qualifyNamesFromSource(
             .filter((candidate) => resolveSymbolAliases(checker, candidate) === target)
         : [];
       const chosen = exported.find((candidate) => candidate.getName() === name) ?? exported[0];
-      if (chosen) {
-        found = {
-          spec: entryRelativeSpecifier(args.entryDir, args.repoRoot, rel.split(path.sep).join('/')),
-          exportName: chosen.getName(),
-        };
-      }
+      if (chosen) found = { spec, exportPath: [chosen.getName()] };
     }
     if (!found && atSource) found = packageImportOf(program, atSource, args.resolveFromEntry);
+    if (!found && !atSource) found = printedImportOf(program, name, printed, specOf);
     imports.set(name, found);
     return found;
   };
 
   const leftmost = (name: ts.EntityName): ts.Identifier =>
     ts.isIdentifier(name) ? name : leftmost(name.left);
-  const renameLeftmost = (name: ts.EntityName, to: string): ts.EntityName =>
+  const entityName = (parts: readonly string[]): ts.EntityName =>
+    parts
+      .slice(1)
+      .reduce<ts.EntityName>(
+        (left, part) => ts.factory.createQualifiedName(left, part),
+        ts.factory.createIdentifier(parts[0])
+      );
+  const replaceLeftmost = (name: ts.EntityName, to: readonly string[]): ts.EntityName =>
     ts.isIdentifier(name)
-      ? ts.factory.createIdentifier(to)
-      : ts.factory.createQualifiedName(renameLeftmost(name.left, to), name.right);
+      ? entityName(to)
+      : ts.factory.createQualifiedName(replaceLeftmost(name.left, to), name.right);
   const dropLeftmost = (name: ts.QualifiedName): ts.EntityName =>
     ts.isIdentifier(name.left)
       ? name.right
       : ts.factory.createQualifiedName(dropLeftmost(name.left), name.right);
-  // What follows `import('<spec>')`: the export, then the reference's own
-  // qualifier. Through a namespace import the namespace's name goes, and the
-  // next name must be something the package exports.
+  // What follows `import('<spec>')`: the export path, then the reference's
+  // own qualifier. Through a namespace import the namespace's name goes, and
+  // the next name must be something the package exports.
   const qualifierFor = (typeName: ts.EntityName, target: ImportedName): ts.EntityName | undefined => {
-    if ('exportName' in target) return renameLeftmost(typeName, target.exportName);
+    if ('exportPath' in target) return replaceLeftmost(typeName, target.exportPath);
     if (ts.isIdentifier(typeName)) return undefined;
     const qualifier = dropLeftmost(typeName);
     return target.namespaceExports.has(leftmost(qualifier).text) ? qualifier : undefined;
@@ -694,11 +708,12 @@ function qualifyNamesFromSource(
 
 /**
  * How the surface entry imports a name a literal's text prints: from a module
- * by one of its exports, or, for a name the source binds with a namespace
- * import, by the qualifier after it (one of the package's exports).
+ * by the export path to it (one export, or a namespace and its member), or,
+ * for a name the source binds with a namespace import, by the qualifier after
+ * it (one of the package's exports).
  */
 type ImportedName =
-  | { spec: string; exportName: string }
+  | { spec: string; exportPath: readonly string[] }
   | { spec: string; namespaceExports: ReadonlySet<string> };
 
 /**
@@ -755,7 +770,41 @@ function packageImportOf(
   const spec = moduleFile.fileName;
   const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
   if (exportName === undefined) return { spec, namespaceExports: exported };
-  return exported.has(exportName) ? { spec, exportName } : undefined;
+  return exported.has(exportName) ? { spec, exportPath: [exportName] } : undefined;
+}
+
+/**
+ * carrick#1836: the import for `name` from the one declaration the inference
+ * recorded printing it for, or undefined.
+ *
+ * Undefined when the name was recorded for no declaration or for several,
+ * when the recorded module is not in this program or not inside the repo
+ * (`specOf`), and when its export path does not lead to a type there: a record
+ * that does not check out names nothing, and the text stays as written.
+ */
+function printedImportOf(
+  program: ts.Program,
+  name: string,
+  printed: readonly PrintedName[] | undefined,
+  specOf: (file: ts.SourceFile) => string | undefined
+): ImportedName | undefined {
+  const recorded = (printed ?? []).filter((entry) => entry.name === name);
+  const identities = new Set(recorded.map((entry) => `${entry.file}\0${entry.export_path.join('.')}`));
+  if (identities.size !== 1) return undefined;
+  const entry = recorded[0];
+  const declaring = program.getSourceFile(entry.file);
+  const spec = declaring && specOf(declaring);
+  if (!declaring || !spec) return undefined;
+  const checker = program.getTypeChecker();
+  let current = checker.getSymbolAtLocation(declaring);
+  for (const part of entry.export_path) {
+    const next = current && checker.getExportsOfModule(current).find((s) => s.getName() === part);
+    current = next && resolveSymbolAliases(checker, next);
+  }
+  if (!current || !(current.flags & (ts.SymbolFlags.Type | ts.SymbolFlags.Namespace))) {
+    return undefined;
+  }
+  return { spec, exportPath: entry.export_path };
 }
 
 /** The type node of `type __LiteralAnchor = <text>;`, or undefined. */

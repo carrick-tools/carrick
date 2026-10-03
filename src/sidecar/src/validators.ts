@@ -214,6 +214,15 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     type_text: z.string().min(1),
     anchor_origin: AnchorOriginSchema,
     source_file: z.string().min(1).optional(),
+    printed_names: z
+      .array(
+        z.object({
+          name: z.string().min(1),
+          file: z.string().min(1),
+          export_path: z.array(z.string().min(1)).min(1),
+        })
+      )
+      .optional(),
   }),
 ]);
 

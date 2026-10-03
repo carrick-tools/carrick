@@ -15789,6 +15789,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -15823,6 +15824,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -15857,6 +15859,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         }
     }
 

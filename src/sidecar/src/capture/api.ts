@@ -78,6 +78,32 @@ export interface LiteralAnchorRequest {
    * record's `source_file` stays `<inline>`: the answer is still the text.
    */
   source_file?: string;
+  /**
+   * carrick#1836: what the text's bare names meant where they were printed,
+   * for the names `source_file` cannot resolve. A name listed once is
+   * imported from the module that declares it; a name listed for two
+   * declarations is left as written.
+   */
+  printed_names?: PrintedName[];
+}
+
+/**
+ * The declaration a bare name in printed type text meant (carrick#1836).
+ *
+ * The v1 inferrer prints some types with no enclosing declaration, and that
+ * print writes every named type by its bare name, whether or not the file the
+ * request names can see it. The compiler knew the symbol when it printed the
+ * name; this is that symbol, recorded as the module that declares it and the
+ * export path that reaches it there (`['Status']`, or `['Billing', 'Kind']`
+ * for a namespace member printed as `Kind`).
+ */
+export interface PrintedName {
+  /** The name as the text prints it: the leftmost part of a reference. */
+  name: string;
+  /** Absolute path of the module that declares it. */
+  file: string;
+  /** Export names from that module down to the declaration. */
+  export_path: string[];
 }
 
 /**

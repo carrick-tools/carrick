@@ -939,6 +939,14 @@ export interface InferredType {
    * stated, or when the only annotation is further away than the read.
    */
   stated_body?: StatedBody;
+  /**
+   * carrick#1836: the declarations behind the names `type_string` prints that
+   * the request's file does not resolve. The printer writes names bare where
+   * no scope reads them, so this is the only record of what they meant. A
+   * name printed for two declarations is listed twice. Absent when there is
+   * nothing to list.
+   */
+  printed_names?: PrintedName[];
 }
 
 /**
@@ -976,6 +984,8 @@ export interface StatedBody {
  * across the bundle seam.
  */
 export type TypeProvenance = import('./capture/api.js').TypeProvenance;
+/** carrick#1836: declared in the capture bundle, which reads it on a literal anchor. */
+export type PrintedName = import('./capture/api.js').PrintedName;
 export type TypeProvenanceReason = import('./capture/api.js').TypeProvenanceReason;
 
 /**

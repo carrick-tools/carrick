@@ -50,6 +50,7 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
+import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import {
@@ -327,7 +328,9 @@ const TYPE_TEXT_FLAGS =
   ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias;
 
 function typeText(type: Type, enclosingNode?: Node): string {
-  return type.getText(enclosingNode, TYPE_TEXT_FLAGS);
+  const text = type.getText(enclosingNode, TYPE_TEXT_FLAGS);
+  notePrintedType(type, enclosingNode, text);
+  return text;
 }
 
 /**
@@ -524,8 +527,14 @@ export class TypeInferrer {
           );
           continue;
         }
-        const result = this.inferSingle(request, extractionConfig);
+        // carrick#1836: what the names the published text prints meant, read
+        // while the program the prints were made in is still the project's.
+        // The unwidened re-read below records nothing: it prints the same
+        // node, and its reading has a budget.
+        const prints = new PrintedTypes();
+        const result = prints.during(() => this.inferSingle(request, extractionConfig));
         if (result) {
+          this.recordPrintedNames(result, request, prints);
           inferredTypes.push(result);
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
@@ -562,6 +571,25 @@ export class TypeInferrer {
       inferred_types: inferredTypes.length > 0 ? inferredTypes : undefined,
       errors: errors.length > 0 ? errors : undefined,
     };
+  }
+
+  /**
+   * carrick#1836: list on `result` the declarations behind the names its text
+   * prints that the request's file cannot resolve (`PrintedTypes.namesIn`).
+   */
+  private recordPrintedNames(
+    result: InferredType,
+    request: InferRequestItem,
+    prints: PrintedTypes
+  ): void {
+    const sourceFile = this.getSourceFile(request.file_path);
+    if (!sourceFile) return;
+    const printedNames = prints.namesIn(
+      [result.type_string],
+      sourceFile.compilerNode,
+      this.project.getTypeChecker().compilerObject
+    );
+    if (printedNames.length > 0) result.printed_names = printedNames;
   }
 
   /**

@@ -416,12 +416,16 @@ pub(crate) fn derive_capture_anchors(
     // inference when it has one (carrick#1516).
     let mut inferred_text: HashMap<&str, &str> = HashMap::new();
     let mut unwidened_text: HashMap<&str, &str> = HashMap::new();
+    // carrick#1836: what that inference's bare names meant, for both texts.
+    let mut printed_names: HashMap<&str, &[crate::services::type_sidecar::PrintedName]> =
+        HashMap::new();
     for inf in inferred {
         if let Some(text) = usable_inferred_text(&inf.type_string) {
             if inferred_text.contains_key(inf.alias.as_str()) {
                 continue;
             }
             inferred_text.insert(inf.alias.as_str(), text);
+            printed_names.insert(inf.alias.as_str(), &inf.printed_names);
             if let Some(unwidened) = inf
                 .unwidened_type_string
                 .as_deref()
@@ -490,20 +494,26 @@ pub(crate) fn derive_capture_anchors(
         }
         // Kind-aware v1 inference result wins over a raw locator re-run.
         if let Some(text) = inferred_text.get(alias) {
+            let names = printed_names
+                .get(alias)
+                .map_or_else(Vec::new, |names| names.to_vec());
+            let unwidened = unwidened_text
+                .get(alias)
+                .map(|unwidened| CaptureAnchor::Literal {
+                    alias: unwidened_alias(alias),
+                    type_text: (*unwidened).to_string(),
+                    anchor_origin: AnchorOrigin::DeterministicInfer,
+                    source_file: Some(repo_relative(&request.file_path, repo_root)),
+                    printed_names: names.clone(),
+                });
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
                 type_text: (*text).to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
+                printed_names: names,
             });
-            if let Some(unwidened) = unwidened_text.get(alias) {
-                anchors.push(CaptureAnchor::Literal {
-                    alias: unwidened_alias(alias),
-                    type_text: (*unwidened).to_string(),
-                    anchor_origin: AnchorOrigin::DeterministicInfer,
-                    source_file: Some(repo_relative(&request.file_path, repo_root)),
-                });
-            }
+            anchors.extend(unwidened);
             continue;
         }
         // The inferrer decided there is no contract here; a raw locator re-run
@@ -515,6 +525,7 @@ pub(crate) fn derive_capture_anchors(
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 // `unknown` names nothing, so no file needs to join the program.
                 source_file: None,
+                printed_names: Vec::new(),
             });
             continue;
         }
@@ -559,6 +570,7 @@ pub(crate) fn derive_capture_anchors(
             type_text: type_text.clone(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             source_file: None,
+            printed_names: Vec::new(),
         });
     }
 
@@ -578,6 +590,7 @@ pub(crate) fn derive_capture_anchors(
             anchor_origin: AnchorOrigin::ManifestPlaceholder,
             // `unknown` names nothing, so no file needs to join the program.
             source_file: None,
+            printed_names: Vec::new(),
         });
     }
 
@@ -807,6 +820,7 @@ pub(crate) fn backfill_anchors(
                     type_text: texts[alias].clone(),
                     anchor_origin: AnchorOrigin::AnchorBackfill,
                     source_file: anchor.source_file().map(str::to_string),
+                    printed_names: Vec::new(),
                 }
             } else {
                 anchor.clone()
@@ -2613,6 +2627,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         }
     }
 
@@ -2685,6 +2700,7 @@ mod tests {
                     type_text,
                     anchor_origin,
                     source_file,
+                    ..
                 } => {
                     assert_eq!(*anchor_origin, AnchorOrigin::ManifestPlaceholder);
                     assert_eq!(*source_file, None, "`unknown` names no file to load");
@@ -2700,6 +2716,48 @@ mod tests {
                 ("Endpoint_unrequested_Response", "unknown"),
             ],
             "sorted, so the surface order follows the manifest and not a hash walk"
+        );
+    }
+
+    /// carrick#1836: the sidecar's printer writes some names bare, and only the
+    /// inference knows what they meant. Both texts it published reach the
+    /// capture with that record, or the capture reads the names nowhere.
+    #[test]
+    fn derive_anchors_hand_the_printed_names_to_both_literal_texts() {
+        let infer = vec![response_body_infer("Endpoint_row_Response")];
+        let names = vec![crate::services::type_sidecar::PrintedName {
+            name: "Status".to_string(),
+            file: "/repo/src/db/enums.ts".to_string(),
+            export_path: vec!["Status".to_string()],
+        }];
+        let mut inference = inferred(
+            "Endpoint_row_Response",
+            "{ status: Status; scope: string; }",
+            None,
+            None,
+        );
+        inference.unwidened_type_string = Some("{ status: Status; scope: \"all\"; }".to_string());
+        inference.printed_names = names.clone();
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[inference], &[], "/repo");
+
+        let printed: Vec<(&str, &[crate::services::type_sidecar::PrintedName])> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    printed_names,
+                    ..
+                } => (alias.as_str(), printed_names.as_slice()),
+                other => panic!("expected the inference's literal texts, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            printed,
+            vec![
+                ("Endpoint_row_Response", names.as_slice()),
+                ("Endpoint_row_Response_Unwidened", names.as_slice()),
+            ]
         );
     }
 
@@ -3151,6 +3209,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         };
 
         let infer = vec![
@@ -3280,6 +3339,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -3296,6 +3356,7 @@ mod tests {
                 type_text,
                 anchor_origin,
                 source_file,
+                ..
             } => {
                 assert_eq!(alias, "Pub_Resolved");
                 assert_eq!(type_text, "{ time: string; item: string; }");
@@ -3371,6 +3432,7 @@ mod tests {
                 type_text: "{ ok: boolean }".to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
+                printed_names: Vec::new(),
             },
         ];
         let records = vec![
@@ -3419,6 +3481,7 @@ mod tests {
                 type_text,
                 anchor_origin,
                 source_file,
+                ..
             } => {
                 assert_eq!(alias, "A_demoted");
                 assert_eq!(type_text, "{ id: string; read: boolean; }");
@@ -3564,6 +3627,7 @@ mod tests {
             any_provenance: Vec::new(),
             unwidened_type_string: None,
             stated_body: None,
+            printed_names: Vec::new(),
         };
 
         let explicit = vec![
@@ -3982,12 +4046,14 @@ mod tests {
                 type_text: pair.producer_type.to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
+                printed_names: Vec::new(),
             });
             billing_anchors.push(CaptureAnchor::Literal {
                 alias: consumer.clone(),
                 type_text: pair.consumer_type.to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
+                printed_names: Vec::new(),
             });
             orders_manifest.push(entry(
                 pair.key.clone(),
@@ -4246,6 +4312,7 @@ mod tests {
                     type_text: type_text.to_string(),
                     anchor_origin: AnchorOrigin::LlmSymbol,
                     source_file: None,
+                    printed_names: Vec::new(),
                 }],
                 &HashMap::new(),
                 None,
@@ -4709,6 +4776,7 @@ mod tests {
                     type_text: type_text.to_string(),
                     anchor_origin: AnchorOrigin::LlmSymbol,
                     source_file: None,
+                    printed_names: Vec::new(),
                 }],
                 &HashMap::new(),
                 None,
@@ -5155,6 +5223,7 @@ mod tests {
                 type_text: "{ status: string }".to_string(),
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 source_file: None,
+                printed_names: Vec::new(),
             }],
             &HashMap::new(),
             None,
