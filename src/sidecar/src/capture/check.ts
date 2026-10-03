@@ -213,7 +213,8 @@ export async function runCheck(
     v.pair_id = fnvOfSpec(spec);
   }
 
-  const { preGated, probing } = preGate(plans, readStubAliasRecords(opts.stubs));
+  const aliasRecords = readStubAliasRecords(opts.stubs);
+  const { preGated, probing } = preGate(plans, aliasRecords);
   writeProbes(ws, probing);
 
   const errors: string[] = [];
@@ -351,6 +352,7 @@ export async function runCheck(
         scrubCtx,
         deepFindings: deepByPair.get(plan.pairId),
         fieldReport: fieldsByPair.get(plan.pairId),
+        rawTextSide: rawTextSideOf(plan, aliasRecords),
       })
     ),
     ...preGated,
@@ -453,6 +455,20 @@ function preGate(
     });
   }
   return { preGated, probing };
+}
+
+/**
+ * The side whose capture record marks its body as read raw (carrick#1842):
+ * the sent side when both are, as the bytes gate names it.
+ */
+function rawTextSideOf(
+  plan: ProbePlan,
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): 'producer' | 'consumer' | undefined {
+  return [plan.direction.sent, plan.direction.expected].find((side) => {
+    const endpoint = plan.spec[side];
+    return aliasRecords.get(endpoint.service_name)?.get(endpoint.alias)?.raw_text_read === true;
+  });
 }
 
 /** First side (producer, then consumer) whose capture recorded a deep decay. */

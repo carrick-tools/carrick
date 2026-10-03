@@ -78,6 +78,11 @@ export interface LiteralAnchorRequest {
    * record's `source_file` stays `<inline>`: the answer is still the text.
    */
   source_file?: string;
+  /**
+   * carrick#1842: the text is a body the call site reads as raw text. Copied
+   * onto the alias's record, where the check phase reads it.
+   */
+  raw_text_read?: true;
 }
 
 /**
@@ -302,6 +307,14 @@ export interface CaptureAliasRecord {
    * entry's other provenance. Absent when every position resolves.
    */
   unresolved_in_tree?: TypeProvenance[];
+  /**
+   * carrick#1842: the alias is a body its call site reads as raw text, from
+   * the literal anchor that published it. The check phase reads a pair with
+   * this on either side unverifiable: raw text states no structural contract,
+   * whether or not the other side's type assigns to `string`. Absent
+   * otherwise, and absent on every record a release before this one stored.
+   */
+  raw_text_read?: true;
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */
