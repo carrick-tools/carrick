@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/v1/orders/${orderId}/download",
+      "method": "GET",
+      "pattern_matched": "ordersApi.downloadFile(",
+      "call_expression_text": "ordersApi.downloadFile(orderId, fileId)",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "/v1/orders/${orderId}/note",
+      "method": "POST",
+      "pattern_matched": "ordersApi\n      .addNote(",
+      "call_expression_text": "ordersApi\n      .addNote(orderId, note.trim())",
+      "call_expression_line": 7,
+      "payload_expression_text": "note.trim()",
+      "payload_expression_line": 8,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/v1/orders/${orderId}",
+      "method": "PATCH",
+      "pattern_matched": "ordersApi.setStatus(",
+      "call_expression_text": "ordersApi.setStatus(orderId, \"approved\")",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

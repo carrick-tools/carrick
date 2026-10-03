@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/v1/orders?mine=true",
+      "method": "GET",
+      "pattern_matched": "apiFetch(",
+      "call_expression_text": "apiFetch(\"/v1/orders?mine=true\")",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "/v1/orders/${orderId}/files/${fileId}",
+      "method": "GET",
+      "pattern_matched": "apiFetch(",
+      "call_expression_text": "apiFetch(`/v1/orders/${orderId}/files/${fileId}`)",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/v1/orders/${orderId}/notes",
+      "method": "POST",
+      "pattern_matched": "apiFetch(",
+      "call_expression_text": "apiFetch(`/v1/orders/${orderId}/notes`, {",
+      "call_expression_line": 21,
+      "payload_expression_text": "formData",
+      "payload_expression_line": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:32",
+      "line_number": 32,
+      "target": "/v1/orders/${orderId}/status",
+      "method": "PUT",
+      "pattern_matched": "apiFetch(",
+      "call_expression_text": "apiFetch(`/v1/orders/${orderId}/status`, {",
+      "call_expression_line": 32,
+      "payload_expression_text": "JSON.stringify({ status })",
+      "payload_expression_line": 35,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

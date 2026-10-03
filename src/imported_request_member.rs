@@ -40,6 +40,14 @@
 //!
 //! - A member is a class method, a named function declaration, or a
 //!   function/arrow bound to a name. It is indexed by that name.
+//! - A function-valued property of an object literal that a module-scope
+//!   `const` holds (`export const ordersApi = { addNote: async (id) => … }`)
+//!   is a member too (carrick#1733), indexed as `<binding>.<property>`. The
+//!   dotted name never meets a bare one, so it joins only a call made through
+//!   that binding as another module imports it (see
+//!   `FileOrchestrator::resolve_object_members`). An object the module writes
+//!   through anywhere, or a property a later spread may replace, states no
+//!   member.
 //! - The request must sit in the member's OWN body. A request inside a
 //!   callback the member builds belongs to whatever later invokes that
 //!   callback, not to a site that calls the member, so a factory that
@@ -125,7 +133,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
+use swc_common::{BytePos, SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -234,6 +242,7 @@ pub fn collect_request_members(module: &Module, source_map: &Lrc<SourceMap>) -> 
         stack: Vec::new(),
         members: HashMap::new(),
         dropped: Vec::new(),
+        constant_objects: constant_objects(module),
     };
     module.visit_with(&mut collector);
     for name in collector.dropped {
@@ -302,6 +311,9 @@ struct MemberCollector<'a> {
     /// Names seen twice with different requests. Removed at the end rather
     /// than as they are found, so the second declaration cannot be kept.
     dropped: Vec<String>,
+    /// The object literals whose function-valued properties are members, by
+    /// the span start of the literal (see [`constant_objects`]).
+    constant_objects: HashSet<BytePos>,
 }
 
 impl MemberCollector<'_> {
@@ -386,8 +398,8 @@ impl Visit for MemberCollector<'_> {
     }
 
     /// Every other function is anonymous from a caller's point of view: a
-    /// callback, an object-literal method, a function expression in an
-    /// argument. It holds its own requests.
+    /// callback, a method of any object literal but a module constant's, a
+    /// function expression in an argument. It holds its own requests.
     fn visit_function(&mut self, node: &Function) {
         self.walk_body(None, Vec::new(), &node.body);
     }
@@ -402,6 +414,12 @@ impl Visit for MemberCollector<'_> {
             return;
         };
         let name = binding.id.sym.to_string();
+        if let Some(object) = object_literal(init)
+            && self.constant_objects.contains(&object.span.lo)
+        {
+            self.walk_object_members(&name, object);
+            return;
+        }
         match &**init {
             Expr::Arrow(arrow) => {
                 let params = arrow.params.iter().filter_map(pat_name).collect();
@@ -440,6 +458,59 @@ impl Visit for MemberCollector<'_> {
 }
 
 impl MemberCollector<'_> {
+    /// Walk a module constant's object literal (carrick#1733): each
+    /// function-valued property is the member `<binding>.<property>`. A
+    /// property a later spread may replace, a key written twice, and every
+    /// other property state no member; a function inside one is walked as
+    /// before and holds its own requests.
+    fn walk_object_members(&mut self, binding: &str, object: &ObjectLit) {
+        let last_spread = object
+            .props
+            .iter()
+            .rposition(|prop| matches!(prop, PropOrSpread::Spread(_)));
+        let mut keys: HashSet<String> = HashSet::new();
+        for (position, prop) in object.props.iter().enumerate() {
+            let PropOrSpread::Prop(prop) = prop else {
+                prop.visit_with(self);
+                continue;
+            };
+            let key = match &**prop {
+                Prop::KeyValue(kv) => prop_name_text(&kv.key),
+                Prop::Method(method) => prop_name_text(&method.key),
+                Prop::Shorthand(ident) => Some(ident.sym.to_string()),
+                Prop::Getter(getter) => prop_name_text(&getter.key),
+                Prop::Setter(setter) => prop_name_text(&setter.key),
+                Prop::Assign(_) => None,
+            };
+            let name = key.map(|key| {
+                let name = format!("{binding}.{key}");
+                if !keys.insert(key) {
+                    self.dropped.push(name.clone());
+                }
+                name
+            });
+            let settled = last_spread.is_none_or(|spread| position > spread);
+            match (&**prop, name) {
+                (Prop::KeyValue(kv), Some(name)) if settled => match unwrap_parens(&kv.value) {
+                    Expr::Arrow(arrow) => {
+                        let params = arrow.params.iter().filter_map(pat_name).collect();
+                        self.walk_body(Some(name), params, &arrow.body);
+                    }
+                    Expr::Fn(fn_expr) => {
+                        let params = fn_param_names(&fn_expr.function.params);
+                        self.walk_body(Some(name), params, &fn_expr.function.body);
+                    }
+                    _ => prop.visit_with(self),
+                },
+                (Prop::Method(method), Some(name)) if settled => {
+                    let params = fn_param_names(&method.function.params);
+                    self.walk_body(Some(name), params, &method.function.body);
+                }
+                _ => prop.visit_with(self),
+            }
+        }
+    }
+
     /// The request `call` issues, when it states its whole URL and its method
     /// itself and neither depends on `params`.
     fn member_request(&self, call: &CallExpr, params: &[String]) -> Option<RequestMember> {
@@ -517,6 +588,137 @@ fn default_method(options: &ObjectLit) -> Option<String> {
     let carries_payload =
         prop_value(options, "body").is_some() || prop_value(options, "data").is_some();
     (!carries_payload).then(|| "GET".to_string())
+}
+
+/// The object literals a module-scope `const` holds and nothing in the module
+/// writes through (carrick#1733), by the literal's span start. Their
+/// function-valued properties are what a caller in another module reaches as
+/// `<binding>.<property>`. A module that assigns to a property of the binding,
+/// deletes one, or hands the binding to a built-in that writes to its first
+/// argument (`Object.assign(api, …)`) can replace any member, so that object
+/// states none. A write through a name a nested scope declares again counts as
+/// well: dropping a member is the safe side.
+fn constant_objects(module: &Module) -> HashSet<BytePos> {
+    let mut declared: Vec<(String, BytePos)> = Vec::new();
+    for item in &module.body {
+        let var = match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => var,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                Decl::Var(var) => var,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if var.kind != VarDeclKind::Const {
+            continue;
+        }
+        for declarator in &var.decls {
+            if let (Pat::Ident(binding), Some(init)) = (&declarator.name, &declarator.init)
+                && let Some(object) = object_literal(init)
+            {
+                declared.push((binding.id.sym.to_string(), object.span.lo));
+            }
+        }
+    }
+    if declared.is_empty() {
+        return HashSet::new();
+    }
+    let mut writes = WrittenThrough::default();
+    module.visit_with(&mut writes);
+    declared
+        .into_iter()
+        .filter(|(name, _)| !writes.names.contains(name))
+        .map(|(_, start)| start)
+        .collect()
+}
+
+/// The object literal an initialiser is, through parentheses and the type
+/// assertions that leave the value alone (`as const`, `satisfies T`, `as T`).
+fn object_literal(expr: &Expr) -> Option<&ObjectLit> {
+    match expr {
+        Expr::Object(object) => Some(object),
+        Expr::Paren(paren) => object_literal(&paren.expr),
+        Expr::TsConstAssertion(assertion) => object_literal(&assertion.expr),
+        Expr::TsSatisfies(satisfies) => object_literal(&satisfies.expr),
+        Expr::TsAs(as_expr) => object_literal(&as_expr.expr),
+        _ => None,
+    }
+}
+
+fn unwrap_parens(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => unwrap_parens(&paren.expr),
+        other => other,
+    }
+}
+
+/// The names a module writes through: the root binding of every member
+/// expression it assigns to, updates or deletes, and the first argument of
+/// every `Object.assign` / `Object.defineProperty` / `Object.defineProperties`
+/// / `Object.setPrototypeOf` call.
+#[derive(Default)]
+struct WrittenThrough {
+    names: HashSet<String>,
+}
+
+impl WrittenThrough {
+    fn member(&mut self, member: &MemberExpr) {
+        if let Some(root) = member_root(&member.obj) {
+            self.names.insert(root);
+        }
+    }
+}
+
+impl Visit for WrittenThrough {
+    fn visit_assign_expr(&mut self, node: &AssignExpr) {
+        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &node.left {
+            self.member(member);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, node: &UpdateExpr) {
+        if let Expr::Member(member) = &*node.arg {
+            self.member(member);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, node: &UnaryExpr) {
+        if node.op == UnaryOp::Delete
+            && let Expr::Member(member) = &*node.arg
+        {
+            self.member(member);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && let Expr::Member(member) = &**callee
+            && matches!(&*member.obj, Expr::Ident(object) if object.sym == *"Object")
+            && let MemberProp::Ident(prop) = &member.prop
+            && matches!(
+                prop.sym.as_ref(),
+                "assign" | "defineProperty" | "defineProperties" | "setPrototypeOf"
+            )
+            && let Some(target) = node.args.first()
+            && let Some(root) = member_root(&target.expr)
+        {
+            self.names.insert(root);
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// The identifier a member chain starts from (`api` in `api.tasks.list`).
+fn member_root(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Member(member) => member_root(&member.obj),
+        Expr::Paren(paren) => member_root(&paren.expr),
+        _ => None,
+    }
 }
 
 /// The text a string or template argument contributes: a literal's value, or a
@@ -1050,5 +1252,125 @@ mod tests {
         let (folded, conflicting) = fold_indexes_with_conflicts([("a", a), ("b", b)]);
         assert!(folded.is_empty());
         assert!(conflicting.contains("go"));
+    }
+
+    /// carrick#1733: a client written as an object constant states one member
+    /// per function-valued property, under `<binding>.<property>`, through a
+    /// helper the module imports, in every function form a property takes.
+    #[test]
+    fn an_object_constant_s_function_properties_are_members_under_dotted_names() {
+        let members = index(
+            r#"
+            import { apiFetch } from "./http";
+            export const ordersApi = {
+              addNote: async (orderId: string, body: string) => {
+                const form = new FormData();
+                form.append("body", body);
+                const response = await apiFetch(`/v1/orders/${orderId}/notes`, {
+                  method: "POST",
+                  body: form,
+                });
+                return response.json();
+              },
+              async setStatus(orderId: string, status: string) {
+                return apiFetch(`/v1/orders/${orderId}/status`, {
+                  method: "PUT",
+                  body: JSON.stringify({ status }),
+                });
+              },
+              remove: async function (orderId: string) {
+                return apiFetch(`/v1/orders/${orderId}`, { method: "DELETE" });
+              },
+              list: async () => apiFetch("/v1/orders"),
+            } as const;
+            "#,
+        );
+        assert_eq!(
+            members.get("ordersApi.addNote"),
+            Some(&member("POST", "/v1/orders/${orderId}/notes"))
+        );
+        assert_eq!(
+            members.get("ordersApi.setStatus"),
+            Some(&member("PUT", "/v1/orders/${orderId}/status")),
+            "a method shorthand is a member as well"
+        );
+        assert_eq!(
+            members.get("ordersApi.remove"),
+            Some(&member("DELETE", "/v1/orders/${orderId}")),
+            "and a function expression"
+        );
+        assert!(
+            !members.contains_key("ordersApi.list"),
+            "a call with no options bag and no verb states no request"
+        );
+        assert!(
+            !members.contains_key("addNote") && !members.contains_key("ordersApi"),
+            "the property never answers to its bare name, nor the object to its own: {members:?}"
+        );
+    }
+
+    /// carrick#1733, the negatives: every shape where the property a caller
+    /// reaches may not be the function written there states no member.
+    #[test]
+    fn an_object_the_module_may_change_states_no_member() {
+        let members = index(
+            r#"
+            export const written = {
+              send: (id: string) => fetch(`/v1/a/${id}`, { method: "POST" }),
+            };
+            written.send = (id: string) => fetch(`/v1/b/${id}`, { method: "POST" });
+
+            export const assigned = {
+              send: (id: string) => fetch(`/v1/c/${id}`, { method: "POST" }),
+            };
+            Object.assign(assigned, overrides);
+
+            export const deleted = {
+              send: (id: string) => fetch(`/v1/d/${id}`, { method: "POST" }),
+            };
+            delete deleted.send;
+
+            export const spread = {
+              send: (id: string) => fetch(`/v1/e/${id}`, { method: "POST" }),
+              ...overrides,
+              keep: (id: string) => fetch(`/v1/f/${id}`, { method: "POST" }),
+            };
+
+            export const twice = {
+              send: (id: string) => fetch(`/v1/g/${id}`, { method: "POST" }),
+              send: (id: string) => fetch(`/v1/g/${id}`, { method: "POST" }),
+            };
+
+            export let reassignable = {
+              send: (id: string) => fetch(`/v1/h/${id}`, { method: "POST" }),
+            };
+
+            export function factory() {
+              const local = {
+                send: (id: string) => fetch(`/v1/i/${id}`, { method: "POST" }),
+              };
+              return local;
+            }
+            "#,
+        );
+        for name in [
+            "written.send",
+            "assigned.send",
+            "deleted.send",
+            "spread.send",
+            "twice.send",
+            "reassignable.send",
+            "local.send",
+        ] {
+            assert!(
+                !members.contains_key(name),
+                "{name} states no member: {members:?}"
+            );
+        }
+        assert_eq!(
+            members.get("spread.keep"),
+            Some(&member("POST", "/v1/f/${id}")),
+            "a property after the last spread is the object's own"
+        );
     }
 }

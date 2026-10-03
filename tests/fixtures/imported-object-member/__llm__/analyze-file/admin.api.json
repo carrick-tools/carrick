@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/admin/orders/${orderId}/notes",
+      "method": "POST",
+      "pattern_matched": "apiFetch(",
+      "call_expression_text": "apiFetch(`/admin/orders/${orderId}/notes`, { method: \"POST\", body })",
+      "call_expression_line": 5,
+      "payload_expression_text": "body",
+      "payload_expression_line": 5,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

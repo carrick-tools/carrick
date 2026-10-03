@@ -2087,11 +2087,19 @@ impl FileOrchestrator {
                 // `None` is a package import: a real binding, no same-repo
                 // module behind it.
                 let mut import_owners: HashMap<String, Option<PathBuf>> = HashMap::new();
+                // Each NAMED import of a same-repo module, with the name that
+                // module exports it by: the receivers an object constant's
+                // members are reached through (carrick#1733).
+                let mut object_receivers: HashMap<String, (PathBuf, String)> = HashMap::new();
                 for (local_name, symbol) in &pf.symbol_table.imported_symbols {
-                    import_owners.insert(
-                        local_name.clone(),
-                        Self::resolve_relative_import(&importer, &symbol.source),
-                    );
+                    let owner = Self::resolve_relative_import(&importer, &symbol.source);
+                    if let (Some(module), SymbolKind::Named) = (&owner, &symbol.kind) {
+                        object_receivers.insert(
+                            local_name.clone(),
+                            (module.clone(), symbol.imported_name.clone()),
+                        );
+                    }
+                    import_owners.insert(local_name.clone(), owner);
                 }
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
@@ -2200,6 +2208,17 @@ impl FileOrchestrator {
                             &import_owners,
                             &receiver_imports,
                         );
+                    // A call through an imported object constant's member
+                    // (carrick#1733) names its module and its object, so it
+                    // answers ahead of the name join at the same site.
+                    for (span, member) in Self::resolve_object_members(
+                        &pf.candidate_map,
+                        &object_receivers,
+                        &member_cache,
+                    ) {
+                        pf.unresolved_member_sites.retain(|(site, _)| *site != span);
+                        pf.resolved_members.insert(span, member);
+                    }
 
                     // Which wrapper each site delegates to, for the dispatch
                     // carry (carrick#872). Same rings, same receiver rule, a
@@ -3861,7 +3880,14 @@ impl FileOrchestrator {
                     }
                 }
 
-                if should_infer_request_body(&method) {
+                // A call through a declaration in another module (carrick#1733)
+                // hands the member its parameters, and the member builds the
+                // body: what the model anchored at this site is an argument,
+                // not the request body. The member's own request line states
+                // the body; this site states none.
+                if should_infer_request_body(&method)
+                    && data_call.resolution_source != Some(ResolutionSource::ImportedMember)
+                {
                     push_infer(
                         &file_path_absolute,
                         line_number,
@@ -8195,6 +8221,48 @@ impl FileOrchestrator {
         // this is persisted.
         declined.sort();
         (resolved, declined)
+    }
+
+    /// Join each call made through an imported object constant onto the member
+    /// its module declares (carrick#1733): `ordersApi.addNote(…)`, where the
+    /// file imports `ordersApi` by name from the module whose `const ordersApi
+    /// = { addNote: … }` states the request.
+    ///
+    /// The call's IMMEDIATE receiver must be that named import, and the member
+    /// is looked up in the imported module alone, under the name the module
+    /// exports the object by (`object_receivers`: local name to module and
+    /// exported name). So no other module's member of the same name can
+    /// answer, and a receiver that is a parameter, a local, a default or
+    /// namespace import, or a barrel that re-exports the object from another
+    /// module joins nothing and keeps whatever extraction gave it.
+    fn resolve_object_members(
+        candidate_map: &HashMap<String, CandidateTarget>,
+        object_receivers: &HashMap<String, (PathBuf, String)>,
+        member_cache: &HashMap<PathBuf, RequestMemberIndex>,
+    ) -> HashMap<u32, ResolvedMember> {
+        let mut resolved = HashMap::new();
+        for candidate in candidate_map.values() {
+            let (Some(receiver), Some(property)) =
+                (&candidate.receiver_ident, &candidate.callee_property)
+            else {
+                continue;
+            };
+            let Some((module, exported)) = object_receivers.get(receiver) else {
+                continue;
+            };
+            let name = format!("{exported}.{property}");
+            let Some(member) = member_cache.get(module).and_then(|index| index.get(&name)) else {
+                continue;
+            };
+            resolved.insert(
+                candidate.span_start,
+                ResolvedMember {
+                    name,
+                    member: member.clone(),
+                },
+            );
+        }
+        resolved
     }
 
     /// Join each candidate's callee name onto the wrapper whose body issues
@@ -13139,6 +13207,94 @@ export * from "./aFetch.js";"#,
         );
     }
 
+    /// carrick#1733: a row the imported-member join states at a call through
+    /// a member carries the member's call, and its arguments are the member's
+    /// parameters: the member builds the body its own request line states. So
+    /// the payload a model row folded onto it anchors (`note.trim()`) is not
+    /// the request body, and no request type is asked for. Its response is
+    /// still asked for, and a model row's own request side beside it still is.
+    #[test]
+    fn a_call_through_an_imported_member_asks_for_no_request_body() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/page.ts", 700);
+        let call = |line: i32, span: u32, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{span}-{}", span + 50),
+            line_number: line,
+            target: "/v1/orders/${orderId}/notes".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "addNote".to_string(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: Some(span + 50),
+            call_expression_text: Some("ordersApi.addNote(orderId, note.trim())".to_string()),
+            call_expression_line: Some(line),
+            payload_expression_text: Some("note.trim()".to_string()),
+            payload_expression_line: Some(line),
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    call(10, 470, ResolutionSource::ImportedMember),
+                    call(20, 530, ResolutionSource::Model),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        let lines = |kind: InferKind| -> Vec<u32> {
+            let mut lines: Vec<u32> = infer
+                .iter()
+                .filter(|item| item.infer_kind == kind)
+                .map(|item| item.line_number)
+                .collect();
+            lines.sort();
+            lines.dedup();
+            lines
+        };
+        assert_eq!(
+            lines(InferKind::RequestBody),
+            vec![20],
+            "only the model row asks for a request body: {infer:?}"
+        );
+        assert_eq!(
+            lines(InferKind::CallResult),
+            vec![10, 20],
+            "both rows still ask for the call's result: {infer:?}"
+        );
+    }
+
     /// carrick#1601: the mark a summary row carries reaches the call row the
     /// type layer reads, on a caller row and on a request line's own row.
     #[test]
@@ -17300,6 +17456,85 @@ export { routes };
         candidate.callee_object = callee_object.to_string();
         candidate.callee_property = Some(callee_property.to_string());
         HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    /// carrick#1733: a call through an imported object constant joins the
+    /// member the IMPORTED module declares, under the name that module exports
+    /// the object by, and nothing else answers for it.
+    #[test]
+    fn resolve_object_members_reads_the_member_off_the_module_the_receiver_is_imported_from() {
+        let module = |path: &str, target: &str| {
+            let (path, index) = ring(&[(path, "ordersApi.addNote", "POST", target)]).remove(0);
+            (path, index)
+        };
+        let member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::from([
+            module("orders.api.ts", "/v1/orders/${orderId}/notes"),
+            module("admin.api.ts", "/admin/orders/${orderId}/notes"),
+        ]);
+        let through = |receiver: Option<&str>, property: &str, imports: &[(&str, &str, &str)]| {
+            let mut sites = site(receiver.unwrap_or("ordersApi"), property);
+            sites.get_mut("c1").expect("one site").receiver_ident = receiver.map(str::to_string);
+            let receivers: HashMap<String, (PathBuf, String)> = imports
+                .iter()
+                .map(|(local, path, exported)| {
+                    (
+                        local.to_string(),
+                        (PathBuf::from(path), exported.to_string()),
+                    )
+                })
+                .collect();
+            FileOrchestrator::resolve_object_members(&sites, &receivers, &member_cache)
+        };
+        let orders = [("ordersApi", "orders.api.ts", "ordersApi")];
+        assert_eq!(
+            through(Some("ordersApi"), "addNote", &orders).get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/v1/orders/${orderId}/notes"
+            ))
+        );
+        assert_eq!(
+            through(
+                Some("ordersApi"),
+                "addNote",
+                &[("ordersApi", "admin.api.ts", "ordersApi")]
+            )
+            .get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/admin/orders/${orderId}/notes"
+            )),
+            "the same object and member in another module answer only for that module"
+        );
+        assert_eq!(
+            through(
+                Some("orders"),
+                "addNote",
+                &[("orders", "orders.api.ts", "ordersApi")]
+            )
+            .get(&100),
+            Some(&ring_outcome(
+                "ordersApi.addNote",
+                "POST",
+                "/v1/orders/${orderId}/notes"
+            )),
+            "an import under another local name joins by the exported name"
+        );
+        assert!(
+            through(Some("api"), "addNote", &orders).is_empty(),
+            "a receiver that is no named import (a parameter, a local) joins nothing"
+        );
+        assert!(
+            through(None, "addNote", &orders).is_empty(),
+            "a call whose immediate receiver is no bare name (`ordersApi.addNote(x).then(f)`'s \
+             `then`) joins nothing"
+        );
+        assert!(
+            through(Some("ordersApi"), "remove", &orders).is_empty(),
+            "a member the module does not declare joins nothing"
+        );
     }
 
     /// carrick#655: a member the consumer's own imports do not declare is

@@ -3263,7 +3263,7 @@ async fn analyze_current_repo_incremental(
             //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
-            drop_caller_response_entries(&mut manifest_entries, &merged_results);
+            drop_call_through_entries(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(
                 &mut manifest_entries,
                 &merged_results,
@@ -7247,54 +7247,66 @@ fn build_type_manifest_entries(
     entries
 }
 
-/// Drop the consumer response entry of every row restated at a call to a
-/// function the service declares (carrick#1601).
+/// Drop the consumer type entries a row stated at a call to a function the
+/// service declares does not state.
 ///
-/// The call at such a site is the function's call, and its value is what the
-/// function returns, not the response body: the site states no response
-/// contract. An entry left at `unknown` would still make the site a party to
-/// the type check, read `unverifiable` there and carry that up to its pair, so
-/// the entry goes, as it does for a call with no internal producer. The
-/// request entry stays: what the caller hands the function is not this rule's.
+/// - **Response**, for a row the request summaries restate at a caller
+///   (carrick#1601): the call's value is what the function returns, not the
+///   response body.
+/// - **Request**, for a row the imported-member join states (carrick#1733):
+///   the call hands the member its parameters and the member builds the body,
+///   which its own request line states. What the caller passes is an
+///   argument, not the request body. A summary row restated at a caller keeps
+///   its request entry; that side is not settled for it.
+///
+/// An entry left at `unknown` would still make the site a party to the type
+/// check, read `unverifiable` there and carry that up to its pair, so the
+/// entry goes, as it does for a call with no internal producer.
 ///
 /// Joined to the call rows the way [`stamp_manifest_anchor_symbols`] joins
 /// them, by `(file_path, line)`, and by the verb, so another row on the same
-/// line keeps its entry.
-fn drop_caller_response_entries(
+/// line keeps its entries.
+fn drop_call_through_entries(
     manifest: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) {
     let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
-    let callers: HashSet<(&str, u32, String)> = file_results
+    let unstated: HashSet<(&str, u32, String, ManifestTypeKind)> = file_results
         .iter()
         .flat_map(|(file_path, result)| {
-            result
-                .data_calls
-                .iter()
-                .filter(|call| call.at_caller)
-                .map(move |call| {
-                    (
-                        file_path.as_str(),
-                        normalize_line(call.line_number),
-                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
-                    )
-                })
+            result.data_calls.iter().filter_map(move |call| {
+                let kind = if call.at_caller {
+                    ManifestTypeKind::Response
+                } else if call.resolution_source
+                    == Some(crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember)
+                {
+                    ManifestTypeKind::Request
+                } else {
+                    return None;
+                };
+                Some((
+                    file_path.as_str(),
+                    normalize_line(call.line_number),
+                    normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                    kind,
+                ))
+            })
         })
         .collect();
-    if callers.is_empty() {
+    if unstated.is_empty() {
         return;
     }
     manifest.retain(|entry| {
-        let restated = entry.role == ManifestRole::Consumer
-            && entry.type_kind == ManifestTypeKind::Response
+        let dropped = entry.role == ManifestRole::Consumer
             && entry.key.as_http().is_some_and(|(method, _)| {
-                callers.contains(&(
+                unstated.contains(&(
                     entry.file_path.as_str(),
                     entry.line_number,
                     method.to_string(),
+                    entry.type_kind,
                 ))
             });
-        !restated
+        !dropped
     });
 }
 
@@ -7953,7 +7965,7 @@ async fn analyze_current_repo(
     // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
-    drop_caller_response_entries(&mut manifest_entries, &analysis_result.file_results);
+    drop_call_through_entries(&mut manifest_entries, &analysis_result.file_results);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
         &analysis_result.file_results,
@@ -10652,6 +10664,11 @@ mod tests {
     /// to a response verdict. Its request entry stays, and so does every entry
     /// of a request line's own row, including another verb on the caller's
     /// line.
+    ///
+    /// carrick#1733: a row the imported-member join states at a call through a
+    /// member states no REQUEST contract (the caller hands the member its
+    /// parameters, the member builds the body), so its request entry goes and
+    /// its response entry stays.
     #[test]
     fn a_row_restated_at_a_helper_s_caller_has_no_response_entry() {
         let config = Config::default();
@@ -10680,6 +10697,8 @@ mod tests {
             call("POST", "/pdf", 9),
             call("GET", "/orders", 9),
             call("GET", "/orders", 12),
+            call("POST", "/orders/:id/notes", 15),
+            call("GET", "/orders/:id", 15),
         ];
         let row = |method: &str, line: i32, at_caller: bool| DataCallResult {
             call_kind: None,
@@ -10720,6 +10739,13 @@ mod tests {
                     row("POST", 9, true),
                     row("GET", 9, false),
                     row("GET", 12, false),
+                    DataCallResult {
+                        resolution_source: Some(
+                            crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember,
+                        ),
+                        ..row("POST", 15, false)
+                    },
+                    row("GET", 15, false),
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -10728,7 +10754,7 @@ mod tests {
         );
 
         let mut entries = build_type_manifest_entries(&mount_graph, &config, ".");
-        drop_caller_response_entries(&mut entries, &file_results);
+        drop_call_through_entries(&mut entries, &file_results);
 
         let mut kept: Vec<(u32, String, ManifestTypeKind)> = entries
             .iter()
@@ -10757,6 +10783,9 @@ mod tests {
                 (9, "POST".to_string(), ManifestTypeKind::Request),
                 (12, "GET".to_string(), ManifestTypeKind::Request),
                 (12, "GET".to_string(), ManifestTypeKind::Response),
+                (15, "GET".to_string(), ManifestTypeKind::Request),
+                (15, "GET".to_string(), ManifestTypeKind::Response),
+                (15, "POST".to_string(), ManifestTypeKind::Response),
             ]
         );
     }
