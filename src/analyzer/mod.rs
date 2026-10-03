@@ -2361,8 +2361,13 @@ impl Analyzer {
             call_sites: BTreeSet<String>,
             producers: Vec<(String, String, String)>,
             /// Which layer stated each consumer call folded into this
-            /// candidate, for the finding's `edge_source` (cloud#599).
+            /// candidate, for the finding's `edge_source` (cloud#599). Only
+            /// calls the scan holds a data-call row for; a `None` here is a
+            /// held row that states no source.
             consumer_sources: Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+            /// A call in this group has no data-call row at its location, so
+            /// the scan cannot state its source at all (carrick#1754).
+            consumer_unheld: bool,
         }
 
         // Grouped accumulators, BTree-keyed so same-target call sites collapse
@@ -2729,12 +2734,15 @@ impl Analyzer {
                             .entry((method.to_string(), miss_path))
                             .or_default();
                         candidate.call_sites.insert(call_site);
-                        candidate.consumer_sources.push(
-                            consumer_source_by_call
-                                .get(&consumer_identity(&call.file_path.display().to_string()))
-                                .copied()
-                                .flatten(),
-                        );
+                        match consumer_source_by_call
+                            .get(&consumer_identity(&call.file_path.display().to_string()))
+                        {
+                            Some(source) => candidate.consumer_sources.push(*source),
+                            // No data-call row at this call's location: a
+                            // missed lookup, not a held row with no source
+                            // (carrick#1754, as carrick#1735 for types).
+                            None => candidate.consumer_unheld = true,
+                        }
                         for endpoint in path_matches {
                             candidate.producers.push((
                                 endpoint.method.to_uppercase(),
@@ -2754,10 +2762,15 @@ impl Analyzer {
         // exact-path producer is verified. Only the chosen producer is
         // suppressed from the orphan list. Keyed by the producer's DECLARED
         // path so N consumer spellings of one route collapse into one risk.
-        type MethodMismatchRow = (
-            BTreeSet<String>,
-            Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
-        );
+        #[derive(Default)]
+        struct MethodMismatchRow {
+            sites: BTreeSet<String>,
+            /// Every held row the pairing rests on: the producer it names and
+            /// each consumer call the scan holds a row for.
+            sources: Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+            /// Any consumer call folded in here had no row (carrick#1754).
+            consumer_unheld: bool,
+        }
         let mut method_mismatches: BTreeMap<(String, String, String), MethodMismatchRow> =
             BTreeMap::new();
         for ((method, _consumer_path), mut candidate) in mismatch_candidates {
@@ -2783,15 +2796,33 @@ impl Analyzer {
             let row = method_mismatches
                 .entry((method, declared_path, expected))
                 .or_default();
-            row.0.extend(candidate.call_sites);
-            row.1.extend(producer_sources);
-            row.1.extend(candidate.consumer_sources);
+            row.sites.extend(candidate.call_sites);
+            row.sources.extend(producer_sources);
+            row.sources.extend(candidate.consumer_sources);
+            row.consumer_unheld |= candidate.consumer_unheld;
         }
 
         // Findings order: risks (method mismatches) first, then gaps, then
         // advisories — mirrors the report's section order.
         let mut findings: Vec<Finding> = Vec::new();
-        for ((method, path, expected), (sites, sources)) in method_mismatches {
+        for (
+            (method, path, expected),
+            MethodMismatchRow {
+                sites,
+                sources,
+                consumer_unheld,
+            },
+        ) in method_mismatches
+        {
+            // A call the scan holds no row for is a side it cannot see, so
+            // the pairing is not a fact: a candidate, as a model row would
+            // make it (carrick#1754). Not the fold's silence, which is a held
+            // row that states no source and stays unstated, and enforced.
+            let edge_source = if consumer_unheld {
+                Some(crate::findings::EdgeSource::Candidate)
+            } else {
+                crate::findings::EdgeSource::fold(sources)
+            };
             // The producer this verb misses and the verb the consumers send:
             // the matcher's own row key, and the pairing a PR run compares
             // with main's on (carrick-cloud#1369). Which files send it is
@@ -2800,7 +2831,7 @@ impl Analyzer {
             findings.push(
                 Finding::method_mismatch(method, path, None, sites.into_iter().collect(), expected)
                     .with_pair(Some(pair))
-                    .with_edge_source(crate::findings::EdgeSource::fold(sources))
+                    .with_edge_source(edge_source)
                     // A wrong verb on a declared route is a routing fact; no type
                     // verdict bears on it, which is not the same as one that could
                     // not be reached (cloud#599).
@@ -5494,6 +5525,8 @@ mod tests {
                     "POST",
                 )
                 .with_pair(Some("POST /api/orders~GET".to_string()))
+                // No data-call row at the call: a candidate (carrick#1754).
+                .with_edge_source(Some(crate::findings::EdgeSource::Candidate))
                 .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ],
             "a wrong-verb call must surface once, as a risk"
@@ -7155,6 +7188,7 @@ mod tests {
                     "POST",
                 )
                 .with_pair(Some("POST /orders/:id~GET".to_string()))
+                .with_edge_source(Some(crate::findings::EdgeSource::Candidate))
                 .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ]
         );
@@ -7186,6 +7220,7 @@ mod tests {
                 // Expected method is the unverified POST, not the verified GET.
                 Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "POST")
                     .with_pair(Some("POST /a~PUT".to_string()))
+                    .with_edge_source(Some(crate::findings::EdgeSource::Candidate))
                     .with_verdict_state(Some(crate::findings::VerdictState::NotChecked)),
                 // GET /b keeps its orphan classification; POST /a is
                 // suppressed (it is the producer the risk names).
@@ -7222,6 +7257,7 @@ mod tests {
             vec![
                 Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "GET",)
                     .with_pair(Some("GET /a~PUT".to_string()))
+                    .with_edge_source(Some(crate::findings::EdgeSource::Candidate))
                     .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
             ]
         );
