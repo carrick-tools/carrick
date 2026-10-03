@@ -21,7 +21,7 @@
 //!
 //! | row | anchor | served type | verdict |
 //! |---|---|---|---|
-//! | `query invoice` (`InvoicePage.tsx:6`) | the declaration (the locate is ignored) | the `invoice` property: `{ __typename: 'Invoice', id, total, dueAt? } \| null` | compatible with the resolver's `Invoice \| null` |
+//! | `query invoice` (`InvoicePage.tsx:6`) | the declaration (the locate is ignored) | the `invoice` property: `{ __typename: 'Invoice', id, total, dueAt?, status } \| null`, `status` the string union its alias names (carrick#1774) | compatible with the resolver's `Invoice \| null` |
 //! | `mutation sendInvoice` (`InvoicePage.tsx:7`) | the declaration, no locate | `{ __typename: 'Invoice', id: string }` | compatible with `Invoice` |
 //! | `query note` (`NotePage.tsx:6`) | the located `NoteView` (carrick#1728) | `{ id: string; body: string }` | none to judge: no resolver |
 //! | `query ledger` (`LedgerPage.tsx:6`) | none yet: the declared type writes `unknown` (carrick#1775) | `unknown`; never the operation result | none to judge: no resolver |
@@ -163,6 +163,14 @@ fn a_typed_documents_declaration_types_the_rows_at_its_calls_at_field_level() {
             && !definition.contains("\"Query\""),
         "the row serves the field's payload, nullable as declared, not the operation result: \
          {definition}"
+    );
+    // The declaration names `status` by an alias its module declares; the
+    // served type carries the union, not a member read `any` (carrick#1774).
+    assert!(
+        definition.contains("\"DRAFT\"")
+            && definition.contains("\"SENT\"")
+            && !definition.contains("any"),
+        "the alias member publishes its union: {definition}"
     );
     assert_eq!(
         verdict(&blobs, "graphql|query|invoice"),

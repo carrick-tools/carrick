@@ -136,14 +136,21 @@ export function resolveAnchor(
     // (a generated model that was never generated). The stub then self-checks
     // such a name as an error placeholder, which no walk flags. A name a
     // sibling symbol anchor imports is resolved by that import.
+    // carrick#1774: the text names types as they read where it was printed,
+    // so a name its source file means by a repo module's export is imported
+    // from that module (a string-union alias printed bare read `any`).
+    const scoped = siblingSpec
+      ? undefined
+      : qualifyNamesFromSource(text, program, request.source_file, args);
+    const scopedText = scoped ?? text;
     // carrick#1377: rewrite what nothing declares to `unknown` in place, so
     // one member typed by a module the checkout does not have stops taking
     // every member around it down with it.
     const rewritten =
       siblingSpec || !args.placeholder
         ? undefined
-        : substituteUndeclaredNamesInText(text, program, args.placeholder);
-    const aliasBody = rewritten?.text ?? text;
+        : substituteUndeclaredNamesInText(scopedText, program, args.placeholder);
+    const aliasBody = rewritten?.text ?? scopedText;
     const undeclaredNames =
       siblingSpec || !args.placeholder
         ? []
@@ -515,6 +522,110 @@ function substituteUndeclaredNamesInText(
     ),
     paths: rewritten.substitutions.map((entry) => entry.path),
   };
+}
+
+/**
+ * carrick#1774: literal text with every type name read where it was printed.
+ *
+ * The text was printed in `sourceFileRel` (the v1 inferrer prints at the node,
+ * where the module's own declarations and imports are in scope), so a type
+ * reference in it means what its leftmost name resolves to in that file. The
+ * surface entry is another scope: there such a name names nothing (TS2304, a
+ * member that reads `any`) or a global of the same name (`Notification`).
+ * Each reference whose name the source resolves to a type that a module
+ * inside the repo exports becomes `import('<module>').<export>`, with its
+ * qualifier and type arguments kept. Anything else is left as written: a
+ * global, a name only a function body declares, an unexported local, and a
+ * type declared outside the repo or under `node_modules`, which the stub does
+ * not ship.
+ *
+ * Returns the rewritten text, or undefined when nothing was rewritten, so a
+ * text with no such name stays byte-identical.
+ */
+function qualifyNamesFromSource(
+  text: string,
+  program: ts.Program,
+  sourceFileRel: string | undefined,
+  args: { repoRoot: string; entryDir: string }
+): string | undefined {
+  if (!sourceFileRel) return undefined;
+  const source = program.getSourceFile(path.join(args.repoRoot, sourceFileRel));
+  const parsed = parseLiteralAnchor(text);
+  if (!source || !parsed) return undefined;
+  const checker = program.getTypeChecker();
+  const meaning = ts.SymbolFlags.Type | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias;
+
+  // Names the text declares itself (`[K in ...]`, `<T>(...)`, `infer U`).
+  const typeParameters = new Set<string>();
+  const collect = (node: ts.Node): void => {
+    if (ts.isTypeParameterDeclaration(node)) typeParameters.add(node.name.text);
+    ts.forEachChild(node, collect);
+  };
+  collect(parsed);
+
+  const imports = new Map<string, { spec: string; exportName: string } | undefined>();
+  const importFor = (name: string): { spec: string; exportName: string } | undefined => {
+    if (imports.has(name)) return imports.get(name);
+    let found: { spec: string; exportName: string } | undefined;
+    const atSource = checker.resolveName(name, source, meaning, false);
+    const target = atSource && resolveSymbolAliases(checker, atSource);
+    const declaringFile = target?.declarations?.[0]?.getSourceFile();
+    const rel = declaringFile && path.relative(args.repoRoot, declaringFile.fileName);
+    if (
+      target &&
+      declaringFile &&
+      rel &&
+      !rel.startsWith('..') &&
+      !rel.split(path.sep).includes('node_modules')
+    ) {
+      const moduleSymbol = checker.getSymbolAtLocation(declaringFile);
+      const exported = moduleSymbol
+        ? checker
+            .getExportsOfModule(moduleSymbol)
+            .filter((candidate) => resolveSymbolAliases(checker, candidate) === target)
+        : [];
+      const chosen = exported.find((candidate) => candidate.getName() === name) ?? exported[0];
+      if (chosen) {
+        found = {
+          spec: entryRelativeSpecifier(args.entryDir, args.repoRoot, rel.split(path.sep).join('/')),
+          exportName: chosen.getName(),
+        };
+      }
+    }
+    imports.set(name, found);
+    return found;
+  };
+
+  const leftmost = (name: ts.EntityName): ts.Identifier =>
+    ts.isIdentifier(name) ? name : leftmost(name.left);
+  const renameLeftmost = (name: ts.EntityName, to: string): ts.EntityName =>
+    ts.isIdentifier(name)
+      ? ts.factory.createIdentifier(to)
+      : ts.factory.createQualifiedName(renameLeftmost(name.left, to), name.right);
+
+  let rewrites = 0;
+  const rewrite = (node: ts.Node): ts.Node => {
+    if (ts.isTypeReferenceNode(node)) {
+      const name = leftmost(node.typeName).text;
+      const target = typeParameters.has(name) ? undefined : importFor(name);
+      if (target) {
+        rewrites += 1;
+        return ts.factory.createImportTypeNode(
+          ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(target.spec)),
+          undefined,
+          renameLeftmost(node.typeName, target.exportName),
+          node.typeArguments?.map((argument) => rewrite(argument) as ts.TypeNode),
+          false
+        );
+      }
+    }
+    return ts.visitEachChild(node, rewrite, /* context */ undefined);
+  };
+  const rewritten = rewrite(parsed);
+  if (rewrites === 0) return undefined;
+  return ts
+    .createPrinter({ removeComments: true })
+    .printNode(ts.EmitHint.Unspecified, rewritten, parsed.getSourceFile());
 }
 
 /** The type node of `type __LiteralAnchor = <text>;`, or undefined. */

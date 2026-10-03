@@ -14,6 +14,7 @@ type Invoice {
   id: ID!
   total: Int!
   dueAt: String
+  status: InvoiceStatus!
 }
 
 type Note {
@@ -24,4 +25,9 @@ type Note {
 type Ledger {
   id: ID!
   entries: JSON
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
 }

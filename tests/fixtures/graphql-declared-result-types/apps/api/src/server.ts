@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 interface Invoice {
   id: string;
   total: number;
-  dueAt: string | null;
+  dueAt: string | null; status: 'DRAFT' | 'SENT';
 }
 
 const invoices = new Map<string, Invoice>();
@@ -15,7 +15,7 @@ const resolvers = {
     invoice: (_parent: unknown, args: { id: string }): Invoice | null => invoices.get(args.id) ?? null,
   },
   Mutation: {
-    sendInvoice: (_parent: unknown, args: { id: string }): Invoice => ({ id: args.id, total: 0, dueAt: null }),
+    sendInvoice: (_parent: unknown, args: { id: string }): Invoice => ({ id: args.id, total: 0, dueAt: null, status: 'DRAFT' }),
   },
 };
 
