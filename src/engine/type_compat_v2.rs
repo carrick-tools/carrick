@@ -1462,17 +1462,17 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
 
 /// Whether the CONSUMER's type is what left this verdict unresolved, in a way
 /// a retype of its call could settle. A consumer that states no contract at
-/// all (it reads no body, or sends a form body) has nothing to compare.
+/// all (it reads no body, sends a form body, or reads or sends bytes,
+/// carrick#1793) has nothing to compare.
 ///
 /// A proven mismatch is never a candidate: the retype may only lift a verdict
 /// that compared nothing, never downgrade one that found a break.
 fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> bool {
     verdict.bucket != VerdictBucket::Incompatible
         && verdict.unresolved_side == Some(VerdictSide::Consumer)
-        && !verdict
-            .gate
-            .as_deref()
-            .is_some_and(|gate| gate.ends_with(":void") || gate.ends_with(":form"))
+        && !verdict.gate.as_deref().is_some_and(|gate| {
+            gate.ends_with(":void") || gate.ends_with(":form") || gate.ends_with(":bytes")
+        })
 }
 
 /// Said on every pair the retype decided.
@@ -2244,6 +2244,12 @@ mod tests {
         assert!(!consumer_to_blame(&verdict(
             consumer,
             Some("consumer:form")
+        )));
+        // It reads bytes (carrick#1793): a blob or a buffer states no shape,
+        // so retyping its call with the producer's type has nothing to judge.
+        assert!(!consumer_to_blame(&verdict(
+            consumer,
+            Some("consumer:bytes")
         )));
     }
 

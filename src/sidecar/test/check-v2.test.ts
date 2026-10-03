@@ -90,6 +90,13 @@ const PAIRS: CheckPairSpec[] = [
   // hand the judge the first of those and never the second.
   mk('envelope', 'Envelope_Producer', 'Envelope_Consumer'),
   mk('envelopeprojection', 'Envelope_Producer', 'Envelope_Projection'),
+  // carrick#1793: a body of bytes has no JSON shape. A route sending bytes
+  // read with `.blob()`, the same route read as a string, a JSON route read
+  // with `.blob()`, and a file upload against a declared request body.
+  mk('bytesblob', 'Bytes_Producer', 'Blob_Consumer'),
+  mk('bytesstring', 'Bytes_Producer', 'String_Consumer'),
+  mk('jsonblob', 'C_Sent', 'Blob_Consumer'),
+  mk('bytesupload', 'Form_Expected', 'Upload_Sent', { type_kind: 'request' }),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -122,6 +129,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Bigint_Producer = { id: string; size: bigint; };',
         'export type Wire_Partial_Producer = { createdAt: Date; size: number; };',
         'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
+        'export type Bytes_Producer = Uint8Array;',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -148,6 +156,9 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Partial_Consumer = { createdAt: string; size: string; };',
         'export type Envelope_Consumer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Envelope_Projection = { [key: string]: boolean; };',
+        'export type Blob_Consumer = Blob;',
+        'export type String_Consumer = string;',
+        'export type Upload_Sent = File;',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -249,6 +260,23 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.bucket, 'unverifiable');
     assert.strictEqual(v.gate, 'consumer:form');
     assert.strictEqual(v.resolved, false);
+  });
+
+  it('a body of bytes on either side is not compared as a JSON shape (carrick#1793)', () => {
+    const cases: Array<[string, string]> = [
+      // Both sides are bytes: the producer, the sent side, is named.
+      ['bytesblob', 'producer:bytes'],
+      ['bytesstring', 'producer:bytes'],
+      ['jsonblob', 'consumer:bytes'],
+      ['bytesupload', 'consumer:bytes'],
+    ];
+    for (const [key, gate] of cases) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'unverifiable', `${key}: ${v.diagnostic}`);
+      assert.strictEqual(v.gate, gate, key);
+      assert.strictEqual(v.resolved, false, key);
+      assert.match(v.diagnostic!, /bytes/, key);
+    }
   });
 
   it('an any consumer keeps its top-type gate, not the void or form gate (carrick#1162)', () => {

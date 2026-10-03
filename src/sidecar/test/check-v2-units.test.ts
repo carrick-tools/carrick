@@ -108,13 +108,14 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
     assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: GqlExpected = sentComparand;');
   });
 
-  it('non-graphql pairs keep the raw sent assignment and eight gates', () => {
+  it('non-graphql pairs keep the raw sent assignment and their gates', () => {
     for (const protocol of ['http', 'socket', 'pubsub'] as const) {
       const plan = buildProbe(spec({ protocol }), PKG);
       assert.ok(!plan.source.includes('GqlComparand'), protocol);
       assert.ok(!plan.source.includes('__typename'), protocol);
-      // any/unknown/never on both sides, plus void on both sides (carrick#1162).
-      assert.strictEqual(plan.gateLines.size, 8, protocol);
+      // any/unknown/never on both sides, plus void on both sides (carrick#1162),
+      // plus bytes on both sides of an http pair (carrick#1793).
+      assert.strictEqual(plan.gateLines.size, protocol === 'http' ? 10 : 8, protocol);
       const lines = plan.source.split('\n');
       assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sent;');
     }
@@ -416,6 +417,37 @@ describe('four-bucket classifier precedence', () => {
     assert.ok(
       ![...buildProbe(spec(), PKG).gateLines.values()].includes('sent:form'),
       'a response probe has no form gate'
+    );
+  });
+
+  it('bytes gates: either side unverifiable, the sent side named when both fire (carrick#1793)', () => {
+    const line = (name: string) => [...plan.gateLines].find(([, n]) => n === name)![0];
+    const classify = (gates: string[]) =>
+      classifyPair({
+        plan,
+        probeDiags: [
+          ...gates.map((g) => diag(line(g), 2344)),
+          diag(plan.assignmentLine, 2322),
+        ],
+        poisonReason: noPoison,
+        scrubCtx,
+      });
+    // http/response => sent is the producer, expected the consumer.
+    const producer = classify(['sent:bytes']);
+    assert.strictEqual(producer.bucket, 'unverifiable');
+    assert.strictEqual(producer.gate, 'producer:bytes');
+    assert.strictEqual(producer.resolved, false);
+    assert.strictEqual(classify(['expected:bytes']).gate, 'consumer:bytes');
+    // The diagnostics' order does not pick the side.
+    assert.strictEqual(classify(['expected:bytes', 'sent:bytes']).gate, 'producer:bytes');
+    assert.strictEqual(classify(['sent:bytes', 'expected:bytes']).gate, 'producer:bytes');
+    // A top type on the same side keeps its own reason.
+    assert.strictEqual(classify(['sent:bytes', 'sent:any']).gate, 'producer:any');
+    assert.ok(
+      ![...buildProbe(spec({ protocol: 'socket' }), PKG).gateLines.values()].includes(
+        'sent:bytes'
+      ),
+      'a socket probe has no bytes gate: its declared form is what travels'
     );
   });
 

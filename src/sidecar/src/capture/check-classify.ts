@@ -206,13 +206,27 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
 
   // 4b. A side that states no contract (carrick#1162), below the decay gates so
   //     an `unknown` side is reported as `unknown`: a `void`/`undefined`
-  //     response a call site reads no body from, and a form-encoded body whose
-  //     fields are runtime appends.
-  const shapeGate = gateDiags
-    .map((d) => plan.gateLines.get(d.line)!)
-    .find((name) => name.endsWith(':void') || name.endsWith(':form'));
+  //     response a call site reads no body from, a form-encoded body whose
+  //     fields are runtime appends, and a body of bytes (carrick#1793). When
+  //     both sides are bytes the sent side is named, whatever order the
+  //     diagnostics came in.
+  const shapeGates = gateDiags.map((d) => plan.gateLines.get(d.line)!);
+  const shapeGate =
+    shapeGates.find((name) => name.endsWith(':void') || name.endsWith(':form')) ??
+    (shapeGates.includes('sent:bytes')
+      ? 'sent:bytes'
+      : shapeGates.find((name) => name === 'expected:bytes'));
   if (shapeGate) {
     const { side, kind } = sideForGate(shapeGate, plan);
+    if (kind === 'bytes') {
+      return {
+        ...base,
+        bucket: 'unverifiable',
+        gate: `${side}:bytes`,
+        diagnostic: `the ${side} body is bytes (a blob, a buffer or a stream), which has no JSON shape to compare with the other side.`,
+        ...notAFact(`the ${side} body is bytes`, side),
+      };
+    }
     if (kind === 'void') {
       return {
         ...base,

@@ -103,10 +103,12 @@ export type GateName =
   | 'sent:never'
   | 'sent:void'
   | 'sent:form'
+  | 'sent:bytes'
   | 'expected:any'
   | 'expected:unknown'
   | 'expected:never'
-  | 'expected:void';
+  | 'expected:void'
+  | 'expected:bytes';
 
 export interface ProbePlan {
   pairId: string;
@@ -235,6 +237,23 @@ export function buildProbe(
       `type IsFormBody<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [FormData | URLSearchParams] ? true : false;`
     );
     gateLines.set(push(`type _G_sent_form = Assert<Not<IsFormBody<Sent>>>;`), 'sent:form');
+  }
+  // carrick#1793: a body of bytes (a blob, a buffer, a typed array, a stream)
+  // has no JSON shape. The wire carries the bytes whatever either side holds
+  // them in, so a route sending a `Uint8Array` read with `.blob()` is not a
+  // mismatch, and neither is the same route read as text. Either side, either
+  // half: a file upload states no fields a declared body could be compared
+  // with. `null`/`undefined` are dropped first, so `Blob | null` still gates,
+  // while a bare `null`, `undefined` or `never` leaves nothing to test.
+  if (spec.protocol === 'http') {
+    push(
+      `type IsByteBody<T> = 0 extends 1 & T ? false : [NonNullable<T>] extends [never] ? false : [NonNullable<T>] extends [Blob | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | ReadableStream<any>] ? true : false;`
+    );
+    gateLines.set(push(`type _G_sent_bytes = Assert<Not<IsByteBody<Sent>>>;`), 'sent:bytes');
+    gateLines.set(
+      push(`type _G_expected_bytes = Assert<Not<IsByteBody<Expected>>>;`),
+      'expected:bytes'
+    );
   }
   push(`declare const sent: Sent;`);
 
