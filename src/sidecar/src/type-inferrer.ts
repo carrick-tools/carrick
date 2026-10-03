@@ -44,7 +44,7 @@ import type {
   InferredType,
   InferKind,
   SourceLocation,
-
+  StatedBody,
   ExtractionConfig,
   ExtractionRule,
   TypeProvenance,
@@ -1848,7 +1848,7 @@ export class TypeInferrer {
       }
     }
 
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -1857,6 +1857,131 @@ export class TypeInferrer {
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth
     );
+    // carrick#1749: say when the text is the source's own statement of the
+    // body, and what that statement is rooted at, so the scanner can tell a
+    // model symbol that names the body from one that names a part of it.
+    const statedBody = explicitType ? this.statedBodyAtRead(terminalNode) : undefined;
+    if (statedBody) {
+      inferred.stated_body = statedBody;
+    }
+    return inferred;
+  }
+
+  /**
+   * What the source states the body read at `terminal` to be, when the type
+   * `extractExplicitTypeFromAncestor` printed for it is stated AT the read
+   * (carrick#1749): the read is the operand of that cast, or the initializer
+   * of that annotated declaration, through wrappers that leave a value as it
+   * is (parentheses, `await`, `!`, another cast). An annotation further out —
+   * the declared type of the function the read sits in — describes something
+   * else, and is not reported.
+   */
+  private statedBodyAtRead(terminal: Node): StatedBody | undefined {
+    const typeNode = this.explicitTypeNodeFromAncestor(terminal);
+    const owner = typeNode?.getParent();
+    if (!typeNode || !owner) return undefined;
+    let current: Node = terminal;
+    for (;;) {
+      if (current === owner) break;
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (
+        parent === owner &&
+        Node.isVariableDeclaration(parent) &&
+        parent.getInitializer() === current
+      ) {
+        break;
+      }
+      if (
+        !Node.isParenthesizedExpression(parent) &&
+        !Node.isAwaitExpression(parent) &&
+        !Node.isNonNullExpression(parent) &&
+        !Node.isAsExpression(parent) &&
+        !Node.isTypeAssertion(parent) &&
+        !Node.isSatisfiesExpression(parent)
+      ) {
+        return undefined;
+      }
+      current = parent;
+    }
+    return this.statedRoot(typeNode);
+  }
+
+  /**
+   * The named root of a stated body type: `Promise<...>` and `PromiseLike`
+   * (the language's await protocol), array levels, parentheses, `readonly`
+   * and `| null`/`| undefined` are peeled, and what is left is either a type
+   * reference, whose name is the root, or anything else, which has none.
+   */
+  private statedRoot(typeNode: Node): StatedBody {
+    let node: Node = typeNode;
+    let depth = 0;
+    for (let step = 0; step < 16; step++) {
+      if (Node.isParenthesizedTypeNode(node)) {
+        node = node.getTypeNode();
+        continue;
+      }
+      if (Node.isArrayTypeNode(node)) {
+        node = node.getElementTypeNode();
+        depth++;
+        continue;
+      }
+      if (
+        Node.isTypeOperatorTypeNode(node) &&
+        node.getOperator() === SyntaxKind.ReadonlyKeyword
+      ) {
+        node = node.getTypeNode();
+        continue;
+      }
+      if (Node.isUnionTypeNode(node)) {
+        const present = node
+          .getTypeNodes()
+          .filter(
+            (member) =>
+              !(
+                (Node.isLiteralTypeNode(member) &&
+                  member.getLiteral().getKind() === SyntaxKind.NullKeyword) ||
+                member.getKind() === SyntaxKind.UndefinedKeyword ||
+                member.getKind() === SyntaxKind.NullKeyword
+              )
+          );
+        if (present.length === 1) {
+          node = present[0];
+          continue;
+        }
+        break;
+      }
+      if (Node.isTypeReference(node)) {
+        const name = node.getTypeName().getText();
+        const args = node.getTypeArguments();
+        if (args.length === 1 && (name === 'Promise' || name === 'PromiseLike')) {
+          node = args[0];
+          continue;
+        }
+        if (args.length === 1 && (name === 'Array' || name === 'ReadonlyArray')) {
+          node = args[0];
+          depth++;
+          continue;
+        }
+      }
+      break;
+    }
+    const depthField = depth > 0 ? { array_depth: depth } : {};
+    if (!Node.isTypeReference(node)) {
+      return depthField;
+    }
+    const typeName = node.getTypeName();
+    const nameNode = Node.isQualifiedName(typeName) ? typeName.getRight() : typeName;
+    let symbol = nameNode.getSymbol();
+    if (symbol?.isAlias()) {
+      symbol = symbol.getAliasedSymbol() ?? symbol;
+    }
+    const source = symbol?.getDeclarations()[0]?.getSourceFile().getFilePath();
+    return {
+      root: nameNode.getText(),
+      ...(source ? { root_source: source } : {}),
+      ...depthField,
+    };
   }
 
   private inferVariable(
@@ -2331,6 +2456,15 @@ export class TypeInferrer {
     callExpr: CallExpression,
     func: FunctionLike | undefined
   ): CallResultUse {
+    // carrick#1749: the call starts a chain, and a callback in it is handed
+    // the body unread and casts it. That cast is the body read, and it comes
+    // before the return-statement answer below, which for a chain is the
+    // value the caller computed from the body, not the body.
+    const chainRead = this.bodyReadInCallbackChain(callExpr);
+    if (chainRead) {
+      return { terminal: chainRead, projectionOnly: false, projections: [] };
+    }
+
     const returnStmt = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
     if (returnStmt) {
       const returnExpr = returnStmt.getExpression();
@@ -2852,6 +2986,76 @@ export class TypeInferrer {
    * HTTP response is read exactly this way whatever produced the response, so
    * the shape is structural, not a framework's name.
    */
+  /**
+   * The body read inside a chain that starts at `callExpr` (carrick#1749):
+   * `request(url).check(ok).mapOk(response => { const data = response as
+   * SearchResponse; ... })`.
+   *
+   * The chain is the run of member calls whose receiver is the call, then
+   * that call's result, and so on. A callback passed to one of them whose
+   * first parameter the compiler types `unknown` is handed a value nothing
+   * has typed yet, which is what a parsed body is; where the source casts
+   * that parameter, the cast is what the caller says the body is. The value
+   * the chain ends in is what the caller computed from it, and publishing
+   * that as the body is the false mismatch this rule exists for.
+   *
+   * Exactly one such cast across the whole chain answers. None, or more than
+   * one (a callback on the failure side can be handed an `unknown` too), and
+   * the walk carries on as before. A parameter typed `any` is not read: an
+   * unresolved library types every callback that way, success and failure
+   * alike, so it says nothing about which one is the body.
+   */
+  private bodyReadInCallbackChain(callExpr: CallExpression): Node | undefined {
+    const reads: Node[] = [];
+    let receiver: Node = callExpr;
+    for (let link = 0; link < 64; link++) {
+      const access = receiver.getParent();
+      if (
+        !access ||
+        !Node.isPropertyAccessExpression(access) ||
+        access.getExpression() !== receiver
+      ) {
+        break;
+      }
+      const call = access.getParent();
+      if (!call || !Node.isCallExpression(call) || call.getExpression() !== access) {
+        break;
+      }
+      for (const arg of call.getArguments()) {
+        if (Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) {
+          reads.push(...this.castsOfUnreadParameter(arg));
+        }
+      }
+      receiver = call;
+    }
+    return reads.length === 1 ? reads[0] : undefined;
+  }
+
+  /**
+   * The casts of a callback's first parameter, when the compiler types that
+   * parameter `unknown`: `response as T` and `<T>response`, the operand being
+   * the parameter itself. A cast to a top type states nothing and is skipped.
+   */
+  private castsOfUnreadParameter(callback: ArrowFunction | FunctionExpression): Node[] {
+    const param = callback.getParameters()[0];
+    const name = param?.getNameNode();
+    if (!param || !name || !Node.isIdentifier(name) || !param.getType().isUnknown()) {
+      return [];
+    }
+    const symbol = name.getSymbol();
+    if (!symbol) return [];
+    return callback.getDescendants().filter((node) => {
+      if (!Node.isAsExpression(node) && !Node.isTypeAssertion(node)) return false;
+      let operand: Node = node.getExpression();
+      while (Node.isParenthesizedExpression(operand)) {
+        operand = operand.getExpression();
+      }
+      if (!Node.isIdentifier(operand) || operand.getSymbol() !== symbol) return false;
+      const stated = node.getType();
+      return !stated.isAny() && !stated.isUnknown();
+    });
+  }
+
   private bodyReadOnReceiver(identifier: Node): Node | undefined {
     const access = identifier.getParent();
     if (
@@ -3656,11 +3860,17 @@ export class TypeInferrer {
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {
+    const typeNode = this.explicitTypeNodeFromAncestor(node);
+    return typeNode ? this.expandAnnotationTypeNode(typeNode) : null;
+  }
+
+  /** The annotation `extractExplicitTypeFromAncestor` prints, as a node. */
+  private explicitTypeNodeFromAncestor(node: Node): Node | undefined {
     const varDecl = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
     if (varDecl) {
       const typeNode = varDecl.getTypeNode();
       if (typeNode) {
-        return this.expandAnnotationTypeNode(typeNode);
+        return typeNode;
       }
     }
 
@@ -3674,7 +3884,7 @@ export class TypeInferrer {
     if (asExpr) {
       const typeNode = asExpr.getTypeNode();
       if (typeNode) {
-        return this.expandAnnotationTypeNode(typeNode);
+        return typeNode;
       }
     }
 
@@ -3684,11 +3894,11 @@ export class TypeInferrer {
     if (typeAssertion) {
       const typeNode = typeAssertion.getTypeNode();
       if (typeNode) {
-        return this.expandAnnotationTypeNode(typeNode);
+        return typeNode;
       }
     }
 
-    return null;
+    return undefined;
   }
 
   /**

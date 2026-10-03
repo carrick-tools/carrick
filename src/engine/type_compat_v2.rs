@@ -2588,6 +2588,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            stated_body: None,
         }
     }
 
@@ -2720,6 +2721,65 @@ mod tests {
                  locator-based infer anchor, got {:?}",
                 other
             ),
+        }
+    }
+
+    /// carrick#1749: the capture anchors what the arbitration left. A consumer
+    /// call whose model symbol names the element of the body the source
+    /// states (`res.json() as Promise<{ members: Member[] }>`, model `Member`)
+    /// must reach the surface as the stated body, not as `Member`: once
+    /// `demote_witnessed_borrowed_anchors` drops the symbol, the alias falls to
+    /// its inference's literal text. Run in the order `run_capture_for_service`
+    /// runs them.
+    #[test]
+    fn derive_anchors_capture_the_stated_body_over_a_model_element_symbol() {
+        let alias = "Endpoint_members_Response_Call1";
+        let explicit = vec![SymbolRequest {
+            symbol_name: "Member".to_string(),
+            source_file: "/repo/src/api.ts".to_string(),
+            alias: Some(alias.to_string()),
+            array_depth: None,
+            payload_borrow_witness: false,
+        }];
+        let infer = vec![InferRequestItem {
+            file_path: "/repo/src/api.ts".to_string(),
+            line_number: 30,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("fetchReply(\"/v1/members\")".to_string()),
+            expression_line: Some(30),
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        }];
+        let text = "{ members: { id: string; name: string; email: string; }[]; }";
+        let mut inf = inferred(alias, text, None, None);
+        inf.infer_kind = InferKind::CallResult;
+        inf.is_explicit = true;
+        inf.stated_body = Some(crate::services::type_sidecar::StatedBody::default());
+        let inferred_types = vec![inf];
+
+        let explicit = crate::services::type_sidecar::demote_witnessed_borrowed_anchors(
+            &explicit,
+            &inferred_types,
+        );
+        let explicit =
+            crate::services::type_sidecar::apply_inferred_array_depth(&explicit, &inferred_types);
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias: anchored,
+                type_text,
+                anchor_origin,
+                ..
+            } => {
+                assert_eq!(anchored, alias);
+                assert_eq!(type_text, text);
+                assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
+            }
+            other => panic!("expected the stated body as a literal anchor, got {other:?}"),
         }
     }
 
@@ -3020,6 +3080,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            stated_body: None,
         };
 
         let infer = vec![
@@ -3148,6 +3209,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            stated_body: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -3430,6 +3492,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            stated_body: None,
         };
 
         let explicit = vec![

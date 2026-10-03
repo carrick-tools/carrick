@@ -1118,6 +1118,30 @@ pub struct InferredType {
     /// when the two are the same or the reading was dropped as unsound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_type_string: Option<String>,
+    /// carrick#1749, `call_result` only: present when `type_string` is the
+    /// source's own statement of the body it reads, made AT the read (a cast
+    /// of it, or the annotated declaration it initializes). Read by
+    /// `demote_witnessed_borrowed_anchors`: a model symbol that is not the
+    /// statement's root names something other than the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stated_body: Option<StatedBody>,
+}
+
+/// What the source states a body read to be (carrick#1749).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatedBody {
+    /// The name the stated type is rooted at once `Promise<…>`, array levels
+    /// and `| null`/`| undefined` are peeled (`Order` for
+    /// `Promise<Order[] | null>`). `None` when the root is not a named type:
+    /// an object literal type, or a union of several types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Declaration file (absolute path) of `root`, when it resolves to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_source: Option<String>,
+    /// Array levels peeled on the way to `root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_depth: Option<u32>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -2081,11 +2105,13 @@ impl TypeSidecar {
             }
         }
 
-        // Two-anchor arbitration (#413, pub/sub only): a request carrying the
+        // Two-anchor arbitration (#413, carrick#1749): a request carrying the
         // scanner's deterministic borrow witness whose alias the inference
         // resolved to a DIFFERENT named root is demoted here — re-aimed at
         // the tsc-witnessed root so the bundler defines the alias from the
-        // inferred payload type instead of the borrowed symbol. This must
+        // inferred payload type instead of the borrowed symbol — and so is a
+        // consumer call's model symbol that the source's own statement of the
+        // body it reads does not root at (re-aimed, or dropped). This must
         // happen BEFORE the bundle runs: compat verdicts are computed from
         // the bundled dts, so a post-hoc flag flip in
         // `enrich_manifest_with_type_resolution` could never undo a wrong
@@ -2387,9 +2413,11 @@ fn frame_errors(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| "sidecar returned an error with no detail".to_string())
 }
 
-/// Two-anchor arbitration for pub/sub payload anchors (#413, the #403/#359
-/// borrow-class lineage): demote a witnessed-borrowed explicit request when
-/// the same alias's location-based inference resolved a DIFFERENT named root.
+/// Two-anchor arbitration (#413, the #403/#359 borrow-class lineage): demote
+/// a witnessed-borrowed explicit request when the same alias's location-based
+/// inference disagrees with it. Two witnesses license it: the scanner's AST
+/// borrow witness for pub/sub payloads, and the source's stated body read for
+/// HTTP consumer responses (carrick#1749, below).
 ///
 /// A pub/sub op can carry two independent anchors: the LLM's explicit
 /// `primary_type_symbol` (a judgment, measured wrong 13/20 on the honest
@@ -2432,8 +2460,21 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// - a root with no reported declaration file (the bundler could not resolve
 ///   it), or a framework envelope root (demotion must never install
 ///   machinery as a payload);
-/// - requests without the witness flag — every HTTP/socket/GraphQL request,
-///   making this function structurally inert outside pub/sub.
+/// - requests without the witness flag.
+///
+/// The second witness is the source's own statement of a consumer's body
+/// (carrick#1749). An HTTP consumer call's explicit request carries the
+/// model's `primary_type_symbol`, and the same alias's `call_result`
+/// inference reports `stated_body` when the source casts or annotates the
+/// body it reads. The model's symbol agrees when it IS the statement's root
+/// (`as Promise<Order>`, model `Order`): kept, whatever the printed text, so
+/// formatting is never a disagreement. Any other symbol names something the
+/// source says the body is not: an element inside it (`as Promise<{ members:
+/// Member[] }>`, model `Member`) or a value the caller computed from it (the
+/// enclosing function's mapped return). The explicit request is then re-aimed
+/// at the stated root when the inference is its bare named form and its
+/// declaration file is known, and dropped otherwise, so the alias is defined
+/// by the inference itself. The fan-in keep above applies to both witnesses.
 pub(crate) fn demote_witnessed_borrowed_anchors(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
@@ -2454,33 +2495,38 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
 
     explicit
         .iter()
-        .map(|req| {
-            if !req.payload_borrow_witness {
-                return req.clone();
-            }
+        .filter_map(|req| {
             let Some(alias) = req.alias.as_deref() else {
-                return req.clone();
+                return Some(req.clone());
             };
             if alias_counts.get(alias).copied().unwrap_or(0) > 1 {
-                return req.clone();
+                return Some(req.clone());
             }
             let Some(inf) = inferred_by_alias.get(alias) else {
-                return req.clone();
+                return Some(req.clone());
             };
+            if inf.infer_kind == InferKind::CallResult
+                && let Some(stated) = inf.stated_body.as_ref()
+            {
+                return arbitrate_stated_body(req, alias, inf, stated);
+            }
+            if !req.payload_borrow_witness {
+                return Some(req.clone());
+            }
             // Anonymous inferred type: no root to disagree with — keep.
             let Some(root) = inf.primary_type_symbol.as_deref() else {
-                return req.clone();
+                return Some(req.clone());
             };
             if root == req.symbol_name {
-                return req.clone();
+                return Some(req.clone());
             }
             // Re-aiming needs the root's declaration file.
             let Some(root_source) = inf.primary_type_symbol_source.as_deref() else {
-                return req.clone();
+                return Some(req.clone());
             };
             // Never install machinery as a payload.
             if TypeSidecar::is_untyped_response_type(root) {
-                return req.clone();
+                return Some(req.clone());
             }
             // The inference must BE the bare named form of its root (modulo
             // array suffixes), or bundling the root would change the type.
@@ -2489,7 +2535,7 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 named_form = stripped.trim_end();
             }
             if named_form != root {
-                return req.clone();
+                return Some(req.clone());
             }
             info!(
                 alias = %alias,
@@ -2500,15 +2546,62 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                  symbol disagrees with the tsc-resolved payload root; demoting \
                  the explicit anchor to the inferred type"
             );
-            SymbolRequest {
+            Some(SymbolRequest {
                 symbol_name: root.to_string(),
                 source_file: root_source.to_string(),
                 alias: req.alias.clone(),
                 array_depth: inf.array_depth,
                 payload_borrow_witness: false,
-            }
+            })
         })
         .collect()
+}
+
+/// The carrick#1749 arm of `demote_witnessed_borrowed_anchors`: the source
+/// states the body a consumer call reads, so a model symbol that is not the
+/// statement's root is not the body. `None` drops the explicit request and
+/// leaves the alias to the inference.
+fn arbitrate_stated_body(
+    req: &SymbolRequest,
+    alias: &str,
+    inf: &InferredType,
+    stated: &StatedBody,
+) -> Option<SymbolRequest> {
+    if stated.root.as_deref() == Some(req.symbol_name.as_str()) {
+        return Some(req.clone());
+    }
+    let mut named_form = inf.type_string.trim();
+    while let Some(stripped) = named_form.strip_suffix("[]") {
+        named_form = stripped.trim_end();
+    }
+    if let (Some(root), Some(root_source)) = (stated.root.as_deref(), stated.root_source.as_deref())
+        && named_form == root
+        && !TypeSidecar::is_untyped_response_type(root)
+    {
+        info!(
+            alias = %alias,
+            explicit_symbol = %req.symbol_name,
+            stated_root = %root,
+            "[type_sidecar] consumer anchor arbitration: the source states the body \
+             it reads as a different type; re-aiming the explicit anchor at it"
+        );
+        return Some(SymbolRequest {
+            symbol_name: root.to_string(),
+            source_file: root_source.to_string(),
+            alias: req.alias.clone(),
+            array_depth: stated.array_depth,
+            payload_borrow_witness: false,
+        });
+    }
+    info!(
+        alias = %alias,
+        explicit_symbol = %req.symbol_name,
+        stated_root = ?stated.root,
+        "[type_sidecar] consumer anchor arbitration: the source states the body \
+         it reads as a different type; dropping the explicit anchor so the \
+         inference defines the alias"
+    );
+    None
 }
 
 /// Copy inference-resolved array depths onto explicit symbol requests (#306).
@@ -3565,6 +3658,7 @@ mod tests {
             member_return_type: None,
             any_provenance: Vec::new(),
             unwidened_type_string: None,
+            stated_body: None,
         }
     }
 
@@ -3849,6 +3943,184 @@ mod tests {
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].symbol_name, "AuditRecord");
+    }
+
+    /// A consumer call's `call_result` inference whose text is the source's
+    /// own statement of the body it reads (carrick#1749).
+    fn stated_call_result(alias: &str, type_string: &str, stated: StatedBody) -> InferredType {
+        let mut inf = inferred(alias, None, None);
+        inf.infer_kind = InferKind::CallResult;
+        inf.type_string = type_string.to_string();
+        inf.is_explicit = true;
+        inf.stated_body = Some(stated);
+        inf
+    }
+
+    /// carrick#1749 family (a): the source casts the body read to a wrapper
+    /// (`res.json() as Promise<{ members: Member[] }>`) and the model named the
+    /// element. The statement is rooted at no name, so the model's symbol is
+    /// not the body: the explicit request goes, and the inference defines the
+    /// alias.
+    #[test]
+    fn arbitration_drops_a_model_symbol_the_stated_body_wraps() {
+        let explicit = vec![symbol_request("Member", "Members_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Members_Response_Call1",
+            "{ members: { id: string; name: string; email: string; }[]; }",
+            StatedBody::default(),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert!(
+            kept.is_empty(),
+            "the element the model named is not the body the source states: {kept:?}"
+        );
+    }
+
+    /// carrick#1749 family (b): the model named the value the caller computed
+    /// from the body (the enclosing function's mapped return); the source
+    /// casts the body itself to another named type, printed expanded. Not the
+    /// bare named form of the root, so nothing to re-aim at: dropped.
+    #[test]
+    fn arbitration_drops_a_model_symbol_naming_the_mapped_return() {
+        let explicit = vec![symbol_request("Suggestions", "Search_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Search_Response_Call1",
+            "{ results: { name: string; }[]; messageKey?: string; }",
+            StatedBody {
+                root: Some("SearchResponse".to_string()),
+                root_source: Some("/repo/src/search.ts".to_string()),
+                array_depth: None,
+            },
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// The model's symbol IS the stated root: kept, whatever the printed
+    /// text. An expanded print of the same type is formatting, not a
+    /// disagreement.
+    #[test]
+    fn arbitration_keeps_a_model_symbol_the_source_states() {
+        let explicit = vec![symbol_request("Member", "Member_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Member_Response_Call1",
+            "{ id: string; name: string; email: string; }",
+            StatedBody {
+                root: Some("Member".to_string()),
+                root_source: Some("/repo/src/members.ts".to_string()),
+                array_depth: None,
+            },
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "Member");
+        assert_eq!(kept[0].source_file, "src/types.ts", "untouched");
+    }
+
+    /// A stated root the inference prints by its bare name, declared in a
+    /// known file: the explicit request is re-aimed at it, depth included, so
+    /// the bundle and the capture both define the alias from the declaration.
+    #[test]
+    fn arbitration_reaims_at_a_stated_named_root() {
+        let explicit = vec![symbol_request("Member", "Page_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Page_Response_Call1",
+            "MemberPage[]",
+            StatedBody {
+                root: Some("MemberPage".to_string()),
+                root_source: Some("/repo/src/pages.ts".to_string()),
+                array_depth: Some(1),
+            },
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "MemberPage");
+        assert_eq!(kept[0].source_file, "/repo/src/pages.ts");
+        assert_eq!(kept[0].array_depth, Some(1));
+        assert_eq!(kept[0].alias.as_deref(), Some("Page_Response_Call1"));
+    }
+
+    /// A stated root that is transport machinery is never installed as a
+    /// payload: the model's symbol is still not the body, so it is dropped
+    /// rather than re-aimed at the machinery.
+    #[test]
+    fn arbitration_never_reaims_at_machinery() {
+        let explicit = vec![symbol_request("Member", "Raw_Response_Call1", None)];
+        let inferred = vec![stated_call_result(
+            "Raw_Response_Call1",
+            "Response",
+            StatedBody {
+                root: Some("Response".to_string()),
+                root_source: Some("/repo/node_modules/types/fetch.d.ts".to_string()),
+                array_depth: None,
+            },
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// An inference that states nothing about the body (no `stated_body`)
+    /// leaves the model's symbol alone, exactly as before.
+    #[test]
+    fn arbitration_keeps_a_model_symbol_when_nothing_is_stated() {
+        let explicit = vec![symbol_request("Member", "Members_Response_Call1", None)];
+        let mut inf = stated_call_result(
+            "Members_Response_Call1",
+            "{ members: { id: string; }[]; }",
+            StatedBody::default(),
+        );
+        inf.stated_body = None;
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "Member");
+    }
+
+    /// The stated-body arm reads `call_result` inferences only: another kind
+    /// carrying the field (none does today) is not a consumer's body read.
+    #[test]
+    fn arbitration_reads_stated_body_on_call_results_only() {
+        let explicit = vec![symbol_request("Member", "Members_Response", None)];
+        let mut inf = stated_call_result(
+            "Members_Response",
+            "{ members: { id: string; }[]; }",
+            StatedBody::default(),
+        );
+        inf.infer_kind = InferKind::ResponseBody;
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &[inf]);
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    /// Two explicit requests on one alias: the inference cannot be attributed
+    /// to either, so neither is dropped.
+    #[test]
+    fn arbitration_keeps_fan_in_stated_body_alias() {
+        let explicit = vec![
+            symbol_request("Member", "Members_Response_Call1", None),
+            symbol_request("Team", "Members_Response_Call1", None),
+        ];
+        let inferred = vec![stated_call_result(
+            "Members_Response_Call1",
+            "{ members: { id: string; }[]; }",
+            StatedBody::default(),
+        )];
+
+        let kept = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

@@ -1079,6 +1079,36 @@ export interface InferredType {
    * was dropped as unsound.
    */
   unwidened_type_string?: string;
+  /**
+   * carrick#1749, `call_result` only: present when the source itself states
+   * the type of the body it reads, AT the read: a cast of the read
+   * (`res.json() as Promise<T>`, a callback's `value as T`) or the annotated
+   * declaration it initializes (`const data: T = await res.json()`). The
+   * text in `type_string` is then that statement. Absent when no type is
+   * stated, or when the only annotation is further away than the read.
+   */
+  stated_body?: StatedBody;
+}
+
+/**
+ * What the source states a body read to be (carrick#1749). The scanner
+ * compares `root` with the type symbol the model named for the same call: a
+ * model symbol that is not the stated root names something other than the
+ * body (an element of it, or a value the caller later computed from it), and
+ * the source's own statement outranks it.
+ */
+export interface StatedBody {
+  /**
+   * The name the stated type is rooted at, once `Promise<...>`, array levels,
+   * parentheses and `| null`/`| undefined` are peeled: `Order` for
+   * `Promise<Order[] | null>`, `Page` for `Page<Order>`. Absent when the root
+   * is not a named type (an object literal type, a union of several types).
+   */
+  root?: string;
+  /** Declaration file (absolute path) of `root`, when it resolves to one. */
+  root_source?: string;
+  /** Array levels peeled on the way to `root`. Omitted when 0. */
+  array_depth?: number;
 }
 
 /**
