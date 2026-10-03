@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.103](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.102...carrick-v0.3.103) (2026-10-03)
+
+
+### Features
+
+* **scanner:** stamp the build's commit on every index blob as scanner_build ([#1772](https://github.com/carrick-tools/carrick/issues/1772)) ([027662f](https://github.com/carrick-tools/carrick/commit/027662f539fa6cb283a62ae03293e5e9f9d07461)), closes [#1739](https://github.com/carrick-tools/carrick/issues/1739)
+
+
+### Bug Fixes
+
+* **detect:** list packages loaded by require() and import() in the detection imports ([#1758](https://github.com/carrick-tools/carrick/issues/1758)) ([b282907](https://github.com/carrick-tools/carrick/commit/b282907bd1731358d9bd3748cd4e9ae4230b373c))
+* **engine:** join located GraphQL consumer types after document rows are placed ([#1756](https://github.com/carrick-tools/carrick/issues/1756)) ([2d9d85c](https://github.com/carrick-tools/carrick/commit/2d9d85cfa9bc9dba8585542aa086b24e3d903392)), closes [#1728](https://github.com/carrick-tools/carrick/issues/1728)
+* **engine:** replay detection and guidance for a service that stored no file answers ([#1751](https://github.com/carrick-tools/carrick/issues/1751)) ([233397d](https://github.com/carrick-tools/carrick/commit/233397d7774d8ec4a5abbac1ab975d577a177035)), closes [#1746](https://github.com/carrick-tools/carrick/issues/1746)
+* **findings:** a type mismatch whose consumer row is not held is a candidate ([#1755](https://github.com/carrick-tools/carrick/issues/1755)) ([2ee53e3](https://github.com/carrick-tools/carrick/commit/2ee53e330477f3233beb1038decd651a00f4c92a))
+* **graphql:** a row at a call that executes a typed document serves the field's declared result type ([#1778](https://github.com/carrick-tools/carrick/issues/1778)) ([0e411f7](https://github.com/carrick-tools/carrick/commit/0e411f7ffe06bfcf7dd8188f1ce41c50c7a1d76d))
+* **scanner:** a client a getter builds once into a module let is a library receiver ([#1799](https://github.com/carrick-tools/carrick/issues/1799)) ([590d814](https://github.com/carrick-tools/carrick/commit/590d8149bebad449d6cc17988391e923d4bfd6d7))
+* **sidecar:** a consumer's stated body read outranks the model's type symbol ([#1784](https://github.com/carrick-tools/carrick/issues/1784)) ([e375b85](https://github.com/carrick-tools/carrick/commit/e375b85147c03be49a9e4abd43d47c8e3fe90a49))
+* **sidecar:** a GraphQL consumer's __typename is supplied by the server ([#1769](https://github.com/carrick-tools/carrick/issues/1769)) ([d5e2d43](https://github.com/carrick-tools/carrick/commit/d5e2d430f64ccb983168f0607ceb00ca225c0e5f)), closes [#1759](https://github.com/carrick-tools/carrick/issues/1759)
+* **sidecar:** a literal anchor's type names are read where the text was printed ([#1792](https://github.com/carrick-tools/carrick/issues/1792)) ([e33f387](https://github.com/carrick-tools/carrick/commit/e33f38789e882d5aea136f5aeb83447c124b2188)), closes [#1774](https://github.com/carrick-tools/carrick/issues/1774)
+* **sidecar:** keep a dependency read as library origin after the project is edited ([#1738](https://github.com/carrick-tools/carrick/issues/1738)) ([730034d](https://github.com/carrick-tools/carrick/commit/730034ddfac30075f8033c5f476278e11cf61dc7)), closes [#1731](https://github.com/carrick-tools/carrick/issues/1731)
+* **sidecar:** never rewrite a scanned repo's file in the capture repair ([#1744](https://github.com/carrick-tools/carrick/issues/1744)) ([fec77df](https://github.com/carrick-tools/carrick/commit/fec77df2484c2f48ff86a86a852b98345b275ac8)), closes [#1742](https://github.com/carrick-tools/carrick/issues/1742)
+* **sidecar:** place declarations for sources outside rootDir inside the stub ([#1771](https://github.com/carrick-tools/carrick/issues/1771)) ([d1fdd3a](https://github.com/carrick-tools/carrick/commit/d1fdd3a308bf5e1d1655f6cffa31b387ede2fbb7)), closes [#1770](https://github.com/carrick-tools/carrick/issues/1770)
+* **sidecar:** publish a mapped response, not the row it was mapped from ([#1747](https://github.com/carrick-tools/carrick/issues/1747)) ([b3438dd](https://github.com/carrick-tools/carrick/commit/b3438dd7c78566839025f8dbc69e6e3d2fc456dc))
+* **sidecar:** route every file write and delete through one guard ([#1777](https://github.com/carrick-tools/carrick/issues/1777)) ([00a90e4](https://github.com/carrick-tools/carrick/commit/00a90e451a8c0ede8837fe0d74327452404fb3d5)), closes [#1748](https://github.com/carrick-tools/carrick/issues/1748)
+* **sidecar:** the capture places an infer anchor on a type node its span covers exactly ([#1791](https://github.com/carrick-tools/carrick/issues/1791)) ([5019e38](https://github.com/carrick-tools/carrick/commit/5019e38fca5839bc56b9b4f87b8c87e2c80283af)), closes [#1775](https://github.com/carrick-tools/carrick/issues/1775)
+* **types:** a declared unknown member leaves a typed contract, not an unknown row ([#1763](https://github.com/carrick-tools/carrick/issues/1763)) ([26d957b](https://github.com/carrick-tools/carrick/commit/26d957bdcb1a17225dc116016d7120568dd955d1)), closes [#1752](https://github.com/carrick-tools/carrick/issues/1752)
+
+
+### Documentation
+
+* a release PR with a release-guard FAIL is not marked ready or merged ([#1743](https://github.com/carrick-tools/carrick/issues/1743)) ([021879c](https://github.com/carrick-tools/carrick/commit/021879cdb5bf7c5d557e26429afe685cbc743d12))
+
 ## [0.3.102](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.101...carrick-v0.3.102) (2026-10-02)
 
 
