@@ -31,7 +31,6 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import type {
   AnchorOrigin,
   CaptureAliasRecord,
@@ -50,6 +49,8 @@ import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
+import { placeEmittedTree } from './outside-root.js';
+import { WriteGuard } from './guarded-fs.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
@@ -161,6 +162,16 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // references others and the anchors' files do not all belong to one project.
   let ownerGroups: Map<ServiceProject, number[]> | undefined;
   let emitProject: ServiceProject | undefined;
+  // Everything this capture writes, it writes through `guard` (carrick#1748):
+  // the stub dir, the staging dir, and the surface entry. A stub dir is
+  // emptied before it is written, so one that is or holds the repo is refused
+  // before anything is touched.
+  let guard: WriteGuard;
+  try {
+    guard = WriteGuard.of({ dirs: [stubDir], protect: [repoRoot] });
+  } catch (err) {
+    return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+  }
   let deno: DenoProject | undefined;
   try {
     const config = findDenoConfig(repoRoot, opts.tsconfigPath);
@@ -247,11 +258,19 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const entryPath = deno
     ? path.join(deno.cacheDir, `${surfaceEntry}.ts`)
     : path.join(entryDir, `${surfaceEntry}.ts`);
-  fs.mkdirSync(path.dirname(entryPath), { recursive: true });
+  // The entry is the one file a capture writes inside the repo itself: tsc
+  // only emits it from inside rootDir. It is written, read and deleted, and
+  // the guard holds it to exactly that path. A Deno entry sits in the cache.
+  try {
+    guard = guard.with(deno ? { dirs: [deno.cacheDir] } : { files: [entryPath] });
+    guard.mkdir(path.dirname(entryPath));
+  } catch (err) {
+    return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
+  }
 
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
-  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath };
+  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard };
   try {
     resolved = ownerGroups && emitProject
       ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
@@ -276,7 +295,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     );
   }
 
-  const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-capture-v2-'));
+  const scratch = WriteGuard.scratch('carrick-capture-v2-');
+  const staging = scratch.dir;
   const emitted = new Map<string, string>();
   // Input .d.ts files (ambient stubs, augmentation declarations, local
   // hand-written declarations in the import closure) are never re-emitted by
@@ -285,7 +305,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const sourceByEmitted = new Map<string, string>();
   let emitPartial = false;
   try {
-    fs.writeFileSync(entryPath, entryLines.join('\n') + '\n');
+    guard.writeFile(entryPath, entryLines.join('\n') + '\n');
     const emitOptions: ts.CompilerOptions = {
       ...parsed.options,
       // The load-bearing trio: emit declarations without checking, so
@@ -333,8 +353,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   } finally {
-    if (fs.existsSync(entryPath)) fs.unlinkSync(entryPath);
-    fs.rmSync(staging, { recursive: true, force: true });
+    if (fs.existsSync(entryPath)) guard.unlink(entryPath);
+    scratch.guard.remove(staging);
   }
 
   // ---- Partial-emit recovery ----
@@ -357,22 +377,28 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- Relocate the emitted tree into the stub package ----
   const typesDir = path.join(stubDir, 'types');
-  fs.rmSync(stubDir, { recursive: true, force: true });
-  fs.mkdirSync(typesDir, { recursive: true });
+  guard.remove(stubDir);
+  guard.mkdir(typesDir);
+  // From here on, only the stub is written.
+  const stubGuard = guard.narrow(stubDir);
 
+  // A declaration for a source outside rootDir arrives at the source's own
+  // path; it is placed under the tree too (carrick#1770).
+  const placed = placeEmittedTree({ emitted, staging, entryDir, surfaceDeclaration });
   const emittedFiles: string[] = [];
   let surfaceAbsPath = '';
-  for (const [fileName, text] of emitted) {
-    let rel = path.relative(staging, fileName).split(path.sep).join('/');
-    if (path.basename(rel) === surfaceDeclaration) {
-      const source = sourceByEmitted.get(rel);
-      sourceByEmitted.delete(rel);
-      rel = 'surface.d.ts';
+  for (const fileName of emitted.keys()) {
+    const stagingRel = path.relative(staging, fileName).split(path.sep).join('/');
+    const rel = placed.relOf.get(fileName)!;
+    const text = placed.textOf.get(fileName)!;
+    if (rel !== stagingRel) {
+      const source = sourceByEmitted.get(stagingRel);
+      sourceByEmitted.delete(stagingRel);
       if (source) sourceByEmitted.set(rel, source);
     }
     const dest = path.join(typesDir, rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, text);
+    stubGuard.mkdir(path.dirname(dest));
+    stubGuard.writeFile(dest, text);
     emittedFiles.push(rel);
     if (rel === 'surface.d.ts') surfaceAbsPath = dest;
   }
@@ -383,8 +409,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   for (const [rel, text] of declarationSources) {
     if (emittedFiles.includes(rel)) continue;
     const dest = path.join(typesDir, rel);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, text);
+    stubGuard.mkdir(path.dirname(dest));
+    stubGuard.writeFile(dest, text);
     emittedFiles.push(rel);
   }
 
@@ -394,6 +420,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     .map((abs) => {
       const noDts = abs.replace(/\.d\.ts$/, '');
       const noExt = noDts === abs ? abs.replace(/\.(ts|tsx|mts|cts)$/, '') : noDts;
+      const outside = placed.outside.get(path.resolve(noExt));
+      if (outside !== undefined) return outside;
       const rel = path.relative(entryDir, noExt).split(path.sep).join('/');
       return `${rel}.d.ts`;
     })
@@ -403,18 +431,20 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // ---- Post-emit specifier rewrite (paths mappings + absolute internals) ----
   let denoRewrites = 0;
   try {
-    denoRewrites = deno?.rewrite(typesDir, emittedFiles, sourceByEmitted) ?? 0;
+    denoRewrites = deno?.rewrite(stubGuard, typesDir, emittedFiles, sourceByEmitted) ?? 0;
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
   const rewritten = rewriteEmittedSpecifiers({
+    guard: stubGuard,
+    outside: placed.outside,
     typesDir,
     files: emittedFiles,
     options: parsed.options,
     configPath: projectConfigPath,
     entryDir,
   });
-  const specifierRewrites = denoRewrites + rewritten.rewrites;
+  const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
 
   // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths
@@ -457,7 +487,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
   const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
 
-  fs.writeFileSync(
+  stubGuard.writeFile(
     path.join(stubDir, 'package.json'),
     JSON.stringify(
       {
@@ -471,7 +501,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       2
     ) + '\n'
   );
-  fs.writeFileSync(
+  stubGuard.writeFile(
     path.join(stubDir, 'tsconfig.snapshot.json'),
     JSON.stringify(
       {
@@ -491,6 +521,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- Capture-time self-check (per-alias closure attribution) ----
   const aliases = selfCheckStub({
+    guard: stubGuard,
     stubDir,
     surfaceAbsPath,
     resolved,
@@ -505,7 +536,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   });
   const fidelity = computeFidelity(aliases);
 
-  fs.writeFileSync(
+  stubGuard.writeFile(
     path.join(stubDir, 'carrick-manifest.json'),
     JSON.stringify(
       {
@@ -639,7 +670,7 @@ function resolveAnchorsByOwner(
   opts: CaptureStubOptions,
   groups: Map<ServiceProject, number[]>,
   emit: ServiceProject,
-  ctx: { repoRoot: string; entryDir: string; entryPath: string },
+  ctx: { repoRoot: string; entryDir: string; entryPath: string; guard: WriteGuard },
   errors: string[]
 ): ResolvedAnchor[] {
   const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
@@ -681,7 +712,7 @@ function resolveAnchorsByOwner(
 function resolveAnchors(
   opts: CaptureStubOptions,
   parsed: ts.ParsedCommandLine,
-  ctx: { repoRoot: string; entryDir: string; entryPath: string },
+  ctx: { repoRoot: string; entryDir: string; entryPath: string; guard: WriteGuard },
   deno?: DenoProject,
 ): ResolvedAnchor[] {
   const placeholderLines = ['// Carrick capture v2 analysis placeholder.'];
@@ -689,7 +720,7 @@ function resolveAnchors(
     placeholderLines.push(`export type ${anchor.alias} = unknown;`);
   }
 
-  fs.writeFileSync(ctx.entryPath, placeholderLines.join('\n') + '\n');
+  ctx.guard.writeFile(ctx.entryPath, placeholderLines.join('\n') + '\n');
   try {
     const anchorSources = [
       ...new Set(
@@ -730,6 +761,6 @@ function resolveAnchors(
       })
     );
   } finally {
-    if (fs.existsSync(ctx.entryPath)) fs.unlinkSync(ctx.entryPath);
+    if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);
   }
 }

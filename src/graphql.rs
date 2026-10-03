@@ -114,6 +114,13 @@ pub struct GraphqlOp {
     /// `resolver_file`). `None` when the type is declared in `file_path` itself.
     /// Null whenever `consumer_located_type_symbol` is null.
     pub consumer_located_type_source: Option<String>,
+    /// CONSUMER-only: where the declaration of the document a call executes
+    /// states this field's result type (carrick#1761), read from the AST by
+    /// [`crate::graphql_document_sites`]. Deterministic, so a model locate
+    /// never overrides it (the engine merge's isolation guard). `None` for
+    /// producers, for rows not placed at a call, and for a declaration that
+    /// states no result type this pass can read.
+    pub declared_result_type: Option<crate::graphql_document_sites::DeclaredFieldType>,
     /// CONSUMER-only: the schema identity the document this operation was
     /// parsed from is bound to, set by [`ConsumerAttribution::apply`] on every
     /// consumer it keeps and carried onto the call row
@@ -1309,6 +1316,7 @@ pub fn extract_from_document_text(
                     // on producers.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    declared_result_type: None,
                     schema_binding: None,
                     arguments: sdl_arguments(field),
                 });
@@ -1377,6 +1385,9 @@ pub fn extract_from_document_text(
                     // gets first shot via `payload_type_symbol`.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    // Set only on a row placed at a call that executes a
+                    // declared document (`graphql_document_sites`).
+                    declared_result_type: None,
                     schema_binding: None,
                     arguments: None,
                 });

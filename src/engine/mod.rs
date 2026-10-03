@@ -3330,6 +3330,13 @@ async fn analyze_current_repo_incremental(
             protocol_infer.extend(
                 file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path),
             );
+            // A GraphQL consumer row whose executed document declares the
+            // field's result type reads that type where it is declared
+            // (carrick#1761).
+            protocol_infer.extend(
+                file_orchestrator
+                    .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
+            );
 
             crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -5201,7 +5208,8 @@ fn merge_graphql_resolver_locations(
 ///
 /// ISOLATION GUARD: an op that already carries `payload_type_symbol` (the
 /// deterministic `TaggedTplVisitor::capture_request_call` explicit-generic
-/// anchor) is left untouched. The file-analyzer is instructed not to emit a
+/// anchor) or `declared_result_type` (the field's type as the executed
+/// document's declaration states it, carrick#1761) is left untouched. The file-analyzer is instructed not to emit a
 /// `graphql_consumer_locates` entry for an already-anchored op, but a
 /// stray/hallucinated entry must never be allowed to override it regardless —
 /// mirrors 186cb27's resolver-first gate on the producer side.
@@ -5239,9 +5247,11 @@ fn merge_graphql_consumer_locations(
                 continue;
             };
             let consumer = &mut graphql.consumers[idx];
-            if consumer.payload_type_symbol.is_some() {
-                // Isolation guard: an explicit call-site generic already
-                // anchored this op — never let a located type override it.
+            if consumer.payload_type_symbol.is_some() || consumer.declared_result_type.is_some() {
+                // Isolation guard: an explicit call-site generic, or the
+                // result type the executed document's declaration states
+                // (carrick#1761), already anchored this op — never let a
+                // located type override it.
                 continue;
             }
             consumer.consumer_located_type_symbol = Some(locate.result_type_symbol.clone());
@@ -8032,6 +8042,11 @@ async fn analyze_current_repo(
     // the LLM-located payload expression through the same infer path.
     protocol_infer
         .extend(file_orchestrator.collect_pubsub_infer_requests(&pubsub_results, repo_path));
+    // A GraphQL consumer row whose executed document declares the field's
+    // result type reads that type where it is declared (carrick#1761).
+    protocol_infer.extend(
+        file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
+    );
 
     crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
 
@@ -16318,6 +16333,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            declared_result_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -16344,6 +16360,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            declared_result_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -16584,6 +16601,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            declared_result_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -17658,6 +17676,92 @@ mod tests {
             2,
             "each producer must emit a backing-type SymbolRequest, got: {:?}",
             requests
+        );
+    }
+
+    /// carrick#1761: a consumer alias is keyed by its operation alone (#291),
+    /// so one anchor answers for every row of a field. A row whose executed
+    /// document declares the field's type answers it ahead of a locate on
+    /// another row of the same field, through ONE infer request at the
+    /// declared property's type, in the sidecar's UTF-16 numbering. An
+    /// explicit call-site generic on any row keeps its alias on the symbol
+    /// path.
+    #[test]
+    fn a_declared_result_type_answers_its_alias_ahead_of_a_locate() {
+        use crate::graphql_document_sites::DeclaredFieldType;
+        use crate::operation::GraphqlOperationKind::Query;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("graphql.ts");
+        // Multi-byte prose above the span, so a byte offset sent unconverted
+        // lands past the type.
+        let source = "// Généré — ne pas modifier\nexport type InvoiceQuery = { invoice: { id: string } | null };\n";
+        std::fs::write(&module, source).unwrap();
+        let text = "{ id: string } | null";
+        let byte_start = source.find(text).unwrap() as u32;
+        let declared = DeclaredFieldType {
+            file: module.clone(),
+            line: 2,
+            lo: byte_start + crate::swc_scanner::SWC_SPAN_BASE,
+            hi: byte_start + text.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        };
+        let consumer = |field: &str, file: &str, line: u32| crate::graphql::GraphqlOp {
+            file_path: PathBuf::from(file),
+            line,
+            document_line: line,
+            primary_type_symbol: None,
+            ..graphql_op(Query, field, None)
+        };
+        let mut located = consumer("invoice", "src/b.tsx", 9);
+        located.consumer_located_type_symbol = Some("InvoiceQuery".to_string());
+        let mut declared_row = consumer("invoice", "src/a.tsx", 4);
+        declared_row.declared_result_type = Some(declared.clone());
+        let mut generic = consumer("order", "src/c.tsx", 3);
+        generic.payload_type_symbol = Some("OrderView".to_string());
+        let mut declared_order = consumer("order", "src/d.tsx", 5);
+        declared_order.declared_result_type = Some(declared.clone());
+        let graphql = crate::graphql::GraphqlExtraction {
+            consumers: vec![located, declared_row, generic, declared_order],
+            ..Default::default()
+        };
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let alias = |field: &str| {
+            crate::type_manifest::build_manifest_type_alias(
+                &OperationKey::graphql(Query, field),
+                crate::cloud_storage::ManifestRole::Consumer,
+                crate::cloud_storage::ManifestTypeKind::Response,
+            )
+        };
+        let symbols: Vec<(String, Option<String>)> = orchestrator
+            .collect_graphql_type_requests(&graphql, ".", &modules_without_config())
+            .into_iter()
+            .map(|request| (request.symbol_name, request.alias))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![("OrderView".to_string(), Some(alias("order")))],
+            "the declared alias sends no located symbol; the generic keeps its own"
+        );
+
+        let infer = orchestrator.collect_graphql_consumer_infer_requests(&graphql);
+        assert_eq!(
+            infer.len(),
+            1,
+            "one request, for the declared alias: {infer:?}"
+        );
+        let request = &infer[0];
+        assert_eq!(request.alias, Some(alias("invoice")));
+        assert_eq!(request.infer_kind, InferKind::Expression);
+        assert_eq!(request.file_path, module.to_string_lossy());
+        let utf16_start = source[..byte_start as usize].encode_utf16().count() as u32;
+        assert_eq!(
+            (request.span_start, request.span_end),
+            (
+                Some(utf16_start),
+                Some(utf16_start + text.encode_utf16().count() as u32)
+            ),
+            "the span goes out in the sidecar's numbering"
         );
     }
 

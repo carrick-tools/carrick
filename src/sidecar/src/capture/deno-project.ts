@@ -6,6 +6,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { rewriteSpecifiers } from './specifiers.js';
+import { WriteGuard } from './guarded-fs.js';
 
 interface Config {
   workspace?: string[];
@@ -133,7 +134,13 @@ export class DenoProject {
   constructor(readonly config: DenoConfig, readonly repoRoot: string) {
     const cache = path.join(config.workspaceRoot, '.carrick', 'deno', createHash('sha256').update(path.resolve(repoRoot)).digest('hex').slice(0, 16));
     this.cacheDir = cache;
-    fs.mkdirSync(cache, { recursive: true });
+    // The graph root lives within the service so compilerOptions.types uses
+    // that member's import-map scope, just like the real source files do.
+    const entry = path.join(repoRoot, '.carrick', 'deno', 'graph.ts');
+    // Its cache and its graph root are the only places a Deno project writes,
+    // both inside `.carrick/deno` (carrick#1748).
+    const guard = WriteGuard.of({ dirs: [cache, path.dirname(entry)], protect: [repoRoot, config.workspaceRoot] });
+    guard.mkdir(cache);
     const raw = { ...config.compilerOptions };
     const libs = Array.isArray(raw.lib) ? raw.lib as string[] : ['deno.window'];
     const denoLibs = libs.filter(l => l.startsWith('deno.'));
@@ -169,21 +176,18 @@ export class DenoProject {
         ).map(s => s.getFullText(source)).join('\n');
       }
       const globalPath = path.join(cache, 'runtime.d.ts');
-      fs.writeFileSync(globalPath, text);
+      guard.writeFile(globalPath, text);
       this.globals.push(globalPath);
     }
-    // The graph root lives within the service so compilerOptions.types uses
-    // that member's import-map scope, just like the real source files do.
-    const entry = path.join(repoRoot, '.carrick', 'deno', 'graph.ts');
-    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    guard.mkdir(path.dirname(entry));
     const roots = this.parsed.fileNames.map(f => pathToFileURL(f).href);
     const extraTypes = config.compilerOptions.types;
     if (Array.isArray(extraTypes)) roots.push(...extraTypes.filter((t): t is string => typeof t === 'string'));
-    fs.writeFileSync(entry, roots.map(s => `import ${JSON.stringify(s)};`).join('\n'));
+    guard.writeFile(entry, roots.map(s => `import ${JSON.stringify(s)};`).join('\n'));
     let graph: Graph;
     try {
       graph = JSON.parse(runDeno(['info', '--json', '--frozen', '--node-modules-dir=none', '--config', config.configPath, entry], repoRoot)) as Graph;
-    } finally { fs.rmSync(entry, { force: true }); }
+    } finally { guard.remove(entry); }
     if (!Array.isArray(graph.modules)) throw new Error('Unsupported deno info JSON: missing modules array');
     this.redirects = graph.redirects ?? {};
     this.npmPackages = graph.npmPackages ?? {};
@@ -202,8 +206,8 @@ export class DenoProject {
         const extension = extensions[module.mediaType ?? ''];
         if (!extension) { this.diagnostics.push(`${module.specifier}: unsupported media type ${module.mediaType}`); continue; }
         local = path.join(cache, 'remote', createHash('sha256').update(module.specifier).digest('hex') + extension);
-        fs.mkdirSync(path.dirname(local), { recursive: true });
-        fs.copyFileSync(module.local, local);
+        guard.mkdir(path.dirname(local));
+        guard.copyFile(module.local, local);
       }
       this.localPaths.set(module.specifier, path.resolve(local));
       this.specifiersByPath.set(path.resolve(local), module.specifier);
@@ -227,7 +231,7 @@ export class DenoProject {
         if (local) this.globals.push(local);
       }
     }
-    fs.writeFileSync(path.join(cache, 'resolution-diagnostics.json'), JSON.stringify(this.diagnostics, null, 2));
+    guard.writeFile(path.join(cache, 'resolution-diagnostics.json'), JSON.stringify(this.diagnostics, null, 2));
     this.parsed.fileNames.push(...this.globals);
   }
 
@@ -418,7 +422,7 @@ export class DenoProject {
   }
 
   /** Relocate Deno's per-file resolutions into the portable declaration tree. */
-  rewrite(typesDir: string, files: string[], sourceByEmitted: Map<string, string>): number {
+  rewrite(guard: WriteGuard, typesDir: string, files: string[], sourceByEmitted: Map<string, string>): number {
     let count = 0;
     const emittedBySource = new Map([...sourceByEmitted].map(([rel, source]) => [path.resolve(source), rel]));
     for (const rel of files) {
@@ -435,26 +439,26 @@ export class DenoProject {
         if (!relative.startsWith('.')) relative = './' + relative;
         return relative;
       });
-      if (result.rewrites) fs.writeFileSync(file, result.text);
+      if (result.rewrites) guard.writeFile(file, result.text);
       count += result.rewrites;
     }
     const runtime = this.globals.find(file => path.basename(file) === 'runtime.d.ts');
     const runtimeRel = runtime && emittedBySource.get(path.resolve(runtime));
-    if (runtimeRel) isolateRuntime(typesDir, files, runtimeRel);
+    if (runtimeRel) isolateRuntime(guard, typesDir, files, runtimeRel);
     const references = this.globals.filter(file => file !== runtime)
       .map(file => emittedBySource.get(path.resolve(file)))
       .filter((file): file is string => file !== undefined)
       .map(file => `/// <reference path=${JSON.stringify('./' + file)} />`);
     if (references.length) {
       const surface = path.join(typesDir, 'surface.d.ts');
-      fs.writeFileSync(surface, references.join('\n') + '\n' + fs.readFileSync(surface, 'utf8'));
+      guard.writeFile(surface, references.join('\n') + '\n' + fs.readFileSync(surface, 'utf8'));
     }
     return count;
   }
 }
 
 /** Runtime declarations belong to their producer, not the checker's globals. */
-function isolateRuntime(typesDir: string, files: string[], runtimeRel: string): void {
+function isolateRuntime(guard: WriteGuard, typesDir: string, files: string[], runtimeRel: string): void {
   const runtimePath = path.join(typesDir, runtimeRel);
   const program = ts.createProgram(files.map(file => path.join(typesDir, file)), {
     strict: true, skipLibCheck: true, target: ts.ScriptTarget.ESNext,
@@ -508,7 +512,7 @@ function isolateRuntime(typesDir: string, files: string[], runtimeRel: string): 
     visit(source);
     let text = source.text;
     for (const edit of edits.sort((a, b) => b.start - a.start)) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
-    if (edits.length) fs.writeFileSync(file, text);
+    if (edits.length) guard.writeFile(file, text);
   }
   while (pending.length) {
     const visit = (node: ts.Node): void => {
@@ -540,5 +544,5 @@ function isolateRuntime(typesDir: string, files: string[], runtimeRel: string): 
     }
   }
   const text = ts.createPrinter().printFile(ts.factory.updateSourceFile(runtime, statements));
-  fs.writeFileSync(runtimePath, '// Runtime declarations from deno types. Copyright the Deno authors. MIT license.\n/// <reference lib="esnext" />\n' + text + `\nexport { ${[...names].sort().join(', ')} };\n`);
+  guard.writeFile(runtimePath, '// Runtime declarations from deno types. Copyright the Deno authors. MIT license.\n/// <reference lib="esnext" />\n' + text + `\nexport { ${[...names].sort().join(', ')} };\n`);
 }

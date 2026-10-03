@@ -67,7 +67,8 @@ use swc_common::{
 };
 use swc_ecma_ast::{
     CallExpr, Callee, Decl, Expr, ImportDecl, ImportSpecifier, Lit, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt,
+    ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt, TsEntityName,
+    TsType, TsTypeElement, TsTypeRef, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -116,6 +117,9 @@ pub struct DocumentOperation {
     /// Root field names (not aliases), introspection fields left out, in
     /// document order.
     pub fields: Vec<String>,
+    /// The key each root field's value has in the result: its alias when it
+    /// has one, else its name. Parallel to `fields`.
+    pub response_keys: Vec<String>,
 }
 
 /// A document bound to a name, or a document file imported whole.
@@ -126,6 +130,34 @@ struct DeclaredDocument {
     /// 1-based line its text or literal starts on: `1` for a document file.
     line: u32,
     operations: Vec<DocumentOperation>,
+    /// Root field name → where the declaration states that field's result
+    /// type ([`declared_field_types`], carrick#1761). Empty when it states
+    /// none this pass can read.
+    field_types: HashMap<String, DeclaredFieldType>,
+}
+
+/// Where a document's declaration states one root field's result type
+/// (carrick#1761).
+///
+/// A generated document declaration is asserted to a document type whose
+/// type arguments include the operation's result type
+/// (`as unknown as DocumentNode<OrdersQuery, OrdersQueryVariables>`), and
+/// that result type declares one property per root field, under the field's
+/// response key (`orders: Array<{ id: string }>`). This is the span of that
+/// property's type: the field's payload, the level a consumer row is keyed
+/// at, never the operation wrapper around it (carrick#1760). The type
+/// sidecar reads the type at this span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredFieldType {
+    /// Canonical path of the module that declares the result type.
+    pub file: PathBuf,
+    /// 1-based line the property's type starts on.
+    pub line: u32,
+    /// The property type's span in the scanner's own units: UTF-8 bytes
+    /// counted from [`SWC_SPAN_BASE`]. Converted to the sidecar's numbering at
+    /// the request, never stored converted (carrick#805).
+    pub lo: u32,
+    pub hi: u32,
 }
 
 /// A call that passes a document.
@@ -298,7 +330,12 @@ impl DocumentSiteConsumers {
                     if !seen.insert((site_file.clone(), executed.line, key.canonical())) {
                         continue;
                     }
-                    rows.push(site_consumer(key, &site_file, executed.line));
+                    rows.push(site_consumer(
+                        key,
+                        &site_file,
+                        executed.line,
+                        document.field_types.get(field).cloned(),
+                    ));
                 }
             }
         }
@@ -347,8 +384,15 @@ impl DocumentSiteConsumers {
 }
 
 /// A consumer row at a call. The call is its own document for attribution:
-/// its root fields are the basis the schema catalogue judges.
-fn site_consumer(key: OperationKey, file: &Path, line: u32) -> GraphqlOp {
+/// its root fields are the basis the schema catalogue judges. `declared` is
+/// where the document's declaration states this field's result type, when
+/// it does.
+fn site_consumer(
+    key: OperationKey,
+    file: &Path,
+    line: u32,
+    declared: Option<DeclaredFieldType>,
+) -> GraphqlOp {
     GraphqlOp {
         key,
         file_path: file.to_path_buf(),
@@ -363,6 +407,7 @@ fn site_consumer(key: OperationKey, file: &Path, line: u32) -> GraphqlOp {
         response_type_source: None,
         consumer_located_type_symbol: None,
         consumer_located_type_source: None,
+        declared_result_type: declared,
         // Set by attribution, which runs after these rows are placed.
         schema_binding: None,
         arguments: None,
@@ -527,6 +572,8 @@ impl<'a> DocumentReader<'a> {
                             .into_iter()
                             .map(|(operation, _)| operation)
                             .collect(),
+                        // A document file states no TypeScript type.
+                        field_types: HashMap::new(),
                     })
                 });
             return Argument::Document(document);
@@ -675,6 +722,7 @@ fn document_declarations(
     file: &Path,
 ) -> HashMap<String, DeclaredDocument> {
     let mut documents = HashMap::new();
+    let object_types = module_object_types(module);
     for decl in module_scope_decls(module) {
         let Decl::Var(var) = decl else {
             continue;
@@ -684,18 +732,221 @@ fn document_declarations(
                 && is_document_expression(init)
             {
                 let expression = unwrap_expression(init);
+                let operations = expression_operations(expression);
+                let field_types =
+                    declared_field_types(declarator, &operations, &object_types, source_map, file);
                 documents.insert(
                     ident.id.sym.to_string(),
                     DeclaredDocument {
                         file: file.to_path_buf(),
                         line: source_map.lookup_char_pos(expression.span().lo).line as u32,
-                        operations: expression_operations(expression),
+                        operations,
+                        field_types,
                     },
                 );
             }
         }
     }
     documents
+}
+
+/// The object types a module declares at module scope, by name: a
+/// non-generic `type X = { ... }` and an `interface X { ... }`, each with its
+/// own members (an interface's `extends` is not followed).
+fn module_object_types(module: &Module) -> HashMap<String, &[TsTypeElement]> {
+    let mut types = HashMap::new();
+    for decl in module_scope_decls(module) {
+        match decl {
+            Decl::TsTypeAlias(alias) if alias.type_params.is_none() => {
+                if let TsType::TsTypeLit(literal) = unwrap_type(&alias.type_ann) {
+                    types.insert(alias.id.sym.to_string(), literal.members.as_slice());
+                }
+            }
+            Decl::TsInterface(interface) if interface.type_params.is_none() => {
+                types.insert(interface.id.sym.to_string(), interface.body.body.as_slice());
+            }
+            _ => {}
+        }
+    }
+    types
+}
+
+/// Where a document declaration states each root field's result type
+/// (carrick#1761), keyed by root field name.
+///
+/// The declaration's type is the one it is annotated with or asserted to
+/// (the outermost `as`, `satisfies` or `<T>`). Of that type's arguments, the
+/// result type is the one that names an object type this module declares
+/// whose properties include the response key of every root field the
+/// operation selects. That match is the evidence: no type name, library or
+/// argument position is assumed. Each root field's entry is the span of its
+/// property's type.
+///
+/// Nothing is read when the evidence is not exactly one way: a document with
+/// more or fewer than one operation, a type with no such argument or with two
+/// of them (a variables type that happens to declare the same keys), or a
+/// field the operation selects under two response keys.
+///
+/// A field whose declared type writes `unknown` or `any` anywhere in it (a
+/// JSON scalar inlined by the generator) is withheld: the capture cannot
+/// place a type node yet, and for such a type it falls back to the line and
+/// serves the whole operation result instead (carrick#1775). The row keeps
+/// whatever it had, which is the model's locate or nothing. Remove this once
+/// the capture places the node.
+fn declared_field_types(
+    declarator: &VarDeclarator,
+    operations: &[DocumentOperation],
+    object_types: &HashMap<String, &[TsTypeElement]>,
+    source_map: &Lrc<SourceMap>,
+    file: &Path,
+) -> HashMap<String, DeclaredFieldType> {
+    let mut field_types = HashMap::new();
+    let [operation] = operations else {
+        return field_types;
+    };
+    if operation.response_keys.is_empty() {
+        return field_types;
+    }
+    let Some(TsType::TsTypeRef(declared)) = declared_document_type(declarator).map(unwrap_type)
+    else {
+        return field_types;
+    };
+    let Some(arguments) = &declared.type_params else {
+        return field_types;
+    };
+    let candidates: Vec<HashMap<String, &TsType>> = arguments
+        .params
+        .iter()
+        .filter_map(|argument| object_types.get(bare_type_name(unwrap_type(argument))?))
+        .map(|members| property_types(members))
+        .filter(|properties| {
+            operation
+                .response_keys
+                .iter()
+                .all(|key| properties.contains_key(key))
+        })
+        .collect();
+    let [properties] = candidates.as_slice() else {
+        return field_types;
+    };
+    for (field, key) in operation.fields.iter().zip(&operation.response_keys) {
+        if operation
+            .fields
+            .iter()
+            .filter(|other| *other == field)
+            .count()
+            > 1
+        {
+            continue;
+        }
+        let declared_type = properties[key];
+        if states_top_type(declared_type) {
+            debug!(
+                field = %field,
+                file = %file.display(),
+                "declared GraphQL field type states unknown or any; withheld until the capture can place a type node (carrick#1775)"
+            );
+            continue;
+        }
+        let span = declared_type.span();
+        let offset = |pos| {
+            source_map
+                .lookup_byte_offset(pos)
+                .pos
+                .0
+                .checked_add(SWC_SPAN_BASE)
+        };
+        let (Some(lo), Some(hi)) = (offset(span.lo), offset(span.hi)) else {
+            continue;
+        };
+        field_types.insert(
+            field.clone(),
+            DeclaredFieldType {
+                file: file.to_path_buf(),
+                line: source_map.lookup_char_pos(span.lo).line as u32,
+                lo,
+                hi,
+            },
+        );
+    }
+    field_types
+}
+
+/// Whether a written type states `unknown` or `any` anywhere in it.
+fn states_top_type(ty: &TsType) -> bool {
+    struct TopType(bool);
+    impl Visit for TopType {
+        fn visit_ts_keyword_type(&mut self, node: &swc_ecma_ast::TsKeywordType) {
+            use swc_ecma_ast::TsKeywordTypeKind::{TsAnyKeyword, TsUnknownKeyword};
+            self.0 |= matches!(node.kind, TsAnyKeyword | TsUnknownKeyword);
+        }
+    }
+    let mut found = TopType(false);
+    ty.visit_with(&mut found);
+    found.0
+}
+
+/// The type a variable declaration states for its value: its annotation, or
+/// the outermost type assertion around its initialiser.
+fn declared_document_type(declarator: &VarDeclarator) -> Option<&TsType> {
+    if let Pat::Ident(binding) = &declarator.name
+        && let Some(annotation) = &binding.type_ann
+    {
+        return Some(&annotation.type_ann);
+    }
+    let mut expr = declarator.init.as_deref()?;
+    loop {
+        match expr {
+            Expr::Paren(inner) => expr = &inner.expr,
+            Expr::TsAs(assertion) => return Some(&assertion.type_ann),
+            Expr::TsSatisfies(assertion) => return Some(&assertion.type_ann),
+            Expr::TsTypeAssertion(assertion) => return Some(&assertion.type_ann),
+            _ => return None,
+        }
+    }
+}
+
+/// `X` for an unqualified, non-generic reference to `X`.
+fn bare_type_name(ty: &TsType) -> Option<&str> {
+    match ty {
+        TsType::TsTypeRef(TsTypeRef {
+            type_name: TsEntityName::Ident(ident),
+            type_params: None,
+            ..
+        }) => Some(ident.sym.as_ref()),
+        _ => None,
+    }
+}
+
+/// A type with its parentheses taken off.
+fn unwrap_type(ty: &TsType) -> &TsType {
+    match ty {
+        TsType::TsParenthesizedType(inner) => unwrap_type(&inner.type_ann),
+        other => other,
+    }
+}
+
+/// Property key → declared type, for the plain properties among `members`
+/// (an identifier or string key, not computed, with a type).
+fn property_types(members: &[TsTypeElement]) -> HashMap<String, &TsType> {
+    let mut properties = HashMap::new();
+    for member in members {
+        let TsTypeElement::TsPropertySignature(property) = member else {
+            continue;
+        };
+        if property.computed {
+            continue;
+        }
+        let key = match &*property.key {
+            Expr::Ident(ident) => ident.sym.to_string(),
+            Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+            _ => continue,
+        };
+        if let Some(annotation) = &property.type_ann {
+            properties.entry(key).or_insert(&*annotation.type_ann);
+        }
+    }
+    properties
 }
 
 /// The operations a document expression states: read off the graphql-js AST
@@ -779,20 +1030,24 @@ fn object_operations(document: &ObjectLit) -> Vec<DocumentOperation> {
                 "subscription" => GraphqlOperationKind::Subscription,
                 _ => return None,
             };
-            let fields = match property(definition, "selectionSet") {
+            let (fields, response_keys) = match property(definition, "selectionSet") {
                 Some(Expr::Object(selection_set)) => object_elements(selection_set, "selections")
                     .into_iter()
                     .filter(|selection| string_property(selection, "kind") == Some("Field"))
-                    .filter_map(|selection| name_value(selection, "name"))
-                    .filter(|name| !name.starts_with("__"))
-                    .map(str::to_string)
-                    .collect(),
-                _ => Vec::new(),
+                    .filter_map(|selection| {
+                        let name = name_value(selection, "name")?;
+                        let key = name_value(selection, "alias").unwrap_or(name);
+                        Some((name.to_string(), key.to_string()))
+                    })
+                    .filter(|(name, _)| !name.starts_with("__"))
+                    .unzip(),
+                _ => (Vec::new(), Vec::new()),
             };
             Some(DocumentOperation {
                 kind,
                 name: name_value(definition, "name").map(str::to_string),
                 fields,
+                response_keys,
             })
         })
         .collect()
@@ -839,6 +1094,7 @@ fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> 
             ),
         };
         let mut fields = Vec::new();
+        let mut response_keys = Vec::new();
         let mut lines = Vec::new();
         for selection in &selection_set.items {
             let Selection::Field(field) = selection else {
@@ -848,9 +1104,18 @@ fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> 
                 continue;
             }
             fields.push(field.name.clone());
+            response_keys.push(field.alias.clone().unwrap_or_else(|| field.name.clone()));
             lines.push(field.position.line as u32);
         }
-        operations.push((DocumentOperation { kind, name, fields }, lines));
+        operations.push((
+            DocumentOperation {
+                kind,
+                name,
+                fields,
+                response_keys,
+            },
+            lines,
+        ));
     }
     operations
 }
@@ -1007,6 +1272,7 @@ impl Visit for CallCollector {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::DataCallResult;
+    use std::collections::BTreeMap;
 
     /// A generated typed-document module: the graphql-js AST node as an
     /// object literal behind a type assertion.
@@ -1560,6 +1826,117 @@ export function CarrierList() {
                 "src/pages/CarrierList.tsx",
                 4
             )]
+        );
+    }
+
+    /// Root field → the source text of the type `name`'s declaration states
+    /// for it (carrick#1761), read through the span the pass records.
+    fn declared_field_text(source: &str, name: &str) -> BTreeMap<String, String> {
+        let file = Path::new("documents.ts");
+        let (source_map, module) =
+            crate::swc_scanner::parse_standalone_module(file, source).expect("module parses");
+        let documents = document_declarations(&module, &source_map, file);
+        documents[name]
+            .field_types
+            .iter()
+            .map(|(field, declared)| {
+                let lo = (declared.lo - SWC_SPAN_BASE) as usize;
+                let hi = (declared.hi - SWC_SPAN_BASE) as usize;
+                (field.clone(), source[lo..hi].to_string())
+            })
+            .collect()
+    }
+
+    fn texts(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+        items
+            .iter()
+            .map(|(field, text)| (field.to_string(), text.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_declaration_states_each_root_fields_type_under_its_response_key() {
+        // The graphql-js AST literal a generator writes, with an aliased root
+        // field, below multi-byte prose so a character-for-byte slip shows.
+        let source = r#"import type { TypedDocumentNode as DocumentNode } from "@example/typed-document";
+// Requête générée — ne pas modifier
+export type OrdersQueryVariables = { first: number };
+export type OrdersQuery = { __typename: 'Query', orders: Array<{ __typename: 'Order', id: string }>, zones?: Array<{ code: string }> | null };
+export const OrdersDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"query","name":{"kind":"Name","value":"Orders"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"__typename"}},{"kind":"Field","name":{"kind":"Name","value":"orders"}},{"kind":"Field","alias":{"kind":"Name","value":"zones"},"name":{"kind":"Name","value":"shippingZones"}}]}}]} as unknown as DocumentNode<OrdersQuery, OrdersQueryVariables>;
+"#;
+        assert_eq!(
+            declared_field_text(source, "OrdersDocument"),
+            texts(&[
+                ("orders", "Array<{ __typename: 'Order', id: string }>"),
+                ("shippingZones", "Array<{ code: string }> | null"),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_interface_or_an_annotated_declaration_states_the_type_too() {
+        let source = r#"import { gql } from "@example/gql";
+interface InvoiceResult { invoice: { id: string } | null }
+export const InvoiceDocument: DocumentNode<InvoiceResult, { id: string }> = gql`
+  query Invoice($id: ID!) { invoice(id: $id) { id } }
+`;
+"#;
+        assert_eq!(
+            declared_field_text(source, "InvoiceDocument"),
+            texts(&[("invoice", "{ id: string } | null")])
+        );
+    }
+
+    #[test]
+    fn a_declaration_whose_evidence_is_not_one_way_states_no_field_type() {
+        let source = r#"import { gql } from "@example/gql";
+import type { RemoteResult } from "./types";
+type UserQuery = { user: { id: string } | null };
+type UserQueryVariables = { user: string };
+type TwoQuery = { invoice: { id: string }, a: { id: string }, b: { id: string }, total: number };
+
+// The variables type declares the root field's key too: two candidates.
+export const UserDocument = gql`query User($user: ID!) { user(id: $user) { id } }` as unknown as DocumentNode<UserQuery, UserQueryVariables>;
+// No type arguments at all.
+export const BareDocument = gql`query Bare { user(id: "1") { id } }` as unknown as DocumentNode;
+// The result type is declared in another module.
+export const RemoteDocument = gql`query Remote { user(id: "1") { id } }` as unknown as DocumentNode<RemoteResult, {}>;
+// Two operations in one document.
+export const PairDocument = gql`query A { user(id: "1") { id } } query B { user(id: "2") { id } }` as unknown as DocumentNode<UserQuery, {}>;
+// One field selected under two response keys has no one property; the
+// other field still reads.
+export const TwoDocument = gql`query Two { a: invoice(id: 1) { id } b: invoice(id: 2) { id } total }` as unknown as DocumentNode<TwoQuery, {}>;
+"#;
+        for name in [
+            "UserDocument",
+            "BareDocument",
+            "RemoteDocument",
+            "PairDocument",
+        ] {
+            assert_eq!(
+                declared_field_text(source, name),
+                BTreeMap::new(),
+                "{name} states no field type"
+            );
+        }
+        assert_eq!(
+            declared_field_text(source, "TwoDocument"),
+            texts(&[("total", "number")])
+        );
+    }
+
+    /// carrick#1775: the capture serves the whole operation for a declared
+    /// field type that writes `unknown` or `any`, so such a field is withheld;
+    /// its sibling still reads.
+    #[test]
+    fn a_field_whose_declared_type_writes_unknown_or_any_is_withheld() {
+        let source = r#"import { gql } from "@example/gql";
+type LedgerQuery = { ledger?: { id: string, entries?: Array<{ value?: unknown | null }> | null } | null, raw: any, owner: { id: string } };
+export const LedgerDocument = gql`query Ledger { ledger { id entries { value } } raw owner { id } }` as unknown as DocumentNode<LedgerQuery, {}>;
+"#;
+        assert_eq!(
+            declared_field_text(source, "LedgerDocument"),
+            texts(&[("owner", "{ id: string }")])
         );
     }
 }
