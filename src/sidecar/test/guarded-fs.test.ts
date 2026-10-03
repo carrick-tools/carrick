@@ -119,6 +119,37 @@ describe('WriteGuard (carrick#1748)', () => {
     assert.throws(() => guard.writeFile(path.join(outside, 'source.ts'), 'y'), WriteRefused);
   });
 
+  it('refuses a directory root elsewhere inside a protected tree unless a .carrick directory holds it (carrick#1768)', () => {
+    // A sibling service in the same repo: a stub dir there would be emptied.
+    const sibling = path.join(outside, 'web');
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(sibling, 'page.ts'), 'export const b = 2;\n');
+    assert.throws(() => WriteGuard.of({ dirs: [sibling], protect: [outside] }), /outside a \.carrick directory/);
+    assert.throws(() => WriteGuard.of({ dirs: [path.join(outside, 'new', 'stub')], protect: [outside] }), WriteRefused);
+    // `.carrick` itself holds the workspace's proposal, jobs and scan logs.
+    assert.throws(() => WriteGuard.of({ dirs: [path.join(outside, '.carrick')], protect: [outside] }), WriteRefused);
+    // Every way a guard gains a root is held to the rule.
+    const guard = WriteGuard.of({ dirs: [root], protect: [outside] });
+    assert.throws(() => guard.with({ dirs: [sibling] }), WriteRefused);
+    // A root reached through a link outside the tree is judged where it lands.
+    fs.symlinkSync(sibling, path.join(base, 'alias'), 'dir');
+    assert.throws(() => WriteGuard.of({ dirs: [path.join(base, 'alias')], protect: [outside] }), WriteRefused);
+
+    // Beneath a `.carrick` directory, at any depth, a root is Carrick's own.
+    WriteGuard.of({ dirs: [path.join(outside, '.carrick', 'stub')], protect: [outside] });
+    WriteGuard.of({ dirs: [path.join(outside, 'web', '.carrick', 'deno', 'abc')], protect: [outside] });
+    // A file root is exempt: the surface entry has to sit inside rootDir.
+    WriteGuard.of({ files: [path.join(sibling, '__carrick_surface__.ts')], protect: [outside] });
+    assert.deepStrictEqual(fs.readdirSync(sibling), ['page.ts']);
+  });
+
+  it('reads the .carrick directory on the resolved path, not the path as given (carrick#1768)', () => {
+    // A `.carrick` that is a link into the repo's sources names nothing of Carrick's.
+    fs.mkdirSync(path.join(outside, 'src'));
+    fs.symlinkSync(path.join(outside, 'src'), path.join(outside, '.carrick'), 'dir');
+    assert.throws(() => WriteGuard.of({ dirs: [path.join(outside, '.carrick', 'stub')], protect: [outside] }), WriteRefused);
+  });
+
   it('holds a single-file root to that file alone', () => {
     const entry = path.join(outside, '__carrick_surface__.ts');
     const guard = WriteGuard.of({ files: [entry], protect: [outside] });

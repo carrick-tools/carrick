@@ -53,7 +53,11 @@ export class WriteGuard {
     private readonly protect: readonly string[]
   ) {}
 
-  /** A guard over `roots`. Throws when a root equals or contains a protected tree. */
+  /**
+   * A guard over `roots`. Throws when a root equals or contains a protected
+   * tree, or when a directory root lies inside one anywhere but beneath a
+   * `.carrick` directory (carrick#1768).
+   */
   static of(roots: WriteRoots): WriteGuard {
     const protect = (roots.protect ?? []).map(landing);
     const dirs = (roots.dirs ?? []).map(landing);
@@ -62,6 +66,16 @@ export class WriteGuard {
       const covered = protect.find((tree) => within(root, tree));
       if (covered !== undefined) {
         throw new WriteRefused(`refused write root ${root}: it is or contains the scanned tree ${covered}`);
+      }
+    }
+    // Inside a scanned tree, a directory root is Carrick's only beneath a
+    // `.carrick` directory. Anywhere else it is the repo's own (a sibling
+    // service, say), and a stub dir is emptied before it is written. A file
+    // root is exempt: the surface entry has to sit inside rootDir.
+    for (const root of dirs) {
+      const inside = protect.find((tree) => within(tree, root) && !carrickOwned(tree, root));
+      if (inside !== undefined) {
+        throw new WriteRefused(`refused write root ${root}: it lies inside the scanned tree ${inside}, outside a .carrick directory`);
       }
     }
     return new WriteGuard(dirs, files, protect);
@@ -160,6 +174,15 @@ export class WriteGuard {
 function within(root: string, p: string): boolean {
   const rel = path.relative(root, p);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * Whether `root`, inside `tree`, lies beneath a `.carrick` directory between
+ * the two. `.carrick` itself is not enough: it holds the workspace's proposal,
+ * jobs and scan logs. Both are resolved paths.
+ */
+function carrickOwned(tree: string, root: string): boolean {
+  return path.relative(tree, root).split(path.sep).slice(0, -1).includes('.carrick');
 }
 
 function isDirectory(p: string): boolean {

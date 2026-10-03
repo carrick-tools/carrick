@@ -176,7 +176,7 @@ Response:
 
 The v2 "tsc as serializer" capture. Stateless: it builds its own program from the service's tsconfig, aliases each anchor into a surface entry, and writes a stub package (declaration tree + `carrick-manifest.json` + exact-version pins) into `out_dir`. The full contract is `src/capture/api.ts`.
 
-It writes nowhere else but a temp staging dir, the surface entry (placed inside the service's `rootDir`, where the compiler requires it, and deleted after emit) and, for Deno, `.carrick/deno`. `out_dir` is emptied first, so one that is or contains `repo_root` is refused before anything is written (carrick#1748).
+It writes nowhere else but a temp staging dir, the surface entry (placed inside the service's `rootDir`, where the compiler requires it, and deleted after emit) and, for Deno, `.carrick/deno`. `out_dir` is emptied first, so one that is or contains `repo_root` or `scan_root` is refused before anything is written (carrick#1748), and so is one inside either of them that does not sit beneath a `.carrick` directory (carrick#1768).
 
 An anchor is one of four kinds, discriminated on `kind`:
 

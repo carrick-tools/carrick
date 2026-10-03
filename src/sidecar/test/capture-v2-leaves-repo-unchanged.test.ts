@@ -211,6 +211,74 @@ describe('carrick#1748: a capture leaves an npm repo byte-identical', () => {
   });
 });
 
+describe('carrick#1768: a capture writes nowhere else in the scanned repo', () => {
+  let base: string;
+  let mono: string;
+  const USER_ANCHOR = {
+    kind: 'symbol' as const,
+    alias: 'Endpoint_user_Response',
+    symbol_name: 'User',
+    source_file: 'src/user.ts',
+    anchor_origin: 'llm-symbol' as const,
+  };
+
+  before(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1768-'));
+    mono = path.join(base, 'mono');
+    writeTree(mono, {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }),
+      ...Object.fromEntries(Object.entries(ROOTDIR_REPO).map(([rel, text]) => [`apps/api/${rel}`, text])),
+      'apps/web/package.json': JSON.stringify({ name: 'web', private: true }),
+      'apps/web/src/page.ts': 'export const page = "home";\n',
+    });
+  });
+
+  after(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it('refuses an out_dir in a sibling service, and deletes nothing', () => {
+    const before_ = snapshot(mono);
+    // The service is apps/api; the scan is the whole repo. A stub dir is
+    // emptied before it is written, so apps/web would go with it.
+    for (const outDir of [path.join(mono, 'apps', 'web'), path.join(mono, '.carrick')]) {
+      const result = captureStub({
+        repoRoot: path.join(mono, 'apps', 'api'),
+        scanRoot: mono,
+        serviceName: 'api',
+        outDir,
+        anchors: [USER_ANCHOR],
+      });
+      // The repo first: a leak shows as what it deleted.
+      assert.deepStrictEqual(snapshot(mono), before_);
+      assert.strictEqual(result.success, false, `captured into ${outDir}`);
+      assert.match(result.errors.join('\n'), /outside a \.carrick directory/);
+    }
+  });
+
+  it('captures into a .carrick directory inside the repo and leaves the rest as it was', () => {
+    const before_ = snapshot(mono);
+    const result = captureStub({
+      repoRoot: path.join(mono, 'apps', 'api'),
+      scanRoot: mono,
+      serviceName: 'api',
+      outDir: path.join(mono, 'apps', 'api', '.carrick', 'stub'),
+      anchors: [USER_ANCHOR],
+    });
+    assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
+    const after_ = snapshot(mono);
+    assert.deepStrictEqual(
+      Object.fromEntries(Object.keys(before_).map((rel) => [rel, after_[rel]])),
+      before_
+    );
+    assert.deepStrictEqual(
+      Object.keys(after_).filter((rel) => !(rel in before_) && !rel.startsWith('apps/api/.carrick/')),
+      []
+    );
+    fs.rmSync(path.join(mono, 'apps', 'api', '.carrick'), { recursive: true, force: true });
+  });
+});
+
 const hasDeno = spawnSync('deno', ['--version']).status === 0;
 
 describe('carrick#1748: a Deno capture writes only its documented cache', { skip: !hasDeno }, () => {

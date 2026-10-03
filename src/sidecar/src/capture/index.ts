@@ -169,10 +169,13 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // Everything this capture writes, it writes through `guard` (carrick#1748):
   // the stub dir, the staging dir, and the surface entry. A stub dir is
   // emptied before it is written, so one that is or holds the repo is refused
-  // before anything is touched.
+  // before anything is touched. The scan root is protected too: a stub dir
+  // in a sibling service of the same repo is refused unless it sits beneath
+  // a `.carrick` directory (carrick#1768).
   let guard: WriteGuard;
   try {
-    guard = WriteGuard.of({ dirs: [stubDir], protect: [repoRoot] });
+    const protect = opts.scanRoot === undefined ? [repoRoot] : [repoRoot, path.resolve(opts.scanRoot)];
+    guard = WriteGuard.of({ dirs: [stubDir], protect });
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }

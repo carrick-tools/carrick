@@ -326,7 +326,8 @@ export interface CaptureStubOptions {
   /**
    * The scanned repo's root, the upper bound of the search for a tsconfig
    * above `repoRoot` when none is named (carrick#1776). Without it only
-   * `repoRoot` is searched.
+   * `repoRoot` is searched. It is a protected tree as well: `outDir` may
+   * lie inside it only beneath a `.carrick` directory (carrick#1768).
    */
   scanRoot?: string;
 }

@@ -47,7 +47,11 @@ function sourceFiles(dir: string): string[] {
 
 /** `file:line: text` for every raw write in one source file. */
 function rawWrites(file: string): string[] {
-  const text = fs.readFileSync(file, 'utf8');
+  return rawWritesIn(file, fs.readFileSync(file, 'utf8'));
+}
+
+/** `file:line: text` for every raw write in `text`, read as the source file `file`. */
+function rawWritesIn(file: string, text: string): string[] {
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const fsNames = new Set<string>();
   const found: string[] = [];
@@ -84,6 +88,28 @@ function rawWrites(file: string): string[] {
         report(node, `sys.${member}`);
       }
     }
+    // `fs['writeFileSync']`: the same member, read by a string key.
+    if (ts.isElementAccessExpression(node)) {
+      const target = node.expression;
+      const key = node.argumentExpression;
+      if (ts.isIdentifier(target) && fsNames.has(target.text) && ts.isStringLiteralLike(key) && MUTATING.has(key.text)) {
+        report(node, `${target.text}['${key.text}']`);
+      }
+    }
+    // `const { writeFileSync } = fs`: the same member, taken off by destructuring.
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isObjectBindingPattern(node.name) &&
+      node.initializer !== undefined &&
+      ts.isIdentifier(node.initializer) &&
+      fsNames.has(node.initializer.text)
+    ) {
+      for (const element of node.name.elements) {
+        const key = element.propertyName ?? element.name;
+        const member = ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : undefined;
+        if (member !== undefined && MUTATING.has(member)) report(element, `{ ${member} } = ${node.initializer.text}`);
+      }
+    }
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const member = node.expression.name.text;
       if (SAVING.has(member)) report(node, `.${member}()`);
@@ -111,6 +137,33 @@ describe('only the write guard writes to disk (carrick#1748)', () => {
   it('sees a raw write when there is one', () => {
     // The guard itself is the one file allowed to call fs directly.
     assert.ok(rawWrites(GUARD).some((line) => line.includes('fs.writeFileSync')));
+  });
+
+  it('sees a mutating member taken off fs by destructuring (carrick#1768)', () => {
+    const file = path.join(srcDir, 'probe.ts');
+    for (const line of [
+      'const { writeFileSync } = fs;',
+      'const { rmSync: remove } = fs;',
+      'const { readFileSync, promises } = fs;',
+      'let { unlinkSync } = nodeFs;',
+    ]) {
+      const text = `import * as fs from 'node:fs';\nimport nodeFs from 'fs';\n${line}\n`;
+      assert.strictEqual(rawWritesIn(file, text).length, 1, `${line}: ${JSON.stringify(rawWritesIn(file, text))}`);
+    }
+    // Reads are not writes, and only a name imported from fs counts.
+    assert.deepStrictEqual(
+      rawWritesIn(file, "import * as fs from 'node:fs';\nconst { readFileSync, existsSync } = fs;\nconst { writeFileSync } = other;\n"),
+      []
+    );
+  });
+
+  it('sees a mutating member read off fs by a string key (carrick#1768)', () => {
+    const file = path.join(srcDir, 'probe.ts');
+    for (const line of ["fs['writeFileSync'](p, 'x');", 'fs[`rmSync`](p);', "fs?.['mkdirSync'](p);"]) {
+      const text = `import * as fs from 'node:fs';\n${line}\n`;
+      assert.strictEqual(rawWritesIn(file, text).length, 1, `${line}: ${JSON.stringify(rawWritesIn(file, text))}`);
+    }
+    assert.deepStrictEqual(rawWritesIn(file, "import * as fs from 'node:fs';\nfs['readFileSync'](p);\n"), []);
   });
 
   it('has no write, delete or rename outside src/capture/guarded-fs.ts', () => {
