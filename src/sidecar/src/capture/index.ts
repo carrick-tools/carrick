@@ -44,13 +44,13 @@ import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './an
 import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
-import { typesPackageOf, withInstalledPackages } from './installed-package.js';
+import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
 import { emitsAlike, ProjectGraph, type ServiceProject } from './project-references.js';
 import { findServiceTsconfig } from './service-config.js';
-import { placeEmittedTree } from './outside-root.js';
+import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
@@ -379,7 +379,14 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       `declaration emit was partial: kept ${emitted.size} emitted file(s); ` +
         'aliases referencing unemitted modules are demoted to structural_fallback'
     );
-    resolved = demoteDanglingAliases({ resolved, emitted, declarationSources, staging, surfaceDeclaration });
+    resolved = demoteDanglingAliases({
+      resolved,
+      emitted,
+      declarationSources,
+      staging,
+      entryDir,
+      surfaceDeclaration,
+    });
   }
 
   // ---- Relocate the emitted tree into the stub package ----
@@ -576,10 +583,18 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 }
 
 /**
- * Partial-emit demotion: with the set of modules that DID reach the tree
- * (emitted .d.ts plus verbatim declaration sources), demote every anchor
- * whose alias text references a relative module absent from that set, and
+ * Partial-emit demotion: demote every anchor whose alias text names, by a
+ * relative or an absolute path, a module the stub will not resolve, and
  * rewrite the demoted aliases' lines in the emitted surface to `unknown`.
+ *
+ * A path resolves when the tree holds its module (`surfaceModuleInTree`: an
+ * emitted declaration inside rootDir or outside it, or a verbatim declaration
+ * source), read from where the entry was written, not from where the surface
+ * sits in the tree. An absolute path into an installed package resolves too
+ * (carrick#1773): no emit writes that module, and the specifier rewrite turns
+ * the path into the package's bare specifier and a pin, as it does when the
+ * emit is whole.
+ *
  * Anchors already demoted stay as they are; anchors whose text is
  * self-contained (node-builder structural prints, literal object text) are
  * untouched even when their source file failed to emit — their surface line
@@ -592,33 +607,36 @@ function demoteDanglingAliases(args: {
   /** entryDir-relative verbatim .d.ts sources that will ship with the tree. */
   declarationSources: Map<string, string>;
   staging: string;
+  /** The emit's rootDir: the tree mirrors it. */
+  entryDir: string;
   /** The emitted name of this capture's surface entry (carrick#1046). */
   surfaceDeclaration: string;
 }): ResolvedAnchor[] {
-  // Extensionless, entryDir-relative POSIX module ids present in the tree.
-  const treeModules = new Set<string>();
-  let surfaceKey: string | undefined;
-  for (const fileName of args.emitted.keys()) {
-    const rel = path.relative(args.staging, fileName).split(path.sep).join('/');
-    if (path.basename(rel) === args.surfaceDeclaration) surfaceKey = fileName;
-    if (rel.endsWith('.d.ts')) treeModules.add(rel.slice(0, -'.d.ts'.length));
-  }
-  for (const rel of args.declarationSources.keys()) {
-    if (rel.endsWith('.d.ts')) treeModules.add(rel.slice(0, -'.d.ts'.length));
-  }
-  // Deno's temporary surface lives in the cache inside the emitted tree.
-  const surfaceDir = surfaceKey ? path.posix.dirname(path.relative(args.staging, surfaceKey).split(path.sep).join('/')) : '.';
-  const moduleInTree = (spec: string): boolean => {
-    const id = path.posix.normalize(path.posix.join(surfaceDir, spec));
-    if (id.startsWith('..')) return false;
-    return treeModules.has(id) || treeModules.has(`${id}/index`);
+  const surfaceKey = [...args.emitted.keys()].find(
+    (fileName) => path.basename(fileName) === args.surfaceDeclaration
+  );
+  const inTree = surfaceModuleInTree({
+    emitted: args.emitted.keys(),
+    declarationSources: args.declarationSources.keys(),
+    staging: args.staging,
+    entryDir: args.entryDir,
+    surfaceDeclaration: args.surfaceDeclaration,
+  });
+  const resolves = new Map<string, boolean>();
+  const moduleResolves = (spec: string): boolean => {
+    let answer = resolves.get(spec);
+    if (answer === undefined) {
+      answer = inTree(spec) || (spec.startsWith('/') && installedPackageSpecifier(spec) !== undefined);
+      resolves.set(spec, answer);
+    }
+    return answer;
   };
 
   const demoted = new Set<string>();
   const next = args.resolved.map((anchor): ResolvedAnchor => {
     if (anchor.failureReason !== undefined) return anchor;
     const dangling = [...collectSpecifiers(anchor.aliasText)].find(
-      (spec) => isRelative(spec) && !moduleInTree(spec)
+      (spec) => isRelative(spec) && !moduleResolves(spec)
     );
     if (dangling === undefined) return anchor;
     demoted.add(anchor.request.alias);

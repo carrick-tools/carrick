@@ -16,6 +16,7 @@
  */
 
 import * as path from 'node:path';
+import { withoutExtension } from './installed-package.js';
 import { rewriteSpecifiers } from './specifiers.js';
 
 /** Tree directory holding declarations of sources outside rootDir. */
@@ -54,13 +55,12 @@ export function placeEmittedTree(args: {
   const sourceSideOf = new Map<string, string>();
   const outsideFiles: string[] = [];
   for (const fileName of args.emitted.keys()) {
+    sourceSideOf.set(fileName, sourceSidePath(fileName, args.staging, args.entryDir));
     const rel = posix(path.relative(args.staging, fileName));
     if (escapes(rel)) {
       outsideFiles.push(fileName);
-      sourceSideOf.set(fileName, path.resolve(fileName));
       continue;
     }
-    sourceSideOf.set(fileName, path.join(args.entryDir, rel));
     relOf.set(fileName, path.basename(rel) === args.surfaceDeclaration ? 'surface.d.ts' : rel);
   }
   const outside = new Map<string, string>();
@@ -102,6 +102,51 @@ export function placeEmittedTree(args: {
     rewrites += result.rewrites;
   }
   return { relOf, textOf, outside, rewrites };
+}
+
+/**
+ * Where tsc would have written an emitted declaration in the source tree. A
+ * file under the staging dir mirrors rootDir; one outside it arrived at its
+ * source's own path.
+ */
+function sourceSidePath(fileName: string, staging: string, entryDir: string): string {
+  const rel = posix(path.relative(staging, fileName));
+  return escapes(rel) ? path.resolve(fileName) : path.join(entryDir, rel);
+}
+
+/**
+ * A test for whether the tree holds the module a specifier in the surface
+ * entry names (carrick#1773).
+ *
+ * The specifier is read the way the placement above reads one: resolved from
+ * the surface's SOURCE-side directory, so an absolute path stays what it is
+ * and `../` leaves rootDir, then looked up among the source-side paths of the
+ * declarations the tree holds. Those are every emitted declaration, inside
+ * rootDir or placed under `OUTSIDE_DIR`, and the declaration sources shipped
+ * verbatim (`declarationSources`, relative to rootDir).
+ */
+export function surfaceModuleInTree(args: {
+  /** tsc's file name for each emitted declaration. */
+  emitted: Iterable<string>;
+  declarationSources: Iterable<string>;
+  staging: string;
+  entryDir: string;
+  surfaceDeclaration: string;
+}): (spec: string) => boolean {
+  const held = new Set<string>();
+  let surfaceDir = args.entryDir;
+  for (const fileName of args.emitted) {
+    const sourceSide = sourceSidePath(fileName, args.staging, args.entryDir);
+    if (path.basename(sourceSide) === args.surfaceDeclaration) surfaceDir = path.dirname(sourceSide);
+    held.add(sourceSide.replace(DECLARATION_EXT, ''));
+  }
+  for (const rel of args.declarationSources) {
+    held.add(path.join(args.entryDir, rel).replace(DECLARATION_EXT, ''));
+  }
+  return (spec) => {
+    const target = path.resolve(surfaceDir, withoutExtension(spec));
+    return held.has(target) || held.has(path.join(target, 'index'));
+  };
 }
 
 function posix(p: string): string {

@@ -126,7 +126,8 @@ function existingFile(spec: string): string | undefined {
   return undefined;
 }
 
-function withoutExtension(subpath: string): string {
+/** A path or specifier without its script, source or declaration extension. */
+export function withoutExtension(subpath: string): string {
   return subpath.replace(/(?:\.d)?\.(?:ts|mts|cts|js|mjs|cjs|tsx|jsx)$/, '');
 }
 
