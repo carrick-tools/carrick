@@ -1,0 +1,15 @@
+{
+  "services": [
+    {
+      "serviceName": "billing-api",
+      "directory": "apps/api"
+    },
+    {
+      "serviceName": "billing-web",
+      "directory": "apps/web",
+      "internalEnvVars": [
+        "BILLING_API_URL"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+type Query {
+  invoice(id: ID!): Invoice
+  note(id: ID!): Note
+}
+
+type Mutation {
+  sendInvoice(id: ID!): Invoice!
+}
+
+type Invoice {
+  id: ID!
+  total: Int!
+  dueAt: String
+}
+
+type Note {
+  id: ID!
+  body: String!
+}

@@ -24,13 +24,16 @@
 //! The REST call in the checkout page is still a call: the page is not a
 //! document file, so the transport fold does not read it as a GraphQL POST.
 //!
-//! The checkout page's cassette also locates the `placeOrder` result type
-//! (`PlacedOrderFragment`, declared in the generated module). The model answers
-//! for the file it reads, the page, so that answer joins the row placed at the
-//! page's hook, never a row in the document's own module (carrick#1728). The
-//! type is the field's payload, not the whole operation result: a consumer row
-//! is keyed by its root field, the level the call-site generic is unwrapped to
-//! (`resolve_request_type_arg` in `src/graphql.rs`).
+//! Each compiled declaration is asserted to a document type whose first
+//! argument is its operation's result type, which declares one property per
+//! root field under its response key. A row at a call serves that property's
+//! type (carrick#1761): the field's payload, not the whole operation result,
+//! because a consumer row is keyed by its root field, the level the call-site
+//! generic is unwrapped to (`resolve_request_type_arg` in `src/graphql.rs`).
+//! The checkout page's cassette also locates the `placeOrder` result type;
+//! the declaration wins over it. A located type joining the row at the call
+//! (carrick#1728) is covered where the declaration states no result type, in
+//! `graphql_declared_result_types_test.rs`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -251,43 +254,66 @@ fn consumer_response_type(
     )
 }
 
-/// carrick#1728: the model locates a result type for the file it reads, which
-/// is the file that executes the document. The row it describes is placed at
-/// that file's call only once the documents are read, so the located type
-/// must join after the placement, or it finds the document's own module and
-/// nothing there.
+/// carrick#1761: a generated document declaration states its operation's
+/// result type in its own type (`as unknown as DocumentNode<OrdersQuery, ...>`),
+/// and that type declares one property per root field, under the field's
+/// response key. The row at the call that executes the document serves that
+/// property's type: the field's payload, never the operation wrapper. The page
+/// locates nothing for this query, so only the declaration can type it.
 #[test]
-fn a_type_located_where_a_document_is_executed_types_the_row_at_the_call() {
+fn a_row_at_a_call_that_executes_a_typed_document_serves_its_fields_declared_type() {
     let scan = scan(&fixture_dir(), Types::Required);
 
-    let (state, symbol, definition) = consumer_response_type(
-        &scan,
-        "shop-web",
-        "mutation|placeOrder",
+    // Both calls that execute `PlaceOrderDocument` read the field's declared
+    // type; the page's located type no longer decides it.
+    for site in [
         ("apps/web/src/pages/CheckoutPage.tsx", 7),
-    );
-    assert_eq!(
-        symbol.as_deref(),
-        Some("PlacedOrderFragment"),
-        "the type located in the page anchors the row at the page's hook"
-    );
-    assert_ne!(state, "unknown", "the located type resolves");
-    let definition = definition.unwrap_or_default();
-    assert!(
-        definition.contains("id: string") && !definition.contains("placeOrder"),
-        "the located type is the field's payload: {definition}"
-    );
+        ("apps/web/src/components/RetryButton.tsx", 5),
+    ] {
+        let (state, _, definition) =
+            consumer_response_type(&scan, "shop-web", "mutation|placeOrder", site);
+        let definition = definition.unwrap_or_default();
+        assert_ne!(state, "unknown", "{site:?}: {definition}");
+        assert!(
+            definition.contains("id: string") && !definition.contains("placeOrder"),
+            "{site:?} serves the field's payload: {definition}"
+        );
+    }
 
-    // The page locates nothing for the query it also executes.
-    let (state, symbol, _) = consumer_response_type(
+    let (state, _, definition) = consumer_response_type(
         &scan,
         "shop-web",
         "query|orders",
         ("apps/web/src/pages/CheckoutPage.tsx", 6),
     );
-    assert_eq!(
-        (state.as_str(), symbol),
-        ("unknown", None),
-        "a row with no located type stays unknown"
+    let definition = definition.unwrap_or_default();
+    assert_ne!(
+        state, "unknown",
+        "the declared result type types the row: {definition}"
+    );
+    assert!(
+        definition.contains("id: string")
+            && !definition.contains("orders")
+            && !definition.contains("code"),
+        "the row serves the `orders` property, not the operation result: {definition}"
+    );
+
+    // An aliased root field is a property under its alias.
+    let (state, _, definition) = consumer_response_type(
+        &scan,
+        "shop-web",
+        "query|shippingZones",
+        ("apps/web/src/pages/CheckoutPage.tsx", 6),
+    );
+    let definition = definition.unwrap_or_default();
+    assert_ne!(
+        state, "unknown",
+        "the declared result type types the aliased row: {definition}"
+    );
+    assert!(
+        definition.contains("code: string")
+            && !definition.contains("zones")
+            && !definition.contains("id: string"),
+        "the aliased row serves the `zones` property: {definition}"
     );
 }

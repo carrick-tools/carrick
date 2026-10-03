@@ -4354,7 +4354,18 @@ impl FileOrchestrator {
 
         let mut requests: Vec<SymbolRequest> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // An alias the executed document's declaration types goes through the
+        // infer path instead (carrick#1761); a located symbol for it must not
+        // compete with that anchor in the capture.
+        let declared = Self::declared_result_anchors(graphql);
         for op in &graphql.consumers {
+            if declared.contains_key(&build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            )) {
+                continue;
+            }
             // #268: the deterministic call-site anchor (`payload_type_symbol`,
             // an explicit `client.request<T>(DOC)` generic) is the
             // higher-fidelity signal and always wins when present. Fall back to
@@ -4442,6 +4453,93 @@ impl FileOrchestrator {
             requests.len(),
             consumer_count,
             requests.len() - consumer_count,
+        );
+        requests
+    }
+
+    /// The consumer Response aliases the executed document's declaration
+    /// types (carrick#1761), each with the row whose declared field type
+    /// answers it.
+    ///
+    /// A consumer alias is keyed by the operation alone (#291), so every row
+    /// of one field in a service shares it and one anchor answers for all of
+    /// them. An explicit call-site generic on any row (`payload_type_symbol`)
+    /// keeps the alias on the symbol path, as it always has. Otherwise a row
+    /// whose document declares the field's type answers it, ahead of any model
+    /// locate: the declaration is read from the AST, the locate is a hint. Of
+    /// several such rows, the first by file and line, so the choice is the
+    /// same on every scan.
+    fn declared_result_anchors(
+        graphql: &crate::graphql::GraphqlExtraction,
+    ) -> BTreeMap<String, &crate::graphql::GraphqlOp> {
+        let alias = |op: &crate::graphql::GraphqlOp| {
+            build_manifest_type_alias(&op.key, ManifestRole::Consumer, ManifestTypeKind::Response)
+        };
+        let generic: HashSet<String> = graphql
+            .consumers
+            .iter()
+            .filter(|op| op.payload_type_symbol.is_some())
+            .map(alias)
+            .collect();
+        let mut declared: Vec<&crate::graphql::GraphqlOp> = graphql
+            .consumers
+            .iter()
+            .filter(|op| op.declared_result_type.is_some())
+            .collect();
+        declared.sort_by(|a, b| (&a.file_path, a.line).cmp(&(&b.file_path, b.line)));
+        let mut anchors = BTreeMap::new();
+        for op in declared {
+            let alias = alias(op);
+            if !generic.contains(&alias) {
+                anchors.entry(alias).or_insert(op);
+            }
+        }
+        anchors
+    }
+
+    /// Build `Expression` infer requests for GraphQL consumer rows whose
+    /// executed document declares the field's result type (carrick#1761).
+    ///
+    /// The declaration is asserted to a document type whose result argument
+    /// declares one property per root field; the request points the sidecar
+    /// at that property's TYPE in the declaring module, so what it reads is
+    /// the field's payload exactly as the declaration states it (the level a
+    /// consumer row is keyed at, carrick#1760), resolved by the checker
+    /// against the module's own imports. The span goes out in the sidecar's
+    /// numbering, converted at this boundary (carrick#805).
+    ///
+    /// The alias is `build_manifest_type_alias(&op.key, Consumer, Response)`,
+    /// byte-identical to the manifest entry's, or the inferred type never
+    /// joins back. One request per alias ([`Self::declared_result_anchors`]).
+    pub fn collect_graphql_consumer_infer_requests(
+        &self,
+        graphql: &crate::graphql::GraphqlExtraction,
+    ) -> Vec<InferRequestItem> {
+        let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        let mut requests = Vec::new();
+        for (alias, op) in Self::declared_result_anchors(graphql) {
+            let Some(declared) = op.declared_result_type.as_ref() else {
+                continue;
+            };
+            let file = declared.file.to_string_lossy().into_owned();
+            let Some(content) = Self::cached_source(&mut file_source, &file) else {
+                continue;
+            };
+            requests.push(InferRequestItem {
+                file_path: file.clone(),
+                line_number: declared.line,
+                span_start: Some(Self::sidecar_position(content, declared.lo)),
+                span_end: Some(Self::sidecar_position(content, declared.hi)),
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::Expression,
+                alias: Some(alias),
+                param_name: None,
+            });
+        }
+        debug!(
+            "[FileOrchestrator] Collected {} graphql consumer infer requests from declared document result types",
+            requests.len()
         );
         requests
     }
