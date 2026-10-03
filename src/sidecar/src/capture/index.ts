@@ -629,6 +629,7 @@ function demoteDanglingAliases(args: {
       failureReason:
         `declaration emit was skipped for module '${dangling}'; ` +
         'alias demoted to keep the partially emitted tree usable',
+      namesUnemittedModule: true,
     };
   });
 

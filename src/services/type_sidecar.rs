@@ -369,6 +369,17 @@ pub struct CaptureAliasRecord {
     /// declares.
     #[serde(default)]
     pub undeclared_names: Vec<String>,
+    /// Every position at which the alias's type, as the emitted tree states
+    /// it, holds the compiler's unresolved-reference placeholder
+    /// (carrick#1446): `""` for the alias's own type, member paths otherwise.
+    /// The placeholder prints as the name it could not follow, so the text
+    /// reads typed where every reader of the tree reads `any`.
+    ///
+    /// Kept apart from `any_provenance`, which the check phase pre-gates on:
+    /// this list moves what the index tells a reader, never a verdict. It
+    /// joins the manifest entry beside the entry's other provenance.
+    #[serde(default)]
+    pub unresolved_in_tree: Vec<TypeProvenance>,
 }
 
 impl CaptureAliasRecord {

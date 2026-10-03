@@ -40,7 +40,11 @@ import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
 import type { WriteGuard } from './guarded-fs.js';
 import {
   findDisqualifyingTopTypes,
+  findUnresolvedPlaceholders,
+  isErrorPlaceholder,
   provenanceOf,
+  unemittedModuleProvenance,
+  unresolvedInTreeProvenance,
   type DeepTopType,
 } from './deep-walk.js';
 
@@ -60,6 +64,10 @@ export interface SelfCheckArgs {
 interface FileFailures {
   externalPinned: Set<string>;
   internal: Set<string>;
+  /** Identifiers the file (or, on the surface, the alias statement) names
+   * that the compiler cannot find: the names a placeholder stands for
+   * (carrick#1446). */
+  unfoundNames: Set<string>;
 }
 
 export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
@@ -146,6 +154,7 @@ function runSelfCheck(
   const emptyFailures = (): FileFailures => ({
     externalPinned: new Set(),
     internal: new Set(),
+    unfoundNames: new Set(),
   });
   const bucketIn = (map: Map<string, FileFailures>, key: string): FileFailures => {
     let entry = map.get(key);
@@ -155,10 +164,22 @@ function runSelfCheck(
     }
     return entry;
   };
+  // A surface diagnostic outside every alias statement (a file-level import,
+  // a reference directive) is attributable to no alias and keeps the
+  // service-wide file bucket: soundness over precision, the same fallback
+  // check-poison.ts makes.
+  const bucketFor = (abs: string, start: number | undefined): FileFailures => {
+    const owner = abs === surfaceAbs ? aliasAtSurfacePosition(start) : undefined;
+    return owner ? bucketIn(surfaceFailuresByAlias, owner) : bucketIn(failuresByFile, abs);
+  };
   for (const d of diagnostics) {
     if (!d.file) continue;
     const abs = path.resolve(d.file.fileName);
     const msg = ts.flattenDiagnosticMessageText(d.messageText, ' ');
+    // A name the compiler cannot find is the placeholder's cause wherever a
+    // type uses it; the record names it beside those positions (carrick#1446).
+    const unfound = /Cannot find (?:name|namespace) '([^']+)'/.exec(msg);
+    if (unfound) bucketFor(abs, d.start).unfoundNames.add(unfound[1]);
     // A name the repair did not reach: the import that bound it is gone, so
     // the module is no longer reported missing and only this diagnostic is
     // left to say the tree is incomplete. Blamed on the specifier that bound
@@ -172,14 +193,7 @@ function runSelfCheck(
     const m = /Cannot find module '([^']+)'/.exec(msg);
     if (!m) continue;
     const spec = m[1];
-    // A surface diagnostic outside every alias statement (a file-level import,
-    // a reference directive) is attributable to no alias and keeps the
-    // service-wide file bucket: soundness over precision, the same fallback
-    // check-poison.ts makes.
-    const owner = abs === surfaceAbs ? aliasAtSurfacePosition(d.start) : undefined;
-    const bucket = owner
-      ? bucketIn(surfaceFailuresByAlias, owner)
-      : bucketIn(failuresByFile, abs);
+    const bucket = bucketFor(abs, d.start);
     if (!isRelative(spec) && args.pinned[packageNameOf(spec)]) {
       bucket.externalPinned.add(spec);
     } else {
@@ -298,6 +312,12 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
     self_check_detail: anchor.failureReason,
     capture_failure_reason: anchor.failureReason,
     top_type_at_self_check: true,
+    // A literal's text is what the index serves for it, and a module it
+    // names never reached the tree (carrick#1446). A symbol anchor's served
+    // declaration comes from elsewhere, so its demotion says nothing about it.
+    ...(anchor.request.kind === 'literal' && anchor.namesUnemittedModule
+      ? { unresolved_in_tree: [unemittedModuleProvenance()] }
+      : {}),
   };
 }
 
@@ -317,6 +337,11 @@ function checkedRecord(
   const alias = anchor.request.alias;
   let topType = true;
   let deepFindings: DeepTopType[] = [];
+  // Where the alias's type holds the unresolved-reference placeholder in this
+  // tree (carrick#1446): `''` for its own type. The deep walk leaves the
+  // placeholder out because the check heals a pinned external; what the index
+  // publishes is this tree, so the record says where it does not resolve.
+  let unresolvedPaths: string[] = [];
   const seeds: string[] = [];
 
   if (ctx.surfaceSource) {
@@ -332,6 +357,9 @@ function checkedRecord(
           ctx.checker,
           stmt.name
         );
+        unresolvedPaths = findUnresolvedPlaceholders(type, ctx.program, ctx.checker, stmt.name);
+      } else if (isErrorPlaceholder(type)) {
+        unresolvedPaths = [''];
       }
       // Seed the closure with the alias's own import-type targets.
       const visit = (node: ts.Node) => {
@@ -365,6 +393,7 @@ function checkedRecord(
   let blamedExternal: string | undefined;
   let internalFailure: string | undefined;
   const danglingSpecifiers = new Set<string>();
+  const unfoundNames = new Set<string>();
   // This alias's own surface statement, then the closure's files. The surface
   // file bucket now holds only the diagnostics no alias statement covers.
   const closureFailures = [
@@ -376,6 +405,7 @@ function checkedRecord(
     if (!blamedExternal) blamedExternal = [...failures.externalPinned][0];
     if (!internalFailure) internalFailure = [...failures.internal][0];
     for (const specifier of failures.internal) danglingSpecifiers.add(specifier);
+    for (const name of failures.unfoundNames) unfoundNames.add(name);
   }
 
   // Classification consults the closure failures REGARDLESS of the root
@@ -475,6 +505,13 @@ function checkedRecord(
       ? { dangling_specifiers: [...danglingSpecifiers].sort() }
       : {}),
     ...(anchor.undeclaredNames ? { undeclared_names: anchor.undeclaredNames } : {}),
+    ...(unresolvedPaths.length > 0
+      ? {
+          unresolved_in_tree: [...unresolvedPaths]
+            .sort()
+            .map((p) => unresolvedInTreeProvenance(p, [...unfoundNames].sort())),
+        }
+      : {}),
   };
 }
 

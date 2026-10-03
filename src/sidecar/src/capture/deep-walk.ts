@@ -98,7 +98,7 @@ export function findUnresolvedPlaceholders(
 
 /** TypeScript's unresolved-reference placeholder: `TypeFlags.Any` with the
  * internal `intrinsicName === 'error'` (stable since TS 1.x; see `anchors.ts`). */
-function isErrorPlaceholder(t: ts.Type): boolean {
+export function isErrorPlaceholder(t: ts.Type): boolean {
   return (
     (t.flags & ts.TypeFlags.Any) !== 0 &&
     (t as unknown as { intrinsicName?: string }).intrinsicName === 'error'
@@ -325,8 +325,8 @@ export interface UnresolvedAtAnchor {
   specifiers: readonly string[];
 }
 
-/** How many unresolved specifiers a detail names before it counts the rest. */
-const MAX_NAMED_SPECIFIERS = 3;
+/** How many specifiers or names a detail lists before it counts the rest. */
+const MAX_NAMED_IN_DETAIL = 3;
 
 /**
  * Turn a deep finding into the published provenance entry (carrick#376).
@@ -376,13 +376,61 @@ function unresolvedDetail(specifiers: readonly string[]): string {
   const lead =
     "the type at this position did not resolve on the scanned checkout, so the compiler printed a placeholder 'any' rather than a declared type";
   if (specifiers.length === 0) return lead;
-  const named = specifiers
-    .slice(0, MAX_NAMED_SPECIFIERS)
-    .map((specifier) => `'${specifier}'`)
+  return `${lead}; unresolved imports reachable from the anchor: ${quotedList(specifiers)}`;
+}
+
+/**
+ * The entry for one position at which the emitted tree holds the
+ * unresolved-reference placeholder (carrick#1446): `path` is `''` for the
+ * alias's own type. `names` are the identifiers the self-check could not find
+ * in this alias's statement and the files it reaches.
+ *
+ * The cause is `unresolved_import`, the word a reader already has for "a
+ * reference here did not resolve"; the detail says where it failed to.
+ */
+export function unresolvedInTreeProvenance(
+  path: string,
+  names: readonly string[]
+): TypeProvenance {
+  const where = path === '' ? 'this type' : 'the type at this position';
+  const lead =
+    `${where} does not resolve in the declarations the capture emitted, so the ` +
+    "compiler reads it as 'any' although the printed text shows the name it could not follow";
+  return {
+    path,
+    kind: 'any',
+    reason: 'unresolved_import',
+    detail:
+      names.length === 0
+        ? lead
+        : `${lead}; names those declarations cannot find: ${quotedList(names)}`,
+  };
+}
+
+/**
+ * The root entry for a literal anchor demoted because its text names a module
+ * whose declaration emit was skipped (carrick#1446, carrick#1165): that text is
+ * what the index serves for it, and nothing in the emitted tree declares what
+ * it imports.
+ */
+export function unemittedModuleProvenance(): TypeProvenance {
+  return {
+    path: '',
+    kind: 'any',
+    reason: 'unresolved_import',
+    detail:
+      'this type names a module whose declarations the capture could not emit, so it ' +
+      "does not resolve in the declarations the capture emitted and the compiler reads it as 'any'",
+  };
+}
+
+/** `'a', 'b', 'c' and 2 more`. */
+function quotedList(items: readonly string[]): string {
+  const named = items
+    .slice(0, MAX_NAMED_IN_DETAIL)
+    .map((item) => `'${item}'`)
     .join(', ');
   const more =
-    specifiers.length > MAX_NAMED_SPECIFIERS
-      ? ` and ${specifiers.length - MAX_NAMED_SPECIFIERS} more`
-      : '';
-  return `${lead}; unresolved imports reachable from the anchor: ${named}${more}`;
+    items.length > MAX_NAMED_IN_DETAIL ? ` and ${items.length - MAX_NAMED_IN_DETAIL} more` : '';
+  return `${named}${more}`;
 }

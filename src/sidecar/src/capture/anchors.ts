@@ -66,6 +66,12 @@ export interface ResolvedAnchor {
    * anchor's type holds no unresolved placeholder.
    */
   unresolved?: UnresolvedAtAnchor;
+  /**
+   * carrick#1446: set on a demotion whose alias text names a module the
+   * declaration emit skipped. The text dangles in the emitted tree, which the
+   * record states for a literal anchor, whose text is what the index serves.
+   */
+  namesUnemittedModule?: true;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */

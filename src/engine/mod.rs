@@ -6945,34 +6945,51 @@ fn resolve_per_endpoint_definitions(
         return;
     };
 
-    // Capture-side provenance (carrick#376). Stamped for EVERY entry, including
-    // the ones whose `type_state` is Unknown and therefore print no definition
-    // at all: "no type here, and here is why" is the answer a reader needs, and
-    // it is exactly the entry the definition resolution below skips.
     let records = read_capture_records(stub_dir);
-    stamp_capture_provenance(manifest, &records);
-
     let aliases = aliases_to_resolve(manifest, &records);
-
-    if aliases.is_empty() {
-        return;
-    }
-
-    debug!(
-        "Resolving {} type definition(s) via compiler",
-        aliases.len()
-    );
-
-    match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
-        Ok(resolved) => {
-            let count = apply_resolved_definitions(manifest, resolved, &records);
-            debug!("Resolved {} type definition(s)", count);
+    let resolved = if aliases.is_empty() {
+        Vec::new()
+    } else {
+        debug!(
+            "Resolving {} type definition(s) via compiler",
+            aliases.len()
+        );
+        match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!("Per-endpoint definition resolution failed: {}", e);
+                debug!("Continuing without resolved definitions (MCP will use regex fallback)");
+                Vec::new()
+            }
         }
-        Err(e) => {
-            warn!("Per-endpoint definition resolution failed: {}", e);
-            debug!("Continuing without resolved definitions (MCP will use regex fallback)");
-        }
-    }
+    };
+    let count = join_capture_answers(manifest, resolved, &records);
+    debug!("Resolved {} type definition(s)", count);
+}
+
+/// Write the capture's answers onto the manifest, then its provenance.
+///
+/// Provenance is stamped for EVERY entry, including the ones whose
+/// `type_state` is Unknown and therefore print no definition at all: "no type
+/// here, and here is why" is the answer a reader needs (carrick#376).
+///
+/// It is stamped after the answers settle the state, not before. The
+/// declared-open-member rule (carrick#1752) settles an answer whose every
+/// top type it can explain, and a position the emitted tree cannot resolve
+/// (carrick#1446) prints as a name, not as a top type: there is nothing in the
+/// text for it to explain, and the same answer without a declared member
+/// settles on its text alone. The record's own `any_provenance` reaches that
+/// rule directly, so the order moves nothing else.
+///
+/// Returns how many aliases the capture answered for.
+fn join_capture_answers(
+    manifest: &mut [TypeManifestEntry],
+    resolved: Vec<crate::services::type_sidecar::ResolvedDefinitionResult>,
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
+) -> usize {
+    let count = apply_resolved_definitions(manifest, resolved, records);
+    stamp_capture_provenance(manifest, records);
+    count
 }
 
 /// The aliases to ask the capture stub about: every entry in the manifest.
@@ -7167,9 +7184,12 @@ fn read_capture_records(
         .collect()
 }
 
-/// Join the capture self-check's `any`/`unknown` findings onto the manifest:
-/// the capture record is the right source for "which fields of this endpoint's
-/// type are `any`". An alias with no record leaves its entry as it was.
+/// Join the capture self-check's findings onto the manifest: the capture record
+/// is the right source for "which fields of this endpoint's type are `any`".
+/// Both of its lists join: the `any`/`unknown` the emitted declarations state,
+/// and the positions the emitted tree cannot resolve, which print as a name
+/// and read `any` (carrick#1446). An alias with no record leaves its entry as
+/// it was.
 fn stamp_capture_provenance(
     manifest: &mut [TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
@@ -7178,12 +7198,13 @@ fn stamp_capture_provenance(
         let Some(record) = records.get(&entry.type_alias) else {
             continue;
         };
-        if record.any_provenance.is_empty() {
-            continue;
-        }
         merge_any_provenance(
             &mut entry.any_provenance,
-            record.any_provenance.iter().cloned(),
+            record
+                .any_provenance
+                .iter()
+                .chain(&record.unresolved_in_tree)
+                .cloned(),
         );
     }
 }
@@ -16246,6 +16267,110 @@ mod tests {
         let mut entry = consumer_entry("OrderView");
         entry.type_state = ManifestTypeState::Implicit;
         entry
+    }
+
+    // ---- carrick#1446: positions that do not resolve in the emitted tree ---
+
+    fn unresolved(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": path,
+            "kind": "any",
+            "reason": "unresolved_import",
+            "detail": "does not resolve in the declarations the capture emitted"
+        })
+    }
+
+    fn provenance_of(entry: &TypeManifestEntry) -> Vec<(&str, &str)> {
+        entry
+            .any_provenance
+            .iter()
+            .map(|p| (p.path.as_str(), p.reason.as_str()))
+            .collect()
+    }
+
+    /// A member the emitted tree cannot resolve prints as the name it could
+    /// not follow, so the published shape reads typed. The record's list of
+    /// such positions reaches the entry a reader sees, beside the entry's
+    /// other findings, and the shape is still published.
+    #[test]
+    fn positions_the_emitted_tree_cannot_resolve_reach_the_entry() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "any_provenance": [finding("meta", "any", "declared")],
+                "unresolved_in_tree": [unresolved("items<0>.status")]
+            }),
+        )]));
+        let mut manifest = vec![answered_entry(), consumer_entry("Untouched")];
+        let shape = "{ meta: any; items: { status: OrderStatus; }[]; }";
+
+        join_capture_answers(&mut manifest, vec![captured("OrderView", shape)], &records);
+
+        assert_eq!(manifest[0].expanded_definition.as_deref(), Some(shape));
+        assert_eq!(
+            provenance_of(&manifest[0]),
+            vec![
+                ("items<0>.status", "unresolved_import"),
+                ("meta", "declared")
+            ]
+        );
+        assert!(manifest[1].any_provenance.is_empty());
+    }
+
+    /// An entry served from v1's text, because the capture's answer did not
+    /// resolve at its root, says so: the text is a literal anchor's, and it
+    /// names what nothing declares (carrick#1165's fallback rows).
+    #[test]
+    fn an_answer_that_does_not_resolve_at_its_root_says_so_on_the_entry() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "anchor_kind": "literal",
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unresolved_in_tree": [unresolved("")]
+            }),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        join_capture_answers(&mut manifest, vec![captured("OrderView", "any")], &records);
+
+        assert_eq!(manifest[0].resolved_definition, None);
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert_eq!(provenance_of(&manifest[0]), vec![("", "unresolved_import")]);
+    }
+
+    /// The list joins AFTER the answer settles the state. An entry no v1 layer
+    /// stated, whose answer has a member the source declares `unknown` and a
+    /// member the tree cannot resolve, settles like the same answer without
+    /// the declared member does: the unresolved name is not a top type in the
+    /// text, so it has nothing for the declared-open-member rule to explain.
+    #[test]
+    fn an_unresolved_member_does_not_stop_an_open_contract_settling() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "any_provenance": [finding("notes", "unknown", "declared")],
+                "unresolved_in_tree": [unresolved("status")]
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured(
+                "OrderView",
+                "{ id: string; notes: unknown; status: OrderStatus; }",
+            )],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert_eq!(
+            provenance_of(&manifest[0]),
+            vec![("notes", "declared"), ("status", "unresolved_import")]
+        );
     }
 
     /// A shape that names an identifier nothing declares reads as a type and

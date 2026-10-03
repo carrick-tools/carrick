@@ -279,6 +279,26 @@ export interface CaptureAliasRecord {
    * absent when there are none.
    */
   undeclared_names?: string[];
+  /**
+   * Every position at which this alias's type, as the emitted tree states it,
+   * holds TypeScript's unresolved-reference placeholder (carrick#1446): `''`
+   * when the alias's own type does not resolve, member paths otherwise, in the
+   * deep walk's notation, sorted by path. The compiler prints the placeholder
+   * as the name it could not follow, so the text reads like a type while every
+   * reader of the tree reads `any` there.
+   *
+   * Read on the self-check program, where the producer's installed packages
+   * resolve, so a name only a missing install leaves unresolved is listed only
+   * on a bare checkout. A literal anchor demoted because its text names a
+   * module the emit skipped is listed at its root: that text is what the
+   * index serves for it, and it names a module the tree does not hold.
+   *
+   * Kept apart from `any_provenance` on purpose: the check phase pre-gates
+   * on `any_provenance[0]`, and this list is what the index tells a reader,
+   * not a verdict. The scanner joins it onto the manifest entry beside the
+   * entry's other provenance. Absent when every position resolves.
+   */
+  unresolved_in_tree?: TypeProvenance[];
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */
