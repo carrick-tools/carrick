@@ -355,6 +355,11 @@ struct ClientRef {
     /// as a hand-off, except the one an own factory makes of the instance it
     /// builds, which is followed to the factory's callers (carrick#1562).
     returned: BTreeSet<u32>,
+    /// The module-scope `let` that holds the instance, when a getter built
+    /// it there on first use and returns that one object to every caller
+    /// (carrick#1790, [`Reader::lazy_clients`]). Only the
+    /// instance a `return` of such a `let` reads carries it.
+    shared: Option<String>,
 }
 
 impl ClientRef {
@@ -684,10 +689,21 @@ impl FnIr {
     /// one or more makers, each handed its own arguments (carrick#1689; one
     /// maker before). How many makers that comes to once own calls are
     /// followed is the reader's to judge ([`library_sites::MAX_MAKERS`]). A
-    /// generator returns no instance to its caller.
+    /// generator returns no instance to its caller, and a function that
+    /// returns a lazily built client on one path (carrick#1790) and anything
+    /// else on another returns no one instance.
     fn settle_returned(&mut self, is_async: bool, is_generator: bool) {
         let returns = std::mem::take(&mut self.returns);
         if is_generator || returns.is_empty() || returns.iter().any(|(_, made)| made.is_empty()) {
+            return;
+        }
+        let mut shared = returns
+            .iter()
+            .flat_map(|(_, made)| made)
+            .map(|client| &client.shared);
+        if let Some(first) = shared.next()
+            && shared.any(|other| other != first)
+        {
             return;
         }
         let mut makers: Vec<ClientRef> = Vec::new();
@@ -816,6 +832,7 @@ pub fn extract_file_ir(
         named: HashSet::new(),
         builders: HashMap::new(),
         receivers: HashMap::new(),
+        lazy_clients: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
@@ -966,6 +983,10 @@ pub fn extract_file_ir(
                 .insert((ident_key(&fn_decl.ident), Vec::new()), builder);
         }
     }
+    // A client a getter builds into a module `let` on first use
+    // (carrick#1790), read where a function returns it, once the module's
+    // constants are known.
+    module_scope.lazy_clients = reader.lazy_clients(module, &module_scope, &reassigned);
     let module_scope = &module_scope;
     let none = Captured::default();
 
@@ -1123,6 +1144,11 @@ struct ModuleScope {
     /// arguments in its parameters).
     builders: HashMap<(BindingKey, Vec<String>), Builder>,
     receivers: HashMap<String, ClientRef>,
+    /// Each module-scope `let` a getter builds a client into on first use,
+    /// with the instance it holds (carrick#1790,
+    /// [`Reader::lazy_clients`]). Read only where a function returns it: no
+    /// call is read through the `let`, for any role.
+    lazy_clients: HashMap<BindingKey, ClientRef>,
     /// Import bindings no scope below declares again, other than namespace
     /// imports: each may hold an instance the module it names declares
     /// (carrick#1568).
@@ -2539,6 +2565,7 @@ fn import_receivers(imports: &HashMap<String, ImportBinding>) -> HashMap<String,
                     member_uses: BTreeSet::new(),
                     export_uses: BTreeSet::new(),
                     returned: BTreeSet::new(),
+                    shared: None,
                 },
             )
         })
@@ -3729,6 +3756,7 @@ impl Reader<'_> {
             member_uses: BTreeSet::new(),
             export_uses: client.member_uses.clone(),
             returned: client.returned.clone(),
+            shared: None,
         })
     }
 

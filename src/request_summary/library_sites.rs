@@ -70,7 +70,11 @@
 //!     each branch, a return per branch) holds the set of those makers
 //!     (carrick#1689, [`SiteReceiver::Instance`]), and a site through it
 //!     states a fact only when every maker reads the same
-//!     ([`LibrarySite::fold`]);
+//!     ([`LibrarySite::fold`]). A getter that builds one instance into a
+//!     module `let` on first use and returns it is followed the same way
+//!     (carrick#1790, [`Reader::lazy_clients`]), and since every call holds
+//!     that one object, every holder's uses are each site's
+//!     ([`share_lazy_clients`]);
 //!   - a name taken from a parameter, stated again at each call that fills
 //!     it with text ([`LibrarySite::origin`]);
 //!   - an entry of a constant object, an imported constant, and what a
@@ -355,6 +359,19 @@ pub struct SiteMaker {
     /// written where the instance is held, whatever factories it went
     /// through.
     pub factory: Option<SiteCall>,
+    /// The module `let` a getter built the instance into on first use
+    /// (carrick#1790): every call of the getter holds this one object, so
+    /// every holder's uses are each site's ([`share_lazy_clients`]).
+    pub shared: Option<SharedLet>,
+}
+
+/// A module-scope `let` that holds the one instance a getter builds on first
+/// use and returns to every caller (carrick#1790).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SharedLet {
+    /// The module that declares it.
+    pub file: PathBuf,
+    pub binding: String,
 }
 
 impl SiteMaker {
@@ -705,6 +722,7 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
         }
         reader.collect(&file.module_level, None, &mut sites);
     }
+    share_lazy_clients(&mut sites, &callers, inputs);
     sites.sort_by(|a, b| {
         (&a.file, a.span_start, a.form, a.span_end, &a.origin).cmp(&(
             &b.file,
@@ -715,6 +733,77 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
         ))
     });
     LibrarySites { sites }
+}
+
+/// Every holder of a getter's one instance holds one object (carrick#1790),
+/// so a use any holder makes is a use at every site through it, as every
+/// module's uses of a module-scope instance are ([`LinkedClients`]): each
+/// site through a [`SharedLet`] takes every such site's member uses and
+/// contest. A call of the getter that no site reads the instance through
+/// holds it where nothing here sees its uses (`register(getClient())`, or a
+/// factory that returns the call), so it takes the instance away from
+/// every site. A call the call graph does not resolve is not seen at all.
+fn share_lazy_clients(
+    sites: &mut [LibrarySite],
+    callers: &Callers<'_>,
+    inputs: &RequestSummaryInputs,
+) {
+    #[derive(Default)]
+    struct Shared {
+        contested: bool,
+        uses: BTreeSet<MemberUse>,
+        export_uses: BTreeSet<MemberUse>,
+        /// The getter calls a site reads the instance through.
+        read_at: HashSet<(PathBuf, u32)>,
+    }
+    let mut shared: BTreeMap<SharedLet, Shared> = BTreeMap::new();
+    for site in sites.iter() {
+        for maker in site.makers() {
+            let Some(held) = &maker.shared else {
+                continue;
+            };
+            let group = shared.entry(held.clone()).or_default();
+            group.contested |= site.contested;
+            group.uses.extend(site.uses.iter().cloned());
+            group.export_uses.extend(site.export_uses.iter().cloned());
+            if let Some(call) = &maker.factory {
+                group.read_at.insert((call.file.clone(), call.span_start));
+            }
+        }
+    }
+    for (held, group) in &mut shared {
+        let functions = inputs.files.get(&held.file).map(|ir| &ir.functions);
+        for (key, function) in functions.into_iter().flatten() {
+            let getter = function.returned.as_ref().is_some_and(|returned| {
+                returned
+                    .makers
+                    .iter()
+                    .any(|maker| maker.shared.as_deref() == Some(held.binding.as_str()))
+            });
+            if !getter {
+                continue;
+            }
+            for caller in callers.of(&held.file, key) {
+                let at = (caller.file.to_path_buf(), caller.call.site.span_start);
+                if !group.read_at.contains(&at) {
+                    group.contested = true;
+                }
+            }
+        }
+    }
+    for site in sites.iter_mut() {
+        let held: Vec<SharedLet> = site
+            .makers()
+            .iter()
+            .filter_map(|maker| maker.shared.clone())
+            .collect();
+        for held in held {
+            let group = &shared[&held];
+            site.contested |= group.contested;
+            site.uses.extend(group.uses.iter().cloned());
+            site.export_uses.extend(group.export_uses.iter().cloned());
+        }
+    }
 }
 
 struct SiteReader<'a> {
@@ -745,17 +834,21 @@ struct Made {
     uses: BTreeSet<MemberUse>,
     /// The export's binding's member uses where the maker is written.
     export_uses: BTreeSet<MemberUse>,
+    /// The module `let` a getter built the instance into (carrick#1790).
+    shared: Option<SharedLet>,
 }
 
 impl Made {
     /// Whether two are one export's maker, handed the same arguments: one
-    /// maker of a set (carrick#1689), wherever each was written.
+    /// maker of a set (carrick#1689), wherever each was written. An instance
+    /// a getter shares and a fresh one are two (carrick#1790).
     fn same_maker(&self, other: &Made) -> bool {
         self.package == other.package
             && self.export == other.export
             && self.instance.form == other.instance.form
             && self.instance.member == other.instance.member
             && self.instance.args == other.instance.args
+            && self.shared == other.shared
     }
 
     /// `other`'s contest and uses added to these: the first one written
@@ -863,6 +956,7 @@ impl SiteReader<'_> {
                                 line: made.instance.site.line,
                                 holder,
                                 factory: made.factory,
+                                shared: made.shared,
                             }
                         })
                         .collect();
@@ -940,6 +1034,7 @@ impl SiteReader<'_> {
                     contested: false,
                     uses: BTreeSet::new(),
                     export_uses: client.export_uses.clone(),
+                    shared: None,
                 }],
                 MadeBy::Call(_) => Vec::new(),
             };
@@ -967,9 +1062,23 @@ impl SiteReader<'_> {
         };
         let mut out: Vec<Made> = Vec::new();
         for product in &returned.makers {
-            let inner = self.made(target_file, product, depth + 1);
+            let mut inner = self.made(target_file, product, depth + 1);
             if inner.is_empty() {
                 return Vec::new();
+            }
+            // A getter's one instance (carrick#1790): every call holds it.
+            // One another getter built is held through two `let`s, which
+            // nothing here joins.
+            if let Some(binding) = &product.shared {
+                for made in &mut inner {
+                    if made.shared.is_some() {
+                        return Vec::new();
+                    }
+                    made.shared = Some(SharedLet {
+                        file: target_file.clone(),
+                        binding: binding.clone(),
+                    });
+                }
             }
             // The factory's binding is used to change the instance, or
             // returned somewhere the factory's own returns are not: a caller
@@ -1480,9 +1589,12 @@ impl Reader<'_> {
     /// What a `return` hands its caller, when it is an instance each call
     /// builds anew (carrick#1562): one [`Reader::written_instance`] reads, a
     /// local that holds one, or a `let` set on every path to one of a few
-    /// makers' (carrick#1689, [`Reader::let_makers`]), one per maker. Empty
-    /// for anything else: a parameter, a module's instance and a class field
-    /// are shared by every call. Only a function the call graph keys is
+    /// makers' (carrick#1689, [`Reader::let_makers`]), one per maker, or the
+    /// module `let` a getter builds a client into on first use
+    /// (carrick#1790, [`Reader::lazy_clients`]), whose one instance every
+    /// call shares. Empty for anything else: a parameter, a module's `const`
+    /// instance and a class field are shared by every call, and nothing
+    /// reads their other holders' uses. Only a function the call graph keys is
     /// followed as a factory, and such a function is never written inside
     /// another, so every local it holds is its own.
     pub(super) fn returned_instances(&self, expr: &Expr, scope: &Scope<'_>) -> Vec<ClientRef> {
@@ -1491,8 +1603,14 @@ impl Reader<'_> {
             if let Some(makers) = scope.let_makers.get(&key) {
                 return makers.clone();
             }
+            if let Some(client) = scope.local_receivers.get(&key) {
+                return vec![client.clone()];
+            }
+            // The one instance a getter builds on first use (carrick#1790):
+            // shared by every call, which [`share_lazy_clients`] reads.
             return scope
-                .local_receivers
+                .module
+                .lazy_clients
                 .get(&key)
                 .cloned()
                 .into_iter()
@@ -1551,6 +1669,101 @@ impl Reader<'_> {
             .collect()
     }
 
+    /// Each module-scope `let` (or `var`) a getter builds a client into on
+    /// first use (carrick#1790), with the instance it holds:
+    ///
+    /// ```ts
+    /// let client: Client | null = null;
+    /// export function getClient() {
+    ///   if (!client) { client = new Client(options); }
+    ///   return client;
+    /// }
+    /// ```
+    ///
+    /// It is one when it is declared once, unexported, with no initialiser,
+    /// `null` or `undefined`; every write to it is a statement `x = …`,
+    /// `x ??= …` or `x ||= …` of one maker, handed the same arguments (read
+    /// in the module's scope, as a module `const` is); and the file uses it
+    /// only to test it, compare it and return it. So it holds nothing or that
+    /// one instance, whatever runs first, and a call through it runs only on
+    /// the instance. Anything else (another value written anywhere, a
+    /// destructuring or `for (x of …)` write, `x++`, a call or a member read
+    /// through it, a hand-off, an export, a second declaration of the name)
+    /// leaves it no client, as before.
+    ///
+    /// No call is read through the `let` itself: it is read only where a
+    /// function returns it ([`Reader::returned_instances`]), and every call
+    /// of that function holds the one instance ([`share_lazy_clients`]).
+    pub(super) fn lazy_clients(
+        &self,
+        module: &Module,
+        module_scope: &ModuleScope,
+        reassigned: &super::Reassigned,
+    ) -> HashMap<BindingKey, ClientRef> {
+        let declared = crate::binding_scope::Declarations::of(module);
+        let scope = Scope::module(module_scope);
+        let mut out = HashMap::new();
+        for item in &module.body {
+            // `export let` publishes the binding: an importer may write it.
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+                continue;
+            };
+            if var.kind == VarDeclKind::Const {
+                continue;
+            }
+            for declarator in &var.decls {
+                let Pat::Ident(ident) = &declarator.name else {
+                    continue;
+                };
+                if !declarator.init.as_deref().is_none_or(holds_nothing) {
+                    continue;
+                }
+                let name = ident.id.sym.as_ref();
+                let key = ident_key(&ident.id);
+                // Every other place the name is bound is a plain
+                // assignment's target ([`crate::binding_scope::Declarations`]
+                // counts those): no scope declares it again, and no pattern
+                // or loop head writes it.
+                let targets = reassigned.targets.get(name).copied().unwrap_or(0);
+                if declared.name_count(name) != 1 + targets {
+                    continue;
+                }
+                if !module_scope
+                    .uses
+                    .get(name)
+                    .is_some_and(only_tested_and_returned)
+                {
+                    continue;
+                }
+                let mut writes = LazyWrites {
+                    key: &key,
+                    writes: Vec::new(),
+                    updated: false,
+                };
+                module.visit_with(&mut writes);
+                if writes.updated || writes.writes.is_empty() || writes.writes.len() != targets {
+                    continue;
+                }
+                let Some(made) = writes
+                    .writes
+                    .iter()
+                    .map(|write| self.written_instance(write, &scope))
+                    .collect::<Option<Vec<ClientRef>>>()
+                else {
+                    continue;
+                };
+                let first = &made[0];
+                if !made.iter().all(|client| same_maker(client, first)) {
+                    continue;
+                }
+                let mut client = module_scope.with_uses(first.clone(), name);
+                client.shared = Some(name.to_string());
+                out.insert(key, client);
+            }
+        }
+        out
+    }
+
     /// A call to a function the service may declare, as a holder's value
     /// (carrick#1562): `make(…)`, `this.make(…)`, `this.#make(…)` or
     /// `ns.a.make(…)`, awaited or not. What it holds is the instance the
@@ -1600,6 +1813,7 @@ impl Reader<'_> {
             member_uses: BTreeSet::new(),
             export_uses: BTreeSet::new(),
             returned: BTreeSet::new(),
+            shared: None,
         })
     }
 
@@ -1834,6 +2048,68 @@ impl Visit for LetUses<'_> {
         }
         ret.visit_children_with(self);
     }
+}
+
+/// The writes of a module `let` the lazy-client rule reads, anywhere in the
+/// module (carrick#1790, [`Reader::lazy_clients`]): what each statement `x =
+/// …`, `x ??= …` or `x ||= …` sets it to, and whether `x++` or `x--` writes
+/// it. Any other write of the name (another operator, or one whose value is
+/// used: `register(x = …)`, `return (x = …)`) is among the assignments
+/// [`super::Reassigned`] counts and not among these, which leaves the `let`
+/// no client.
+struct LazyWrites<'a> {
+    key: &'a BindingKey,
+    writes: Vec<Expr>,
+    updated: bool,
+}
+
+impl Visit for LazyWrites<'_> {
+    fn visit_expr_stmt(&mut self, stmt: &ExprStmt) {
+        if let Expr::Assign(assign) = unwrap_expression(&stmt.expr)
+            && matches!(
+                assign.op,
+                AssignOp::Assign | AssignOp::NullishAssign | AssignOp::OrAssign
+            )
+            && let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left
+            && ident_key(&target.id) == *self.key
+        {
+            self.writes.push((*assign.right).clone());
+        }
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &UpdateExpr) {
+        if names_binding(&update.arg, self.key) {
+            self.updated = true;
+        }
+        update.visit_children_with(self);
+    }
+}
+
+/// Whether a module `let`'s initialiser leaves it holding nothing (carrick#1790):
+/// `null` or `undefined`.
+fn holds_nothing(init: &Expr) -> bool {
+    match unwrap_expression(init) {
+        Expr::Lit(Lit::Null(_)) => true,
+        Expr::Ident(ident) => ident.sym == *"undefined",
+        _ => false,
+    }
+}
+
+/// Whether a module `let`'s uses across its file are only tests, comparisons
+/// and returns, with at least one return (carrick#1790): nothing is called,
+/// constructed or read through it, it is handed nowhere, spread, written
+/// through or exported.
+fn only_tested_and_returned(used: &BindingUse) -> bool {
+    !used.written
+        && !used.member_read
+        && !used.spread
+        && !used.other
+        && !used.called_computed
+        && !used.exported
+        && used.called.is_empty()
+        && used.library_calls.is_empty()
+        && !used.returned_at.is_empty()
 }
 
 /// Whether `expr` is the binding `key`, through parentheses and type
@@ -4347,6 +4623,10 @@ mod tests {
             (declared, "export function drop() { lazy &&= null; }"),
             (
                 declared,
+                "export function eager() { register(lazy = new Queue(\"emails\")); }",
+            ),
+            (
+                declared,
                 "export function unpack() { [lazy] = [new Queue(\"emails\")]; }",
             ),
             (
@@ -4401,6 +4681,70 @@ mod tests {
                 .all(|site| !(site.file.ends_with("src/mixed.ts") && site.line == 14)),
             "{mixed:#?}"
         );
+
+        // A `let` set to what another getter's `let` holds is one object
+        // held through two `let`s, which nothing here joins.
+        let nested = sites_of(&[(
+            "src/nested.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             let inner: Queue | null = null;\n\
+             export function getInner() {\n\
+             \x20 if (!inner) {\n\
+             \x20   inner = new Queue(\"emails\");\n\
+             \x20 }\n\
+             \x20 return inner;\n\
+             }\n\
+             let outer: Queue | null = null;\n\
+             export function getOuter() {\n\
+             \x20 if (!outer) {\n\
+             \x20   outer = getInner();\n\
+             \x20 }\n\
+             \x20 return outer;\n\
+             }\n\
+             export async function send() {\n\
+             \x20 const both = getOuter();\n\
+             \x20 await both.add(\"x\", {});\n\
+             }\n",
+        )]);
+        assert!(
+            nested
+                .iter()
+                .all(|site| !(site.file.ends_with("src/nested.ts") && site.line == 18)),
+            "{nested:#?}"
+        );
+    }
+
+    /// A factory that returns a getter's one instance on one path and a
+    /// fresh one of the same maker on another holds a set of two makers
+    /// (carrick#1790): the getter's call inside the factory holds the shared
+    /// instance where no site reads its uses, so the shared one is taken
+    /// away, and the set with it.
+    #[test]
+    fn a_factory_that_returns_a_getter_s_instance_hands_it_on() {
+        let sites = sites_of(&[(
+            "src/either.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             let lazy: Queue | null = null;\n\
+             export function get() {\n\
+             \x20 if (!lazy) {\n\
+             \x20   lazy = new Queue(\"emails\");\n\
+             \x20 }\n\
+             \x20 return lazy;\n\
+             }\n\
+             export function either(fresh: boolean) {\n\
+             \x20 if (fresh) {\n\
+             \x20   return new Queue(\"emails\");\n\
+             \x20 }\n\
+             \x20 return get();\n\
+             }\n\
+             export async function send() {\n\
+             \x20 const picked = either(true);\n\
+             \x20 await picked.add(\"x\", {});\n\
+             }\n",
+        )]);
+        let add = site(&sites, "src/either.ts", 17, Some("add"));
+        assert_eq!(add.makers().len(), 2, "{add:#?}");
+        assert_eq!(add.contest(on_wire), Some(Contest::Used));
     }
 
     /// Own factories that build one of a few makers' instances, each binding

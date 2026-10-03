@@ -257,6 +257,20 @@ an HTTP row.
   role and name scope (`LibrarySite::fold`); otherwise it is a candidate.
   Five makers, or makers of two exports, are no factory. One maker's
   instance held by two bindings is one maker, used as both are.
+- **A client built on first use** (carrick#1790). A function that returns a
+  module-scope `let` (`if (!client) { client = new Client(…); } return
+  client;`, or `client ??= …`) is a factory of that maker's instance when
+  the `let` is declared once, unexported, with no value, `null` or
+  `undefined`; every write to it is such a statement of one maker, handed
+  the same arguments; and the file only tests, compares and returns it.
+  Anything else (another value written anywhere, `x++`, a destructuring or
+  loop-head write, a call or member read through it, a hand-off, a second
+  declaration of the name, a path that returns something else) leaves it
+  no factory. Every call holds the one instance, so each site through it
+  takes every holder's member uses and contests, and a call of the function
+  that no site reads through (`register(getClient())`, a factory returning
+  the call) takes the instance away everywhere. No call is read through
+  the `let` itself, and HTTP reads nothing through the instance.
 - **Names a caller fills** (carrick#1562). A library call whose argument
   holds a parameter of the function it is written in (`bus.publish(topic,
   data)` inside `publish(topic, data)`, or a template built from one) states
