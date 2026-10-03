@@ -1,0 +1,123 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/api/orders",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/orders\")",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Order",
+      "type_import_source": "./shapes"
+    },
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "/api/members/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/members/${id}`)",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/api/members",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/members\")",
+      "call_expression_line": 17,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Envelope",
+      "type_import_source": "./shapes"
+    },
+    {
+      "candidate_id": "@line:24",
+      "line_number": 24,
+      "target": "/api/orders/latest",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/orders/latest\")",
+      "call_expression_line": 24,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Order",
+      "type_import_source": "./shapes"
+    },
+    {
+      "candidate_id": "@line:30",
+      "line_number": 30,
+      "target": "/api/orders/open",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/orders/open\")",
+      "call_expression_line": 30,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:36",
+      "line_number": 36,
+      "target": "/api/members/active",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/members/active\")",
+      "call_expression_line": 36,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Member",
+      "type_import_source": "./shapes"
+    },
+    {
+      "candidate_id": "@line:42",
+      "line_number": 42,
+      "target": "/api/search/${term}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/search/${term}`)",
+      "call_expression_line": 42,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Order",
+      "type_import_source": "./shapes"
+    },
+    {
+      "candidate_id": "@line:48",
+      "line_number": 48,
+      "target": "/api/orders/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/orders/${id}`)",
+      "call_expression_line": 48,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:54",
+      "line_number": 54,
+      "target": "/api/orders/by-id",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/orders/by-id\")",
+      "call_expression_line": 54,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Order",
+      "type_import_source": "./shapes"
+    }
+  ]
+}

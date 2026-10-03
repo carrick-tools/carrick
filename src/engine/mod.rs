@@ -7610,12 +7610,19 @@ fn reported_declaration_home(
 /// It runs after the restamp and before enrichment, whose fill then reaches
 /// only the entries this leaves without an anchor.
 ///
+/// The root is the outer named type of the statement, whatever type
+/// arguments are written at it: `res.json() as Promise<Page<Order>>` is
+/// anchored at `Page`, with the generic's own declaration as its home, as
+/// the fill anchors an instantiated generic interface at its bare name. The
+/// argument (`Order`) is the element the arbitration already refuses.
+///
 /// The entry keeps no anchor when the root is:
-/// - written with type arguments (`Page<Order>`): what such a row should
-///   name is not decided;
 /// - not declared in the repo under that name, so no home can be stated
-///   (the compiler's own globals, such as `Blob`, fall here);
+///   (the compiler's own globals and generics, such as `Blob` and `Record`,
+///   fall here, and so does a name the reading file imported under another);
 /// - transport machinery, which never anchors a row.
+///
+/// A union of several types has no root at all, so it anchors nothing.
 fn anchor_stated_body_roots(
     manifest: &mut [TypeManifestEntry],
     inferred: &[crate::services::type_sidecar::InferredType],
@@ -7637,11 +7644,7 @@ fn anchor_stated_body_roots(
         let Some(inf) = first_by_alias.get(entry.type_alias.as_str()) else {
             continue;
         };
-        let Some(stated) = inf
-            .stated_body
-            .as_ref()
-            .filter(|stated| stated.root_type_arguments.is_none())
-        else {
+        let Some(stated) = inf.stated_body.as_ref() else {
             continue;
         };
         let (Some(root), Some(source_file)) = (stated.root.as_ref(), stated.root_source.as_ref())
@@ -16379,6 +16382,84 @@ mod tests {
         assert_eq!(manifest[2].defined_in, None);
     }
 
+    /// The module the generic #1817 fixtures declare their bodies in: an
+    /// envelope with one type parameter and a keyed pair with two, an
+    /// interface and a type alias, away from the file that reads them.
+    const GENERIC_SOURCE: &str = "export interface Order {\n  id: string;\n}\n\nexport interface Envelope<T> {\n  data: T;\n  cursor: string | null;\n}\n\nexport type Keyed<K extends string, V> = {\n  key: K;\n  value: V;\n};\n";
+
+    /// The source states the body as an instantiation of a generic
+    /// (`res.json() as Promise<Envelope<Order>>`): the row is anchored at
+    /// the outer named type, `Envelope`, with the generic's own declaration
+    /// as its home, as the fill anchors an instantiated generic interface.
+    /// The type argument is never the anchor: a model that named it is
+    /// dropped by the arbitration, and the row ends at `Envelope` whichever
+    /// name the model picked, or none. How many arguments are written does
+    /// not matter.
+    #[test]
+    fn stated_generic_root_anchors_at_the_outer_named_type() {
+        let (repo, _) = stated_repo();
+        std::fs::write(repo.path().join("src/envelope.ts"), GENERIC_SOURCE).expect("write");
+        let declaring = repo
+            .path()
+            .join("src/envelope.ts")
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        let instantiated = |root: &str, arguments: u32| {
+            let mut stated = stated_root(root, &declaring);
+            stated.root_type_arguments = Some(arguments);
+            stated
+        };
+        let mut dropped_call = consumer_entry("Orders_Response_Call1");
+        dropped_call.primary_type_symbol = Some("Order".to_string());
+        let mut manifest = vec![
+            dropped_call,
+            consumer_entry("Orders_Response_Call2"),
+            consumer_entry("Orders_Request_Call2"),
+            consumer_entry("Orders_Response_Call3"),
+        ];
+        manifest[2].type_kind = ManifestTypeKind::Request;
+        let mut resolution = empty_resolution();
+        resolution.anchor_changes = vec![dropped("Orders_Response_Call1", "Order")];
+        resolution.inferred_types = vec![
+            stated_call("Orders_Response_Call1", instantiated("Envelope", 1)),
+            stated_call("Orders_Response_Call2", instantiated("Envelope", 1)),
+            stated_call("Orders_Response_Call3", instantiated("Keyed", 2)),
+        ];
+
+        let repo_path = repo.path().to_string_lossy();
+        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
+        anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        let home = |symbol: &str, line_number: u32| crate::cloud_storage::TypeHome {
+            file_path: "src/envelope.ts".to_string(),
+            line_number,
+            symbol: symbol.to_string(),
+        };
+        for (entry, symbol, line_number) in [
+            (&manifest[0], "Envelope", 5),
+            (&manifest[1], "Envelope", 5),
+            (&manifest[3], "Keyed", 10),
+        ] {
+            assert_eq!(
+                entry.primary_type_symbol.as_deref(),
+                Some(symbol),
+                "{}",
+                entry.type_alias
+            );
+            assert_eq!(
+                entry.defined_in,
+                Some(home(symbol, line_number)),
+                "{}",
+                entry.type_alias
+            );
+        }
+        assert_eq!(manifest[2].primary_type_symbol, None);
+        assert_eq!(manifest[2].defined_in, None);
+    }
+
     /// An anchor the row already has is not the stated root's to replace:
     /// the model's, kept because it is the root or because several requests
     /// fan in to the alias, and a re-aimed root.
@@ -16418,12 +16499,9 @@ mod tests {
             .join("src/transport.ts")
             .canonicalize()
             .expect("canonical");
-        let mut generic = stated_root("MemberPage", &declaring);
-        generic.root_type_arguments = Some(1);
         let mut no_source = stated_root("MemberPage", &declaring);
         no_source.root_source = None;
         let cases = [
-            ("written with type arguments", generic),
             ("declared nowhere the sidecar found", no_source),
             (
                 "declared outside the repo",

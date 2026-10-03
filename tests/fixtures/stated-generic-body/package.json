@@ -1,0 +1,6 @@
+{
+  "name": "stated-generic-body",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture: a client whose body reads are cast to generic types (carrick#1817)"
+}

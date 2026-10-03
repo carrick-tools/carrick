@@ -197,6 +197,7 @@ jobs:
           --test run_log_isolation_test
           --test scan_leaves_repo_unedited_test
           --test spread_options_verb_test
+          --test stated_generic_body_anchor_test
           --test undeclared_external_host_test
           --test unprepared_refusal_test
           --test wrapper_call_route_test
