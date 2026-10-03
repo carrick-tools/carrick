@@ -2403,7 +2403,10 @@ fn module_loads(module: &Module, bound_requires: &HashSet<u32>) -> BTreeSet<Stri
 /// is used as a value (`used`), which the compiler drops (`import type` and
 /// `{ type x }` among them), and `export type`, or a re-export whose every
 /// specifier is `type`.
-fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<String> {
+///
+/// The framework-detect import sample reads through it too
+/// ([`crate::framework_detector::ImportSample`], carrick#1757).
+pub(crate) fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(decl) = item else {
@@ -2457,11 +2460,10 @@ fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> BTreeSet<St
 /// or bound at module scope. A computed specifier (`require(name)`, a
 /// template with a hole) names no module and is not here.
 ///
-/// The request summaries' value specifiers and the framework-detect import
-/// sample ([`crate::framework_detector::ImportSample`], carrick#1727) both
-/// read loads through it. [`module_loads`] answers another question (which
-/// loads bind nothing) and keeps its own rules.
-pub(crate) fn literal_loads(module: &Module) -> BTreeSet<String> {
+/// [`value_specifiers`] reads loads through it (carrick#1727).
+/// [`module_loads`] answers another question (which loads bind nothing) and
+/// keeps its own rules.
+fn literal_loads(module: &Module) -> BTreeSet<String> {
     struct Loads {
         found: BTreeSet<String>,
     }

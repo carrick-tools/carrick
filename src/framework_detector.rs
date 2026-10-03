@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 /// specifier, whatever syntax loads it. The `imports` list of the
 /// `/framework-detect` body is rendered from it, and detection classifies only
 /// the packages that list names, so a package loaded any way the sample does
-/// not read is never classified (carrick#1727).
+/// not read is never classified (carrick#1727, carrick#1757).
 ///
 /// Built from every file of the service through [`ImportSample::add_file`],
 /// which is the one way facts enter it, in discovery and in the tests alike.
@@ -26,9 +26,12 @@ pub struct ImportSample {
     /// `import x = require()` that state the same thing
     /// ([`crate::commonjs::require_bindings`], the call graph's reader).
     bindings: BTreeSet<ImportedSymbol>,
-    /// Every specifier a `require` or `import()` call names by a literal,
-    /// anywhere in a file. A source a binding above also names is stated by
-    /// the binding.
+    /// Every specifier a file loads a module by, bound or not
+    /// ([`crate::request_summary::value_specifiers`]): an import declaration,
+    /// a side-effect import, a re-export, and a `require` or `import()` that
+    /// names it by a literal, anywhere in the file. A re-export TypeScript
+    /// erases (`export type`, or one whose every specifier is `type`) loads
+    /// nothing. A source a binding above also names is stated by the binding.
     loads: BTreeSet<String>,
 }
 
@@ -45,8 +48,10 @@ impl ImportSample {
                 .bindings
                 .into_values(),
         );
+        // Every binding counts as used: the sample states what a file
+        // imports, whether or not the file uses it.
         self.loads
-            .extend(crate::request_summary::literal_loads(module));
+            .extend(crate::request_summary::value_specifiers(module, |_| true));
     }
 
     /// The sample as the body's `imports` list states it.
@@ -313,9 +318,10 @@ fn extract_package_summary(packages: &Packages) -> PackageJsonSummary {
 /// source the service imports from appears — including the ones whose only
 /// local name is also used for a different module elsewhere in the service.
 ///
-/// A source no binding names, only a `require` or `import()` call, is stated
-/// as a side-effect import (`import 'x';`): the statement form the cloud's
-/// detection reads a package name from, as it reads every other line here.
+/// A source no binding names (one a side-effect import, a re-export, or a
+/// `require` or `import()` call loads) is stated as a side-effect import
+/// (`import 'x';`): the statement form the cloud's detection reads a package
+/// name from, as it reads every other line here.
 ///
 /// There is no cap on the list: if one is ever added it goes AFTER this
 /// function's ordering, or the sample starts varying again (carrick#954).
@@ -475,9 +481,36 @@ mod tests {
         ),
     ];
 
-    fn write_loaded(root: &Path) -> Vec<PathBuf> {
+    /// A service whose files load modules without binding a name from them
+    /// (carrick#1757): a side-effect import and a re-export in each of its
+    /// forms, one re-export of a module another file imports by a binding,
+    /// and the re-exports TypeScript erases (`export type`, `export type *`,
+    /// and one whose every specifier is `type`), which load nothing.
+    const UNBOUND_FILES: [(&str, &str); 2] = [
+        (
+            "main.ts",
+            "import 'reflect-metadata';\n\
+             import './polyfills';\n\
+             import express from 'express';\n\
+             export const app = express();\n",
+        ),
+        (
+            "index.ts",
+            "export * from 'kafkajs';\n\
+             export * as metrics from 'prom-client';\n\
+             export { Queue } from 'bullmq';\n\
+             export { default as Redis, type RedisOptions } from 'ioredis';\n\
+             export * from 'express';\n\
+             export * from './routes';\n\
+             export type { Pool } from 'pg';\n\
+             export type * from 'zod';\n\
+             export { type Job } from 'bull';\n",
+        ),
+    ];
+
+    fn write_service(root: &Path, files: &[(&str, &str)]) -> Vec<PathBuf> {
         std::fs::write(root.join("package.json"), MANIFEST).expect("manifest");
-        LOADED_FILES
+        files
             .iter()
             .map(|(name, source)| {
                 let path = root.join(name);
@@ -496,7 +529,7 @@ mod tests {
     #[test]
     fn import_sample_carries_modules_loaded_by_require_and_import() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let files = write_loaded(dir.path());
+        let files = write_service(dir.path(), &LOADED_FILES);
         let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
 
         let input = build_detection_input(&packages, &import_facts(&files));
@@ -513,6 +546,34 @@ mod tests {
                 "import * as fs from 'node:fs';",
                 "import 'pg';",
                 "import 'redis';",
+            ]
+        );
+    }
+
+    /// A module a file loads by a side-effect import or a re-export is in
+    /// the sample (carrick#1757), stated as a side-effect import, since
+    /// neither binds a name in the file. A module another file imports by a
+    /// binding keeps that binding's statement. A re-export TypeScript erases
+    /// loads nothing and adds nothing.
+    #[test]
+    fn import_sample_carries_side_effect_imports_and_re_exports() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let files = write_service(dir.path(), &UNBOUND_FILES);
+        let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
+
+        let input = build_detection_input(&packages, &import_facts(&files));
+
+        assert_eq!(
+            input.imports,
+            vec![
+                "import './polyfills';",
+                "import './routes';",
+                "import 'bullmq';",
+                "import express from 'express';",
+                "import 'ioredis';",
+                "import 'kafkajs';",
+                "import 'prom-client';",
+                "import 'reflect-metadata';",
             ]
         );
     }
@@ -546,14 +607,18 @@ mod tests {
         assert_eq!(body["ask_client_semantics"], serde_json::json!(true));
 
         // The same for modules loaded by `require` and `import()`
-        // (carrick#1727), which one file also imports by a declaration.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut files = write_loaded(dir.path());
-        let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
-        let forward = wire_body(&build_detection_input(&packages, &import_facts(&files)));
-        files.reverse();
-        let reversed = wire_body(&build_detection_input(&packages, &import_facts(&files)));
-        assert_eq!(forward, reversed);
+        // (carrick#1727), and by a side-effect import or a re-export
+        // (carrick#1757), each of which one file also imports by a
+        // declaration.
+        for loaded in [&LOADED_FILES, &UNBOUND_FILES] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut files = write_service(dir.path(), loaded);
+            let packages = Packages::new(vec![dir.path().join("package.json")]).expect("packages");
+            let forward = wire_body(&build_detection_input(&packages, &import_facts(&files)));
+            files.reverse();
+            let reversed = wire_body(&build_detection_input(&packages, &import_facts(&files)));
+            assert_eq!(forward, reversed);
+        }
     }
 
     /// The contract sample (carrick#1564), byte for byte as both repos hold it.

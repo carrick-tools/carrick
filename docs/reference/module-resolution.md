@@ -101,10 +101,12 @@ Two forms are not read, and each has a reason rather than an omission:
 
 Framework detection's import list (`ImportSample`, `src/framework_detector.rs`)
 reads more than the binding table: every `require` and `import()` whose
-specifier is a literal, anywhere in a file, so a package a service loads only
-that way is still classified (carrick#1727). A load that binds nothing at module
-scope is listed as a side-effect import (`import 'x';`). A computed specifier
-adds nothing.
+specifier is a literal, anywhere in a file (carrick#1727), and every side-effect
+import and re-export (carrick#1757), so a package a service loads only one of
+those ways is still classified. A re-export TypeScript erases (`export type`, or
+one whose every specifier is `type`) adds nothing. A load that binds nothing at
+module scope is listed as a side-effect import (`import 'x';`). A computed
+specifier adds nothing.
 
 The four passes that build ANALYZER inputs — mount, wrapper, SDK surface,
 GraphQL — do not read CommonJS exports, for the reason the section below gives
