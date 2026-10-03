@@ -20,9 +20,9 @@
  * any other condition lets everything through. A node is on the failure path
  * only when NO status in 200-299 can reach it.
  *
- * That is deliberately stricter than the retype check's reading of a status
- * test (`okWhenTrue` in retype.ts), which reads the false side of
- * `res.status === 200` as the failure path so it can find a success read to
+ * The retype check (retype.ts) reads the same tests through `testsOnPath` and
+ * keeps its own policy on top: it also reads the false side of
+ * `res.status === 200` as the failure path, so it can find a success read to
  * judge. Here a decided failure REMOVES a read, so the reading has to be sound
  * the other way round: after `if (res.status === 204) return null`, 200 still
  * gets through, and the json read that follows is the payload.
@@ -31,7 +31,7 @@
 import { Node, SyntaxKind } from 'ts-morph';
 
 /** A set of HTTP statuses, as the predicate that admits them. */
-type Statuses = (status: number) => boolean;
+export type Statuses = (status: number) => boolean;
 
 const FIRST_STATUS = 100;
 const LAST_STATUS = 599;
@@ -39,15 +39,45 @@ const LAST_STATUS = 599;
 const EVERY_STATUS: Statuses = () => true;
 
 /** The statuses `ok` is true for. */
-const SUCCEEDED: Statuses = (status) => status >= 200 && status <= 299;
+export const SUCCEEDED: Statuses = (status) => status >= 200 && status <= 299;
+
+/** The statuses from 100 to 599 that `statuses` admits, in order. */
+export function statusesIn(statuses: Statuses): number[] {
+  const admitted: number[] = [];
+  for (let status = FIRST_STATUS; status <= LAST_STATUS; status++) {
+    if (statuses(status)) admitted.push(status);
+  }
+  return admitted;
+}
 
 /** The statuses a condition lets through on each of its sides. */
 interface StatusTest {
   whenTrue: Statuses;
   whenFalse: Statuses;
+  /** See `SideTaken.inexact`. */
+  inexact: boolean;
 }
 
-const UNDECIDED: StatusTest = { whenTrue: EVERY_STATUS, whenFalse: EVERY_STATUS };
+/** A condition that does not read the response's `ok` or `status`. */
+const UNRELATED: StatusTest = { whenTrue: EVERY_STATUS, whenFalse: EVERY_STATUS, inexact: false };
+
+/** A condition that reads the response's status in a form this reading cannot follow. */
+const UNREAD: StatusTest = { whenTrue: EVERY_STATUS, whenFalse: EVERY_STATUS, inexact: true };
+
+/** One test of the response on the path to a node, as the side the node is on. */
+export interface SideTaken {
+  /** Every status that can take this side, and maybe more (see `inexact`). */
+  admits: Statuses;
+  /**
+   * The test reads the response's `ok` or `status` in a form this reading
+   * cannot follow (`res.status === OK`, `codes.includes(res.status)`), or
+   * combines it with a condition that is not about the response
+   * (`res.ok && fresh`). `admits` then lets through more statuses than the
+   * side does: still sound for "no success status reaches the node", but no
+   * longer only the statuses the source singled out.
+   */
+  inexact: boolean;
+}
 
 /**
  * True when the source reaches `node` only after the response named by
@@ -59,13 +89,29 @@ export function reachedOnlyOnFailure(
   boundary: Node,
   isResponse: (node: Node) => boolean
 ): boolean {
-  let admitted: Statuses = EVERY_STATUS;
-  let narrowed = false;
-  const narrow = (by: Statuses) => {
-    if (by === EVERY_STATUS) return;
-    const before = admitted;
-    admitted = (status) => before(status) && by(status);
-    narrowed = true;
+  const sides = testsOnPath(node, boundary, isResponse);
+  if (sides.length === 0) return false;
+  const reaching = statusesIn((status) => sides.every((side) => side.admits(status)));
+  return reaching.length > 0 && !reaching.some(SUCCEEDED);
+}
+
+/**
+ * Each test of the response on the path from `node` up to `boundary` (the
+ * whole file when it is `undefined`), as the side `node` is on: a branch of
+ * an `if` or a conditional expression it sits in, or an earlier `if` in an
+ * enclosing block one of whose branches cannot complete, which leaves the
+ * rest of the block to the other side. A test that does not read the
+ * response's `ok` or `status` is not listed.
+ */
+export function testsOnPath(
+  node: Node,
+  boundary: Node | undefined,
+  isResponse: (node: Node) => boolean
+): SideTaken[] {
+  const sides: SideTaken[] = [];
+  const take = (test: StatusTest, whenTrue: boolean) => {
+    if (test === UNRELATED) return;
+    sides.push({ admits: whenTrue ? test.whenTrue : test.whenFalse, inexact: test.inexact });
   };
 
   for (
@@ -75,15 +121,15 @@ export function reachedOnlyOnFailure(
   ) {
     if (Node.isIfStatement(parent)) {
       if (child === parent.getThenStatement()) {
-        narrow(readTest(parent.getExpression(), isResponse).whenTrue);
+        take(readTest(parent.getExpression(), isResponse), true);
       } else if (child === parent.getElseStatement()) {
-        narrow(readTest(parent.getExpression(), isResponse).whenFalse);
+        take(readTest(parent.getExpression(), isResponse), false);
       }
     } else if (Node.isConditionalExpression(parent)) {
       if (child === parent.getWhenTrue()) {
-        narrow(readTest(parent.getCondition(), isResponse).whenTrue);
+        take(readTest(parent.getCondition(), isResponse), true);
       } else if (child === parent.getWhenFalse()) {
-        narrow(readTest(parent.getCondition(), isResponse).whenFalse);
+        take(readTest(parent.getCondition(), isResponse), false);
       }
     }
 
@@ -100,22 +146,14 @@ export function reachedOnlyOnFailure(
         const thenLeaves = cannotComplete(statement.getThenStatement());
         const elseLeaves = otherwise !== undefined && cannotComplete(otherwise);
         if (thenLeaves && !elseLeaves) {
-          narrow(readTest(statement.getExpression(), isResponse).whenFalse);
+          take(readTest(statement.getExpression(), isResponse), false);
         } else if (elseLeaves && !thenLeaves) {
-          narrow(readTest(statement.getExpression(), isResponse).whenTrue);
+          take(readTest(statement.getExpression(), isResponse), true);
         }
       }
     }
   }
-
-  if (!narrowed) return false;
-  let reachable = false;
-  for (let status = FIRST_STATUS; status <= LAST_STATUS; status++) {
-    if (!admitted(status)) continue;
-    if (SUCCEEDED(status)) return false;
-    reachable = true;
-  }
-  return reachable;
+  return sides;
 }
 
 /** The statuses `condition` lets through when it is true and when it is false. */
@@ -128,11 +166,12 @@ function readTest(condition: Node, isResponse: (node: Node) => boolean): StatusT
     test.getOperatorToken() === SyntaxKind.ExclamationToken
   ) {
     const inner = readTest(test.getOperand(), isResponse);
-    return { whenTrue: inner.whenFalse, whenFalse: inner.whenTrue };
+    if (inner === UNRELATED || inner === UNREAD) return inner;
+    return { whenTrue: inner.whenFalse, whenFalse: inner.whenTrue, inexact: inner.inexact };
   }
 
   if (isMemberOfResponse(test, 'ok', isResponse)) {
-    return { whenTrue: SUCCEEDED, whenFalse: (status) => !SUCCEEDED(status) };
+    return { whenTrue: SUCCEEDED, whenFalse: (status) => !SUCCEEDED(status), inexact: false };
   }
 
   if (Node.isBinaryExpression(test)) {
@@ -143,25 +182,28 @@ function readTest(condition: Node, isResponse: (node: Node) => boolean): StatusT
     ) {
       const left = readTest(test.getLeft(), isResponse);
       const right = readTest(test.getRight(), isResponse);
-      if (left === UNDECIDED && right === UNDECIDED) return UNDECIDED;
+      if (left === UNRELATED && right === UNRELATED) return UNRELATED;
+      const inexact = left.inexact || right.inexact || left === UNRELATED || right === UNRELATED;
       return operator === SyntaxKind.AmpersandAmpersandToken
         ? {
             whenTrue: (status) => left.whenTrue(status) && right.whenTrue(status),
             whenFalse: (status) => left.whenFalse(status) || right.whenFalse(status),
+            inexact,
           }
         : {
             whenTrue: (status) => left.whenTrue(status) || right.whenTrue(status),
             whenFalse: (status) => left.whenFalse(status) && right.whenFalse(status),
+            inexact,
           };
     }
 
     const compared = statusComparison(test.getLeft(), operator, test.getRight(), isResponse);
     if (compared) {
-      return { whenTrue: compared, whenFalse: (status) => !compared(status) };
+      return { whenTrue: compared, whenFalse: (status) => !compared(status), inexact: false };
     }
   }
 
-  return UNDECIDED;
+  return readsResponseStatus(test, isResponse) ? UNREAD : UNRELATED;
 }
 
 /**
@@ -222,6 +264,15 @@ function isMemberOfResponse(
     Node.isPropertyAccessExpression(node) &&
     node.getName() === name &&
     isResponse(node.getExpression())
+  );
+}
+
+/** `node` reads the response's `ok` or `status`, itself or anywhere inside it. */
+export function readsResponseStatus(node: Node, isResponse: (node: Node) => boolean): boolean {
+  return [node, ...node.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)].some(
+    (inner) =>
+      isMemberOfResponse(inner, 'ok', isResponse) ||
+      isMemberOfResponse(inner, 'status', isResponse)
   );
 }
 

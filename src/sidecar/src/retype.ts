@@ -28,6 +28,13 @@
 import { Node, SyntaxKind, ts } from 'ts-morph';
 import type { CallExpression, Identifier, Project, PropertyAccessExpression, SourceFile, Type } from 'ts-morph';
 import type { TypeInferrer } from './type-inferrer.js';
+import {
+  readsResponseStatus,
+  statusesIn,
+  SUCCEEDED,
+  testsOnPath,
+  type Statuses,
+} from './failure-path.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
@@ -788,55 +795,66 @@ function responseTest(read: CallExpression): (node: Node) => boolean {
   return (node) => Node.isIdentifier(node) && node.getSymbol() === symbol;
 }
 
-type Side = 'success' | 'failure' | 'unclear';
+type Side = 'failure' | 'unclear';
 
 /**
- * Which side of a test of the response's status `node` runs on: inside a
- * branch of one, or after an `if (test) return/throw` that leaves the rest of
- * the block to the other side. `undefined` when no test decides it.
+ * Whether `node` sits on the response's error path (`'failure'`), on a path
+ * whose status tests do not say (`'unclear'`), or where the producer's body
+ * is read (`undefined`, also when no test of the response is on its path).
+ *
+ * The tests on the path are read as failure-path.ts reads them, each as the
+ * statuses that take the side `node` is on, and taken together. On top of
+ * that reading, in this order:
+ *
+ *  - no success status reaches `node`: the error path;
+ *  - a test lets through every status but one success status that carries a
+ *    body (the side of `res.status === 200` the read after an early return on
+ *    it is on): the error path. This is the consumer's own reading of that
+ *    test, kept even when only success statuses get that far, because the
+ *    read there is not the body the source singled out;
+ *  - no status from 400 up reaches `node`: the producer's body;
+ *  - a `switch` on the status, or a test the reading cannot follow exactly
+ *    (`res.status === OK`, `res.ok || retry`), is on the path: unclear;
+ *  - the tests take away a success status that carries a body
+ *    (`res.status === 200 || res.status === 404`, `res.status > 200`):
+ *    unclear;
+ *  - otherwise they took away only error statuses, or statuses that carry no
+ *    content (carrick#1813: the retype only runs against a producer that
+ *    publishes a body, and that body never arrives with a 204 or 205), and
+ *    `node` is where the body is read, as it is with no test at all.
  */
 function sideOf(node: Node, isResponse: (node: Node) => boolean): Side | undefined {
-  let found: Side | undefined;
-  const note = (side: Side | undefined) => {
-    if (side === 'failure' || found === 'failure') found = 'failure';
-    else if (side === 'unclear' || found === 'unclear') found = 'unclear';
-    else found = side ?? found;
-  };
-  for (let child: Node = node, parent = node.getParent(); parent; child = parent, parent = parent.getParent()) {
-    if (Node.isIfStatement(parent) && child !== parent.getExpression()) {
-      note(branchSide(parent.getExpression(), child === parent.getThenStatement(), isResponse));
-    } else if (Node.isConditionalExpression(parent) && child !== parent.getCondition()) {
-      note(branchSide(parent.getCondition(), child === parent.getWhenTrue(), isResponse));
-    } else if (Node.isCaseClause(parent) || Node.isDefaultClause(parent)) {
-      const swtch = parent.getParent()?.getParent();
-      if (swtch && Node.isSwitchStatement(swtch) && testsResponse(swtch.getExpression(), isResponse)) {
-        note('unclear');
-      }
-    }
-    if (Node.isBlock(parent) || Node.isSourceFile(parent) || Node.isCaseClause(parent)) {
-      for (const statement of parent.getStatements()) {
-        if (statement === child) break;
-        if (
-          Node.isIfStatement(statement) &&
-          !statement.getElseStatement() &&
-          exits(statement.getThenStatement())
-        ) {
-          note(branchSide(statement.getExpression(), false, isResponse));
-        }
-      }
-    }
-  }
-  return found;
+  const sides = testsOnPath(node, undefined, isResponse);
+  const switched = node.getAncestors().some((ancestor) => {
+    if (!Node.isCaseClause(ancestor) && !Node.isDefaultClause(ancestor)) return false;
+    const statement = ancestor.getParent()?.getParent();
+    return (
+      !!statement &&
+      Node.isSwitchStatement(statement) &&
+      readsResponseStatus(statement.getExpression(), isResponse)
+    );
+  });
+  if (sides.length === 0 && !switched) return undefined;
+
+  const admitted = (status: number) => sides.every((side) => side.admits(status));
+  const reaching = statusesIn(admitted);
+  if (!reaching.some(SUCCEEDED)) return 'failure';
+  if (sides.some((side) => singlesOutABody(side.admits))) return 'failure';
+  if (!reaching.some((status) => status >= 400)) return undefined;
+  if (switched || sides.some((side) => side.inexact)) return 'unclear';
+  if (statusesIn((status) => !admitted(status)).some(carriesBody)) return 'unclear';
+  return undefined;
 }
 
-function branchSide(
-  condition: Node,
-  whenTrue: boolean,
-  isResponse: (node: Node) => boolean
-): Side | undefined {
-  const ok = okWhenTrue(condition, isResponse);
-  if (ok === undefined || ok === 'unclear') return ok;
-  return ok === whenTrue ? 'success' : 'failure';
+/** `statuses` is every status but one success status that carries a body. */
+function singlesOutABody(statuses: Statuses): boolean {
+  const excluded = statusesIn((status) => !statuses(status));
+  return excluded.length === 1 && carriesBody(excluded[0]);
+}
+
+/** A success status whose response can carry the producer's body. */
+function carriesBody(status: number): boolean {
+  return SUCCEEDED(status) && !NO_CONTENT_STATUSES.has(status);
 }
 
 /**
@@ -844,77 +862,6 @@ function branchSide(
  * Content, 205 Reset Content).
  */
 const NO_CONTENT_STATUSES: ReadonlySet<number> = new Set([204, 205]);
-
-/**
- * Whether `condition` being true means the response succeeded: `res.ok`,
- * `res.status === 200`, `res.status !== 200`, `res.status >= 400` and their
- * negations. Any other test of the response is `'unclear'`; a condition that does not
- * test the response is `undefined`.
- *
- * An equality or inequality with a no-content status is `undefined` too
- * (carrick#1813). The retype only runs against a producer that publishes a
- * response body, and that body never arrives with a 204 or 205, so
- * `if (res.status === 204) return null` only takes away a status the body
- * cannot come with. The read after it sits where a read no test decides
- * sits, not on the error path.
- */
-function okWhenTrue(condition: Node, isResponse: (node: Node) => boolean): boolean | 'unclear' | undefined {
-  let e = condition;
-  while (Node.isParenthesizedExpression(e)) e = e.getExpression();
-  if (Node.isPrefixUnaryExpression(e) && e.getOperatorToken() === SyntaxKind.ExclamationToken) {
-    const inner = okWhenTrue(e.getOperand(), isResponse);
-    return typeof inner === 'boolean' ? !inner : inner;
-  }
-  if (isMember(e, 'ok', isResponse)) return true;
-  if (Node.isBinaryExpression(e)) {
-    const op = e.getOperatorToken().getKind();
-    const [left, right] = [e.getLeft(), e.getRight()];
-    const value =
-      isMember(left, 'status', isResponse) && Node.isNumericLiteral(right)
-        ? right.getLiteralValue()
-        : undefined;
-    if (value !== undefined) {
-      const success = value >= 200 && value < 300;
-      const noContent = NO_CONTENT_STATUSES.has(value);
-      switch (op) {
-        case SyntaxKind.EqualsEqualsEqualsToken:
-        case SyntaxKind.EqualsEqualsToken:
-          return noContent ? undefined : success;
-        case SyntaxKind.ExclamationEqualsEqualsToken:
-        case SyntaxKind.ExclamationEqualsToken:
-          return noContent ? undefined : !success;
-        case SyntaxKind.GreaterThanEqualsToken:
-          if (value >= 300) return false;
-          break;
-      }
-      return 'unclear';
-    }
-  }
-  return testsResponse(e, isResponse) ? 'unclear' : undefined;
-}
-
-function isMember(node: Node, name: string, isResponse: (node: Node) => boolean): boolean {
-  return (
-    Node.isPropertyAccessExpression(node) && node.getName() === name && isResponse(node.getExpression())
-  );
-}
-
-/** The expression reads the response's `ok` or `status`. */
-function testsResponse(node: Node, isResponse: (node: Node) => boolean): boolean {
-  return [node, ...node.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)].some(
-    (n) => isMember(n, 'ok', isResponse) || isMember(n, 'status', isResponse)
-  );
-}
-
-/** A statement that always leaves the function. */
-function exits(statement: Node): boolean {
-  if (Node.isReturnStatement(statement) || Node.isThrowStatement(statement)) return true;
-  if (Node.isBlock(statement)) {
-    const last = statement.getStatements().at(-1);
-    return !!last && exits(last);
-  }
-  return false;
-}
 
 /** `node.json()` with no arguments, where `node` is the receiver. */
 function bodyReadOn(node: Node): CallExpression | undefined {

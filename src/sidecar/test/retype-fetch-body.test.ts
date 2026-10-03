@@ -330,6 +330,98 @@ export async function hasContent(): Promise<number | null> {
   }
   return null;
 }
+
+export async function acceptedOrEmpty(): Promise<number | undefined> {
+  const res = await fetch('/p');
+  if (!res.ok) throw new Error(await res.text());
+  if (res.status === 202 || res.status === 204) return undefined;
+  const body = await res.json();
+  return body.x;
+}
+
+export async function successRange(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status >= 200 && res.status < 300) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
+
+export async function noContentFirst(): Promise<number | null> {
+  const res = await fetch('/p');
+  if (204 === res.status) return null;
+  const body = await res.json();
+  return body.x;
+}
+
+export async function okStatusNumberFirst(): Promise<number> {
+  const res = await fetch('/p');
+  if (200 === res.status) return (await res.json()).x;
+  const e = await res.json();
+  throw new Error(e.message);
+}
+
+export async function deniedFirst(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status === 401 || res.status === 403) throw new Error('denied');
+  const body = await res.json();
+  return body.x;
+}
+
+declare const OK_STATUS: number;
+
+export async function okThenNamedStatus(): Promise<number> {
+  const res = await fetch('/p');
+  if (!res.ok) throw new Error(res.statusText);
+  if (res.status === OK_STATUS) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
+
+export async function okThenOkStatus(): Promise<number> {
+  const res = await fetch('/p');
+  if (!res.ok) throw new Error(res.statusText);
+  if (res.status === 200) return (await res.json()).x;
+  const other = await res.json();
+  return other.count;
+}
+
+export async function okOrMissing(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status === 200 || res.status === 404) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
+
+export async function aboveOk(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status > 200) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
+
+export async function okAndFlag(fresh: boolean): Promise<number> {
+  const res = await fetch('/p');
+  if (res.ok && fresh) return (await res.json()).x;
+  const e = await res.json();
+  throw new Error(e.message);
+}
+
+export async function namedStatus(): Promise<number> {
+  const res = await fetch('/p');
+  if (res.status === OK_STATUS) {
+    const body = await res.json();
+    return body.x;
+  }
+  return 0;
+}
 `;
 
 const CASES = {
@@ -356,7 +448,7 @@ const CASES = {
   okElse: { line: 137, text: "fetch('/p')", read: 140 },
   okFirst: { line: 148, text: "fetch('/p')", read: 149 },
   statusGuard: { line: 155, text: "fetch('/p')", read: 161 },
-  statusOdd: { line: 165, text: "fetch('/p')" },
+  statusOdd: { line: 165, text: "fetch('/p')", read: 168 },
   doubleCast: { line: 174, text: "fetch('/p')" },
   angleCast: { line: 180, text: "fetch('/p')" },
   parsedBody: { line: 186, text: "fetch('/p')" },
@@ -375,6 +467,17 @@ const CASES = {
   noContentThenError: { line: 284, text: "fetch('/p')", read: 291 },
   okStatusFirst: { line: 295, text: "fetch('/p')", read: 296 },
   hasContent: { line: 302, text: "fetch('/p')", read: 305 },
+  acceptedOrEmpty: { line: 311, text: "fetch('/p')", read: 315 },
+  successRange: { line: 319, text: "fetch('/p')", read: 322 },
+  noContentFirst: { line: 328, text: "fetch('/p')", read: 331 },
+  okStatusNumberFirst: { line: 335, text: "fetch('/p')", read: 336 },
+  deniedFirst: { line: 342, text: "fetch('/p')", read: 345 },
+  okThenNamedStatus: { line: 351, text: "fetch('/p')", read: 355 },
+  okThenOkStatus: { line: 361, text: "fetch('/p')", read: 363 },
+  okOrMissing: { line: 369, text: "fetch('/p')" },
+  aboveOk: { line: 378, text: "fetch('/p')" },
+  okAndFlag: { line: 387, text: "fetch('/p')" },
+  namedStatus: { line: 394, text: "fetch('/p')" },
 } as const;
 
 interface Outcome {
@@ -466,6 +569,22 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     // ...while a read after an early return on a status that does carry a
     // body is still the error path, and only the first read is judged.
     'okStatusFirst',
+    // carrick#1834: the tests on the path are read together, as the set of
+    // statuses that reach the read. A read only success statuses reach, or
+    // one every success status with a body reaches, is retyped.
+    'acceptedOrEmpty',
+    'successRange',
+    'noContentFirst',
+    'deniedFirst',
+    'statusOdd',
+    // A test the reading cannot follow does not stop a read that only
+    // success statuses reach from being retyped.
+    'okThenNamedStatus',
+    // An equality with a status that carries a body still puts the read
+    // after it on the error path, written number first too, and even when
+    // only success statuses get that far.
+    'okStatusNumberFirst',
+    'okThenOkStatus',
   ] as const) {
     it(`(${name}) flags the read of a field the producer does not return`, async () => {
       const out = await retype(name, '{ y: number; }');
@@ -571,7 +690,16 @@ describe('carrick#1493: retype a body read off a fetch Response', () => {
     });
   }
 
-  for (const name of ['statusOdd', 'switchStatus', 'compoundTest'] as const) {
+  for (const name of [
+    'switchStatus',
+    'compoundTest',
+    'namedStatus',
+    'okAndFlag',
+    // carrick#1834: tests that take away a success status with a body and
+    // still let an error status through.
+    'okOrMissing',
+    'aboveOk',
+  ] as const) {
     it(`(${name}) abstains when a status test does not say which side fails`, async () => {
       const out = await retype(name, '{ x: number; }');
       assert.strictEqual(out.outcome, 'abstain', JSON.stringify(out));

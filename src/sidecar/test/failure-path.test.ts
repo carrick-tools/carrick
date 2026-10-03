@@ -11,7 +11,7 @@
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
 import { Node, Project, SyntaxKind } from 'ts-morph';
-import { reachedOnlyOnFailure } from '../src/failure-path.js';
+import { reachedOnlyOnFailure, statusesIn, testsOnPath } from '../src/failure-path.js';
 
 const PRELUDE = `declare const res: { ok: boolean; status: number };
 declare const other: { ok: boolean; status: number };
@@ -22,7 +22,9 @@ declare function READ(): void;
 declare function log(): void;
 `;
 
-function decide(source: string): boolean {
+const isRes = (node: Node) => Node.isIdentifier(node) && node.getText() === 'res';
+
+function parse(source: string): { marker: Node; boundary: Node } {
   const project = new Project({ useInMemoryFileSystem: true });
   const file = project.createSourceFile('case.ts', PRELUDE + source);
   const markers = file
@@ -33,11 +35,12 @@ function decide(source: string): boolean {
     .getDescendantsOfKind(SyntaxKind.FunctionDeclaration)
     .find((declaration) => declaration.getName() === 'f');
   assert.ok(boundary, 'each case declares f');
-  return reachedOnlyOnFailure(
-    markers[0],
-    boundary,
-    (node) => Node.isIdentifier(node) && node.getText() === 'res'
-  );
+  return { marker: markers[0], boundary };
+}
+
+function decide(source: string): boolean {
+  const { marker, boundary } = parse(source);
+  return reachedOnlyOnFailure(marker, boundary, isRes);
 }
 
 const fn = (body: string) => `function f() {\n${body}\n}`;
@@ -75,6 +78,45 @@ describe('carrick#1796: reachedOnlyOnFailure', () => {
   for (const [name, source, expected] of CASES) {
     it(`${expected ? 'failure path' : 'kept'}: ${name}`, () => {
       assert.strictEqual(decide(source), expected, source);
+    });
+  }
+});
+
+/** Every status from 100 to 599 but the listed ones. */
+const allBut = (...taken: number[]) =>
+  statusesIn((status) => !taken.includes(status));
+const range = (from: number, to: number) =>
+  statusesIn((status) => status >= from && status <= to);
+
+/**
+ * `testsOnPath` (carrick#1834): each test of the response on the path, as
+ * the statuses that take the marker's side, and whether that set is only an
+ * upper bound. `undefined` admits marks a side whose set the row does not pin.
+ */
+const SIDES: Array<[string, string, Array<{ admits?: number[]; inexact: boolean }>]> = [
+  ['a test that is not about the response is not listed', fn('if (other.ok) { READ(); }'), []],
+  ['a condition with no status in it is not listed', fn('if (cached) { READ(); }'), []],
+  ['a range read as one set', fn('if (res.status >= 200 && res.status < 300) { READ(); }'), [{ admits: range(200, 299), inexact: false }]],
+  ['an equality written number first', fn('if (204 === res.status) { return; } READ();'), [{ admits: allBut(204), inexact: false }]],
+  ['each early exit is its own side', fn('if (!res.ok) { throw new Error(); } if (res.status === 202 || res.status === 204) { return; } READ();'), [{ admits: range(200, 299), inexact: false }, { admits: allBut(202, 204), inexact: false }]],
+  ['a status compared with a name it cannot read', fn('if (res.status === kind) { READ(); }'), [{ inexact: true }]],
+  ['the same comparison negated', fn('if (!(res.status === kind)) { READ(); }'), [{ inexact: true }]],
+  ['a status test beside a condition about something else', fn('if (res.ok && cached) { READ(); }'), [{ admits: range(200, 299), inexact: true }]],
+  ['the other side of that test', fn('if (res.ok && cached) { return; } READ();'), [{ admits: range(100, 599), inexact: true }]],
+];
+
+describe('carrick#1834: testsOnPath', () => {
+  for (const [name, source, expected] of SIDES) {
+    it(name, () => {
+      const { marker } = parse(source);
+      const sides = testsOnPath(marker, undefined, isRes);
+      assert.strictEqual(sides.length, expected.length, source);
+      expected.forEach((want, index) => {
+        assert.strictEqual(sides[index].inexact, want.inexact, `${source} side ${index}`);
+        if (want.admits) {
+          assert.deepStrictEqual(statusesIn(sides[index].admits), want.admits, `${source} side ${index}`);
+        }
+      });
     });
   }
 });
