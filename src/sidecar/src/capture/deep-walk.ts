@@ -16,6 +16,7 @@
 
 import ts from 'typescript';
 import type { TypeProvenance } from './api.js';
+import { memberPath } from './member-name.js';
 
 /** A disqualifying finding below the root of a captured type: an author-baked
  * `any`/`unknown`, or `budget_exhausted` — a subtree the walk could not finish
@@ -265,11 +266,7 @@ function walkTopTypes(
         continue;
       }
       const propType = checker.getTypeOfSymbolAtLocation(prop, location);
-      walk(
-        propType,
-        path === '' ? prop.getName() : `${path}.${prop.getName()}`,
-        depth + 1
-      );
+      walk(propType, memberPath(path, prop, checker), depth + 1);
       if (exhausted) return;
     }
   };

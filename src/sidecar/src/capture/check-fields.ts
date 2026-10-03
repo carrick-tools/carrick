@@ -32,6 +32,7 @@
 import ts from 'typescript';
 import type { ProbePlan, Side } from './check-probe.js';
 import type { ProbeProgram } from './check-deep.js';
+import { memberPath } from './member-name.js';
 
 /** What kind of difference one field path carries. */
 export type FieldDifferenceNature =
@@ -276,7 +277,7 @@ function walk(
   let absent = 0;
 
   for (const [name, expectedProp] of expectedProps) {
-    const at = join(path, name);
+    const at = memberPath(path, expectedProp, checker);
     const sentProp = sentProps.get(name);
     const supplied = ctx.serverSupplied.has(name);
     if (!sentProp) {
@@ -329,14 +330,10 @@ function walk(
   // On the common subset case — a call site reading fewer fields than the
   // producer returns — nothing is absent and nothing is named.
   if (absent === 0) return;
-  for (const [name] of sentProps) {
+  for (const [name, sentProp] of sentProps) {
     if (expectedProps.has(name)) continue;
-    ctx.found.push({ path: join(path, name), nature: 'extra_in_sent' });
+    ctx.found.push({ path: memberPath(path, sentProp, checker), nature: 'extra_in_sent' });
   }
-}
-
-function join(path: string, name: string): string {
-  return path === '' ? name : `${path}.${name}`;
 }
 
 function isOptional(symbol: ts.Symbol): boolean {

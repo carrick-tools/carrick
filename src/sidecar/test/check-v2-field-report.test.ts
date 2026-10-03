@@ -18,7 +18,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildProbe } from '../src/capture/check-probe.js';
 import { openProbeProgram } from '../src/capture/check-deep.js';
-import { pairFieldReports, MAX_NAMED_FIELDS } from '../src/capture/check-fields.js';
+import {
+  describeFieldReport,
+  pairFieldReports,
+  MAX_NAMED_FIELDS,
+} from '../src/capture/check-fields.js';
 import type { CheckPairSpec } from '../src/capture/api.js';
 
 const TSCONFIG = JSON.stringify({
@@ -49,6 +53,9 @@ const KEYS = [
   'optionalabsent',
   'relocated',
   'many',
+  'iterable',
+  'nestediterable',
+  'uniquekey',
 ] as const;
 
 const PRODUCER = `export type named_Producer = { id: string; label: string; };
@@ -61,6 +68,9 @@ export type memberunion_Producer = { kind: "a" | "b" };
 export type optionalabsent_Producer = { id: string; total: number };
 export type relocated_Producer = { data: { reason: string } };
 export type many_Producer = { a: string; b: string; c: string; d: string; e: string; f: string; g: string; h: string; i: string; j: string; };
+export type iterable_Producer = { id: string };
+export type nestediterable_Producer = { data: { id: string } };
+export type uniquekey_Producer = { id: string };
 `;
 
 const CONSUMER = `export type named_Consumer = { id: number; label: string; };
@@ -73,6 +83,10 @@ export type memberunion_Consumer = { kind: "a" };
 export type optionalabsent_Consumer = { id: string; total: string; note?: string };
 export type relocated_Consumer = { reason?: string };
 export type many_Consumer = { a: number; b: number; c: number; d: number; e: number; f: number; g: number; h: number; i: number; j: number; };
+export type iterable_Consumer = { id: string; [Symbol.iterator](): Iterator<string> };
+export type nestediterable_Consumer = { data: { id: string; [Symbol.iterator](): Iterator<string> } };
+export declare const KEY: unique symbol;
+export type uniquekey_Consumer = { id: string; [KEY]: string };
 `;
 
 function spec(pairKey: string): CheckPairSpec {
@@ -191,6 +205,39 @@ describe('the field report never contradicts the judge', () => {
       report.differences.map((d) => d.path),
       ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
     );
+  });
+
+  // carrick#1766. A member keyed by a unique symbol has no name of its own: the
+  // checker calls it `__@iterator@<symbol id>`, and the id counts every symbol
+  // the process made before it, so the stored sentence changed on every scan
+  // of an unchanged tree. Two programs over the same files are two scans: the
+  // second program's symbols are numbered after the first's.
+  it('names a symbol-keyed member the way the source writes it', () => {
+    assert.deepStrictEqual(
+      reportFor('iterable')!.differences.map((d) => [d.path, d.nature]),
+      [['[Symbol.iterator]', 'missing_in_sent']]
+    );
+    assert.deepStrictEqual(
+      reportFor('uniquekey')!.differences.map((d) => [d.path, d.nature]),
+      [['[KEY]', 'missing_in_sent']]
+    );
+  });
+
+  it('puts a nested symbol-keyed member in brackets, with no dot', () => {
+    assert.deepStrictEqual(
+      reportFor('nestediterable')!.differences.map((d) => [d.path, d.nature]),
+      [['data[Symbol.iterator]', 'missing_in_sent']]
+    );
+  });
+
+  it('writes the same sentence for the same pair on two programs', () => {
+    for (const key of ['iterable', 'nestediterable', 'uniquekey'] as const) {
+      const first = describeFieldReport(reportFor(key)!, 'producer', 'consumer');
+      const second = describeFieldReport(reportFor(key)!, 'producer', 'consumer');
+      assert.ok(first.includes('Fields that differ'), first);
+      assert.strictEqual(second, first);
+      assert.ok(!first.includes('__@'), first);
+    }
   });
 
   it('has no entry at all when it could not run', () => {
