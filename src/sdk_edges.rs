@@ -770,11 +770,11 @@ mod tests {
         packages.package_jsons.push(PackageJson {
             name: Some(SDK_PACKAGE.to_string()),
             version: Some("1.0.0".to_string()),
-            dependencies: HashMap::new(),
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            optional_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
+            dependencies: BTreeMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            resolutions: BTreeMap::new(),
         });
         data.packages = Some(packages);
         data.sdk_surface = Some(vec![SdkMember {

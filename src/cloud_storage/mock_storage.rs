@@ -2,7 +2,7 @@ use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutc
 use crate::packages::{PackageJson, Packages};
 use async_trait::async_trait;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::debug;
@@ -277,7 +277,7 @@ impl CloudStorage for MockStorage {
 
 impl MockStorage {
     fn create_mock_packages_repo_a() -> Packages {
-        let mut dependencies = HashMap::new();
+        let mut dependencies = BTreeMap::new();
         dependencies.insert("express".to_string(), "5.0.0".to_string()); // Major version difference (critical)
         dependencies.insert("react".to_string(), "18.3.0".to_string()); // Minor version difference (warning)
         dependencies.insert("lodash".to_string(), "4.17.22".to_string()); // Patch version difference (info)
@@ -286,10 +286,10 @@ impl MockStorage {
             name: Some("repo-a".to_string()),
             version: Some("1.0.0".to_string()),
             dependencies,
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            optional_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            resolutions: BTreeMap::new(),
         };
 
         Packages::new(vec![PathBuf::from("repo-a/package.json")]).unwrap_or_else(|_| {
@@ -305,7 +305,7 @@ impl MockStorage {
     }
 
     fn create_mock_packages_repo_b() -> Packages {
-        let mut dependencies = HashMap::new();
+        let mut dependencies = BTreeMap::new();
         dependencies.insert("express".to_string(), "4.18.0".to_string()); // Major version difference (critical)
         dependencies.insert("react".to_string(), "18.2.0".to_string()); // Minor version difference (warning)
         dependencies.insert("lodash".to_string(), "4.17.21".to_string()); // Patch version difference (info)
@@ -315,10 +315,10 @@ impl MockStorage {
             name: Some("repo-b".to_string()),
             version: Some("1.0.0".to_string()),
             dependencies,
-            dev_dependencies: HashMap::new(),
-            peer_dependencies: HashMap::new(),
-            optional_dependencies: HashMap::new(),
-            resolutions: HashMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            resolutions: BTreeMap::new(),
         };
 
         Packages::new(vec![PathBuf::from("repo-b/package.json")]).unwrap_or_else(|_| {

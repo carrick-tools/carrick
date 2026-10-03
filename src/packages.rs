@@ -1,7 +1,7 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     io,
     path::{Path, PathBuf},
 };
@@ -10,18 +10,21 @@ use std::{
 /// server-side; staying under it keeps requests deterministic.
 pub const DEPENDENCY_NAME_CAP: usize = 500;
 
+/// Every map here is a `BTreeMap`: this struct reaches the blob twice (inside
+/// `packages` and serialized into `package_json`), and a hash map would write
+/// one tree's entries in a different order on every scan (carrick#1806).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PackageJson {
     pub name: Option<String>,
     pub version: Option<String>,
     #[serde(default)]
-    pub dependencies: HashMap<String, String>,
+    pub dependencies: BTreeMap<String, String>,
     #[serde(default)]
     #[serde(rename = "devDependencies")]
-    pub dev_dependencies: HashMap<String, String>,
+    pub dev_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     #[serde(rename = "peerDependencies")]
-    pub peer_dependencies: HashMap<String, String>,
+    pub peer_dependencies: BTreeMap<String, String>,
     /// npm `optionalDependencies`. Deliberately NOT folded into
     /// [`Packages::resolve_dependencies`]: `merged_dependencies` drives the
     /// cloud dependency list and the synthetic type-check install, and an
@@ -30,7 +33,7 @@ pub struct PackageJson {
     /// question — see `crate::external_call_candidates`.
     #[serde(default)]
     #[serde(rename = "optionalDependencies")]
-    pub optional_dependencies: HashMap<String, String>,
+    pub optional_dependencies: BTreeMap<String, String>,
     /// yarn/pnpm `resolutions` (version-override map). Keys may be plain names
     /// or `name@range` selectors; values may be `npm:<real-name>@<range>`
     /// aliases that remap a locally-invented dependency name (e.g. MetaMask's
@@ -38,7 +41,7 @@ pub struct PackageJson {
     /// real registry package. The synthetic type-check install must apply
     /// these aliases or the invented name 404s.
     #[serde(default)]
-    pub resolutions: HashMap<String, String>,
+    pub resolutions: BTreeMap<String, String>,
 }
 
 /// The manifest facts shared by package loading and workspace resolution.
@@ -127,7 +130,7 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
         });
     }
 
-    let mut dependencies = HashMap::new();
+    let mut dependencies = BTreeMap::new();
     let mut local_imports = Vec::new();
     let external_map = crate::deno_support::import_map_path(path, &json)?
         .map(|path| read_json_config(&path))
@@ -159,10 +162,10 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         dependencies,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
     let workspace = match json.get("workspace") {
         None => Vec::new(),
@@ -361,11 +364,13 @@ pub struct PackageInfo {
     pub source_path: PathBuf,
 }
 
+/// Sorted collections throughout, for the reason [`PackageJson`] gives: this
+/// is the blob's `packages` and, serialized, its `package_json` (carrick#1806).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Packages {
     pub package_jsons: Vec<PackageJson>,
     pub source_paths: Vec<PathBuf>,
-    pub merged_dependencies: HashMap<String, PackageInfo>,
+    pub merged_dependencies: BTreeMap<String, PackageInfo>,
     /// Package names declared by ANY package.json in the scanned repo tree —
     /// not just the service-scoped ones in `package_jsons`. A monorepo's
     /// shared workspace package (`@meridian/contracts` under
@@ -374,7 +379,7 @@ pub struct Packages {
     /// internal (registry-unresolvable). `default` for CloudRepoData
     /// payloads persisted before the field existed.
     #[serde(default)]
-    pub internal_names: std::collections::HashSet<String>,
+    pub internal_names: BTreeSet<String>,
 }
 
 /// The pnpm catalogs one `pnpm-workspace.yaml` declares (carrick#1156).
@@ -554,10 +559,8 @@ fn deno_manifest_at(dir: &Path) -> Option<PathBuf> {
 /// Names declared by every package.json under `repo_root` (workspace members
 /// included), skipping dependency/build directories. Used to recognize
 /// workspace-internal packages that must not be treated as registry deps.
-pub fn collect_internal_package_names(
-    repo_root: &std::path::Path,
-) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+pub fn collect_internal_package_names(repo_root: &std::path::Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
     let walker = walkdir::WalkDir::new(repo_root)
         .sort_by_file_name()
         .into_iter()
@@ -725,7 +728,7 @@ impl Packages {
     }
 
     /// Gets all merged dependencies
-    pub fn get_dependencies(&self) -> &HashMap<String, PackageInfo> {
+    pub fn get_dependencies(&self) -> &BTreeMap<String, PackageInfo> {
         &self.merged_dependencies
     }
 
@@ -1075,5 +1078,62 @@ mod tests {
         let names = collect_internal_package_names(&fixture);
         assert!(names.contains("@meridian/contracts"));
         assert!(names.contains("catalog-api"));
+    }
+
+    /// The same packages, built by inserting every entry in the given order.
+    /// Forty entries per collection: with a handful, two hash orders can
+    /// coincide by chance and the comparison would prove nothing.
+    fn packages_inserted_in(order: &[usize]) -> Packages {
+        let names: Vec<String> = order.iter().map(|i| format!("pkg-{i:02}")).collect();
+        let entries = |prefix: &str| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|name| (format!("{prefix}{name}"), "^1.0.0".to_string()))
+                .collect()
+        };
+        let source_path = PathBuf::from("api/package.json");
+        let package_json = PackageJson {
+            name: Some("api".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: entries("").into_iter().collect(),
+            dev_dependencies: entries("dev-").into_iter().collect(),
+            peer_dependencies: entries("peer-").into_iter().collect(),
+            optional_dependencies: entries("optional-").into_iter().collect(),
+            resolutions: entries("resolved-").into_iter().collect(),
+        };
+        Packages {
+            package_jsons: vec![package_json],
+            source_paths: vec![source_path.clone()],
+            merged_dependencies: names
+                .iter()
+                .map(|name| {
+                    let info = PackageInfo {
+                        name: name.clone(),
+                        version: "1.0.0".to_string(),
+                        spec: "^1.0.0".to_string(),
+                        source_path: source_path.clone(),
+                    };
+                    (name.clone(), info)
+                })
+                .collect(),
+            internal_names: names
+                .iter()
+                .map(|name| format!("@internal/{name}"))
+                .collect(),
+        }
+    }
+
+    /// carrick#1806: the blob's `package_json` is this serialization and its
+    /// `packages` is this struct, so two scans of one tree must write them
+    /// byte for byte the same whatever order the entries were read in.
+    #[test]
+    fn packages_serialize_identically_whatever_the_insertion_order() {
+        let forward: Vec<usize> = (0..40).collect();
+        let reversed: Vec<usize> = forward.iter().rev().copied().collect();
+
+        let first = serde_json::to_string(&packages_inserted_in(&forward)).unwrap();
+        let second = serde_json::to_string(&packages_inserted_in(&reversed)).unwrap();
+
+        assert_eq!(first, second);
     }
 }

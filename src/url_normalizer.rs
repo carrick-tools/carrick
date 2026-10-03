@@ -44,7 +44,7 @@
 
 use crate::config::Config;
 use crate::env_alias::is_loopback_origin;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Result of URL normalization
 #[derive(Debug, Clone, PartialEq)]
@@ -69,10 +69,10 @@ pub struct NormalizedUrl {
 /// URL normalizer that uses configuration to identify internal/external domains
 #[derive(Debug, Clone)]
 pub struct UrlNormalizer {
-    internal_domains: HashSet<String>,
-    external_domains: HashSet<String>,
-    internal_env_vars: HashSet<String>,
-    external_env_vars: HashSet<String>,
+    internal_domains: BTreeSet<String>,
+    external_domains: BTreeSet<String>,
+    internal_env_vars: BTreeSet<String>,
+    external_env_vars: BTreeSet<String>,
 }
 
 impl UrlNormalizer {
@@ -89,10 +89,10 @@ impl UrlNormalizer {
     /// Create a URL normalizer with no configured domains (normalizes all URLs)
     pub fn default_permissive() -> Self {
         Self {
-            internal_domains: HashSet::new(),
-            external_domains: HashSet::new(),
-            internal_env_vars: HashSet::new(),
-            external_env_vars: HashSet::new(),
+            internal_domains: BTreeSet::new(),
+            external_domains: BTreeSet::new(),
+            internal_env_vars: BTreeSet::new(),
+            external_env_vars: BTreeSet::new(),
         }
     }
 
@@ -480,7 +480,7 @@ impl UrlNormalizer {
     /// backwards and could flip internal/external classification — e.g. host `company`
     /// would spuriously match a configured `api.company.com`, and `api.com` would fail
     /// to match `api.company.com`.
-    fn host_matches_domains(host: &str, domains: &HashSet<String>) -> bool {
+    fn host_matches_domains(host: &str, domains: &BTreeSet<String>) -> bool {
         // Strip port if present, then lowercase.
         let host_without_port = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
 

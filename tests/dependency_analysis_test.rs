@@ -1,7 +1,7 @@
 use carrick::analyzer::{Analyzer, ConflictSeverity};
 use carrick::config::Config;
 use carrick::packages::{PackageJson, Packages};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn test_dependency_conflict_detection() {
     let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with express 4.18.0
-    let mut deps_a = HashMap::new();
+    let mut deps_a = BTreeMap::new();
     deps_a.insert("express".to_string(), "4.18.0".to_string());
     deps_a.insert("lodash".to_string(), "4.17.21".to_string());
 
@@ -19,10 +19,10 @@ async fn test_dependency_conflict_detection() {
         name: Some("repo-a".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_a,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -33,7 +33,7 @@ async fn test_dependency_conflict_detection() {
     packages_a.resolve_dependencies();
 
     // Create mock packages for repo-b with express 3.17.0 (major version conflict!)
-    let mut deps_b = HashMap::new();
+    let mut deps_b = BTreeMap::new();
     deps_b.insert("express".to_string(), "3.17.0".to_string());
     deps_b.insert("axios".to_string(), "1.3.0".to_string());
 
@@ -41,10 +41,10 @@ async fn test_dependency_conflict_detection() {
         name: Some("repo-b".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_b,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -89,17 +89,17 @@ async fn test_no_dependency_conflicts_when_versions_match() {
     let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with express 4.18.0
-    let mut deps_a = HashMap::new();
+    let mut deps_a = BTreeMap::new();
     deps_a.insert("express".to_string(), "4.18.0".to_string());
 
     let package_json_a = PackageJson {
         name: Some("repo-a".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_a,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -110,17 +110,17 @@ async fn test_no_dependency_conflicts_when_versions_match() {
     packages_a.resolve_dependencies();
 
     // Create mock packages for repo-b with same express version (no conflict)
-    let mut deps_b = HashMap::new();
+    let mut deps_b = BTreeMap::new();
     deps_b.insert("express".to_string(), "4.18.0".to_string());
 
     let package_json_b = PackageJson {
         name: Some("repo-b".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_b,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -148,17 +148,17 @@ async fn test_no_conflicts_for_unique_packages() {
     let mut analyzer = Analyzer::new(config);
 
     // Create mock packages for repo-a with lodash only
-    let mut deps_a = HashMap::new();
+    let mut deps_a = BTreeMap::new();
     deps_a.insert("lodash".to_string(), "4.17.21".to_string());
 
     let package_json_a = PackageJson {
         name: Some("repo-a".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_a,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -169,17 +169,17 @@ async fn test_no_conflicts_for_unique_packages() {
     packages_a.resolve_dependencies();
 
     // Create mock packages for repo-b with axios only (no shared dependencies)
-    let mut deps_b = HashMap::new();
+    let mut deps_b = BTreeMap::new();
     deps_b.insert("axios".to_string(), "1.3.0".to_string());
 
     let package_json_b = PackageJson {
         name: Some("repo-b".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_b,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_b = Packages::default();
@@ -211,7 +211,7 @@ async fn test_only_major_incompatible_conflicts_reported() {
     // a cross-service conflict; the same-major minor/patch drifts are compatible
     // and suppressed (they were the false-positive noise that pinned dependency
     // F1 on xrepo-corpus-1).
-    let mut deps_a = HashMap::new();
+    let mut deps_a = BTreeMap::new();
     deps_a.insert("critical_pkg".to_string(), "2.0.0".to_string()); // Major diff
     deps_a.insert("warning_pkg".to_string(), "1.2.0".to_string()); // Minor diff
     deps_a.insert("info_pkg".to_string(), "1.0.2".to_string()); // Patch diff
@@ -220,10 +220,10 @@ async fn test_only_major_incompatible_conflicts_reported() {
         name: Some("repo-a".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_a,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_a = Packages::default();
@@ -233,7 +233,7 @@ async fn test_only_major_incompatible_conflicts_reported() {
         .push(PathBuf::from("repo-a/package.json"));
     packages_a.resolve_dependencies();
 
-    let mut deps_b = HashMap::new();
+    let mut deps_b = BTreeMap::new();
     deps_b.insert("critical_pkg".to_string(), "1.0.0".to_string()); // Major diff
     deps_b.insert("warning_pkg".to_string(), "1.1.0".to_string()); // Minor diff
     deps_b.insert("info_pkg".to_string(), "1.0.1".to_string()); // Patch diff
@@ -242,10 +242,10 @@ async fn test_only_major_incompatible_conflicts_reported() {
         name: Some("repo-b".to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps_b,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages_b = Packages::default();

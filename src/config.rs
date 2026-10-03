@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io,
     path::{Path, PathBuf},
 };
@@ -48,18 +48,20 @@ pub struct Config {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub graphql_schemas: Vec<String>,
+    /// The four declared lists are sets, sorted so the blob's `config_json`
+    /// writes them in one order on every scan (carrick#1806).
     #[serde(default)]
     #[serde(rename = "internalEnvVars")]
-    pub internal_env_vars: HashSet<String>,
+    pub internal_env_vars: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "internalDomains")]
-    pub internal_domains: HashSet<String>,
+    pub internal_domains: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "externalEnvVars")]
-    pub external_env_vars: HashSet<String>,
+    pub external_env_vars: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "externalDomains")]
-    pub external_domains: HashSet<String>,
+    pub external_domains: BTreeSet<String>,
     /// Operations this service declares behind a body-dispatching handler
     /// (carrick#831), resolved from the file's top-level `operations` array by
     /// [`Config::load_services`]. Never written in a service entry directly:
@@ -156,16 +158,16 @@ impl DeclaredOperations {
 struct IncludeDeclarations {
     #[serde(default)]
     #[serde(rename = "internalEnvVars")]
-    internal_env_vars: HashSet<String>,
+    internal_env_vars: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "internalDomains")]
-    internal_domains: HashSet<String>,
+    internal_domains: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "externalEnvVars")]
-    external_env_vars: HashSet<String>,
+    external_env_vars: BTreeSet<String>,
     #[serde(default)]
     #[serde(rename = "externalDomains")]
-    external_domains: HashSet<String>,
+    external_domains: BTreeSet<String>,
 }
 
 /// File-level shape of `carrick.json`: either a single flat service (the flat
@@ -913,5 +915,31 @@ mod tests {
         );
         let plain = serde_json::to_value(&services[1]).unwrap();
         assert!(plain.get("graphqlSchemas").is_none(), "{plain}");
+    }
+
+    /// carrick#1806: the blob's `config_json` is this serialization, so two
+    /// scans of one tree must write it byte for byte the same whatever order
+    /// the declared lists were read in. Forty entries per list: with a
+    /// handful, two hash orders can coincide by chance.
+    #[test]
+    fn test_config_serializes_identically_whatever_the_insertion_order() {
+        let config_inserted_in = |order: &[usize]| -> Config {
+            let list = |prefix: &str| order.iter().map(|i| format!("{prefix}_{i:02}")).collect();
+            Config {
+                service_name: Some("api".to_string()),
+                internal_env_vars: list("INTERNAL_URL"),
+                internal_domains: list("internal.example"),
+                external_env_vars: list("EXTERNAL_URL"),
+                external_domains: list("external.example"),
+                ..Config::default()
+            }
+        };
+        let forward: Vec<usize> = (0..40).collect();
+        let reversed: Vec<usize> = forward.iter().rev().copied().collect();
+
+        let first = serde_json::to_string(&config_inserted_in(&forward)).unwrap();
+        let second = serde_json::to_string(&config_inserted_in(&reversed)).unwrap();
+
+        assert_eq!(first, second);
     }
 }

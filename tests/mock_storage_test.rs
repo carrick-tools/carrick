@@ -1,22 +1,22 @@
 use carrick::cloud_storage::{CloudRepoData, CloudStorage, MockStorage};
 use carrick::packages::{PackageJson, Packages};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Helper function to create test CloudRepoData
 fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
-    let mut deps = HashMap::new();
+    let mut deps = BTreeMap::new();
     deps.insert("express".to_string(), "4.18.0".to_string());
 
     let package_json = PackageJson {
         name: Some(repo_name.to_string()),
         version: Some("1.0.0".to_string()),
         dependencies: deps,
-        dev_dependencies: HashMap::new(),
-        peer_dependencies: HashMap::new(),
-        optional_dependencies: HashMap::new(),
-        resolutions: HashMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        peer_dependencies: BTreeMap::new(),
+        optional_dependencies: BTreeMap::new(),
+        resolutions: BTreeMap::new(),
     };
 
     let mut packages = Packages::default();
