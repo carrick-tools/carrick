@@ -121,6 +121,19 @@ pub struct GraphqlOp {
     /// producers, for rows not placed at a call, and for a declaration that
     /// states no result type this pass can read.
     pub declared_result_type: Option<crate::graphql_document_sites::DeclaredFieldType>,
+    /// CONSUMER-only: the operation this row's field is selected in, as its
+    /// document states it: every root field and the key each one's value has
+    /// in the result. A located result type is read against it (carrick#1760).
+    /// `None` for producers.
+    pub operation: Option<crate::graphql_document_sites::DocumentOperation>,
+    /// CONSUMER-only: where the result type the model located for this row
+    /// (`consumer_located_type_symbol`) states the field's type, when that
+    /// type is the result of the row's whole operation rather than the field's
+    /// payload (carrick#1760), read from the AST by
+    /// [`crate::graphql_document_sites::read_located_result_types`]. When set,
+    /// the located symbol is never bundled: the row reads this property's type
+    /// instead. `None` otherwise.
+    pub located_field_type: Option<crate::graphql_document_sites::DeclaredFieldType>,
     /// CONSUMER-only: the schema identity the document this operation was
     /// parsed from is bound to, set by [`ConsumerAttribution::apply`] on every
     /// consumer it keeps and carried onto the call row
@@ -1317,6 +1330,8 @@ pub fn extract_from_document_text(
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
                     declared_result_type: None,
+                    operation: None,
+                    located_field_type: None,
                     schema_binding: None,
                     arguments: sdl_arguments(field),
                 });
@@ -1332,35 +1347,21 @@ pub fn extract_from_document_text(
     }
 
     if let Ok(document) = graphql_parser::parse_query::<String>(text) {
-        use graphql_parser::query::{Definition, OperationDefinition, Selection};
+        use graphql_parser::query::Definition;
 
         for definition in &document.definitions {
             let Definition::Operation(operation) = definition else {
                 continue; // standalone fragments carry no operation identity
             };
-            let (kind, selection_set) = match operation {
-                // `{ user }` shorthand is an anonymous query
-                OperationDefinition::SelectionSet(set) => (GraphqlOperationKind::Query, set),
-                OperationDefinition::Query(q) => (GraphqlOperationKind::Query, &q.selection_set),
-                OperationDefinition::Mutation(m) => {
-                    (GraphqlOperationKind::Mutation, &m.selection_set)
-                }
-                OperationDefinition::Subscription(s) => {
-                    (GraphqlOperationKind::Subscription, &s.selection_set)
-                }
-            };
-            for selection in &selection_set.items {
-                // Top-level fragment spreads can't be resolved without the
-                // fragment source (often interpolated) — skip, never guess.
-                let Selection::Field(field) = selection else {
-                    continue;
-                };
-                if field.name.starts_with("__") {
-                    continue; // introspection
-                }
+            // `{ user }` shorthand is an anonymous query. Top-level fragment
+            // spreads can't be resolved without the fragment source (often
+            // interpolated) and introspection fields are no operation, so
+            // neither is a root field here — skip, never guess.
+            let (operation, roots) = crate::graphql_document_sites::parsed_operation(operation);
+            for field in roots {
                 extraction.consumers.push(GraphqlOp {
                     // alias-aware: match on the real field name, not the alias
-                    key: OperationKey::graphql(kind, field.name.clone()),
+                    key: OperationKey::graphql(operation.kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
                     document_line: base_line,
@@ -1388,6 +1389,9 @@ pub fn extract_from_document_text(
                     // Set only on a row placed at a call that executes a
                     // declared document (`graphql_document_sites`).
                     declared_result_type: None,
+                    operation: Some(operation.clone()),
+                    // Read once a locate has joined (carrick#1760).
+                    located_field_type: None,
                     schema_binding: None,
                     arguments: None,
                 });

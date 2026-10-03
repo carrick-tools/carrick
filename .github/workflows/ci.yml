@@ -100,6 +100,7 @@ jobs:
           --test graphql_declared_result_types_test
           --test graphql_document_call_sites_test
           --test graphql_extraction_test
+          --test graphql_located_operation_types_test
           --test graphql_schema_identity_test
           --test graphql_schemas_setting_test
           --test graphql_walked_schema_evidence_test

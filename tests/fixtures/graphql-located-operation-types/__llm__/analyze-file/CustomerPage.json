@@ -1,0 +1,27 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "${process.env.BILLING_API_URL}/health",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${process.env.BILLING_API_URL}/health`)",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "graphql_consumer_locates": [
+    {
+      "kind": "query",
+      "field": "customer",
+      "result_type_symbol": "CustomerData",
+      "result_type_source": null
+    }
+  ]
+}

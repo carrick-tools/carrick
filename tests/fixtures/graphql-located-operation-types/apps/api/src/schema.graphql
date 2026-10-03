@@ -1,0 +1,26 @@
+type Query {
+  invoice(id: ID!): Invoice
+  settings: Settings!
+  customer(id: ID!): Customer
+  folder(id: ID!): Folder
+}
+
+type Invoice {
+  id: ID!
+  total: Int!
+}
+
+type Settings {
+  prefix: String!
+}
+
+type Customer {
+  id: ID!
+  name: String!
+}
+
+type Folder {
+  id: ID!
+  name: String!
+  folder: Folder
+}

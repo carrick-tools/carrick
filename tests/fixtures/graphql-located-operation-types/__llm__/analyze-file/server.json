@@ -1,0 +1,53 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:39",
+      "line_number": 39,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/health",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ ok: true }",
+      "response_expression_line": 39,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": [],
+  "graphql_operations": [
+    {
+      "kind": "query",
+      "field": "invoice",
+      "resolver_function": "invoice",
+      "resolver_line": 24,
+      "primary_type_symbol": "Invoice",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "settings",
+      "resolver_function": "settings",
+      "resolver_line": 25,
+      "primary_type_symbol": "Settings",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "customer",
+      "resolver_function": "customer",
+      "resolver_line": 26,
+      "primary_type_symbol": "Customer",
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    }
+  ]
+}

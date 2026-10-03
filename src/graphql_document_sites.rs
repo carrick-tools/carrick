@@ -68,7 +68,7 @@ use swc_common::{
 use swc_ecma_ast::{
     CallExpr, Callee, Decl, Expr, ImportDecl, ImportSpecifier, Lit, Module, ModuleDecl,
     ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt, TsEntityName,
-    TsType, TsTypeElement, TsTypeRef, VarDeclarator,
+    TsPropertySignature, TsType, TsTypeElement, TsTypeRef, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -146,7 +146,9 @@ struct DeclaredDocument {
 /// response key (`orders: Array<{ id: string }>`). This is the span of that
 /// property's type: the field's payload, the level a consumer row is keyed
 /// at, never the operation wrapper around it (carrick#1760). The type
-/// sidecar reads the type at this span.
+/// sidecar reads the type at this span. A result type the model locates is
+/// read the same way when it is the operation's result
+/// ([`read_located_result_types`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredFieldType {
     /// Canonical path of the module that declares the result type.
@@ -334,6 +336,7 @@ impl DocumentSiteConsumers {
                         key,
                         &site_file,
                         executed.line,
+                        operation,
                         document.field_types.get(field).cloned(),
                     ));
                 }
@@ -384,13 +387,14 @@ impl DocumentSiteConsumers {
 }
 
 /// A consumer row at a call. The call is its own document for attribution:
-/// its root fields are the basis the schema catalogue judges. `declared` is
-/// where the document's declaration states this field's result type, when
-/// it does.
+/// its root fields are the basis the schema catalogue judges. `operation` is
+/// the operation the row's field is selected in; `declared` is where the
+/// document's declaration states this field's result type, when it does.
 fn site_consumer(
     key: OperationKey,
     file: &Path,
     line: u32,
+    operation: &DocumentOperation,
     declared: Option<DeclaredFieldType>,
 ) -> GraphqlOp {
     GraphqlOp {
@@ -408,6 +412,9 @@ fn site_consumer(
         consumer_located_type_symbol: None,
         consumer_located_type_source: None,
         declared_result_type: declared,
+        operation: Some(operation.clone()),
+        // Read once a locate has joined (carrick#1760).
+        located_field_type: None,
         // Set by attribution, which runs after these rows are placed.
         schema_binding: None,
         arguments: None,
@@ -832,29 +839,157 @@ fn declared_field_types(
         {
             continue;
         }
-        let declared_type = properties[key];
-        let span = declared_type.span();
-        let offset = |pos| {
-            source_map
-                .lookup_byte_offset(pos)
-                .pos
-                .0
-                .checked_add(SWC_SPAN_BASE)
-        };
-        let (Some(lo), Some(hi)) = (offset(span.lo), offset(span.hi)) else {
-            continue;
-        };
-        field_types.insert(
-            field.clone(),
-            DeclaredFieldType {
-                file: file.to_path_buf(),
-                line: source_map.lookup_char_pos(span.lo).line as u32,
-                lo,
-                hi,
-            },
-        );
+        if let Some(field_type) = field_type_at(properties[key], source_map, file) {
+            field_types.insert(field.clone(), field_type);
+        }
     }
     field_types
+}
+
+/// Where `ty` is written in `file`, in the scanner's own span units.
+fn field_type_at(
+    ty: &TsType,
+    source_map: &Lrc<SourceMap>,
+    file: &Path,
+) -> Option<DeclaredFieldType> {
+    let span = ty.span();
+    let offset = |pos| {
+        source_map
+            .lookup_byte_offset(pos)
+            .pos
+            .0
+            .checked_add(SWC_SPAN_BASE)
+    };
+    Some(DeclaredFieldType {
+        file: file.to_path_buf(),
+        line: source_map.lookup_char_pos(span.lo).line as u32,
+        lo: offset(span.lo)?,
+        hi: offset(span.hi)?,
+    })
+}
+
+/// Read the result type the model located for each consumer row against the
+/// operation the row's field is selected in (carrick#1760). Returns how many
+/// rows it set a field-level type on.
+///
+/// A row is keyed by one root field, and its type is that field's payload.
+/// The model sometimes locates the result type of the row's whole operation
+/// instead: an object with one property per root field
+/// (`{ __typename: 'Query', invoice?: { ... } | null, settings?: { ... } }`).
+/// Bundled as it is, that wrapper is served as the field's type, and the
+/// judge compares it with the producer's field-level return. When the located
+/// symbol names an object type its module declares
+/// ([`operation_field_type`] says when), the row's type is that type's
+/// property under the row's response key, and
+/// [`GraphqlOp::located_field_type`] records where it is written. The type
+/// sidecar reads it there, as it reads a declared field type (carrick#1761).
+///
+/// The rule reads the located type and the document, never the type's name,
+/// so no codegen naming convention is assumed. A type it cannot read (an
+/// intersection, a generic, a name the module re-exports from elsewhere) or
+/// that is not the operation's result keeps the symbol path, unchanged.
+///
+/// The located specifier resolves from the row's file through `modules`,
+/// the way the symbol path resolves it.
+pub fn read_located_result_types(
+    graphql: &mut GraphqlExtraction,
+    modules: &WorkspaceIndex,
+) -> usize {
+    let source_map: Lrc<SourceMap> = Default::default();
+    let handler =
+        Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(source_map.clone()));
+    let mut parsed: HashMap<PathBuf, Option<Module>> = HashMap::new();
+    let mut read = 0;
+    for op in &mut graphql.consumers {
+        let (Some(symbol), Some(operation), Some(field)) = (
+            op.consumer_located_type_symbol.as_deref(),
+            op.operation.as_ref(),
+            op.key.graphql_field(),
+        ) else {
+            continue;
+        };
+        let module_file = match op.consumer_located_type_source.as_deref() {
+            Some(source) => PathBuf::from(
+                crate::agents::file_orchestrator::FileOrchestrator::resolve_import_path(
+                    &op.file_path.to_string_lossy(),
+                    source,
+                    modules,
+                ),
+            ),
+            None => op.file_path.clone(),
+        };
+        let Ok(module_file) = module_file.canonicalize() else {
+            continue;
+        };
+        let module = parsed
+            .entry(module_file.clone())
+            .or_insert_with(|| parse_file(&module_file, &source_map, &handler));
+        let Some(module) = module.as_ref() else {
+            continue;
+        };
+        let located =
+            operation_field_type(module, symbol, field, operation, &source_map, &module_file);
+        if located.is_some() {
+            read += 1;
+            debug!(
+                op = %op.key.canonical(),
+                file = %op.file_path.display(),
+                symbol,
+                "located GraphQL result type is the operation's; the row reads its field's property"
+            );
+        }
+        op.located_field_type = located;
+    }
+    read
+}
+
+/// Where the object type `symbol` that `module` declares states the result
+/// type of `field`, when that object type is the result of the whole
+/// `operation` (carrick#1760); `None` otherwise.
+///
+/// It is the operation's result when its members are a property under the
+/// response key of every root field the operation selects, and nothing else
+/// but `__typename`. Every root field is required because an operation's
+/// result carries each one. Nothing else is allowed because a field's payload
+/// that happens to carry a member named like the field (a `folder` with its
+/// parent `folder`) also carries the field's own fields, and none of those is
+/// a root field. `__typename` says nothing either way: the server answers it
+/// on every object. A field the operation selects under two response keys
+/// has no one key, and reads nothing.
+fn operation_field_type(
+    module: &Module,
+    symbol: &str,
+    field: &str,
+    operation: &DocumentOperation,
+    source_map: &Lrc<SourceMap>,
+    file: &Path,
+) -> Option<DeclaredFieldType> {
+    let mut positions = operation
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, selected)| *selected == field)
+        .map(|(index, _)| index);
+    let (Some(index), None) = (positions.next(), positions.next()) else {
+        return None;
+    };
+    let key = operation.response_keys.get(index)?;
+    let object_types = module_object_types(module);
+    let members = *object_types.get(symbol)?;
+    let only_root_keys = members.iter().all(|member| {
+        property_key(member).is_some_and(|(name, _)| {
+            name == "__typename" || operation.response_keys.contains(&name)
+        })
+    });
+    let properties = property_types(members);
+    let every_root_key = operation
+        .response_keys
+        .iter()
+        .all(|key| properties.contains_key(key));
+    if !(only_root_keys && every_root_key) {
+        return None;
+    }
+    field_type_at(properties.get(key)?, source_map, file)
 }
 
 /// The type a variable declaration states for its value: its annotation, or
@@ -901,23 +1036,29 @@ fn unwrap_type(ty: &TsType) -> &TsType {
 /// (an identifier or string key, not computed, with a type).
 fn property_types(members: &[TsTypeElement]) -> HashMap<String, &TsType> {
     let mut properties = HashMap::new();
-    for member in members {
-        let TsTypeElement::TsPropertySignature(property) = member else {
-            continue;
-        };
-        if property.computed {
-            continue;
-        }
-        let key = match &*property.key {
-            Expr::Ident(ident) => ident.sym.to_string(),
-            Expr::Lit(Lit::Str(s)) => s.value.to_string(),
-            _ => continue,
-        };
+    for (key, property) in members.iter().filter_map(property_key) {
         if let Some(annotation) = &property.type_ann {
             properties.entry(key).or_insert(&*annotation.type_ann);
         }
     }
     properties
+}
+
+/// The key of a plain property member (an identifier or string key, not
+/// computed), with the member.
+fn property_key(member: &TsTypeElement) -> Option<(String, &TsPropertySignature)> {
+    let TsTypeElement::TsPropertySignature(property) = member else {
+        return None;
+    };
+    if property.computed {
+        return None;
+    }
+    let key = match &*property.key {
+        Expr::Ident(ident) => ident.sym.to_string(),
+        Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+        _ => return None,
+    };
+    Some((key, property))
 }
 
 /// The operations a document expression states: read off the graphql-js AST
@@ -1037,7 +1178,7 @@ fn text_operations(text: &str) -> Vec<DocumentOperation> {
 /// selection set is a query, fragment spreads and introspection fields at the
 /// root are left out.
 fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> {
-    use graphql_parser::query::{Definition, OperationDefinition, Selection};
+    use graphql_parser::query::Definition;
     let Ok(document) = graphql_parser::parse_query::<String>(text) else {
         return Vec::new();
     };
@@ -1046,49 +1187,63 @@ fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> 
         let Definition::Operation(operation) = definition else {
             continue;
         };
-        let (kind, name, selection_set) = match operation {
-            OperationDefinition::SelectionSet(set) => (GraphqlOperationKind::Query, None, set),
-            OperationDefinition::Query(q) => (
-                GraphqlOperationKind::Query,
-                q.name.clone(),
-                &q.selection_set,
-            ),
-            OperationDefinition::Mutation(m) => (
-                GraphqlOperationKind::Mutation,
-                m.name.clone(),
-                &m.selection_set,
-            ),
-            OperationDefinition::Subscription(s) => (
-                GraphqlOperationKind::Subscription,
-                s.name.clone(),
-                &s.selection_set,
-            ),
-        };
-        let mut fields = Vec::new();
-        let mut response_keys = Vec::new();
-        let mut lines = Vec::new();
-        for selection in &selection_set.items {
-            let Selection::Field(field) = selection else {
-                continue;
-            };
-            if field.name.starts_with("__") {
-                continue;
-            }
-            fields.push(field.name.clone());
-            response_keys.push(field.alias.clone().unwrap_or_else(|| field.name.clone()));
-            lines.push(field.position.line as u32);
-        }
-        operations.push((
-            DocumentOperation {
-                kind,
-                name,
-                fields,
-                response_keys,
-            },
-            lines,
-        ));
+        let (operation, roots) = parsed_operation(operation);
+        let lines = roots
+            .iter()
+            .map(|field| field.position.line as u32)
+            .collect();
+        operations.push((operation, lines));
     }
     operations
+}
+
+/// The operation a parsed operation definition states, with the node of
+/// each of its root fields in the order of `fields`. An anonymous selection
+/// set is a query; fragment spreads and introspection fields at the root are
+/// left out, because they name no root field a row can be keyed by.
+pub(crate) fn parsed_operation<'a, 'd>(
+    definition: &'d graphql_parser::query::OperationDefinition<'a, String>,
+) -> (
+    DocumentOperation,
+    Vec<&'d graphql_parser::query::Field<'a, String>>,
+) {
+    use graphql_parser::query::{OperationDefinition, Selection};
+    let (kind, name, selection_set) = match definition {
+        OperationDefinition::SelectionSet(set) => (GraphqlOperationKind::Query, None, set),
+        OperationDefinition::Query(q) => (
+            GraphqlOperationKind::Query,
+            q.name.clone(),
+            &q.selection_set,
+        ),
+        OperationDefinition::Mutation(m) => (
+            GraphqlOperationKind::Mutation,
+            m.name.clone(),
+            &m.selection_set,
+        ),
+        OperationDefinition::Subscription(s) => (
+            GraphqlOperationKind::Subscription,
+            s.name.clone(),
+            &s.selection_set,
+        ),
+    };
+    let roots: Vec<_> = selection_set
+        .items
+        .iter()
+        .filter_map(|selection| match selection {
+            Selection::Field(field) if !field.name.starts_with("__") => Some(field),
+            _ => None,
+        })
+        .collect();
+    let operation = DocumentOperation {
+        kind,
+        name,
+        fields: roots.iter().map(|field| field.name.clone()).collect(),
+        response_keys: roots
+            .iter()
+            .map(|field| field.alias.clone().unwrap_or_else(|| field.name.clone()))
+            .collect(),
+    };
+    (operation, roots)
 }
 
 /// Is `expr` a GraphQL document, read from its shape alone?
@@ -1915,6 +2070,204 @@ export const LedgerDocument = gql`query Ledger { ledger { id entries { value } }
                 ("raw", "any"),
                 ("owner", "{ id: string }"),
             ])
+        );
+    }
+
+    /// Result types a model might locate for a consumer row (carrick#1760),
+    /// under multi-byte prose so a byte-vs-character span slip cannot pass.
+    const LOCATED_TYPES: &str = r#"// Généré — ne pas modifier
+export type InvoicePageQuery = { __typename: 'Query', invoice?: { __typename: 'Invoice', id: string, total: number } | null, settings: { __typename: 'Settings', prefix: string } };
+export interface CustomerData { customer: { id: string; name: string } | null }
+export type MineQuery = { mine: Array<{ id: string }> };
+export type NoteView = { id: string; body: string };
+export type FolderView = { __typename: 'Folder', id: string, folder?: { id: string } | null };
+export type ReceiptQuery = { __typename?: 'Query' } & { receipt?: { id: string } | null };
+export type PairQuery = { first?: { id: string } | null, second?: { id: string } | null };
+"#;
+
+    /// The text the located `symbol` is read at for `field`, when the one
+    /// operation `document` states executes; `None` when the row keeps the
+    /// located symbol as it is.
+    fn located_field_text(symbol: &str, document: &str, field: &str) -> Option<String> {
+        let file = Path::new("types.ts");
+        let (source_map, module) =
+            crate::swc_scanner::parse_standalone_module(file, LOCATED_TYPES).expect("parses");
+        let [operation]: [DocumentOperation; 1] =
+            text_operations(document).try_into().expect("one operation");
+        let located = operation_field_type(&module, symbol, field, &operation, &source_map, file)?;
+        assert_eq!(located.file, file);
+        let lo = (located.lo - SWC_SPAN_BASE) as usize;
+        let hi = (located.hi - SWC_SPAN_BASE) as usize;
+        Some(LOCATED_TYPES[lo..hi].to_string())
+    }
+
+    /// A located type that is the result of the row's whole operation, one
+    /// property per root field, is read at the row's field: the property under
+    /// its response key, the field's alias when it has one. A type alias and an
+    /// interface read the same.
+    #[test]
+    fn a_located_operation_result_is_read_at_the_rows_field() {
+        let document = "query InvoicePage { invoice(id: 1) { id total } settings { prefix } }";
+        assert_eq!(
+            located_field_text("InvoicePageQuery", document, "invoice").as_deref(),
+            Some("{ __typename: 'Invoice', id: string, total: number } | null")
+        );
+        assert_eq!(
+            located_field_text("InvoicePageQuery", document, "settings").as_deref(),
+            Some("{ __typename: 'Settings', prefix: string }")
+        );
+        assert_eq!(
+            located_field_text("CustomerData", "query { customer { id name } }", "customer")
+                .as_deref(),
+            Some("{ id: string; name: string } | null")
+        );
+        assert_eq!(
+            located_field_text("MineQuery", "query { mine: invoices { id } }", "invoices")
+                .as_deref(),
+            Some("Array<{ id: string }>"),
+            "the property is keyed by the field's alias"
+        );
+    }
+
+    /// A located type that is the field's payload keeps the symbol path, even
+    /// when it carries a member named like the field: its own fields are not
+    /// root fields.
+    #[test]
+    fn a_located_payload_type_is_not_read_at_a_member() {
+        assert_eq!(
+            located_field_text("NoteView", "query { note { id body } }", "note"),
+            None
+        );
+        assert_eq!(
+            located_field_text(
+                "FolderView",
+                "query { folder { id folder { id } } }",
+                "folder"
+            ),
+            None,
+            "a payload whose parent is a field of the same name is not the operation"
+        );
+    }
+
+    /// Nothing is read when the located type does not show it is the
+    /// operation's result: a type the module states as an intersection, a type
+    /// missing one of the operation's root fields, a field the operation
+    /// selects twice, or a name the module does not declare.
+    #[test]
+    fn a_located_type_this_pass_cannot_read_keeps_the_symbol_path() {
+        assert_eq!(
+            located_field_text("ReceiptQuery", "query { receipt { id } }", "receipt"),
+            None
+        );
+        assert_eq!(
+            located_field_text(
+                "InvoicePageQuery",
+                "query { invoice(id: 1) { id } settings { prefix } customer { id } }",
+                "invoice"
+            ),
+            None,
+            "the type has no property for the customer root field"
+        );
+        assert_eq!(
+            located_field_text(
+                "PairQuery",
+                "query { first: invoice(id: 1) { id } second: invoice(id: 2) { id } }",
+                "invoice"
+            ),
+            None,
+            "a field selected under two keys has no one property"
+        );
+        assert_eq!(
+            located_field_text("Missing", "query { note { id } }", "note"),
+            None
+        );
+    }
+
+    /// The located symbol resolves the way the symbol path resolves it: through
+    /// the specifier the model gave, from the file the row sits in, or in that
+    /// file when there is none. Only a row with an operation and a located
+    /// symbol is read.
+    #[test]
+    fn a_located_operation_result_resolves_from_the_rows_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write(root.path(), "src/generated/types.ts", LOCATED_TYPES);
+        let page = write(
+            root.path(),
+            "src/pages/Page.tsx",
+            "type PageQuery = { order: { id: string } | null };\nexport const page = 1;\n",
+        );
+        let operation = |document: &str| {
+            let [operation]: [DocumentOperation; 1] =
+                text_operations(document).try_into().expect("one operation");
+            operation
+        };
+        let row = |field: &str, symbol: &str, source: Option<&str>, document: Option<&str>| {
+            let mut op = site_consumer(
+                OperationKey::graphql(GraphqlOperationKind::Query, field),
+                Path::new(&page),
+                3,
+                &operation(document.unwrap_or("query { unused }")),
+                None,
+            );
+            op.operation = document.map(operation);
+            op.consumer_located_type_symbol = Some(symbol.to_string());
+            op.consumer_located_type_source = source.map(str::to_string);
+            op
+        };
+        let mut graphql = GraphqlExtraction {
+            consumers: vec![
+                row(
+                    "invoice",
+                    "InvoicePageQuery",
+                    Some("../generated/types"),
+                    Some("query { invoice(id: 1) { id } settings { prefix } }"),
+                ),
+                row("order", "PageQuery", None, Some("query { order { id } }")),
+                row(
+                    "note",
+                    "NoteView",
+                    Some("../generated/types"),
+                    Some("query { note { id body } }"),
+                ),
+                row("order", "PageQuery", None, None),
+            ],
+            ..Default::default()
+        };
+        let modules = WorkspaceIndex::build_with_aliases(root.path(), None);
+
+        assert_eq!(read_located_result_types(&mut graphql, &modules), 2);
+        let text = |op: &GraphqlOp| {
+            op.located_field_type.as_ref().map(|located| {
+                let source = std::fs::read_to_string(&located.file).expect("module");
+                let lo = (located.lo - SWC_SPAN_BASE) as usize;
+                let hi = (located.hi - SWC_SPAN_BASE) as usize;
+                (
+                    located
+                        .file
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    source[lo..hi].to_string(),
+                )
+            })
+        };
+        assert_eq!(
+            text(&graphql.consumers[0]),
+            Some((
+                "types.ts".to_string(),
+                "{ __typename: 'Invoice', id: string, total: number } | null".to_string()
+            ))
+        );
+        assert_eq!(
+            text(&graphql.consumers[1]),
+            Some(("Page.tsx".to_string(), "{ id: string } | null".to_string()))
+        );
+        assert_eq!(text(&graphql.consumers[2]), None, "a payload type is kept");
+        assert_eq!(
+            text(&graphql.consumers[3]),
+            None,
+            "no operation, nothing read"
         );
     }
 }

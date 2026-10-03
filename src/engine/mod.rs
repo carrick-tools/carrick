@@ -3149,6 +3149,7 @@ async fn analyze_current_repo_incremental(
                 document_sites,
                 &merged_results,
                 repo_path,
+                &service_modules,
                 &mut mount_graph,
                 service,
                 graphql_schemas,
@@ -4000,12 +4001,17 @@ fn withdraw_model_routes_at_definitions(
 /// those rows are placed (carrick#1728). The model answers for the file it
 /// reads, and the row a located type describes sits in that file only after
 /// the placement: before it, the operation is still at its document file or
-/// the module that declares the document, and no locate finds it.
+/// the module that declares the document, and no locate finds it. A located
+/// type that is the result of the row's whole operation is then read at the
+/// row's field (carrick#1760); `modules` resolves the specifier it was located
+/// through.
+#[allow(clippy::too_many_arguments)]
 fn settle_graphql_documents(
     graphql: &mut crate::graphql::GraphqlExtraction,
     document_sites: crate::graphql_document_sites::DocumentSiteConsumers,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
@@ -4013,6 +4019,12 @@ fn settle_graphql_documents(
     fold_graphql_transport_calls(mount_graph, graphql);
     document_sites.apply(graphql);
     merge_graphql_consumer_locations(graphql, file_results, repo_path);
+    let read = crate::graphql_document_sites::read_located_result_types(graphql, modules);
+    if read > 0 {
+        debug!(
+            "GraphQL consumer rows typed at their field from a located operation result type: {read}"
+        );
+    }
     let label = service.service_name.as_deref().unwrap_or("(root)");
     // A schema the service's walk found is one it serves only with evidence
     // that it serves a schema at all (carrick#1189): it declares one, it serves
@@ -5322,10 +5334,15 @@ fn append_protocol_manifest_entries(
             // fall back to the file-analyzer-located co-located type (#268) —
             // the engine merge's isolation guard already guarantees an op never
             // carries both, so this is a plain either/or, not a priority
-            // decision made here.
+            // decision made here. A located type that is the result of the
+            // row's whole operation names the wrapper, not the row's type: the
+            // row reads its field's property instead (carrick#1760).
             op.payload_type_symbol
                 .clone()
-                .or_else(|| op.consumer_located_type_symbol.clone()),
+                .or_else(|| match op.located_field_type {
+                    Some(_) => None,
+                    None => op.consumer_located_type_symbol.clone(),
+                }),
             // Fan-in consumers (multiple repos reading the same field) carry the
             // same latent alias-collision risk the pub/sub publisher path fixes,
             // but neither corpus exercises it today; deferred to #291.
@@ -7891,6 +7908,7 @@ async fn analyze_current_repo(
         document_sites,
         &analysis_result.file_results,
         repo_path,
+        &service_modules,
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
@@ -16343,6 +16361,8 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             declared_result_type: None,
+            operation: None,
+            located_field_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -16370,6 +16390,8 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             declared_result_type: None,
+            operation: None,
+            located_field_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -16566,6 +16588,7 @@ mod tests {
             Default::default(),
             &HashMap::new(),
             "",
+            &modules_without_config(),
             &mut mount_graph,
             &Config::default(),
             &catalogue,
@@ -16611,6 +16634,8 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             declared_result_type: None,
+            operation: None,
+            located_field_type: None,
             schema_binding: None,
             arguments: None,
         }
@@ -17771,6 +17796,126 @@ mod tests {
                 Some(utf16_start + text.encode_utf16().count() as u32)
             ),
             "the span goes out in the sidecar's numbering"
+        );
+    }
+
+    /// carrick#1760: a located type that is the result of the row's whole
+    /// operation was read at the row's field. The row never bundles that
+    /// symbol and its manifest entry names none: it reads the field's
+    /// property through an infer request, as a declared field type does. A
+    /// document's declaration still answers its alias first, and a located
+    /// payload type keeps the symbol path.
+    #[test]
+    fn a_located_operation_result_is_read_at_its_field_not_bundled() {
+        use crate::graphql_document_sites::DeclaredFieldType;
+        use crate::operation::GraphqlOperationKind::Query;
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("types.ts");
+        let source = "export type PageQuery = { invoice: { id: string } | null, settings: { prefix: string } };\nexport type SettingsQuery = { settings: { prefix: string; code: number } };\n";
+        std::fs::write(&module, source).unwrap();
+        let span = |text: &str| {
+            let start = source.find(text).unwrap() as u32;
+            DeclaredFieldType {
+                file: module.clone(),
+                line: 1,
+                lo: start + crate::swc_scanner::SWC_SPAN_BASE,
+                hi: start + text.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+            }
+        };
+        let consumer = |field: &str, file: &str, line: u32| crate::graphql::GraphqlOp {
+            file_path: PathBuf::from(file),
+            line,
+            document_line: line,
+            primary_type_symbol: None,
+            ..graphql_op(Query, field, None)
+        };
+        let mut invoice = consumer("invoice", "src/a.tsx", 4);
+        invoice.consumer_located_type_symbol = Some("PageQuery".to_string());
+        invoice.located_field_type = Some(span("{ id: string } | null"));
+        // First by file and line, but a located type ranks after a declared one.
+        let mut settings_located = consumer("settings", "src/a.tsx", 4);
+        settings_located.consumer_located_type_symbol = Some("PageQuery".to_string());
+        settings_located.located_field_type = Some(span("{ prefix: string }"));
+        let mut settings_declared = consumer("settings", "src/b.tsx", 7);
+        settings_declared.declared_result_type = Some(span("{ prefix: string; code: number }"));
+        let mut note = consumer("note", "src/c.tsx", 2);
+        note.consumer_located_type_symbol = Some("NoteView".to_string());
+        note.consumer_located_type_source = Some("./types".to_string());
+        let graphql = crate::graphql::GraphqlExtraction {
+            consumers: vec![invoice, settings_located, settings_declared, note],
+            ..Default::default()
+        };
+
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let alias = |field: &str| {
+            crate::type_manifest::build_manifest_type_alias(
+                &OperationKey::graphql(Query, field),
+                crate::cloud_storage::ManifestRole::Consumer,
+                crate::cloud_storage::ManifestTypeKind::Response,
+            )
+        };
+        let symbols: Vec<(String, Option<String>)> = orchestrator
+            .collect_graphql_type_requests(&graphql, ".", &modules_without_config())
+            .into_iter()
+            .map(|request| (request.symbol_name, request.alias))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![("NoteView".to_string(), Some(alias("note")))],
+            "the operation's result type is never bundled; the payload type is"
+        );
+
+        let infer: BTreeMap<Option<String>, (Option<u32>, Option<u32>)> = orchestrator
+            .collect_graphql_consumer_infer_requests(&graphql)
+            .into_iter()
+            .map(|request| {
+                assert_eq!(request.infer_kind, InferKind::Expression);
+                assert_eq!(request.file_path, module.to_string_lossy());
+                (request.alias, (request.span_start, request.span_end))
+            })
+            .collect();
+        let sidecar_span = |text: &str| {
+            let start = source.find(text).unwrap() as u32;
+            (Some(start), Some(start + text.len() as u32))
+        };
+        assert_eq!(
+            infer,
+            BTreeMap::from([
+                (
+                    Some(alias("invoice")),
+                    sidecar_span("{ id: string } | null")
+                ),
+                (
+                    Some(alias("settings")),
+                    sidecar_span("{ prefix: string; code: number }")
+                ),
+            ]),
+            "the located row answers its alias; the declaration answers ahead of it"
+        );
+
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql,
+            sockets: Default::default(),
+            library: Default::default(),
+        };
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        let symbols: Vec<(String, Option<String>)> = entries
+            .iter()
+            .map(|entry| (entry.file_path.clone(), entry.primary_type_symbol.clone()))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![
+                ("src/a.tsx".to_string(), None),
+                ("src/a.tsx".to_string(), None),
+                ("src/b.tsx".to_string(), None),
+                ("src/c.tsx".to_string(), Some("NoteView".to_string())),
+            ],
+            "a row read at its field names no symbol for the operation's result"
         );
     }
 
