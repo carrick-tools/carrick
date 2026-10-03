@@ -3,7 +3,8 @@
 # Install Git Hooks for Carrick
 #
 # Copies the tracked hook in scripts/hooks/ into this clone's hooks directory.
-# Run it once after cloning, and again after a change to scripts/hooks/.
+# Run it once after cloning, and again from a checkout of main after a change
+# to scripts/hooks/ merges: every worktree of the clone shares the installed copy.
 #
 
 set -e

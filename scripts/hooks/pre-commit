@@ -22,11 +22,13 @@ echo "🪢 Carrick Pre-Commit Hook"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # The installed hook is a copy, so a change to this file reaches a committer
-# only after the installer runs again. Say so when the two differ.
+# only after the installer runs again. Say so when the two differ, without
+# telling a feature branch to install its copy: the hooks directory is shared
+# by every worktree, so that would replace the hook for all of them.
 TRACKED_HOOK="$REPO_ROOT/scripts/hooks/pre-commit"
 if [ -f "$TRACKED_HOOK" ] && ! cmp -s "$0" "$TRACKED_HOOK"; then
     echo "ℹ️  The installed hook differs from scripts/hooks/pre-commit in this checkout."
-    echo "   To install this checkout's copy: ./scripts/install-hooks.sh"
+    echo "   Once that change is on main, run ./scripts/install-hooks.sh from a checkout of main."
 fi
 
 cd "$REPO_ROOT"

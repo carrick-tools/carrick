@@ -109,7 +109,7 @@ npm ci --prefix lister   # bundler for the surface lister artifact test
 npm run build
 npm test
 ```
-Install hooks once per clone: `./scripts/install-hooks.sh`.
+Install hooks once per clone, and again from a checkout of main after `scripts/hooks/` changes: `./scripts/install-hooks.sh`.
 
 ## Coding Style & Naming Conventions
 - Rust is formatted with `rustfmt`; keep code `cargo fmt` clean and `clippy`-warning free.
