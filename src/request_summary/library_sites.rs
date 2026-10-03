@@ -4100,6 +4100,309 @@ mod tests {
         );
     }
 
+    /// A getter that builds a client on first use into a module-scope `let`
+    /// and returns it (carrick#1790) is read as an own factory of that
+    /// maker's instance, at every call that holds what it returns: `if (!x)
+    /// { x = … }`, `x ??= …`, a comparison with `null`, and a write of what
+    /// another own factory returns.
+    #[test]
+    fn a_client_a_getter_builds_once_into_a_module_let_is_read_where_it_is_held() {
+        let sites = sites_of(&[
+            ("src/queues.ts", QUEUE_FACTORY),
+            (
+                "src/queue.ts",
+                "import { Queue } from \"@fixture/queue\";\n\
+                 import { createQueue } from \"./queues\";\n\
+                 let lazy: Queue | null = null;\n\
+                 export function getQueue(): Queue {\n\
+                 \x20 if (!lazy) {\n\
+                 \x20   lazy = new Queue(\"emails\");\n\
+                 \x20 }\n\
+                 \x20 return lazy!;\n\
+                 }\n\
+                 let nullish: Queue | undefined;\n\
+                 export const getNullish = (): Queue => {\n\
+                 \x20 nullish ??= new Queue(\"audit\");\n\
+                 \x20 return nullish;\n\
+                 };\n\
+                 let owned: Queue | null = null;\n\
+                 export function getOwned() {\n\
+                 \x20 if (owned === null) {\n\
+                 \x20   owned = createQueue(\"owned\");\n\
+                 \x20 }\n\
+                 \x20 return owned;\n\
+                 }\n\
+                 export async function send() {\n\
+                 \x20 const q = getQueue();\n\
+                 \x20 await q.add(\"welcome\", {});\n\
+                 }\n",
+            ),
+            (
+                "src/use.ts",
+                "import { getQueue, getNullish, getOwned } from \"./queue\";\n\
+                 export async function chained() {\n\
+                 \x20 await getQueue().add(\"chained\", {});\n\
+                 }\n\
+                 export async function audited() {\n\
+                 \x20 const audit = getNullish();\n\
+                 \x20 await audit.add(\"entry\", {});\n\
+                 }\n\
+                 export async function ownedSend() {\n\
+                 \x20 const o = getOwned();\n\
+                 \x20 await o.add(\"tick\", {});\n\
+                 }\n",
+            ),
+        ]);
+        for (file, line, maker_file, maker_line, name, holder, called_at) in [
+            (
+                "src/queue.ts",
+                24,
+                "src/queue.ts",
+                6,
+                "emails",
+                Holder::Local,
+                23,
+            ),
+            (
+                "src/use.ts",
+                3,
+                "src/queue.ts",
+                6,
+                "emails",
+                Holder::Chained,
+                3,
+            ),
+            (
+                "src/use.ts",
+                7,
+                "src/queue.ts",
+                12,
+                "audit",
+                Holder::Local,
+                6,
+            ),
+            (
+                "src/use.ts",
+                11,
+                "src/queues.ts",
+                3,
+                "owned",
+                Holder::Local,
+                10,
+            ),
+        ] {
+            let (add, made) = through(&sites, file, line, "add");
+            assert_eq!(add.receiver_ids(), ["instance:new"], "{file}:{line}");
+            assert_eq!(add.specifier, "@fixture/queue", "{file}:{line}");
+            assert_eq!(add.export, "Queue", "{file}:{line}");
+            assert!(made.file.ends_with(maker_file), "{file}:{line}: {made:#?}");
+            assert_eq!(made.line, maker_line, "{file}:{line}");
+            assert_eq!(made.args[0].text.as_deref(), Some(name), "{file}:{line}");
+            assert_eq!(made.holder, holder, "{file}:{line}");
+            let factory = made.factory.as_ref().expect("the getter call");
+            assert!(factory.file.ends_with(file), "{file}:{line}");
+            assert_eq!(factory.line, called_at, "{file}:{line}");
+            assert_eq!(add.contest(on_wire), None, "{file}:{line}: {add:#?}");
+        }
+        // Through another own factory, that factory's uses count too.
+        let (owned, _) = through(&sites, "src/use.ts", 11, "add");
+        assert!(owned.uses.contains(&MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("on".to_string()),
+        }));
+    }
+
+    /// Every call of a getter that builds its client once holds one object,
+    /// so every holder's uses are each holder's (carrick#1790): a member one
+    /// holder calls is classified at every site through the client, a
+    /// holder that hands it on takes it away everywhere, and so does a call
+    /// of the getter that holds what it returns where no site reads it.
+    #[test]
+    fn every_holder_of_a_client_a_getter_builds_once_shares_its_uses() {
+        let getter = |extra: &str| {
+            format!(
+                "import {{ Queue }} from \"@fixture/queue\";\n\
+                 import {{ register }} from \"./registry\";\n\
+                 let lazy: Queue | null = null;\n\
+                 export function get() {{\n\
+                 \x20 if (!lazy) {{\n\
+                 \x20   lazy = new Queue(\"emails\");\n\
+                 \x20 }}\n\
+                 \x20 return lazy;\n\
+                 }}\n\
+                 export async function send() {{\n\
+                 \x20 const held = get();\n\
+                 \x20 await held.add(\"welcome\", {{}});\n\
+                 }}\n\
+                 {extra}"
+            )
+        };
+        let send_in = |extra: &str| {
+            let source = getter(extra);
+            let sites = sites_of(&[
+                ("src/queue.ts", source.as_str()),
+                (
+                    "src/registry.ts",
+                    "export function register(value: unknown) {}\n",
+                ),
+            ]);
+            site(&sites, "src/queue.ts", 12, Some("add")).clone()
+        };
+        let paused = MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("pause".to_string()),
+        };
+        let pause_unlisted = |_: &str, used: &MemberUse| {
+            if used == &paused {
+                MemberWire::Unlisted
+            } else {
+                MemberWire::OnWire
+            }
+        };
+
+        let control = send_in("");
+        assert_eq!(control.contest(pause_unlisted), None);
+
+        let other = send_in("export function stop() { const other = get(); other.pause(); }\n");
+        assert!(other.uses.contains(&paused), "{other:#?}");
+        assert_eq!(
+            other.contest(pause_unlisted),
+            Some(Contest::Member {
+                on: "instance:new".to_string(),
+                used: paused.clone(),
+                wire: MemberWire::Unlisted,
+            })
+        );
+
+        for extra in [
+            "export async function handed() { const out = get(); register(out); await out.add(\"x\", {}); }\n",
+            "export function unread() { register(get()); }\n",
+        ] {
+            let send = send_in(extra);
+            assert_eq!(send.contest(on_wire), Some(Contest::Used), "{extra}");
+        }
+    }
+
+    /// A module `let` read any way but tested and returned, or set by
+    /// anything but one maker handed the same arguments, is no lazily built
+    /// client (carrick#1790): the getter returns no instance and the call
+    /// holding it reads nothing. One returned from anywhere but the getter
+    /// hands the instance on.
+    #[test]
+    fn what_may_be_set_or_read_otherwise_is_no_lazily_built_client() {
+        let service = |declared: &str, extra: &str| {
+            format!(
+                "import {{ Queue }} from \"@fixture/queue\";\n\
+                 import {{ register }} from \"./registry\";\n\
+                 {declared}\n\
+                 export function get() {{\n\
+                 \x20 if (!lazy) {{\n\
+                 \x20   lazy = new Queue(\"emails\");\n\
+                 \x20 }}\n\
+                 \x20 return lazy;\n\
+                 }}\n\
+                 export async function send() {{\n\
+                 \x20 const held = get();\n\
+                 \x20 await held.add(\"welcome\", {{}});\n\
+                 }}\n\
+                 {extra}\n"
+            )
+        };
+        let send_in = |declared: &str, extra: &str| {
+            let source = service(declared, extra);
+            let sites = sites_of(&[
+                ("src/queue.ts", source.as_str()),
+                (
+                    "src/registry.ts",
+                    "export function register(value: unknown) {}\n",
+                ),
+            ]);
+            sites
+                .into_iter()
+                .find(|site| site.file.ends_with("src/queue.ts") && site.line == 12)
+        };
+        let declared = "let lazy: Queue | null = null;";
+        let control = send_in(declared, "").expect("the control reads through its getter");
+        assert_eq!(control.contest(on_wire), None);
+
+        for (declared, extra) in [
+            (declared, "export function reset() { lazy = null; }"),
+            ("export let lazy: Queue | null = null;", ""),
+            (declared, "export { lazy };"),
+            (declared, "register(lazy);"),
+            (
+                declared,
+                "export function direct() { if (lazy) { lazy.pause(); } }",
+            ),
+            (
+                declared,
+                "export function swap() { lazy = new Queue(\"other\"); }",
+            ),
+            (
+                declared,
+                "export function shadow() { const lazy = 1; return lazy; }",
+            ),
+            (declared, "export function drop() { lazy &&= null; }"),
+            (
+                declared,
+                "export function unpack() { [lazy] = [new Queue(\"emails\")]; }",
+            ),
+            (
+                declared,
+                "export function each(all: Queue[]) { for (lazy of all) {} }",
+            ),
+            (
+                "let lazy: any = null;",
+                "export function bump() { lazy++; }",
+            ),
+            ("let lazy: Queue | null = new Queue(\"emails\");", ""),
+            (
+                "var lazy: Queue | null = null; var lazy: Queue | null = null;",
+                "",
+            ),
+        ] {
+            let send = send_in(declared, extra);
+            assert!(send.is_none(), "{declared} {extra}: {send:#?}");
+        }
+
+        for extra in [
+            "export function also() { return lazy; }",
+            "export function later() { return () => lazy; }",
+        ] {
+            let send = send_in(declared, extra).expect(extra);
+            assert_eq!(send.contest(on_wire), Some(Contest::Used), "{extra}");
+        }
+
+        // A getter that returns the `let` on one path and anything else on
+        // another returns no one instance.
+        let mixed = sites_of(&[(
+            "src/mixed.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             let pick: Queue | null = null;\n\
+             export function either(flag: boolean) {\n\
+             \x20 if (flag) {\n\
+             \x20   return new Queue(\"emails\");\n\
+             \x20 }\n\
+             \x20 if (!pick) {\n\
+             \x20   pick = new Queue(\"emails\");\n\
+             \x20 }\n\
+             \x20 return pick;\n\
+             }\n\
+             export async function send() {\n\
+             \x20 const chosen = either(true);\n\
+             \x20 await chosen.add(\"x\", {});\n\
+             }\n",
+        )]);
+        assert!(
+            mixed
+                .iter()
+                .all(|site| !(site.file.ends_with("src/mixed.ts") && site.line == 14)),
+            "{mixed:#?}"
+        );
+    }
+
     /// Own factories that build one of a few makers' instances, each binding
     /// named apart from every other (uses are kept by name across a file).
     const MAKER_SETS: &str = "import { Queue, Worker } from \"@fixture/queue\";\n\

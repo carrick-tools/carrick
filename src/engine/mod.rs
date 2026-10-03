@@ -12995,6 +12995,41 @@ mod tests {
         );
     }
 
+    /// carrick#1790: a client a getter builds once into a module-scope `let`
+    /// is read by the message roles ([`crate::request_summary::library_sites`]);
+    /// an HTTP reading reads nothing through it, whatever the semantics
+    /// verify, held in a function's `const` or called on directly.
+    #[test]
+    fn a_client_a_getter_builds_once_states_no_http_row() {
+        let (dir, discovery) = discover_sources(&[(
+            "src/lazy.ts",
+            "import http from \"@fixture/http\";\n\
+             let api: any = null;\n\
+             export function getApi() {\n\
+             \x20 if (!api) {\n\
+             \x20   api = http.create({ baseURL: \"/v1\" });\n\
+             \x20 }\n\
+             \x20 return api;\n\
+             }\n\
+             export function load() { return getApi().get(\"/users\"); }\n\
+             export function local() { const inner = getApi(); return inner.get(\"/teams\"); }\n",
+        )]);
+        let verified = library_rows_of(&dir, &discovery, "src/lazy.ts", &verified_sample());
+        assert!(
+            verified.iter().all(|row| row.library_semantics.is_empty()),
+            "{verified:#?}"
+        );
+        assert_eq!(
+            verified,
+            library_rows_of(
+                &dir,
+                &discovery,
+                "src/lazy.ts",
+                &crate::client_semantics::LibrarySemantics::default()
+            )
+        );
+    }
+
     /// carrick#1564: a wrapper handed the path is stated at the call that
     /// fills it, and a call through a declaration in another module reaches
     /// the request line, both joined to the instance's base.
