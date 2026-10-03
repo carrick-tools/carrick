@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.104](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.103...carrick-v0.3.104) (2026-10-03)
+
+
+### Bug Fixes
+
+* **findings:** a method mismatch with an unheld call site is a candidate ([#1802](https://github.com/carrick-tools/carrick/issues/1802)) ([3eafd6c](https://github.com/carrick-tools/carrick/commit/3eafd6c1407ae6cc03a0b95c8dcd8cfb801fa75e))
+* **scanner:** a call of an imported helper reaches the route the helper's body requests ([#1800](https://github.com/carrick-tools/carrick/issues/1800)) ([ae70988](https://github.com/carrick-tools/carrick/commit/ae7098869e00f1be38d7ad69aa18d82c4f52a980))
+* **sidecar:** a body of bytes on either side of an http pair is not judged as a JSON shape ([#1797](https://github.com/carrick-tools/carrick/issues/1797)) ([2e689cb](https://github.com/carrick-tools/carrick/commit/2e689cbaa95376f773113eef70d8392452a7ed78))
+* **sidecar:** a service with no tsconfig of its own is typed under the nearest one above it ([#1788](https://github.com/carrick-tools/carrick/issues/1788)) ([6437299](https://github.com/carrick-tools/carrick/commit/6437299f856766bc625a883947c07901deb31985)), closes [#1776](https://github.com/carrick-tools/carrick/issues/1776)
+
 ## [0.3.103](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.102...carrick-v0.3.103) (2026-10-03)
 
 
