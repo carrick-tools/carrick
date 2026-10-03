@@ -239,7 +239,7 @@ pub(crate) fn site_of<'a>(sites: &'a [CallSite], call: &DataCallResult) -> Optio
 /// The operation a row states: the method it will be indexed under and its
 /// consumer path, so two spellings of one base do not read as two operations.
 /// `None` for a row whose method is not an HTTP one.
-fn operation_key(call: &DataCallResult, normalizer: &UrlNormalizer) -> Option<String> {
+pub(crate) fn operation_key(call: &DataCallResult, normalizer: &UrlNormalizer) -> Option<String> {
     let method = crate::agents::file_orchestrator::FileOrchestrator::normalize_consumer_method(
         call.method.as_deref(),
     )?;
@@ -256,6 +256,11 @@ pub(crate) struct ReachedDeclaration {
     pub(crate) file: PathBuf,
     /// The name that module publishes it as.
     pub(crate) published: String,
+    /// The name the declaring module binds it to in its own source
+    /// (`export { load as fetchItems }` binds `load`), which is what its
+    /// declaration is found by. `None` when the export names no local binding,
+    /// or the resolver could not follow the export to its declaration.
+    pub(crate) local: Option<String>,
 }
 
 /// The declaration a call written on `root` reaches, or `None` when `root` is
@@ -287,16 +292,17 @@ pub(crate) fn declaration_reached(
         .map(|module| module.canonicalize().unwrap_or(module))?;
     // The module that DECLARES the binding, which is the module whose rows
     // state the request: a barrel republishing it holds none.
-    let declaring = resolver
-        .resolve_export(&module, &import.imported)
-        .map(|binding| binding.file)
-        .unwrap_or(module);
+    let (declaring, local) = match resolver.resolve_export(&module, &import.imported) {
+        Some(binding) => (binding.file, binding.local_name),
+        None => (module, None),
+    };
     if declaring == canonical {
         return None;
     }
     Some(ReachedDeclaration {
         file: declaring,
         published: import.imported.clone(),
+        local,
     })
 }
 
@@ -325,6 +331,10 @@ pub(crate) struct CallSite {
     /// The root binding the callee is written on (`client` in
     /// `client.list()`).
     pub(crate) root: String,
+    /// The callee IS the root binding (`load(id)`), not a member reached
+    /// through it (`client.list()`), so the call runs the binding's own
+    /// declaration.
+    pub(crate) direct: bool,
     /// What this call states about its own request (carrick#1384): a site that
     /// is a request itself states its own verb, and neither pass looks
     /// elsewhere for it.
@@ -362,23 +372,24 @@ pub(crate) fn read_call_sites(file: &Path) -> Option<FileCalls> {
     })
 }
 
-fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
+pub(crate) fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
     let mut collector = CallCollector::default();
     module.visit_with(&mut collector);
     collector
         .calls
         .into_iter()
-        .filter_map(|(pos, root, request)| {
+        .filter_map(|call| {
             let span = cm
-                .lookup_byte_offset(pos)
+                .lookup_byte_offset(call.pos)
                 .pos
                 .0
                 .checked_add(SWC_SPAN_BASE)?;
             Some(CallSite {
                 span,
-                line: cm.lookup_char_pos(pos).line as u32,
-                root,
-                request,
+                line: cm.lookup_char_pos(call.pos).line as u32,
+                root: call.root,
+                direct: call.direct,
+                request: call.request,
             })
         })
         .collect()
@@ -389,7 +400,14 @@ fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
 /// left out.
 #[derive(Default)]
 struct CallCollector {
-    calls: Vec<(swc_common::BytePos, String, RequestShapeSignal)>,
+    calls: Vec<CollectedCall>,
+}
+
+struct CollectedCall {
+    pos: swc_common::BytePos,
+    root: String,
+    direct: bool,
+    request: RequestShapeSignal,
 }
 
 impl Visit for CallCollector {
@@ -397,11 +415,12 @@ impl Visit for CallCollector {
         if let Callee::Expr(expr) = &node.callee
             && let Some(root) = callee_root(expr)
         {
-            self.calls.push((
-                node.span.lo,
+            self.calls.push(CollectedCall {
+                pos: node.span.lo,
                 root,
-                call_request_verb(node, callee_property(expr).as_deref()),
-            ));
+                direct: matches!(unwrap_expression(expr), Expr::Ident(_)),
+                request: call_request_verb(node, callee_property(expr).as_deref()),
+            });
         }
         node.visit_children_with(self);
     }

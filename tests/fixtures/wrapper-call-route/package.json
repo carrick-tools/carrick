@@ -1,0 +1,7 @@
+{
+  "name": "wrapper-call-route",
+  "private": true,
+  "dependencies": {
+    "@example/http": "1.0.0"
+  }
+}

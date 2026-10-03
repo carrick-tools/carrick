@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:22",
+      "line_number": 22,
+      "target": "/v1/shelves/shared-stats",
+      "method": "GET",
+      "pattern_matched": "request({",
+      "call_expression_text": "request({\n    path: `/v1/shelves/shared-stats?shelfId=${encodeURIComponent(shelfId)}`,\n    method: \"GET\",\n  })",
+      "call_expression_line": 22,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "SharedShelfStats",
+      "type_import_source": null
+    }
+  ]
+}

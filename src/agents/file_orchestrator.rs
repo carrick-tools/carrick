@@ -220,6 +220,10 @@ pub struct ProcessingStats {
     /// Model rows whose verb the declaration they reach stated (carrick#1384),
     /// and the rows left with the model's because it stated no single verb.
     pub wrapper_method_corrections: crate::wrapper_call_method::WrapperMethodCorrections,
+    /// Model rows at a call of an imported function whose route its body
+    /// states (carrick#1794), and the rows left with the model's because the
+    /// body states no single route it writes.
+    pub wrapper_route_corrections: crate::wrapper_call_route::WrapperRouteCorrections,
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
@@ -3123,6 +3127,30 @@ impl FileOrchestrator {
                 stats.graphql_document_site_drops.total(),
                 stats.graphql_document_site_drops.document_argument,
                 stats.graphql_document_site_drops.document_executor
+            );
+        }
+
+        // PHASE 5c1 (carrick#1794): the route at a direct call of an imported
+        // function is the one its body writes and states. The site writes no
+        // URL, the model names one anyway, and where the module declares one
+        // function per sibling route it can name the sibling. Before the verb
+        // pass, so the verb its AST states still has the last word, and before
+        // the two passes after it, which decide which rows state one
+        // operation.
+        let wrapper_route_corrections = crate::wrapper_call_route::correct_wrapper_call_routes(
+            &mut file_results,
+            normalizer,
+            Some(service_modules),
+        );
+        stats.wrapper_route_corrections = wrapper_route_corrections;
+        if wrapper_route_corrections
+            != crate::wrapper_call_route::WrapperRouteCorrections::default()
+        {
+            debug!(
+                "  - Routes read off the body of the function the call reaches: {} (body states \
+                 no single route it writes: {})",
+                wrapper_route_corrections.corrected,
+                wrapper_route_corrections.declaration_unreadable
             );
         }
 
