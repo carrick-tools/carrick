@@ -3724,19 +3724,19 @@ export class TypeInferrer {
     // by (carrick#1843). When the rule also carries originModuleGlobs, the
     // declaration of the name that matched must come from a matching module
     // — names like `Response` are shared by the DOM, frameworks, and HTTP
-    // clients, so a bare name match would unwrap unrelated types.
+    // clients, so a bare name match would unwrap unrelated types. A name
+    // that fails that gate is no match, and the rule's test of members and
+    // origin below still has its turn: a service's alias that shares the
+    // rule's name can stand around the very type the rule verifies.
     const named = readings.filter((reading) =>
       rule.wrapperSymbols?.includes(reading.symbol.getName())
     );
-    if (named.length > 0) {
-      const globs = rule.originModuleGlobs ?? [];
-      const originGated = globs.length > 0;
-      const matched = originGated
-        ? named.find((reading) => this.symbolOriginatesFromModules(reading.symbol, globs))
-        : named[0];
-      if (!matched) {
-        return { kind: 'no-match' };
-      }
+    const globs = rule.originModuleGlobs ?? [];
+    const originGated = globs.length > 0;
+    const matched = originGated
+      ? named.find((reading) => this.symbolOriginatesFromModules(reading.symbol, globs))
+      : named[0];
+    if (matched) {
       const extracted = this.extractPayloadFromWrapper(type, matched, node, rule, config, depth);
       if (extracted) {
         return { kind: 'extracted', result: extracted };

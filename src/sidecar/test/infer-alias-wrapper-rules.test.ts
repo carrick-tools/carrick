@@ -109,6 +109,22 @@ export function loadLocal(id: string) {
 }
 `;
 
+/** A service's own alias, named like a rule's wrapper, around a library interface. */
+const SHADOW_TS = `import type { Envelope } from "tiny-wire";
+
+export interface Receipt {
+  id: string;
+  settled: boolean;
+}
+
+type Reply<T> = Envelope<T>;
+declare function shadowed(url: string): Reply<Receipt>;
+
+export function loadShadowed(id: string) {
+  return shadowed(\`/v1/shadowed/\${id}\`);
+}
+`;
+
 interface Rule {
   wrapperSymbols?: string[];
   machineryIndicators?: string[];
@@ -148,6 +164,7 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
     ({ repoDir, pathOf } = writeWireRepo('carrick-1843-', {
       'service.ts': SERVICE_TS,
       'local.ts': LOCAL_TS,
+      'shadow.ts': SHADOW_TS,
     }));
     client = new SidecarClient();
     await client.start();
@@ -378,6 +395,23 @@ describe('carrick#1843: a wrapper rule that names a type alias unwraps it', () =
       });
       assert.match(inferred.type_string, /status: number/);
       assert.match(inferred.type_string, /body:/);
+    });
+
+    it("still matches by members and origin under a service's alias that shares the rule's name", async () => {
+      // `Reply<Receipt>` here is the library's `Envelope<Receipt>` written
+      // through the service's own `Reply`. The rule's name matches that
+      // alias, which its modules do not declare, so the name is no match.
+      // The rule's members-and-origin test still has its turn, as it did
+      // before a rule could match an alias: the interface is the library's,
+      // and its own argument is the payload.
+      const inferred = await infer(
+        'Shadowed_Response',
+        'shadowed(`',
+        [rule('Reply', { machineryIndicators: ['requestId'] })],
+        { name: 'shadow.ts', text: SHADOW_TS }
+      );
+      assert.strictEqual(collapse(inferred.type_string), 'Receipt');
+      assert.strictEqual(inferred.primary_type_symbol, 'Receipt');
     });
 
     it("unwraps a service's own alias for a rule that names it with no origin", async () => {
