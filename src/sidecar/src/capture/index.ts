@@ -593,7 +593,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
  * sits in the tree. An absolute path into an installed package resolves too
  * (carrick#1773): no emit writes that module, and the specifier rewrite turns
  * the path into the package's bare specifier and a pin, as it does when the
- * emit is whole.
+ * emit is whole. A relative path into a package is not rewritten, so it stays
+ * demoted (carrick#1857).
  *
  * Anchors already demoted stay as they are; anchors whose text is
  * self-contained (node-builder structural prints, literal object text) are

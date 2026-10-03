@@ -22,7 +22,9 @@
  *
  * An alias that names the skipped module is still demoted, by whichever kind
  * of specifier names it, and so is one whose specifier reaches neither a tree
- * module nor an installed package.
+ * module nor an installed package. A RELATIVE path into a package stays
+ * demoted too: no rewrite maps it, so kept it would ship a path out of the
+ * stub (carrick#1857).
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -160,6 +162,8 @@ function captureService(scratch: string, name: string, routes: string): Capture 
         `{ event: import("${repoRoot}/src/events").OrderPlaced; reply: import("${repoRoot}/src/http/routes").RouteReply }`),
       // Named nowhere: not in the tree, not in a package.
       literal('Demoted_AbsNowhere', `{ gone: import("${repoRoot}/src/gone").Gone }`),
+      // A package by a relative path: the rewrite maps only an absolute one.
+      literal('Demoted_RelPackage', '{ total: import("./node_modules/ledgerkit/index").Money }'),
     ],
   });
   assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
@@ -306,6 +310,20 @@ describe('partial emit keeps an alias whose specifier names a module that was no
       surfaceLine(partial.surface, 'Demoted_AbsNowhere'),
       'export type Demoted_AbsNowhere = unknown;'
     );
+  });
+
+  it('a relative path into a package is still demoted: no rewrite maps it (#1857)', () => {
+    const record = partial.records.get('Demoted_RelPackage')!;
+    assert.strictEqual(record.self_check, 'decayed_internal');
+    assert.match(record.capture_failure_reason ?? '', /declaration emit was skipped for module/);
+    assert.strictEqual(
+      surfaceLine(partial.surface, 'Demoted_RelPackage'),
+      'export type Demoted_RelPackage = unknown;'
+    );
+    // What keeping it would ship: on the whole emit the path stays as written,
+    // and the stub cannot resolve it.
+    assert.match(surfaceLine(whole.surface, 'Demoted_RelPackage'), /import\("\.\/node_modules\/ledgerkit\/index"\)/);
+    assert.strictEqual(whole.records.get('Demoted_RelPackage')!.self_check, 'decayed_internal');
   });
 
   it('no declaration in the tree holds a checkout path', () => {
