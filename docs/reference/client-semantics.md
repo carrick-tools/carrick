@@ -269,8 +269,18 @@ an HTTP row.
   no factory. Every call holds the one instance, so each site through it
   takes every holder's member uses and contests, and a call of the function
   that no site reads through (`register(getClient())`, a factory returning
-  the call) takes the instance away everywhere. No call is read through
-  the `let` itself, and HTTP reads nothing through the instance.
+  the call) takes the instance away everywhere. Every call is found by
+  syntax, wherever it is written (a field initialiser, a constructor, a
+  static block, a default parameter) and whether or not the call graph
+  resolved it (carrick#1798). The function's binding, in its module, in
+  every import of it through any re-exports, and as a member of every
+  namespace that publishes it, may only be called: handed on, aliased,
+  returned, read as a member, or reached by a namespace used any other
+  way or a module loaded some other way, it takes the instance away. So
+  does a published function in a service with an import or a load the
+  scan cannot follow, and a class member, which no binding names. No call
+  is read through the `let` itself, and HTTP reads nothing through the
+  instance.
 - **Names a caller fills** (carrick#1562). A library call whose argument
   holds a parameter of the function it is written in (`bus.publish(topic,
   data)` inside `publish(topic, data)`, or a template built from one) states

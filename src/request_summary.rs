@@ -366,7 +366,7 @@ impl ClientRef {
     /// This client, held by a binding the file uses as `used`.
     fn used_as(mut self, used: &BindingUse) -> Self {
         self.contested |= used.contests_client();
-        self.called = used.called.clone();
+        self.called = used.called.keys().cloned().collect();
         self.called_computed = used.called_computed;
         self.contested_message |= used.contests_message();
         self.member_uses = used.member_uses().collect();
@@ -768,9 +768,36 @@ pub struct FileIr {
     /// object this module keeps ([`BindingUse::keeps_entries`]), or a
     /// builder. Read by name, for this module's names and every importer's.
     names: HashMap<String, library_sites::NameValue>,
+    /// Each function declared at module scope that returns the client a
+    /// getter builds into a module `let` on first use (carrick#1790), by
+    /// name, with how this module uses its binding: what accounts for every
+    /// call of the getter (carrick#1798, [`library_sites`]'s
+    /// `share_lazy_clients`). A class member that returns one is no binding
+    /// a call names, so it is not here.
+    getters: HashMap<String, OwnGetter>,
+    /// Where this file starts in the discovery source map
+    /// ([`Self::swc_start`]).
+    source_start: u32,
+}
+
+/// A getter of a lazily built client as the module that declares it uses its
+/// binding (carrick#1798).
+#[derive(Debug, Clone, Default)]
+struct OwnGetter {
+    uses: BindingUse,
+    /// The module publishes the binding: `export function`, `export {}`,
+    /// `export default` or a CommonJS export. A module the scan cannot
+    /// follow may then call it.
+    published: bool,
 }
 
 impl FileIr {
+    /// A span start this file's [`BindingUse`]s record (discovery
+    /// numbering) in SWC numbering, as [`Site::span_start`] is.
+    fn swc_start(&self, lo: u32) -> u32 {
+        lo.saturating_sub(self.source_start) + SWC_SPAN_BASE
+    }
+
     /// The import bindings whose declaring module the summaries read, the
     /// modules the file loads, and, when `every_specifier`, every specifier
     /// it loads a module by ([`crate::call_graph::resolve_call_edges`]'s
@@ -869,6 +896,9 @@ pub fn extract_file_ir(
         value_specifiers,
         loads: module_loads(module, &bound_requires),
         names_commonjs_exports: names_commonjs_exports(module),
+        source_start: source_map
+            .try_lookup_byte_offset(module.span.lo)
+            .map_or(0, |found| found.sf.start_pos.0),
         ..FileIr::default()
     };
     let reader = Reader {
@@ -990,11 +1020,17 @@ pub fn extract_file_ir(
     let module_scope = &module_scope;
     let none = Captured::default();
 
+    // Each function a module-scope binding names, and whether the statement
+    // that declares it publishes it (carrick#1798).
+    let mut bound: HashMap<String, bool> = HashMap::new();
     for item in &module.body {
+        let declared_exported = matches!(item, ModuleItem::ModuleDecl(_));
         match module_decl(item) {
             Some(Decl::Fn(fn_decl)) => {
                 let ir = reader.function(&fn_decl.function, None, module_scope, &none);
-                file.functions.insert(fn_decl.ident.sym.to_string(), ir);
+                let name = fn_decl.ident.sym.to_string();
+                bound.insert(name.clone(), declared_exported);
+                file.functions.insert(name, ir);
             }
             Some(Decl::Var(var)) => {
                 for declarator in &var.decls {
@@ -1009,7 +1045,9 @@ pub fn extract_file_ir(
                         }
                         _ => continue,
                     };
-                    file.functions.insert(ident.id.sym.to_string(), ir);
+                    let name = ident.id.sym.to_string();
+                    bound.insert(name.clone(), declared_exported);
+                    file.functions.insert(name, ir);
                 }
             }
             Some(Decl::Class(class)) => {
@@ -1032,7 +1070,9 @@ pub fn extract_file_ir(
                     function,
                 }) => {
                     let ir = reader.function(function, None, module_scope, &none);
-                    file.functions.insert(ident.sym.to_string(), ir);
+                    let name = ident.sym.to_string();
+                    bound.insert(name.clone(), true);
+                    file.functions.insert(name, ir);
                 }
                 DefaultDecl::Class(ClassExpr {
                     ident: Some(ident),
@@ -1042,6 +1082,21 @@ pub fn extract_file_ir(
                 }
                 _ => {}
             }
+        }
+    }
+    // A getter of a lazily built client (carrick#1790), with how this module
+    // uses its binding, so that every call of it can be accounted for
+    // (carrick#1798).
+    for (name, declared_exported) in bound {
+        let hands_out_shared = file
+            .functions
+            .get(&name)
+            .and_then(|function| function.returned.as_ref())
+            .is_some_and(|returned| returned.makers.iter().any(|made| made.shared.is_some()));
+        if hands_out_shared {
+            let uses = module_scope.uses.get(&name).cloned().unwrap_or_default();
+            let published = declared_exported || uses.exported;
+            file.getters.insert(name, OwnGetter { uses, published });
         }
     }
     // The calls made where the module is loaded (carrick#1661): every
@@ -1271,8 +1326,11 @@ fn only_return(stmts: &[Stmt]) -> Option<&Expr> {
 /// field of `this` keyed `this.<field>` ([`binding_key`]).
 #[derive(Debug, Default, Clone)]
 struct BindingUse {
-    /// The members called through it (`None`: the binding itself called).
-    called: BTreeSet<Option<String>>,
+    /// The members called through it (`None`: the binding itself called),
+    /// each with the span start of every call (discovery numbering, as
+    /// [`Self::returned_at`]). Where a getter's calls are, so that every one
+    /// can be accounted for (carrick#1798).
+    called: BTreeMap<Option<String>, BTreeSet<u32>>,
     /// A member called through it by a key the source does not state
     /// (`api[name](…)`).
     called_computed: bool,
@@ -1368,7 +1426,12 @@ impl BindingUse {
     /// Every use of `other` added to these (one class's uses of a field and
     /// a related class's, carrick#1665).
     fn merge(&mut self, other: &BindingUse) {
-        self.called.extend(other.called.iter().cloned());
+        for (member, at) in &other.called {
+            self.called
+                .entry(member.clone())
+                .or_default()
+                .extend(at.iter().copied());
+        }
         self.called_computed |= other.called_computed;
         self.written |= other.written;
         self.member_read |= other.member_read;
@@ -1410,7 +1473,7 @@ impl BindingUse {
     /// Every member called or constructed through the binding.
     fn member_uses(&self) -> impl Iterator<Item = MemberUse> + '_ {
         self.called
-            .iter()
+            .keys()
             .map(|member| MemberUse {
                 form: MakerForm::Call,
                 path: Vec::new(),
@@ -1524,13 +1587,14 @@ impl BindingUses {
         }
     }
 
-    /// A call's callee: a binding called, or the direct receiver of the
-    /// member called, records nothing; a deeper receiver is read.
-    fn callee(&mut self, callee: &Expr) {
+    /// A call's callee, for the call that starts at `at`: a binding called,
+    /// or the direct receiver of the member called, records the call where
+    /// it is ([`BindingUse::called`]); a deeper receiver is read.
+    fn callee(&mut self, callee: &Expr, at: u32) {
         let callee = crate::graphql_document_sites::unwrap_expression(callee);
         if let Some(key) = binding_key(callee) {
             self.mark(key, |used| {
-                used.called.insert(None);
+                used.called.entry(None).or_default().insert(at);
             });
             return;
         }
@@ -1546,7 +1610,7 @@ impl BindingUses {
             let called = called_member(&member.prop);
             self.mark(key, |used| match called {
                 Some(name) => {
-                    used.called.insert(Some(name));
+                    used.called.entry(Some(name)).or_default().insert(at);
                 }
                 None => used.called_computed = true,
             });
@@ -1691,7 +1755,7 @@ impl Visit for BindingUses {
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
         match &call.callee {
-            Callee::Expr(callee) => self.callee(callee),
+            Callee::Expr(callee) => self.callee(callee, call.span.lo.0),
             other => other.visit_with(self),
         }
         call.args.visit_with(self);
@@ -1705,7 +1769,7 @@ impl Visit for BindingUses {
     fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
         match &*chain.base {
             OptChainBase::Call(call) => {
-                self.callee(&call.callee);
+                self.callee(&call.callee, call.span.lo.0);
                 call.args.visit_with(self);
             }
             OptChainBase::Member(member) => {
@@ -4716,7 +4780,7 @@ impl LinkedClients {
     fn merge(&mut self, held: &(PathBuf, String), used: &BindingUse) {
         if let Some(client) = self.clients.get_mut(held) {
             client.contested |= used.contests_client();
-            client.called.extend(used.called.iter().cloned());
+            client.called.extend(used.called.keys().cloned());
             client.called_computed |= used.called_computed;
             client.contested_message |= used.contests_message();
             client.member_uses.extend(used.member_uses());
@@ -4743,7 +4807,7 @@ impl LinkedClients {
                     if let Some(client) = self.clients.get_mut(&held) {
                         client.contested |= contests;
                         client.contested_message |= contests;
-                        if used.called.contains(&Some(binding.published.clone())) {
+                        if used.called.contains_key(&Some(binding.published.clone())) {
                             client.called.insert(None);
                             client.member_uses.insert(MemberUse {
                                 form: MakerForm::Call,

@@ -74,7 +74,8 @@
 //!     module `let` on first use and returns it is followed the same way
 //!     (carrick#1790, [`Reader::lazy_clients`]), and since every call holds
 //!     that one object, every holder's uses are each site's
-//!     ([`share_lazy_clients`]);
+//!     ([`share_lazy_clients`]), and a getter whose calls cannot all be found
+//!     takes the instance away (carrick#1798, [`GetterHolders`]);
 //!   - a name taken from a parameter, stated again at each call that fills
 //!     it with text ([`LibrarySite::origin`]);
 //!   - an entry of a constant object, an imported constant, and what a
@@ -742,7 +743,11 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
 /// contest. A call of the getter that no site reads the instance through
 /// holds it where nothing here sees its uses (`register(getClient())`, or a
 /// factory that returns the call), so it takes the instance away from
-/// every site. A call the call graph does not resolve is not seen at all.
+/// every site. So does a getter whose calls cannot all be found
+/// (carrick#1798, [`GetterHolders::accounted`]): one written where the call
+/// graph's callers are not read (a field initialiser, a constructor), one
+/// the call graph does not resolve, and a binding of the getter used any way
+/// but called.
 fn share_lazy_clients(
     sites: &mut [LibrarySite],
     callers: &Callers<'_>,
@@ -771,6 +776,7 @@ fn share_lazy_clients(
             }
         }
     }
+    let holders = GetterHolders::link(inputs);
     for (held, group) in &mut shared {
         let functions = inputs.files.get(&held.file).map(|ir| &ir.functions);
         for (key, function) in functions.into_iter().flatten() {
@@ -789,6 +795,9 @@ fn share_lazy_clients(
                     group.contested = true;
                 }
             }
+            if !holders.accounted(&held.file, key, &group.read_at) {
+                group.contested = true;
+            }
         }
     }
     for site in sites.iter_mut() {
@@ -804,6 +813,234 @@ fn share_lazy_clients(
             site.export_uses.extend(group.export_uses.iter().cloned());
         }
     }
+}
+
+/// Every binding in the service that may hold a getter of a lazily built
+/// client (carrick#1798): each import that names one, followed through the
+/// modules that re-export it as [`LinkedClients`] follows a module-scope
+/// instance, and each namespace that publishes one. Read by syntax, wherever
+/// the call is written, whether or not the call graph resolved it.
+struct GetterHolders<'a> {
+    files: &'a HashMap<PathBuf, FileIr>,
+    bindings: &'a super::ImportedBindings,
+    /// (declaring module, getter) -> each binding another module holds it
+    /// by, with the member a call of it names: `None` for an import of the
+    /// getter, the name it is published under for a namespace.
+    held: HashMap<(PathBuf, String), Vec<GetterBinding<'a>>>,
+    /// Getters a module may reach in a way no call records: a namespace
+    /// used any way but calling its members, one published by another
+    /// namespace, or a module loaded other than through an import binding.
+    unaccounted: HashSet<(PathBuf, String)>,
+    /// Some import or load names a module the scan cannot follow, which may
+    /// be the getter's.
+    unfollowable: bool,
+}
+
+/// One binding another module holds a getter by ([`GetterHolders`]).
+struct GetterBinding<'a> {
+    file: &'a Path,
+    used: &'a BindingUse,
+    member: Option<String>,
+}
+
+/// What a binding reaches, followed through the modules that re-export it.
+enum Reached<'a> {
+    Getter((PathBuf, String)),
+    Module(&'a [super::PublishedBinding]),
+    Nothing,
+    Unfollowable,
+}
+
+impl<'a> GetterHolders<'a> {
+    fn link(inputs: &'a RequestSummaryInputs) -> Self {
+        let mut linked = GetterHolders {
+            files: &inputs.files,
+            bindings: &inputs.bindings,
+            held: HashMap::new(),
+            unaccounted: HashSet::new(),
+            unfollowable: !inputs.bindings.unresolved_in().is_empty(),
+        };
+        if inputs.files.values().all(|ir| ir.getters.is_empty()) {
+            return linked;
+        }
+        for (file, ir) in &inputs.files {
+            for (local, used) in &ir.imported {
+                match inputs.bindings.get(file, local) {
+                    Some(super::ImportedBinding::Binding { file: at, name }) => {
+                        match linked.reach(at, name) {
+                            Reached::Getter(getter) => {
+                                linked.held.entry(getter).or_default().push(GetterBinding {
+                                    file,
+                                    used,
+                                    member: None,
+                                });
+                            }
+                            Reached::Module(published) => linked.namespace(file, used, published),
+                            Reached::Nothing => {}
+                            Reached::Unfollowable => linked.unfollowable = true,
+                        }
+                    }
+                    Some(super::ImportedBinding::Module(published)) => {
+                        linked.namespace(file, used, published);
+                    }
+                    Some(
+                        super::ImportedBinding::Unfollowable | super::ImportedBinding::Unresolved,
+                    ) => linked.unfollowable = true,
+                    None => {}
+                }
+            }
+            for specifier in &ir.loads {
+                match inputs.bindings.load(file, specifier) {
+                    Some(super::ImportedBinding::Module(published)) => {
+                        linked.unaccount(published, 0);
+                    }
+                    Some(super::ImportedBinding::Unfollowable) => linked.unfollowable = true,
+                    // `import()` or `require` of a specifier that names
+                    // nothing the scan can find may name the getter's module
+                    // under a name the scan does not know. A relative one
+                    // handed to any other call names a file, not a module
+                    // ([`super::module_loads`]).
+                    Some(super::ImportedBinding::Unresolved)
+                        if !specifier.starts_with("./") && !specifier.starts_with("../") =>
+                    {
+                        linked.unfollowable = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        linked
+    }
+
+    /// What `name` in `file` reaches, following a module that re-exports an
+    /// import (as [`super::declared_client`] does for a module-scope
+    /// instance).
+    fn reach(&self, file: &'a Path, name: &'a str) -> Reached<'a> {
+        let (mut file, mut name) = (file, name);
+        for _ in 0..=super::MAX_REEXPORT_HOPS {
+            let Some(ir) = self.files.get(file) else {
+                return Reached::Nothing;
+            };
+            if ir.getters.contains_key(name) {
+                return Reached::Getter((file.to_path_buf(), name.to_string()));
+            }
+            if !ir.imported.contains_key(name) {
+                return Reached::Nothing;
+            }
+            match self.bindings.get(file, name) {
+                Some(super::ImportedBinding::Binding {
+                    file: at,
+                    name: next,
+                }) => {
+                    (file, name) = (at, next);
+                }
+                Some(super::ImportedBinding::Module(published)) => {
+                    return Reached::Module(published);
+                }
+                Some(super::ImportedBinding::Unfollowable | super::ImportedBinding::Unresolved) => {
+                    return Reached::Unfollowable;
+                }
+                None => return Reached::Nothing,
+            }
+        }
+        Reached::Unfollowable
+    }
+
+    /// A namespace `used` in `file` that publishes `published`: every call
+    /// of a getter's member (`ns.getClient()`) holds the getter's instance,
+    /// and a namespace used any other way may hand any getter on, as it may
+    /// any instance ([`LinkedClients`]).
+    fn namespace(
+        &mut self,
+        file: &'a Path,
+        used: &'a BindingUse,
+        published: &'a [super::PublishedBinding],
+    ) {
+        let handed_on = used.contests_client() || used.called_computed;
+        for binding in published {
+            match self.reach(&binding.file, &binding.name) {
+                Reached::Getter(getter) if handed_on => {
+                    self.unaccounted.insert(getter);
+                }
+                Reached::Getter(getter) => {
+                    self.held.entry(getter).or_default().push(GetterBinding {
+                        file,
+                        used,
+                        member: Some(binding.published.clone()),
+                    });
+                }
+                Reached::Module(inner) => self.unaccount(inner, 0),
+                Reached::Nothing => {}
+                Reached::Unfollowable => self.unfollowable = true,
+            }
+        }
+    }
+
+    /// Every getter `published` reaches, through any namespace it publishes,
+    /// taken as held where no call records it.
+    fn unaccount(&mut self, published: &'a [super::PublishedBinding], depth: usize) {
+        if depth > super::MAX_REEXPORT_HOPS {
+            self.unfollowable = true;
+            return;
+        }
+        for binding in published {
+            match self.reach(&binding.file, &binding.name) {
+                Reached::Getter(getter) => {
+                    self.unaccounted.insert(getter);
+                }
+                Reached::Module(inner) => self.unaccount(inner, depth + 1),
+                Reached::Nothing => {}
+                Reached::Unfollowable => self.unfollowable = true,
+            }
+        }
+    }
+
+    /// Whether every call of the getter `key` declared in `file` is one a
+    /// site reads its instance through (`read_at`, by file and SWC span
+    /// start), and no binding of it is used any way but called. A getter
+    /// that is no module-scope binding (a class member) cannot be followed,
+    /// and a published one cannot be when some module the scan cannot
+    /// follow may import it.
+    fn accounted(&self, file: &Path, key: &str, read_at: &HashSet<(PathBuf, u32)>) -> bool {
+        let Some(own) = self.files.get(file).and_then(|ir| ir.getters.get(key)) else {
+            return false;
+        };
+        let getter = (file.to_path_buf(), key.to_string());
+        if self.unaccounted.contains(&getter) || (own.published && self.unfollowable) {
+            return false;
+        }
+        let read = |at: &Path, used: &BindingUse, member: &Option<String>| {
+            let Some(ir) = self.files.get(at) else {
+                return false;
+            };
+            used.called
+                .get(member)
+                .into_iter()
+                .flatten()
+                .all(|lo| read_at.contains(&(at.to_path_buf(), ir.swc_start(*lo))))
+        };
+        only_called(&own.uses)
+            && read(file, &own.uses, &None)
+            && self.held.get(&getter).into_iter().flatten().all(|binding| {
+                (binding.member.is_some() || only_called(binding.used))
+                    && read(binding.file, binding.used, &binding.member)
+            })
+    }
+}
+
+/// Whether a binding of a getter (carrick#1798) is only called: tested,
+/// compared and exported as well, but never handed on, aliased, returned,
+/// written, spread, read through or called through.
+fn only_called(used: &BindingUse) -> bool {
+    !used.written
+        && !used.member_read
+        && !used.member_tested
+        && !used.spread
+        && !used.other
+        && !used.called_computed
+        && used.library_calls.is_empty()
+        && used.returned_at.is_empty()
+        && used.called.keys().all(Option::is_none)
 }
 
 struct SiteReader<'a> {
@@ -4759,6 +4996,272 @@ mod tests {
         let add = site(&sites, "src/either.ts", 17, Some("add"));
         assert_eq!(add.makers().len(), 2, "{add:#?}");
         assert_eq!(add.contest(on_wire), Some(Contest::Used));
+    }
+
+    /// The site at line 12 of a service whose `src/queue.ts` builds its
+    /// client once in `get`, declared as `declared` (`export function` or
+    /// `function`), with `extra` on line 14 and `others` beside it
+    /// (carrick#1798).
+    fn lazy_send(declared: &str, extra: &str, others: &[(&str, &str)]) -> Option<LibrarySite> {
+        let source = format!(
+            "import {{ Queue }} from \"@fixture/queue\";\n\
+             import {{ register }} from \"./registry\";\n\
+             let lazy: Queue | null = null;\n\
+             {declared} get() {{\n\
+             \x20 if (!lazy) {{\n\
+             \x20   lazy = new Queue(\"emails\");\n\
+             \x20 }}\n\
+             \x20 return lazy;\n\
+             }}\n\
+             export async function send() {{\n\
+             \x20 const held = get();\n\
+             \x20 await held.add(\"welcome\", {{}});\n\
+             }}\n\
+             {extra}\n"
+        );
+        let mut files = vec![
+            ("src/queue.ts", source.as_str()),
+            (
+                "src/registry.ts",
+                "export function register(value: unknown) {}\n",
+            ),
+        ];
+        files.extend_from_slice(others);
+        sites_of(&files)
+            .into_iter()
+            .find(|site| site.file.ends_with("src/queue.ts") && site.line == 12)
+    }
+
+    /// Every call of a getter that builds its client once holds the one
+    /// instance, wherever it is written (carrick#1798): one in a class
+    /// field's initialiser, a constructor, a static block or a default
+    /// parameter holds it as one in a function body does. A call no site
+    /// reads the instance through, or the getter's binding used any way but
+    /// called, takes the instance away from every site.
+    #[test]
+    fn a_getter_call_no_site_reads_takes_its_client_away_wherever_it_is_written() {
+        let control = lazy_send("export function", "", &[]).expect("the control site");
+        assert_eq!(control.contest(on_wire), None);
+        let mut read: Vec<&str> = Vec::new();
+        for extra in [
+            "export function hand() { register(get); }",
+            "export function alias() { const other = get; other(); }",
+            "export function back() { return get; }",
+            "export const table = { get };",
+            "export function maybe() { get?.(); }",
+            "export class Initialised { private held = get(); run() { register(this.held); } }",
+            "export class Constructed { private held: Queue; constructor() { this.held = get(); } run() { register(this.held); } }",
+            "export class Static { static { register(get()); } }",
+            "export function defaulted(held = get()) { register(held); }",
+            "register(get());",
+        ] {
+            let send = lazy_send("export function", extra, &[]).expect(extra);
+            if send.contest(on_wire) != Some(Contest::Used) {
+                read.push(extra);
+            }
+        }
+        assert!(read.is_empty(), "still read through: {read:#?}");
+
+        // A class member that returns the `let` is no binding a call names,
+        // so its calls cannot all be found.
+        let sites = sites_of(&[(
+            "src/svc.ts",
+            "import { Queue } from \"@fixture/queue\";\n\
+             let lazy: Queue | null = null;\n\
+             export class Svc {\n\
+             \x20 static get() {\n\
+             \x20   if (!lazy) {\n\
+             \x20     lazy = new Queue(\"emails\");\n\
+             \x20   }\n\
+             \x20   return lazy;\n\
+             \x20 }\n\
+             }\n\
+             export async function send() {\n\
+             \x20 await Svc.get().add(\"x\", {});\n\
+             }\n",
+        )]);
+        let add = site(&sites, "src/svc.ts", 12, Some("add"));
+        assert_eq!(add.contest(on_wire), Some(Contest::Used), "{add:#?}");
+    }
+
+    /// A class field a getter fills holds the one instance too
+    /// (carrick#1798): the site through the field and every other site
+    /// through the getter share their uses.
+    #[test]
+    fn a_field_a_getter_fills_shares_the_instance_s_uses() {
+        let paused = MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("pause".to_string()),
+        };
+        let added = MemberUse {
+            form: MakerForm::Call,
+            path: Vec::new(),
+            member: Some("add".to_string()),
+        };
+        for holder in [
+            "export class Initialised { private held = get(); stop() { this.held.pause(); } }",
+            "export class Constructed { private held: Queue; constructor() { this.held = get(); } stop() { this.held.pause(); } }",
+        ] {
+            let source = format!(
+                "import {{ Queue }} from \"@fixture/queue\";\n\
+                 import {{ register }} from \"./registry\";\n\
+                 let lazy: Queue | null = null;\n\
+                 export function get() {{\n\
+                 \x20 if (!lazy) {{\n\
+                 \x20   lazy = new Queue(\"emails\");\n\
+                 \x20 }}\n\
+                 \x20 return lazy;\n\
+                 }}\n\
+                 export async function send() {{\n\
+                 \x20 const held = get();\n\
+                 \x20 await held.add(\"welcome\", {{}});\n\
+                 }}\n\
+                 {holder}\n"
+            );
+            let sites = sites_of(&[
+                ("src/queue.ts", source.as_str()),
+                (
+                    "src/registry.ts",
+                    "export function register(value: unknown) {}\n",
+                ),
+            ]);
+            let send = site(&sites, "src/queue.ts", 12, Some("add"));
+            assert!(send.uses.contains(&paused), "{holder}: {send:#?}");
+            assert_eq!(send.contest(on_wire), None, "{holder}");
+            let stop = site(&sites, "src/queue.ts", 14, Some("pause"));
+            assert_eq!(maker(stop).holder, Holder::Field, "{holder}");
+            assert!(stop.uses.contains(&added), "{holder}: {stop:#?}");
+            assert_eq!(stop.contest(on_wire), None, "{holder}");
+        }
+    }
+
+    /// A getter reached from another module any way but a call a site reads
+    /// through takes its client away (carrick#1798): an importer that hands
+    /// it on or holds it in a field, through a re-export or not, a namespace
+    /// that calls it where no site reads, reads it or is handed on, and a
+    /// module loaded some other way. A namespace that calls only the
+    /// module's other functions, or calls the getter where a site reads the
+    /// instance, does not.
+    #[test]
+    fn a_getter_reached_from_another_module_but_by_a_read_call_takes_its_client_away() {
+        for kept in [
+            "import { send } from \"./queue\";\nexport async function run() { await send(); }\n",
+            "import * as queue from \"./queue\";\nexport async function run() { await queue.send(); }\n",
+            "import { get } from \"./queue\";\nexport async function run() { await get().add(\"x\", {}); }\n",
+            "import * as queue from \"./queue\";\nexport async function run() { await queue.get().add(\"x\", {}); }\n",
+            "",
+        ] {
+            let send = lazy_send("export function", "", &[("src/other.ts", kept)]).expect(kept);
+            assert_eq!(send.contest(on_wire), None, "{kept}: {send:#?}");
+        }
+        let mut read: Vec<String> = Vec::new();
+        for others in [
+            vec![(
+                "src/other.ts",
+                "import { get } from \"./queue\";\nimport { register } from \"./registry\";\nexport function hand() { register(get); }\n",
+            )],
+            vec![(
+                "src/other.ts",
+                "import { get as fetchQueue } from \"./queue\";\nexport class Holder { private held = fetchQueue(); }\n",
+            )],
+            vec![
+                ("src/index.ts", "export { get } from \"./queue\";\n"),
+                (
+                    "src/other.ts",
+                    "import { get } from \"./index\";\nimport { register } from \"./registry\";\nexport function hand() { register(get); }\n",
+                ),
+            ],
+            vec![
+                (
+                    "src/index.ts",
+                    "import { get } from \"./queue\";\nexport { get as fetchQueue };\n",
+                ),
+                (
+                    "src/other.ts",
+                    "import { fetchQueue } from \"./index\";\nexport class Holder { private held = fetchQueue(); }\n",
+                ),
+            ],
+            vec![(
+                "src/other.ts",
+                "import * as queue from \"./queue\";\nimport { register } from \"./registry\";\nexport function hand() { register(queue.get()); }\n",
+            )],
+            vec![(
+                "src/other.ts",
+                "import * as queue from \"./queue\";\nimport { register } from \"./registry\";\nexport function hand() { register(queue.get); }\n",
+            )],
+            vec![
+                ("src/index.ts", "export * as queue from \"./queue\";\n"),
+                (
+                    "src/other.ts",
+                    "import { queue } from \"./index\";\nimport { register } from \"./registry\";\nexport function hand() { register(queue.get()); }\n",
+                ),
+            ],
+            vec![(
+                "src/other.ts",
+                "import * as queue from \"./queue\";\nimport { register } from \"./registry\";\nexport function hand() { register(queue); }\n",
+            )],
+            vec![(
+                "src/other.ts",
+                "export async function load() { const queue = await import(\"./queue\"); return queue; }\n",
+            )],
+        ] {
+            let send = lazy_send("export function", "", &others).expect("the site");
+            if send.contest(on_wire) != Some(Contest::Used) {
+                read.push(format!("{others:?}"));
+            }
+        }
+        assert!(read.is_empty(), "still read through: {read:#?}");
+
+        // A default import names the getter as a named one does.
+        let default_import = |body: &str| {
+            let other = format!(
+                "import fetchQueue from \"./queue\";\nimport {{ register }} from \"./registry\";\n{body}\n"
+            );
+            lazy_send(
+                "function",
+                "export default get;",
+                &[("src/other.ts", other.as_str())],
+            )
+            .expect("the site")
+            .contest(on_wire)
+        };
+        assert_eq!(
+            default_import("export async function run() { await fetchQueue().add(\"x\", {}); }"),
+            None
+        );
+        assert_eq!(
+            default_import("export function hand() { register(fetchQueue); }"),
+            Some(Contest::Used)
+        );
+    }
+
+    /// An import the scan cannot follow may name the getter (carrick#1798):
+    /// a getter its module publishes, by any form of export, is then no
+    /// factory, and one the module keeps to itself still is.
+    #[test]
+    fn a_published_getter_in_a_service_the_scan_cannot_follow_takes_its_client_away() {
+        let unresolved = [(
+            "src/other.ts",
+            "import { thing } from \"@missing/alias\";\nexport const value = thing;\n",
+        )];
+        let kept = lazy_send("function", "", &unresolved).expect("an unpublished getter");
+        assert_eq!(kept.contest(on_wire), None, "{kept:#?}");
+        let mut read: Vec<String> = Vec::new();
+        for (declared, extra) in [
+            ("export function", ""),
+            ("function", "export { get };"),
+            ("function", "export { get as fetchQueue };"),
+            ("function", "export default get;"),
+        ] {
+            let followed = lazy_send(declared, extra, &[]).expect(extra);
+            assert_eq!(followed.contest(on_wire), None, "{declared} {extra}");
+            let send = lazy_send(declared, extra, &unresolved).expect(extra);
+            if send.contest(on_wire) != Some(Contest::Used) {
+                read.push(format!("{declared} {extra}"));
+            }
+        }
+        assert!(read.is_empty(), "still read through: {read:#?}");
     }
 
     /// Own factories that build one of a few makers' instances, each binding
