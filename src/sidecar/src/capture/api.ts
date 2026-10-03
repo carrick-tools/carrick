@@ -168,7 +168,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    contract.
  *  - `machinery_envelope`: the return resolved to transport (a
  *    Response/Request-shaped envelope) and no payload was recoverable inside
- *    it or from the handler's returned arguments.
+ *    it or from the handler's returned arguments. On a consumer call result it
+ *    is a decided abstain: what the call's result carrier holds is transport
+ *    the service's wrapper rules verify and read no payload out of, such as a
+ *    request library's own response object (carrick#1841).
  *  - `coerced_input`: a request schema's INPUT is `any`/`unknown` at this
  *    position while its parsed output is concrete, which is what a coercion
  *    declares (carrick#1101). The published type carries the output there, so
