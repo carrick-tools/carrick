@@ -179,6 +179,7 @@ export async function runCheck(
 
   const scrubCtx: ScrubContext = {
     workspaceRoot: ws.workspaceDir,
+    workspaceRealRoot: fs.realpathSync(ws.workspaceDir),
     packageLabelOf: ws.packageLabelOf,
   };
 
@@ -265,6 +266,9 @@ export async function runCheck(
       (install.stderr || install.stdout).trim().slice(0, 2000),
       scrubCtx
     );
+    // The client reads why a check failed from `errors` (carrick#1821), as it
+    // does for an abnormal tsc below.
+    errors.push(`workspace dependency install failed${installError ? `: ${installError}` : ''}`);
     for (const s of opts.stubs) {
       degraded.push({ service_name: s.service_name, reason: 'workspace install failed' });
     }

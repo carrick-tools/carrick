@@ -931,8 +931,6 @@ pub struct CheckV2Result {
     /// missing (soundness over availability — never a silent npm fallback).
     pub isolation: String,
     pub install_ok: bool,
-    #[serde(default)]
-    pub install_error: Option<String>,
     pub ts_version: String,
     #[serde(default)]
     pub verdicts: Vec<CheckVerdict>,
@@ -2069,27 +2067,18 @@ impl TypeSidecar {
         // Keepalives arrive every ~1.5s during install/check, so a per-frame
         // deadline detects a dead sidecar without capping the install itself.
         let value = self.read_result_value(&request_id, OPERATION_TIMEOUT)?;
+        // The sidecar answers `error` exactly when the check failed, and puts
+        // why (an install's output, an abnormal tsc) in `errors`.
         if value.get("status").and_then(|s| s.as_str()) != Some("success") {
             return Err(SidecarError::CheckFailed(frame_errors(&value)));
         }
-        let result: CheckV2Result = serde_json::from_value(
+        serde_json::from_value(
             value
                 .get("result")
                 .cloned()
                 .ok_or_else(|| SidecarError::CheckFailed("no result in response".into()))?,
         )
-        .map_err(|e| SidecarError::DeserializationError(e.to_string()))?;
-        if !result.success {
-            let mut detail = result.errors.join("; ");
-            if let Some(install_error) = &result.install_error {
-                if !detail.is_empty() {
-                    detail.push_str("; ");
-                }
-                detail.push_str(install_error);
-            }
-            return Err(SidecarError::CheckFailed(detail));
-        }
-        Ok(result)
+        .map_err(|e| SidecarError::DeserializationError(e.to_string()))
     }
 
     /// Resolve all types (explicit + inferred) in a single operation.

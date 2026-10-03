@@ -17,6 +17,9 @@
 export interface ScrubContext {
   /** Absolute path of the scratch workspace root (fully removed from output). */
   workspaceRoot: string;
+  /** The same root with symlinks resolved, as a tool that prints real paths
+   * names it (pnpm, under a macOS temp dir). Absent when there is no tree. */
+  workspaceRealRoot?: string;
   /** Workspace package dir (== sanitized service) -> the @carrick/<dir> label. */
   packageLabelOf: (packageDir: string) => string | undefined;
 }
@@ -57,10 +60,13 @@ export function scrubPaths(text: string, ctx: ScrubContext): string {
   let out = text.replace(IMPORT_PATH_RE, (_m, p1: string) => {
     return `import("${labelForImportPath(p1, ctx)}")`;
   });
-  // Defensive: no raw temp path may survive anywhere in the message.
-  if (ctx.workspaceRoot) {
-    out = out.split(ctx.workspaceRoot).join('');
-    out = out.split(ctx.workspaceRoot.split('/').join('\\')).join('');
+  // Defensive: no raw temp path may survive anywhere in the message. The real
+  // root goes first: the given root can be its suffix (`/private/var/...`
+  // against `/var/...`), and stripping that first would strand the prefix.
+  for (const root of [ctx.workspaceRealRoot, ctx.workspaceRoot]) {
+    if (!root) continue;
+    out = out.split(root).join('');
+    out = out.split(root.split('/').join('\\')).join('');
   }
   return out;
 }

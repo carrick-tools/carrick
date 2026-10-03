@@ -189,4 +189,41 @@ describe('check_v2: install failure still degrades service-wide (#438 part 2)', 
     const degraded = result.degraded_services.map((d) => d.service_name).sort();
     assert.deepStrictEqual(degraded, ['orders', 'web']);
   });
+
+  // carrick#1821: the scanner reads why a check failed from `errors`, so the
+  // installer's own output must be there, or every pair reads "no detail".
+  it('a failing install names the installer output in errors', async () => {
+    const pnpmPath = fakeBin(
+      'pnpm-fail-detail',
+      'echo "ERR_FAKE_FETCH GET https://registry.example/missing-pkg error (EPERM)" >&2; exit 1'
+    );
+    const pairs: CheckPairSpec[] = [mk('only', 'P_Res', 'C_Res')];
+    const result = await runCheck({ stubs, pairs, pnpmPath });
+    assert.strictEqual(result.install_ok, false);
+    assert.strictEqual(result.errors.length, 1, JSON.stringify(result.errors));
+    assert.match(result.errors[0], /^workspace dependency install failed: /);
+    assert.match(result.errors[0], /ERR_FAKE_FETCH GET https:\/\/registry\.example\/missing-pkg error \(EPERM\)/);
+  });
+
+  // The installer prints the workspace by its real path. Where the scratch
+  // root sits behind a symlink (the OS temp dir on macOS), scrubbing only the
+  // path the check was given left the link's target in the message.
+  it('a failing install names no part of the workspace path, given or real', async () => {
+    const real = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-real-root-')));
+    const link = path.join(root, 'linked-root');
+    fs.symlinkSync(real, link);
+    try {
+      const pnpmPath = fakeBin(
+        'pnpm-fail-path',
+        'echo "ERR_FAKE_DIR at $(pwd -P)/packages/orders" >&2; exit 1'
+      );
+      const pairs: CheckPairSpec[] = [mk('only', 'P_Res', 'C_Res')];
+      const result = await runCheck({ stubs, pairs, pnpmPath, workspaceRoot: link });
+      assert.deepStrictEqual(result.errors, [
+        'workspace dependency install failed: ERR_FAKE_DIR at /packages/orders',
+      ]);
+    } finally {
+      fs.rmSync(real, { recursive: true, force: true });
+    }
+  });
 });

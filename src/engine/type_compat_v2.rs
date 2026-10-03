@@ -3740,11 +3740,81 @@ mod tests {
     #[test]
     #[serial(v2_capture_sidecar)]
     fn corpus_capture_check_join_end_to_end() {
+        let Some((sidecar, key, all_repo_data)) = corpus_pair() else {
+            return;
+        };
+
+        let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        assert_eq!(outcomes.len(), 1, "exactly one matched pair");
+        let outcome = &outcomes[0];
+        assert_eq!(
+            outcome.bucket,
+            VerdictBucket::Incompatible,
+            "the corpus-2 Money-object vs number mismatch must verdict \
+             incompatible; diagnostic: {:?}",
+            outcome.diagnostic
+        );
+        let diagnostic = outcome.diagnostic.as_deref().unwrap_or("");
+        assert!(
+            !diagnostic.contains("/tmp/") && !diagnostic.contains("/private/"),
+            "diagnostic leaked a scratch path: {diagnostic}"
+        );
+
+        // Pair-ID join onto the CrossRepoMatch edge — structured identity,
+        // no label parsing anywhere.
+        let mut edges = vec![crate::analyzer::CrossRepoMatch {
+            producer_repo: "orders-engine".to_string(),
+            producer_key: key.canonical(),
+            consumer_repo: "billing-svc".to_string(),
+            consumer_key: key.canonical(),
+            consumer_location: Some("src/billing-call.ts:5:9".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        }];
+        crate::analyzer::apply_pair_outcomes(&outcomes, &mut edges);
+        assert_eq!(
+            edges[0].type_compatible,
+            Some(false),
+            "the incompatible verdict must land on the edge"
+        );
+        assert!(edges[0].mismatch_reason.is_some());
+
+        // Determinism: a second independent check run yields the same
+        // outcomes (pair keys, buckets, diagnostics).
+        let outcomes_again = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
+        let flat = |v: &[PairCheckOutcome]| {
+            v.iter()
+                .map(|o| {
+                    format!(
+                        "{}|{:?}|{}",
+                        o.pair_key,
+                        o.bucket,
+                        o.diagnostic.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            flat(&outcomes),
+            flat(&outcomes_again),
+            "check outcomes must be byte-stable across runs"
+        );
+    }
+
+    /// The corpus-2 fixture pair captured through the Rust client, as
+    /// `run_check` reads it: a sidecar init'd on the producer, the pair's
+    /// operation, and both services' repo data. `None` when the sidecar is
+    /// not built.
+    fn corpus_pair() -> Option<(TypeSidecar, OperationKey, Vec<CloudRepoData>)> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
         if !sidecar_path.exists() {
             eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
-            return;
+            return None;
         }
         let orders_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/orders-engine");
         let billing_repo = manifest_dir.join("tests/fixtures/xrepo-corpus-2/billing-svc");
@@ -3838,65 +3908,46 @@ mod tests {
                 Some(billing_artifact),
             ),
         ];
+        Some((sidecar, key, all_repo_data))
+    }
+
+    /// carrick#1821: when the check workspace's install fails, every pair the
+    /// check would have compared says why, in the installer's own words, not
+    /// "sidecar returned an error with no detail". The producer's stub names a
+    /// dependency at a directory that does not exist, which the vendored pnpm
+    /// refuses before it reaches any registry.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_failed_install_reaches_the_pair_in_the_installers_words() {
+        let Some((sidecar, _key, mut all_repo_data)) = corpus_pair() else {
+            return;
+        };
+        let manifest = all_repo_data[0]
+            .capture_stub
+            .as_mut()
+            .expect("producer artifact")
+            .files
+            .get_mut("package.json")
+            .expect("stub package.json");
+        let mut pkg: serde_json::Value = serde_json::from_str(manifest).expect("package.json");
+        pkg["dependencies"]["carrick-absent-dependency"] =
+            serde_json::json!("file:./does-not-exist");
+        *manifest = pkg.to_string();
 
         let outcomes = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
         assert_eq!(outcomes.len(), 1, "exactly one matched pair");
         let outcome = &outcomes[0];
-        assert_eq!(
-            outcome.bucket,
-            VerdictBucket::Incompatible,
-            "the corpus-2 Money-object vs number mismatch must verdict \
-             incompatible; diagnostic: {:?}",
-            outcome.diagnostic
-        );
-        let diagnostic = outcome.diagnostic.as_deref().unwrap_or("");
+        assert_eq!(outcome.bucket, VerdictBucket::Unverifiable);
+        let reason = outcome.unresolved_reason.as_deref().unwrap_or("");
         assert!(
-            !diagnostic.contains("/tmp/") && !diagnostic.contains("/private/"),
-            "diagnostic leaked a scratch path: {diagnostic}"
+            reason.contains("workspace dependency install failed: ")
+                && reason.contains("ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND"),
+            "the reason must carry the installer's output: {reason}"
         );
-
-        // Pair-ID join onto the CrossRepoMatch edge — structured identity,
-        // no label parsing anywhere.
-        let mut edges = vec![crate::analyzer::CrossRepoMatch {
-            producer_repo: "orders-engine".to_string(),
-            producer_key: key.canonical(),
-            consumer_repo: "billing-svc".to_string(),
-            consumer_key: key.canonical(),
-            consumer_location: Some("src/billing-call.ts:5:9".to_string()),
-            match_score: 1.0,
-            type_compatible: None,
-            type_verdict: None,
-            mismatch_reason: None,
-            producer_provenance: Default::default(),
-            relationship: carrick_match::MatchRelationship::ProducerConsumer,
-        }];
-        crate::analyzer::apply_pair_outcomes(&outcomes, &mut edges);
-        assert_eq!(
-            edges[0].type_compatible,
-            Some(false),
-            "the incompatible verdict must land on the edge"
-        );
-        assert!(edges[0].mismatch_reason.is_some());
-
-        // Determinism: a second independent check run yields the same
-        // outcomes (pair keys, buckets, diagnostics).
-        let outcomes_again = run_check(&sidecar, &all_repo_data, &LocalConsumers::new());
-        let flat = |v: &[PairCheckOutcome]| {
-            v.iter()
-                .map(|o| {
-                    format!(
-                        "{}|{:?}|{}",
-                        o.pair_key,
-                        o.bucket,
-                        o.diagnostic.as_deref().unwrap_or("")
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            flat(&outcomes),
-            flat(&outcomes_again),
-            "check outcomes must be byte-stable across runs"
+        assert!(!reason.contains("no detail"), "reason: {reason}");
+        assert!(
+            !reason.contains("/tmp/") && !reason.contains("/private/"),
+            "reason leaked a scratch path: {reason}"
         );
     }
 
