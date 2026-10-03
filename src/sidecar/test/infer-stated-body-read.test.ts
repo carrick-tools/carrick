@@ -58,6 +58,20 @@ export const findMember = async (): Promise<Member | null> => {
   return found ? found[0] : null;
 };
 
+export const listOpen = async (): Promise<Member[]> => {
+  const response = await fetchReply("/v1/members-open");
+  const data: unknown = await response.json();
+  if (!Array.isArray(data)) {
+    throw new Error("not a list");
+  }
+  return data as Member[];
+};
+
+export const listLoose = async (): Promise<Record<string, unknown>> => {
+  const response = await fetchReply("/v1/members-loose");
+  return (await response.json()) as Record<string, unknown>;
+};
+
 type Loader = () => Promise<unknown>;
 
 export const loadLoose: Loader = async () => {
@@ -74,6 +88,8 @@ declare class Chain<T> {
 
 declare function request(url: string): Chain<unknown>;
 declare function hasBody(value: unknown): boolean;
+
+type Opaque = unknown;
 
 type SearchHit = { registrationNumber: string; name: string; city?: string };
 type SearchResponse = { results: SearchHit[]; messageKey?: string };
@@ -97,6 +113,8 @@ export const searchUncast = (query: string): Chain<Suggestions> => {
   return request(\`/v1/search-uncast?q=\${query}\`).mapOk((response) => {
     const label = String(response) as string;
     void (response as unknown);
+    void (response as Record<string, unknown>);
+    void (response as Opaque);
     return { suggestions: [{ value: label, label: query }] };
   });
 };
@@ -221,6 +239,15 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       assert.strictEqual(inferred.stated_body?.array_depth, 1);
     });
 
+    it('does not report a statement that leaves a position open', async () => {
+      // \`unknown\` at the read is a placeholder the source narrows later; a
+      // model symbol taken from the later cast must not lose to it.
+      const open = await infer('MembersOpen_Response', 'fetchReply("/v1/members-open")');
+      assert.strictEqual(open.stated_body, undefined);
+      const loose = await infer('MembersLoose_Response', 'fetchReply("/v1/members-loose")');
+      assert.strictEqual(loose.stated_body, undefined);
+    });
+
     it('does not report an annotation further out than the read', async () => {
       // The declared type of the function the read sits in describes the
       // function, not the body; the read itself states nothing.
@@ -242,18 +269,21 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
     });
 
     it('states nothing when no callback casts the body itself to a type', async () => {
-      // One cast is of another value, one is of the body to \`unknown\`: neither
-      // says what the body is.
+      // One cast is of another value; the others are of the body to a type
+      // with a position left open, written or behind an alias: none says what
+      // the body is.
       const inferred = await infer(
         'SearchUncast_Response',
         'request(`/v1/search-uncast?q=${query}`)'
       );
       assert.strictEqual(inferred.stated_body, undefined);
+      assert.strictEqual(inferred.is_explicit, false, 'no cast was read as the body');
     });
 
     it('states nothing when two callbacks cast an unread value', async () => {
       const inferred = await infer('SearchTwo_Response', 'request(`/v1/search-two?q=${query}`)');
       assert.strictEqual(inferred.stated_body, undefined);
+      assert.strictEqual(inferred.is_explicit, false, 'no cast was read as the body');
       assert.ok(
         !/registrationNumber/.test(inferred.type_string),
         `two candidate reads must not pick one, got: ${inferred.type_string}`
@@ -263,6 +293,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
     it('does not read a parameter typed any', async () => {
       const inferred = await infer('SearchAny_Response', 'request(`/v1/search-any?q=${query}`)');
       assert.strictEqual(inferred.stated_body, undefined);
+      assert.strictEqual(inferred.is_explicit, false, 'no cast was read as the body');
     });
   });
 });

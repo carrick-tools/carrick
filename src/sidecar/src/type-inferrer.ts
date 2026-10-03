@@ -1879,7 +1879,7 @@ export class TypeInferrer {
   private statedBodyAtRead(terminal: Node): StatedBody | undefined {
     const typeNode = this.explicitTypeNodeFromAncestor(terminal);
     const owner = typeNode?.getParent();
-    if (!typeNode || !owner) return undefined;
+    if (!typeNode || !owner || this.leavesAPositionOpen(typeNode)) return undefined;
     let current: Node = terminal;
     for (;;) {
       if (current === owner) break;
@@ -1905,6 +1905,18 @@ export class TypeInferrer {
       current = parent;
     }
     return this.statedRoot(typeNode);
+  }
+
+  /**
+   * A stated type with `any` or `unknown` written anywhere in it (`unknown`,
+   * `Record<string, unknown>`, `{ items: any[] }`) leaves a position open: it
+   * is a placeholder the source narrows later (`const data: unknown = await
+   * res.json()`, then `data as Entry[]`), not its statement of the body.
+   */
+  private leavesAPositionOpen(typeNode: Node): boolean {
+    const open = (node: Node): boolean =>
+      node.getKind() === SyntaxKind.AnyKeyword || node.getKind() === SyntaxKind.UnknownKeyword;
+    return open(typeNode) || typeNode.getDescendants().some(open);
   }
 
   /**
@@ -3034,7 +3046,8 @@ export class TypeInferrer {
   /**
    * The casts of a callback's first parameter, when the compiler types that
    * parameter `unknown`: `response as T` and `<T>response`, the operand being
-   * the parameter itself. A cast to a top type states nothing and is skipped.
+   * the parameter itself. A cast that leaves a position open states nothing
+   * about the body and is skipped.
    */
   private castsOfUnreadParameter(callback: ArrowFunction | FunctionExpression): Node[] {
     const param = callback.getParameters()[0];
@@ -3052,7 +3065,13 @@ export class TypeInferrer {
       }
       if (!Node.isIdentifier(operand) || operand.getSymbol() !== symbol) return false;
       const stated = node.getType();
-      return !stated.isAny() && !stated.isUnknown();
+      const statedNode = node.getTypeNode();
+      return (
+        !!statedNode &&
+        !stated.isAny() &&
+        !stated.isUnknown() &&
+        !this.leavesAPositionOpen(statedNode)
+      );
     });
   }
 
