@@ -378,6 +378,68 @@ fn a_withdrawn_row_resolves_no_type() {
     }
 }
 
+/// An anchor the inference fills states where its type is declared
+/// (carrick#1819). The answers name no type for any call here, so both
+/// anchors below are the compiler's, and each carries the declaration the
+/// compiler resolved:
+///
+/// - `orders.service.ts:24` publishes `order`, an `Order`, which the same file
+///   declares at line 8;
+/// - `inventory.listener.ts:9` subscribes with a parameter typed `FeedEvent`,
+///   which the file imports by name from `realtime/feed.service.ts`, where it
+///   is declared at line 3. The home is the declaring file, not the reader.
+///
+/// Needs the sidecar built (`src/sidecar`), as CI builds it before this step.
+#[test]
+fn an_anchor_the_inference_fills_states_its_home() {
+    let scan = scan();
+    assert!(
+        !scan.blob["bundled_types"].is_null(),
+        "the blob has no bundled_types: the sidecar did not run, so this test checks nothing"
+    );
+    let anchored_at = |file: &str, line: u64| -> (serde_json::Value, serde_json::Value) {
+        let entries: Vec<&serde_json::Value> = scan.blob["type_manifest"]
+            .as_array()
+            .expect("type_manifest")
+            .iter()
+            .filter(|entry| {
+                entry["protocol"] == "pubsub"
+                    && entry["file_path"] == file
+                    && entry["line_number"] == line
+                    && !entry["primary_type_symbol"].is_null()
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one anchored entry at {file}:{line}: {entries:#?}"
+        );
+        (
+            entries[0]["primary_type_symbol"].clone(),
+            entries[0]["defined_in"].clone(),
+        )
+    };
+
+    assert_eq!(
+        anchored_at(ORDERS, 24),
+        (
+            serde_json::json!("Order"),
+            serde_json::json!({ "file_path": ORDERS, "line_number": 8, "symbol": "Order" })
+        )
+    );
+    assert_eq!(
+        anchored_at(LISTENER, 9),
+        (
+            serde_json::json!("FeedEvent"),
+            serde_json::json!({
+                "file_path": "src/realtime/feed.service.ts",
+                "line_number": 3,
+                "symbol": "FeedEvent",
+            })
+        )
+    );
+}
+
 /// The second scan of an unchanged tree reuses the model's cached answers and
 /// builds its rows on the incremental path, which withdraws the same rows.
 #[test]

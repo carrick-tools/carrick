@@ -1108,12 +1108,16 @@ pub struct InferredType {
     /// of the bare element. Absent when 0 or when there is no anchor symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
-    /// Declaration file (absolute path) of `primary_type_symbol`, reported by
-    /// the pub/sub infer kinds (`function_param`, `expression`) only (#413).
-    /// `demote_witnessed_borrowed_anchors` uses it to re-aim a demoted
-    /// explicit `SymbolRequest`: the bundler resolves a symbol only against
-    /// declarations IN the request's `source_file`, and the inference is the
-    /// only party that knows where the tsc-witnessed payload type lives.
+    /// Declaration file (absolute path) of `primary_type_symbol`. Not every
+    /// inference reports it: the pub/sub infer kinds (`function_param`,
+    /// `expression`) do (#413), and so does a response whose anchor was read
+    /// off the annotation as written (carrick#768). Two readers:
+    /// `demote_witnessed_borrowed_anchors` re-aims a demoted explicit
+    /// `SymbolRequest` at it, because the bundler resolves a symbol only
+    /// against declarations IN the request's `source_file` and the inference
+    /// is the only party that knows where the tsc-witnessed payload type
+    /// lives; and the engine's `anchor_inferred_symbols` states it as the home
+    /// of an anchor it fills (carrick#1819).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol_source: Option<String>,
     /// Why this inference carries `any`/`unknown` (carrick#376), recorded by
