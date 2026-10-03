@@ -2738,6 +2738,22 @@ export class TypeInferrer {
       }
     }
 
+    // carrick#1851: the source reads the body in place on the call's own
+    // value, `const body = await (await fetch(url)).text()`. No binding holds
+    // the response, so the walk below has nothing to follow, and the call
+    // itself would stand as the terminal and publish the transport object.
+    // The read is the terminal, as it is when the walk finds it on a binding,
+    // and a call that takes the read and states what it returns says more
+    // than the read does (carrick#1382).
+    const inPlaceRead = this.bodyReadOnCallValue(callExpr);
+    if (inPlaceRead) {
+      return {
+        terminal: this.statedPayloadAroundBodyRead(inPlaceRead) ?? inPlaceRead,
+        projectionOnly: false,
+        projections: [],
+      };
+    }
+
     const binding = this.extractBindingFromCall(callExpr);
     if (binding && func) {
       let currentNames = binding.names;
@@ -3385,17 +3401,46 @@ export class TypeInferrer {
   }
 
   /**
-   * The zero-argument whole-body read that takes `identifier` as its receiver,
+   * The zero-argument whole-body read taken in place on the value `callExpr`
+   * yields, or `undefined` (carrick#1851): `(await fetch(url)).text()`. The
+   * receiver is the call itself, through the wrappers that leave a value as
+   * it is (parentheses, `await`, `!`), so it is the same read
+   * `bodyReadOnReceiver` finds on a binding of that value. A call that is not
+   * awaited first is read the same way: a request that is a promise and reads
+   * its own body (`send(url).json()`) yields the body from that read too.
+   */
+  private bodyReadOnCallValue(callExpr: CallExpression): Node | undefined {
+    let value: Node = callExpr;
+    for (;;) {
+      const parent = value.getParent();
+      if (
+        !parent ||
+        !(
+          Node.isParenthesizedExpression(parent) ||
+          Node.isAwaitExpression(parent) ||
+          Node.isNonNullExpression(parent)
+        ) ||
+        parent.getExpression() !== value
+      ) {
+        break;
+      }
+      value = parent;
+    }
+    return this.bodyReadOnReceiver(value);
+  }
+
+  /**
+   * The zero-argument whole-body read that takes `receiver` as its receiver,
    * `res.json()` or `res.text()`, or `undefined`. A text read is a body read
    * like a json one (carrick#1842): without it, `return res.text()` left the
    * walk on the response binding and published the transport object.
    */
-  private bodyReadOnReceiver(identifier: Node): Node | undefined {
-    const access = identifier.getParent();
+  private bodyReadOnReceiver(receiver: Node): Node | undefined {
+    const access = receiver.getParent();
     if (
       !access ||
       !Node.isPropertyAccessExpression(access) ||
-      access.getExpression() !== identifier ||
+      access.getExpression() !== receiver ||
       !WHOLE_BODY_READS.has(access.getName())
     ) {
       return undefined;
