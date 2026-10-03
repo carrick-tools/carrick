@@ -8,6 +8,16 @@ export function isRelative(spec: string): boolean {
   return spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/');
 }
 
+/**
+ * A Deno `npm:` specifier as the npm package specifier a stub imports:
+ * `npm:@scope/pkg@^1/sub` -> `@scope/pkg/sub`. Any other specifier is
+ * returned unchanged.
+ */
+export function npmPackageSpecifier(spec: string): string {
+  const npm = /^npm:\/?(.*)$/.exec(spec)?.[1];
+  return npm === undefined ? spec : npm.replace(/^(@[^/]+\/[^/@]+|[^/@]+)@[^/]+/, '$1');
+}
+
 /** zod -> zod, @scope/pkg/sub -> @scope/pkg, pkg/sub -> pkg */
 export function packageNameOf(spec: string): string {
   const parts = spec.split('/');

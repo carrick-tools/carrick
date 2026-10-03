@@ -759,12 +759,22 @@ function resolveAnchors(
         );
       }
     }
+    // A module specifier as the entry resolves it, under the program's own
+    // resolution (the Deno graph's, for a Deno service).
+    const entryMode = entrySource?.impliedNodeFormat;
+    const resolveFromEntry = (specifier: string): string | undefined =>
+      (deno
+        ? deno.resolve(specifier, ctx.entryPath, options)
+        : ts.resolveModuleName(specifier, ctx.entryPath, options, ts.sys, undefined, undefined, entryMode)
+            .resolvedModule
+      )?.resolvedFileName;
     return opts.anchors.map((request) =>
       resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,
         entryDir: ctx.entryDir,
         placeholder: placeholders.get(request.alias),
         siblingSymbolSpecs,
+        resolveFromEntry,
       })
     );
   } finally {
