@@ -38,6 +38,7 @@ use crate::{
         whole_url_local_default, whole_url_target_binding,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
+    forwarded_body::CallBody,
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
     imported_request_member::{
@@ -3913,24 +3914,42 @@ impl FileOrchestrator {
                     }
                 }
 
-                // A call through a declaration in another module (carrick#1733)
-                // hands the member its parameters, and the member builds the
-                // body: what the model anchored at this site is an argument,
-                // not the request body. The member's own request line states
-                // the body; this site states none.
-                if should_infer_request_body(&method)
-                    && data_call.resolution_source != Some(ResolutionSource::ImportedMember)
-                {
-                    push_infer(
-                        &file_path_absolute,
-                        line_number,
-                        InferKind::RequestBody,
-                        request_alias.clone(),
-                        InferLocator::Text {
-                            expression_text: data_call.payload_expression_text.as_deref(),
-                            expression_line: data_call.payload_expression_line,
-                        },
-                    );
+                // A call to a function the service declares hands it its
+                // parameters (carrick#1782), and what the model anchored at
+                // the site is one of them. The body there is the declared
+                // parameter the function sends unchanged, read where it is
+                // declared, so a literal argument is typed against that
+                // declaration rather than widened on its own; a function that
+                // builds its own body leaves the site none, its own request
+                // line states it.
+                if should_infer_request_body(&method) {
+                    match &data_call.call_body {
+                        None => {
+                            push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::RequestBody,
+                                request_alias.clone(),
+                                InferLocator::Text {
+                                    expression_text: data_call.payload_expression_text.as_deref(),
+                                    expression_line: data_call.payload_expression_line,
+                                },
+                            );
+                        }
+                        Some(CallBody::Param(param)) => {
+                            push_infer(
+                                &Self::to_absolute_path(&param.file, &repo_root_absolute),
+                                param.line,
+                                InferKind::RequestBody,
+                                request_alias.clone(),
+                                InferLocator::Span {
+                                    span_start: Some(param.span_start),
+                                    span_end: Some(param.span_end),
+                                },
+                            );
+                        }
+                        Some(CallBody::Built) => {}
+                    }
                 }
             }
         }
@@ -6430,6 +6449,20 @@ impl FileOrchestrator {
             // own source.
             if let Some(resolved) = resolved_members.get(&candidate.span_start) {
                 let member = &resolved.member;
+                // The call hands the member its parameters: what the body at
+                // the site is follows from what the member sends
+                // (carrick#1782).
+                let row = DataCallResult {
+                    call_body: member.body.clone(),
+                    ..Self::deterministic_call(
+                        candidate,
+                        line,
+                        member.target.clone(),
+                        Some(member.method.clone()),
+                        ResolutionSource::ImportedMember,
+                        None,
+                    )
+                };
                 claim(Resolved {
                     method: Some(member.method.clone()),
                     url: member.target.clone(),
@@ -6437,14 +6470,7 @@ impl FileOrchestrator {
                     line,
                     source: ResolutionSource::ImportedMember,
                     emits: true,
-                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
-                        candidate,
-                        line,
-                        member.target.clone(),
-                        Some(member.method.clone()),
-                        ResolutionSource::ImportedMember,
-                        None,
-                    ))),
+                    row: ResolvedRow::Call(Box::new(row)),
                 });
             }
 
@@ -6627,6 +6653,7 @@ impl FileOrchestrator {
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 })),
             });
         }
@@ -6752,6 +6779,7 @@ impl FileOrchestrator {
                 body_literals: row.body_literals.clone(),
                 library_semantics: row.library_semantics.clone(),
                 at_caller: row.at_caller,
+                call_body: row.call_body.clone(),
             })),
         }
     }
@@ -6948,6 +6976,9 @@ impl FileOrchestrator {
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            // Set by the one claim here that reads a call to a declared
+            // function, the imported-member join (carrick#1782).
+            call_body: None,
         }
     }
 
@@ -11840,6 +11871,7 @@ export * from "./aFetch.js";"#,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -11899,6 +11931,7 @@ export * from "./aFetch.js";"#,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 }
             };
 
@@ -11986,6 +12019,7 @@ export * from "./aFetch.js";"#,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 }],
                 ..Default::default()
             },
@@ -12157,6 +12191,7 @@ export * from "./aFetch.js";"#,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         }
     }
 
@@ -12614,6 +12649,7 @@ export * from "./aFetch.js";"#,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
                 at_caller: false,
+                call_body: None,
             }],
             ..Default::default()
         };
@@ -12709,6 +12745,7 @@ export * from "./aFetch.js";"#,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         };
 
         let mut file_results = HashMap::new();
@@ -12836,6 +12873,7 @@ export * from "./aFetch.js";"#,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         };
 
         let mut file_results = HashMap::new();
@@ -12936,6 +12974,7 @@ export * from "./aFetch.js";"#,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -13030,6 +13069,7 @@ export * from "./aFetch.js";"#,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
                         at_caller: false,
+                        call_body: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -13056,6 +13096,7 @@ export * from "./aFetch.js";"#,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
                         at_caller: false,
+                        call_body: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -13119,6 +13160,7 @@ export * from "./aFetch.js";"#,
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -13185,6 +13227,7 @@ export * from "./aFetch.js";"#,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
                         at_caller: false,
+                        call_body: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -13211,6 +13254,7 @@ export * from "./aFetch.js";"#,
                         body_literals: Default::default(),
                         library_semantics: Vec::new(),
                         at_caller: false,
+                        call_body: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -13281,6 +13325,7 @@ export * from "./aFetch.js";"#,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller,
+            call_body: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -13345,18 +13390,34 @@ export * from "./aFetch.js";"#,
         );
     }
 
-    /// carrick#1733: a row the imported-member join states at a call through
-    /// a member carries the member's call, and its arguments are the member's
-    /// parameters: the member builds the body its own request line states. So
-    /// the payload a model row folded onto it anchors (`note.trim()`) is not
-    /// the request body, and no request type is asked for. Its response is
-    /// still asked for, and a model row's own request side beside it still is.
+    /// carrick#1782: a row at a call to a function the service declares asks
+    /// for the request body the function's parameters say the call sends.
+    ///
+    /// - The function builds its body (or sends none): the payload a model row
+    ///   folded onto the site (`note.trim()`) is an argument, not the body,
+    ///   and no request type is asked for there.
+    /// - The function sends a declared parameter unchanged: the request type
+    ///   is asked for at that declaration, by the parameter name's span in the
+    ///   declaring file, under the site's own request alias.
+    /// - A row with no such fact (a model row) keeps its own payload.
+    ///
+    /// The call's result is asked for on every one of them.
     #[test]
-    fn a_call_through_an_imported_member_asks_for_no_request_body() {
+    fn a_call_to_a_declared_function_asks_for_the_body_its_parameters_state() {
         let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
         let repo = repo_with_source("src/page.ts", 700);
-        let call = |line: i32, span: u32, source: ResolutionSource| DataCallResult {
+        let api = "export const ordersApi = {\n  setStatus: async (id: string, params: StatusBody) =>\n    send(`/v1/orders/${id}/status`, { method: \"PUT\", body: JSON.stringify(params) }),\n};\n";
+        let api_path = repo.path().join("src/orders.api.ts");
+        std::fs::write(&api_path, api).expect("api source");
+        let name_at = u32::try_from(api.find("params:").expect("param")).expect("offset");
+        let declared = CallBody::Param(crate::forwarded_body::DeclaredParam {
+            file: api_path.to_string_lossy().into_owned(),
+            span_start: name_at + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: name_at + crate::swc_scanner::SWC_SPAN_BASE + 6,
+            line: 2,
+        });
+        let call = |line: i32, span: u32, call_body: Option<CallBody>| DataCallResult {
             call_kind: None,
             candidate_id: format!("span:{span}-{}", span + 50),
             line_number: line,
@@ -13374,12 +13435,17 @@ export * from "./aFetch.js";"#,
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
-            resolution_source: Some(source),
+            resolution_source: Some(if call_body.is_some() {
+                ResolutionSource::ImportedMember
+            } else {
+                ResolutionSource::Model
+            }),
             dispatch: None,
             reaches_request: None,
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -13389,8 +13455,9 @@ export * from "./aFetch.js";"#,
                 mounts: vec![],
                 endpoints: vec![],
                 data_calls: vec![
-                    call(10, 470, ResolutionSource::ImportedMember),
-                    call(20, 530, ResolutionSource::Model),
+                    call(10, 470, Some(CallBody::Built)),
+                    call(20, 530, None),
+                    call(30, 590, Some(declared)),
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -13411,30 +13478,64 @@ export * from "./aFetch.js";"#,
             &repo_modules(repo.path()),
         );
 
-        let lines = |kind: InferKind| -> Vec<u32> {
-            let mut lines: Vec<u32> = infer
+        let of_kind = |kind: InferKind| -> Vec<&InferRequestItem> {
+            infer
                 .iter()
                 .filter(|item| item.infer_kind == kind)
-                .map(|item| item.line_number)
-                .collect();
-            lines.sort();
-            lines.dedup();
-            lines
+                .collect()
         };
+        let mut result_lines: Vec<u32> = of_kind(InferKind::CallResult)
+            .iter()
+            .map(|item| item.line_number)
+            .collect();
+        result_lines.sort();
+        result_lines.dedup();
         assert_eq!(
-            lines(InferKind::RequestBody),
-            vec![20],
-            "only the model row asks for a request body: {infer:?}"
+            result_lines,
+            vec![10, 20, 30],
+            "every row still asks for the call's result: {infer:?}"
         );
+
+        let bodies = of_kind(InferKind::RequestBody);
+        assert_eq!(bodies.len(), 2, "no body for the built one: {bodies:?}");
+        let site = bodies
+            .iter()
+            .find(|item| item.file_path.ends_with("src/page.ts"))
+            .expect("the model row asks at its own payload");
         assert_eq!(
-            lines(InferKind::CallResult),
-            vec![10, 20],
-            "both rows still ask for the call's result: {infer:?}"
+            (site.line_number, site.expression_text.as_deref()),
+            (20, Some("note.trim()"))
         );
+        let at_declaration = bodies
+            .iter()
+            .find(|item| item.file_path == api_path.to_string_lossy())
+            .expect("the forwarded parameter is read where it is declared");
+        // The span goes out in the sidecar's numbering: from zero.
+        assert_eq!(
+            (
+                at_declaration.line_number,
+                at_declaration.span_start,
+                at_declaration.span_end,
+                at_declaration.expression_text.as_deref(),
+            ),
+            (2, Some(name_at), Some(name_at + 6), None)
+        );
+        // Under the site's own request alias: the same call id the site's
+        // result is asked for under.
+        let call_id = |alias: &str| alias.rsplit("_Call").next().map(str::to_string);
+        let result_at_30 = of_kind(InferKind::CallResult)
+            .into_iter()
+            .find(|item| item.line_number == 30)
+            .and_then(|item| item.alias.clone())
+            .expect("result alias");
+        let body_alias = at_declaration.alias.clone().expect("body alias");
+        assert!(body_alias.contains("_Request_"), "{body_alias}");
+        assert_eq!(call_id(&body_alias), call_id(&result_at_30));
     }
 
     /// carrick#1601: the mark a summary row carries reaches the call row the
     /// type layer reads, on a caller row and on a request line's own row.
+    /// carrick#1782: so does what the row says the call's body is.
     #[test]
     fn a_summary_row_restated_at_a_caller_stays_marked_as_a_call_row() {
         let summary = |at_caller: bool| crate::request_summary::SummaryRow {
@@ -13448,6 +13549,7 @@ export * from "./aFetch.js";"#,
             reaches_request: Some("src/availability.ts:3".to_string()),
             own_site: !at_caller,
             at_caller,
+            call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
         };
@@ -13461,6 +13563,10 @@ export * from "./aFetch.js";"#,
                 panic!("a summary row is a call row");
             };
             assert_eq!(call.at_caller, at_caller);
+            assert_eq!(
+                call.call_body,
+                at_caller.then_some(crate::forwarded_body::CallBody::Built)
+            );
         }
     }
 
@@ -14042,6 +14148,7 @@ export * from "./aFetch.js";"#,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
                 at_caller: false,
+                call_body: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -14151,6 +14258,7 @@ export * from "./aFetch.js";"#,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
                 at_caller: false,
+                call_body: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -14519,6 +14627,7 @@ export * from "./aFetch.js";"#,
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
                 at_caller: false,
+                call_body: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -16313,6 +16422,7 @@ export { routes };
                     method: "POST".to_string(),
                     target: "/v2/widgets".to_string(),
                     request_line: 3,
+                    body: None,
                 },
             },
         )]);
@@ -17010,6 +17120,7 @@ export { routes };
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         }
     }
 
@@ -17553,14 +17664,15 @@ export { routes };
         )])
     }
 
-    /// A member as the ring assertions compare it. `request_line` is
-    /// provenance and outside `RequestMember`'s `PartialEq`, so the value here
-    /// is never read.
+    /// A member as the ring assertions compare it. `request_line` and `body`
+    /// are outside `RequestMember`'s `PartialEq`, so the values here are
+    /// never read.
     fn ring_member(method: &str, target: &str) -> crate::imported_request_member::RequestMember {
         crate::imported_request_member::RequestMember {
             method: method.to_string(),
             target: target.to_string(),
             request_line: 0,
+            body: None,
         }
     }
 
@@ -19324,6 +19436,7 @@ export function publishWrapped(order: OrderPlaced): void {
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         }
     }
 

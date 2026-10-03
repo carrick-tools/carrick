@@ -29,6 +29,7 @@ mod file_based_router;
 mod file_finder;
 mod findings;
 mod formatter;
+mod forwarded_body;
 mod framework_detector;
 mod git_state;
 mod graphql;

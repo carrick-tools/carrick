@@ -444,6 +444,7 @@ mod tests {
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         }
     }
 

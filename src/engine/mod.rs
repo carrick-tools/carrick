@@ -7280,11 +7280,12 @@ fn build_type_manifest_entries(
 /// - **Response**, for a row the request summaries restate at a caller
 ///   (carrick#1601): the call's value is what the function returns, not the
 ///   response body.
-/// - **Request**, for a row the imported-member join states (carrick#1733):
-///   the call hands the member its parameters and the member builds the body,
-///   which its own request line states. What the caller passes is an
-///   argument, not the request body. A summary row restated at a caller keeps
-///   its request entry; that side is not settled for it.
+/// - **Request**, for a row whose function builds the body itself or sends
+///   none ([`crate::forwarded_body::CallBody::Built`], carrick#1782): the
+///   call hands the function its parameters, and the function's own request
+///   line states the body. What the caller passes is an argument, not the
+///   request body. A row whose function sends a declared parameter unchanged
+///   keeps its entry, typed from that declaration.
 ///
 /// An entry left at `unknown` would still make the site a party to the type
 /// check, read `unverifiable` there and carry that up to its pair, so the
@@ -7301,22 +7302,18 @@ fn drop_call_through_entries(
     let unstated: HashSet<(&str, u32, String, ManifestTypeKind)> = file_results
         .iter()
         .flat_map(|(file_path, result)| {
-            result.data_calls.iter().filter_map(move |call| {
-                let kind = if call.at_caller {
-                    ManifestTypeKind::Response
-                } else if call.resolution_source
-                    == Some(crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember)
-                {
-                    ManifestTypeKind::Request
-                } else {
-                    return None;
-                };
-                Some((
-                    file_path.as_str(),
-                    normalize_line(call.line_number),
-                    normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
-                    kind,
-                ))
+            result.data_calls.iter().flat_map(move |call| {
+                let response = call.at_caller.then_some(ManifestTypeKind::Response);
+                let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built))
+                    .then_some(ManifestTypeKind::Request);
+                response.into_iter().chain(request).map(move |kind| {
+                    (
+                        file_path.as_str(),
+                        normalize_line(call.line_number),
+                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                        kind,
+                    )
+                })
             })
         })
         .collect();
@@ -10599,6 +10596,7 @@ mod tests {
                     body_literals: Default::default(),
                     library_semantics: Vec::new(),
                     at_caller: false,
+                    call_body: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -10698,10 +10696,10 @@ mod tests {
     /// of a request line's own row, including another verb on the caller's
     /// line.
     ///
-    /// carrick#1733: a row the imported-member join states at a call through a
-    /// member states no REQUEST contract (the caller hands the member its
-    /// parameters, the member builds the body), so its request entry goes and
-    /// its response entry stays.
+    /// carrick#1782: a row at a call to a function that builds its own body
+    /// (or sends none) states no REQUEST contract, whichever pass stated it,
+    /// so its request entry goes too; a row whose function sends a declared
+    /// parameter unchanged keeps its request entry.
     #[test]
     fn a_row_restated_at_a_helper_s_caller_has_no_response_entry() {
         let config = Config::default();
@@ -10732,6 +10730,8 @@ mod tests {
             call("GET", "/orders", 12),
             call("POST", "/orders/:id/notes", 15),
             call("GET", "/orders/:id", 15),
+            call("POST", "/orders/:id/tags", 18),
+            call("PUT", "/orders/:id/status", 21),
         ];
         let row = |method: &str, line: i32, at_caller: bool| DataCallResult {
             call_kind: None,
@@ -10759,7 +10759,15 @@ mod tests {
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller,
+            call_body: None,
         };
+        let declared =
+            crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
+                file: "src/orders.api.ts".to_string(),
+                span_start: 120,
+                span_end: 126,
+                line: 7,
+            });
         let mut file_results = HashMap::new();
         file_results.insert(
             "src/page.ts".to_string(),
@@ -10776,9 +10784,18 @@ mod tests {
                         resolution_source: Some(
                             crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember,
                         ),
+                        call_body: Some(crate::forwarded_body::CallBody::Built),
                         ..row("POST", 15, false)
                     },
                     row("GET", 15, false),
+                    DataCallResult {
+                        call_body: Some(crate::forwarded_body::CallBody::Built),
+                        ..row("POST", 18, true)
+                    },
+                    DataCallResult {
+                        call_body: Some(declared),
+                        ..row("PUT", 21, true)
+                    },
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -10819,6 +10836,7 @@ mod tests {
                 (15, "GET".to_string(), ManifestTypeKind::Request),
                 (15, "GET".to_string(), ManifestTypeKind::Response),
                 (15, "POST".to_string(), ManifestTypeKind::Response),
+                (21, "PUT".to_string(), ManifestTypeKind::Request),
             ]
         );
     }
@@ -12806,6 +12824,103 @@ mod tests {
                 ("raw", false),
                 ("mapped", false),
                 ("missing", false),
+            ]
+        );
+    }
+
+    /// carrick#1782: a row stated at a call to a function the service
+    /// declares says what the call's body is, from what the function does
+    /// with its parameters.
+    ///
+    /// - It sends a declared parameter unchanged (`create`, and `viaCreate`,
+    ///   which hands its own parameter on): the body is read at THAT
+    ///   function's declaration, the one the site calls.
+    /// - It builds its body (`rename`), sends none (`remove`), or assigns the
+    ///   parameter again before sending it (`stamped`, and `viaStamped`, one
+    ///   call further out): the site states no body.
+    /// - Its parameter's declaration states nothing (`loose`), or it is a
+    ///   transport the caller hands a path (`post`): no fact, so the site's
+    ///   own payload stays the reading.
+    #[test]
+    fn a_row_at_a_call_says_what_body_the_function_sends() {
+        let (dir, discovery) = discover_sources(&[
+            (
+                "src/api.ts",
+                "export type CreateBody = { name: string; mode: \"a\" | \"b\" };\n\
+                 const BASE = process.env.API_BASE;\n\
+                 export async function create(body: CreateBody) {\n\
+                 \x20 const res = await fetch(`${BASE}/v1/things`, { method: \"POST\", body: JSON.stringify(body) });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function rename(id: string, name: string) {\n\
+                 \x20 const res = await fetch(`${BASE}/v1/things/${id}`, { method: \"PATCH\", body: JSON.stringify({ name }) });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function loose(body: unknown) {\n\
+                 \x20 const res = await fetch(`${BASE}/v1/loose`, { method: \"POST\", body: JSON.stringify(body) });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function stamped(body: CreateBody) {\n\
+                 \x20 body = { ...body, name: body.name.trim() };\n\
+                 \x20 const res = await fetch(`${BASE}/v1/stamped`, { method: \"POST\", body: JSON.stringify(body) });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function remove(id: string) {\n\
+                 \x20 const res = await fetch(`${BASE}/v1/things/${id}`, { method: \"DELETE\" });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function post(path: string, body: CreateBody) {\n\
+                 \x20 const res = await fetch(`${BASE}${path}`, { method: \"POST\", body: JSON.stringify(body) });\n\
+                 \x20 return res.ok;\n\
+                 }\n\
+                 export async function viaCreate(input: CreateBody) {\n\
+                 \x20 return create(input);\n\
+                 }\n\
+                 export async function viaStamped(input: CreateBody) {\n\
+                 \x20 return stamped(input);\n\
+                 }\n",
+            ),
+            (
+                "src/page.ts",
+                "import { create, rename, loose, stamped, remove, post, viaCreate, viaStamped } from \"./api\";\n\
+                 export async function go(id: string) {\n\
+                 \x20 await create({ name: \"x\", mode: \"a\" });\n\
+                 \x20 await rename(id, \"y\");\n\
+                 \x20 await loose({ any: 1 });\n\
+                 \x20 await stamped({ name: \" z \", mode: \"b\" });\n\
+                 \x20 await remove(id);\n\
+                 \x20 await post(\"/v1/posts\", { name: \"p\", mode: \"a\" });\n\
+                 \x20 await viaCreate({ name: \"v\", mode: \"b\" });\n\
+                 \x20 await viaStamped({ name: \"w\", mode: \"a\" });\n\
+                 }\n",
+            ),
+        ]);
+        let mut bodies: Vec<(u32, String)> = summary_rows_of(&dir, &discovery, "src/page.ts")
+            .into_iter()
+            .map(|row| {
+                let body = match row.call_body {
+                    None => "site".to_string(),
+                    Some(crate::forwarded_body::CallBody::Built) => "none".to_string(),
+                    Some(crate::forwarded_body::CallBody::Param(param)) => {
+                        assert!(param.file.ends_with("src/api.ts"), "{}", param.file);
+                        format!("declared at {}", param.line)
+                    }
+                };
+                (row.line, body)
+            })
+            .collect();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec![
+                (3, "declared at 3".to_string()),
+                (4, "none".to_string()),
+                (5, "site".to_string()),
+                (6, "none".to_string()),
+                (7, "none".to_string()),
+                (8, "site".to_string()),
+                (9, "declared at 28".to_string()),
+                (10, "none".to_string()),
             ]
         );
     }

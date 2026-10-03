@@ -564,6 +564,20 @@ pub struct DataCallResult {
     /// restate at a caller.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub at_caller: bool,
+    /// What the request body is at this row's call, when the call is a call
+    /// to a function the service declares that makes the request inside it
+    /// ([`crate::forwarded_body`], carrick#1782): no body the site states, or
+    /// the declared parameter the function sends unchanged. The type layer
+    /// reads the site's request type from it, not from the payload a model
+    /// row folded onto the site, which is one of the function's arguments.
+    ///
+    /// Never from the model: set by the request summaries at a caller and by
+    /// the imported-member join. Absent everywhere else, and where the
+    /// function sends a parameter whose declaration states no type, or the
+    /// options a caller writes the body into: there the site's own payload is
+    /// the body, as on a request's own line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_body: Option<crate::forwarded_body::CallBody>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1986,6 +2000,7 @@ mod tests {
             body_literals: Default::default(),
             library_semantics: Vec::new(),
             at_caller: false,
+            call_body: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -2050,6 +2065,7 @@ mod tests {
                 body_literals: Default::default(),
                 library_semantics: Vec::new(),
                 at_caller: false,
+                call_body: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

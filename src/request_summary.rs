@@ -144,6 +144,7 @@ use crate::call_graph::{
 };
 use crate::client_semantics::{LibrarySemantics, instance_receiver};
 use crate::commonjs::{require_bound_names, require_specifier};
+use crate::forwarded_body::{CallBody, ParamDecl, type_param_names};
 use crate::import_bindings::DEFAULT_EXPORT;
 use crate::services::type_sidecar::{SemanticsRequestArgs, SemanticsVerbArgs};
 use crate::swc_scanner::SWC_SPAN_BASE;
@@ -583,6 +584,15 @@ struct FnIr {
     /// as far as it is a request's parsed body or another call's value
     /// ([`BodyReturn`], carrick#1601). Empty when the body returns nothing.
     body_returns: Vec<BodyReturn>,
+    /// Each parameter by position, as a body sent through it is read
+    /// (carrick#1782): where its name is written, whether its declaration
+    /// states a type, and whether the body assigns it again. `None` for a
+    /// destructured or rest parameter.
+    params: Vec<Option<ParamDecl>>,
+    /// The type parameters in scope at the declaration, the function's own
+    /// and, for a class member, the class's: a parameter typed through one is
+    /// typed by whatever the caller passes.
+    type_params: HashSet<String>,
 }
 
 /// What one `return` hands back, read for whether a call of the function is
@@ -685,6 +695,43 @@ struct Returned {
 }
 
 impl FnIr {
+    /// `effect` as this body sends it (carrick#1782): a body sent through a
+    /// parameter the body assigns again is not what the caller passed, so
+    /// the effect states no body a caller writes.
+    fn settle_forward(&self, mut effect: Effect) -> Effect {
+        if let Some((index, None)) = effect.body_param
+            && self
+                .params
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(ParamDecl::assigned_again)
+        {
+            effect.body_param = None;
+        }
+        effect
+    }
+
+    /// What the body is at a call of this function that sends `effect`, an
+    /// effect of this function's own summary (carrick#1782).
+    ///
+    /// The function writes the body itself or sends none: the call's
+    /// arguments are not the body. It sends one of its parameters unchanged:
+    /// the argument in that position is, typed from the parameter's
+    /// declaration where that states a type. It forwards an options object
+    /// the caller writes the body into: the call's own payload is the body,
+    /// as on a request's own line.
+    fn call_body(&self, effect: &Effect) -> Option<CallBody> {
+        match &effect.body_param {
+            None => Some(CallBody::Built),
+            Some((_, Some(_))) => None,
+            Some((index, None)) => self
+                .params
+                .get(*index)?
+                .as_ref()?
+                .forwarded(&self.type_params),
+        }
+    }
+
     /// Settle `returns` into `returned`: an instance on every `return`, of
     /// one or more makers, each handed its own arguments (carrick#1689; one
     /// maker before). How many makers that comes to once own calls are
@@ -2840,6 +2887,13 @@ impl Reader<'_> {
         // In a static member `this` is the class, not an instance: the
         // instance field table says nothing about what it holds.
         let table = |is_static: bool| (!is_static).then_some(&fields);
+        // A member's parameter typed through the class's own type parameter
+        // is typed by whatever the caller passes (carrick#1782).
+        let class_type_params = type_param_names(class.type_params.as_deref());
+        let in_class = |mut ir: FnIr| {
+            ir.type_params.extend(class_type_params.iter().cloned());
+            ir
+        };
         // Every maker write to a field, for the message-role field rule
         // (carrick#1665): the initialisers' and the constructor's here, each
         // member's as it is read.
@@ -2854,7 +2908,7 @@ impl Reader<'_> {
                         self.function(&method.function, table(method.is_static), module, &none);
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
                     file.functions
-                        .insert(key(&member_name, method.is_static), ir);
+                        .insert(key(&member_name, method.is_static), in_class(ir));
                 }
                 ClassMember::PrivateMethod(method)
                     if !matches!(method.kind, MethodKind::Setter) =>
@@ -2864,7 +2918,7 @@ impl Reader<'_> {
                         self.function(&method.function, table(method.is_static), module, &none);
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
                     file.functions
-                        .insert(key(&member_name, method.is_static), ir);
+                        .insert(key(&member_name, method.is_static), in_class(ir));
                 }
                 ClassMember::ClassProp(prop) => {
                     let (Some(member_name), Some(init)) = (prop_name(&prop.key), &prop.value)
@@ -2881,7 +2935,8 @@ impl Reader<'_> {
                         _ => continue,
                     };
                     library_sites::take_field_writes(&mut ir, &mut field_writes);
-                    file.functions.insert(key(&member_name, prop.is_static), ir);
+                    file.functions
+                        .insert(key(&member_name, prop.is_static), in_class(ir));
                 }
                 _ => {}
             }
@@ -3095,7 +3150,15 @@ impl Reader<'_> {
             fields,
             module,
         };
-        let mut ir = FnIr::default();
+        let mut ir = FnIr {
+            params: ParamDecl::all(
+                function.params.iter().map(|param| &param.pat),
+                function.body.as_ref(),
+                self.source_map,
+            ),
+            type_params: type_param_names(function.type_params.as_deref()),
+            ..FnIr::default()
+        };
         match &function.body {
             Some(body) => self.body(&body.stmts, &mut scope, &mut ir),
             None => ir.bodyless = true,
@@ -3127,7 +3190,11 @@ impl Reader<'_> {
             fields,
             module,
         };
-        let mut ir = FnIr::default();
+        let mut ir = FnIr {
+            params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
+            type_params: type_param_names(arrow.type_params.as_deref()),
+            ..FnIr::default()
+        };
         match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => self.body(&block.stmts, &mut scope, &mut ir),
             // The expression body is what the arrow returns, where it starts
@@ -4652,6 +4719,11 @@ pub struct SummaryRow {
     /// whatever the function returns (a boolean, a token, a mapped object)
     /// and says nothing about the response body.
     pub at_caller: bool,
+    /// What the request body is at a row stated at a call to a function the
+    /// service declares (carrick#1782): what that function does with its
+    /// parameters says whether the call's arguments are the body. `None` on
+    /// a request's own line, and where the site's own payload is the body.
+    pub call_body: Option<CallBody>,
     /// The library-semantics claim ids the row was read through
     /// (carrick#1564), sorted. Empty on every other row.
     pub library_semantics: Vec<String>,
@@ -5016,7 +5088,7 @@ impl Composer<'_> {
                     for effect in &callee.effects {
                         summary
                             .effects
-                            .insert(effect.at_call(&call.args, file, call.site));
+                            .insert(ir.settle_forward(effect.at_call(&call.args, file, call.site)));
                     }
                     for (index, arg) in call.args.iter().enumerate() {
                         match arg {
@@ -5038,9 +5110,11 @@ impl Composer<'_> {
                 }
                 None => {
                     if let Some(request) = shape_of(call, file, self.semantics, &self.clients) {
-                        summary
-                            .effects
-                            .insert(Effect::from_shape(&request, file, call.site.line));
+                        summary.effects.insert(ir.settle_forward(Effect::from_shape(
+                            &request,
+                            file,
+                            call.site.line,
+                        )));
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -5148,6 +5222,7 @@ pub fn summarize(
 }
 
 fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut RequestSummaryIndex) {
+    let (files, sites) = (composer.files, composer.sites);
     for call in &ir.calls {
         if call.invokes_param.is_some() {
             continue;
@@ -5155,6 +5230,9 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
+                let callee_ir = sites
+                    .target(file, call.site.lo)
+                    .and_then(|(target, key)| files.get(target)?.functions.get(key));
                 let mut sends = false;
                 for effect in &callee.effects {
                     sends = true;
@@ -5196,7 +5274,20 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                     } else {
                         RowSite::Caller
                     };
-                    match row(&instantiated, file, composer.files, call, reaches, at) {
+                    // The call hands the function its parameters
+                    // (carrick#1782). A function that states the whole
+                    // request names one endpoint, and a parameter it sends
+                    // unchanged is declared as that endpoint's body. One the
+                    // caller hands a path is a transport, whose body
+                    // parameter is declared for every endpoint it reaches:
+                    // there the site's own payload is the better reading.
+                    let call_body = callee_ir.and_then(|callee| callee.call_body(effect));
+                    let call_body = match (&reaches, call_body) {
+                        (Some(_), call_body) => call_body,
+                        (None, Some(CallBody::Built)) => Some(CallBody::Built),
+                        (None, _) => None,
+                    };
+                    match row(&instantiated, file, files, call, reaches, at, call_body) {
                         Some(row) => rows.push(row),
                         None => index.undetermined += 1,
                     }
@@ -5232,7 +5323,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                             } else {
                                 RowSite::Own
                             };
-                            match row(&effect, file, composer.files, call, None, at) {
+                            match row(&effect, file, composer.files, call, None, at, None) {
                                 Some(row) => rows.push(row),
                                 None => index.undetermined += 1,
                             }
@@ -5281,6 +5372,7 @@ fn row(
     call: &CallIr,
     reaches_request: Option<String>,
     at: RowSite,
+    call_body: Option<CallBody>,
 ) -> Option<SummaryRow> {
     let site = call.site;
     let MethodValue::Lit(method) = &effect.method else {
@@ -5309,6 +5401,7 @@ fn row(
         reaches_request,
         own_site: at == RowSite::Own,
         at_caller: at == RowSite::Caller,
+        call_body,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
             .base_scope

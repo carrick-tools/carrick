@@ -137,6 +137,8 @@ use swc_common::{BytePos, SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::binding_scope::ident_key;
+use crate::forwarded_body::{CallBody, ParamDecl, sent_ident, type_param_names};
 use crate::new_url_target::UrlBindings;
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{
@@ -161,15 +163,22 @@ pub struct RequestMember {
     /// file carries for this request is found again (carrick#656), and it is
     /// deliberately outside `PartialEq` below.
     pub request_line: u32,
+    /// What a call through the member sends as its body (carrick#1782): no
+    /// body the call's arguments state ([`CallBody::Built`]), or the declared
+    /// parameter the member sends unchanged. `None` where the member sends a
+    /// parameter its declaration states no type for: the site's own payload
+    /// is the body there. Outside `PartialEq` too: it says how to type a site,
+    /// not which request the member makes.
+    pub body: Option<CallBody>,
 }
 
 /// Two members state the SAME request when their method and their URL agree.
 ///
-/// Written out rather than derived because `request_line` is provenance: a
-/// module that declares one name twice with the same request keeps it (see
-/// `MemberCollector::pop_frame`), and deriving equality over the line would
-/// turn every such pair into a conflict and drop a member that is not
-/// ambiguous at all.
+/// Written out rather than derived because `request_line` and `body` are not
+/// the request: a module that declares one name twice with the same request
+/// keeps it (see `MemberCollector::pop_frame`), and deriving equality over
+/// either would turn every such pair into a conflict and drop a member that
+/// is not ambiguous at all.
 impl PartialEq for RequestMember {
     fn eq(&self, other: &Self) -> bool {
         self.method == other.method && self.target == other.target
@@ -243,6 +252,7 @@ pub fn collect_request_members(module: &Module, source_map: &Lrc<SourceMap>) -> 
         members: HashMap::new(),
         dropped: Vec::new(),
         constant_objects: constant_objects(module),
+        class_type_params: Vec::new(),
     };
     module.visit_with(&mut collector);
     for name in collector.dropped {
@@ -291,10 +301,45 @@ pub fn fold_indexes_with_conflicts<Id: Clone + PartialEq, M: Clone + PartialEq>(
 /// its own requests so they cannot be attributed to the member that built it.
 struct MemberFrame {
     name: Option<String>,
-    params: Vec<String>,
+    params: FrameParams,
     request: Option<RequestMember>,
     /// Two requests in one member: a site could be reaching either.
     ambiguous: bool,
+}
+
+/// A member's parameters, as its request reads them.
+#[derive(Default)]
+struct FrameParams {
+    /// The names its plain parameters bind, for the URL rule.
+    names: Vec<String>,
+    /// Each parameter as a body sent through it is read (carrick#1782).
+    decls: Vec<Option<ParamDecl>>,
+    /// The type parameters in scope: the function's own and its class's.
+    type_params: HashSet<String>,
+}
+
+impl FrameParams {
+    fn of_function(function: &Function, source_map: &SourceMap, class: &HashSet<String>) -> Self {
+        let mut type_params = type_param_names(function.type_params.as_deref());
+        type_params.extend(class.iter().cloned());
+        FrameParams {
+            names: fn_param_names(&function.params),
+            decls: ParamDecl::all(
+                function.params.iter().map(|param| &param.pat),
+                function.body.as_ref(),
+                source_map,
+            ),
+            type_params,
+        }
+    }
+
+    fn of_arrow(arrow: &ArrowExpr, source_map: &SourceMap) -> Self {
+        FrameParams {
+            names: arrow.params.iter().filter_map(pat_name).collect(),
+            decls: ParamDecl::all(&arrow.params, Some(&*arrow.body), source_map),
+            type_params: type_param_names(arrow.type_params.as_deref()),
+        }
+    }
 }
 
 struct MemberCollector<'a> {
@@ -314,6 +359,9 @@ struct MemberCollector<'a> {
     /// The object literals whose function-valued properties are members, by
     /// the span start of the literal (see [`constant_objects`]).
     constant_objects: HashSet<BytePos>,
+    /// The type parameters of the classes enclosing the node being visited,
+    /// innermost last (carrick#1782).
+    class_type_params: Vec<HashSet<String>>,
 }
 
 impl MemberCollector<'_> {
@@ -331,8 +379,15 @@ impl MemberCollector<'_> {
         let Some(request) = frame.request else {
             return;
         };
-        match self.members.get(&name) {
-            Some(existing) if *existing == request => {}
+        match self.members.get_mut(&name) {
+            Some(existing) if *existing == request => {
+                // The same request declared twice, with the body read two
+                // ways: which one a site reaches is not known, so neither
+                // types it (carrick#1782).
+                if existing.body != request.body {
+                    existing.body = Some(CallBody::Built);
+                }
+            }
             Some(_) => self.dropped.push(name),
             None => {
                 self.members.insert(name, request);
@@ -340,12 +395,17 @@ impl MemberCollector<'_> {
         }
     }
 
+    /// The type parameters of the class enclosing the node being visited.
+    fn class_scope(&self) -> HashSet<String> {
+        self.class_type_params.last().cloned().unwrap_or_default()
+    }
+
     /// Walk `body` as the member named `name`, or as an anonymous barrier when
     /// `name` is `None`.
     fn walk_body<N: VisitWith<Self>>(
         &mut self,
         name: Option<String>,
-        params: Vec<String>,
+        params: FrameParams,
         body: &N,
     ) {
         self.stack.push(MemberFrame {
@@ -369,30 +429,37 @@ impl Visit for MemberCollector<'_> {
             MethodKind::Method => prop_name_text(&node.key),
             _ => None,
         };
-        self.walk_body(
-            name,
-            fn_param_names(&node.function.params),
-            &node.function.body,
-        );
+        let params = FrameParams::of_function(&node.function, self.source_map, &self.class_scope());
+        self.walk_body(name, params, &node.function.body);
+    }
+
+    /// A class's type parameters are in scope for its members' parameters
+    /// (carrick#1782).
+    fn visit_class(&mut self, node: &Class) {
+        self.class_type_params
+            .push(type_param_names(node.type_params.as_deref()));
+        node.visit_children_with(self);
+        self.class_type_params.pop();
     }
 
     fn visit_private_method(&mut self, node: &PrivateMethod) {
         // A `#private` method is not reachable from another file, so it is a
         // barrier rather than a member.
-        self.walk_body(None, Vec::new(), &node.function.body);
+        self.walk_body(None, FrameParams::default(), &node.function.body);
     }
 
     fn visit_constructor(&mut self, node: &Constructor) {
         // A constructor is not called by name either. It is walked all the same
         // so a `const url` it declares stays inside it rather than reaching the
         // module scope, where a method that declares none could read it.
-        self.walk_body(None, Vec::new(), &node.body);
+        self.walk_body(None, FrameParams::default(), &node.body);
     }
 
     fn visit_fn_decl(&mut self, node: &FnDecl) {
+        let params = FrameParams::of_function(&node.function, self.source_map, &HashSet::new());
         self.walk_body(
             Some(node.ident.sym.to_string()),
-            fn_param_names(&node.function.params),
+            params,
             &node.function.body,
         );
     }
@@ -401,11 +468,11 @@ impl Visit for MemberCollector<'_> {
     /// callback, a method of any object literal but a module constant's, a
     /// function expression in an argument. It holds its own requests.
     fn visit_function(&mut self, node: &Function) {
-        self.walk_body(None, Vec::new(), &node.body);
+        self.walk_body(None, FrameParams::default(), &node.body);
     }
 
     fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
-        self.walk_body(None, Vec::new(), &node.body);
+        self.walk_body(None, FrameParams::default(), &node.body);
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
@@ -422,11 +489,12 @@ impl Visit for MemberCollector<'_> {
         }
         match &**init {
             Expr::Arrow(arrow) => {
-                let params = arrow.params.iter().filter_map(pat_name).collect();
+                let params = FrameParams::of_arrow(arrow, self.source_map);
                 self.walk_body(Some(name), params, &arrow.body);
             }
             Expr::Fn(fn_expr) => {
-                let params = fn_param_names(&fn_expr.function.params);
+                let params =
+                    FrameParams::of_function(&fn_expr.function, self.source_map, &HashSet::new());
                 self.walk_body(Some(name), params, &fn_expr.function.body);
             }
             _ => {
@@ -439,18 +507,19 @@ impl Visit for MemberCollector<'_> {
     }
 
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        if let Some(frame) = self.stack.last() {
-            let params = frame.params.clone();
-            if let Some(request) = self.member_request(node, &params) {
-                let frame = self
-                    .stack
-                    .last_mut()
-                    .expect("frame present: checked immediately above");
-                if frame.request.is_some() {
-                    frame.ambiguous = true;
-                } else {
-                    frame.request = Some(request);
-                }
+        let request = self
+            .stack
+            .last()
+            .and_then(|frame| self.member_request(node, &frame.params));
+        if let Some(request) = request {
+            let frame = self
+                .stack
+                .last_mut()
+                .expect("frame present: a request was read in it");
+            if frame.request.is_some() {
+                frame.ambiguous = true;
+            } else {
+                frame.request = Some(request);
             }
         }
         node.visit_children_with(self);
@@ -493,17 +562,25 @@ impl MemberCollector<'_> {
             match (&**prop, name) {
                 (Prop::KeyValue(kv), Some(name)) if settled => match unwrap_parens(&kv.value) {
                     Expr::Arrow(arrow) => {
-                        let params = arrow.params.iter().filter_map(pat_name).collect();
+                        let params = FrameParams::of_arrow(arrow, self.source_map);
                         self.walk_body(Some(name), params, &arrow.body);
                     }
                     Expr::Fn(fn_expr) => {
-                        let params = fn_param_names(&fn_expr.function.params);
+                        let params = FrameParams::of_function(
+                            &fn_expr.function,
+                            self.source_map,
+                            &HashSet::new(),
+                        );
                         self.walk_body(Some(name), params, &fn_expr.function.body);
                     }
                     _ => prop.visit_with(self),
                 },
                 (Prop::Method(method), Some(name)) if settled => {
-                    let params = fn_param_names(&method.function.params);
+                    let params = FrameParams::of_function(
+                        &method.function,
+                        self.source_map,
+                        &HashSet::new(),
+                    );
                     self.walk_body(Some(name), params, &method.function.body);
                 }
                 _ => prop.visit_with(self),
@@ -513,18 +590,19 @@ impl MemberCollector<'_> {
 
     /// The request `call` issues, when it states its whole URL and its method
     /// itself and neither depends on `params`.
-    fn member_request(&self, call: &CallExpr, params: &[String]) -> Option<RequestMember> {
+    fn member_request(&self, call: &CallExpr, params: &FrameParams) -> Option<RequestMember> {
         let verb = verb_from_callee_property(callee_property(call).as_deref());
         let options = request_options_argument(call);
         if verb.is_none() && options.is_none() {
             return None;
         }
+        let verb_call = verb.is_some();
 
-        let target = self.sole_target_argument(call)?;
+        let (target_at, target) = self.sole_target_argument(call)?;
         // A URL whose STRUCTURE comes from the member's caller is the shape
         // `local_http_wrapper` joins by substitution. Asserting the member's
         // half alone would replace the site's literal with a parameter name.
-        if parameter_supplies_path_structure(&target, params) {
+        if parameter_supplies_path_structure(&target, &params.names) {
             return None;
         }
 
@@ -545,16 +623,17 @@ impl MemberCollector<'_> {
             target,
             request_line: u32::try_from(self.source_map.lookup_char_pos(call.span().lo).line)
                 .unwrap_or(0),
+            body: sent_body(call, options, verb_call, target_at, params),
         })
     }
 
-    /// The call's single URL argument: a route-shaped string or template as
-    /// written, or the path a `new URL(<literal>, base)` in scope supplies to
-    /// it. `None` when the call has none, or more than one, or when the
-    /// argument sits behind a spread.
-    fn sole_target_argument(&self, call: &CallExpr) -> Option<String> {
-        let mut found: Option<String> = None;
-        for arg in &call.args {
+    /// The call's single URL argument, with its position: a route-shaped
+    /// string or template as written, or the path a `new URL(<literal>,
+    /// base)` in scope supplies to it. `None` when the call has none, or more
+    /// than one, or when the argument sits behind a spread.
+    fn sole_target_argument(&self, call: &CallExpr) -> Option<(usize, String)> {
+        let mut found: Option<(usize, String)> = None;
+        for (position, arg) in call.args.iter().enumerate() {
             if arg.spread.is_some() {
                 continue;
             }
@@ -567,10 +646,87 @@ impl MemberCollector<'_> {
             if found.is_some() {
                 return None;
             }
-            found = Some(text);
+            found = Some((position, text));
         }
         found
     }
+}
+
+/// What a call through the member sends as its body (carrick#1782): the
+/// options bag's `body` (or `data`) where it carries one, or for a verb call
+/// the argument after the URL.
+///
+/// - One of the member's parameters, unchanged: read from its declaration
+///   ([`ParamDecl::forwarded`]), which leaves `None` where the declaration
+///   states no type.
+/// - The member's options parameter spread into the bag with no body of its
+///   own after it: the caller writes the body, so `None` (the site's own
+///   payload).
+/// - Anything else, including no body at all: [`CallBody::Built`].
+fn sent_body(
+    call: &CallExpr,
+    options: Option<(usize, &ObjectLit)>,
+    verb: bool,
+    target_at: usize,
+    params: &FrameParams,
+) -> Option<CallBody> {
+    let param = |ident: &Ident| {
+        let key = ident_key(ident);
+        params.decls.iter().flatten().find(|decl| decl.key == key)
+    };
+    let sent: Option<&Ident> = match options.map(|(_, bag)| bag_body(bag)) {
+        Some(BagBody::Sent(expr)) => sent_ident(expr),
+        Some(BagBody::Named(ident)) => Some(ident),
+        Some(BagBody::Spread(spread)) => {
+            return match sent_ident(spread).and_then(param) {
+                Some(_) => None,
+                None => Some(CallBody::Built),
+            };
+        }
+        Some(BagBody::Absent) | None if verb => call
+            .args
+            .get(target_at + 1)
+            .filter(|arg| arg.spread.is_none())
+            .filter(|_| options.is_none_or(|(at, _)| at != target_at + 1))
+            .and_then(|arg| sent_ident(&arg.expr)),
+        Some(BagBody::Absent) | None => None,
+    };
+    match sent.and_then(param) {
+        Some(decl) => decl.forwarded(&params.type_params),
+        None => Some(CallBody::Built),
+    }
+}
+
+/// The body a request-options bag carries.
+enum BagBody<'a> {
+    /// The last `body` or `data` key, with nothing spread after it.
+    Sent(&'a Expr),
+    /// The same, written shorthand (`{ body }`).
+    Named(&'a Ident),
+    /// A spread with no `body` or `data` key after it, which may carry one.
+    Spread(&'a Expr),
+    /// Neither.
+    Absent,
+}
+
+fn bag_body(bag: &ObjectLit) -> BagBody<'_> {
+    let is_body = |name: Option<String>| matches!(name.as_deref(), Some("body" | "data"));
+    let mut found = BagBody::Absent;
+    for prop in &bag.props {
+        match prop {
+            PropOrSpread::Spread(spread) => found = BagBody::Spread(&spread.expr),
+            PropOrSpread::Prop(prop) => match &**prop {
+                Prop::KeyValue(kv) if is_body(prop_name_text(&kv.key)) => {
+                    found = BagBody::Sent(&kv.value);
+                }
+                Prop::Shorthand(ident) if is_body(Some(ident.sym.to_string())) => {
+                    found = BagBody::Named(ident);
+                }
+                _ => {}
+            },
+        }
+    }
+    found
 }
 
 /// The method a request-options bag that names none states.
@@ -923,13 +1079,14 @@ mod tests {
         collect_request_members(&module, &source_map)
     }
 
-    /// A member as the assertions compare it. `request_line` is provenance and
-    /// outside `PartialEq`, so the value here is never read.
+    /// A member as the assertions compare it. `request_line` and `body` are
+    /// outside `PartialEq`, so the values here are never read.
     fn member(method: &str, target: &str) -> RequestMember {
         RequestMember {
             method: method.to_string(),
             target: target.to_string(),
             request_line: 0,
+            body: None,
         }
     }
 
@@ -1371,6 +1528,152 @@ mod tests {
             members.get("spread.keep"),
             Some(&member("POST", "/v1/f/${id}")),
             "a property after the last spread is the object's own"
+        );
+    }
+
+    /// What each member's body reading says, as a short label.
+    fn body_of(members: &RequestMemberIndex, name: &str) -> String {
+        match &members
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is a member: {members:?}"))
+            .body
+        {
+            None => "site".to_string(),
+            Some(CallBody::Built) => "none".to_string(),
+            Some(CallBody::Param(param)) => {
+                assert_eq!(param.file, "client.ts");
+                format!("declared at {}", param.line)
+            }
+        }
+    }
+
+    /// carrick#1782: a call through a member hands it its parameters, so what
+    /// the call's body is follows from what the member sends. A parameter
+    /// sent unchanged (serialised, shorthand, or after the URL of a verb
+    /// call) whose declaration states a type is read at that declaration. A
+    /// body the member builds, no body, a parameter assigned again, a spread
+    /// a later key or a non-parameter may fill: no body at the site. A
+    /// declaration that states no type (none, or the class's type parameter)
+    /// and an options parameter the caller writes the body into: the site's
+    /// own payload.
+    #[test]
+    fn a_member_states_what_body_a_call_through_it_sends() {
+        let members = index(
+            r#"type Body = { name: string };
+class Client<P> {
+  create(body: Body) {
+    return send(`/v1/things`, { method: "POST", body: JSON.stringify(body) });
+  }
+  wrap(name: string) {
+    return send(`/v1/wrap`, { method: "POST", body: JSON.stringify({ name }) });
+  }
+  shorthand(body: Body) {
+    return send(`/v1/short`, { method: "POST", body });
+  }
+  generic(body: P) {
+    return send(`/v1/generic`, { method: "POST", body: JSON.stringify(body) });
+  }
+  untyped(body) {
+    return send(`/v1/untyped`, { method: "POST", body: JSON.stringify(body) });
+  }
+  read(id: string) {
+    return send(`/v1/things/${id}`, { method: "GET" });
+  }
+  stamped(body: Body) {
+    body = { ...body };
+    return send(`/v1/stamped`, { method: "POST", body: JSON.stringify(body) });
+  }
+  verb(body: Body) {
+    return this.http.post(`/v1/verb`, body, { headers: {} });
+  }
+  options(init: RequestInit) {
+    return send(`/v1/options`, { ...init, method: "POST" });
+  }
+  spreadLocal(body: Body) {
+    const defaults = {};
+    return send(`/v1/local`, { ...defaults, method: "POST" });
+  }
+  later(body: Body) {
+    return send(`/v1/later`, { method: "POST", body: JSON.stringify(body), ...this.defaults });
+  }
+}
+export const api = {
+  update: async (
+    id: string,
+    params: { status: "a" | "b" },
+  ) => send(`/v1/things/${id}`, { method: "PUT", body: JSON.stringify(params) }),
+};
+"#,
+        );
+        let read: Vec<(&str, String)> = [
+            "create",
+            "wrap",
+            "shorthand",
+            "generic",
+            "untyped",
+            "read",
+            "stamped",
+            "verb",
+            "options",
+            "spreadLocal",
+            "later",
+            "api.update",
+        ]
+        .into_iter()
+        .map(|name| (name, body_of(&members, name)))
+        .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("create", "declared at 3".to_string()),
+                ("wrap", "none".to_string()),
+                ("shorthand", "declared at 9".to_string()),
+                ("generic", "site".to_string()),
+                ("untyped", "site".to_string()),
+                ("read", "none".to_string()),
+                ("stamped", "none".to_string()),
+                ("verb", "declared at 25".to_string()),
+                ("options", "site".to_string()),
+                ("spreadLocal", "none".to_string()),
+                ("later", "none".to_string()),
+                ("api.update", "declared at 42".to_string()),
+            ]
+        );
+    }
+
+    /// carrick#1782: one name declared twice with the same request but its
+    /// body read two ways keeps the member, and neither reading types a site.
+    #[test]
+    fn a_member_declared_twice_with_two_body_readings_states_no_body() {
+        let members = index(
+            r#"type Body = { name: string };
+class A {
+  save(body: Body) {
+    return send(`/v1/save`, { method: "POST", body: JSON.stringify(body) });
+  }
+}
+class B {
+  save(name: string) {
+    return send(`/v1/save`, { method: "POST", body: JSON.stringify({ name }) });
+  }
+}
+class C {
+  load(body: Body) {
+    return send(`/v1/load`, { method: "POST", body: JSON.stringify(body) });
+  }
+}
+class D {
+  load(body: Body) {
+    return send(`/v1/load`, { method: "POST", body: JSON.stringify(body) });
+  }
+}
+"#,
+        );
+        assert_eq!(body_of(&members, "save"), "none");
+        assert_eq!(
+            body_of(&members, "load"),
+            "none",
+            "two declarations are two parameters: which one a site reaches is not known"
         );
     }
 }

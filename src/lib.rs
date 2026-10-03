@@ -29,6 +29,7 @@ pub mod file_based_router;
 pub mod file_finder;
 pub mod findings;
 pub mod formatter;
+pub mod forwarded_body;
 pub mod framework_detector;
 pub mod git_state;
 pub mod graphql;
