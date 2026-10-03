@@ -97,6 +97,8 @@ const PAIRS: CheckPairSpec[] = [
   mk('bytesstring', 'Bytes_Producer', 'String_Consumer'),
   mk('jsonblob', 'C_Sent', 'Blob_Consumer'),
   mk('bytesupload', 'Form_Expected', 'Upload_Sent', { type_kind: 'request' }),
+  // A stream sent where a stream is read agrees, and stays a verdict.
+  mk('streamupload', 'Stream_Expected', 'Stream_Sent', { type_kind: 'request' }),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -130,6 +132,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Partial_Producer = { createdAt: Date; size: number; };',
         'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Bytes_Producer = Uint8Array;',
+        'export type Stream_Expected = ReadableStream<Uint8Array> | null;',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -159,6 +162,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Blob_Consumer = Blob;',
         'export type String_Consumer = string;',
         'export type Upload_Sent = File;',
+        'export type Stream_Sent = ReadableStream<Uint8Array>;',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -277,6 +281,12 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
       assert.strictEqual(v.resolved, false, key);
       assert.match(v.diagnostic!, /bytes/, key);
     }
+  });
+
+  it('bytes that assign to bytes stay compatible: the gate overrides a mismatch only (carrick#1793)', () => {
+    const v = verdicts.get('streamupload')!;
+    assert.strictEqual(v.bucket, 'compatible', `${v.diagnostic}`);
+    assert.strictEqual(v.gate, undefined);
   });
 
   it('an any consumer keeps its top-type gate, not the void or form gate (carrick#1162)', () => {

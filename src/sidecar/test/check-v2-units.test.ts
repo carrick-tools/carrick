@@ -420,14 +420,14 @@ describe('four-bucket classifier precedence', () => {
     );
   });
 
-  it('bytes gates: either side unverifiable, the sent side named when both fire (carrick#1793)', () => {
+  it('bytes gates: a mismatch is unverifiable, the sent side named when both fire (carrick#1793)', () => {
     const line = (name: string) => [...plan.gateLines].find(([, n]) => n === name)![0];
-    const classify = (gates: string[]) =>
+    const classify = (gates: string[], mismatch = true) =>
       classifyPair({
         plan,
         probeDiags: [
           ...gates.map((g) => diag(line(g), 2344)),
-          diag(plan.assignmentLine, 2322),
+          ...(mismatch ? [diag(decisiveAssignmentLine(plan), 2322)] : []),
         ],
         poisonReason: noPoison,
         scrubCtx,
@@ -443,6 +443,34 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(classify(['sent:bytes', 'expected:bytes']).gate, 'producer:bytes');
     // A top type on the same side keeps its own reason.
     assert.strictEqual(classify(['sent:bytes', 'sent:any']).gate, 'producer:any');
+    // Bytes that assign to bytes (a stream sent where a stream is read) is an
+    // agreement the gate never overrides.
+    const agreed = classify(['sent:bytes', 'expected:bytes'], false);
+    assert.strictEqual(agreed.bucket, 'compatible');
+    assert.strictEqual(agreed.gate, undefined);
+    // A mismatch only in the declared form, cleared by the wire rule, is not
+    // a mismatch the gate turns into an abstention either.
+    const declaredOnly = classifyPair({
+      plan,
+      probeDiags: [diag(line('sent:bytes'), 2344), diag(plan.assignmentLine, 2322)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(declaredOnly.bucket, 'compatible');
+    // Where the wire form could not be computed, the declared mismatch is the
+    // judgment, and bytes still abstain from it.
+    const wireUnjudged = classifyPair({
+      plan,
+      probeDiags: [
+        diag(line('sent:bytes'), 2344),
+        diag(plan.assignmentLine, 2322),
+        diag(plan.wireAssignmentLine!, 2589),
+      ],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(wireUnjudged.bucket, 'unverifiable');
+    assert.strictEqual(wireUnjudged.gate, 'producer:bytes');
     assert.ok(
       ![...buildProbe(spec({ protocol: 'socket' }), PKG).gateLines.values()].includes(
         'sent:bytes'
