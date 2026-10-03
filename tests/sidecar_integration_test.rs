@@ -1465,6 +1465,26 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         "without a witness the explicit symbol must win"
     );
 
+    // carrick#1779: the result names the alias the arbitration re-aimed, the
+    // symbol it rejected and the root it took, so the manifest row the
+    // borrowed symbol was stamped on can follow. The kept alias is no change.
+    assert_eq!(
+        result.anchor_changes.len(),
+        1,
+        "{:?}",
+        result.anchor_changes
+    );
+    let change = &result.anchor_changes[0];
+    assert_eq!(change.alias, demoted_alias);
+    assert_eq!(change.rejected, "AuditRecord");
+    let root = change.reaimed.as_ref().expect("re-aimed, not dropped");
+    assert_eq!(root.symbol, "OrderPlaced");
+    assert!(
+        root.source_file.ends_with("types.ts"),
+        "{}",
+        root.source_file
+    );
+
     // And the dts — the artifact compat verdicts are computed from — carries
     // the payload shape for the demoted alias and the explicit shape for the
     // kept one.

@@ -2768,7 +2768,8 @@ mod tests {
         let explicit = crate::services::type_sidecar::demote_witnessed_borrowed_anchors(
             &explicit,
             &inferred_types,
-        );
+        )
+        .requests;
         let explicit =
             crate::services::type_sidecar::apply_inferred_array_depth(&explicit, &inferred_types);
         let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, &[], "/repo");
