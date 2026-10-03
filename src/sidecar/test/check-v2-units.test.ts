@@ -420,7 +420,7 @@ describe('four-bucket classifier precedence', () => {
     );
   });
 
-  it('bytes gates: a mismatch is unverifiable, the sent side named when both fire (carrick#1793)', () => {
+  it('bytes gates: unverifiable whether or not the sides agree, the sent side named when both fire (carrick#1793, carrick#1812)', () => {
     const line = (name: string) => [...plan.gateLines].find(([, n]) => n === name)![0];
     const classify = (gates: string[], mismatch = true) =>
       classifyPair({
@@ -443,22 +443,35 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(classify(['sent:bytes', 'expected:bytes']).gate, 'producer:bytes');
     // A top type on the same side keeps its own reason.
     assert.strictEqual(classify(['sent:bytes', 'sent:any']).gate, 'producer:any');
-    // Bytes that assign to bytes (a stream sent where a stream is read) is an
-    // agreement the gate never overrides.
+    // Bytes that assign to bytes (a stream sent where a stream is read) agree
+    // about nothing a type states: the content of a file is not checked, so
+    // the pair is not a compatibility fact either (carrick#1812).
     const agreed = classify(['sent:bytes', 'expected:bytes'], false);
-    assert.strictEqual(agreed.bucket, 'compatible');
-    assert.strictEqual(agreed.gate, undefined);
-    // A mismatch only in the declared form, cleared by the wire rule, is not
-    // a mismatch the gate turns into an abstention either.
+    assert.strictEqual(agreed.bucket, 'unverifiable');
+    assert.strictEqual(agreed.gate, 'producer:bytes');
+    assert.strictEqual(agreed.resolved, false);
+    // One side of bytes with no diagnostic on any assignment line.
+    assert.strictEqual(classify(['expected:bytes'], false).gate, 'consumer:bytes');
+    // A mismatch only in the declared form, which the wire rule would clear.
     const declaredOnly = classifyPair({
       plan,
       probeDiags: [diag(line('sent:bytes'), 2344), diag(plan.assignmentLine, 2322)],
       poisonReason: noPoison,
       scrubCtx,
     });
-    assert.strictEqual(declaredOnly.bucket, 'compatible');
-    // Where the wire form could not be computed, the declared mismatch is the
-    // judgment, and bytes still abstain from it.
+    assert.strictEqual(declaredOnly.bucket, 'unverifiable');
+    assert.strictEqual(declaredOnly.gate, 'producer:bytes');
+    // A diagnostic on the assignment line that is not a mismatch: the bytes
+    // reason, not `assignment:other`.
+    const otherDiag = classifyPair({
+      plan,
+      probeDiags: [diag(line('expected:bytes'), 2344), diag(plan.assignmentLine, 2589)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(otherDiag.bucket, 'unverifiable');
+    assert.strictEqual(otherDiag.gate, 'consumer:bytes');
+    // Where the wire form could not be computed, bytes abstain too.
     const wireUnjudged = classifyPair({
       plan,
       probeDiags: [

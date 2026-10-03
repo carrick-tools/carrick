@@ -243,8 +243,8 @@ export function buildProbe(
   // them in, so a route sending a `Uint8Array` read with `.blob()` is not a
   // mismatch, and neither is the same route read as text. Either side, either
   // half: a file upload states no fields a declared body could be compared
-  // with. The classifier lets this gate override a mismatch only, so bytes
-  // that assign to bytes still read compatible. `null`/`undefined` are
+  // with. Bytes that assign to bytes are not a contract either: the check
+  // cannot read a file's content (carrick#1812). `null`/`undefined` are
   // dropped first, so `Blob | null` still gates, while a bare `null`,
   // `undefined` or `never` leaves nothing to test.
   if (spec.protocol === 'http') {

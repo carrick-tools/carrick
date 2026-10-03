@@ -97,7 +97,8 @@ const PAIRS: CheckPairSpec[] = [
   mk('bytesstring', 'Bytes_Producer', 'String_Consumer'),
   mk('jsonblob', 'C_Sent', 'Blob_Consumer'),
   mk('bytesupload', 'Form_Expected', 'Upload_Sent', { type_kind: 'request' }),
-  // A stream sent where a stream is read agrees, and stays a verdict.
+  // A stream sent where a stream is read: bytes that assign to bytes, which
+  // still state nothing a type can check (carrick#1812).
   mk('streamupload', 'Stream_Expected', 'Stream_Sent', { type_kind: 'request' }),
 ];
 
@@ -266,13 +267,16 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.resolved, false);
   });
 
-  it('a body of bytes on either side is not compared as a JSON shape (carrick#1793)', () => {
+  it('a body of bytes on either side is not compared as a JSON shape, agreeing or not (carrick#1793, carrick#1812)', () => {
     const cases: Array<[string, string]> = [
       // Both sides are bytes: the producer, the sent side, is named.
       ['bytesblob', 'producer:bytes'],
       ['bytesstring', 'producer:bytes'],
       ['jsonblob', 'consumer:bytes'],
       ['bytesupload', 'consumer:bytes'],
+      // Both sides are bytes and they assign; on a request the consumer is
+      // the sent side.
+      ['streamupload', 'consumer:bytes'],
     ];
     for (const [key, gate] of cases) {
       const v = verdicts.get(key)!;
@@ -281,12 +285,6 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
       assert.strictEqual(v.resolved, false, key);
       assert.match(v.diagnostic!, /bytes/, key);
     }
-  });
-
-  it('bytes that assign to bytes stay compatible: the gate overrides a mismatch only (carrick#1793)', () => {
-    const v = verdicts.get('streamupload')!;
-    assert.strictEqual(v.bucket, 'compatible', `${v.diagnostic}`);
-    assert.strictEqual(v.gate, undefined);
   });
 
   it('an any consumer keeps its top-type gate, not the void or form gate (carrick#1162)', () => {
