@@ -419,6 +419,9 @@ pub(crate) fn derive_capture_anchors(
     // carrick#1836: what that inference's bare names meant, for both texts.
     let mut printed_names: HashMap<&str, &[crate::services::type_sidecar::PrintedName]> =
         HashMap::new();
+    // carrick#1842: the aliases whose published text is a body read as raw
+    // text, marked by the same inference that supplied the text.
+    let mut raw_text: HashSet<&str> = HashSet::new();
     for inf in inferred {
         if let Some(text) = usable_inferred_text(&inf.type_string) {
             if inferred_text.contains_key(inf.alias.as_str()) {
@@ -426,6 +429,9 @@ pub(crate) fn derive_capture_anchors(
             }
             inferred_text.insert(inf.alias.as_str(), text);
             printed_names.insert(inf.alias.as_str(), &inf.printed_names);
+            if inf.raw_text_read {
+                raw_text.insert(inf.alias.as_str());
+            }
             if let Some(unwidened) = inf
                 .unwidened_type_string
                 .as_deref()
@@ -505,6 +511,7 @@ pub(crate) fn derive_capture_anchors(
                     anchor_origin: AnchorOrigin::DeterministicInfer,
                     source_file: Some(repo_relative(&request.file_path, repo_root)),
                     printed_names: names.clone(),
+                    raw_text_read: false,
                 });
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
@@ -512,6 +519,7 @@ pub(crate) fn derive_capture_anchors(
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
                 printed_names: names,
+                raw_text_read: raw_text.contains(alias),
             });
             anchors.extend(unwidened);
             continue;
@@ -526,6 +534,7 @@ pub(crate) fn derive_capture_anchors(
                 // `unknown` names nothing, so no file needs to join the program.
                 source_file: None,
                 printed_names: Vec::new(),
+                raw_text_read: false,
             });
             continue;
         }
@@ -571,6 +580,7 @@ pub(crate) fn derive_capture_anchors(
             anchor_origin: AnchorOrigin::LlmSymbol,
             source_file: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         });
     }
 
@@ -591,6 +601,7 @@ pub(crate) fn derive_capture_anchors(
             // `unknown` names nothing, so no file needs to join the program.
             source_file: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         });
     }
 
@@ -821,6 +832,7 @@ pub(crate) fn backfill_anchors(
                     anchor_origin: AnchorOrigin::AnchorBackfill,
                     source_file: anchor.source_file().map(str::to_string),
                     printed_names: Vec::new(),
+                    raw_text_read: false,
                 }
             } else {
                 anchor.clone()
@@ -1494,8 +1506,9 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
 
 /// Whether the CONSUMER's type is what left this verdict unresolved, in a way
 /// a retype of its call could settle. A consumer that states no contract at
-/// all (it reads no body, sends a form body, or reads or sends bytes,
-/// carrick#1793) has nothing to compare.
+/// all (it reads no body, sends a form body, reads or sends bytes,
+/// carrick#1793, or reads the body as raw text, carrick#1842) has nothing to
+/// compare.
 ///
 /// A proven mismatch is never a candidate: the retype may only lift a verdict
 /// that compared nothing, never downgrade one that found a break.
@@ -1503,7 +1516,10 @@ fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> b
     verdict.bucket != VerdictBucket::Incompatible
         && verdict.unresolved_side == Some(VerdictSide::Consumer)
         && !verdict.gate.as_deref().is_some_and(|gate| {
-            gate.ends_with(":void") || gate.ends_with(":form") || gate.ends_with(":bytes")
+            gate.ends_with(":void")
+                || gate.ends_with(":form")
+                || gate.ends_with(":bytes")
+                || gate.ends_with(":text")
         })
 }
 
@@ -2236,6 +2252,66 @@ mod tests {
         assert_eq!(with(Some("{ scope: any; }")).len(), 1);
     }
 
+    /// carrick#1842: a body the call site reads as raw text marks the literal
+    /// anchor that publishes the inference's text, and no other anchor.
+    #[test]
+    fn a_raw_text_read_marks_the_literal_anchor_that_publishes_it() {
+        let request = |alias: &str| InferRequestItem {
+            file_path: "/repo/src/client.ts".to_string(),
+            line_number: 9,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        };
+        let mut text_read = inferred("Endpoint_a_Response_Call1", "string", None, None);
+        text_read.infer_kind = InferKind::CallResult;
+        text_read.raw_text_read = true;
+        let mut json_string = inferred("Endpoint_b_Response_Call2", "string", None, None);
+        json_string.infer_kind = InferKind::CallResult;
+        let anchors = derive_capture_anchors(
+            &[],
+            &[
+                request("Endpoint_a_Response_Call1"),
+                request("Endpoint_b_Response_Call2"),
+            ],
+            &[],
+            &[text_read, json_string],
+            &[
+                "Endpoint_a_Response_Call1".to_string(),
+                "Endpoint_b_Response_Call2".to_string(),
+                "Endpoint_c_Response_Call3".to_string(),
+            ],
+            "/repo",
+        );
+        let marks: Vec<(&str, bool)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    raw_text_read,
+                    ..
+                } => (alias.as_str(), *raw_text_read),
+                other => panic!("expected a literal anchor, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("Endpoint_a_Response_Call1", true),
+                ("Endpoint_b_Response_Call2", false),
+                ("Endpoint_c_Response_Call3", false),
+            ]
+        );
+        let wire = serde_json::to_value(&anchors[0]).unwrap();
+        assert_eq!(wire["raw_text_read"], serde_json::json!(true));
+        let unmarked = serde_json::to_value(&anchors[1]).unwrap();
+        assert!(unmarked.get("raw_text_read").is_none(), "{unmarked}");
+    }
+
     #[test]
     fn a_consumer_is_to_blame_only_for_a_type_a_retype_can_settle() {
         let verdict = |side: Option<VerdictSide>, gate: Option<&str>| {
@@ -2282,6 +2358,12 @@ mod tests {
         assert!(!consumer_to_blame(&verdict(
             consumer,
             Some("consumer:bytes")
+        )));
+        // It reads the body as raw text (carrick#1842): retyping its call with
+        // the producer's type would judge a text read against a JSON shape.
+        assert!(!consumer_to_blame(&verdict(
+            consumer,
+            Some("consumer:text")
         )));
     }
 
@@ -2628,6 +2710,7 @@ mod tests {
             unwidened_type_string: None,
             stated_body: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         }
     }
 
@@ -3210,6 +3293,7 @@ mod tests {
             unwidened_type_string: None,
             stated_body: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         };
 
         let infer = vec![
@@ -3340,6 +3424,7 @@ mod tests {
             unwidened_type_string: None,
             stated_body: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -3433,6 +3518,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
                 printed_names: Vec::new(),
+                raw_text_read: false,
             },
         ];
         let records = vec![
@@ -3628,6 +3714,7 @@ mod tests {
             unwidened_type_string: None,
             stated_body: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         };
 
         let explicit = vec![
@@ -4047,6 +4134,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
                 printed_names: Vec::new(),
+                raw_text_read: false,
             });
             billing_anchors.push(CaptureAnchor::Literal {
                 alias: consumer.clone(),
@@ -4054,6 +4142,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: None,
                 printed_names: Vec::new(),
+                raw_text_read: false,
             });
             orders_manifest.push(entry(
                 pair.key.clone(),
@@ -4313,6 +4402,7 @@ mod tests {
                     anchor_origin: AnchorOrigin::LlmSymbol,
                     source_file: None,
                     printed_names: Vec::new(),
+                    raw_text_read: false,
                 }],
                 &HashMap::new(),
                 None,
@@ -4777,6 +4867,7 @@ mod tests {
                     anchor_origin: AnchorOrigin::LlmSymbol,
                     source_file: None,
                     printed_names: Vec::new(),
+                    raw_text_read: false,
                 }],
                 &HashMap::new(),
                 None,
@@ -4853,6 +4944,177 @@ mod tests {
         assert_eq!(agreed.bucket, VerdictBucket::Compatible, "{agreed:#?}");
         assert!(agreed.resolved, "{agreed:#?}");
         assert_eq!(agreed.diagnostic, None);
+    }
+
+    /// carrick#1842: a consumer that reads the body with `res.text()` states
+    /// no structural contract, end to end against the real sidecar ($0, no
+    /// model). The inferrer marks the `string` it publishes, the mark rides
+    /// the literal anchor into the stub's record, and the check reads the pair
+    /// unverifiable rather than comparing `string` with the producer's object.
+    /// The retype does not reopen it. Without the mark the same pair is the
+    /// false incompatible the ticket reports.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_body_read_as_raw_text_is_not_judged_against_a_json_body() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let api_root = manifest_dir
+            .join("tests/fixtures/retype-http-client/api")
+            .canonicalize()
+            .expect("api fixture");
+        let web_dir = tempfile::tempdir().unwrap();
+        let web_root = web_dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(web_root.join("src")).unwrap();
+        std::fs::write(
+            web_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","lib":["es2022","dom"],"skipLibCheck":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        // Line numbers are read off this text; keep the two in step.
+        std::fs::write(
+            web_root.join("src/ping.ts"),
+            "export async function ping(): Promise<string> {\n  \
+             const res = await fetch(\"/ping\");\n  \
+             return res.text();\n\
+             }\n",
+        )
+        .unwrap();
+        let call_line = 2;
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&web_root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let key = OperationKey::http("POST", "/ping");
+        let producer_alias =
+            build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
+        let site = crate::type_manifest::build_site_id(
+            "src/ping.ts",
+            call_line,
+            &key,
+            web_root.to_str().unwrap(),
+        );
+        let consumer_alias = build_manifest_type_alias_with_site_id(
+            &key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&site),
+        );
+        let infer = vec![InferRequestItem {
+            file_path: web_root.join("src/ping.ts").to_string_lossy().into_owned(),
+            line_number: call_line,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("fetch(\"/ping\")".to_string()),
+            expression_line: Some(call_line),
+            infer_kind: InferKind::CallResult,
+            alias: Some(consumer_alias.clone()),
+            param_name: None,
+        }];
+        let inferred = sidecar
+            .infer_types(&infer, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        assert_eq!(inferred.len(), 1, "{inferred:#?}");
+        assert_eq!(inferred[0].type_string.trim(), "string", "{inferred:#?}");
+        assert!(inferred[0].raw_text_read, "{inferred:#?}");
+
+        let (api_stub, api_artifact) = run_capture(
+            &sidecar,
+            api_root.to_str().unwrap(),
+            "api",
+            &[CaptureAnchor::Literal {
+                alias: producer_alias.clone(),
+                type_text: "{ ok: boolean }".to_string(),
+                anchor_origin: AnchorOrigin::LlmSymbol,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+            }],
+            &HashMap::new(),
+            None,
+        )
+        .expect("api capture");
+        let _ = std::fs::remove_dir_all(&api_stub);
+        let api = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                &producer_alias,
+                "src/routes.ts",
+                1,
+                ManifestTypeState::Explicit,
+            )],
+            Some(api_artifact),
+        );
+        let web = |inferred: &[crate::services::type_sidecar::InferredType]| {
+            let anchors = derive_capture_anchors(
+                &[],
+                &infer,
+                &[],
+                inferred,
+                std::slice::from_ref(&consumer_alias),
+                web_root.to_str().unwrap(),
+            );
+            let (dir, artifact) = run_capture(
+                &sidecar,
+                web_root.to_str().unwrap(),
+                "web",
+                &anchors,
+                &HashMap::new(),
+                None,
+            )
+            .expect("web capture");
+            let _ = std::fs::remove_dir_all(&dir);
+            repo(
+                "web",
+                None,
+                vec![entry(
+                    key.clone(),
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                    &consumer_alias,
+                    "src/ping.ts",
+                    call_line,
+                    ManifestTypeState::Implicit,
+                )],
+                Some(artifact),
+            )
+        };
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: web_root.clone(),
+                tsconfig: None,
+                calls: consumer_call_locators(&infer),
+            },
+        )]);
+        let only = |outcomes: Vec<PairCheckOutcome>| -> PairCheckOutcome {
+            assert_eq!(outcomes.len(), 1, "{outcomes:#?}");
+            outcomes.into_iter().next().unwrap()
+        };
+
+        let text = only(run_check(&sidecar, &[api.clone(), web(&inferred)], &local));
+        assert_eq!(text.bucket, VerdictBucket::Unverifiable, "{text:#?}");
+        assert_eq!(text.gate.as_deref(), Some("consumer:text"), "{text:#?}");
+        assert!(!text.resolved, "{text:#?}");
+
+        // Control: the same read with no mark is compared, and reads as the
+        // false incompatible the ticket reports.
+        let mut unmarked = inferred.clone();
+        unmarked[0].raw_text_read = false;
+        let control = only(run_check(&sidecar, &[api, web(&unmarked)], &local));
+        assert_eq!(control.bucket, VerdictBucket::Incompatible, "{control:#?}");
     }
 
     #[test]
@@ -5224,6 +5486,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 source_file: None,
                 printed_names: Vec::new(),
+                raw_text_read: false,
             }],
             &HashMap::new(),
             None,

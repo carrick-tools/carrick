@@ -33,7 +33,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { CaptureAliasRecord, SelfCheckOutcome } from './api.js';
+import type { CaptureAliasRecord, CaptureAnchorRequest, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
@@ -298,6 +298,14 @@ function buildSurfaceSpanIndex(
   };
 }
 
+/**
+ * carrick#1842: a literal anchor whose text is a body read as raw text passes
+ * that mark to its record, where the check phase reads it.
+ */
+function rawTextMark(request: CaptureAnchorRequest): Pick<CaptureAliasRecord, 'raw_text_read'> {
+  return request.kind === 'literal' && request.raw_text_read ? { raw_text_read: true } : {};
+}
+
 /** An alias that never reached a capture-native tier: the failure reason was
  * recorded at demotion time; the surface line is `unknown` by construction. */
 function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
@@ -318,6 +326,7 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
     ...(anchor.request.kind === 'literal' && anchor.namesUnemittedModule
       ? { unresolved_in_tree: [unemittedModuleProvenance()] }
       : {}),
+    ...rawTextMark(anchor.request),
   };
 }
 
@@ -512,6 +521,7 @@ function checkedRecord(
             .map((p) => unresolvedInTreeProvenance(p, [...unfoundNames].sort())),
         }
       : {}),
+    ...rawTextMark(anchor.request),
   };
 }
 

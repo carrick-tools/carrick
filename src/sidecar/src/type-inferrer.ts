@@ -311,6 +311,16 @@ type SchemaDirection = 'input' | 'output';
  */
 const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
 
+/**
+ * The zero-argument reads that take the WHOLE body out of a transport response
+ * (the platform `Response` and the clients that copy its shape): parsed as
+ * JSON, or as raw text (carrick#1842).
+ */
+const WHOLE_BODY_READS = new Set(['json', 'text']);
+
+/** The body format a caller names to read a response as raw text (carrick#1842). */
+const RAW_TEXT_FORMAT = 'text';
+
 interface DeclaredContract {
   text: string;
   provenance?: TypeProvenance[];
@@ -331,6 +341,18 @@ function typeText(type: Type, enclosingNode?: Node): string {
   const text = type.getText(enclosingNode, TYPE_TEXT_FLAGS);
   notePrintedType(type, enclosingNode, text);
   return text;
+}
+
+/**
+ * `text` is `string`, alone or beside `null` and `undefined` in either order:
+ * the only payload a raw-text read publishes (carrick#1842).
+ */
+function isBareStringText(text: string): boolean {
+  const members = text.split('|').map((member) => member.trim());
+  return (
+    members.includes('string') &&
+    members.every((member) => member === 'string' || member === 'null' || member === 'undefined')
+  );
 }
 
 /**
@@ -1943,7 +1965,117 @@ export class TypeInferrer {
     if (statedBody) {
       inferred.stated_body = statedBody;
     }
+    // carrick#1842: `string` cannot tell a body read as raw text from a JSON
+    // body that is a string, and raw text states no structural contract. The
+    // row says which it is, so the check phase can read the pair unverifiable
+    // instead of comparing `string` with the other side's body.
+    if (
+      isBareStringText(typeString) &&
+      (this.textReadAtTerminal(callExpr, terminalNode) || this.callChoosesTextBody(callExpr))
+    ) {
+      inferred.raw_text_read = true;
+    }
     return inferred;
+  }
+
+  /**
+   * The terminal of a call's def-use walk is a zero-argument `.text()` read of
+   * the call's own result (carrick#1842): on its binding (`res.text()`,
+   * through a declaration, `await` or a cast), or in the callback a `then` on
+   * the call hands the response to (`fetch(u).then((res) => res.text())`).
+   */
+  private textReadAtTerminal(callExpr: CallExpression, terminal: Node): boolean {
+    const value = Node.isVariableDeclaration(terminal) ? terminal.getInitializer() : terminal;
+    const read = value ? this.unwrapExpressionNode(value) : undefined;
+    if (!read || !Node.isCallExpression(read)) return false;
+    const callResult = this.unwrapPromiseType(callExpr.getType()).compilerType;
+    if (
+      this.isTextReadOf(
+        read,
+        (receiver) =>
+          receiver === callExpr ||
+          this.unwrapPromiseType(receiver.getType()).compilerType === callResult
+      )
+    ) {
+      return true;
+    }
+    const then = read.getExpression();
+    if (
+      !Node.isPropertyAccessExpression(then) ||
+      then.getName() !== 'then' ||
+      this.unwrapExpressionNode(then.getExpression()) !== callExpr
+    ) {
+      return false;
+    }
+    const callback = read.getArguments()[0];
+    if (!callback || (!Node.isArrowFunction(callback) && !Node.isFunctionExpression(callback))) {
+      return false;
+    }
+    const param = callback.getParameters()[0]?.getNameNode();
+    if (!param || !Node.isIdentifier(param)) return false;
+    const returned = this.returnedExpressions(callback);
+    const inner = returned.length === 1 ? this.unwrapExpressionNode(returned[0]) : undefined;
+    return (
+      !!inner &&
+      Node.isCallExpression(inner) &&
+      this.isTextReadOf(
+        inner,
+        (receiver) => Node.isIdentifier(receiver) && receiver.getSymbol() === param.getSymbol()
+      )
+    );
+  }
+
+  /** `call` is `<receiver>.text()` with no arguments, and `accept` takes its receiver. */
+  private isTextReadOf(call: CallExpression, accept: (receiver: Node) => boolean): boolean {
+    const access = call.getExpression();
+    return (
+      Node.isPropertyAccessExpression(access) &&
+      access.getName() === RAW_TEXT_FORMAT &&
+      call.getArguments().length === 0 &&
+      accept(this.unwrapExpressionNode(access.getExpression()))
+    );
+  }
+
+  /**
+   * The call's resolved signature, at this site, types a member of an object
+   * argument as exactly the literal `'text'`, and the source passes that
+   * literal there (carrick#1842). That is how a request library lets a caller
+   * choose a text body from the formats it offers (`{ type: 'text' }`): a
+   * generic config instantiated by the literal, or an overload taken by it.
+   * A member typed as a wider union (`kind: 'text' | 'image'`) chooses no
+   * format, and no member name is read.
+   */
+  private callChoosesTextBody(callExpr: CallExpression): boolean {
+    const checker = this.project.getTypeChecker().compilerObject;
+    let signature: ts.Signature | undefined;
+    try {
+      signature = checker.getResolvedSignature(callExpr.compilerNode);
+    } catch {
+      return false;
+    }
+    if (!signature || signature.parameters.length === 0) return false;
+    return callExpr.getArguments().some((argument, index) => {
+      if (!Node.isObjectLiteralExpression(argument)) return false;
+      const parameter = signature!.parameters[Math.min(index, signature!.parameters.length - 1)];
+      const parameterType = checker.getTypeOfSymbolAtLocation(parameter, callExpr.compilerNode);
+      return argument.getProperties().some((property) => {
+        if (!Node.isPropertyAssignment(property)) return false;
+        const value = property.getInitializer();
+        if (
+          !value ||
+          !(Node.isStringLiteral(value) || Node.isNoSubstitutionTemplateLiteral(value)) ||
+          value.getLiteralValue() !== RAW_TEXT_FORMAT
+        ) {
+          return false;
+        }
+        const member = checker.getPropertyOfType(parameterType, property.getName());
+        if (!member) return false;
+        const declared = checker.getNonNullableType(
+          checker.getTypeOfSymbolAtLocation(member, callExpr.compilerNode)
+        );
+        return declared.isStringLiteral() && declared.value === RAW_TEXT_FORMAT;
+      });
+    });
   }
 
   /**
@@ -2604,9 +2736,9 @@ export class TypeInferrer {
         }
 
         // The body a caller reads OUT of a transport response IS the payload
-        // of the call that produced it: `res.json()` on the tracked binding,
-        // with whatever `as T` the source states around it read by
-        // `extractExplicitTypeFromAncestor` below. A bare identifier never
+        // of the call that produced it: `res.json()` or `res.text()` on the
+        // tracked binding, with whatever `as T` the source states around it
+        // read by `extractExplicitTypeFromAncestor` below. A bare identifier never
         // matches `expressionUsesNames` (it tests DESCENDANTS), so without
         // this the body read is invisible to the def-use walk.
         if (Node.isIdentifier(expr) && this.isIdentifierUsage(expr, currentNames)) {
@@ -2894,10 +3026,10 @@ export class TypeInferrer {
    * `query.data`, `envelope` in `envelope.list[0]` — or `undefined` when the
    * identifier names the value itself.
    *
-   * A member CALL is not a projection: `res.text()` yields a body rather than
+   * A member CALL is not a projection: `res.blob()` yields a body rather than
    * a part of one, and what it returns stays the walk's business. The
-   * zero-argument json body read has its own branch and is taken before this
-   * is asked.
+   * zero-argument json and text body reads have their own branch and are
+   * taken before this is asked.
    */
   private projectionOnReceiver(identifier: Node): Node | undefined {
     const access = identifier.getParent();
@@ -3169,13 +3301,19 @@ export class TypeInferrer {
     });
   }
 
+  /**
+   * The zero-argument whole-body read that takes `identifier` as its receiver,
+   * `res.json()` or `res.text()`, or `undefined`. A text read is a body read
+   * like a json one (carrick#1842): without it, `return res.text()` left the
+   * walk on the response binding and published the transport object.
+   */
   private bodyReadOnReceiver(identifier: Node): Node | undefined {
     const access = identifier.getParent();
     if (
       !access ||
       !Node.isPropertyAccessExpression(access) ||
       access.getExpression() !== identifier ||
-      access.getName() !== 'json'
+      !WHOLE_BODY_READS.has(access.getName())
     ) {
       return undefined;
     }
