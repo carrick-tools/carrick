@@ -3,77 +3,38 @@
  * request library's own response object published that object as the
  * response contract.
  *
- * The client below returns `Task<Outcome<Reply<string>, WireError>>`. The
- * service's wrapper rules name all three wrappers, but a rule never matched:
- * `Task` and `Reply` are type aliases (of a class and of an object literal),
- * and the matcher reads the type's own symbol first. So the #1376 carrier
- * read peeled the thenable and the outcome by shape and published what the
- * success side holds, `Reply<string>`: the library's status, url and headers
- * around the body, not the body. Judged against a producer's body, every one
- * of those members read as one the producer does not send.
+ * The client below returns `Task<Outcome<Reply<T>, WireError>>`, and the
+ * service has rules for what a result holds (`Reply`, `Envelope`) and none
+ * for the thenable or the outcome around it. The carrick#1376 carrier read
+ * peels those two by shape and finds what the success side holds,
+ * `Reply<T>`: the library's status, url and headers around the body, not the
+ * body. Judged against a producer's body, every one of those members read as
+ * one the producer does not send.
  *
- * The carrier's payload is now offered to the same rules before it is
+ * The carrier's payload is offered to the service's rules before it is
  * published. A rule that verifies it as the library's transport object and
  * reads no payload out of it makes the site decide it states no contract
  * (`machinery_envelope` at the root, no anchor). A rule that does read a
- * payload out of it publishes that payload, printed with its own members.
+ * payload out of it publishes that payload: a shape printed with its own
+ * members, or the `string` of a body read as text, marked as raw text
+ * (carrick#1842).
+ *
+ * `Reply` is a type alias, so its rule read no payload out of it until
+ * carrick#1843, and the text read below abstained with the json one. A
+ * service whose rules name all three wrappers never reaches the carrier
+ * read: test/infer-alias-wrapper-rules.test.ts.
  */
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
-
-const PACKAGE_DTS = `export declare class __Task<A> {
-  then(func: (value: A) => void): this;
-}
-export type Task<A> = __Task<A>;
-
-declare class __Outcome<A, E> {
-  isDone(): boolean;
-}
-interface Done<A, E> extends __Outcome<A, E> {
-  readonly tag: "Done";
-  readonly value: A;
-}
-interface Failed<A, E> extends __Outcome<A, E> {
-  readonly tag: "Failed";
-  readonly error: E;
-}
-export type Outcome<A, E> = Done<A, E> | Failed<A, E>;
-
-export type Maybe<A> = { present: true; value: A } | { present: false };
-
-type BodyKinds = { text: string; json: unknown };
-
-export type Reply<T> = {
-  status: number;
-  ok: boolean;
-  response: Maybe<T>;
-  url: string;
-  headers: Record<string, string>;
-};
-
-export interface Envelope<T> {
-  data: T;
-  requestId: string;
-}
-
-export declare class WireError extends Error {
-  url: string;
-}
-
-export declare const Wire: {
-  make: <K extends keyof BodyKinds>(config: {
-    url: string;
-    method?: "GET" | "POST";
-    type: K;
-  }) => Task<Outcome<Reply<BodyKinds[K]>, WireError>>;
-  enveloped: <T>(url: string) => Task<Outcome<Envelope<T>, WireError>>;
-};
-`;
+import {
+  WIRE_ORIGIN,
+  collapse,
+  writeWireRepo,
+  type WireInferred,
+} from './wire-package.js';
 
 const SERVICE_TS = `import { Wire } from "tiny-wire";
 
@@ -100,34 +61,24 @@ const PING_LINE = 9;
 const INVITE_LINE = 13;
 const INVOICE_LINE = 17;
 
-/** The service's wrapper rules, shaped like the ones a scan receives. */
+/**
+ * The service's rules for what a result holds, shaped like the ones a scan
+ * receives. None names the thenable or the outcome, so the carrier read is
+ * what reaches the payload.
+ */
 const EXTRACTION_CONFIG = {
   rules: [
     {
       wrapperSymbols: ['Reply'],
       machineryIndicators: ['headers', 'status', 'statusText', 'ok', 'body'],
-      originModuleGlobs: ['tiny-wire', 'tiny-wire/*'],
+      originModuleGlobs: WIRE_ORIGIN,
       payloadGenericIndex: 0,
       unwrapRecursively: true,
       maxDepth: 3,
     },
     {
-      wrapperSymbols: ['Task'],
-      originModuleGlobs: ['tiny-wire', 'tiny-wire/*'],
-      payloadGenericIndex: 0,
-      unwrapRecursively: true,
-      maxDepth: 4,
-    },
-    {
-      wrapperSymbols: ['Outcome'],
-      originModuleGlobs: ['tiny-wire', 'tiny-wire/*'],
-      payloadGenericIndex: 0,
-      unwrapRecursively: true,
-      maxDepth: 4,
-    },
-    {
       wrapperSymbols: ['Envelope'],
-      originModuleGlobs: ['tiny-wire', 'tiny-wire/*'],
+      originModuleGlobs: WIRE_ORIGIN,
       payloadGenericIndex: 0,
       unwrapRecursively: true,
       maxDepth: 3,
@@ -136,17 +87,8 @@ const EXTRACTION_CONFIG = {
 };
 
 interface InferShape {
-  inferred_types?: Array<{
-    alias: string;
-    type_string: string;
-    is_explicit: boolean;
-    primary_type_symbol?: string;
-    array_depth?: number;
-    any_provenance?: Array<{ path: string; kind: string; reason: string; detail?: string }>;
-  }>;
+  inferred_types?: WireInferred[];
 }
-
-const collapse = (text: string): string => text.replace(/\s+/g, ' ').trim();
 
 describe("carrick#1841: a carrier's payload passes the service's wrapper rules", () => {
   let client: SidecarClient;
@@ -154,31 +96,9 @@ describe("carrick#1841: a carrier's payload passes the service's wrapper rules",
   let servicePath: string;
 
   before(async () => {
-    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1841-'));
-    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
-    const pkgDir = path.join(repoDir, 'node_modules', 'tiny-wire');
-    fs.mkdirSync(pkgDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(pkgDir, 'package.json'),
-      JSON.stringify({ name: 'tiny-wire', version: '1.0.0', types: 'index.d.ts' })
-    );
-    fs.writeFileSync(path.join(pkgDir, 'index.d.ts'), PACKAGE_DTS);
-    fs.writeFileSync(
-      path.join(repoDir, 'tsconfig.json'),
-      JSON.stringify({
-        compilerOptions: {
-          strict: true,
-          module: 'esnext',
-          moduleResolution: 'bundler',
-          target: 'es2022',
-          lib: ['es2022'],
-          skipLibCheck: true,
-        },
-        include: ['src'],
-      })
-    );
-    servicePath = path.join(repoDir, 'src', 'service.ts');
-    fs.writeFileSync(servicePath, SERVICE_TS);
+    const repo = writeWireRepo('carrick-1841-', { 'service.ts': SERVICE_TS });
+    repoDir = repo.repoDir;
+    servicePath = repo.pathOf('service.ts');
 
     client = new SidecarClient();
     await client.start();
@@ -236,17 +156,22 @@ describe("carrick#1841: a carrier's payload passes the service's wrapper rules",
     );
   }
 
-  it('abstains on a text read whose carrier holds the library response object', async () => {
+  it('publishes a text read as the string the rule reads out, marked as raw text', async () => {
+    // `Reply<string>`: the rule reads the alias's argument (carrick#1843), and
+    // the body read as text states no structural contract (carrick#1842).
+    // The mark is what keeps `string` from being judged against a JSON body.
     const inferred = await infer(
       'Endpoint_Ping_Response',
       PING_LINE,
       'Wire.make({ url: "/v1/ping", method: "POST", type: "text" })'
     );
     assert.ok(inferred, 'the row must be answered');
-    assertDecidedTransport(inferred);
+    assert.strictEqual(collapse(inferred.type_string), 'string');
+    assert.strictEqual(inferred.raw_text_read, true);
+    assert.strictEqual(inferred.primary_type_symbol, undefined);
   });
 
-  it('abstains the same way on a json read the caller returns unread', async () => {
+  it('abstains on a json read whose carrier holds the library response object', async () => {
     const inferred = await infer(
       'Endpoint_Invite_Response',
       INVITE_LINE,

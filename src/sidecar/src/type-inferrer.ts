@@ -475,6 +475,19 @@ type RuleAttempt =
   | { kind: 'no-match' };
 
 /**
+ * One of the names a type goes by, with the arguments the compiler states for
+ * that name (carrick#1843): the symbol of the declaration its structure comes
+ * from with the type's own arguments, or the alias it was written through
+ * with the alias's arguments.
+ */
+interface WrapperReading {
+  symbol: TsSymbol;
+  typeArguments: Type[];
+  /** The name is the alias the type was written through, not its own symbol. */
+  viaAlias: boolean;
+}
+
+/**
  * TypeInferrer - Extracts types from source code, both explicit and inferred
  *
  * Usage:
@@ -1725,6 +1738,21 @@ export class TypeInferrer {
       isExplicit = true;
     }
 
+    // carrick#1843: the rules verified the call's own result as transport and
+    // read no payload out of it (`Task<Outcome<Reply<unknown>, E>>`, every
+    // layer named by a rule, the last one holding nothing). That is the
+    // decision carrick#1841 made one step later, on what a carrier holds, and
+    // it is made here for the same reason: left undecided, the capture's own
+    // locator re-reads the raw call and publishes the library's objects.
+    if (unwrapResult.verifiedMachinery && !explicitType) {
+      this.log(
+        `Call result at ${request.file_path}:${request.line_number} is ` +
+          `${typeText(returnType, terminalNode)}, which the service's wrapper rules verify as ` +
+          'transport and read no payload out of; this site states no response contract'
+      );
+      return this.transportAbstain(request, callExpr);
+    }
+
     // carrick#1376: the call answers a RESULT CARRIER — a generic union whose
     // branches say whether the call worked and carry, on the success side, the
     // value it produced. The carrier is the transport's own bookkeeping; the
@@ -1732,18 +1760,19 @@ export class TypeInferrer {
     // the carrier instead reports an envelope as a wire contract, which is the
     // same class of answer the machinery guard refuses on the producer side.
     //
-    // A wrapper rule that already unwrapped, and a type the source itself
-    // states, both outrank this: they are what the service's own config and
-    // its own author said.
+    // A type the source itself states outranks this: it is what the author
+    // said. A wrapper rule that unwrapped is read first, and the carrier read
+    // takes what the rule left (carrick#1843): a service with a rule for
+    // `Task` and none for `Outcome` leaves `Outcome<Reply<T>, E>`, which is as
+    // much a carrier as it was before the rule could match `Task` by its
+    // alias. A rule that left no single payload (a union join) leaves nothing
+    // to read.
+    const where = `${request.file_path}:${request.line_number}`;
+    const afterRules = unwrapResult.wasUnwrapped ? unwrapResult.payloadType : returnType;
     const carrierCandidate =
-      unwrapResult.wasUnwrapped || explicitType
+      explicitType || !afterRules
         ? undefined
-        : this.resultCarrierPayload(
-            returnType,
-            terminalNode,
-            use.projections,
-            `${request.file_path}:${request.line_number}`
-          );
+        : this.resultCarrierPayload(afterRules, terminalNode, use.projections, where);
     // carrick#1841: what the carrier holds goes through the service's wrapper
     // rules before it is published, as the call's own result did. The carrier
     // is found by its shape, so what it holds can still be a library's
@@ -1769,28 +1798,10 @@ export class TypeInferrer {
     ) {
       const carried = typeText(carrierCandidate, terminalNode);
       this.log(
-        `Call result at ${request.file_path}:${request.line_number} carries ${carried}, which ` +
-          "the service's wrapper rules verify as transport and read no payload out of; this " +
-          'site states no response contract'
+        `Call result at ${where} carries ${carried}, which the service's wrapper rules ` +
+          'verify as transport and read no payload out of; this site states no response contract'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(callExpr)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'machinery_envelope',
-          detail:
-            "what this call's result carries is transport that the service's wrapper rules " +
-            'verify and read no payload out of (a library response object around the body), ' +
-            'so this site states no response contract',
-        },
-      ];
-      return abstain;
+      return this.transportAbstain(request, callExpr);
     }
     const carried =
       carrierUnwrap?.wasUnwrapped && carrierUnwrap.payloadType
@@ -1892,11 +1903,18 @@ export class TypeInferrer {
     // operation's declaration — and where the carrier is a local interface the
     // service does not export, nothing is emitted at all and the row reads
     // null. The payload the carrier was found to hold is the anchor.
-    const anchorSource = carrierPayload
-      ? carrierPayload
-      : callUnwrap.wasUnwrapped
-        ? callUnwrap.payloadType
-        : callPayloadType;
+    //
+    // carrick#1843: that holds for a carrier a rule left of the call's own
+    // result too. A rule for `Task` alone turns `Task<Outcome<T, E>>` into
+    // `Outcome<T, E>` here, and where the terminal's read took no payload out
+    // of it (an open payload, or a terminal further down a chain) the
+    // carrier's alias would otherwise be the anchor.
+    const callAfterRules = callUnwrap.wasUnwrapped ? callUnwrap.payloadType : callPayloadType;
+    const ruleLeftCarrier =
+      callUnwrap.wasUnwrapped &&
+      !!callAfterRules &&
+      this.resultCarrierArguments(callAfterRules, callExpr) !== undefined;
+    const anchorSource = carrierPayload ?? (ruleLeftCarrier ? undefined : callAfterRules);
     let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
@@ -2881,39 +2899,11 @@ export class TypeInferrer {
     projections: Node[],
     where: string
   ): Type | undefined {
-    const carrier = this.unwrapThenableType(this.unwrapPromiseType(type));
-    if (!carrier.isUnion()) {
+    const shape = this.resultCarrierArguments(type, at);
+    if (!shape) {
       return undefined;
     }
-    const branches = carrier.getUnionTypes();
-    if (branches.length < 2 || !branches.every((branch) => this.isObjectShape(branch))) {
-      return undefined;
-    }
-    const args = [
-      ...carrier.getAliasTypeArguments(),
-      ...carrier.getTypeArguments(),
-    ];
-    if (args.length < 2) {
-      return undefined;
-    }
-    // A type argument only names a payload when a branch actually holds it:
-    // a generic that parameterises a status code or a key carries nothing.
-    const carried = args.filter((arg) =>
-      branches.some((branch) =>
-        branch
-          .getProperties()
-          .some((property) => {
-            try {
-              return property.getTypeAtLocation(at).getText() === arg.getText();
-            } catch {
-              return false;
-            }
-          })
-      )
-    );
-    if (carried.length === 0) {
-      return undefined;
-    }
+    const { carrier, carried } = shape;
 
     const argTexts = new Map(carried.map((arg) => [arg.getText(), arg]));
     const read = new Set<string>();
@@ -2955,6 +2945,77 @@ export class TypeInferrer {
         'written rather than guessing which argument is the payload'
     );
     return undefined;
+  }
+
+  /**
+   * The shape test of `resultCarrierPayload`: the carrier `type` is, once a
+   * promise-like around it is peeled, and the type arguments a branch of it
+   * holds as a member. `undefined` when `type` is not a carrier.
+   */
+  private resultCarrierArguments(
+    type: Type,
+    at: Node
+  ): { carrier: Type; carried: Type[] } | undefined {
+    const carrier = this.unwrapThenableType(this.unwrapPromiseType(type));
+    if (!carrier.isUnion()) {
+      return undefined;
+    }
+    const branches = carrier.getUnionTypes();
+    if (branches.length < 2 || !branches.every((branch) => this.isObjectShape(branch))) {
+      return undefined;
+    }
+    const args = [
+      ...carrier.getAliasTypeArguments(),
+      ...carrier.getTypeArguments(),
+    ];
+    if (args.length < 2) {
+      return undefined;
+    }
+    // A type argument only names a payload when a branch actually holds it:
+    // a generic that parameterises a status code or a key carries nothing.
+    const carried = args.filter((arg) =>
+      branches.some((branch) =>
+        branch
+          .getProperties()
+          .some((property) => {
+            try {
+              return property.getTypeAtLocation(at).getText() === arg.getText();
+            } catch {
+              return false;
+            }
+          })
+      )
+    );
+    return carried.length === 0 ? undefined : { carrier, carried };
+  }
+
+  /**
+   * The decided abstain of a call whose result, or what its result carries,
+   * is transport the service's wrapper rules verify and read no payload out
+   * of (carrick#1841, carrick#1843): `unknown` with `machinery_envelope` at
+   * the root and no anchor. The root reason is what keeps the capture's own
+   * locator from re-reading the raw call (`inference_decided_no_contract`,
+   * engine/type_compat_v2.rs).
+   */
+  private transportAbstain(request: InferRequestItem, callExpr: CallExpression): InferredType {
+    const abstain = this.createInferredType(
+      request,
+      'unknown',
+      false,
+      this.getNodeLocation(callExpr)
+    );
+    abstain.any_provenance = [
+      {
+        path: '',
+        kind: 'unknown',
+        reason: 'machinery_envelope',
+        detail:
+          "what this call's result carries is transport that the service's wrapper rules " +
+          'verify and read no payload out of (a library response object around the body), ' +
+          'so this site states no response contract',
+      },
+    ];
+    return abstain;
   }
 
   /**
@@ -3635,27 +3696,34 @@ export class TypeInferrer {
       return { kind: 'no-match' };
     }
 
-    const symbol = type.getSymbol() || type.getAliasSymbol();
-    const symbolName = symbol?.getName();
+    const readings = this.wrapperReadings(type);
 
-    // 1. Check exact wrapperSymbols match. When the rule also carries
-    // originModuleGlobs, the symbol's declaration must come from a matching
-    // module — names like `Response` are shared by the DOM, frameworks, and
-    // HTTP clients, so a bare name match would unwrap unrelated types.
-    if (rule.wrapperSymbols && symbolName && rule.wrapperSymbols.includes(symbolName)) {
-      const originGated = !!(rule.originModuleGlobs && rule.originModuleGlobs.length > 0);
-      if (!originGated || this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs!)) {
-        const extracted = this.extractPayloadFromWrapper(type, node, rule, config, depth);
-        if (extracted) {
-          return { kind: 'extracted', result: extracted };
-        }
-        // A name-only match is not proof of machinery: a local type that
-        // happens to share the name must keep its real structural type when
-        // nothing was extracted. Only origin-verified matches may collapse
-        // to `unknown`.
-        return originGated ? { kind: 'verified-no-payload' } : { kind: 'no-match' };
+    // 1. Check exact wrapperSymbols match, against either name the type goes
+    // by (carrick#1843). When the rule also carries originModuleGlobs, the
+    // declaration of the name that matched must come from a matching module
+    // — names like `Response` are shared by the DOM, frameworks, and HTTP
+    // clients, so a bare name match would unwrap unrelated types.
+    const named = readings.filter((reading) =>
+      rule.wrapperSymbols?.includes(reading.symbol.getName())
+    );
+    if (named.length > 0) {
+      const globs = rule.originModuleGlobs ?? [];
+      const originGated = globs.length > 0;
+      const matched = originGated
+        ? named.find((reading) => this.symbolOriginatesFromModules(reading.symbol, globs))
+        : named[0];
+      if (!matched) {
+        return { kind: 'no-match' };
       }
-      return { kind: 'no-match' };
+      const extracted = this.extractPayloadFromWrapper(type, matched, node, rule, config, depth);
+      if (extracted) {
+        return { kind: 'extracted', result: extracted };
+      }
+      // A name-only match is not proof of machinery: a local type that
+      // happens to share the name must keep its real structural type when
+      // nothing was extracted. Only origin-verified matches may collapse
+      // to `unknown`.
+      return originGated ? { kind: 'verified-no-payload' } : { kind: 'no-match' };
     }
 
     // 2. Check machineryIndicators + originModuleGlobs. Indicators alone are
@@ -3670,11 +3738,22 @@ export class TypeInferrer {
         return { kind: 'no-match' };
       }
 
-      if (!this.symbolOriginatesFromModules(symbol, rule.originModuleGlobs)) {
+      // The rule named neither of the type's names, so its index is read
+      // against a name its modules declare: the first such reading that
+      // states arguments. An alias declared elsewhere (a service's own alias
+      // around the library's object) has its own parameter list, which the
+      // rule says nothing about, and lends none.
+      const globs = rule.originModuleGlobs;
+      const verified = readings.filter((reading) =>
+        this.symbolOriginatesFromModules(reading.symbol, globs)
+      );
+      if (verified.length === 0) {
         return { kind: 'no-match' };
       }
 
-      const extracted = this.extractPayloadFromWrapper(type, node, rule, config, depth);
+      const reading =
+        verified.find((candidate) => candidate.typeArguments.length > 0) ?? verified[0];
+      const extracted = this.extractPayloadFromWrapper(type, reading, node, rule, config, depth);
       if (extracted) {
         return { kind: 'extracted', result: extracted };
       }
@@ -3685,14 +3764,46 @@ export class TypeInferrer {
   }
 
   /**
+   * The names `type` goes by, own symbol first (carrick#1843).
+   *
+   * `type Task<A> = __Task<A>` has the class's symbol and arguments, and the
+   * alias's beside them. `type Reply<T> = { ... }` has the anonymous `__type`
+   * with no arguments of its own. `type Outcome<A, E> = Done<A, E> |
+   * Failed<A, E>` has no symbol of its own at all. In each, the alias and its
+   * arguments are what a rule naming `Task`, `Reply` or `Outcome` describes.
+   */
+  private wrapperReadings(type: Type): WrapperReading[] {
+    const readings: WrapperReading[] = [];
+    const own = type.getSymbol();
+    if (own) {
+      readings.push({ symbol: own, typeArguments: type.getTypeArguments(), viaAlias: false });
+    }
+    const alias = type.getAliasSymbol();
+    if (alias && alias !== own) {
+      readings.push({
+        symbol: alias,
+        typeArguments: type.getAliasTypeArguments(),
+        viaAlias: true,
+      });
+    }
+    return readings;
+  }
+
+  /**
    * Extract the payload type from a matched wrapper. Returns null when the
    * rule matched the wrapper but no payload is recoverable from generics or
    * property paths — the caller decides what a payload-less match means
    * (verified machinery collapses to `unknown` after every rule has run;
    * a name-only match leaves the type untouched).
+   *
+   * `payloadGenericIndex` counts the arguments of `reading`, the name the
+   * rule matched (carrick#1843): an alias is free to order its parameters
+   * differently from the type it stands for, so the same index into the
+   * other list is a different argument.
    */
   private extractPayloadFromWrapper(
     type: Type,
+    reading: WrapperReading,
     node: Node,
     rule: ExtractionRule,
     config: ExtractionConfig,
@@ -3717,7 +3828,7 @@ export class TypeInferrer {
 
     // 1. Try generic type argument at payloadGenericIndex
     const genericIndex = rule.payloadGenericIndex ?? 0;
-    const typeArgs = type.getTypeArguments();
+    const typeArgs = reading.typeArguments;
 
     if (typeArgs.length > genericIndex) {
       const payloadArg = typeArgs[genericIndex];
@@ -3737,8 +3848,11 @@ export class TypeInferrer {
         };
       }
 
-      // Try "first useful generic" heuristic
-      for (let i = 0; i < typeArgs.length; i++) {
+      // Try "first useful generic" heuristic. It is a guess about a type's
+      // own arguments and is not extended to an alias's (carrick#1843): the
+      // alias this reaches most often is a result carrier, `Outcome<A, E>`,
+      // whose next argument after an open payload is the error side.
+      for (let i = 0; !reading.viaAlias && i < typeArgs.length; i++) {
         const argType = typeArgs[i];
         const text = typeText(argType, node);
         if (!this.isUselessType(text)) {
