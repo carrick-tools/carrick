@@ -18,7 +18,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
-import { isRelative, npmPackageSpecifier } from './specifiers.js';
+import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
@@ -699,13 +699,20 @@ type ImportedName =
  * carrick#1789: how the surface entry imports `local`, a name the source file
  * binds with an import from an installed package, or undefined.
  *
- * The specifier is the one the source wrote, with a Deno `npm:` specifier
- * read as its package. It is kept only when the module it names is an
- * external library and the entry reaches that same module by it. So a
- * tsconfig path alias stays as written (its module is the repo's own), and so
- * does a Deno import-map key that is not the package's name (the entry cannot
- * read it). The capture pins every package its surface imports, so the check
- * phase resolves the name where the stub's own tree never could.
+ * The entry names the module the source's import resolves to by its file
+ * path, as the node builder names a library type it cannot reach by a bare
+ * specifier; the post-emit rewrite turns that path into the package's bare
+ * specifier and pins the installed version (`installedPackageSpecifier`). A
+ * bare specifier in the entry itself would be resolved from the entry: on a
+ * Deno service that goes through the graph's virtual `node_modules`, and the
+ * emitter then reads the package there, cannot name its types from the
+ * service's own modules (TS2742), and skips their declarations.
+ *
+ * Kept only when the module lies inside an installed package and the bare
+ * specifier that package gives resolves from the entry to the same file. So
+ * a tsconfig path alias to the repo's own module, a workspace package linked
+ * from the repo (no installed copy to pin), and an import of another
+ * installed copy than the entry reaches all stay as written.
  */
 function packageImportOf(
   program: ts.Program,
@@ -730,22 +737,16 @@ function packageImportOf(
   } else {
     return undefined;
   }
-  if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
-    return undefined;
-  }
-  const written = statement.moduleSpecifier.text;
-  if (isRelative(written)) return undefined;
-
+  if (!ts.isImportDeclaration(statement)) return undefined;
   const checker = program.getTypeChecker();
   const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
   const moduleFile = moduleSymbol?.declarations?.find(ts.isSourceFile);
-  if (!moduleSymbol || !moduleFile || !program.isSourceFileFromExternalLibrary(moduleFile)) {
-    return undefined;
-  }
-  const spec = npmPackageSpecifier(written);
-  const fromEntry = resolveFromEntry(spec);
+  if (!moduleSymbol || !moduleFile) return undefined;
+  const installed = installedPackageSpecifier(moduleFile.fileName, exportName);
+  const fromEntry = installed && resolveFromEntry(installed.specifier);
   if (!fromEntry || realPath(fromEntry) !== realPath(moduleFile.fileName)) return undefined;
 
+  const spec = moduleFile.fileName;
   const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
   if (exportName === undefined) return { spec, namespaceExports: exported };
   return exported.has(exportName) ? { spec, exportName } : undefined;

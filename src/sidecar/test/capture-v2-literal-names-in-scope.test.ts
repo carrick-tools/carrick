@@ -188,9 +188,10 @@ describe('capture reads a literal anchor\'s names where the text was printed (#1
 
 /**
  * carrick#1789: a name the source file imports from a package is imported in
- * the surface through the specifier the source wrote, so the check phase's
- * pinned install resolves it. Before, it stayed bare: the stub ships no
- * `node_modules`, the name named nothing there, and the member read `any`.
+ * the surface through that package's bare specifier, and the package is
+ * pinned, so the check phase's install resolves it. Before, it stayed bare:
+ * the stub ships no `node_modules`, the name named nothing there, and the
+ * member read `any`.
  */
 describe('a name the source imports from a package resolves through that package (#1789)', () => {
   let parentDir: string;
@@ -288,7 +289,7 @@ describe('a name the source imports from a package resolves through that package
         literal('Endpoint_default_Response', '{ ledger: Ledger; }'),
         // A namespace import's qualifier names the export.
         literal('Endpoint_namespace_Response', '{ total: Money.LibMoney; }'),
-        // A subpath is kept as the source wrote it.
+        // A subpath export stays a subpath.
         literal('Endpoint_subpath_Response', '{ rate: Rate; }'),
         // Type arguments are read in the source scope too.
         literal('Endpoint_list_Response', '{ prices: Array<LibMoney>; }'),
@@ -348,7 +349,7 @@ describe('a name the source imports from a package resolves through that package
     return stub.checker.getPropertiesOfType(type).map((p) => p.name).sort();
   }
 
-  it('imports the name through the specifier the source wrote', () => {
+  it('imports the name through its package specifier', () => {
     assert.match(surface, /Endpoint_library_Response = \{ price: import\("@example\/money"\)\.LibMoney; \};/);
     assert.match(surface, /Endpoint_renamed_Response = \{ cash: import\("@example\/money"\)\.LibMoney; \};/);
     assert.match(surface, /Endpoint_default_Response = \{ ledger: import\("@example\/money"\)\.default; \};/);
@@ -395,70 +396,100 @@ const hasDeno = spawnSync('deno', ['--version']).status === 0;
  * carrick#1789 on Deno: the source names a package through an import-map key
  * or an `npm:` specifier, neither of which the stub's npm install reads. The
  * surface names the npm package, and the capture pins its cached version.
+ *
+ * The entry must not name the package by a bare specifier: resolved from the
+ * entry, it goes through the graph's virtual `node_modules`, and the emitter
+ * then cannot name the package's types inside the service's own modules
+ * (TS2742). A module whose exported value has an inferred framework type
+ * loses its declaration, and every symbol anchor on it is demoted.
  */
 describe('a name a Deno source imports from an npm package resolves through that package (#1789)', { skip: !hasDeno }, () => {
-  it('imports the name by its npm package name and pins it', () => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1789-deno-')));
-    try {
-      fs.writeFileSync(
-        path.join(root, 'deno.json'),
-        JSON.stringify({ imports: { hono: 'npm:hono@4.12.12', web: 'npm:hono@4.12.12' } })
-      );
-      fs.writeFileSync(
-        path.join(root, 'main.ts'),
-        [
-          'import type { Env } from "hono";',
-          'import type { Env as Direct } from "npm:hono@4.12.12";',
-          // An import-map key that is not the package's name: the entry
-          // cannot import by it, so the name stays as the text printed it.
-          'import type { Schema } from "web";',
-          'export type Local = Env | Direct | Schema;',
-          '',
-        ].join('\n')
-      );
-      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
-      assert.equal(installed.status, 0, installed.stderr);
-      const result = captureStub({
-        repoRoot: root,
-        serviceName: 'deno-literal-package',
-        outDir: path.join(root, '.carrick', 'stub'),
-        anchors: [
-          {
-            kind: 'literal',
-            alias: 'Endpoint_mapped_Response',
-            type_text: '{ env: Env; }',
-            anchor_origin: 'deterministic-infer',
-            source_file: 'main.ts',
-          },
-          {
-            kind: 'literal',
-            alias: 'Endpoint_direct_Response',
-            type_text: '{ env: Direct; }',
-            anchor_origin: 'deterministic-infer',
-            source_file: 'main.ts',
-          },
-          {
-            kind: 'literal',
-            alias: 'Endpoint_keyed_Response',
-            type_text: '{ schema: Schema; }',
-            anchor_origin: 'deterministic-infer',
-            source_file: 'main.ts',
-          },
-        ],
-      });
-      assert.ok(result.success, result.errors.join('\n'));
-      const text = fs.readFileSync(path.join(result.stub_dir, 'types', 'surface.d.ts'), 'utf8').replace(/\s+/g, ' ');
-      assert.match(text, /Endpoint_mapped_Response = \{ env: import\("hono"\)\.Env; \};/);
-      assert.match(text, /Endpoint_direct_Response = \{ env: import\("hono"\)\.Env; \};/);
-      assert.match(text, /Endpoint_keyed_Response = \{ schema: Schema; \};/);
-      assert.ok(!text.includes('import("web")'), text);
-      assert.equal(result.pinned_dependencies.hono, '4.12.12');
-      for (const alias of ['Endpoint_mapped_Response', 'Endpoint_direct_Response']) {
-        const record = result.aliases.find((entry) => entry.alias === alias);
-        assert.equal(record?.self_check, 'ok', JSON.stringify(record));
-      }
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+  let root: string;
+  let result: ReturnType<typeof captureStub>;
+  let text: string;
+
+  before(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1789-deno-')));
+    fs.writeFileSync(
+      path.join(root, 'deno.json'),
+      JSON.stringify({ imports: { hono: 'npm:hono@4.12.12', web: 'npm:hono@4.12.12' } })
+    );
+    fs.writeFileSync(
+      path.join(root, 'main.ts'),
+      [
+        'import type { Env } from "hono";',
+        'import type { Env as Direct } from "npm:hono@4.12.12";',
+        // An import-map key that is not the package's name.
+        'import type { Env as Keyed } from "web";',
+        'export type Local = Env | Direct | Keyed;',
+        '',
+      ].join('\n')
+    );
+    // A module whose declaration names hono's types for an inferred value.
+    fs.writeFileSync(
+      path.join(root, 'router.ts'),
+      [
+        'import { Hono } from "hono";',
+        'export interface Account { id: string }',
+        'export const router = new Hono().get("/account", (c) => c.json({ id: "a" }));',
+        '',
+      ].join('\n')
+    );
+    const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+    assert.equal(installed.status, 0, installed.stderr);
+    const literal = (alias: string, type_text: string) => ({
+      kind: 'literal' as const,
+      alias,
+      type_text,
+      anchor_origin: 'deterministic-infer' as const,
+      source_file: 'main.ts',
+    });
+    result = captureStub({
+      repoRoot: root,
+      serviceName: 'deno-literal-package',
+      outDir: path.join(root, '.carrick', 'stub'),
+      anchors: [
+        literal('Endpoint_mapped_Response', '{ env: Env; }'),
+        literal('Endpoint_direct_Response', '{ env: Direct; }'),
+        literal('Endpoint_keyed_Response', '{ env: Keyed; }'),
+        {
+          kind: 'symbol',
+          alias: 'Endpoint_account_Response',
+          symbol_name: 'Account',
+          source_file: 'router.ts',
+          anchor_origin: 'llm-symbol',
+        },
+      ],
+    });
+    assert.ok(result.success, result.errors.join('\n'));
+    text = fs.readFileSync(path.join(result.stub_dir, 'types', 'surface.d.ts'), 'utf8').replace(/\s+/g, ' ');
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('imports the name by its npm package name and pins the cached version', () => {
+    assert.match(text, /Endpoint_mapped_Response = \{ env: import\("hono"\)\.Env; \};/);
+    assert.match(text, /Endpoint_direct_Response = \{ env: import\("hono"\)\.Env; \};/);
+    assert.match(text, /Endpoint_keyed_Response = \{ env: import\("hono"\)\.Env; \};/);
+    assert.equal(result.pinned_dependencies.hono, '4.12.12');
+    for (const alias of ['Endpoint_mapped_Response', 'Endpoint_direct_Response', 'Endpoint_keyed_Response']) {
+      const record = result.aliases.find((entry) => entry.alias === alias);
+      assert.equal(record?.self_check, 'ok', JSON.stringify(record));
     }
+  });
+
+  it('leaves no file path in the surface', () => {
+    assert.ok(!text.includes('import("/'), text);
+  });
+
+  it('a module whose declaration names the package still emits', () => {
+    const record = result.aliases.find((entry) => entry.alias === 'Endpoint_account_Response');
+    assert.equal(record?.self_check, 'ok', JSON.stringify(record));
+    assert.deepStrictEqual(
+      result.errors.filter((error) => /cannot be named|emit was partial/.test(error)),
+      []
+    );
   });
 });
