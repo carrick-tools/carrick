@@ -1116,6 +1116,14 @@ function isPreferredTarget(node: ts.Node): boolean {
   );
 }
 
+/**
+ * The deepest node a span names: a value-space target covering it, or a TYPE
+ * node it covers exactly (carrick#1775). A span is the scanner naming a node,
+ * and a declared type is named by its type node: the property type a generated
+ * GraphQL document declaration states for a field sits inside a type alias,
+ * where no value-space node covers it. Exactness keeps a span that names no
+ * node from being read as whatever type happens to enclose it.
+ */
 function tightestCoveringNode(
   sourceFile: ts.SourceFile,
   start: number,
@@ -1123,12 +1131,17 @@ function tightestCoveringNode(
 ): ts.Node | undefined {
   let best: ts.Node | undefined;
   const visit = (node: ts.Node) => {
-    if (node.getStart(sourceFile) <= start && node.getEnd() >= end) {
-      if (isPreferredTarget(node)) best = node;
-      node.forEachChild(visit);
-    } else {
-      node.forEachChild(visit);
+    const nodeStart = node.getStart(sourceFile);
+    const nodeEnd = node.getEnd();
+    if (nodeStart <= start && nodeEnd >= end) {
+      if (
+        isPreferredTarget(node) ||
+        (ts.isTypeNode(node) && nodeStart === start && nodeEnd === end)
+      ) {
+        best = node;
+      }
     }
+    node.forEachChild(visit);
   };
   visit(sourceFile);
   return best;

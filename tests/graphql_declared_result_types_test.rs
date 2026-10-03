@@ -24,7 +24,7 @@
 //! | `query invoice` (`InvoicePage.tsx:6`) | the declaration (the locate is ignored) | the `invoice` property: `{ __typename: 'Invoice', id, total, dueAt? } \| null` | compatible with the resolver's `Invoice \| null` |
 //! | `mutation sendInvoice` (`InvoicePage.tsx:7`) | the declaration, no locate | `{ __typename: 'Invoice', id: string }` | compatible with `Invoice` |
 //! | `query note` (`NotePage.tsx:6`) | the located `NoteView` (carrick#1728) | `{ id: string; body: string }` | none to judge: no resolver |
-//! | `query ledger` (`LedgerPage.tsx:6`) | none yet: the declared type writes `unknown` (carrick#1775) | `unknown`; never the operation result | none to judge: no resolver |
+//! | `query ledger` (`LedgerPage.tsx:6`) | the declaration, whose `entries` member writes `unknown` (carrick#1775) | the `ledger` property: `{ __typename: 'Ledger', id, entries? } \| null`, `entries` `unknown` as declared | none to judge: no resolver |
 //!
 //! An operation-level type under the field-keyed `invoice` row would read
 //! incompatible against the resolver's field-level return (carrick#1760),
@@ -188,13 +188,12 @@ fn a_typed_documents_declaration_types_the_rows_at_its_calls_at_field_level() {
 }
 
 /// A declared field type with a member the declaration writes as `unknown`
-/// (a JSON scalar) is still the field's payload. Whatever path the sidecar
-/// reads it through, the row never serves the operation result around it:
-/// the field's type, or `unknown` when it cannot be read. Today the capture
-/// cannot place a type node and would serve the operation, so the scanner
-/// withholds such a field and the row reads `unknown` (carrick#1775).
+/// (a JSON scalar) is still the field's payload. The v1 text carries the
+/// `unknown`, so the capture reads the field through its own infer anchor,
+/// which places the property's TYPE node and never serves the operation result
+/// around it (carrick#1775). The member stays `unknown`, as declared.
 #[test]
-fn a_declared_field_type_with_an_unknown_member_is_never_served_as_the_operation() {
+fn a_declared_field_type_with_an_unknown_member_is_served_at_field_level() {
     let blobs = scan(&fixture_dir());
 
     let (state, _, definition) = consumer_type(
@@ -206,9 +205,12 @@ fn a_declared_field_type_with_an_unknown_member_is_never_served_as_the_operation
         !definition.contains("ledger") && !definition.contains("\"Query\""),
         "the row never serves the operation result: {definition}"
     );
+    assert_ne!(state, "unknown", "the declared type resolves: {definition}");
     assert!(
-        state == "unknown" || definition.contains("entries"),
-        "a typed row serves the `ledger` property: {state} {definition}"
+        definition.contains("\"Ledger\"")
+            && definition.contains("entries")
+            && definition.contains("null"),
+        "the row serves the `ledger` property, nullable as declared: {definition}"
     );
 }
 
