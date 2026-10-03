@@ -2285,7 +2285,7 @@ impl TypeSidecar {
         format!("req-{}", counter)
     }
 
-    fn is_untyped_response_type(type_string: &str) -> bool {
+    pub(crate) fn is_untyped_response_type(type_string: &str) -> bool {
         let trimmed = type_string.trim().trim_end_matches(';');
         if trimmed.is_empty() {
             return false;

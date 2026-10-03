@@ -7668,9 +7668,17 @@ fn enrich_manifest_with_type_resolution(
     // path while `entry.file_path` is repo-relative, so the coordinates need not
     // line up. First non-None wins per alias, so a later inferred entry can't
     // clobber an earlier real symbol.
+    //
+    // Transport machinery never anchors a row (carrick#1779). A consumer
+    // call's inference anchors on the call's own type, which for `fetch` is
+    // `Response`: the thing the body is read out of, not the body.
     let mut inferred_symbols: HashMap<String, String> = HashMap::new();
     for inferred in &type_resolution.inferred_types {
-        if let Some(symbol) = inferred.primary_type_symbol.as_ref() {
+        if let Some(symbol) = inferred
+            .primary_type_symbol
+            .as_ref()
+            .filter(|symbol| !TypeSidecar::is_untyped_response_type(symbol))
+        {
             inferred_symbols
                 .entry(inferred.alias.clone())
                 .or_insert_with(|| symbol.clone());
@@ -15681,6 +15689,22 @@ mod tests {
             Some("Payment"),
             "an existing LLM anchor must never be regressed by the inferred symbol"
         );
+    }
+
+    /// carrick#1779: a `fetch` call's inference anchors on the call's own type,
+    /// `Response`, while its text is the body the source reads out of it. The
+    /// transport is not the row's type, so it fills no anchor.
+    #[test]
+    fn enrich_never_fills_an_anchor_with_transport_machinery() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        resolution
+            .inferred_types
+            .push(inferred_with_symbol("Response"));
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(manifest[0].primary_type_symbol, None);
     }
 
     // -----------------------------------------------------------------
