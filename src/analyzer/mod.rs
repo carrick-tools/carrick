@@ -5609,6 +5609,78 @@ mod tests {
         }
     }
 
+    /// carrick#1754: a wrong-verb call this scan holds no data-call row for
+    /// makes the method mismatch a candidate, whatever the other rows say, as
+    /// a type mismatch's unheld consumer does (carrick#1735). The pairing has
+    /// a side the scan cannot see, so it is not a fact, and the wire must say
+    /// `candidate`: a missing field is enforced by the cloud's PR check. A row
+    /// the scan holds that states no source still folds to unstated (the last
+    /// case of the test above).
+    #[test]
+    fn a_method_mismatch_with_an_unheld_call_site_is_a_candidate() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{
+            FileBasedRoute, ImportedMember,
+        };
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        // (call sites, the ones with a data-call row) -> one finding each.
+        let cases: [(&[&str], &[&str]); 2] = [
+            // A held fact site beside an unheld one on the same route.
+            (
+                &["web/src/client.ts:12", "web/src/other.ts:40"],
+                &["web/src/client.ts:12"],
+            ),
+            // The only site is unheld (the held row is on another line).
+            (&["web/src/client.ts:12"], &["web/src/client.ts:30"]),
+        ];
+
+        for (sites, held) in cases {
+            let mut analyzer = Analyzer::new(Config::default());
+            for site in sites {
+                analyzer.calls.push(http_call("GET", "/api/orders", site));
+            }
+            let mut mount_graph = MountGraph::new();
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                resolution_source: Some(FileBasedRoute),
+                ..resolved("POST", "/api/orders")
+            });
+            for location in held {
+                mount_graph.data_calls.push(DataFetchingCall {
+                    method: "GET".to_string(),
+                    target_url: "/api/orders".to_string(),
+                    canonical_path: "/api/orders".to_string(),
+                    client: "fetch".to_string(),
+                    file_location: location.to_string(),
+                    call_kind: None,
+                    repo_name: Some("web".to_string()),
+                    service_name: None,
+                    host: None,
+                    line: None,
+                    base: None,
+                    consumers_not_resolved: None,
+                    resolution_source: Some(ImportedMember),
+                    dispatch: None,
+                    role: None,
+                    reaches_request: None,
+                    library_semantics: Vec::new(),
+                });
+            }
+
+            let (findings, _verified, _edges) =
+                analyzer.analyze_matches_with_mount_graph(&mount_graph);
+            let mismatches: Vec<&Finding> = findings
+                .iter()
+                .filter(|f| matches!(f, Finding::MethodMismatch { .. }))
+                .collect();
+            assert_eq!(mismatches.len(), 1, "sites {sites:?}: {findings:?}");
+            let wire = serde_json::to_value(mismatches[0]).expect("a finding serializes");
+            assert_eq!(
+                wire["edge_source"], "candidate",
+                "sites {sites:?}, held {held:?}: a call the scan holds no row for is not a fact; got {wire}"
+            );
+        }
+    }
+
     /// One non-HTTP row as the cross-repo merge leaves it.
     fn protocol_row(
         key: OperationKey,
