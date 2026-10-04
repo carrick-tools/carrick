@@ -1084,7 +1084,8 @@ export class TypeInferrer {
       this.getNodeLocation(func),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
-      anchor.depth
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
     if (provenance && provenance.length > 0) {
       inferred.any_provenance = provenance;
@@ -1449,7 +1450,8 @@ export class TypeInferrer {
       this.getNodeLocation(payloadNode),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
-      anchor.depth
+      anchor.depth,
+      this.primaryTypeSymbolSource(anchor.element)
     );
   }
 
@@ -1513,6 +1515,12 @@ export class TypeInferrer {
     const stated = recovered.statedTypeNode;
     const writtenAnchor =
       resolvedSymbol === undefined && stated ? this.writtenAnchorOf(stated) : undefined;
+    // carrick#1819: a symbol the resolved type carries has a declaration file
+    // as much as one read off the annotation does.
+    const resolvedSource =
+      resolvedSymbol !== undefined && recoveredAnchor
+        ? this.primaryTypeSymbolSource(recoveredAnchor.element)
+        : undefined;
     return this.createInferredType(
       request,
       recovered.typeString,
@@ -1521,7 +1529,7 @@ export class TypeInferrer {
       undefined,
       resolvedSymbol ?? writtenAnchor?.symbol,
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-      writtenAnchor?.source
+      writtenAnchor ? writtenAnchor.source : resolvedSource
     );
   }
 
@@ -1996,7 +2004,8 @@ export class TypeInferrer {
       this.getNodeLocation(terminalNode),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
-      anchor?.depth
+      anchor?.depth,
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
     );
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
@@ -5058,11 +5067,19 @@ export class TypeInferrer {
   /**
    * Declaration file (absolute path) of the anchor symbol
    * `primaryTypeSymbol` reports for this type, or `undefined` when the type
-   * has no user-facing anchor or no source declaration. The scanner's
-   * pub/sub two-anchor arbitration (carrick#413) uses this to re-aim a
-   * demoted explicit bundle request: the bundler resolves a `SymbolRequest`
-   * only against declarations IN its `source_file`, so the request must
-   * point at the file that actually declares the tsc-witnessed payload type.
+   * has no user-facing anchor or no source declaration. Every path that
+   * reports the symbol reports this beside it (carrick#1819): it is where a
+   * reader finds the type an anchor names. The scanner's pub/sub two-anchor
+   * arbitration (carrick#413) also uses it to re-aim a demoted explicit
+   * bundle request: the bundler resolves a `SymbolRequest` only against
+   * declarations IN its `source_file`, so the request must point at the file
+   * that actually declares the tsc-witnessed payload type.
+   *
+   * The declarations read are those of the type's own symbol, so a name
+   * imported through a barrel reports the file that declares it, and a name
+   * two files declare reports the one this type resolves to. A declaration in
+   * an installed package or a TypeScript lib is reported as it is found, as
+   * an absolute path; what a reader is shown for it is the scanner's call.
    *
    * Only declaration kinds the bundler's `validateSymbols` can resolve
    * (interface, type alias, class, enum, function, variable) count. A

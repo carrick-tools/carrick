@@ -60,7 +60,10 @@ export interface ExtractionRule {
 
   /**
    * Index of the generic type argument containing the payload.
-   * Defaults to 0 (first type arg).
+   * Defaults to 0 (first type arg). It counts the parameters of the name
+   * the rule matched: a type alias named in `wrapperSymbols` is read by its
+   * own parameters, which it may order differently from the type it stands
+   * for (carrick#1843).
    * Examples:
    *   - Response<T> → index 0
    *   - Map<K, V> → index 1 for values
@@ -896,14 +899,18 @@ export interface InferredType {
   array_depth?: number;
   /**
    * Declaration file of `primary_type_symbol` (absolute path), when the
-   * anchor symbol has a resolvable source declaration. Lets the scanner's
-   * pub/sub two-anchor arbitration (carrick#413) re-aim a demoted explicit
+   * anchor symbol has a resolvable source declaration. Reported by every
+   * infer kind that reports the symbol (carrick#1819): it is where a reader
+   * finds the type an anchor names, and the scanner writes an anchor's home
+   * from it. The file is the one that declares the symbol the type resolves
+   * to, never a barrel that re-exports it.
+   *
+   * The scanner's pub/sub two-anchor arbitration (carrick#413) also reads it,
+   * for a borrowed-anchor request only, to re-aim a demoted explicit
    * `SymbolRequest` at the tsc-witnessed payload type: the bundler requires
    * the symbol to be declared in, or re-exported by, the request's
    * `source_file`, and the inference is the only party that knows where that
-   * is. Reported only by
-   * the pub/sub infer kinds (`function_param`, `expression`); other kinds
-   * omit it.
+   * is.
    */
   primary_type_symbol_source?: string;
   /**
