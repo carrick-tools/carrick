@@ -56,6 +56,11 @@ jobs:
       - name: Run sidecar operation timeout tests
         run: cargo test --test sidecar_operation_timeout_test --verbose
 
+      # Replacing the sidecar process on request, and a process that dies
+      # mid-answer (carrick#1916), against the same kind of stand-in.
+      - name: Run sidecar fresh process tests
+        run: cargo test --test sidecar_fresh_process_test --verbose
+
       # Each raises a real signal at its own process, and each is the only
       # test in its binary: the signal and the flag it sets are process-wide,
       # and the flag keeps the FIRST signal, so a second test in the same

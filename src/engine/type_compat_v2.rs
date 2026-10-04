@@ -28,9 +28,10 @@ use crate::cloud_storage::{
 use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
-    AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CheckPairEndpoint, CheckPairSpec,
-    CheckStubInput, InferKind, InferRequestItem, ManifestEntry, ProbeProtocol, ProbeTypeKind,
-    RetypeItem, RetypeOutcome, RetypeVerdict, SymbolRequest, VerdictBucket, VerdictSide,
+    AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
+    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, ProbeProtocol,
+    ProbeTypeKind, RetypeItem, RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest,
+    VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -608,10 +609,44 @@ pub(crate) fn derive_capture_anchors(
     anchors
 }
 
+/// Why a service's capture produced no stub (carrick#1921). The caller writes
+/// it on the service, so the index says what happened without anyone probing
+/// the sidecar afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureFailure {
+    /// The sidecar gave no answer and reported no progress inside the
+    /// operation deadline. It was killed and replaced (carrick#1914). Not
+    /// retried: the same request would wait the same deadline out.
+    TimedOut,
+    /// The sidecar process ended before it answered, in the process the
+    /// capture was first asked of and again in the fresh one it was retried
+    /// in; or no process could be started to ask. The text says which.
+    SidecarDied(String),
+    /// The sidecar answered, and the answer was not a stub: the capture's own
+    /// error, or a stub package this side could not read.
+    Failed(String),
+}
+
+impl std::fmt::Display for CaptureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureFailure::TimedOut => write!(
+                f,
+                "the type sidecar gave no answer and reported no progress inside the \
+                 operation deadline"
+            ),
+            CaptureFailure::SidecarDied(detail) | CaptureFailure::Failed(detail) => {
+                write!(f, "{detail}")
+            }
+        }
+    }
+}
+
 /// Run `capture_v2` for one service and read the stub package into the wire
 /// artifact. Returns the on-disk stub dir (for the definitions re-point;
-/// caller owns cleanup) alongside the artifact. `None` = capture degraded;
-/// the service ships without a surface and its pairs verdict unverifiable.
+/// caller owns cleanup) alongside the artifact. `Err` = capture degraded, and
+/// why; the service ships without a surface and its pairs verdict
+/// unverifiable.
 ///
 /// When the first capture DEMOTES an alias (a `capture_failure_reason` on its
 /// record — e.g. TS4023 skipped its file's declaration emit, so its surface
@@ -631,9 +666,9 @@ pub(crate) fn run_capture(
     anchors: &[CaptureAnchor],
     backfill_texts: &HashMap<String, String>,
     tsconfig_path: Option<&str>,
-) -> Option<(PathBuf, CaptureStubArtifact)> {
+) -> Result<(PathBuf, CaptureStubArtifact), CaptureFailure> {
     if anchors.is_empty() {
-        return None;
+        return Err(CaptureFailure::Failed("no anchors to capture".to_string()));
     }
     let repo_root = std::path::Path::new(repo_path)
         .canonicalize()
@@ -644,7 +679,7 @@ pub(crate) fn run_capture(
 
     let Some((rerun_anchors, backfilled)) = backfill_anchors(anchors, &records, backfill_texts)
     else {
-        return Some((stub_dir, artifact));
+        return Ok((stub_dir, artifact));
     };
     debug!(
         "v2 capture for {}: literal backfill attempt for {} demoted alias(es)",
@@ -658,7 +693,7 @@ pub(crate) fn run_capture(
         &rerun_anchors,
         tsconfig_path,
     ) {
-        Some((rerun_dir, rerun_artifact, rerun_records))
+        Ok((rerun_dir, rerun_artifact, rerun_records))
             if backfill_accepted(&backfilled, &records, &rerun_records) =>
         {
             debug!(
@@ -667,9 +702,9 @@ pub(crate) fn run_capture(
                 backfilled.len()
             );
             let _ = std::fs::remove_dir_all(&stub_dir);
-            Some((rerun_dir, rerun_artifact))
+            Ok((rerun_dir, rerun_artifact))
         }
-        Some((rerun_dir, _, _)) => {
+        Ok((rerun_dir, _, _)) => {
             // Fail-closed: the backfill result failed its self-check or
             // degraded a sibling alias — keep the demoted/unknown surface
             // (honest unverifiable), never a backfill that didn't verify.
@@ -678,46 +713,26 @@ pub(crate) fn run_capture(
                 service_id
             );
             let _ = std::fs::remove_dir_all(&rerun_dir);
-            Some((stub_dir, artifact))
+            Ok((stub_dir, artifact))
         }
-        None => Some((stub_dir, artifact)),
+        // The first capture stands: the backfill is an extra, and its own
+        // failure is in the log.
+        Err(_) => Ok((stub_dir, artifact)),
     }
 }
 
-/// One `capture_v2` round-trip: run the capture into a fresh scratch dir and
-/// read the stub package into the wire artifact, keeping the per-alias
-/// records (the demotion signal the backfill decision needs).
+/// One capture: ask it of a fresh sidecar process, and read the stub package
+/// it wrote into the wire artifact, keeping the per-alias records (the
+/// demotion signal the backfill decision needs).
 fn capture_once(
     sidecar: &TypeSidecar,
     repo_root: &Path,
     service_id: &str,
     anchors: &[CaptureAnchor],
     tsconfig_path: Option<&str>,
-) -> Option<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>)> {
-    let unique = format!(
-        "carrick-capture-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let out_dir = std::env::temp_dir().join(unique);
-
-    let result = match sidecar.capture_v2(
-        &repo_root.to_string_lossy(),
-        service_id,
-        anchors,
-        &out_dir.to_string_lossy(),
-        tsconfig_path,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            warn!("v2 capture failed for {}: {}", service_id, e);
-            let _ = std::fs::remove_dir_all(&out_dir);
-            return None;
-        }
-    };
+) -> Result<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>), CaptureFailure> {
+    let result = capture_in_a_fresh_process(sidecar, repo_root, service_id, anchors, tsconfig_path)
+        .inspect_err(|failure| warn!("v2 capture failed for {}: {}", service_id, failure))?;
 
     debug!(
         "v2 capture for {}: {} alias(es), usable_rate {:.3}, {} emitted file(s), bare_checkout={}",
@@ -735,12 +750,101 @@ fn capture_once(
         &result.ts_version,
         result.bare_checkout,
     ) {
-        Ok(artifact) => Some((stub_dir, artifact, result.aliases)),
+        Ok(artifact) => Ok((stub_dir, artifact, result.aliases)),
         Err(e) => {
             warn!("failed to read capture stub for {}: {}", service_id, e);
             let _ = std::fs::remove_dir_all(&stub_dir);
-            None
+            Err(CaptureFailure::Failed(format!(
+                "the stub package the capture wrote could not be read: {e}"
+            )))
         }
+    }
+}
+
+/// Ask one `capture_v2` of a sidecar process started for it, and once more of
+/// another if that process dies (carrick#1916).
+///
+/// **A process of its own.** By the time a service is captured its sidecar has
+/// built the service's program and served every inference over it, and holds
+/// all of that. The capture reads none of it: it builds its own program from
+/// the service's tsconfig. On a 2,345-file project that was 3.1 GB of live
+/// heap under a capture that added 3.4 GB, against an 8 GB cap; the same
+/// request alone in a fresh process answered at 2.8 GB. So the sidecar is
+/// replaced first, by the restart a timed-out operation already uses, scoped
+/// as it was. Every capture gets one, the backfill re-capture included: a
+/// process that has just captured still holds part of that capture.
+///
+/// **One retry.** A process that dies with the capture in hand (out of heap,
+/// killed by the OS) takes nothing of the service with it, so the capture is
+/// asked once more of another fresh process before the service ships with no
+/// surface. A timeout is not retried, and neither is an answer that says the
+/// capture failed: both would come back the same.
+///
+/// **A live sidecar afterwards, whatever happened.** After a second death one
+/// more process is started and left in place, because the sidecar serves the
+/// rest of the scan: the next service's init and the check phase would
+/// otherwise write to a closed pipe, and one service's capture would cost
+/// every later service its types.
+fn capture_in_a_fresh_process(
+    sidecar: &TypeSidecar,
+    repo_root: &Path,
+    service_id: &str,
+    anchors: &[CaptureAnchor],
+    tsconfig_path: Option<&str>,
+) -> Result<CaptureV2Result, CaptureFailure> {
+    let not_started = |e: SidecarError| CaptureFailure::SidecarDied(e.to_string());
+    let mut died_before: Option<SidecarError> = None;
+    loop {
+        sidecar
+            .restart(match died_before {
+                None => "a capture runs in a process of its own",
+                Some(_) => "the sidecar died during a capture, which is retried once",
+            })
+            .map_err(not_started)?;
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "carrick-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let error = match sidecar.capture_v2(
+            &repo_root.to_string_lossy(),
+            service_id,
+            anchors,
+            &out_dir.to_string_lossy(),
+            tsconfig_path,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+        let _ = std::fs::remove_dir_all(&out_dir);
+
+        if !error.is_process_death() {
+            return Err(match error {
+                SidecarError::Timeout => CaptureFailure::TimedOut,
+                SidecarError::CaptureFailed(detail) => CaptureFailure::Failed(detail),
+                other => CaptureFailure::Failed(other.to_string()),
+            });
+        }
+        let Some(first) = died_before.replace(error.clone()) else {
+            warn!(
+                "The type sidecar died during the capture for {} ({}); retrying once in a \
+                 fresh process",
+                service_id, error
+            );
+            continue;
+        };
+        // Whether or not this one starts, the capture's failure is the two
+        // deaths; a failure to start is left in the sidecar's state for
+        // whoever asks next.
+        let _ = sidecar.restart("the sidecar died during a capture and during its retry");
+        return Err(CaptureFailure::SidecarDied(format!(
+            "the type sidecar process ended during the capture ({first}) and again when the \
+             capture was retried in a fresh process ({error})"
+        )));
     }
 }
 

@@ -1038,8 +1038,6 @@ enum SidecarRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
     },
-    #[serde(rename = "health")]
-    Health { request_id: String },
     #[serde(rename = "shutdown")]
     Shutdown { request_id: String },
 }
@@ -1337,17 +1335,13 @@ const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
 /// this long in all.
 ///
 /// When it passes, the sidecar is killed and a fresh one is started in its
-/// place: see [`TypeSidecar::restart_after_timeout`].
+/// place: see [`TypeSidecar::restart`].
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// How often a progress frame is written to the log while an operation runs.
 /// The sidecar reports far more often than this; the log needs enough to tell
 /// steady work from a stall, and no more.
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
-
-/// How long to wait for the sidecar to acknowledge a shutdown request. Short
-/// on purpose: the process is killed straight after.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a blocking wait on the sidecar goes without asking whether this
 /// process has been signalled (carrick#1387).
@@ -1554,15 +1548,32 @@ impl SidecarProcess {
         // sidecar's event loop still get a progress frame out: a frame-sized
         // write to a pipe with room in it completes on the spot, and only a
         // write that finds the pipe full has to wait for the event loop.
+        //
+        // A frame is a whole line. Text with no newline after it at EOF is a
+        // frame the process was still writing when it ended, so it is not
+        // passed on: the reader then finds the channel closed and reports
+        // the death. Passed on, it parsed as a broken answer, and a sidecar
+        // that ran out of heap mid-answer was recorded as a deserialization
+        // error at the byte the pipe happened to hold (carrick#1916).
         let (tx, responses) = channel::<String>();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        if tx.send(line).is_err() {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line.ends_with('\n') => {
+                        if tx.send(line.trim_end().to_owned()).is_err() {
                             break; // client gone
                         }
+                    }
+                    Ok(cut_off) => {
+                        debug!(
+                            "[type_sidecar] stdout ended {} bytes into an unfinished frame",
+                            cut_off
+                        );
+                        break;
                     }
                     Err(e) => {
                         debug!("[type_sidecar] stdout read ended: {}", e);
@@ -1918,74 +1929,80 @@ impl TypeSidecar {
         }
     }
 
-    /// Replace a sidecar that missed an operation's deadline with a fresh one,
-    /// scoped as the old one was (carrick#1914).
+    /// Replace the sidecar process with a fresh one, scoped as the old one was.
+    /// `why` is for the log and for the state a failed restart leaves.
     ///
-    /// The sidecar answers one request at a time, and a handler that runs the
-    /// compiler does not return until it is done. So a sidecar that has
-    /// missed a deadline is still working on that request, and whatever is
-    /// asked next waits in the pipe behind it: the next request's deadline
-    /// starts when it is sent and passes while it is still queued. That is
-    /// how one slow inference cost a scan two timeouts in a row, the second
-    /// on a request the sidecar had not begun.
+    /// Two callers, and one restart between them.
     ///
-    /// Nobody will read the old process's answer, so it is killed: the work
-    /// stops, and its late frames go with its pipe rather than being read as
-    /// the answer to the next request. The fresh process is initialised to
-    /// the same root, tsconfig and scan root before this returns, so the
-    /// caller's next request finds a ready sidecar and runs inside its own
-    /// window. It pays for the program again on first use, which is the cost
-    /// of asking it anything at all.
+    /// An operation that misses its deadline (carrick#1914). The sidecar
+    /// answers one request at a time, and a handler that runs the compiler
+    /// does not return until it is done. So a sidecar that has missed a
+    /// deadline is still working on that request, and whatever is asked next
+    /// waits in the pipe behind it: the next request's deadline starts when
+    /// it is sent and passes while it is still queued. That is how one slow
+    /// inference cost a scan two timeouts in a row, the second on a request
+    /// the sidecar had not begun.
+    ///
+    /// A capture (carrick#1916). `capture_v2` builds a program of its own, so
+    /// in a process that has already served the service's inference it stands
+    /// beside the init'd project's program and everything the checker cached
+    /// while inferring, none of which it reads. Asked of a fresh process it
+    /// holds its own program and nothing else.
+    ///
+    /// Nobody will read the old process's answer, so it is killed: its work
+    /// stops, its heap goes back to the machine, and its late frames go with
+    /// its pipe rather than being read as the answer to the next request. A
+    /// process that has already died is replaced the same way. The fresh
+    /// process is initialised to the same root, tsconfig and scan root before
+    /// this returns, so the caller's next request finds a ready sidecar. The
+    /// project is built by the first request that reads it, so a request that
+    /// does read it pays for the program again; `capture_v2` does not.
     ///
     /// If the fresh process cannot be started or does not become ready, the
-    /// state is left `Failed` with the reason, and every later operation
-    /// fails at once with it instead of waiting on a process that is gone.
+    /// state is left `Failed` with the reason and the same reason is
+    /// returned, and every later operation fails at once with it instead of
+    /// waiting on a process that is gone.
     ///
     /// Readiness is not restarted this way: a sidecar that cannot initialise
     /// in its budget is abandoned ([`Self::abandon`]), because a fresh one
     /// would be asked the same question.
-    fn restart_after_timeout(&self) {
+    pub fn restart(&self, why: &str) -> Result<(), SidecarError> {
         let started = Instant::now();
-        debug!(
-            "[type_sidecar] No answer or progress within {:?}: killing the sidecar and \
-             starting a fresh one",
-            self.operation_timeout
-        );
+        debug!("[type_sidecar] Starting a fresh sidecar: {why}");
         self.kill();
+
+        let failed = |detail: String| {
+            warn!("The type sidecar was not replaced ({why}): {detail}");
+            let reason = format!("no fresh sidecar could be started ({why}): {detail}");
+            *self.state.lock().unwrap() = SidecarState::Failed(reason.clone());
+            Err(SidecarError::NotReady(reason))
+        };
 
         let process = match SidecarProcess::spawn(&self.sidecar_path) {
             Ok(process) => process,
-            Err(e) => {
-                warn!("The type sidecar could not be restarted after a timed-out operation: {e}");
-                *self.state.lock().unwrap() = SidecarState::Failed(format!(
-                    "the sidecar timed out on an operation and could not be restarted: {e}"
-                ));
-                return;
-            }
+            Err(e) => return failed(e.to_string()),
         };
         *self.child.lock().unwrap() = process.child;
         *self.stdin.lock().unwrap() = process.stdin;
         *self.responses.lock().unwrap() = process.responses;
 
-        // An operation only runs on a sidecar that was initialised, so there
-        // is a scope to restore.
+        // A sidecar that was never initialised has no scope to restore: the
+        // fresh one waits for its first `init` as the old one did.
         let scope = self.scope.lock().unwrap().clone();
         let Some((root, tsconfig)) = scope else {
             *self.state.lock().unwrap() = SidecarState::Spawning;
-            return;
+            return Ok(());
         };
         self.start_init(&root, tsconfig.as_deref());
         match self.wait_ready(ready_budget()) {
-            Ok(()) => debug!(
-                "[type_sidecar] Fresh sidecar ready in {:?}",
-                started.elapsed()
-            ),
-            Err(e) => {
-                warn!("The type sidecar did not come back after a timed-out operation: {e}");
-                *self.state.lock().unwrap() = SidecarState::Failed(format!(
-                    "the sidecar timed out on an operation and its replacement was not ready: {e}"
-                ));
+            Ok(()) => {
+                debug!(
+                    "[type_sidecar] Fresh sidecar ready in {:?}",
+                    started.elapsed()
+                );
+                Ok(())
             }
+            Err(e) => failed(format!("it was not ready: {e}")),
         }
     }
 
@@ -1993,7 +2010,7 @@ impl TypeSidecar {
     /// comes inside the operation deadline.
     ///
     /// Every operation reads through this or [`Self::operation_result`]. The
-    /// readiness and health reads do not: see [`Self::restart_after_timeout`].
+    /// readiness read does not: see [`Self::restart`].
     fn operation_response(&self) -> Result<SidecarResponse, SidecarError> {
         let response = self.read_response_with_timeout(self.operation_timeout);
         self.restarting_on_timeout(response)
@@ -2007,10 +2024,15 @@ impl TypeSidecar {
     }
 
     /// The reader has returned by the time this runs, so the channel it held
-    /// is free to be replaced.
+    /// is free to be replaced. The timeout is what the caller is told either
+    /// way: a restart that failed has left its reason in the state, where the
+    /// next operation reads it.
     fn restarting_on_timeout<T>(&self, answer: Result<T, SidecarError>) -> Result<T, SidecarError> {
         if matches!(answer, Err(SidecarError::Timeout)) {
-            self.restart_after_timeout();
+            let _ = self.restart(&format!(
+                "an operation gave no answer or progress within {:?}",
+                self.operation_timeout
+            ));
         }
         answer
     }
@@ -2492,16 +2514,6 @@ impl TypeSidecar {
         Ok(result)
     }
 
-    /// Check health status of the sidecar.
-    pub fn health_check(&self) -> Result<SidecarResponse, SidecarError> {
-        let request = SidecarRequest::Health {
-            request_id: self.next_request_id(),
-        };
-
-        self.send_request(&request)?;
-        self.read_response_with_timeout(SHUTDOWN_TIMEOUT)
-    }
-
     /// Shutdown the sidecar gracefully.
     pub fn shutdown(&self) -> Result<(), SidecarError> {
         let request = SidecarRequest::Shutdown {
@@ -2592,7 +2604,7 @@ impl TypeSidecar {
 
     /// Read the next terminal frame as a [`SidecarResponse`], whichever
     /// request it answers: the protocol is one request at a time, and the
-    /// init and health reads have no id to ask for. See [`Self::read_frame`]
+    /// init read has no id to ask for. See [`Self::read_frame`]
     /// for what the deadline measures.
     fn read_response_with_timeout(
         &self,
@@ -3059,6 +3071,14 @@ impl SidecarError {
             self,
             SidecarError::Timeout | SidecarError::ProcessDied | SidecarError::IoError(_)
         )
+    }
+
+    /// Whether the sidecar process was gone when this was asked of it: its
+    /// stdout closed before the answer came, or the request could not be
+    /// written to its stdin. A frame the process was still writing when it
+    /// ended reads as the first of these (see [`SidecarProcess::spawn`]).
+    pub fn is_process_death(&self) -> bool {
+        matches!(self, SidecarError::ProcessDied | SidecarError::IoError(_))
     }
 }
 

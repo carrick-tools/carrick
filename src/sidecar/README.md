@@ -102,6 +102,8 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 `capture_v2`, `check_v2`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
+`capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. A `resolve_definitions` after it builds the init'd project again in the fresh process.
+
 ### Actions
 
 | Action | Needs `init` | Purpose |
