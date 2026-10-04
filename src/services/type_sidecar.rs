@@ -259,6 +259,11 @@ pub enum CaptureAnchor {
         /// from the inference the text came from; empty for any other text.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         printed_names: Vec<PrintedName>,
+        /// carrick#1842: the text is a body its call site reads as raw text.
+        /// The capture copies it onto the alias's record, which the check
+        /// phase reads from every stored stub.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        raw_text_read: bool,
     },
 }
 
@@ -1153,6 +1158,13 @@ pub struct InferredType {
     /// declarations is listed twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub printed_names: Vec<PrintedName>,
+    /// carrick#1842, `call_result` only: `type_string` is a body the call
+    /// site reads as raw text (a `.text()` read, or a request library's text
+    /// format). Raw text states no structural contract, so
+    /// `derive_capture_anchors` carries the mark onto the literal anchor and
+    /// the check phase reads the pair unverifiable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_text_read: bool,
 }
 
 /// The declaration a bare name in an inference's printed text meant
@@ -3101,6 +3113,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             source_file: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
@@ -3118,6 +3131,7 @@ mod tests {
                 file: "/repo/src/enums.ts".into(),
                 export_path: vec!["Status".into()],
             }],
+            raw_text_read: false,
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
@@ -3796,6 +3810,7 @@ mod tests {
             unwidened_type_string: None,
             stated_body: None,
             printed_names: Vec::new(),
+            raw_text_read: false,
         }
     }
 
