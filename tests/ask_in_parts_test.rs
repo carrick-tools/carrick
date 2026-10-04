@@ -44,7 +44,8 @@ const ROUTE: &str = "/analyze-file";
 
 /// Modules the table imports its handlers from. Each one makes a call the
 /// scanner raises and exports a binding, so its source rides in the prompt of
-/// a file that imports it.
+/// a file a call in which reaches it (carrick#1928): the table's
+/// registrations call the handlers they import.
 const HANDLER_MODULES: usize = 4;
 
 /// The table's registrations, in source order:
@@ -76,6 +77,13 @@ fn single(out: &mut String, tag: &str, i: usize, handler: &str) {
     writeln!(out, "table.get(\"/{tag}/r/{i}\", {handler});").unwrap();
 }
 
+/// A handler written at the registration that calls imported handler `n`:
+/// the call is what reaches that handler's module. A handler handed over by
+/// name is an argument, and reaches nothing.
+fn calling(n: usize) -> String {
+    format!("(req: any, res: any) => h{n}(req, res)")
+}
+
 fn table_source(tag: &str) -> String {
     let mut out = String::new();
     for n in 0..HANDLER_MODULES {
@@ -87,12 +95,18 @@ fn table_source(tag: &str) -> String {
     for i in 0..LOCAL_SINGLES {
         single(&mut out, tag, i, "local");
     }
-    writeln!(out, "table.route(\"/{tag}/c/0\").get(h0).post(h1);").unwrap();
+    writeln!(
+        out,
+        "table.route(\"/{tag}/c/0\").get({}).post({});",
+        calling(0),
+        calling(1)
+    )
+    .unwrap();
     for i in LOCAL_SINGLES..LAST_PART_FIRST_SINGLE {
-        single(&mut out, tag, i, &format!("h{}", i % HANDLER_MODULES));
+        single(&mut out, tag, i, &calling(i % HANDLER_MODULES));
     }
     for i in LAST_PART_FIRST_SINGLE..SINGLES {
-        single(&mut out, tag, i, "h0");
+        single(&mut out, tag, i, &calling(0));
     }
     out
 }
@@ -157,9 +171,35 @@ impl Fixture {
                 &carrick::url_normalizer::UrlNormalizer::default_permissive(),
                 &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&self.root, None),
                 None,
+                // No call graph: this entry attaches no module to any prompt.
+                &Default::default(),
             )
             .await
             .expect("the analysis runs")
+    }
+
+    /// The whole scan, as the engine runs it: discovery resolves the calls
+    /// that decide which modules a prompt carries (carrick#1928). Answers how
+    /// the scan ended.
+    async fn try_scan(&self) -> Result<(), String> {
+        std::fs::write(
+            self.root.join("package.json"),
+            r#"{"name":"table","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        carrick::engine::run_analysis_engine_with_sidecar(
+            carrick::cloud_storage::MockStorage::new(),
+            self.root.to_str().unwrap(),
+            None,
+            true,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::try_scan`], for a scan that loses no file.
+    async fn scan(&self) {
+        self.try_scan().await.expect("a mocked scan");
     }
 
     /// What every request about the subject carries and no other file's does.
@@ -204,6 +244,18 @@ impl Fixture {
         let dump = tempfile::tempdir().unwrap();
         dump_into(Some(dump.path()));
         self.analyze().await;
+        dump_into(None);
+        self.dumps(dump.path())
+            .whole
+            .expect("a file that answers whole dumps its prompt")
+    }
+
+    /// The same from a whole scan ([`Self::scan`]): the prompt as it reads
+    /// with the modules the file's calls reach.
+    async fn scanned_whole_prompt(&self) -> String {
+        let dump = tempfile::tempdir().unwrap();
+        dump_into(Some(dump.path()));
+        self.scan().await;
         dump_into(None);
         self.dumps(dump.path())
             .whole
@@ -823,7 +875,9 @@ async fn a_part_prompt_is_the_whole_prompt_with_its_own_candidates_and_modules()
     offline();
     let tag = "prompt";
     let fx = Fixture::table(tag);
-    let whole = fx.whole_prompt().await;
+    // Through the engine, both times: which modules a prompt carries is read
+    // off the call graph discovery resolves.
+    let whole = fx.scanned_whole_prompt().await;
     let listed = listed_in(&whole);
     assert_the_table_lists_what_the_tests_assume(&listed);
     let every_module: Vec<String> = (0..HANDLER_MODULES)
@@ -832,14 +886,14 @@ async fn a_part_prompt_is_the_whole_prompt_with_its_own_candidates_and_modules()
     assert_eq!(
         attached_modules(&whole),
         every_module,
-        "the whole prompt carries every module the table imports"
+        "the whole prompt carries every module the table calls into"
     );
 
     let dump = tempfile::tempdir().unwrap();
     agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
     dump_into(Some(dump.path()));
     let before = requests();
-    fx.analyze().await;
+    fx.scan().await;
     dump_into(None);
     assert_eq!(requests() - before, HANDLER_MODULES + 1 + 3);
 
@@ -851,9 +905,9 @@ async fn a_part_prompt_is_the_whole_prompt_with_its_own_candidates_and_modules()
     let parts: Vec<&String> = dumps.parts.values().collect();
     assert_eq!(parts.len(), 3, "part dumps: {:?}", dumps.parts.keys());
 
-    // What each part's candidates name through an import: the first part's
-    // handlers are the table's own, the middle part's come from all four
-    // modules, the last part's from the first.
+    // What the calls written inside each part's candidates reach: the first
+    // part's handlers are the table's own, the middle part's call into all
+    // four modules, the last part's into the first.
     let modules: [&[String]; 3] = [&[], &every_module, &every_module[..1]];
     for ((part, (from, to)), modules) in parts.iter().zip(PART_RANGES).zip(modules) {
         let ids: Vec<&str> = listed[from..to].iter().map(|c| c.id.as_str()).collect();
@@ -870,7 +924,7 @@ async fn a_part_prompt_is_the_whole_prompt_with_its_own_candidates_and_modules()
         assert_eq!(
             part.contains("### IMPORTED HTTP WRAPPER DEFINITIONS"),
             !modules.is_empty(),
-            "a part that names no module carries no such section"
+            "a part that reaches no module carries no such section"
         );
         for module in modules {
             let header = format!("--- wrapper module: {module} ---\n");
@@ -999,8 +1053,9 @@ async fn a_file_lost_for_any_other_reason_is_not_split() {
 #[serial]
 async fn a_file_with_no_candidates_is_not_split() {
     offline();
-    // A file that raises no candidate and is asked about because it imports a
-    // module that makes a call.
+    // A file that raises no candidate and is asked about because a call in it
+    // reaches a module that makes one. The call graph says so, and that is
+    // discovery's, so the file is scanned through the engine.
     let fx = Fixture::of(
         &[
             ("src/handlers/h0.ts".to_string(), handler_source(0)),
@@ -1012,14 +1067,15 @@ async fn a_file_with_no_candidates_is_not_split() {
         ],
         "src/nocandidates_uses.ts",
     );
-    let whole = fx.whole_prompt().await;
+    let whole = fx.scanned_whole_prompt().await;
     assert!(listed_in(&whole).is_empty(), "the file lists no candidate");
 
     agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
     let before = requests();
-    let result = fx.analyze().await;
+    // How a scan that lost a file to a final verdict ends is not this test's
+    // to say (carrick#1924): it reads the requests sent and the loss.
+    let _ended = fx.try_scan().await;
     assert_eq!(requests() - before, 1 + 1, "one request a file");
-    assert!(!result.raw_model_results.contains_key(&fx.table));
     assert_eq!(lost_reason(&fx.table).as_deref(), Some("output_truncated"));
 }
 

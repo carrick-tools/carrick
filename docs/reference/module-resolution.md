@@ -156,14 +156,58 @@ from them. Resolving more specifiers there would change what the model is
 asked, and cached answers would stop replaying. Moving the analyzer path onto
 the same resolver is carrick#474.
 
-Three surfaces read the alias-bearing index, and none of them is an analyzer
-input: the call graph's edges (carrick#1104), the GraphQL hop that follows a
-field's named resolver (carrick#1411), and every type request the sidecar is
-sent — endpoint and data-call types, socket and pub/sub payloads, GraphQL
-consumer anchors, and the manifest's `TypeHome` stamp (carrick#1416). The
-last of these is built once per service as `engine::service_module_index` and
-passed down; it is what turns the specifier a type was located through into
-the file the sidecar reads.
+Three surfaces read the alias-bearing index, and none of them widens an
+analyzer input: the call graph's edges (carrick#1104), the GraphQL hop that
+follows a field's named resolver (carrick#1411), and every type request the
+sidecar is sent — endpoint and data-call types, socket and pub/sub payloads,
+GraphQL consumer anchors, and the manifest's `TypeHome` stamp (carrick#1416).
+The last of these is built once per service as `engine::service_module_index`
+and passed down; it is what turns the specifier a type was located through
+into the file the sidecar reads.
+
+## What a prompt attaches
+
+A file's analysis prompt can carry the source of a same-repo module that sends
+requests (the `IMPORTED HTTP WRAPPER DEFINITIONS` section). Which modules a
+file may carry is decided by its import table, read through relative specifiers
+and their re-export barrels, as above. Of those, a module is attached only
+where a call in the file reaches it (carrick#1928, `src/call_reach.rs`):
+
+1. the call graph recorded where the call site lands, and it lands on a
+   declaration in the module; or
+2. the call graph recorded no target for the site, and the site's callee chain
+   is rooted at a binding the file imports from the module (`api.get(…)` where
+   the module writes `export const api = makeClient(…)`).
+
+The call graph's edges are read here only to take a module out of a prompt.
+They never add one: an import written through an alias or a package name
+attaches nothing, whatever the file calls (carrick#474).
+
+An import that is only passed as an argument, named in a type, or never used
+attaches nothing. A site neither rule answers attaches nothing: a local that
+aliases an import, a destructured member, a receiver handed in as a parameter
+with no declared class.
+
+A call site is a call, an optional call, or a `new` expression. The call graph
+records no target for a `new`, so rule 2 answers it: constructing an imported
+class keeps the module that declares it, including where the instance goes
+into a field whose later method calls the call graph cannot follow. A JSX
+element is not a call site: rendering a component hands it to the JSX factory
+as an argument, and sends none of the component's requests from the file that
+renders it.
+
+A file that raises no candidate of its own is sent to the model only when it
+holds such a call. Importing an attachable module is not enough.
+
+A file asked in parts (carrick#1898) gives each part the modules reached by the
+call sites written inside that part's candidates.
+
+Which modules are attachable is unchanged: a module of the service that raises
+an HTTP candidate and exports a binding. What is attached is unchanged too: the
+module's text to a 4,000 byte cap, modules in sorted path order.
+
+The compiler is not asked, for the reasons under "Why a config reader and not
+the compiler": a prompt must not depend on whether the sidecar started.
 
 Call edges do feed one model input: a function's intent context includes the
 intents of the functions it calls (`intent_generator::compute_intent_hash`).

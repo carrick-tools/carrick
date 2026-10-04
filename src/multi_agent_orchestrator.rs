@@ -105,6 +105,10 @@ impl MultiAgentOrchestrator {
         // What each call site's callee sends (carrick#1555), possibly still
         // being composed while the library semantics settle (carrick#1564).
         request_summaries: crate::agents::file_orchestrator::SummarySource,
+        // What discovery resolved for this service: where each call site
+        // lands and what each import binding names. Decides which same-repo
+        // modules a file's prompt carries (carrick#1928).
+        call_resolution: &crate::request_summary::RequestSummaryInputs,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -151,6 +155,7 @@ impl MultiAgentOrchestrator {
                 normalizer,
                 service_modules,
                 sidecar,
+                call_resolution,
             )
             .await?;
 

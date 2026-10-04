@@ -3132,6 +3132,7 @@ async fn analyze_current_repo_incremental(
                     &normalizer,
                     &service_modules,
                     sidecar,
+                    &request_inputs,
                 ),
                 compose_summaries(
                     &request_inputs,
@@ -8355,6 +8356,7 @@ async fn analyze_current_repo(
             &service_modules,
             sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
+            &request_inputs,
         ),
         compose_summaries(
             &request_inputs,

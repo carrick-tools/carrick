@@ -105,6 +105,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             None,
+            &Default::default(),
         )
         .await
         .expect("analysis should succeed");

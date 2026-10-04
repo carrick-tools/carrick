@@ -4746,6 +4746,25 @@ pub struct RequestSummaryInputs {
     pub bindings: ImportedBindings,
 }
 
+impl RequestSummaryInputs {
+    /// The definition (file as walked, definition key) the call spanning
+    /// exactly `span_start..span_end` in `file` reaches, when the call graph
+    /// followed it. The span is in the numbering a candidate's is
+    /// ([`SWC_SPAN_BASE`]): [`FileIr::swc_start`] read the other way, into
+    /// the discovery numbering [`CallSiteTargets`] is keyed by.
+    pub fn call_target(
+        &self,
+        file: &Path,
+        span_start: u32,
+        span_end: u32,
+    ) -> Option<&(PathBuf, String)> {
+        let source_start = self.files.get(file)?.source_start;
+        let discovered = |swc: u32| Some(swc.checked_sub(SWC_SPAN_BASE)? + source_start);
+        self.sites
+            .target_at(file, discovered(span_start)?, discovered(span_end)?)
+    }
+}
+
 /// How many modules re-exporting a binding they import are followed to the
 /// one that declares it, beyond the hops the call graph's resolver already
 /// takes. The resolver's own cap, for the same reason.
