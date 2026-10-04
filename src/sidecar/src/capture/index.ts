@@ -519,6 +519,9 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // the directly-referenced externals; transitives resolve at check-install
   // (check-workspace NPMRC: "Direct deps are exact-pinned by the stubs;
   // only transitives resolve").
+  // A package only a carried declaration names is pinned at the version its
+  // source read (carrick#1620), where the service's own install does not say.
+  for (const name of Object.keys(rewritten.sourcePins)) externalSpecs.add(name);
   const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
@@ -530,11 +533,15 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const unpinned: string[] = [];
   for (const name of [...externalSpecs].sort()) {
     const version =
-      deno?.pinned[name] ?? rewritten.pins[name] ?? installed.get(name) ?? lockVersions.get(name);
+      deno?.pinned[name] ??
+      rewritten.pins[name] ??
+      installed.get(name) ??
+      rewritten.sourcePins[name] ??
+      lockVersions.get(name);
     if (version) pinned[name] = version;
     // A runtime name whose declarations come from a rewritten `@types/*`
     // package resolves through that pin.
-    else if (!rewritten.pins[typesPackageOf(name)]) unpinned.push(name);
+    else if (!rewritten.pins[typesPackageOf(name)] && !rewritten.sourcePins[typesPackageOf(name)]) unpinned.push(name);
   }
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;

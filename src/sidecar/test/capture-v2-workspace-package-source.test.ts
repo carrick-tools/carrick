@@ -567,3 +567,367 @@ describe('carrick#1620: a stub that carries the package is judged on its types',
     assert.strictEqual(byKey.get('Differs')!.bucket, 'incompatible', JSON.stringify(byKey.get('Differs')));
   });
 });
+
+/**
+ * A workspace with an isolated install, as pnpm lays one out: the service
+ * links `@depot/records` and nothing else, and what the package depends on is
+ * linked into the package's own `node_modules`. The package is not built.
+ */
+function isolatedWorkspace(
+  records: Record<string, string>,
+  service: Record<string, string>,
+  extra: { files?: Record<string, string>; links?: Record<string, string>; manifest?: Record<string, unknown> } = {}
+): { base: string; repo: string; service: string } {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1910-')));
+  bases.push(base);
+  const repo = path.join(base, 'repo');
+  const units = 'node_modules/.pnpm/units@3.1.0/node_modules/units';
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'depot', private: true }),
+    [`${units}/package.json`]: JSON.stringify({ name: 'units', version: '3.1.0', types: 'index.d.ts' }),
+    [`${units}/index.d.ts`]: 'export interface Unit { symbol: string; factor: number }\n',
+    'packages/records/package.json': JSON.stringify({
+      name: '@depot/records',
+      version: '1.0.0',
+      types: 'dist/index.d.ts',
+      main: 'dist/index.js',
+      dependencies: { units: '3.1.0' },
+      ...extra.manifest,
+    }),
+    'packages/records/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib', outDir: 'dist' }, { include: ['lib'] }),
+    ...Object.fromEntries(Object.entries(records).map(([rel, text]) => [`packages/records/${rel}`, text])),
+    'packages/api/package.json': JSON.stringify({ name: '@depot/api', version: '1.0.0', dependencies: { '@depot/records': 'workspace:*' } }),
+    'packages/api/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib' }, { include: ['lib'] }),
+    ...Object.fromEntries(Object.entries(service).map(([rel, text]) => [`packages/api/${rel}`, text])),
+    ...extra.files,
+  };
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+    fs.writeFileSync(path.join(repo, rel), text);
+  }
+  const link = (at: string, to: string) => {
+    fs.mkdirSync(path.dirname(path.join(repo, at)), { recursive: true });
+    fs.symlinkSync(path.relative(path.dirname(path.join(repo, at)), path.join(repo, to)), path.join(repo, at), 'dir');
+  };
+  link('packages/records/node_modules/units', units);
+  link('packages/api/node_modules/@depot/records', 'packages/records');
+  for (const [at, to] of Object.entries(extra.links ?? {})) link(at, to);
+  return { base, repo, service: path.join(repo, 'packages/api') };
+}
+
+/** A capture that reads no package of the checkout from source: the service is its whole scope. */
+function captureAsBefore(service: string, base: string, anchors: CaptureAnchorRequest[]): CaptureStubResult {
+  const result = captureStub({ repoRoot: service, scanRoot: service, serviceName: 'api', outDir: path.join(base, 'before'), anchors });
+  assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
+  return result;
+}
+
+/** Every file of a stub's declarations, with its text. */
+function declarations(stubDir: string): Record<string, string> {
+  const types = path.join(stubDir, 'types');
+  const out: Record<string, string> = {};
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else out[path.relative(types, file)] = fs.readFileSync(file, 'utf8');
+    }
+  };
+  walk(types);
+  return out;
+}
+
+describe('carrick#1910: a package whose source is not all on the checkout is read as it was', () => {
+  // The service's result type names nothing of the package; the class beside
+  // it takes two of the package's types, one of them from the missing module.
+  const TALLY = {
+    'lib/tally.ts': [
+      "import type { Row, Store } from '@depot/records';",
+      'export type Tally = { count: number };',
+      'export class Counter {',
+      '  constructor(private readonly store: Store) {}',
+      '  count(row: Row): Tally {',
+      '    return { count: row ? 1 : 0 };',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  };
+  const TALLY_ANCHORS: CaptureAnchorRequest[] = [
+    { kind: 'symbol', alias: 'Endpoint_tally_Response', symbol_name: 'Tally', source_file: 'lib/tally.ts', anchor_origin: 'llm-symbol' },
+    { kind: 'symbol', alias: 'Endpoint_counter_Response', symbol_name: 'Counter', source_file: 'lib/tally.ts', anchor_origin: 'llm-symbol' },
+  ];
+  const STORE = 'export interface Store { name: string }\n';
+
+  /** The capture says of the package exactly what one that never read it from source says. */
+  function assertAsBefore(
+    records: Record<string, string>,
+    because: string,
+    extra: Parameters<typeof isolatedWorkspace>[2] = {}
+  ): void {
+    const { base, repo, service } = isolatedWorkspace(records, TALLY, extra);
+    const before = captureAsBefore(service, base, TALLY_ANCHORS);
+    const result = capture(repo, service, base, TALLY_ANCHORS);
+    // The result type read `ok` before, and a package that cannot be read
+    // whole must not take that away.
+    assert.strictEqual(before.aliases[0].self_check, 'ok', JSON.stringify(before.aliases[0]));
+    assert.deepStrictEqual(summary(result.aliases), summary(before.aliases), JSON.stringify(result.aliases, null, 1));
+    assert.deepStrictEqual(declarations(result.stub_dir), declarations(before.stub_dir));
+    assert.deepStrictEqual(result.unpinned_externals, before.unpinned_externals);
+    assert.deepStrictEqual(result.pinned_dependencies, before.pinned_dependencies);
+    // And an anchor that names the package is told what is missing.
+    const named = capture(repo, service, base, [
+      { kind: 'symbol', alias: 'Endpoint_store_Response', symbol_name: 'Store', source_file: '@depot/records', anchor_origin: 'llm-symbol' },
+    ]).aliases[0];
+    assert.strictEqual(
+      named.capture_failure_reason,
+      `source '@depot/records' did not resolve: '@depot/records' is a package of this checkout whose entry is not on disk, and ${because}`
+    );
+  }
+  const missing = (specifier: string): string => `its source imports '${specifier}', which does not resolve on this checkout either`;
+
+  it('its entry re-exports a module that was never generated', () => {
+    assertAsBefore(
+      {
+        'lib/index.ts': "export * from '../generated/schema';\nexport * from './store';\n",
+        'lib/store.ts': STORE,
+      },
+      missing('../generated/schema')
+    );
+  });
+
+  it('a file its entry reaches re-exports that module', () => {
+    assertAsBefore(
+      {
+        'lib/index.ts': "export * from './store';\n",
+        'lib/store.ts': `export * from './rows';\n${STORE}`,
+        'lib/rows.ts': "export type { Row } from '../../generated/schema';\n",
+      },
+      missing('../../generated/schema')
+    );
+  });
+
+  it('a dependency of the package that is not installed', () => {
+    assertAsBefore(
+      {
+        'lib/index.ts': "export * from './store';\nexport type { Row } from 'rowkit';\n",
+        'lib/store.ts': STORE,
+      },
+      missing('rowkit')
+    );
+  });
+
+  // A second unbuilt package of the checkout, which `@depot/records` reads.
+  const ROWS = {
+    files: {
+      'packages/rows/package.json': JSON.stringify({ name: '@depot/rows', version: '1.0.0', types: 'dist/index.d.ts' }),
+      'packages/rows/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib', outDir: 'dist' }, { include: ['lib'] }),
+    },
+    links: { 'packages/records/node_modules/@depot/rows': 'packages/rows' },
+  };
+  const READS_ROWS = {
+    'lib/index.ts': "export * from './store';\nexport type { Row } from '@depot/rows';\n",
+    'lib/store.ts': STORE,
+  };
+
+  it('another package of the checkout it reads is not all there', () => {
+    assertAsBefore(READS_ROWS, missing('../generated/schema'), {
+      ...ROWS,
+      files: { ...ROWS.files, 'packages/rows/lib/index.ts': "export * from '../generated/schema';\n" },
+    });
+  });
+
+  it('a dependency it reads at another version than the service does', () => {
+    // The stub pins one version of a name: the service's.
+    const units = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+    assertAsBefore(
+      {
+        'lib/index.ts': "export * from './store';\nexport type Row = { id: string };\n",
+        'lib/store.ts': "import type { Unit } from 'units';\nexport interface Store { name: string; unit: Unit }\n",
+      },
+      "its source reads 'units' at 3.1.0, where the service reads it at 2.0.0",
+      {
+        files: {
+          [`${units}/package.json`]: JSON.stringify({ name: 'units', version: '2.0.0', types: 'index.d.ts' }),
+          [`${units}/index.d.ts`]: 'export interface Unit { symbol: string }\n',
+        },
+        links: { 'packages/api/node_modules/units': units },
+      }
+    );
+  });
+
+  it('a package whose entry is its source is left an installed library', () => {
+    const { base, repo, service } = isolatedWorkspace(
+      {
+        'lib/index.ts': "export * from '../generated/schema';\nexport * from './store';\n",
+        'lib/store.ts': STORE,
+      },
+      TALLY,
+      { manifest: { types: 'lib/index.ts', main: 'lib/index.ts' } }
+    );
+    // Text an inference printed, naming a type the package declares.
+    const anchors: CaptureAnchorRequest[] = [
+      ...TALLY_ANCHORS,
+      { kind: 'literal', alias: 'Endpoint_store_Text', type_text: '{ store: Store; }', source_file: 'lib/tally.ts', anchor_origin: 'deterministic-infer' },
+    ];
+    const before = captureAsBefore(service, base, anchors);
+    const result = capture(repo, service, base, anchors);
+    assert.deepStrictEqual(summary(result.aliases), summary(before.aliases), JSON.stringify(result.aliases, null, 1));
+    assert.deepStrictEqual(declarations(result.stub_dir), declarations(before.stub_dir));
+    assert.deepStrictEqual(result.unpinned_externals, ['@depot/records']);
+  });
+
+  // The Node runtime's types, as the service's program includes them.
+  const NODE_TYPES = 'node_modules/.pnpm/@types+node@20.0.0/node_modules/@types/node';
+  const EMITTER = {
+    'lib/index.ts': "export * from './store';\nexport type Row = { id: string };\n",
+    'lib/store.ts': "import type { EventEmitter } from 'node:events';\nexport interface Store { name: string; bus: EventEmitter }\n",
+  };
+
+  it('a module of the runtime resolves where the program holds the runtime\'s types', () => {
+    const { base, repo, service } = isolatedWorkspace(EMITTER, TALLY, {
+      files: {
+        [`${NODE_TYPES}/package.json`]: JSON.stringify({ name: '@types/node', version: '20.0.0', types: 'index.d.ts' }),
+        [`${NODE_TYPES}/index.d.ts`]: "declare module 'node:events' {\n  export class EventEmitter { on(event: string): this }\n}\n",
+      },
+      links: { 'packages/api/node_modules/@types/node': NODE_TYPES },
+    });
+    const result = capture(repo, service, base, TALLY_ANCHORS);
+    assert.strictEqual(result.aliases[0].self_check, 'ok', JSON.stringify(result.aliases[0]));
+    assert.ok(Object.keys(declarations(result.stub_dir)).some((file) => file.endsWith('records/lib/store.d.ts')));
+  });
+
+  it('and does not where it holds none', () => {
+    assertAsBefore(EMITTER, missing('node:events'));
+  });
+
+  it('two packages that read each other, both all there, travel together', () => {
+    const { base, repo, service } = isolatedWorkspace(
+      {
+        'lib/index.ts': "export * from './store';\nexport type { Row } from '@depot/rows';\n",
+        'lib/store.ts': STORE,
+      },
+      TALLY,
+      {
+        ...ROWS,
+        files: {
+          ...ROWS.files,
+          'packages/rows/lib/index.ts': "import type { Store } from '@depot/records';\nexport interface Row { id: string; store: Store }\n",
+        },
+        links: { ...ROWS.links, 'packages/rows/node_modules/@depot/records': 'packages/records' },
+      }
+    );
+    const result = capture(repo, service, base, TALLY_ANCHORS);
+    assert.strictEqual(result.aliases[0].self_check, 'ok', JSON.stringify(result.aliases[0]));
+    const files = Object.keys(declarations(result.stub_dir));
+    for (const carried of ['records/lib/index.d.ts', 'records/lib/store.d.ts', 'rows/lib/index.d.ts']) {
+      assert.ok(files.some((file) => file.endsWith(carried)), `${carried} not in ${files.join(', ')}`);
+    }
+    assert.deepStrictEqual(result.unpinned_externals, []);
+    assert.deepStrictEqual(standalone(result.stub_dir, base).diagnostics, []);
+  });
+});
+
+describe('carrick#1620: what a carried package depends on resolves in the stub as it did in its source', () => {
+  it('a dependency only the package installs is pinned at the version the package reads', () => {
+    const { base, repo, service } = isolatedWorkspace(
+      {
+        'lib/index.ts': "export * from './store';\n",
+        'lib/store.ts': "import type { Unit } from 'units';\nexport interface Store { name: string; unit: Unit }\n",
+      },
+      {
+        'lib/shelves.ts': "import type { Store } from '@depot/records';\nexport interface Shelf { store: Store; aisle: number }\n",
+      }
+    );
+    const anchors: CaptureAnchorRequest[] = [
+      { kind: 'symbol', alias: 'Endpoint_shelf_Response', symbol_name: 'Shelf', source_file: 'lib/shelves.ts', anchor_origin: 'llm-symbol' },
+    ];
+    const result = capture(repo, service, base, anchors);
+    assert.deepStrictEqual(summary(result.aliases), [['Endpoint_shelf_Response', 'ok', undefined]], JSON.stringify(result.aliases, null, 1));
+    assert.deepStrictEqual(result.pinned_dependencies, { units: '3.1.0' });
+    assert.deepStrictEqual(result.unpinned_externals, []);
+    const files = declarations(result.stub_dir);
+    const store = Object.keys(files).find((file) => file.endsWith('records/lib/store.d.ts'));
+    assert.ok(store, Object.keys(files).join(', '));
+    assert.match(files[store], /from ['"]units['"]/);
+  });
+});
+
+describe('carrick#1910: a service with no package of the checkout in play captures as before', () => {
+  /**
+   * An isolated install, as pnpm lays one out: each package in its own
+   * directory under `.pnpm`, linked into the service and into the packages
+   * that depend on it. `kit` returns a type `inner` declares, and the
+   * service depends on both and imports only `kit`.
+   */
+  function isolatedInstall(): { base: string; repo: string; service: string } {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1910-')));
+    bases.push(base);
+    const repo = path.join(base, 'repo');
+    const store = 'node_modules/.pnpm';
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'depot', private: true }),
+      [`${store}/inner@2.0.0/node_modules/inner/package.json`]: JSON.stringify({ name: 'inner', version: '2.0.0', types: 'index.d.ts' }),
+      [`${store}/inner@2.0.0/node_modules/inner/index.d.ts`]: 'export interface Position { aisle: number; shelf: number }\n',
+      [`${store}/kit@1.0.0/node_modules/kit/package.json`]: JSON.stringify({ name: 'kit', version: '1.0.0', types: 'index.d.ts', dependencies: { inner: '2.0.0' } }),
+      [`${store}/kit@1.0.0/node_modules/kit/index.d.ts`]: [
+        "import type { Position } from 'inner';",
+        'export declare function usePosition(): Position;',
+        "export type { Position } from 'inner';",
+        '',
+      ].join('\n'),
+      'packages/api/package.json': JSON.stringify({ name: '@depot/api', version: '1.0.0', dependencies: { kit: '1.0.0', inner: '2.0.0' } }),
+      'packages/api/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib' }, { include: ['lib'] }),
+      'packages/api/lib/positions.ts': [
+        "import { usePosition } from 'kit';",
+        // The return type is inferred, so the declaration has to name it.
+        'export function current() {',
+        '  return usePosition();',
+        '}',
+        '',
+      ].join('\n'),
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      fs.writeFileSync(path.join(repo, rel), text);
+    }
+    const link = (at: string, to: string) => {
+      fs.mkdirSync(path.dirname(path.join(repo, at)), { recursive: true });
+      fs.symlinkSync(path.relative(path.dirname(path.join(repo, at)), path.join(repo, to)), path.join(repo, at), 'dir');
+    };
+    link(`${store}/kit@1.0.0/node_modules/inner`, `${store}/inner@2.0.0/node_modules/inner`);
+    link('packages/api/node_modules/kit', `${store}/kit@1.0.0/node_modules/kit`);
+    link('packages/api/node_modules/inner', `${store}/inner@2.0.0/node_modules/inner`);
+    return { base, repo, service: path.join(repo, 'packages/api') };
+  }
+
+  it('names a type from a package the service does not import as the compiler does', () => {
+    const { base, repo, service } = isolatedInstall();
+    const result = capture(repo, service, base, [
+      { kind: 'handler_return', alias: 'Endpoint_current_Response', symbol_name: 'current', source_file: 'lib/positions.ts', anchor_origin: 'llm-symbol' },
+    ]);
+    assert.deepStrictEqual(summary(result.aliases), [['Endpoint_current_Response', 'ok', undefined]]);
+    const emitted = fs.readFileSync(path.join(result.stub_dir, 'types/positions.d.ts'), 'utf8');
+
+    // What the compiler writes for that file with no host of ours.
+    const parsed = ts.getParsedCommandLineOfConfigFile(path.join(service, 'tsconfig.json'), {}, {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic: () => {},
+    })!;
+    let plain = '';
+    const program = ts.createProgram([path.join(service, 'lib/positions.ts')], {
+      ...parsed.options,
+      declaration: true,
+      emitDeclarationOnly: true,
+      noEmit: false,
+      composite: false,
+      incremental: false,
+      outDir: path.join(base, 'plain'),
+    });
+    program.emit(undefined, (_file, text) => {
+      plain = text;
+    });
+    assert.match(plain, /import\("inner"\)\.Position/, plain);
+    assert.strictEqual(emitted, plain);
+  });
+});

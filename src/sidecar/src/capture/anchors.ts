@@ -696,8 +696,13 @@ function qualifyNamesFromSource(
     if (rel.startsWith('..')) {
       // Source of another package of the checkout (carrick#1910): the emit
       // writes its declaration into the stub, and the rewrite turns this
-      // path into its place there.
-      return args.workspace && isOwnSource(file.fileName, args.workspace) ? file.fileName : undefined;
+      // path into its place there. A package the program reads as an
+      // installed library is not emitted, and is named as it was.
+      return args.workspace &&
+        isOwnSource(file.fileName, args.workspace) &&
+        !program.isSourceFileFromExternalLibrary(file)
+        ? file.fileName
+        : undefined;
     }
     return entryRelativeSpecifier(
       args.entryDir,

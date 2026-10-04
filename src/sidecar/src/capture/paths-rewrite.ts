@@ -16,7 +16,8 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { installedPackageSpecifier } from './installed-package.js';
+import { installOf, installedPackageSpecifier } from './installed-package.js';
+import { OUTSIDE_DIR } from './outside-root.js';
 import type { WriteGuard } from './guarded-fs.js';
 import {
   isRelative,
@@ -119,6 +120,13 @@ export interface RewriteResult {
    * resolution only. Absolute paths: never written into the stub.
    */
   installs: Record<string, string>;
+  /**
+   * The version of each package a declaration emitted from outside the
+   * service names, read from the install its source resolved it in
+   * (carrick#1620). An isolated install links a dependency only into the
+   * package that declares it, so the service's own install may not say.
+   */
+  sourcePins: Record<string, string>;
 }
 
 /**
@@ -138,6 +146,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
   const emitted = new Set(args.files);
   const pins: Record<string, string> = {};
   const installs: Record<string, string> = {};
+  const sourcePins: Record<string, string> = {};
   let total = 0;
 
   const installed = (spec: string, importedName?: string): string | undefined => {
@@ -187,13 +196,25 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
       }
       // A module whose declaration the tree holds, named by a bare specifier.
       const named = args.moduleFromTree?.(spec, file);
-      const target = named && treeFileFor(named, args.entryDir, emitted, args.outside);
-      return target ? relativeSpecifier(file, target) : undefined;
+      if (named === undefined) return undefined;
+      const target = treeFileFor(named, args.entryDir, emitted, args.outside);
+      if (target) return relativeSpecifier(file, target);
+      // A declaration emitted from outside the service names its packages as
+      // its own source resolves them. Where the service's install does not
+      // hold one, the self-check reads it from the install the source did.
+      if (file.startsWith(`${OUTSIDE_DIR}/`)) {
+        const install = installOf(named);
+        if (install) {
+          installs[install.name] ??= install.root;
+          if (install.version !== undefined) sourcePins[install.name] ??= install.version;
+        }
+      }
+      return undefined;
     });
     if (rewrites + importTypeRewrites > 0) {
       args.guard.writeFile(absFile, rewritten);
       total += rewrites + importTypeRewrites;
     }
   }
-  return { rewrites: total, pins, installs };
+  return { rewrites: total, pins, installs, sourcePins };
 }

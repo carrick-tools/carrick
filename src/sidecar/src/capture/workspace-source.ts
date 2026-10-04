@@ -27,6 +27,15 @@
  *     `exports`, `types`, `typesVersions`, `main` and the import's mode are
  *     read as before, and the output it lands on is answered with its source.
  *
+ * A package is read from its source whole or not at all. Its declarations
+ * travel in the stub with their imports as written, so a file that names a
+ * module the checkout does not have (a client that is generated, a dependency
+ * that was not installed) would make every type that reaches the file
+ * unreadable there, including types that ask nothing of the package. The
+ * same holds for a dependency the package reads at another version than the
+ * service does: the stub pins one version of a name. Such a package is left
+ * as the compiler found it, which is what it was before any of this.
+ *
  * Nothing is guessed. A package no project of which writes the entry stays
  * unresolved, and so does an output two of its projects write from different
  * sources; `unbuiltPackageNote` says which, for the reason a reader is given.
@@ -36,7 +45,9 @@
 
 import ts from 'typescript';
 import * as fs from 'node:fs';
+import { isBuiltin } from 'node:module';
 import * as path from 'node:path';
+import { installOf } from './installed-package.js';
 import { checkoutRootOf } from './machinery.js';
 import { realPath } from './service-config.js';
 import { packageNameOf } from './specifiers.js';
@@ -48,6 +59,8 @@ export interface WorkspaceScope {
    * its real directory is inside this one and inside no `node_modules`.
    */
   root: string;
+  /** The service the capture is of: what it installs is what the stub pins. */
+  service: string;
 }
 
 /**
@@ -56,7 +69,10 @@ export interface WorkspaceScope {
  * `.git` entry.
  */
 export function workspaceScopeOf(serviceRoot: string, scanRoot?: string): WorkspaceScope {
-  return { root: scanRoot === undefined ? checkoutRootOf(serviceRoot) : path.resolve(scanRoot) };
+  return {
+    root: scanRoot === undefined ? checkoutRootOf(serviceRoot) : path.resolve(scanRoot),
+    service: path.resolve(serviceRoot),
+  };
 }
 
 /** The source files a package's TypeScript projects write its outputs from. */
@@ -211,6 +227,8 @@ type Followed =
   | { kind: 'ambiguous' }
   /** One of the checkout's packages, and no project of it writes the entry. */
   | { kind: 'unmapped' }
+  /** Its source cannot stand in for its build: `because` is the clause that says why. */
+  | { kind: 'incomplete'; because: string }
   /** Not one of the checkout's own packages, or not installed. */
   | undefined;
 
@@ -223,6 +241,22 @@ function follow(
   redirected?: ts.ResolvedProjectReference,
   mode?: ts.ResolutionMode
 ): Followed {
+  const entry = entrySource(name, containingFile, options, host, scope, redirected, mode);
+  if (entry?.kind !== 'source') return entry;
+  const because = incompleteFrom(entry.file, options, host, scope);
+  return because === undefined ? entry : { kind: 'incomplete', because };
+}
+
+/** The source file a specifier's entry is written from, whatever that source goes on to import. */
+function entrySource(
+  name: string,
+  containingFile: string,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost,
+  scope: WorkspaceScope,
+  redirected?: ts.ResolvedProjectReference,
+  mode?: ts.ResolutionMode
+): Exclude<Followed, { kind: 'incomplete' }> {
   if (name.startsWith('.') || path.isAbsolute(name)) return undefined;
   const installed = packageInstall(name, containingFile);
   if (!installed || !isOwnPath(installed.real, scope)) return undefined;
@@ -251,6 +285,123 @@ function follow(
   return source === null ? { kind: 'ambiguous' } : { kind: 'source', file: source };
 }
 
+/** What one set of compiler options has found of the checkout's source so far. */
+interface Readings {
+  /** Source file -> why what it reaches cannot be read whole; undefined when it can. */
+  incomplete: Map<string, string | undefined>;
+  resolutions: ts.ModuleResolutionCache;
+  /**
+   * Whether a program under these options holds the Node runtime's types. No
+   * file is found for a module of the runtime (`node:events`): its types
+   * package declares the module by name, so it resolves in a program that
+   * includes that package and in no other.
+   */
+  runtimeTypes: () => boolean;
+}
+
+const readingsByOptions = new WeakMap<ts.CompilerOptions, Map<string, Readings>>();
+
+function readingsFor(options: ts.CompilerOptions, scope: WorkspaceScope): Readings {
+  let byScope = readingsByOptions.get(options);
+  if (!byScope) readingsByOptions.set(options, (byScope = new Map()));
+  const key = `${scope.root}\0${scope.service}`;
+  let readings = byScope.get(key);
+  if (!readings) {
+    let runtimeTypes: boolean | undefined;
+    readings = {
+      incomplete: new Map(),
+      resolutions: ts.createModuleResolutionCache(
+        ts.sys.getCurrentDirectory(),
+        (file) => (ts.sys.useCaseSensitiveFileNames ? file : file.toLowerCase()),
+        options
+      ),
+      runtimeTypes: () => (runtimeTypes ??= ts.getAutomaticTypeDirectiveNames(options, ts.sys).includes('node')),
+    };
+    byScope.set(key, readings);
+  }
+  return readings;
+}
+
+/**
+ * Why the source a package is entered through cannot stand in for its build,
+ * as the clause a reason ends on; undefined when it can.
+ *
+ * Every source file of the checkout the entry reaches is read, in this
+ * package or in another one entered the same way, nearest first. Each module
+ * a file names has to resolve under the options the capture's own program
+ * resolves with, and a dependency has to be the version the service reads
+ * under that name, where the service installs it. A module only an ambient
+ * declaration names (a stylesheet, an image) does not resolve here: which
+ * declarations the program will hold is not known until it is built.
+ *
+ * `unresolvedSpecifiersReachableFrom` asks a program that exists what it did
+ * not resolve; this is asked while a program's modules are being resolved,
+ * and decides what that program will hold.
+ */
+function incompleteFrom(
+  entry: string,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost,
+  scope: WorkspaceScope
+): string | undefined {
+  const readings = readingsFor(options, scope);
+  if (readings.incomplete.has(entry)) return readings.incomplete.get(entry);
+  const reached = [entry];
+  const seen = new Set(reached);
+  let because: string | undefined;
+  for (let next = 0; next < reached.length && because === undefined; next++) {
+    const file = reached[next];
+    if (readings.incomplete.has(file)) {
+      // Read before, from another entry: whole, or not for the reason found then.
+      because = readings.incomplete.get(file);
+      continue;
+    }
+    const text = host.readFile(file);
+    if (text === undefined) continue;
+    const mode = ts.getImpliedNodeFormatForFile(file, readings.resolutions.getPackageJsonInfoCache(), host, options);
+    for (const { fileName: specifier } of ts.preProcessFile(text, true).importedFiles) {
+      const resolved =
+        ts.resolveModuleName(specifier, file, options, host, readings.resolutions, undefined, mode).resolvedModule
+          ?.resolvedFileName ?? sourceOf(entrySource(specifier, file, options, host, scope, undefined, mode));
+      if (resolved === undefined) {
+        if (isBuiltin(specifier) && readings.runtimeTypes()) continue;
+        because = `its source imports '${specifier}', which does not resolve on this checkout either`;
+        break;
+      }
+      if (isOwnSource(resolved, scope)) {
+        if (!seen.has(resolved)) reached.push(resolved);
+        seen.add(resolved);
+        continue;
+      }
+      because = skewedDependency(specifier, file, scope);
+      if (because !== undefined) break;
+    }
+  }
+  if (because === undefined) for (const file of reached) readings.incomplete.set(file, undefined);
+  else readings.incomplete.set(entry, because);
+  return because;
+}
+
+function sourceOf(followed: Followed): string | undefined {
+  return followed?.kind === 'source' ? followed.file : undefined;
+}
+
+/**
+ * A dependency one of the checkout's packages reads at another version than
+ * the service does, as the clause that says so. The stub pins one version of
+ * a name, and the service's is the one its own declarations were read at.
+ */
+function skewedDependency(specifier: string, file: string, scope: WorkspaceScope): string | undefined {
+  if (specifier.startsWith('.') || path.isAbsolute(specifier)) return undefined;
+  const mine = packageInstall(specifier, file);
+  const theirs = packageInstall(specifier, path.join(scope.service, 'package.json'));
+  if (!mine || !theirs || mine.real === theirs.real) return undefined;
+  const versionAt = (install: string): string | undefined => installOf(path.join(install, 'package.json'))?.version;
+  const [read, pinned] = [versionAt(mine.real), versionAt(theirs.real)];
+  if (read === undefined || pinned === undefined || read === pinned) return undefined;
+  return `its source reads '${packageNameOf(specifier)}' at ${read}, where the service reads it at ${pinned}`;
+}
+
 function extensionOf(file: string): ts.Extension {
   const found = [ts.Extension.Tsx, ts.Extension.Mts, ts.Extension.Cts, ts.Extension.Ts].find((extension) =>
     file.endsWith(extension)
@@ -271,10 +422,16 @@ export function isOwnSource(file: string, scope: WorkspaceScope): boolean {
 /**
  * The compiler's answer with the checkout's own source read as source: a
  * `.ts` file of the checkout the resolver reached through a `node_modules`
- * link is not an external library.
+ * link is not an external library, where what it reaches can be read whole.
  */
-function asOwnSource(resolved: ts.ResolvedModuleFull, scope: WorkspaceScope): ts.ResolvedModuleFull {
+function asOwnSource(
+  resolved: ts.ResolvedModuleFull,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost,
+  scope: WorkspaceScope
+): ts.ResolvedModuleFull {
   if (!resolved.isExternalLibraryImport || !isOwnSource(resolved.resolvedFileName, scope)) return resolved;
+  if (incompleteFrom(resolved.resolvedFileName, options, host, scope) !== undefined) return resolved;
   return { ...resolved, isExternalLibraryImport: false };
 }
 
@@ -313,7 +470,7 @@ export function resolveModule(
 ): ts.ResolvedModuleFull | undefined {
   const standard = ts.resolveModuleName(name, containingFile, options, host, cache, redirected, mode)
     .resolvedModule;
-  if (standard) return asOwnSource(standard, scope);
+  if (standard) return asOwnSource(standard, options, host, scope);
   return unbuiltPackageSource(name, containingFile, options, host, scope, redirected, mode);
 }
 
@@ -328,6 +485,12 @@ export function workspaceCompilerHost(options: ts.CompilerOptions, scope: Worksp
     (file) => host.getCanonicalFileName(file),
     options
   );
+  // The program reads this cache when it names a module in a declaration it
+  // emits (what a package's manifest exports, which names reach it). A host
+  // that resolves for itself and does not hand its cache over leaves the
+  // program without one, and a type from a package the service does not
+  // import by name is then named through another package, or not at all.
+  host.getModuleResolutionCache = () => cache;
   host.resolveModuleNameLiterals = (literals, containingFile, redirected, compilerOptions, containingSourceFile) =>
     literals.map((literal) => ({
       resolvedModule: resolveModule(
@@ -361,6 +524,9 @@ export function unbuiltPackageNote(
       `'${name}' is a package of this checkout whose entry is not on disk, ` +
       'and no tsconfig in the package writes that entry from a source file'
     );
+  }
+  if (followed?.kind === 'incomplete') {
+    return `'${name}' is a package of this checkout whose entry is not on disk, and ${followed.because}`;
   }
   if (followed?.kind === 'ambiguous') {
     return (
