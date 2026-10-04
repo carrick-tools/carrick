@@ -24,10 +24,15 @@ See `AGENTS.md` for the full build/test command set.
 
 Runs the scanner twice over every cassette fixture (and, optionally, one
 large real-world tree) under the mock analyzer and fails if the two eval
-projections differ. It reads determinism, not accuracy: a change that alters
-what the scanner emits from the same input is a defect it catches; a wrong
-row it cannot see. Deterministic-layer changes (emission sources, the join
-rule, the URL resolver) run it before they merge.
+projections differ, then twice more and fails if the two indexes it would
+upload differ by a byte (`last_updated` left out). The projection is compared
+with keys and top-level arrays sorted; the blob is compared as written, so the
+order of a key, a list or a line of type text counts. It reads determinism,
+not accuracy: a change that alters what the scanner emits from the same input
+is a defect it catches; a wrong row it cannot see. Deterministic-layer changes
+(emission sources, the join rule, the URL resolver) run it before they merge.
+Build the type sidecar first (`npm ci && npm run build` in `src/sidecar`), or
+the blobs hold no type text to compare.
 
 ```bash
 cargo build
@@ -35,8 +40,8 @@ scripts/scan-twice.sh                     # fixtures only
 scripts/scan-twice.sh /path/to/probe-dir  # plus a one-service carrick.json tree
 ```
 
-`CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections per
-target. The script header lists the exclusions and why.
+`CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections and both
+blob directories per target. The script header lists the exclusions and why.
 
 ## Fact-coverage probe
 

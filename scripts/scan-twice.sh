@@ -3,11 +3,19 @@
 # Scan-twice determinism probe (carrick#599).
 #
 # Runs the scanner twice over the same tree under the mock analyzer and asserts
-# the two eval projections are identical. The mock analyzer replays a fixture's
-# `__llm__/` cassette (or returns nothing at all where a fixture has none), so
-# the model is held constant and any difference between the two runs comes from
-# the scanner itself: iteration order over a HashMap, a pass that reads a
-# previous pass's leftovers, a span that depends on visit order.
+# the two eval projections are identical, then twice more and asserts the two
+# indexes it would upload are the same bytes (carrick#1876). The mock analyzer
+# replays a fixture's `__llm__/` cassette (or returns nothing at all where a
+# fixture has none), so the model is held constant and any difference between
+# the two runs comes from the scanner itself: iteration order over a HashMap, a
+# pass that reads a previous pass's leftovers, a span that depends on visit
+# order.
+#
+# The projection is compared with its keys and its top-level arrays sorted, so
+# it reads the row set. The blob is compared as written, so it also reads the
+# order of every key, list and line of type text. A binary that finds its type
+# sidecar writes types into the blob; one that does not writes none, and the
+# comparison then covers no type text.
 #
 # This is a determinism reading, not an accuracy reading. It says nothing about
 # whether a row is correct, only that the same input produces the same row set
@@ -23,8 +31,9 @@
 #
 # Environment:
 #   CARRICK_BIN   scanner binary (default: target/debug/carrick)
-#   SCAN_OUT_DIR  where to keep the two projections per target (default: a
-#                 fresh mktemp dir, printed on the first line)
+#   SCAN_OUT_DIR  where to keep the two projections and the two blob
+#                 directories per target (default: a fresh mktemp dir, printed
+#                 on the first line)
 #
 # Exit status is non-zero if any target differs between its two runs.
 
@@ -134,33 +143,40 @@ fi
 # model; no intents, because intent generation is a separate lambda and is not
 # part of the projection. CI-shaped env vars are removed so the run takes the
 # same branch on a developer machine and on a runner.
+#
+# With a sixth argument the scan writes the index it would upload into that
+# directory instead of printing a projection (carrick#1876). The two outputs
+# need a scan each: a run that prints the projection uploads nothing. The
+# directory is read back as empty, so the scan is a cold one with no sibling.
 scan() {
   scan_dir="$1"
   scan_path="$2"
   mock_dir="$3"
   stdout_file="$4"
   stderr_file="$5"
+  blob_dir="${6:-}"
 
+  unset_vars=(-u GITHUB_REPOSITORY -u GITHUB_ACTIONS -u CI)
+  # A fixture that states dependencies and has none installed is scanned as it
+  # is: the scanner otherwise refuses it at preflight, and a refused target is
+  # not probed at all.
+  set_vars=(CARRICK_MOCK_ALL=1 CARRICK_SKIP_INTENTS=1 CARRICK_ALLOW_UNPREPARED=1)
   if [ -n "$mock_dir" ]; then
-    (
-      cd "$scan_dir" || exit 3
-      env -u GITHUB_REPOSITORY -u GITHUB_ACTIONS -u CI \
-        CARRICK_MOCK_ALL=1 \
-        CARRICK_OUTPUT_JSON=1 \
-        CARRICK_SKIP_INTENTS=1 \
-        CARRICK_MOCK_FIXTURE_DIR="$mock_dir" \
-        "$bin" "$scan_path" --no-cache
-    ) >"$stdout_file" 2>"$stderr_file"
+    set_vars+=("CARRICK_MOCK_FIXTURE_DIR=$mock_dir")
   else
-    (
-      cd "$scan_dir" || exit 3
-      env -u GITHUB_REPOSITORY -u GITHUB_ACTIONS -u CI -u CARRICK_MOCK_FIXTURE_DIR \
-        CARRICK_MOCK_ALL=1 \
-        CARRICK_OUTPUT_JSON=1 \
-        CARRICK_SKIP_INTENTS=1 \
-        "$bin" "$scan_path" --no-cache
-    ) >"$stdout_file" 2>"$stderr_file"
+    unset_vars+=(-u CARRICK_MOCK_FIXTURE_DIR)
   fi
+  if [ -n "$blob_dir" ]; then
+    unset_vars+=(-u CARRICK_OUTPUT_JSON -u GITHUB_EVENT_NAME -u GITHUB_REF)
+    set_vars+=("CARRICK_LOCAL_STORAGE_DIR=$blob_dir" CARRICK_LOCAL_STORAGE_ISOLATE=1)
+  else
+    set_vars+=(CARRICK_OUTPUT_JSON=1)
+  fi
+
+  (
+    cd "$scan_dir" || exit 3
+    env "${unset_vars[@]}" "${set_vars[@]}" "$bin" "$scan_path" --no-cache
+  ) >"$stdout_file" 2>"$stderr_file"
 }
 
 # --- canonical comparison ----------------------------------------------------
@@ -267,6 +283,77 @@ print(f"  run 2: {clip(right)}")
 raise SystemExit(1)
 PY
 
+# --- blob comparison ---------------------------------------------------------
+#
+# The index a scan uploads, compared as written (carrick#1876). Nothing is
+# sorted here: whatever stores a blob compares its bytes, so a key or a list in
+# another order is a difference. `last_updated` states when the scan ran and is
+# the one field left out. The first differing path of each blob is printed,
+# with what kind of difference it is.
+blob_compare_py="$out_dir/_compare_blobs.py"
+cat >"$blob_compare_py" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def load(path):
+    # Objects as key/value lists, so the order the keys were written in is kept.
+    pairs = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=lambda p: ("object", p))
+    return ("object", [(k, v) for k, v in pairs[1] if k != "last_updated"])
+
+
+def is_object(value):
+    return isinstance(value, tuple) and len(value) == 2 and value[0] == "object"
+
+
+def first_diff(a, b, path="$"):
+    if is_object(a) and is_object(b):
+        keys_a = [k for k, _ in a[1]]
+        keys_b = [k for k, _ in b[1]]
+        if keys_a != keys_b:
+            if sorted(keys_a) == sorted(keys_b):
+                return path, "the same keys in another order"
+            return path, "different keys"
+        for (key, x), (_, y) in zip(a[1], b[1]):
+            found = first_diff(x, y, f"{path}.{key}")
+            if found:
+                return found
+        return None
+    if isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            return path, f"{len(a)} elements in run 1, {len(b)} in run 2"
+        for index, (x, y) in enumerate(zip(a, b)):
+            found = first_diff(x, y, f"{path}[{index}]")
+            if found:
+                return found
+        return None
+    if type(a) is not type(b) or a != b:
+        if isinstance(a, str) and isinstance(b, str) and sorted(a.split("\n")) == sorted(b.split("\n")):
+            return path, "the same lines in another order"
+        return path, "different values"
+    return None
+
+
+one, two = Path(sys.argv[1]), Path(sys.argv[2])
+names = sorted({p.name for p in one.glob("*.json")} | {p.name for p in two.glob("*.json")})
+if not names:
+    # No blob from either run is not a PASS: the scan uploaded nothing.
+    print("neither scan wrote a blob")
+    raise SystemExit(2)
+differing = 0
+for name in names:
+    if not (one / name).exists() or not (two / name).exists():
+        print(f"{name}: written by one scan only")
+        differing += 1
+        continue
+    diff = first_diff(load(one / name), load(two / name))
+    if diff:
+        print(f"{name}: first differing path {diff[0]} ({diff[1]})")
+        differing += 1
+raise SystemExit(1 if differing else 0)
+PY
+
 # --- run ---------------------------------------------------------------------
 failures=0
 run_target() {
@@ -280,17 +367,30 @@ run_target() {
   b_out="$out_dir/$slug.2.json"
   a_err="$out_dir/$slug.1.err"
   b_err="$out_dir/$slug.2.err"
+  a_blobs="$out_dir/$slug.blobs.1"
+  b_blobs="$out_dir/$slug.blobs.2"
+  rm -rf "${a_blobs:?}" "${b_blobs:?}"
 
   started="$(date +%s)"
   scan "$scan_dir" "$scan_path" "$mock_dir" "$a_out" "$a_err"
   a_status=$?
   scan "$scan_dir" "$scan_path" "$mock_dir" "$b_out" "$b_err"
   b_status=$?
+  scan "$scan_dir" "$scan_path" "$mock_dir" "$out_dir/$slug.blobs.1.out" "$out_dir/$slug.blobs.1.err" "$a_blobs"
+  a_blob_status=$?
+  scan "$scan_dir" "$scan_path" "$mock_dir" "$out_dir/$slug.blobs.2.out" "$out_dir/$slug.blobs.2.err" "$b_blobs"
+  b_blob_status=$?
   elapsed=$(( $(date +%s) - started ))
 
   if [ "$a_status" -ne 0 ] || [ "$b_status" -ne 0 ]; then
     printf 'FAIL  %-44s %4ss  scanner exited %s / %s\n' "$label" "$elapsed" "$a_status" "$b_status"
     tail -n 5 "$a_err" | sed 's/^/        /'
+    failures=$((failures + 1))
+    return
+  fi
+  if [ "$a_blob_status" -ne 0 ] || [ "$b_blob_status" -ne 0 ]; then
+    printf 'FAIL  %-44s %4ss  the blob scan exited %s / %s\n' "$label" "$elapsed" "$a_blob_status" "$b_blob_status"
+    tail -n 5 "$out_dir/$slug.blobs.1.err" | sed 's/^/        /'
     failures=$((failures + 1))
     return
   fi
@@ -301,21 +401,28 @@ run_target() {
   # that stopped emitting.
   detail="$(python3 "$compare_py" "$a_out" "$b_out")"
   compare_status=$?
+  blob_detail="$(python3 "$blob_compare_py" "$a_blobs" "$b_blobs")"
+  blob_status=$?
 
-  if [ "$compare_status" -eq 0 ]; then
+  if [ "$compare_status" -eq 0 ] && [ "$blob_status" -eq 0 ]; then
     if cmp -s "$a_out" "$b_out"; then
-      printf 'PASS  %-44s %4ss  byte-identical\n' "$label" "$elapsed"
+      printf 'PASS  %-44s %4ss  projection and blob byte-identical\n' "$label" "$elapsed"
     else
       # The canonical forms agree, so the row set is the same and only the
       # order it was emitted in moved. Not a failure today; worth watching,
       # because an emission-order change can turn it into one.
-      printf 'PASS  %-44s %4ss  order-only diff in the raw output\n' "$label" "$elapsed"
+      printf 'PASS  %-44s %4ss  blob byte-identical, order-only diff in the raw projection\n' "$label" "$elapsed"
     fi
     return
   fi
 
   printf 'FAIL  %-44s %4ss\n' "$label" "$elapsed"
-  printf '%s\n' "$detail" | sed 's/^/        /'
+  if [ "$compare_status" -ne 0 ]; then
+    printf '%s\n' "$detail" | sed 's/^/        projection: /'
+  fi
+  if [ "$blob_status" -ne 0 ]; then
+    printf '%s\n' "$blob_detail" | sed 's/^/        blob: /'
+  fi
   failures=$((failures + 1))
 }
 

@@ -3486,7 +3486,13 @@ impl FileOrchestrator {
                 .push((method, path, call_id));
         }
 
-        for (file_path, result) in file_results {
+        // In file order, not the map's (carrick#1876). The sidecar answers in
+        // the order it is asked, and the bundle and the capture stub are
+        // written in the order the answers come back, so requests in hash
+        // order wrote that type text in another order on every scan.
+        let mut files: Vec<(&String, &FileAnalysisResult)> = file_results.iter().collect();
+        files.sort_by_key(|(path, _)| *path);
+        for (file_path, result) in files {
             // Convert file_path to absolute path relative to repo root
             let file_path_absolute = Self::to_absolute_path(file_path, &repo_root_absolute);
 
@@ -13285,6 +13291,81 @@ export * from "./aFetch.js";"#,
         assert!(aliases[0].contains("_Call"));
         assert!(aliases[1].contains("_Call"));
         assert_ne!(aliases[0], aliases[1]);
+    }
+
+    /// carrick#1876: the type requests go out in one order on every scan.
+    ///
+    /// The answers are held in a hash map, which every scan walks in another
+    /// order. The sidecar answers in the order it is asked, and the bundle and
+    /// the capture stub are written in the order the answers come back, so a
+    /// request list in map order made that type text differ between two scans
+    /// of one tree. Forty files with one call each: two maps of that size do
+    /// not share an order by chance.
+    #[test]
+    fn type_requests_are_collected_in_file_order_whatever_order_the_map_is_in() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let names: Vec<String> = (0..40).map(|n| format!("src/page{n:02}.ts")).collect();
+        std::fs::create_dir_all(repo.path().join("src")).expect("source dir");
+        for name in &names {
+            std::fs::write(repo.path().join(name), "x".repeat(700)).expect("source file");
+        }
+
+        let answers = |names: &[String]| -> HashMap<String, FileAnalysisResult> {
+            names
+                .iter()
+                .map(|name| {
+                    let answer = serde_json::json!({
+                        "mounts": [],
+                        "endpoints": [],
+                        "data_calls": [{
+                            "candidate_id": "span:470-520",
+                            "line_number": 10,
+                            "target": "https://api.example.com/orders",
+                            "method": "GET",
+                            "pattern_matched": "fetch(",
+                            "call_expression_span_start": 470,
+                            "call_expression_span_end": 520,
+                        }],
+                    });
+                    (
+                        name.clone(),
+                        serde_json::from_value(answer).expect("a file answer"),
+                    )
+                })
+                .collect()
+        };
+        let requested_files = |file_results: &HashMap<String, FileAnalysisResult>| {
+            let graph = orchestrator.build_mount_graph(
+                file_results,
+                &UrlNormalizer::default_permissive(),
+                Path::new(""),
+                Path::new(""),
+            );
+            let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+                file_results,
+                &repo.path().to_string_lossy(),
+                &graph,
+                &Config::default(),
+                &repo_modules(repo.path()),
+            );
+            infer
+                .into_iter()
+                .map(|request| request.file_path)
+                .collect::<Vec<String>>()
+        };
+
+        let forward = requested_files(&answers(&names));
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+        let backward = requested_files(&answers(&reversed));
+        assert_eq!(forward.len(), 40, "every call asks for its type");
+        assert_eq!(
+            forward, backward,
+            "one set of answers must ask for its types in one order"
+        );
+        let mut in_file_order = forward.clone();
+        in_file_order.sort();
+        assert_eq!(forward, in_file_order, "and that order is the files'");
     }
 
     /// carrick#1601: a row restated at a call to a function the service

@@ -1042,8 +1042,8 @@ fn assert_same_bytes(
 /// thirty-file service that publishes and subscribes, and five GraphQL
 /// services in one repo), each scanned cold twice (the second from an empty
 /// store, so nothing is replayed) and then once more over the stored
-/// generation, as an ordinary rescan runs. Without the type sidecar: the type
-/// text it writes has a member order of its own (carrick#1598).
+/// generation, as an ordinary rescan runs. Without the type sidecar: the scan
+/// with types is `two_scans_of_one_tree_with_types_upload_the_same_bytes`.
 #[tokio::test]
 #[serial]
 async fn two_scans_of_one_tree_upload_the_same_bytes() {
@@ -1077,6 +1077,89 @@ async fn two_scans_of_one_tree_upload_the_same_bytes() {
         assert_same_bytes(
             fixture,
             "a cold scan and the rescan after it",
+            &cold,
+            &uploaded_text(&storage),
+        );
+    }
+}
+
+/// The real type sidecar, built from `src/sidecar` and initialised on `repo`.
+/// A fresh one for each scan, as every scan starts its own.
+fn real_sidecar(repo: &Path) -> carrick::services::type_sidecar::TypeSidecar {
+    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    assert!(
+        entry.exists(),
+        "build the sidecar first: cd src/sidecar && npm ci && npm run build"
+    );
+    let sidecar =
+        carrick::services::type_sidecar::TypeSidecar::spawn(&entry).expect("the sidecar spawns");
+    sidecar.start_init(repo, None);
+    sidecar
+        .wait_ready(std::time::Duration::from_secs(120))
+        .expect("the sidecar initialises on the fixture");
+    sidecar
+}
+
+/// One scan through a sidecar of its own, into `storage`.
+async fn scan_with_types(storage: &StubStorage, repo_path: &Path) {
+    let sidecar = real_sidecar(repo_path);
+    run_analysis_engine_with_sidecar(
+        storage.clone(),
+        repo_path.to_str().unwrap(),
+        Some(&sidecar),
+        false,
+    )
+    .await
+    .expect("scan failed");
+}
+
+/// carrick#1876: two scans of one tree with types upload the same bytes.
+///
+/// With the sidecar, every operation asks for its type, and the bundle and
+/// the capture stub are written in the order the answers come back. The
+/// requests were collected in the order of a hash map, so that type text was
+/// written in another order on every scan while holding the same
+/// declarations. They now go out in file order.
+///
+/// Two HTTP trees whose routes and calls sit in several files, each scanned
+/// cold twice through the live sidecar. The blobs must carry type text, or
+/// the comparison proves nothing.
+#[tokio::test]
+#[serial]
+async fn two_scans_of_one_tree_with_types_upload_the_same_bytes() {
+    for fixture in ["llm-mocked-api", "request-summary"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, cassette) = committed_copy_of(fixture, tmp.path(), &[]);
+        mock_env(&cassette);
+
+        let storage = StubStorage::default();
+        scan_with_types(&storage, &repo_path).await;
+        let typed = latest_upload(&storage);
+        let declarations = typed
+            .bundled_types
+            .as_deref()
+            .map(|bundle| bundle.matches("export ").count())
+            .unwrap_or(0);
+        assert!(
+            declarations >= 4 && typed.capture_stub.is_some(),
+            "{fixture}: the scan must write type text worth comparing \
+             ({declarations} declarations in the bundle)"
+        );
+        let cold = uploaded_text(&storage);
+
+        let other_store = StubStorage::default();
+        scan_with_types(&other_store, &repo_path).await;
+        assert_same_bytes(
+            fixture,
+            "two cold scans with types",
+            &cold,
+            &uploaded_text(&other_store),
+        );
+
+        scan_with_types(&storage, &repo_path).await;
+        assert_same_bytes(
+            fixture,
+            "a cold scan with types and the rescan after it",
             &cold,
             &uploaded_text(&storage),
         );
