@@ -199,6 +199,101 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
     }
 }
 
+/// Whether `dir` is the top of a git checkout: it holds `.git`, a directory in
+/// a clone and a file in a linked worktree or a submodule. The npm installer
+/// asks the same of a sibling repository (`npm/carrick/src/init/repos.ts`,
+/// carrick#975).
+pub fn is_git_checkout(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// The paths the checkout at `top` declares as its submodules, relative to
+/// `top`: every `path` its `.gitmodules` states.
+///
+/// Read as text, one `path = <value>` line per submodule, which is how git
+/// writes the file. A value this reads differently from git names no
+/// directory on disk, and the checkout it was meant for is then left out and
+/// named in the scan's output, never read by mistake.
+fn declared_submodules(top: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(top.join(".gitmodules")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("path"))
+        .map(|(_, value)| {
+            Path::new(value.trim().trim_matches('"'))
+                .components()
+                .filter(|part| matches!(part, std::path::Component::Normal(_)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Whether `dir` is a git checkout the repository around it does not state:
+/// a linked worktree, or a clone somebody made inside the tree.
+///
+/// Such a directory is another working tree, often a whole copy of the
+/// repository it sits in, and no commit of that repository holds a file of
+/// it. A submodule is the one checkout a repository does state: the checkout
+/// above it lists the path in `.gitmodules` and its commit pins what the
+/// directory holds, so a submodule is read as the rest of the tree is.
+///
+/// "The repository around it" is the nearest directory above `dir` that is a
+/// checkout itself, wherever the walk started. With none above it, nothing
+/// states `dir`.
+pub fn is_separate_checkout(dir: &Path) -> bool {
+    if !is_git_checkout(dir) {
+        return false;
+    }
+    // Absolute, and not canonical: a walk started at `.` must still reach the
+    // checkout above its own root, and a directory linked in is asked about
+    // where the link sits.
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(top) = dir.ancestors().skip(1).find(|above| is_git_checkout(above)) else {
+        return true;
+    };
+    let Ok(relative) = dir.strip_prefix(top) else {
+        return true;
+    };
+    !declared_submodules(top)
+        .iter()
+        .any(|declared| declared == relative)
+}
+
+/// Why a walk stops at a directory below its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitBoundary {
+    /// `.git` itself: the repository's own records, never its source.
+    Records,
+    /// A checkout of its own ([`is_separate_checkout`]).
+    SeparateCheckout,
+}
+
+/// Whether a walk stops at `entry`, and why (carrick#1902).
+///
+/// **The one rule every walk of a repository's tree shares**: the source walk
+/// here, the GraphQL walks, the manifest walks and the workspace-member walk
+/// all ask it, so a file one of them leaves out is left out by all of them.
+///
+/// The walk's own root is never a boundary, whatever it holds: a scan started
+/// inside a linked worktree reads that worktree, and a service `directory` or
+/// an `include` root that names a checkout reads it whole. Naming it is how a
+/// checkout this rule leaves out is brought back.
+///
+/// Dot folders are not a boundary. A framework can define one as part of an
+/// application's source (a server-only module folder, say), and nothing about
+/// the name tells that from a tool's cache.
+pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return None;
+    }
+    if entry.file_name() == ".git" {
+        return Some(GitBoundary::Records);
+    }
+    is_separate_checkout(entry.path()).then_some(GitBoundary::SeparateCheckout)
+}
+
 /// The entries of a source walk below `dir`: everything the scan may read,
 /// with the ignored directories never entered.
 ///
@@ -222,23 +317,45 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
 /// `left_out` are directories below `root`, relative to it, that the walk
 /// never enters: the services nested in the one being walked (carrick#553).
 /// Pruned for the reason above, and so a nested service's tree is read once.
+///
+/// `checkouts` receives every separate checkout the walk stopped at
+/// ([`git_boundary`]), as walked, so the caller can say what was left out.
 fn source_entries<'a>(
     root: &'a Path,
     ignore_patterns: &'a [&'a str],
     left_out: &'a [PathBuf],
+    checkouts: &'a mut Vec<PathBuf>,
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .sort_by_file_name()
         .follow_links(true)
         .into_iter()
         .filter_entry(move |entry| {
-            !is_ignored(entry.path(), root, ignore_patterns)
-                && !entry
+            if is_ignored(entry.path(), root, ignore_patterns)
+                || entry
                     .path()
                     .strip_prefix(root)
                     .is_ok_and(|relative| left_out.iter().any(|dir| relative == dir))
+            {
+                return false;
+            }
+            match git_boundary(entry) {
+                None => true,
+                Some(GitBoundary::Records) => false,
+                Some(GitBoundary::SeparateCheckout) => {
+                    checkouts.push(entry.path().to_path_buf());
+                    false
+                }
+            }
         })
         .filter_map(|e| e.ok())
+}
+
+/// What one walk read, and the separate checkouts it stopped at.
+struct Walked {
+    files: Vec<PathBuf>,
+    config_file: Option<PathBuf>,
+    checkouts: Vec<PathBuf>,
 }
 
 /// Find all JavaScript and TypeScript files in a directory
@@ -251,20 +368,18 @@ fn source_entries<'a>(
 /// last on that host. A service's manifest is the one at its root and nowhere
 /// else — see [`find_service_files`].
 pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
-    find_files_leaving_out(dir, ignore_patterns, &[])
+    let walked = find_files_leaving_out(dir, ignore_patterns, &[]);
+    (walked.files, walked.config_file)
 }
 
 /// [`find_files`], never entering the `left_out` directories below `dir`.
-fn find_files_leaving_out(
-    dir: &str,
-    ignore_patterns: &[&str],
-    left_out: &[PathBuf],
-) -> (Vec<PathBuf>, Option<PathBuf>) {
+fn find_files_leaving_out(dir: &str, ignore_patterns: &[&str], left_out: &[PathBuf]) -> Walked {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
+    let mut checkouts = Vec::new();
     let root_path = Path::new(dir);
 
-    for entry in source_entries(root_path, ignore_patterns, left_out) {
+    for entry in source_entries(root_path, ignore_patterns, left_out, &mut checkouts) {
         let path = entry.path();
 
         if !path.is_file() {
@@ -281,7 +396,11 @@ fn find_files_leaving_out(
         }
     }
 
-    (js_ts_files, config_file)
+    Walked {
+        files: js_ts_files,
+        config_file,
+        checkouts,
+    }
 }
 
 /// Where a service's own tree starts: its `directory` under the repo root, or
@@ -332,11 +451,38 @@ pub fn find_service_manifest(repo_path: &Path, service: &crate::config::Config) 
 /// source it declares on purpose, so it is read even where it sits inside a
 /// nested service's directory, and a nested service inside an include root is
 /// read with it.
+///
+/// **A checkout of its own inside the service is not entered**
+/// ([`git_boundary`], carrick#1902). [`walk_service`] also says which ones.
 pub fn find_service_files(
     repo_path: &str,
     service: &crate::config::Config,
     ignore_patterns: &[&str],
 ) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let walk = walk_service(repo_path, service, ignore_patterns);
+    (walk.files, walk.manifest)
+}
+
+/// What a service's walk read, and what it left out for a caller to say so.
+#[derive(Debug, Default)]
+pub struct ServiceWalk {
+    /// The service's source files, as [`find_service_files`] lists them.
+    pub files: Vec<PathBuf>,
+    /// The service's own manifest ([`find_service_manifest`]).
+    pub manifest: Option<PathBuf>,
+    /// The separate checkouts below the service's roots that the walk did not
+    /// enter, sorted, each under `repo_path` as given. One that holds a root
+    /// the config names (an `include` root, a nested service) is not listed:
+    /// what was named inside it is read by the walk rooted there.
+    pub checkouts_left_out: Vec<PathBuf>,
+}
+
+/// [`find_service_files`], with the checkouts the walk stopped at.
+pub fn walk_service(
+    repo_path: &str,
+    service: &crate::config::Config,
+    ignore_patterns: &[&str],
+) -> ServiceWalk {
     let root = Path::new(repo_path);
     let service_root = service_root(root, service);
 
@@ -353,15 +499,19 @@ pub fn find_service_files(
 
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.
-    let (mut files, _config) =
-        find_files_leaving_out(&service_root.to_string_lossy(), ignore_patterns, &left_out);
+    let Walked {
+        mut files,
+        config_file: _,
+        mut checkouts,
+    } = find_files_leaving_out(&service_root.to_string_lossy(), ignore_patterns, &left_out);
 
-    let package_json = find_service_manifest(root, service);
+    let manifest = find_service_manifest(root, service);
 
     for inc in &service.include {
         let inc_path = root.join(inc);
-        let (inc_files, _) = find_files(&inc_path.to_string_lossy(), ignore_patterns);
-        files.extend(inc_files);
+        let included = find_files_leaving_out(&inc_path.to_string_lossy(), ignore_patterns, &[]);
+        files.extend(included.files);
+        checkouts.extend(included.checkouts);
     }
 
     // An `include` root may overlap the service directory; keep the first
@@ -369,7 +519,24 @@ pub fn find_service_files(
     let mut seen = std::collections::HashSet::new();
     files.retain(|p| seen.insert(p.clone()));
 
-    (files, package_json)
+    // A checkout that holds a root the config names was stopped at by the
+    // directory walk and is read, as far as it was named, by the walk rooted
+    // inside it: this service's `include` root, or the nested service's own.
+    let named: Vec<PathBuf> = service
+        .include
+        .iter()
+        .chain(&service.nested_directories)
+        .map(|directory| root.join(directory))
+        .collect();
+    checkouts.retain(|checkout| !named.iter().any(|named| named.starts_with(checkout)));
+    checkouts.sort();
+    checkouts.dedup();
+
+    ServiceWalk {
+        files,
+        manifest,
+        checkouts_left_out: checkouts,
+    }
 }
 
 #[cfg(test)]
@@ -555,7 +722,8 @@ mod tests {
         let root = tmp.path();
         installed_workspace(root, 12, 2);
 
-        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[])
+        let mut checkouts = Vec::new();
+        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[], &mut checkouts)
             .map(|entry| entry.path().to_path_buf())
             .collect();
 
@@ -1156,6 +1324,227 @@ mod tests {
         assert_eq!(
             read_by(root, &alone),
             ["src/orders.ts", "workers/edge/src/index.ts"]
+        );
+    }
+
+    /// The `.git` a linked worktree or a submodule holds: a file naming where
+    /// its git directory is.
+    fn git_file(root: &Path, dir: &str) {
+        fs::create_dir_all(root.join(dir)).expect("checkout dir");
+        fs::write(
+            root.join(dir).join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/copy\n",
+        )
+        .expect(".git file");
+    }
+
+    /// The `.git` a clone holds: a directory.
+    fn git_dir(root: &Path, dir: &str) {
+        fs::create_dir_all(root.join(dir).join(".git")).expect(".git dir");
+    }
+
+    /// The checkouts a service's walk says it left out, relative to the repo.
+    fn left_out_by(root: &Path, service: &crate::config::Config) -> Vec<String> {
+        walk_service(root.to_str().unwrap(), service, ARTIFACT_IGNORES)
+            .checkouts_left_out
+            .iter()
+            .map(|checkout| {
+                checkout
+                    .strip_prefix(root)
+                    .expect("a checkout left out is under the repo")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// carrick#1902. A service at the repository root with two checkouts
+    /// inside it: a linked worktree that is a whole copy of the repository,
+    /// and a clone of something else. Neither is the repository's tree, and
+    /// the walk read both, so every file of the copy was indexed a second time
+    /// under the root service.
+    #[test]
+    fn a_service_walk_does_not_enter_a_checkout_of_its_own() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        touch(root, "src/orders.ts");
+        // The copy: a worktree kept in a dot folder the repository ignores.
+        git_file(root, ".agent/worktrees/copy");
+        touch(root, ".agent/worktrees/copy/src/orders.ts");
+        // A clone in a plain folder, so the rule is not about the dot.
+        git_dir(root, "vendor/clone");
+        touch(root, "vendor/clone/index.ts");
+        // A plain folder beside them is read.
+        touch(root, "vendor/patched/shim.ts");
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            ["src/orders.ts", "vendor/patched/shim.ts"]
+        );
+        assert_eq!(
+            left_out_by(root, &services[0]),
+            [".agent/worktrees/copy", "vendor/clone"]
+        );
+    }
+
+    /// The repository's own `.git` is its records, never its source. A hook
+    /// written in JavaScript sits there on any checkout that has one.
+    #[test]
+    fn a_walk_does_not_read_the_repositorys_own_git_directory() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, ".git/hooks/pre-commit.js");
+        touch(root, "src/orders.ts");
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(read_by(root, &services[0]), ["src/orders.ts"]);
+        assert!(left_out_by(root, &services[0]).is_empty());
+    }
+
+    /// A dot folder that is no checkout is read as any folder is. A framework
+    /// can define one as an application's server-only modules, and a blanket
+    /// skip would take the request code out of the index with it.
+    #[test]
+    fn a_dot_folder_that_is_no_checkout_is_still_read() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        touch(root, "app/routes/orders.tsx");
+        touch(root, "app/.server/session.ts");
+        touch(root, ".tooling/release.ts");
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            [
+                ".tooling/release.ts",
+                "app/.server/session.ts",
+                "app/routes/orders.tsx"
+            ]
+        );
+        assert!(left_out_by(root, &services[0]).is_empty());
+    }
+
+    /// Naming a checkout is how it is read: as a service's own `directory`,
+    /// as an `include` root, or as the path the scan was started at. Each is
+    /// the root of a walk, and a walk's root is never a boundary.
+    #[test]
+    fn a_checkout_the_config_names_is_read_whole() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        touch(root, "src/orders.ts");
+        git_dir(root, "vendor/clone");
+        touch(root, "vendor/clone/index.ts");
+        touch(root, "vendor/clone/lib/format.ts");
+
+        // An `include` root that is the checkout, and one inside it.
+        let included = resolved(&[(".", "vendor/clone")]);
+        assert_eq!(
+            read_by(root, &included[0]),
+            [
+                "src/orders.ts",
+                "vendor/clone/index.ts",
+                "vendor/clone/lib/format.ts"
+            ]
+        );
+        assert!(left_out_by(root, &included[0]).is_empty());
+        let partly = resolved(&[(".", "vendor/clone/lib")]);
+        assert_eq!(
+            read_by(root, &partly[0]),
+            ["src/orders.ts", "vendor/clone/lib/format.ts"]
+        );
+        assert!(left_out_by(root, &partly[0]).is_empty());
+
+        // A service declared at the checkout reads it, and the service above
+        // leaves it out as a nested service, not as a checkout.
+        let declared = resolved(&[(".", ""), ("vendor/clone", "")]);
+        assert_eq!(read_by(root, &declared[0]), ["src/orders.ts"]);
+        assert!(left_out_by(root, &declared[0]).is_empty());
+        assert_eq!(
+            read_by(root, &declared[1]),
+            ["vendor/clone/index.ts", "vendor/clone/lib/format.ts"]
+        );
+
+        // A scan started at the checkout reads it.
+        let (files, _) = find_files(
+            root.join("vendor/clone").to_str().unwrap(),
+            ARTIFACT_IGNORES,
+        );
+        assert_eq!(files.len(), 2);
+    }
+
+    /// A submodule is the one checkout a repository states: `.gitmodules`
+    /// lists its path and the commit pins what it holds. It is read as before,
+    /// at any depth, and a checkout beside it that nothing declares is not.
+    #[test]
+    fn a_submodule_the_repository_declares_is_read() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"shared\"]\n\tpath = libs/shared\n\turl = https://example.test/shared.git\n\
+             [submodule \"quoted\"]\n\tPath = \"libs/quoted/\"\n\turl = ../quoted.git\n",
+        )
+        .expect(".gitmodules");
+        touch(root, "src/orders.ts");
+        git_file(root, "libs/shared");
+        touch(root, "libs/shared/client.ts");
+        git_file(root, "libs/quoted");
+        touch(root, "libs/quoted/index.ts");
+        git_file(root, "libs/stray");
+        touch(root, "libs/stray/index.ts");
+        // A submodule of the submodule is declared by the submodule.
+        fs::write(
+            root.join("libs/shared/.gitmodules"),
+            "[submodule \"inner\"]\n\tpath = vendor/inner\n",
+        )
+        .expect("inner .gitmodules");
+        git_file(root, "libs/shared/vendor/inner");
+        touch(root, "libs/shared/vendor/inner/codec.ts");
+        // The same path one level up is not what the outer repository states.
+        git_file(root, "vendor/inner");
+        touch(root, "vendor/inner/codec.ts");
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            [
+                "libs/quoted/index.ts",
+                "libs/shared/client.ts",
+                "libs/shared/vendor/inner/codec.ts",
+                "src/orders.ts"
+            ]
+        );
+        assert_eq!(
+            left_out_by(root, &services[0]),
+            ["libs/stray", "vendor/inner"]
+        );
+    }
+
+    /// A service inside a larger repository: the repository that declares a
+    /// submodule is above the walk's own root, and is still the one asked.
+    #[test]
+    fn a_submodule_is_declared_by_the_checkout_above_the_walk_root() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"proto\"]\n\tpath = apps/api/proto\n",
+        )
+        .expect(".gitmodules");
+        touch(root, "apps/api/src/server.ts");
+        git_file(root, "apps/api/proto");
+        touch(root, "apps/api/proto/messages.ts");
+
+        let services = resolved(&[("apps/api", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            ["apps/api/proto/messages.ts", "apps/api/src/server.ts"]
         );
     }
 }

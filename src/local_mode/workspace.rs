@@ -401,7 +401,7 @@ fn detect(root: &Path) -> Result<Detection, String> {
             continue;
         }
         if is_repo(&entry.path()) {
-            checkout_inside |= is_git_checkout(&entry.path());
+            checkout_inside |= crate::file_finder::is_git_checkout(&entry.path());
             repos.push(format!("./{name}"));
         } else {
             unmarked.push(name);
@@ -416,7 +416,7 @@ fn detect(root: &Path) -> Result<Detection, String> {
         // Action's installer and the scan name the same services
         // (carrick#1858). A root that is not a checkout, or that holds one,
         // is still read as a folder of repositories.
-        if is_git_checkout(root) && !checkout_inside {
+        if crate::file_finder::is_git_checkout(root) && !checkout_inside {
             return Ok(found("single repository", vec![".".into()]));
         }
         repos.sort();
@@ -464,12 +464,6 @@ fn is_repo(root: &Path) -> bool {
     REPO_MARKERS
         .iter()
         .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
-}
-
-/// Whether `root` is the top of a git checkout: it holds `.git`, a directory
-/// in a clone and a file in a linked worktree or a submodule.
-fn is_git_checkout(root: &Path) -> bool {
-    std::fs::symlink_metadata(root.join(".git")).is_ok()
 }
 
 /// Find the workspace root for a read-only command, in the order a caller can

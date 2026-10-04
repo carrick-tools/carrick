@@ -407,9 +407,12 @@ fn is_graphql_file(path: &Path) -> bool {
 
 /// Every `.graphql`/`.gql` file a service's own walk reads under `roots`, in
 /// walk order (roots in order, names sorted), skipping dependency, build and
-/// generated-artifact folders, and the test folders the TypeScript walk does
-/// not read either ([`crate::file_finder::is_under_test_dir`], carrick#1626).
-/// A path under two overlapping roots is listed twice; callers dedup.
+/// generated-artifact folders, the test folders the TypeScript walk does not
+/// read either ([`crate::file_finder::is_under_test_dir`], carrick#1626), and
+/// the checkouts it does not enter ([`crate::file_finder::git_boundary`],
+/// carrick#1902): a schema in a copy of the repository is not one this
+/// service serves. A path under two overlapping roots is listed twice;
+/// callers dedup.
 ///
 /// [`SchemaCatalogue::build`] reads the repository's other schema files
 /// through the same test-folder filter: a schema this walk leaves out must not
@@ -428,6 +431,7 @@ fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
                             || crate::packages::MANIFEST_SKIP_DIRS.contains(&name)
                     })
                     .unwrap_or(false)
+                    && crate::file_finder::git_boundary(e).is_none()
             })
             .filter_map(Result::ok)
         {
@@ -814,10 +818,11 @@ fn repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
         .collect()
 }
 
-/// Every GraphQL file on disk under `repo_root`, skipping `.git` and
-/// dependency folders only: the fallback when git cannot say what is tracked.
-/// Build folders are walked, because a committed printed schema usually sits
-/// in one.
+/// Every GraphQL file on disk under `repo_root`, skipping `.git`, dependency
+/// folders and checkouts of their own
+/// ([`crate::file_finder::git_boundary`]): the fallback when git cannot say
+/// what is tracked. Build folders are walked, because a committed printed
+/// schema usually sits in one.
 fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
     WalkDir::new(repo_root)
         .sort_by_file_name()
@@ -828,6 +833,7 @@ fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
                     .file_name()
                     .to_str()
                     .is_some_and(|name| name == ".git" || name == "node_modules")
+                    && crate::file_finder::git_boundary(e).is_none()
         })
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && is_graphql_file(entry.path()))
@@ -3059,6 +3065,49 @@ export const typeDefs = gql`
             "an end-to-end suite's operations are not calls: {:?}",
             extraction.consumers
         );
+    }
+
+    /// carrick#1902: both GraphQL walks stop at a checkout of its own inside
+    /// the tree, as the TypeScript walk does. A linked worktree holds a copy
+    /// of every schema file, and the copy is neither a schema this service
+    /// serves nor another API's. A submodule the repository declares is read.
+    #[test]
+    fn neither_graphql_walk_enters_a_checkout_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write(
+            ".gitmodules",
+            "[submodule \"contracts\"]\n\tpath = contracts\n",
+        );
+        write("api/schema.graphql", "type Query { orders: [String] }");
+        write("contracts/.git", "gitdir: ../.git/modules/contracts\n");
+        write("contracts/partner.graphql", "type Query { quote: Int }");
+        write("trees/task/.git", "gitdir: /elsewhere\n");
+        write(
+            "trees/task/api/schema.graphql",
+            "type Query { orders: Int }",
+        );
+
+        let relative = |files: Vec<PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|file| {
+                    file.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect()
+        };
+        let read = ["api/schema.graphql", "contracts/partner.graphql"];
+        assert_eq!(relative(graphql_files_under(&[root.to_path_buf()])), read);
+        assert_eq!(relative(graphql_files_on_disk(root)), read);
     }
 
     /// The catalogue reads schemas through the same filter as the walk, in the

@@ -8,7 +8,7 @@ use crate::cloud_storage::{
     UploadOutcome, get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::Config;
-use crate::file_finder::find_service_files;
+use crate::file_finder::walk_service;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
 use crate::intent_generator::{IntentsInFlight, PreviousIntents, RunIntentMemo};
 use crate::logging;
@@ -6463,6 +6463,83 @@ fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> V
         .collect()
 }
 
+/// How many places a left-out line names before it counts the rest.
+const MAX_NAMED_CHECKOUTS: usize = 3;
+
+/// The checkouts a service's walk did not enter
+/// ([`crate::file_finder::git_boundary`], carrick#1902), as a reader would
+/// name them: how many, and where under the repo. `None` when there are none.
+///
+/// Up to [`MAX_NAMED_CHECKOUTS`] are named one by one. More than that are
+/// counted by the folder that holds them, because that is the shape the case
+/// takes: a tool keeps its worktrees side by side in one folder, and eight
+/// paths that differ in their last segment say less than "8 in" that folder.
+fn checkouts_left_out(repo_path: &str, checkouts: &[PathBuf]) -> Option<String> {
+    if checkouts.is_empty() {
+        return None;
+    }
+    let relative: Vec<String> = checkouts
+        .iter()
+        .map(|checkout| {
+            checkout
+                .strip_prefix(repo_path)
+                .unwrap_or(checkout)
+                .components()
+                .filter_map(|part| match part {
+                    std::path::Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    // (what the reader is shown, how many checkouts it stands for)
+    let places: Vec<(String, usize)> = if relative.len() <= MAX_NAMED_CHECKOUTS {
+        relative.iter().map(|path| (path.clone(), 1)).collect()
+    } else {
+        let mut by_parent: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+        for path in &relative {
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            by_parent.entry(parent).or_default().push(path);
+        }
+        by_parent
+            .into_iter()
+            .map(|(parent, inside)| match (inside.as_slice(), parent) {
+                ([only], _) => ((*only).clone(), 1),
+                (many, "") => (format!("{} in the repo root", many.len()), many.len()),
+                (many, parent) => (format!("{} in {parent}", many.len()), many.len()),
+            })
+            .collect()
+    };
+    let named: Vec<&str> = places
+        .iter()
+        .take(MAX_NAMED_CHECKOUTS)
+        .map(|(place, _)| place.as_str())
+        .collect();
+    let rest: usize = places
+        .iter()
+        .skip(MAX_NAMED_CHECKOUTS)
+        .map(|(_, count)| count)
+        .sum();
+    Some(format!(
+        "{} folder(s) with their own .git: {}{}",
+        relative.len(),
+        named.join(", "),
+        if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// What a scan prints when a service's walk left checkouts out: how many,
+/// which, and how to scan one. A file that is missing from the index because
+/// of where it sits is never a silent decision.
+fn checkouts_left_out_line(left_out: &str) -> String {
+    format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
+}
+
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
@@ -6475,7 +6552,8 @@ fn discover_files_and_symbols(
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let walk_started = Instant::now();
-    let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
+    let walk = walk_service(repo_path, service, &ignore_patterns);
+    let files = walk.files;
     // Timed separately from the parse that follows: the walk and the parse
     // scale with different things, and a scan that spends minutes in the walk
     // is a walk reaching somewhere it should not (carrick#751).
@@ -6485,6 +6563,7 @@ fn discover_files_and_symbols(
         service.directory.as_deref().unwrap_or("the repo root"),
         walk_started.elapsed().as_secs_f64()
     );
+    let left_out = checkouts_left_out(repo_path, &walk.checkouts_left_out);
 
     // Zero files means the scan target is wrong (typo'd path, empty checkout):
     // proceeding would upload an empty service and silently erase its
@@ -6494,12 +6573,24 @@ fn discover_files_and_symbols(
             Some(dir) => format!("service directory '{}'", dir),
             None => "repository root".to_string(),
         };
+        // A folder of checkouts holds source and none of it is this walk's:
+        // the error names them, so the fix is not searched for in the config.
+        let advice = match &left_out {
+            Some(left_out) => format!(
+                "Left out {left_out}. Scan one of them, or name it under \"include\" in \
+                 carrick.json."
+            ),
+            None => {
+                "Check the scan path and the directory/include entries in carrick.json.".to_string()
+            }
+        };
         return Err(format!(
-            "No JS/TS source files found under {} in '{}'. Check the scan path \
-             and the directory/include entries in carrick.json.",
-            scope, repo_path
+            "No JS/TS source files found under {scope} in '{repo_path}'. {advice}"
         )
         .into());
+    }
+    if let Some(left_out) = &left_out {
+        info!("{}", checkouts_left_out_line(left_out));
     }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
@@ -8732,6 +8823,62 @@ mod tests {
             "a file missing beside its siblings is not a directory nobody generated, and the \
              instruction is where that difference reaches a reader:\n{}",
             lines[1]
+        );
+    }
+
+    /// The line carrick#1902 adds, pinned: how many, which, and how to scan
+    /// one. A file missing from an index because of the folder it sits in is
+    /// a decision the scan states.
+    #[test]
+    fn checkouts_a_walk_left_out_are_counted_named_and_given_a_way_back() {
+        let line = |checkouts: &[&str]| {
+            let checkouts: Vec<PathBuf> = checkouts.iter().map(PathBuf::from).collect();
+            super::checkouts_left_out("/work/shop", &checkouts)
+                .map(|left_out| super::checkouts_left_out_line(&left_out))
+        };
+        assert_eq!(line(&[]), None);
+        // Few enough to name. A service declared at `.` walks `<repo>/./…`.
+        assert_eq!(
+            line(&["/work/shop/./vendor/clone"]).as_deref(),
+            Some(
+                "Left out 1 folder(s) with their own .git: vendor/clone. Name one under \
+                 \"include\" in carrick.json to scan it."
+            )
+        );
+
+        // The measured shape: a tool's worktrees side by side in one folder.
+        let worktrees: Vec<String> = (1..=8)
+            .map(|n| format!("/work/shop/.agent/worktrees/task-{n}"))
+            .chain(["/work/shop/vendor/clone".to_string()])
+            .collect();
+        let worktrees: Vec<&str> = worktrees.iter().map(String::as_str).collect();
+        let counted = line(&worktrees).expect("a line");
+        assert_eq!(
+            counted,
+            "Left out 9 folder(s) with their own .git: 8 in .agent/worktrees, vendor/clone. Name \
+             one under \"include\" in carrick.json to scan it."
+        );
+        assert!(
+            counted.split_whitespace().count() <= 22,
+            "the count, the folders and what to do, and nothing about what the copies cost: \
+             {counted}"
+        );
+
+        // More places than the line names: the rest are counted, by checkout.
+        let scattered = line(&[
+            "/work/shop/a/one",
+            "/work/shop/b/two",
+            "/work/shop/c/three",
+            "/work/shop/d/four",
+            "/work/shop/d/five",
+            "/work/shop/top",
+        ])
+        .expect("a line");
+        assert!(
+            scattered.starts_with(
+                "Left out 6 folder(s) with their own .git: top, a/one, b/two and 3 more."
+            ),
+            "{scattered}"
         );
     }
 

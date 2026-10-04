@@ -557,7 +557,8 @@ fn deno_manifest_at(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Names declared by every package.json under `repo_root` (workspace members
-/// included), skipping dependency/build directories. Used to recognize
+/// included), skipping dependency/build directories and the checkouts no walk
+/// enters ([`crate::file_finder::git_boundary`]). Used to recognize
 /// workspace-internal packages that must not be treated as registry deps.
 pub fn collect_internal_package_names(repo_root: &std::path::Path) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -570,6 +571,7 @@ pub fn collect_internal_package_names(repo_root: &std::path::Path) -> BTreeSet<S
                     && e.file_name()
                         .to_str()
                         .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
+                    && crate::file_finder::git_boundary(e).is_none()
         });
     let mut manifests: Vec<PathBuf> = walker
         .flatten()

@@ -227,6 +227,10 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                             && !MANIFEST_SKIP_DIRS.contains(&name)
                             && !["target", "out", "coverage"].contains(&name)
                     })
+                    // A checkout of its own inside the repository is no
+                    // member of this workspace: a linked worktree holds a
+                    // copy of every member (carrick#1902).
+                    && crate::file_finder::git_boundary(entry).is_none()
             });
         for entry in walker {
             let entry = entry.map_err(|e| e.to_string())?;

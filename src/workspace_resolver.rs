@@ -752,6 +752,13 @@ fn is_declaration_file(path: &str) -> bool {
 /// Every file under `repo_root` named one of `names`, in walk order, skipping
 /// dependency installs and build output. One walk serves the manifests and,
 /// for an alias-reading index, the config files beside them.
+///
+/// A checkout of its own inside the repository is not entered
+/// ([`crate::file_finder::git_boundary`], carrick#1902). A linked worktree is
+/// a whole copy of the repository, so it declares every package name again,
+/// and the smallest-directory rule in [`WorkspaceIndex::build`] then kept the
+/// copy wherever its folder sorted first: an import of a workspace package
+/// resolved into the copy, for every service of the repository.
 fn tree_files(repo_root: &Path, names: &[&str]) -> Vec<PathBuf> {
     walkdir::WalkDir::new(repo_root)
         .sort_by_file_name()
@@ -763,6 +770,7 @@ fn tree_files(repo_root: &Path, names: &[&str]) -> Vec<PathBuf> {
                     && e.file_name()
                         .to_str()
                         .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
+                    && crate::file_finder::git_boundary(e).is_none()
         })
         .flatten()
         .filter(|e| {
