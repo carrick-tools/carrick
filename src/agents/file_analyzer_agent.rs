@@ -854,7 +854,12 @@ impl FileAnalyzerAgent {
     /// evidence-driven: we read what the model actually emitted (owner_node,
     /// mount_path, whether the endpoint was extracted at all) rather than guess.
     /// One request per file, so one dump per file.
-    fn dump_eval_artifact(file_path: &str, user_message: &str, response: &str) {
+    ///
+    /// A file asked in parts (carrick#1898) sends one request per part, and
+    /// each is dumped beside the others as `<file>.part-<part>.json` with the
+    /// part named in the payload. A whole-file dump is the name and the bytes
+    /// it always was.
+    fn dump_eval_artifact(file_path: &str, part: Option<&str>, user_message: &str, response: &str) {
         let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
             return;
         };
@@ -863,13 +868,27 @@ impl FileAnalyzerAgent {
             return;
         }
         let stem = file_path.replace(['/', '\\'], "_");
-        let payload = serde_json::json!({
-            "file_path": file_path,
-            "request_user_message": user_message,
-            "raw_response": response,
-        });
+        let (name, payload) = match part {
+            None => (
+                format!("{stem}.json"),
+                serde_json::json!({
+                    "file_path": file_path,
+                    "request_user_message": user_message,
+                    "raw_response": response,
+                }),
+            ),
+            Some(part) => (
+                format!("{stem}.part-{part}.json"),
+                serde_json::json!({
+                    "file_path": file_path,
+                    "part": part,
+                    "request_user_message": user_message,
+                    "raw_response": response,
+                }),
+            ),
+        };
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
-            let _ = std::fs::write(dir.join(format!("{stem}.json")), s);
+            let _ = std::fs::write(dir.join(name), s);
         }
     }
 
@@ -946,6 +965,35 @@ impl FileAnalyzerAgent {
         prompt: &AnalysisPrompt,
         guidance: &FrameworkGuidance,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        self.send_prompt(file_path, None, prompt, guidance).await
+    }
+
+    /// Send the prompt of one part of a file and read its answer back
+    /// (carrick#1898).
+    ///
+    /// The same request a whole file makes, to the same route under the same
+    /// guidance key. `part` names the part where the whole-file call names
+    /// only the file: in the prompt fingerprint's log line and in the eval
+    /// dump, so a file's parts sit beside each other and never under the name
+    /// of its whole prompt.
+    pub async fn analyze_part_prompt(
+        &self,
+        file_path: &str,
+        part: &str,
+        prompt: &AnalysisPrompt,
+        guidance: &FrameworkGuidance,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        self.send_prompt(file_path, Some(part), prompt, guidance)
+            .await
+    }
+
+    async fn send_prompt(
+        &self,
+        file_path: &str,
+        part: Option<&str>,
+        prompt: &AnalysisPrompt,
+        guidance: &FrameworkGuidance,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         let user_message = prompt.text.clone();
         // Present only when every guidance answer carried an id; without one
         // the cloud keys the whole message, exactly as it did before
@@ -971,14 +1019,29 @@ impl FileAnalyzerAgent {
         // for the whole service, and a body that moved is this file's own
         // inputs. The digest names the bytes without putting a line of the
         // scanned repo into a log file the run uploads (#61).
-        debug!(
-            target: PROMPT_FINGERPRINT_TARGET,
-            "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={}",
-            file_path,
-            prompt_fingerprint(&user_message),
-            user_message.len(),
-            prompt.guidance_prefix_bytes,
-        );
+        //
+        // A part's line carries the part after the fields a whole file's line
+        // has, so a file asked in parts reads as one line for the request
+        // that was cut and one per part (carrick#1898).
+        match part {
+            None => debug!(
+                target: PROMPT_FINGERPRINT_TARGET,
+                "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={}",
+                file_path,
+                prompt_fingerprint(&user_message),
+                user_message.len(),
+                prompt.guidance_prefix_bytes,
+            ),
+            Some(part) => debug!(
+                target: PROMPT_FINGERPRINT_TARGET,
+                "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={} part={}",
+                file_path,
+                prompt_fingerprint(&user_message),
+                user_message.len(),
+                prompt.guidance_prefix_bytes,
+                part,
+            ),
+        }
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         debug!("Analyzing file: {}", file_path);
@@ -1001,7 +1064,7 @@ impl FileAnalyzerAgent {
         // capture mode), persist the analyzer's input (the guidance/candidates it
         // received) and raw output so prompt-hardening can be driven by what the
         // model actually emitted, not by guesswork. Off unless the env is set.
-        Self::dump_eval_artifact(file_path, &user_message, &response);
+        Self::dump_eval_artifact(file_path, part, &user_message, &response);
 
         Ok(Self::result_from_answer(file_path, &response)?)
     }

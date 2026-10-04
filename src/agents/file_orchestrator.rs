@@ -79,8 +79,8 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Lit, ModuleDecl, ModuleItem, Pat, Str,
-    Tpl, TsEntityName, TsType, VarDeclarator,
+    BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Ident, Lit, ModuleDecl, ModuleItem,
+    Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
@@ -92,6 +92,320 @@ use tracing::{debug, warn};
 /// which this stage shares with the intent stage running beside it
 /// (carrick#1065).
 pub const FILE_ANALYSIS_QUEUE_DEPTH: usize = 20;
+
+/// The most candidates one part holds when a file is asked in parts
+/// (carrick#1898), unless the verdict that asks for the split states its own
+/// limit ([`crate::agent_service::AgentCallError::max_part_candidates`]).
+///
+/// A row of an answer needs a candidate id, so a part's answer holds about as
+/// many rows as the part lists candidates, and this many rows fit one
+/// response. Candidates that share a start are never separated, so a group
+/// larger than the limit is a part on its own.
+pub const MAX_PART_CANDIDATES: usize = 32;
+
+/// The cloud's error code for an answer that ended at the response's limit.
+const OUTPUT_TRUNCATED_CODE: &str = "output_truncated";
+
+/// The cloud's final verdict that an answer does not fit one response, when
+/// `error` is one: the code, on an answer the cloud itself called final
+/// ([`crate::agent_service::AgentCallError::is_final_answer`]).
+///
+/// Only the final verdict asks a file in parts. A cut the cloud calls
+/// retriable is one it expects to pass on another attempt, and those attempts
+/// were the retry loop's to make before the call ended. A failure the scanner
+/// classified for itself is nothing the cloud said about the request.
+fn cut_verdict<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::agent_service::AgentCallError> {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .filter(|e| e.code == OUTPUT_TRUNCATED_CODE && e.is_final_answer())
+}
+
+/// One candidate as a file's prompt lists it: what asking the file in parts
+/// reads of it (carrick#1898).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedCandidate {
+    pub candidate_id: String,
+    /// Where the candidate's call starts and ends, in the scanner's own
+    /// numbering ([`crate::swc_scanner::SWC_SPAN_BASE`]).
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+/// A run of consecutive candidate groups of one file, asked about in one
+/// request (carrick#1898).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidatePart {
+    /// Where the part's first group sits among the file's groups in source
+    /// order. It orders a file's parts and names one.
+    pub first_group: usize,
+    /// The part's groups, in source order. A group is the candidates that
+    /// share a start, each given as its position in the prompt's listing.
+    pub groups: Vec<Vec<usize>>,
+}
+
+impl CandidatePart {
+    /// The part's candidates as positions in the prompt's listing, in the
+    /// order the prompt lists them.
+    pub fn candidates(&self) -> Vec<usize> {
+        let mut positions: Vec<usize> = self.groups.iter().flatten().copied().collect();
+        positions.sort_unstable();
+        positions
+    }
+
+    /// The two halves of a part of several groups, split at its middle group.
+    /// `None` for a single group: its candidates are never separated.
+    pub fn halves(&self) -> Option<(Self, Self)> {
+        if self.groups.len() < 2 {
+            return None;
+        }
+        let middle = self.groups.len() / 2;
+        Some((
+            Self {
+                first_group: self.first_group,
+                groups: self.groups[..middle].to_vec(),
+            },
+            Self {
+                first_group: self.first_group + middle,
+                groups: self.groups[middle..].to_vec(),
+            },
+        ))
+    }
+
+    /// The part's name in a log line and a dump: its first and last group.
+    pub fn label(&self) -> String {
+        format!(
+            "{:04}-{:04}",
+            self.first_group,
+            self.first_group + self.groups.len().saturating_sub(1)
+        )
+    }
+}
+
+/// A file's candidates as groups in source order: the candidates that share a
+/// start are one group, held as positions in the prompt's listing, in the
+/// order the prompt lists them.
+fn candidate_groups(listed: &[ListedCandidate]) -> Vec<Vec<usize>> {
+    let mut by_start: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (position, candidate) in listed.iter().enumerate() {
+        by_start
+            .entry(candidate.span_start)
+            .or_default()
+            .push(position);
+    }
+    by_start.into_values().collect()
+}
+
+/// The parts a file is asked in: runs of consecutive groups in source order,
+/// each holding at most `max_candidates` (carrick#1898).
+///
+/// A function of the file's candidates and nothing else, so the same file is
+/// asked in the same parts on every scan. A group that alone holds more than
+/// the limit is a part on its own.
+pub fn candidate_parts(listed: &[ListedCandidate], max_candidates: usize) -> Vec<CandidatePart> {
+    let mut parts: Vec<CandidatePart> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut held = 0;
+    let mut first_group = 0;
+    for (index, group) in candidate_groups(listed).into_iter().enumerate() {
+        if !groups.is_empty() && held + group.len() > max_candidates {
+            parts.push(CandidatePart {
+                first_group,
+                groups: std::mem::take(&mut groups),
+            });
+            first_group = index;
+            held = 0;
+        }
+        held += group.len();
+        groups.push(group);
+    }
+    if !groups.is_empty() {
+        parts.push(CandidatePart {
+            first_group,
+            groups,
+        });
+    }
+    parts
+}
+
+/// Append the rows of `more` that `rows` does not hold already, byte for
+/// byte as they serialize.
+fn append_unseen_rows<T: serde::Serialize>(
+    rows: &mut Vec<T>,
+    seen: &mut HashSet<String>,
+    more: Vec<T>,
+) {
+    for row in more {
+        match serde_json::to_string(&row) {
+            Ok(key) => {
+                if seen.insert(key) {
+                    rows.push(row);
+                }
+            }
+            // A row that cannot be compared is kept: nothing says it repeats.
+            Err(_) => rows.push(row),
+        }
+    }
+}
+
+/// The one answer a file asked in parts stores (carrick#1898).
+///
+/// `answers` holds each part's answer beside the part's `first_group`, in
+/// whatever order the parts completed. The result does not depend on that
+/// order:
+///
+/// - route and call rows are every part's rows, ordered by where their
+///   candidate sits in the source; rows of one candidate keep the order their
+///   part gave them, and a row whose id names no listed candidate follows the
+///   rows that do, in part order;
+/// - the rows that carry no candidate id (mounts, pub/sub and GraphQL
+///   operations, dispatch tables) are a set: every part reads the whole file
+///   and may state the same one, so a row is kept the first time it is
+///   stated, parts taken in source order, and an exact repeat is dropped.
+pub fn merge_part_answers(
+    listed: &[ListedCandidate],
+    mut answers: Vec<(usize, FileAnalysisResult)>,
+) -> FileAnalysisResult {
+    answers.sort_by_key(|(first_group, _)| *first_group);
+    let place_in_source: HashMap<&str, usize> = candidate_groups(listed)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(place, position)| (listed[position].candidate_id.as_str(), place))
+        .collect();
+    let place = |candidate_id: &str| {
+        place_in_source
+            .get(candidate_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    };
+
+    let mut merged = FileAnalysisResult::default();
+    let mut mounts = HashSet::new();
+    let mut graphql_operations = HashSet::new();
+    let mut pubsub_operations = HashSet::new();
+    let mut graphql_consumer_locates = HashSet::new();
+    let mut dispatch_tables = HashSet::new();
+    for (_, part) in answers {
+        merged.endpoints.extend(part.endpoints);
+        merged.data_calls.extend(part.data_calls);
+        append_unseen_rows(&mut merged.mounts, &mut mounts, part.mounts);
+        append_unseen_rows(
+            &mut merged.graphql_operations,
+            &mut graphql_operations,
+            part.graphql_operations,
+        );
+        append_unseen_rows(
+            &mut merged.pubsub_operations,
+            &mut pubsub_operations,
+            part.pubsub_operations,
+        );
+        append_unseen_rows(
+            &mut merged.graphql_consumer_locates,
+            &mut graphql_consumer_locates,
+            part.graphql_consumer_locates,
+        );
+        append_unseen_rows(
+            &mut merged.dispatch_tables,
+            &mut dispatch_tables,
+            part.dispatch_tables,
+        );
+    }
+    // Stable, so the rows of one candidate stay in the order their part gave.
+    merged.endpoints.sort_by_key(|row| place(&row.candidate_id));
+    merged
+        .data_calls
+        .sort_by_key(|row| place(&row.candidate_id));
+    merged
+}
+
+/// What asking a file in parts reads of it (carrick#1898): the inputs of its
+/// whole prompt, the order that prompt lists its candidates in, and which of
+/// its attached modules each imported name reaches.
+struct PartedFile<'a> {
+    prompt_path: &'a str,
+    content: &'a str,
+    listed: &'a [ListedCandidate],
+    candidate_hints: &'a [String],
+    candidate_contexts: &'a [String],
+    imported_symbols: &'a HashMap<String, ImportedSymbol>,
+    graphql_producer_hints: &'a [String],
+    graphql_consumer_hints: &'a [String],
+    wrapper_context: &'a [String],
+    wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+}
+
+/// Every place a file's source names one of `imports`, as (where the name
+/// starts, the modules it reaches).
+struct ImportReferences<'a> {
+    imports: &'a BTreeMap<String, Vec<usize>>,
+    found: Vec<(u32, &'a [usize])>,
+}
+
+impl Visit for ImportReferences<'_> {
+    /// Bindings and references. A property name (`x.name`, `{ name: 1 }`) is
+    /// not an `Ident`, so it is not read as naming an import.
+    fn visit_ident(&mut self, ident: &Ident) {
+        if let Some(modules) = self.imports.get(ident.sym.as_ref()) {
+            self.found.push((ident.span.lo.0, modules));
+        }
+    }
+}
+
+/// For each listed candidate, the attached modules its source span names
+/// through an import, as positions in the file's `wrapper_context`
+/// (carrick#1898).
+///
+/// Read off the syntax tree: an identifier inside the candidate's span that is
+/// one of the file's imported names reaches the modules that import stands
+/// for. `None` when the file does not parse here; the caller then keeps every
+/// module in every part, because a module that cannot be shown to be unnamed
+/// is not left out.
+fn modules_named_by_candidates(file: &PartedFile<'_>) -> Option<Vec<BTreeSet<usize>>> {
+    if file.wrapper_imports.is_empty() {
+        return Some(vec![BTreeSet::new(); file.listed.len()]);
+    }
+    use swc_common::FileName;
+    use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
+    let path = Path::new(file.prompt_path);
+    let (syntax, _) = crate::parser::syntax_for_path(path);
+    // A source map of its own, as the scan that raised the candidates used:
+    // spans count from the start of this file.
+    let source_map: Lrc<SourceMap> = Default::default();
+    let source = source_map.new_source_file(
+        Lrc::new(FileName::Real(path.to_path_buf())),
+        file.content.to_string(),
+    );
+    let lexer = Lexer::new(
+        syntax,
+        Default::default(),
+        StringInput::from(&*source),
+        None,
+    );
+    let module = Parser::new_from(lexer).parse_module().ok()?;
+    let mut references = ImportReferences {
+        imports: file.wrapper_imports,
+        found: Vec::new(),
+    };
+    module.visit_with(&mut references);
+    references.found.sort_by_key(|(start, _)| *start);
+    Some(
+        file.listed
+            .iter()
+            .map(|candidate| {
+                let from = references
+                    .found
+                    .partition_point(|(start, _)| *start < candidate.span_start);
+                references.found[from..]
+                    .iter()
+                    .take_while(|(start, _)| *start < candidate.span_end)
+                    .flat_map(|(_, modules)| modules.iter().copied())
+                    .collect()
+            })
+            .collect(),
+    )
+}
 
 /// Complete result of file-centric analysis
 #[derive(Debug)]
@@ -1117,6 +1431,159 @@ impl FileOrchestrator {
         self
     }
 
+    /// Ask about a file in parts, after the cloud's verdict that its whole
+    /// answer does not fit one response (carrick#1898).
+    ///
+    /// The file's candidates are split into parts ([`candidate_parts`]) of at
+    /// most the number the verdict states, or [`MAX_PART_CANDIDATES`] when it
+    /// states none. Each part is asked on its own, and the answers are merged
+    /// into the one answer the file stores ([`merge_part_answers`]). A part whose own
+    /// answer is cut is halved by groups and its halves asked, down to a
+    /// single group; a single group that is cut loses the file with that
+    /// verdict. A part that fails any other way loses the file with that
+    /// failure. Either way nothing of the file's answer is kept, and when
+    /// several parts fail it is the first in source order that is reported.
+    ///
+    /// A file with no candidate has nothing to be split by, and is lost with
+    /// the verdict it was given.
+    async fn ask_in_parts(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        verdict: crate::agent_service::AgentCallError,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        // The verdict's own limit when it states one, read once: a part that
+        // is cut in its turn is halved, whatever its verdict states.
+        let limit = verdict.max_part_candidates().unwrap_or(MAX_PART_CANDIDATES);
+        let mut wave = candidate_parts(file.listed, limit);
+        if wave.is_empty() {
+            return Err(Box::new(verdict));
+        }
+        let named = modules_named_by_candidates(file);
+        // The request that was cut, to tell a part that would repeat it.
+        let whole = self.file_analyzer.prompt_for(
+            file.prompt_path,
+            file.content,
+            guidance,
+            file.candidate_hints,
+            file.candidate_contexts,
+            file.imported_symbols,
+            file.graphql_producer_hints,
+            file.graphql_consumer_hints,
+            file.wrapper_context,
+        );
+        debug!(
+            "{}: the answer does not fit one response; asking about its {} candidate(s) in {} part(s)",
+            file.prompt_path,
+            file.listed.len(),
+            wave.len()
+        );
+
+        let mut answers: Vec<(usize, FileAnalysisResult)> = Vec::new();
+        while !wave.is_empty() {
+            let outcomes = futures::future::join_all(wave.iter().map(|part| {
+                self.ask_part(
+                    file,
+                    guidance,
+                    part,
+                    named.as_deref(),
+                    whole.as_ref(),
+                    &verdict,
+                )
+            }))
+            .await;
+            // `join_all` answers in the order it was given the parts, which is
+            // source order, so the failure kept is the first in the source
+            // whichever request came back first.
+            let mut halves: Vec<CandidatePart> = Vec::new();
+            let mut lost: Option<Box<dyn std::error::Error>> = None;
+            for (part, outcome) in wave.iter().zip(outcomes) {
+                match outcome {
+                    Ok(answer) => answers.push((part.first_group, answer)),
+                    Err(error) if lost.is_some() => drop(error),
+                    Err(error) => match (cut_verdict(error.as_ref()).is_some(), part.halves()) {
+                        (true, Some((front, back))) => {
+                            debug!(
+                                "{}: the answer for part {} does not fit either; asking its halves",
+                                file.prompt_path,
+                                part.label()
+                            );
+                            halves.extend([front, back]);
+                        }
+                        _ => lost = Some(error),
+                    },
+                }
+            }
+            if let Some(error) = lost {
+                return Err(error);
+            }
+            wave = halves;
+        }
+        debug!(
+            "{}: answered in {} part(s)",
+            file.prompt_path,
+            answers.len()
+        );
+        Ok(merge_part_answers(file.listed, answers))
+    }
+
+    /// Ask about one part of a file: the file's own prompt, listing only the
+    /// part's candidates and carrying only the modules those candidates name
+    /// through an import (carrick#1898).
+    ///
+    /// A part whose prompt is byte for byte the request that was cut is not
+    /// sent: its verdict is the one already given.
+    async fn ask_part(
+        &self,
+        file: &PartedFile<'_>,
+        guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
+        part: &CandidatePart,
+        named: Option<&[BTreeSet<usize>]>,
+        whole: Option<&crate::agents::file_analyzer_agent::AnalysisPrompt>,
+        verdict: &crate::agent_service::AgentCallError,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let positions = part.candidates();
+        let hints: Vec<String> = positions
+            .iter()
+            .map(|position| file.candidate_hints[*position].clone())
+            .collect();
+        let contexts: Vec<String> = positions
+            .iter()
+            .map(|position| file.candidate_contexts[*position].clone())
+            .collect();
+        // In the context's own order, which is the modules' sorted order.
+        let modules: Vec<String> = match named {
+            Some(named) => positions
+                .iter()
+                .flat_map(|position| named[*position].iter().copied())
+                .collect::<BTreeSet<usize>>()
+                .into_iter()
+                .map(|place| file.wrapper_context[place].clone())
+                .collect(),
+            None => file.wrapper_context.to_vec(),
+        };
+        let prompt = self.file_analyzer.prompt_for(
+            file.prompt_path,
+            file.content,
+            guidance,
+            &hints,
+            &contexts,
+            file.imported_symbols,
+            file.graphql_producer_hints,
+            file.graphql_consumer_hints,
+            &modules,
+        );
+        let Some(prompt) = prompt else {
+            return Err(Box::new(verdict.clone()));
+        };
+        if whole.is_some_and(|whole| whole.text == prompt.text) {
+            return Err(Box::new(verdict.clone()));
+        }
+        self.file_analyzer
+            .analyze_part_prompt(file.prompt_path, &part.label(), &prompt, guidance)
+            .await
+    }
+
     /// Run AST-gated file-centric analysis on all provided files.
     ///
     /// **AST-Gated Architecture:**
@@ -1239,6 +1706,11 @@ impl FileOrchestrator {
             content: String,
             candidate_hints: Vec<String>,
             candidate_contexts: Vec<String>,
+            /// The HTTP candidates in the order the prompt lists them:
+            /// `candidate_hints[i]` and `candidate_contexts[i]` are
+            /// `listed[i]`'s lines. Read only when the file is asked in parts
+            /// (carrick#1898).
+            listed: Vec<ListedCandidate>,
             candidate_map: HashMap<String, CandidateTarget>,
             symbol_table: SymbolTable,
             /// `local const -> process.env name` bindings (e.g.
@@ -1300,6 +1772,11 @@ impl FileOrchestrator {
             /// user message so call sites of an imported wrapper can be emitted
             /// as resolved data calls. Empty for files with no such imports.
             wrapper_context: Vec<String>,
+            /// Which of `wrapper_context`'s modules each imported local name
+            /// reaches, as positions in it (carrick#1898). A file asked in
+            /// parts gives each part only the modules its own candidates name
+            /// through an import. Empty for files with no such imports.
+            wrapper_imports: BTreeMap<String, Vec<usize>>,
             /// The request shape every wrapper module behind `wrapper_context`
             /// agrees on (carrick-cloud#386): the literal HTTP method, and
             /// whether the request carries a body. `None` — the common case —
@@ -1942,6 +2419,14 @@ impl FileOrchestrator {
                 .iter()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
                 .collect();
+            let listed: Vec<ListedCandidate> = http_candidates
+                .iter()
+                .map(|candidate| ListedCandidate {
+                    candidate_id: candidate.candidate_id.clone(),
+                    span_start: candidate.span_start,
+                    span_end: candidate.span_end,
+                })
+                .collect();
             let candidate_map: HashMap<String, CandidateTarget> = http_candidates
                 .iter()
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
@@ -1957,6 +2442,7 @@ impl FileOrchestrator {
                 route_module_claimed,
                 candidate_hints,
                 candidate_contexts,
+                listed,
                 candidate_map,
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
@@ -1973,6 +2459,7 @@ impl FileOrchestrator {
                 },
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
+                wrapper_imports: BTreeMap::new(),
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
@@ -2106,6 +2593,10 @@ impl FileOrchestrator {
                     }
                     import_owners.insert(local_name.clone(), owner);
                 }
+                // The wrapper modules each imported module stands for, kept so
+                // a file asked in parts can say which of them one imported
+                // name reaches (carrick#1898).
+                let mut wrappers_behind: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
                     else {
@@ -2117,14 +2608,16 @@ impl FileOrchestrator {
                     if wrapper_map.is_empty() {
                         continue;
                     }
-                    matched.extend(Self::wrapper_modules_behind(
+                    let behind = Self::wrapper_modules_behind(
                         &resolved,
                         self_canon.as_ref(),
                         &wrapper_map,
                         &mut reexport_cache,
                         &cm,
                         &handler,
-                    ));
+                    );
+                    matched.extend(behind.iter().cloned());
+                    wrappers_behind.insert(resolved, behind);
                 }
                 // `imported_symbols` is a HashMap, so sort before materializing
                 // the prompt context: identical inputs must yield identical
@@ -2141,6 +2634,26 @@ impl FileOrchestrator {
                     .iter()
                     .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                     .collect();
+                // Every matched path came out of `wrapper_map`
+                // (`wrapper_modules_behind` returns nothing else), so the
+                // context holds one snippet per matched path in the same
+                // order, and a path's place in `matched` is its snippet's
+                // place in the context. Only a file with candidates can be
+                // asked in parts.
+                debug_assert_eq!(pf.wrapper_context.len(), matched.len());
+                if !pf.listed.is_empty() {
+                    pf.wrapper_imports = import_owners
+                        .iter()
+                        .filter_map(|(local_name, owner)| {
+                            let behind = wrappers_behind.get(owner.as_ref()?)?;
+                            let places: Vec<usize> = behind
+                                .iter()
+                                .filter_map(|path| matched.binary_search(path).ok())
+                                .collect();
+                            (!places.is_empty()).then(|| (local_name.clone(), places))
+                        })
+                        .collect();
+                }
                 // Members reached directly by a relative import, plus those
                 // behind a re-export barrel the wrapper pass already followed,
                 // and then one hop further: the modules those import. A
@@ -2393,6 +2906,7 @@ impl FileOrchestrator {
                 route_module_claimed: deferred.route_module_claimed,
                 candidate_hints: Vec::new(),
                 candidate_contexts: Vec::new(),
+                listed: Vec::new(),
                 candidate_map: HashMap::new(),
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
@@ -2405,6 +2919,9 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
+                // No candidate, so the file is never asked in parts and
+                // nothing reads which name reaches which module.
+                wrapper_imports: BTreeMap::new(),
                 wrapper_request_shape: rescued_shape,
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
@@ -2718,7 +3235,7 @@ impl FileOrchestrator {
         crate::scan_health::record_files_attempted(to_dispatch.len());
         let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
-                let result = self
+                let whole = self
                     .file_analyzer
                     .analyze_file_with_candidates(
                         &pf.prompt_path,
@@ -2731,30 +3248,56 @@ impl FileOrchestrator {
                         &pf.graphql_consumer_hints,
                         &pf.wrapper_context,
                     )
-                    .await
-                    .map_err(|e| {
-                        // Recorded here, where the error is still typed: this
-                        // file has no analysis in the index, and the run must
-                        // not call itself a success. A call a limit refused
-                        // is excluded, because the model was never asked
-                        // (carrick#555, `counts_as_lost_file`).
-                        if crate::scan_health::counts_as_lost_file(e.as_ref()) {
-                            crate::scan_health::record_unanalysed_file(
-                                &pf.path_str,
-                                &crate::scan_health::analysis_failure_reason(e.as_ref()),
-                            );
-                        } else if crate::scan_health::is_budget_refusal(e.as_ref()) {
-                            // The refusal's own sentence, while the error is
-                            // still typed: the summary quotes it rather than
-                            // describing the budget itself (carrick#1413).
-                            crate::scan_health::record_candidates_not_refreshed(
-                                &pf.path_str,
-                                crate::scan_health::refusal_sentence(e.as_ref()),
-                            );
-                            return ModelAnswer::Refused(e.to_string());
+                    .await;
+                // A file is asked whole, and only the cloud's final verdict
+                // that its answer does not fit one response asks it again, in
+                // parts (carrick#1898). Every other outcome is what it was:
+                // an answer is the file's answer, and any other failure is
+                // the file's failure.
+                let asked = match whole {
+                    Err(error) => match cut_verdict(error.as_ref()).cloned() {
+                        Some(verdict) => {
+                            let file = PartedFile {
+                                prompt_path: &pf.prompt_path,
+                                content: &pf.content,
+                                listed: &pf.listed,
+                                candidate_hints: &pf.candidate_hints,
+                                candidate_contexts: &pf.candidate_contexts,
+                                imported_symbols: &pf.symbol_table.imported_symbols,
+                                graphql_producer_hints: &pf.graphql_producer_hints,
+                                graphql_consumer_hints: &pf.graphql_consumer_hints,
+                                wrapper_context: &pf.wrapper_context,
+                                wrapper_imports: &pf.wrapper_imports,
+                            };
+                            self.ask_in_parts(&file, guidance, verdict).await
                         }
-                        ModelAnswer::Failed(e.to_string())
-                    });
+                        None => Err(error),
+                    },
+                    answered => answered,
+                };
+                let result = asked.map_err(|e| {
+                    // Recorded here, where the error is still typed: this
+                    // file has no analysis in the index, and the run must
+                    // not call itself a success. A call a limit refused
+                    // is excluded, because the model was never asked
+                    // (carrick#555, `counts_as_lost_file`).
+                    if crate::scan_health::counts_as_lost_file(e.as_ref()) {
+                        crate::scan_health::record_unanalysed_file(
+                            &pf.path_str,
+                            &crate::scan_health::analysis_failure_reason(e.as_ref()),
+                        );
+                    } else if crate::scan_health::is_budget_refusal(e.as_ref()) {
+                        // The refusal's own sentence, while the error is
+                        // still typed: the summary quotes it rather than
+                        // describing the budget itself (carrick#1413).
+                        crate::scan_health::record_candidates_not_refreshed(
+                            &pf.path_str,
+                            crate::scan_health::refusal_sentence(e.as_ref()),
+                        );
+                        return ModelAnswer::Refused(e.to_string());
+                    }
+                    ModelAnswer::Failed(e.to_string())
+                });
                 (pf, result)
             }))
             .buffer_unordered(concurrency)
@@ -20918,5 +21461,380 @@ export async function POST(request: Request): Promise<Response> {
             result.data_calls
         );
         assert_eq!(stats.model_routes_kept_without_a_site, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // A file asked in parts (carrick#1898)
+    // -----------------------------------------------------------------------
+
+    /// Candidates at the given spans, in the order given: the prompt's listing.
+    fn listed_at(spans: &[(u32, u32)]) -> Vec<ListedCandidate> {
+        spans
+            .iter()
+            .map(|(start, end)| ListedCandidate {
+                candidate_id: format!("span:{start}-{end}"),
+                span_start: *start,
+                span_end: *end,
+            })
+            .collect()
+    }
+
+    /// The candidate ids each part holds, part by part.
+    fn ids_by_part(listed: &[ListedCandidate], parts: &[CandidatePart]) -> Vec<Vec<String>> {
+        parts
+            .iter()
+            .map(|part| {
+                part.candidates()
+                    .into_iter()
+                    .map(|position| listed[position].candidate_id.clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn candidates_that_share_a_start_stay_in_one_part() {
+        // Two singles, a chain of three links, one single. At three a part,
+        // the chain cannot join the two singles, and it is not cut to fit.
+        let listed = listed_at(&[(10, 20), (30, 40), (50, 90), (50, 80), (50, 70), (100, 110)]);
+        let parts = candidate_parts(&listed, 3);
+        assert_eq!(
+            parts,
+            [
+                CandidatePart {
+                    first_group: 0,
+                    groups: vec![vec![0], vec![1]],
+                },
+                CandidatePart {
+                    first_group: 2,
+                    groups: vec![vec![2, 3, 4]],
+                },
+                CandidatePart {
+                    first_group: 3,
+                    groups: vec![vec![5]],
+                },
+            ]
+        );
+        assert!(
+            parts.iter().all(|part| part.candidates().len() <= 3),
+            "no part holds more than the limit"
+        );
+    }
+
+    #[test]
+    fn a_group_larger_than_the_limit_is_a_part_on_its_own() {
+        let listed = listed_at(&[(1, 5), (10, 90), (10, 80), (10, 70), (10, 60), (95, 99)]);
+        let sizes: Vec<usize> = candidate_parts(&listed, 2)
+            .iter()
+            .map(|part| part.candidates().len())
+            .collect();
+        assert_eq!(sizes, [1, 4, 1]);
+    }
+
+    #[test]
+    fn a_file_with_no_candidates_has_no_parts() {
+        assert!(candidate_parts(&[], MAX_PART_CANDIDATES).is_empty());
+    }
+
+    /// The parts are runs in SOURCE order, whatever order the prompt lists
+    /// the candidates in, and they are the same parts for the same
+    /// candidates listed in any order.
+    #[test]
+    fn the_parts_depend_on_the_candidates_and_not_on_the_order_they_are_listed_in() {
+        let in_source_order = listed_at(&[(10, 20), (30, 40), (30, 35), (50, 60), (70, 80)]);
+        let expected = ids_by_part(&in_source_order, &candidate_parts(&in_source_order, 2));
+        assert_eq!(
+            expected,
+            [
+                vec!["span:10-20"],
+                vec!["span:30-40", "span:30-35"],
+                vec!["span:50-60", "span:70-80"],
+            ]
+        );
+
+        // The same candidates, listed late ones first.
+        let listed = listed_at(&[(70, 80), (30, 40), (10, 20), (50, 60), (30, 35)]);
+        let parts = candidate_parts(&listed, 2);
+        let mut by_part = ids_by_part(&listed, &parts);
+        let mut expected_sets = expected.clone();
+        for ids in by_part.iter_mut().chain(expected_sets.iter_mut()) {
+            ids.sort();
+        }
+        assert_eq!(by_part, expected_sets, "the same candidates in each part");
+        // Within a part, the prompt's own listing order is kept.
+        assert_eq!(parts[2].candidates(), [0, 3]);
+        assert_eq!(
+            candidate_parts(&listed, 2),
+            parts,
+            "and the same on every call"
+        );
+    }
+
+    #[test]
+    fn a_part_is_halved_at_its_middle_group_down_to_one_group() {
+        let listed = listed_at(&[(1, 2), (3, 9), (3, 8), (10, 11), (12, 13), (14, 15)]);
+        let whole = candidate_parts(&listed, MAX_PART_CANDIDATES);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].label(), "0000-0004");
+
+        let (front, back) = whole[0].halves().expect("five groups halve");
+        assert_eq!(front.groups, [vec![0], vec![1, 2]]);
+        assert_eq!(back.groups, [vec![3], vec![4], vec![5]]);
+        assert_eq!((front.first_group, back.first_group), (0, 2));
+        assert_eq!(
+            (front.label(), back.label()),
+            ("0000-0001".into(), "0002-0004".into())
+        );
+
+        let (single, chain) = front.halves().expect("two groups halve");
+        assert_eq!((single.groups.len(), chain.groups.len()), (1, 1));
+        assert!(single.halves().is_none(), "one group is not halved");
+        assert!(
+            chain.halves().is_none(),
+            "a group of two candidates is one group, and is not separated"
+        );
+    }
+
+    fn part_answer(value: serde_json::Value) -> FileAnalysisResult {
+        serde_json::from_value(value).expect("a part answer")
+    }
+
+    fn route_row(candidate_id: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "candidate_id": candidate_id,
+            "line_number": 1,
+            "owner_node": "table",
+            "method": "GET",
+            "path": path,
+            "handler_name": "handler",
+            "pattern_matched": ".get(",
+        })
+    }
+
+    fn mount_row(child: &str) -> serde_json::Value {
+        serde_json::json!({
+            "line_number": 1,
+            "parent_node": "table",
+            "child_node": child,
+            "mount_path": "/",
+            "import_source": null,
+            "pattern_matched": ".use(",
+        })
+    }
+
+    #[test]
+    fn merged_rows_follow_the_source_and_rows_that_name_no_candidate_come_last() {
+        let listed = listed_at(&[(10, 20), (30, 40), (50, 60), (70, 80)]);
+        // Two parts of two candidates. Each writes its rows last first, one
+        // candidate has two rows, and each part has a row whose id names no
+        // listed candidate.
+        let first = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [
+                route_row("line:99", "/unlisted-by-first"),
+                route_row("span:30-40", "/b"),
+                route_row("span:10-20", "/a-first"),
+                route_row("span:10-20", "/a-second"),
+            ],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [
+                route_row("span:70-80", "/d"),
+                route_row("line:98", "/unlisted-by-second"),
+                route_row("span:50-60", "/c"),
+            ],
+        }));
+        let expected = [
+            "/a-first",
+            "/a-second",
+            "/b",
+            "/c",
+            "/d",
+            "/unlisted-by-first",
+            "/unlisted-by-second",
+        ];
+        for answers in [
+            vec![(0, first.clone()), (2, second.clone())],
+            vec![(2, second), (0, first)],
+        ] {
+            let merged = merge_part_answers(&listed, answers);
+            let paths: Vec<&str> = merged
+                .endpoints
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect();
+            assert_eq!(paths, expected);
+        }
+    }
+
+    #[test]
+    fn a_row_with_no_candidate_id_is_kept_once_however_many_parts_state_it() {
+        let listed = listed_at(&[(10, 20), (30, 40)]);
+        let first = part_answer(serde_json::json!({
+            "mounts": [mount_row("shared"), mount_row("only-first")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [{ "topic": "ready", "role": "publisher", "line_number": 3 }],
+        }));
+        let second = part_answer(serde_json::json!({
+            "mounts": [mount_row("only-second"), mount_row("shared")],
+            "endpoints": [], "data_calls": [],
+            "pubsub_operations": [
+                { "topic": "ready", "role": "publisher", "line_number": 3 },
+                { "topic": "ready", "role": "subscriber", "line_number": 3 },
+            ],
+        }));
+        for answers in [
+            vec![(0, first.clone()), (1, second.clone())],
+            vec![(1, second), (0, first)],
+        ] {
+            let merged = merge_part_answers(&listed, answers);
+            let children: Vec<&str> = merged
+                .mounts
+                .iter()
+                .map(|m| m.child_node.as_str())
+                .collect();
+            assert_eq!(
+                children,
+                ["shared", "only-first", "only-second"],
+                "each exact row once, in the order the parts state them in source order"
+            );
+            assert_eq!(
+                merged.pubsub_operations.len(),
+                2,
+                "a row that differs in any field is a row of its own"
+            );
+        }
+    }
+
+    /// The spans of the calls in `source` that start with `callee`, one a
+    /// line, as the scanner numbers them.
+    fn calls_of(source: &str, callee: &str) -> Vec<(u32, u32)> {
+        let mut spans = Vec::new();
+        let mut offset = 0;
+        for line in source.split_inclusive('\n') {
+            if let Some(at) = line.find(callee) {
+                let start = (offset + at) as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+                let end = (offset + line.rfind(')').expect("a call") + 1) as u32
+                    + crate::swc_scanner::SWC_SPAN_BASE;
+                spans.push((start, end));
+            }
+            offset += line.len();
+        }
+        spans
+    }
+
+    fn parted<'a>(
+        content: &'a str,
+        listed: &'a [ListedCandidate],
+        wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
+        no_symbols: &'a HashMap<String, ImportedSymbol>,
+    ) -> PartedFile<'a> {
+        PartedFile {
+            prompt_path: "src/table.ts",
+            content,
+            listed,
+            candidate_hints: &[],
+            candidate_contexts: &[],
+            imported_symbols: no_symbols,
+            graphql_producer_hints: &[],
+            graphql_consumer_hints: &[],
+            wrapper_context: &[],
+            wrapper_imports,
+        }
+    }
+
+    #[test]
+    fn a_candidate_names_the_modules_its_own_span_imports() {
+        let source = "\
+import { alpha } from \"./alpha\";
+import * as beta from \"./beta\";
+declare const table: any;
+declare const other: any;
+table.get(\"/a\", alpha);
+table.get(\"/b\", (request: any) => beta.run(request));
+table.get(\"/c\", other.alpha);
+table.get(\"/d\", \"alpha\");
+table.get(\"/e\", () => alpha(beta));
+";
+        let listed = listed_at(&calls_of(source, "table.get("));
+        assert_eq!(listed.len(), 5);
+        let imports: BTreeMap<String, Vec<usize>> = [
+            ("alpha".to_string(), vec![0]),
+            ("beta".to_string(), vec![1]),
+        ]
+        .into();
+        let no_symbols = HashMap::new();
+
+        let named = modules_named_by_candidates(&parted(source, &listed, &imports, &no_symbols))
+            .expect("the file parses");
+        let named: Vec<Vec<usize>> = named
+            .into_iter()
+            .map(|modules| modules.into_iter().collect())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                vec![0],    // the imported binding itself
+                vec![1],    // inside the handler written at the call
+                vec![],     // a property that shares the import's name
+                vec![],     // a string that spells it
+                vec![0, 1], // both
+            ]
+        );
+    }
+
+    /// A file that cannot be read as a module here says nothing about what
+    /// its candidates name, so nothing is concluded from it.
+    #[test]
+    fn a_file_that_does_not_parse_names_nothing_and_says_so() {
+        let source = "table.get(\"/a\", alpha;\n";
+        let listed = listed_at(&[(1, 10)]);
+        let imports: BTreeMap<String, Vec<usize>> = [("alpha".to_string(), vec![0])].into();
+        let no_symbols = HashMap::new();
+        assert!(
+            modules_named_by_candidates(&parted(source, &listed, &imports, &no_symbols)).is_none()
+        );
+        // With no imported module to name, there is nothing to read the file
+        // for, and every candidate names none.
+        let none = BTreeMap::new();
+        assert_eq!(
+            modules_named_by_candidates(&parted(source, &listed, &none, &no_symbols)),
+            Some(vec![BTreeSet::new()])
+        );
+    }
+
+    #[test]
+    fn only_the_final_cut_verdict_asks_a_file_in_parts() {
+        use crate::agent_service::AgentCallError;
+        // What the cloud stated in an error envelope.
+        let error = |code: &str, retriable: bool| -> Box<dyn std::error::Error> {
+            Box::new(AgentCallError::from_cloud(
+                code,
+                "stated by the test",
+                retriable,
+            ))
+        };
+        assert!(cut_verdict(error("output_truncated", false).as_ref()).is_some());
+        // A cut the cloud would retry is not its last word.
+        assert!(cut_verdict(error("output_truncated", true).as_ref()).is_none());
+        for code in [
+            "model_error",
+            "gateway_error",
+            "bad_response",
+            "llm_disabled",
+        ] {
+            assert!(cut_verdict(error(code, false).as_ref()).is_none(), "{code}");
+            assert!(cut_verdict(error(code, true).as_ref()).is_none(), "{code}");
+        }
+        // The same code on a failure the scanner classified for itself is
+        // nothing the cloud said about the request.
+        let classified_here: Box<dyn std::error::Error> = Box::new(AgentCallError::permanent(
+            "output_truncated",
+            "no envelope".to_string(),
+        ));
+        assert!(cut_verdict(classified_here.as_ref()).is_none());
+        let unparseable: Box<dyn std::error::Error> = "not an answer".into();
+        assert!(cut_verdict(unparseable.as_ref()).is_none());
     }
 }

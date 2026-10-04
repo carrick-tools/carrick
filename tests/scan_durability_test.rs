@@ -1109,11 +1109,21 @@ async fn a_file_the_model_refused_for_capacity_still_waits_before_the_retry() {
 /// flag here and nowhere by its code.
 const ANSWERED_WITH_A_FINAL_VERDICT: &str = r#"{"success":false,"error":{"code":"output_truncated","message":"every try at the file was incomplete","retriable":false,"details":{"reason":"finish_max_tokens","max_part_candidates":32,"replayed":true}}}"#;
 
+/// The requests one pass makes about a file whose every answer is cut
+/// (carrick#1898). The file holds four candidates, each starting on its own:
+/// the whole request, then its two halves (one part of four would repeat the
+/// whole request, so it is not sent), then each candidate alone.
+const REQUESTS_ABOUT_A_FILE_CUT_TO_ITS_LAST_GROUP: usize = 1 + 2 + 4;
+
 /// carrick#1897: a file the cloud says cannot be answered is not asked about
 /// again in the run. Its service owes nothing another ask could mend, so the
-/// retry of owed work passes it by: three file requests, one a service, where
-/// a file a gateway cut ended makes four. The injected verdict answers once,
-/// so a second ask would be answered and the file would read as recovered.
+/// retry of owed work passes it by.
+///
+/// A file whose whole answer is cut is first asked in parts (carrick#1898),
+/// and is lost only when a single group is cut. So the verdict answers every
+/// request the pass makes about the file and no more: one request for each
+/// other service, seven about this file. A second ask of the file would be
+/// answered and the file would read as recovered.
 ///
 /// The file is still missing from the index and is recorded under the
 /// cloud's own code, so its service lands pending on a first index, named on
@@ -1125,15 +1135,16 @@ async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
         carrick::agent_service::inject_mock_envelope(
             "/analyze-file",
             BETA_ONLY_ROUTE,
-            1,
+            REQUESTS_ABOUT_A_FILE_CUT_TO_ITS_LAST_GROUP,
             ANSWERED_WITH_A_FINAL_VERDICT,
         );
     })
     .await;
 
     assert_eq!(
-        file_requests, 3,
-        "one file a service, and the one with a final answer is not asked again"
+        file_requests,
+        2 + REQUESTS_ABOUT_A_FILE_CUT_TO_ITS_LAST_GROUP,
+        "one file a service, the cut one in parts, and it is not asked again"
     );
     assert_eq!(waited, std::time::Duration::ZERO);
 
