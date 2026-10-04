@@ -385,6 +385,8 @@ fn detect(root: &Path) -> Result<Detection, String> {
     let mut repos = Vec::new();
     let mut unmarked = Vec::new();
     let mut skipped = 0usize;
+    // Whether a directory inside the root is a git checkout of its own.
+    let mut checkout_inside = false;
     for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -399,12 +401,24 @@ fn detect(root: &Path) -> Result<Detection, String> {
             continue;
         }
         if is_repo(&entry.path()) {
+            checkout_inside |= is_git_checkout(&entry.path());
             repos.push(format!("./{name}"));
         } else {
             unmarked.push(name);
         }
     }
     if !repos.is_empty() {
+        // The root is itself one git checkout and nothing inside it is a
+        // checkout of its own: the directories that hold a manifest are that
+        // repository's packages, not repositories beside each other. Which of
+        // them are services is `service_derivation::resolve`'s question, and
+        // it is asked of the root, as a scan of the root asks it, so the
+        // Action's installer and the scan name the same services
+        // (carrick#1858). A root that is not a checkout, or that holds one,
+        // is still read as a folder of repositories.
+        if is_git_checkout(root) && !checkout_inside {
+            return Ok(found("single repository", vec![".".into()]));
+        }
         repos.sort();
         return Ok(found("sibling repositories", repos));
     }
@@ -450,6 +464,12 @@ fn is_repo(root: &Path) -> bool {
     REPO_MARKERS
         .iter()
         .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+}
+
+/// Whether `root` is the top of a git checkout: it holds `.git`, a directory
+/// in a clone and a file in a linked worktree or a submodule.
+fn is_git_checkout(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".git")).is_ok()
 }
 
 /// Find the workspace root for a read-only command, in the order a caller can
@@ -711,6 +731,56 @@ mod tests {
         let workspace = Workspace::load(&root).unwrap();
         assert_eq!(workspace.repos_detected_by, "single repository");
         assert_eq!(workspace.repos, [root.canonicalize().unwrap()]);
+    }
+
+    /// carrick#1858. One git repository whose packages sit in directories
+    /// below it, under a root manifest that declares no workspace: the
+    /// packages are parts of that repository, and were listed as repositories
+    /// beside each other. A clone and a linked worktree (`.git` as a file)
+    /// read the same.
+    #[test]
+    fn a_git_repository_holding_package_directories_is_one_repository() {
+        for git in ["directory", "file"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("shop");
+            for package in ["web", "api"] {
+                std::fs::create_dir_all(root.join(package)).unwrap();
+                std::fs::write(root.join(package).join("package.json"), "{}").unwrap();
+            }
+            std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
+            if git == "directory" {
+                std::fs::create_dir(root.join(".git")).unwrap();
+            } else {
+                std::fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+            }
+            let workspace = Workspace::load(&root).unwrap();
+            assert_eq!(workspace.repos_detected_by, "single repository", "{git}");
+            assert_eq!(workspace.repos, [root.canonicalize().unwrap()], "{git}");
+        }
+    }
+
+    /// The same directories with no `.git` above them are still a folder of
+    /// repositories, and so is a checkout that holds another checkout: a
+    /// directory with its own `.git` is a repository of its own, and nothing
+    /// says the others beside it are not.
+    #[test]
+    fn a_folder_of_repositories_is_still_read_as_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        for package in ["web", "api"] {
+            std::fs::create_dir_all(root.join(package)).unwrap();
+            std::fs::write(root.join(package).join("package.json"), "{}").unwrap();
+        }
+        std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
+        let workspace = Workspace::load(&root).unwrap();
+        assert_eq!(workspace.repos_detected_by, "sibling repositories");
+        assert_eq!(workspace.repos.len(), 2);
+
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("api/.git")).unwrap();
+        let workspace = Workspace::load(&root).unwrap();
+        assert_eq!(workspace.repos_detected_by, "sibling repositories");
+        assert_eq!(workspace.repos.len(), 2);
     }
 
     #[test]

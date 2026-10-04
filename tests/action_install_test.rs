@@ -493,3 +493,95 @@ fn a_derivation_that_fails_still_writes_only_step_outputs() {
         );
     }
 }
+
+fn write(root: &Path, file: &str, body: &str) {
+    let target = root.join(file);
+    fs::create_dir_all(target.parent().expect("file parent")).expect("parent dir");
+    fs::write(target, body).expect("write file");
+}
+
+/// A package that states an install: a manifest declaring a dependency, its
+/// lockfile, and source.
+fn package_with_lockfile(root: &Path, directory: &str, name: &str) {
+    write(
+        root,
+        &format!("{directory}/package.json"),
+        &format!(r#"{{"name":"{name}","dependencies":{{"left-pad":"1.3.0"}}}}"#),
+    );
+    write(root, &format!("{directory}/package-lock.json"), "{}");
+    write(
+        root,
+        &format!("{directory}/src/index.ts"),
+        "export const port = 3000;\n",
+    );
+}
+
+/// The roots the installer says it prepares, as `detect` logs them, relative
+/// to the scan root with the root itself as `.`.
+fn prepared_roots(detected: &Run) -> Vec<String> {
+    let mut roots: Vec<String> = detected
+        .err
+        .lines()
+        .filter_map(|line| line.strip_prefix("Carrick prepares "))
+        .filter_map(|rest| rest.rsplit_once(" with "))
+        .map(|(root, _)| match root {
+            "the repository root" => ".".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// The roots a scan of `root` would refuse as uninstalled: the pre-flight's
+/// own answer for the services the scan derives.
+fn refused_roots(root: &Path) -> Vec<String> {
+    let services = carrick::service_derivation::resolve(root)
+        .expect("the scan derives services")
+        .services;
+    let mut roots: Vec<String> = carrick::preflight::unprepared(root, &services)
+        .into_iter()
+        .filter_map(|row| match row {
+            carrick::preflight::Unprepared::Dependencies { install_root, .. } => {
+                Some(if install_root.is_empty() {
+                    ".".to_string()
+                } else {
+                    install_root
+                })
+            }
+            carrick::preflight::Unprepared::Mapping { .. } => None,
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// carrick#1858. The installer asks `carrick derive --workspace <scan root>`
+/// for the services to prepare, and the scan derives its own from the same
+/// root. At the root of one git repository whose packages sit in directories
+/// below it, the command answered for a folder of repositories (each package
+/// directory a repository of its own) and the scan for one repository, so the
+/// two sets differed: the installer prepared what the scan never checked, and
+/// would not prepare a package the scan derived deeper down.
+///
+/// Asks both, on one tree, and they have to agree: what the installer
+/// prepares is what the pre-flight would otherwise refuse.
+#[test]
+fn the_installer_prepares_the_roots_the_scan_would_refuse_at_a_git_root() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let root = scratch.path().canonicalize().expect("canonical scratch");
+    fs::create_dir(root.join(".git")).expect("a git checkout");
+    package_with_lockfile(&root, ".", "shop");
+    package_with_lockfile(&root, "web", "web");
+    package_with_lockfile(&root, "tools/sync", "sync");
+
+    let detected = detect(&root);
+    assert_eq!(detected.status, 0, "detect exits 0: {}", detected.text());
+    assert_eq!(
+        prepared_roots(&detected),
+        refused_roots(&root),
+        "the installer and the scan name different roots: {}",
+        detected.text()
+    );
+}
