@@ -3105,8 +3105,30 @@ export class TypeInferrer {
    *
    * A `then` that cannot be called, or whose first parameter is no callback,
    * is no protocol, and the type is returned as it is.
+   *
+   * The compiler's own awaited type arbitrates. This walk reads the first
+   * signature of `then`; the language reads all of them. Where awaiting the
+   * type and awaiting what this walk found are not the same thing to the
+   * compiler (an overloaded `then` whose first signature is not the one
+   * `await` takes), the walk did not read the protocol, and the type is
+   * returned as it is rather than published as a guess.
    */
   private unwrapThenableType(type: Type): Type {
+    const yielded = this.firstThenValue(type);
+    if (yielded === type) return type;
+    try {
+      const checker = this.project.getTypeChecker().compilerObject;
+      const awaited = checker.getAwaitedType(type.compilerType);
+      return awaited !== undefined && awaited === checker.getAwaitedType(yielded.compilerType)
+        ? yielded
+        : type;
+    } catch {
+      return type;
+    }
+  }
+
+  /** The value `then`'s first signature hands its callback, read until it stops changing. */
+  private firstThenValue(type: Type): Type {
     let current = type;
     for (let depth = 0; depth < 8; depth++) {
       const then = current.getProperty('then');

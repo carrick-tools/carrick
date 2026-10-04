@@ -50,6 +50,13 @@ export class Deferred<T> {
 /** A subclass whose \`then\` yields something other than its type argument. */
 export class Tagged<T> extends Promise<{ value: T; tag: string }> {}
 
+/** Two \`then\` overloads; the first one's callback is not the one \`await\` takes. */
+export class Odd<T> {
+  then(onLabel: (label: string) => void, mode: "label"): void;
+  then(onDone: (value: T) => void): void;
+  then(..._args: unknown[]): void {}
+}
+
 /** A property called \`then\` that is not callable. */
 export interface Step<T> {
   then: string;
@@ -69,6 +76,7 @@ declare function request<T>(url: string): PendingCall<T>;
 declare function defer<T>(url: string): Deferred<T>;
 declare function tagged<T>(url: string): Tagged<T>;
 declare function step<T>(url: string): Step<T>;
+declare function odd<T>(url: string): Odd<T>;
 declare function plain<T>(url: string): Promise<T>;
 declare function like<T>(url: string): PromiseLike<T>;
 declare function plainTagged<T>(url: string): Promise<{ value: T; tag: string }>;
@@ -108,6 +116,10 @@ export function taggedCall(id: string) {
 
 export function plainTaggedCall(id: string) {
   return plainTagged<Invoice>(\`/plain-tagged/\${id}\`);
+}
+
+export function oddCall(id: string) {
+  return odd<Invoice>(\`/odd/\${id}\`);
 }
 
 export function stepCall(id: string) {
@@ -342,6 +354,15 @@ describe("carrick#1877: a call's result holds what await yields for the call's t
       // The row answers as a plain Promise of that object does, anchor
       // included: this reading decides nothing a `Promise<T>` did not.
       assert.deepStrictEqual(answer(inferred), answer(await infer('/plain-tagged')));
+    });
+
+    it('leaves a then it cannot read the way the compiler does as it is', async () => {
+      // `Odd` overloads `then`, and the first signature's callback takes a
+      // label. Awaiting an `Odd<Invoice>` does not yield `string`, and the
+      // compiler says so; the row keeps the type as written rather than
+      // publish the first signature's parameter.
+      const inferred = await infer('/odd');
+      assert.strictEqual(collapse(inferred.type_string), 'Odd<Invoice>');
     });
 
     it('leaves a type whose then cannot be called as it is', async () => {
