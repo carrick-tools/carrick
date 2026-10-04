@@ -67,7 +67,13 @@ fn capture_from(dump: &Path, corpus: &Path) -> BTreeMap<String, String> {
         // anything, so the type layer is not under test and skipping it keeps
         // the run hermetic beside other sidecar-driving tests.
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_ALLOW_MISSING_TYPES", "1");
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        // The corpus root declares no workspace and each package in it
+        // carries a lockfile, so each is a service of its own (carrick#1854),
+        // and none is ever installed. The pre-flight would refuse them; the
+        // request is under test, not the types, so the tree is scanned as it
+        // is.
+        .env("CARRICK_ALLOW_UNPREPARED", "1");
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",

@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 
 use crate::agent_service::AgentCallError;
 use crate::library_claims::{CallClaim, ExportClaims, Side};
+use crate::packages::LOCKFILES;
 use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 
 /// The roles this scanner reads rows for: the store spends nothing on others.
@@ -65,15 +66,6 @@ const PUBLIC_REGISTRIES: [&str; 2] = ["registry.npmjs.org", "registry.yarnpkg.co
 
 /// The runtime's types package: a runtime module's version is its version.
 const RUNTIME_TYPES: &str = "@types/node";
-
-/// The lockfiles an install writes.
-const LOCKFILES: [&str; 5] = [
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "deno.lock",
-];
 
 /// A request to the store (contract section 2). `workspace_packages` is
 /// carrick#1666's and is never part of it here.

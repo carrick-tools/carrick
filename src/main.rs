@@ -544,7 +544,14 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let services = service_derivation::resolve(Path::new(&args.repo_path))?.services;
+    let derivation = service_derivation::resolve(Path::new(&args.repo_path))?;
+    // What the derivation found about the services it inferred, such as a
+    // package with no lockfile that is indexed with the root: a scan says so
+    // itself, since nothing else prints a proposal on this path.
+    for warning in &derivation.warnings {
+        warn!("{warning}");
+    }
+    let services = derivation.services;
     deno_support::require_runtime(Path::new(&args.repo_path), &services)?;
     // Before the sidecar, before the first model call, and before anything is
     // charged for: a tree that is not prepared indexes `any` where a package

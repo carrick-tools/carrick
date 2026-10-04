@@ -1,5 +1,21 @@
 //! Service selection shared by CI, local indexing and the npm init preview.
 //! Explicit configuration wins; inferred package boundaries remain editable.
+//!
+//! Three things state a service boundary, read in this order:
+//!
+//! 1. `carrick.json`, which is taken as written.
+//! 2. A declared workspace: npm or pnpm patterns, or a Deno manifest at the
+//!    root. The declaration alone decides; a lockfile inside a member, or
+//!    beside a package no pattern claims, changes nothing.
+//! 3. With neither, a manifest with a lockfile beside it, below the root: a
+//!    package that installs on its own ([`lockfile_rooted_packages`]),
+//!    proposed beside the root where the root holds source of its own.
+//!
+//! A repository that states none of them is one service at its root.
+//!
+//! Services may sit inside each other in all three: a file belongs to the
+//! deepest service whose directory holds it (`Config::resolve_nested`,
+//! carrick#553).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -7,7 +23,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_manifest};
+use crate::packages::{
+    MANIFEST_SKIP_DIRS, ManifestFacts, deno_workspace_manifest_paths, holds_lockfile, read_manifest,
+};
 
 #[derive(Debug, Serialize)]
 pub struct ServiceDerivation {
@@ -216,19 +234,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 }
             }
         }
-        let walker = walkdir::WalkDir::new(&root)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !entry.file_type().is_dir()
-                    || entry.file_name().to_str().is_some_and(|name| {
-                        !name.starts_with('.')
-                            && !MANIFEST_SKIP_DIRS.contains(&name)
-                            && !["target", "out", "coverage"].contains(&name)
-                    })
-            });
-        for entry in walker {
+        for entry in manifest_walk(&root) {
             let entry = entry.map_err(|e| e.to_string())?;
             if !entry.file_type().is_file() || entry.file_name() != "package.json" {
                 continue;
@@ -264,7 +270,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         }
     }
     let deno = deno_workspace_manifest_paths(&root).map_err(|e| e.to_string())?;
-    let has_deno = !deno.is_empty();
+    let mut has_deno = !deno.is_empty();
     if has_deno {
         reasons.push("Deno manifests".into());
         for manifest in deno {
@@ -281,11 +287,39 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
             members.entry(directory).or_insert(manifest);
         }
     }
+    // What this derivation found that the reader has to act on, and the
+    // package names more than one lockfile-rooted package declares.
+    let mut warnings = Vec::new();
+    let mut shared_names = BTreeSet::new();
+    let mut lockfile_rooted = false;
     if members.is_empty() {
         if !sources.is_empty() && sources.iter().any(|(_, patterns)| !patterns.is_empty()) {
             return Err("Workspace patterns select no services; declare the intended services in carrick.json.".into());
         }
-        members.insert(root.clone(), root.join("package.json"));
+        // Asked only of a repository that declares no workspace at all: a
+        // declaration is the repository's own statement of its packages, even
+        // one that lists none.
+        let found = if sources.is_empty() {
+            lockfile_rooted_packages(&root)?
+        } else {
+            None
+        };
+        match found {
+            Some(found) => {
+                reasons.push("lockfile-rooted packages".into());
+                warnings.extend(found.unlocked_warning());
+                has_deno = found
+                    .members
+                    .values()
+                    .any(|manifest| manifest.file_name().is_some_and(|n| n != "package.json"));
+                members = found.members;
+                shared_names = found.shared_names;
+                lockfile_rooted = true;
+            }
+            None => {
+                members.insert(root.clone(), root.join("package.json"));
+            }
+        }
     }
     let mut names = BTreeSet::new();
     let mut services = Vec::new();
@@ -298,9 +332,13 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         };
         // A plain root service is identified by its repo, as before. Package
         // names identify workspace members without changing root cache keys.
+        // Lockfile-rooted packages that share a package name take their
+        // directory: nothing claims they are one workspace, so nothing made
+        // their names unique, and the one service this repository used to be
+        // never failed over it.
         let name = facts
             .and_then(|facts| facts.package.name)
-            .filter(|_| !relative.as_os_str().is_empty())
+            .filter(|name| !relative.as_os_str().is_empty() && !shared_names.contains(name))
             .or_else(|| {
                 (!relative.as_os_str().is_empty())
                     .then(|| relative.to_string_lossy().replace('\\', "/"))
@@ -338,13 +376,14 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     Config::resolve_nested(&mut services);
     validate(&root, &services)?;
     let config = serde_json::json!({ "services": services });
-    // Both of these are true of every proposal of this shape and neither is
-    // something this run found, so they are notes rather than warnings: they
-    // belong to the document the agent reads and to the quickstart, not to a
-    // terminal line with a warning marker on it (carrick#1032).
-    let warnings = Vec::new();
+    // These are true of every proposal of this shape and none is something
+    // this run found, so they are notes rather than warnings: they belong to
+    // the document the agent reads and to the quickstart, not to a terminal
+    // line with a warning marker on it (carrick#1032).
     let mut notes = Vec::new();
-    if services.len() > 1 {
+    if lockfile_rooted {
+        notes.push("Directories holding their own manifest and lockfile are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
+    } else if services.len() > 1 {
         notes.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
     }
     if has_deno {
@@ -365,14 +404,213 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     })
 }
 
-/// The manifest a service's own directory holds, npm's before Deno's.
-fn member_manifest(root: &Path, service: &Config) -> Option<PathBuf> {
-    let directory = root.join(service.directory.as_deref().unwrap_or("."));
+/// The walk every manifest search below a repository root makes: sorted, and
+/// never into a dot directory, a dependency install or build output.
+fn manifest_walk(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    walkdir::WalkDir::new(root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || entry.file_name().to_str().is_some_and(|name| {
+                    !name.starts_with('.')
+                        && !MANIFEST_SKIP_DIRS.contains(&name)
+                        && !["target", "out", "coverage"].contains(&name)
+                })
+        })
+}
+
+/// What [`lockfile_rooted_packages`] proposes.
+struct LockfileRooted {
+    /// Directory to manifest, as the declared-workspace branches fill it. The
+    /// root is among them when it holds source of its own.
+    members: BTreeMap<PathBuf, PathBuf>,
+    /// Package names more than one of those manifests declares.
+    shared_names: BTreeSet<String>,
+    /// Directories, relative to the root, whose manifest declares
+    /// dependencies with no lockfile beside it: packages that are not
+    /// proposed and are indexed with the root.
+    unlocked: Vec<PathBuf>,
+}
+
+impl LockfileRooted {
+    /// How many such directories are named before the rest are counted.
+    const PLACES_SHOWN: usize = 3;
+
+    /// The line for packages that declare dependencies and state no install,
+    /// or `None` when there are none. The lockfile is what states that a
+    /// package installs on its own, so one that is not committed leaves its
+    /// package unproposed; this says so, since nothing else would.
+    fn unlocked_warning(&self) -> Option<String> {
+        if self.unlocked.is_empty() {
+            return None;
+        }
+        let mut named = self
+            .unlocked
+            .iter()
+            .take(Self::PLACES_SHOWN)
+            .map(|directory| format!("`{}`", directory.to_string_lossy().replace('\\', "/")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.unlocked.len() > Self::PLACES_SHOWN {
+            named.push_str(&format!(
+                " and {} more",
+                self.unlocked.len() - Self::PLACES_SHOWN
+            ));
+        }
+        Some(format!(
+            "{named}: a manifest that declares dependencies with no lockfile beside it, so not proposed as a service and indexed with the repository root. An uncommitted lockfile is the usual cause: commit it, or declare the service in carrick.json."
+        ))
+    }
+}
+
+/// Whether a manifest declares anything to install. A manifest that declares
+/// nothing (a module-type marker, say) is not a package missing its lockfile.
+fn declares_an_install(facts: &ManifestFacts) -> bool {
+    let package = &facts.package;
+    !package.dependencies.is_empty()
+        || !package.dev_dependencies.is_empty()
+        || !package.peer_dependencies.is_empty()
+        || !package.optional_dependencies.is_empty()
+}
+
+/// The packages below `root` that install on their own, in a repository that
+/// declares no workspace (carrick#1854).
+///
+/// A manifest with a lockfile beside it states an install, and a repository
+/// holding several under a root that claims none of them is as many
+/// applications as it has installs: the usual shape of a client and the
+/// server it calls kept in one repository. Proposed as one service, every
+/// call between them is a call a service makes to itself.
+///
+/// What is read, and nothing else:
+///
+/// * **A lockfile beside a manifest**, for every package manager the scanner
+///   recognises ([`holds_lockfile`]). A manifest alone states no install: it
+///   is as often a module-type marker or a fixture as a package. One that
+///   declares dependencies is named in a warning
+///   ([`LockfileRooted::unlocked_warning`]).
+/// * **Source of its own that a scan of this repository reads.** A file
+///   belongs to the deepest service whose directory holds it (carrick#553),
+///   so a package is proposed for the files under it that no package beneath
+///   it holds. A directory with none (an install of tooling, a suite under a
+///   test directory, a folder that only holds other packages) would be a
+///   service with nothing in it, which a scan refuses.
+///
+/// The root is proposed beside them on the same terms: it is a service when
+/// it holds source no package below it holds. So every file the one service
+/// read is still read, once, and packages nested in each other are each
+/// proposed.
+///
+/// `None` when no package is proposed, which leaves the repository one
+/// service. A directory or a nested manifest that cannot be read is passed
+/// over rather than failed on: the repository was one service before this
+/// looked.
+fn lockfile_rooted_packages(root: &Path) -> Result<Option<LockfileRooted>, String> {
+    // Directory to its manifest and the package name that manifest declares.
+    let mut candidates: BTreeMap<PathBuf, (PathBuf, Option<String>)> = BTreeMap::new();
+    let mut unlocked: Vec<PathBuf> = Vec::new();
+    for entry in manifest_walk(root).flatten() {
+        if entry.depth() == 0 || !entry.file_type().is_dir() {
+            continue;
+        }
+        let Some(manifest) = manifest_in(entry.path()) else {
+            continue;
+        };
+        let Ok(facts) = read_manifest(&manifest) else {
+            continue;
+        };
+        if holds_lockfile(entry.path()) {
+            candidates.insert(entry.path().to_path_buf(), (manifest, facts.package.name));
+        } else if declares_an_install(&facts) {
+            unlocked.push(entry.path().to_path_buf());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // The files the one service this repository would otherwise be reads, so
+    // "holds source" means the same thing here as it does to a scan.
+    let (source, _) = crate::file_finder::find_files(&root.to_string_lossy(), &MANIFEST_SKIP_DIRS);
+    candidates.retain(|directory, _| source.iter().any(|file| file.starts_with(directory)));
+
+    // Whether a file under `directory` is in none of the packages beneath it.
+    let holds_own_source = |directory: &Path| {
+        source.iter().any(|file| {
+            file.starts_with(directory)
+                && !candidates.keys().any(|inner| {
+                    inner != directory && inner.starts_with(directory) && file.starts_with(inner)
+                })
+        })
+    };
+    let mut members: BTreeMap<PathBuf, PathBuf> = candidates
+        .iter()
+        .filter(|(directory, _)| holds_own_source(directory))
+        .map(|(directory, (manifest, _))| (directory.clone(), manifest.clone()))
+        .collect();
+    if members.is_empty() {
+        return Ok(None);
+    }
+    // A package with no lockfile is indexed with the root only where no
+    // lockfile-rooted package holds it: inside one it may be that package's
+    // own workspace member, installed by the lockfile above it.
+    unlocked.retain(|directory| {
+        !candidates
+            .keys()
+            .any(|package| directory.starts_with(package))
+            && source.iter().any(|file| file.starts_with(directory))
+    });
+    let unlocked = unlocked
+        .iter()
+        .filter_map(|directory| directory.strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect();
+    // A package name names a service only where it can name one alone: a name
+    // two of these declare, or one that is another's directory, gives way to
+    // the directory each sits in, and directories are distinct.
+    let mut seen_names: BTreeSet<String> = members
+        .keys()
+        .filter_map(|directory| directory.strip_prefix(root).ok())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let mut shared_names = BTreeSet::new();
+    for directory in members.keys() {
+        let relative = directory.strip_prefix(root).unwrap_or(directory);
+        if let Some(name) = &candidates[directory].1
+            && name.as_str() != relative.to_string_lossy().replace('\\', "/")
+            && !seen_names.insert(name.clone())
+        {
+            shared_names.insert(name.clone());
+        }
+    }
+    // The root, for what is left: the files no proposed package holds. It
+    // keeps the manifest path a single-service repository reads, present or
+    // not, and stays unnamed, so it is the service the repository already was.
+    if source
+        .iter()
+        .any(|file| !members.keys().any(|directory| file.starts_with(directory)))
+    {
+        members.insert(root.to_path_buf(), root.join("package.json"));
+    }
+    Ok(Some(LockfileRooted {
+        members,
+        shared_names,
+        unlocked,
+    }))
+}
+
+/// The manifest a directory holds, npm's before Deno's.
+fn manifest_in(directory: &Path) -> Option<PathBuf> {
     let package = directory.join("package.json");
     if package.is_file() {
         return Some(package);
     }
-    crate::deno_support::manifest_at(&directory)
+    crate::deno_support::manifest_at(directory)
+}
+
+/// The manifest a service's own directory holds.
+fn member_manifest(root: &Path, service: &Config) -> Option<PathBuf> {
+    manifest_in(&root.join(service.directory.as_deref().unwrap_or(".")))
 }
 
 /// What this proposal calls a service, so a dependent names it the same way.
