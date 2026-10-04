@@ -77,20 +77,91 @@ fn retry_announcement_due(last: Option<Instant>, now: Instant) -> bool {
 /// to "the boundary says nothing was sent, so where did those invocations come
 /// from". One per CALL, not per HTTP attempt — a call the retry loop repeats
 /// is one row here and more than one invocation in the cloud.
-static REQUEST_COUNTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+static REQUEST_COUNTS: OnceLock<Mutex<RequestCounts>> = OnceLock::new();
 
-fn request_counts_map() -> &'static Mutex<BTreeMap<String, usize>> {
-    REQUEST_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+/// Every request the scan has issued, by route, and which of them were asked
+/// for a service ahead of its analysis (carrick#1895).
+#[derive(Default)]
+struct RequestCounts {
+    /// Every request, by route.
+    issued: BTreeMap<String, usize>,
+    /// Those of `issued` that a service's detection and guidance were asked
+    /// with ahead of it ([`crate::current_service::asked_for`]), by route.
+    ahead: BTreeMap<String, usize>,
+    /// Those of `ahead` no service's line has counted yet, by the service
+    /// they were asked for.
+    ahead_unclaimed: BTreeMap<Option<String>, BTreeMap<String, usize>>,
+}
+
+fn request_counts_map() -> &'static Mutex<RequestCounts> {
+    REQUEST_COUNTS.get_or_init(|| Mutex::new(RequestCounts::default()))
 }
 
 fn record_request(path: &str) {
+    // Read before the lock: it is the running task's own.
+    let asked_ahead = crate::current_service::asked_ahead();
     let mut counts = request_counts_map().lock().unwrap();
-    *counts.entry(path.to_string()).or_insert(0) += 1;
+    *counts.issued.entry(path.to_string()).or_insert(0) += 1;
+    if let Some(service) = asked_ahead {
+        *counts.ahead.entry(path.to_string()).or_insert(0) += 1;
+        *counts
+            .ahead_unclaimed
+            .entry(service)
+            .or_default()
+            .entry(path.to_string())
+            .or_insert(0) += 1;
+    }
 }
 
 /// Requests issued per route so far this scan.
 pub fn request_counts() -> BTreeMap<String, usize> {
-    request_counts_map().lock().unwrap().clone()
+    request_counts_map().lock().unwrap().issued.clone()
+}
+
+/// The requests one service made, for its line in the run log.
+///
+/// A service's requests used to be the ones issued while its analysis ran,
+/// because nothing else was asking. Its detection and guidance are now asked
+/// ahead of it, while the scan analyses another service (carrick#1895), so
+/// the window alone would give the first service every other service's
+/// setup and the later ones none of their own. A service's requests are the
+/// ones issued in its window that were not asked ahead for anyone, and the
+/// ones asked ahead for it, whenever they were sent.
+pub struct ServiceRequests {
+    issued: BTreeMap<String, usize>,
+    ahead: BTreeMap<String, usize>,
+}
+
+impl ServiceRequests {
+    /// Open the window as the service's analysis starts.
+    pub fn open() -> Self {
+        let counts = request_counts_map().lock().unwrap();
+        Self {
+            issued: counts.issued.clone(),
+            ahead: counts.ahead.clone(),
+        }
+    }
+
+    /// Close the window and say what `service` requested, as
+    /// [`requests_between`] words it. What was asked ahead for it is counted
+    /// here once: a second pass over the service does not count it again.
+    pub fn close(self, service: Option<&str>) -> String {
+        let mut counts = request_counts_map().lock().unwrap();
+        let asked_ahead = counts
+            .ahead_unclaimed
+            .remove(&service.map(str::to_string))
+            .unwrap_or_default();
+        let mut own = self.issued.clone();
+        for (route, issued) in &counts.issued {
+            let before =
+                |snapshot: &BTreeMap<String, usize>| snapshot.get(route).copied().unwrap_or(0);
+            let in_window = issued - before(&self.issued);
+            let ahead_in_window = before(&counts.ahead) - before(&self.ahead);
+            *own.entry(route.clone()).or_insert(0) += in_window.saturating_sub(ahead_in_window)
+                + asked_ahead.get(route).copied().unwrap_or(0);
+        }
+        requests_between(&self.issued, &own)
+    }
 }
 
 /// The requests issued between two snapshots, as the per-service line prints
@@ -6644,6 +6715,76 @@ pub(crate) mod tests {
             header_of(&request, "x-carrick-service").as_deref(),
             Some("api")
         );
+    }
+
+    /// A service's detection and guidance are asked while the loop analyses
+    /// another service (carrick#1895). A call made for it names it, and not
+    /// the service the loop is in; one made for an unnamed service names
+    /// nobody.
+    #[tokio::test]
+    #[serial(current_service)]
+    async fn a_call_asked_ahead_for_a_service_names_it_and_not_the_one_being_analysed() {
+        let _scope = crate::current_service::enter(Some("api"));
+
+        let ahead =
+            crate::current_service::asked_for(Some("web".to_string()), prompt_call_request()).await;
+        assert_eq!(
+            header_of(&ahead, "x-carrick-service").as_deref(),
+            Some("web")
+        );
+
+        let unnamed = crate::current_service::asked_for(None, prompt_call_request()).await;
+        assert!(
+            header_of(&unnamed, "x-carrick-service").is_none(),
+            "an unnamed service asked ahead names nobody, not the loop's service: {unnamed}"
+        );
+    }
+
+    /// The per-service line of the run log says what a service requested. Its
+    /// setup is asked ahead of it, while another service is analysed, so the
+    /// requests made during a service's analysis are no longer the service's
+    /// own (carrick#1895): the ones asked ahead for others are left out, and
+    /// the ones asked ahead for it are counted with it, once.
+    #[tokio::test]
+    async fn a_services_requests_are_the_ones_asked_for_it_whenever_they_were_sent() {
+        // Routes and services no other test counts on: the counters are the
+        // process's, and other tests issue requests beside this one.
+        const SETUP: &str = "/a-setup-asked-ahead";
+        const FILE: &str = "/a-file-of-its-own";
+        const FIRST: &str = "the service analysed first";
+        const SECOND: &str = "the service analysed second";
+        let ask_ahead = |service: &'static str| {
+            crate::current_service::asked_for(Some(service.to_string()), async {
+                record_request(SETUP)
+            })
+        };
+
+        // Before any service is analysed, the second one's setup is asked.
+        ask_ahead(SECOND).await;
+
+        // The first is analysed. Its own setup is asked meanwhile, and one
+        // more request of the second's; two files are its own.
+        let first = ServiceRequests::open();
+        ask_ahead(FIRST).await;
+        ask_ahead(SECOND).await;
+        record_request(FILE);
+        record_request(FILE);
+        let first = first.close(Some(FIRST));
+        assert!(first.contains("a-setup-asked-ahead 1"), "{first}");
+        assert!(first.contains("a-file-of-its-own 2"), "{first}");
+
+        // The second is analysed and asks for one file: what was asked ahead
+        // for it, before and during the first's analysis, is counted here.
+        let second = ServiceRequests::open();
+        record_request(FILE);
+        let second = second.close(Some(SECOND));
+        assert!(second.contains("a-setup-asked-ahead 2"), "{second}");
+        assert!(second.contains("a-file-of-its-own 1"), "{second}");
+
+        // A second pass over it (the retry of owed work) counts none again.
+        let again = ServiceRequests::open().close(Some(SECOND));
+        assert!(!again.contains("a-setup-asked-ahead"), "{again}");
+        assert!(!again.contains("a-file-of-its-own"), "{again}");
     }
 
     /// A single unnamed service sends nothing rather than the `(root)` the

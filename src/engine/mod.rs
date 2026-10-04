@@ -48,6 +48,7 @@ use swc_ecma_visit::VisitWith;
 
 pub mod durability;
 pub(crate) mod served_paths;
+pub mod setup_ahead;
 pub(crate) mod type_compat_v2;
 pub(crate) mod upload_boundary;
 
@@ -838,16 +839,27 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // One intent memo for the whole scan, so a function several services hold
     // is described once (carrick#1080). The retry below reads it too.
     let run_intents = RunIntentMemo::default();
+    // Where each service's previous generation is read from: the laptop's
+    // hosted snapshot when the indexer handed one in, otherwise the download.
+    let previous_generations = local_previous.as_ref().unwrap_or(&all_repo_data);
+    // Every service's detection and guidance, asked for from here on beside
+    // the loop below instead of one service at a time inside it
+    // (carrick#1895). Dropped with this function, which ends every ask.
+    let setups = setup_ahead::SetupsAhead::start(repo_path, &services, |service| {
+        if no_cache {
+            return None;
+        }
+        previous_generation(previous_generations, &repo_name, service)
+            .map(setup_ahead::StoredSetup::of)
+    });
     let scan = ServiceScan {
         repo_path,
         sidecar,
         total: services.len(),
         run_intents: &run_intents,
         graphql_schemas: &graphql_schemas,
+        setups: &setups,
     };
-    // Where each service's previous generation is read from: the laptop's
-    // hosted snapshot when the indexer handed one in, otherwise the download.
-    let previous_generations = local_previous.as_ref().unwrap_or(&all_repo_data);
     let upload_blocked = multi_service && !storage.supports_multi_service();
     let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
     for (index, service) in services.iter().enumerate() {
@@ -856,7 +868,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         let previous_data = if no_cache {
             None
         } else {
-            previous_generation(previous_generations, &repo_name, service)
+            previous_generation(previous_generations, &repo_name, service).cloned()
         };
         match scan
             .analyze(
@@ -1723,6 +1735,8 @@ struct ServiceScan<'a> {
     total: usize,
     run_intents: &'a RunIntentMemo,
     graphql_schemas: &'a crate::graphql::SchemaCatalogue,
+    /// Each service's detection and guidance, asked for ahead of it.
+    setups: &'a setup_ahead::SetupsAhead,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -1780,7 +1794,7 @@ impl ServiceScan<'_> {
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
-        let requests_before = crate::agent_service::request_counts();
+        let requests = crate::agent_service::ServiceRequests::open();
         crate::phase_timing::start_service();
         let analysis = analyze_current_repo_incremental(
             self.repo_path,
@@ -1789,6 +1803,7 @@ impl ServiceScan<'_> {
             self.sidecar,
             previous_data,
             generation,
+            self.setups.source(index, generation),
             workspace,
             self.run_intents,
             self.graphql_schemas,
@@ -1799,6 +1814,8 @@ impl ServiceScan<'_> {
         // it (carrick#767). The breakdown after the colon adds up to it, and
         // the request counts say how many round trips this service made —
         // which is what distinguishes work that grew from waiting that grew.
+        // The ones asked ahead of it are counted with it, and the ones asked
+        // ahead for other services while it ran are not (carrick#1895).
         let totals = crate::phase_timing::take();
         // The same marks, folded into the split the build states before and
         // after the wait (carrick#1452). The two stages that ask the model are
@@ -1814,10 +1831,7 @@ impl ServiceScan<'_> {
             .as_ref()
             .map(crate::phase_timing::Totals::line)
             .unwrap_or_else(|| "not recorded".to_string());
-        let requests = crate::agent_service::requests_between(
-            &requests_before,
-            &crate::agent_service::request_counts(),
-        );
+        let requests = requests.close(service.service_name.as_deref());
         info!(
             "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s: \
              {}; requests {})",
@@ -1859,15 +1873,14 @@ impl ServiceScan<'_> {
 
 /// The previous generation of `service` among `generations`, for the
 /// incremental cache.
-fn previous_generation(
-    generations: &[CloudRepoData],
+fn previous_generation<'a>(
+    generations: &'a [CloudRepoData],
     repo_name: &str,
     service: &Config,
-) -> Option<CloudRepoData> {
+) -> Option<&'a CloudRepoData> {
     generations
         .iter()
         .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
-        .cloned()
 }
 
 /// Ship a dispatched run's prompts and say what came back (carrick#1229).
@@ -2838,6 +2851,7 @@ async fn analyze_current_repo_incremental(
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
     generation: PreviousGeneration,
+    model_setup: setup_ahead::SetupSource,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
@@ -2845,9 +2859,7 @@ async fn analyze_current_repo_incremental(
     let start = Instant::now();
 
     // Canonicalize repo_path for consistent path normalization between runs
-    let canonical = std::fs::canonicalize(repo_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| repo_path.to_string());
+    let canonical = canonical_repo_path(repo_path);
     let repo_path = canonical.as_str();
 
     let config = service;
@@ -2958,7 +2970,9 @@ async fn analyze_current_repo_incremental(
             // Get framework detection, guidance, and extraction config
             // (cached or fresh — all three share the package_json_hash gate).
             // A fresh ask that fails defers this service's model analysis
-            // instead of ending the run (see `model_setup`).
+            // instead of ending the run (see `SetupSource::settle`). Whether
+            // to ask is decided where the queue that asks ahead decides it
+            // (`StoredSetup::decide`, carrick#1895).
             let mut setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
                     ModelSetup::ready(
@@ -2975,58 +2989,61 @@ async fn analyze_current_repo_incremental(
                         None,
                     )
                 }
-            } else if !pkg_changed {
-                if let (Some(det), Some(guid)) = (
-                    &prev.cached_detection,
-                    prev.cached_guidance
-                        .as_ref()
-                        .filter(|g| guidance_is_keyed(g)),
-                ) {
-                    debug!("Reusing cached framework detection and guidance");
-                    let det = reask_client_semantics(
-                        det,
-                        generation,
-                        &service_scan_root(repo_path, config),
-                        Path::new(repo_path),
-                        || async {
-                            FrameworkDetector::new(reask_agent())
-                                .detect_frameworks_and_libraries(packages, &all_import_facts)
-                                .await
-                        },
-                        say_schedule,
-                    )
-                    .await;
-                    // A missing cached config (older cache entry, or an
-                    // earlier failed generation) is regenerated on its own.
-                    let extraction = match &prev.cached_extraction_config {
-                        Some(config) => Some(config.clone()),
-                        None => {
-                            generate_extraction_config(&extraction_config_agent(), &det, packages)
-                                .await
-                        }
-                    };
-                    ModelSetup::ready(det, guid.clone(), extraction)
-                } else {
-                    // Something is missing: a first scan's cache entry, the
-                    // service a previous scan deferred, or a blob whose
-                    // guidance predates the guidance id (carrick#1224). A
-                    // detection that landed without usable guidance is kept,
-                    // and only the guidance is asked again (carrick#1126).
-                    if prev.cached_guidance.is_some() {
-                        debug!(
-                            "Cached guidance carries no id (written before the id existed); asking for guidance again so the analysis cache keys it by identity, not by its text"
-                        );
-                    }
-                    model_setup(
-                        packages,
-                        &all_import_facts,
-                        SettledDetection::kept_by(prev, &current_pkg_hash),
-                    )
-                    .await
-                }
             } else {
-                debug!("package.json changed, re-running framework detection");
-                model_setup(packages, &all_import_facts, None).await
+                match setup_ahead::StoredSetup::of(prev).decide(&current_pkg_hash) {
+                    setup_ahead::SetupAsk::Reuse {
+                        detection,
+                        guidance,
+                        extraction_config,
+                    } => {
+                        debug!("Reusing cached framework detection and guidance");
+                        let det = reask_client_semantics(
+                            &detection,
+                            generation,
+                            &service_scan_root(repo_path, config),
+                            Path::new(repo_path),
+                            || async {
+                                FrameworkDetector::new(reask_agent())
+                                    .detect_frameworks_and_libraries(packages, &all_import_facts)
+                                    .await
+                            },
+                            say_schedule,
+                        )
+                        .await;
+                        // A missing cached config (older cache entry, or an
+                        // earlier failed generation) is regenerated on its own.
+                        let extraction = match extraction_config {
+                            Some(config) => Some(config),
+                            None => {
+                                generate_extraction_config(
+                                    &extraction_config_agent(),
+                                    &det,
+                                    packages,
+                                )
+                                .await
+                            }
+                        };
+                        ModelSetup::ready(det, guidance, extraction)
+                    }
+                    setup_ahead::SetupAsk::Ask(settled) => {
+                        if pkg_changed {
+                            debug!("package.json changed, re-running framework detection");
+                        } else if prev.cached_guidance.is_some() {
+                            // Something is missing: a first scan's cache
+                            // entry, the service a previous scan deferred, or
+                            // a blob whose guidance predates the guidance id
+                            // (carrick#1224). A detection that landed without
+                            // usable guidance is kept, and only the guidance
+                            // is asked again (carrick#1126).
+                            debug!(
+                                "Cached guidance carries no id (written before the id existed); asking for guidance again so the analysis cache keys it by identity, not by its text"
+                            );
+                        }
+                        model_setup
+                            .settle(packages, &all_import_facts, settled)
+                            .await
+                    }
+                }
             };
             // The in-scan schedule starts now, so it runs beside everything
             // below (carrick#1564).
@@ -3479,6 +3496,7 @@ async fn analyze_current_repo_incremental(
         },
         prev_intents,
         settled,
+        model_setup,
         workspace,
         run_intents,
         graphql_schemas,
@@ -3596,6 +3614,7 @@ fn say_schedule(
 
 /// A detection an earlier pass of this service already has, with the
 /// extraction config asked alongside it (when that answered).
+#[derive(Debug)]
 struct SettledDetection {
     detection: DetectionResult,
     extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
@@ -3621,27 +3640,14 @@ fn guidance_is_keyed(guidance: &ProtocolGuidance) -> bool {
 }
 
 impl SettledDetection {
-    /// The detection `prev` kept when its guidance was deferred
-    /// ([`ModelSetup::guidance_deferred`]) or cannot be replayed
-    /// ([`guidance_is_keyed`]): there is a cached detection and no usable
-    /// cached guidance, from this cache version and these manifests. A
-    /// complete previous generation returns `None`; the incremental branch
-    /// reuses it whole, and a full analysis asks again as it always has.
+    /// The detection `prev` kept when its guidance was deferred or cannot be
+    /// replayed ([`setup_ahead::StoredSetup::kept`]).
     fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
-        if prev.cached_guidance.as_ref().is_some_and(guidance_is_keyed)
-            || prev.cache_version != Some(CACHE_VERSION)
-            || prev.package_json_hash.as_deref() != Some(current_pkg_hash)
-        {
-            return None;
-        }
-        prev.cached_detection.clone().map(|detection| Self {
-            detection,
-            extraction_config: prev.cached_extraction_config.clone(),
-        })
+        setup_ahead::StoredSetup::of(prev).kept(current_pkg_hash)
     }
 }
 
-/// Run framework detection, per-protocol guidance generation, and
+/// Ask for framework detection, per-protocol guidance generation, and
 /// extraction-config generation (machinery-unwrap rules). All three are
 /// cached together under the package_json_hash gate.
 ///
@@ -3649,38 +3655,42 @@ impl SettledDetection {
 /// guidance failed: detection is not asked again, only guidance (and the
 /// extraction config, when that failed too).
 ///
-/// Never fails. Detection and guidance are single calls a whole service
-/// depends on, so they retry under [`RetryPolicy::PATIENT`]; when even that is
-/// spent, the service's model analysis is DEFERRED rather than the run ended:
-/// its files are analysed facts-only, none of the missing answers is cached,
-/// and the engine names it at the end and asks again (2026-09-15: one
-/// exhausted detection call aborted a seven-service first index after four
-/// services were done). A guidance failure keeps the detection that answered,
-/// so the next ask is guidance only (carrick#1126).
+/// Asked by the loop when it reaches a service, and by the queue that asks
+/// ahead of it (carrick#1895), which is why this names no scan stage, says
+/// nothing about a failure, and returns the answer rather than the setup:
+/// [`setup_ahead::SetupSource::settle`] does all three where the scan waits.
+/// Each ask takes its turn in `turns` first, so two services asking the same
+/// thing never ask it side by side ([`setup_ahead::AskTurns`]).
 ///
-/// A deferred service is never analysed under a stand-in guidance. The
-/// analyzer's cache key names the guidance it embedded, so answers bought
-/// under a placeholder would be paid for again the moment the real guidance
-/// arrived.
-async fn model_setup(
+/// Detection and guidance are single calls a whole service depends on, so
+/// they retry under [`RetryPolicy::PATIENT`].
+async fn ask_model_setup(
     packages: &Packages,
     import_facts: &crate::framework_detector::ImportSample,
     settled: Option<SettledDetection>,
-) -> ModelSetup {
-    crate::scan_stage::enter(crate::scan_stage::Stage::FrameworkDetect);
+    turns: &setup_ahead::AskTurns,
+) -> setup_ahead::SetupAnswer {
     let patient = AgentService::new().with_retry_policy(RetryPolicy::PATIENT);
     let (detection, settled_extraction_config) = match settled {
         Some(settled) => {
             debug!("Reusing this service's detection; asking for its guidance only");
             (settled.detection, settled.extraction_config)
         }
-        None => match FrameworkDetector::new(patient.clone())
-            .detect_frameworks_and_libraries(packages, import_facts)
-            .await
-        {
-            Ok(detection) => (detection, None),
-            Err(error) => return ModelSetup::deferred("framework detection", error.as_ref()),
-        },
+        None => {
+            let asked = {
+                let _turn = turns
+                    .take(setup_ahead::detection_ask(packages, import_facts))
+                    .await;
+                FrameworkDetector::new(patient.clone())
+                    .detect_frameworks_and_libraries(packages, import_facts)
+                    .await
+                    .map_err(setup_ahead::AskFailure::of)
+            };
+            match asked {
+                Ok(detection) => (detection, None),
+                Err(failure) => return setup_ahead::SetupAnswer::NoDetection(failure),
+            }
+        }
     };
 
     let guidance_agent = FrameworkGuidanceAgent::new(patient);
@@ -3688,17 +3698,35 @@ async fn model_setup(
     // Guidance and extraction config both depend only on detection — run
     // them concurrently instead of paying a lone extra lambda round-trip.
     let (guidance, extraction_config) = tokio::join!(
-        guidance_agent.generate_for_active_protocols(&detection),
+        async {
+            let _turn = turns.take(setup_ahead::guidance_ask(&detection)).await;
+            guidance_agent
+                .generate_for_active_protocols(&detection)
+                .await
+        },
         async {
             match settled_extraction_config {
                 Some(config) => Some(config),
-                None => generate_extraction_config(&extraction_agent, &detection, packages).await,
+                None => {
+                    let _turn = turns
+                        .take(setup_ahead::extraction_ask(&detection, packages))
+                        .await;
+                    generate_extraction_config(&extraction_agent, &detection, packages).await
+                }
             }
         },
     );
     match guidance {
-        Ok(guidance) => ModelSetup::ready(detection, guidance, extraction_config),
-        Err(error) => ModelSetup::guidance_deferred(detection, extraction_config, error.as_ref()),
+        Ok(guidance) => setup_ahead::SetupAnswer::Ready {
+            detection,
+            guidance,
+            extraction_config,
+        },
+        Err(error) => setup_ahead::SetupAnswer::NoGuidance {
+            detection,
+            extraction_config,
+            failure: error.into(),
+        },
     }
 }
 
@@ -6596,6 +6624,59 @@ fn checkouts_left_out_line(left_out: &str) -> String {
     format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
 }
 
+/// `repo_path` as every path of a scan is read from: canonical, so two runs
+/// that name one tree two ways normalise their paths alike.
+fn canonical_repo_path(repo_path: &str) -> String {
+    std::fs::canonicalize(repo_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_path.to_string())
+}
+
+/// Add one file's import facts to its service's sample, and return the file's
+/// import-declaration table. The one way a file enters the sample, whoever
+/// reads it: discovery, and the read made ahead of it ([`read_import_sample`]).
+fn sample_file_imports(
+    sample: &mut crate::framework_detector::ImportSample,
+    module: &swc_ecma_ast::Module,
+) -> HashMap<String, crate::visitor::ImportedSymbol> {
+    let mut import_extractor = ImportSymbolExtractor::new();
+    module.visit_with(&mut import_extractor);
+    let file_imports = import_extractor.imported_symbols;
+    sample.add_file(module, &file_imports);
+    file_imports
+}
+
+/// A service's import sample and nothing else discovery reads: what its
+/// detection is asked with, read before the scan reaches the service so the
+/// ask can be made ahead of it (carrick#1895).
+///
+/// The same walk and the same parse as [`discover_files_and_symbols`], over
+/// the canonical `repo_path`, so the sample is the one discovery will read
+/// (`the_sample_read_ahead_is_the_one_discovery_reads`). Each file is parsed
+/// a second time when the scan reaches it; what this keeps is the sample, not
+/// the sources. `None` for a service with no source file, which discovery
+/// refuses.
+///
+/// Quiet: discovery reports a file that does not parse when it reads it.
+fn read_import_sample(
+    repo_path: &str,
+    service: &Config,
+) -> Option<crate::framework_detector::ImportSample> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
+    let files = walk_service(repo_path, service, &service_ignore_patterns(service)).files;
+    if files.is_empty() {
+        return None;
+    }
+    let mut sample = crate::framework_detector::ImportSample::default();
+    for file_path in &files {
+        if let Some(module) = parse_file(file_path, &cm, &handler) {
+            sample_file_imports(&mut sample, &module);
+        }
+    }
+    Some(sample)
+}
+
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
@@ -6681,10 +6762,7 @@ fn discover_files_and_symbols(
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
             // Extract import symbols
-            let mut import_extractor = ImportSymbolExtractor::new();
-            module.visit_with(&mut import_extractor);
-            let file_imports = import_extractor.imported_symbols;
-            all_import_facts.add_file(&module, &file_imports);
+            let file_imports = sample_file_imports(&mut all_import_facts, &module);
 
             // Call resolution reads the `require` bindings too (carrick#1348).
             // Merged AFTER the sample above is taken: the analyzer's import
@@ -8158,6 +8236,7 @@ async fn analyze_current_repo(
     discovered: Discovered,
     previous_intents: PreviousIntents,
     settled: Option<SettledDetection>,
+    model_setup: setup_ahead::SetupSource,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
@@ -8207,7 +8286,9 @@ async fn analyze_current_repo(
             None,
         )
     } else {
-        model_setup(packages, &all_import_facts, settled).await
+        model_setup
+            .settle(packages, &all_import_facts, settled)
+            .await
     };
     // The in-scan schedule starts now, before the GraphQL hints below, so it
     // runs beside everything up to the point the analysis reads the

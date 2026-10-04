@@ -71,7 +71,7 @@ impl MultiAgentOrchestrator {
     ///
     /// ## Workflow:
     /// 1. **Framework Detection** and 2. **Framework Guidance** arrive settled
-    ///    in `setup` (see `engine::model_setup`)
+    ///    in `setup` (see `engine::setup_ahead`)
     /// 3. **AST-Gated Analysis** - For each file:
     ///    - Run SWC Scanner to find candidates
     ///    - If no candidates → SKIP (zero LLM cost)
@@ -109,7 +109,7 @@ impl MultiAgentOrchestrator {
         debug!("Starting AST-Gated File-Centric analysis...");
 
         // Stages 0 and 1 (framework detection, then guidance) are the engine's
-        // (`engine::model_setup`): it is the one place that decides whether a
+        // (`engine::setup_ahead`): it is the one place that decides whether a
         // service's model analysis runs at all, and a failure there defers the
         // service rather than ending the run. What reaches here is the setup
         // it settled on.

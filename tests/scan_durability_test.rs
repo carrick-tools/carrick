@@ -271,6 +271,7 @@ fn offline_env() {
         std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "0");
         std::env::remove_var(carrick::retry_budget::BUDGET_ENV);
+        std::env::remove_var(carrick::engine::setup_ahead::IN_FLIGHT_ENV);
         std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR");
         std::env::remove_var(carrick::scan_health::ALLOW_PARTIAL_ENV);
         std::env::remove_var("GITHUB_EVENT_NAME");
@@ -1177,4 +1178,107 @@ async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
         "its service is pending, as with any lost file"
     );
     assert!(storage.scan_failed.lock().unwrap().is_empty());
+}
+
+/// The requests a scan made to set its services up and to analyse their
+/// files: detection, the guidance route (five guidance answers and the
+/// extraction config), and file analysis.
+fn setup_and_file_requests() -> [usize; 3] {
+    [
+        detect_requests(),
+        requests_to("/framework-guidance"),
+        analyze_file_requests(),
+    ]
+}
+
+/// What a scan wrote for each service, without the time it was written.
+fn index_written(storage: &StubStorage) -> Vec<serde_json::Value> {
+    ["alpha", "beta", "gamma"]
+        .iter()
+        .map(|service| {
+            let data = storage.latest(service).expect("every service is uploaded");
+            let mut written = serde_json::to_value(data).unwrap();
+            written.as_object_mut().unwrap().remove("last_updated");
+            written
+        })
+        .collect()
+}
+
+/// A first index of the three-service repo, and what it requested.
+async fn first_index(repo: &Path) -> (StubStorage, [usize; 3]) {
+    let storage = StubStorage::laptop(&[]);
+    let before = setup_and_file_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a first index with the model answering succeeds");
+    let after = setup_and_file_requests();
+    (
+        storage,
+        [
+            after[0] - before[0],
+            after[1] - before[1],
+            after[2] - before[2],
+        ],
+    )
+}
+
+/// carrick#1895: every service's detection and guidance are asked for as the
+/// scan starts, beside the analysis, where each used to be asked when the
+/// scan reached its service. Asking ahead changes when a request is made and
+/// nothing else: a first index asked ahead makes the requests the same index
+/// makes with every service asking for itself, and writes the same index.
+///
+/// alpha and gamma send one detection body between them (the same
+/// dependencies, the same imports). Each is still asked: the second waits for
+/// the first and is then sent, as it was when one came after the other.
+#[tokio::test]
+#[serial]
+async fn asking_ahead_makes_the_requests_the_loop_made_and_writes_the_same_index() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+
+    // SAFETY: every test in this binary is `#[serial]`.
+    unsafe { std::env::set_var(carrick::engine::setup_ahead::IN_FLIGHT_ENV, "0") };
+    let (in_the_loop, asked_in_the_loop) = first_index(&repo).await;
+    unsafe { std::env::remove_var(carrick::engine::setup_ahead::IN_FLIGHT_ENV) };
+    let (ahead, asked_ahead) = first_index(&repo).await;
+
+    assert_eq!(
+        asked_ahead,
+        [3, 18, 3],
+        "a detection a service, six requests on the guidance route a service, and its one file"
+    );
+    assert_eq!(asked_ahead, asked_in_the_loop);
+    assert_eq!(index_written(&ahead), index_written(&in_the_loop));
+    for storage in [&ahead, &in_the_loop] {
+        assert!(storage.scan_failed.lock().unwrap().is_empty());
+    }
+}
+
+/// carrick#1895: a service whose previous generation holds its detection and
+/// guidance is asked nothing ahead, as it is asked nothing when the scan
+/// reaches it. A rescan of an unchanged tree makes no setup request at all.
+#[tokio::test]
+#[serial]
+async fn a_rescan_of_an_unchanged_tree_asks_for_no_setup() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let (storage, _) = first_index(&repo).await;
+
+    let rescan = StubStorage {
+        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        ..storage.clone()
+    };
+    let before = setup_and_file_requests();
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("the rescan succeeds");
+
+    assert_eq!(
+        setup_and_file_requests(),
+        before,
+        "every service's setup and file answers replay"
+    );
 }

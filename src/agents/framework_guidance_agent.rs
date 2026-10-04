@@ -13,6 +13,10 @@ use tracing::debug;
 /// analyze-file prompt) instead of diluting one prompt across protocols.
 pub type ProtocolGuidance = BTreeMap<Protocol, FrameworkGuidance>;
 
+/// Why a guidance ask failed: the call's own error
+/// ([`crate::agent_service::AgentCallError`]) or an answer that did not parse.
+pub type GuidanceError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Protocols that have a guidance + analyze-file prompt registered in
 /// carrick-cloud. Deterministic protocols (GraphQL) never appear here; new
 /// LLM-routed protocols are added together with their cloud prompts.
@@ -144,10 +148,13 @@ impl FrameworkGuidanceAgent {
     /// today HTTP is the only routed protocol, so the map has one entry.
     /// When the websocket prompt lands, socket libraries in the inventory
     /// activate a second, independently prompted entry.
+    ///
+    /// The error is `Send`, so a service's guidance can be asked on a task of
+    /// its own, ahead of its analysis (carrick#1895).
     pub async fn generate_for_active_protocols(
         &self,
         framework_detection: &DetectionResult,
-    ) -> Result<ProtocolGuidance, Box<dyn std::error::Error>> {
+    ) -> Result<ProtocolGuidance, GuidanceError> {
         let mut guidance = ProtocolGuidance::new();
         for protocol in LLM_ROUTED_PROTOCOLS {
             guidance.insert(
@@ -163,7 +170,7 @@ impl FrameworkGuidanceAgent {
         &self,
         framework_detection: &DetectionResult,
         protocol: Protocol,
-    ) -> Result<FrameworkGuidance, Box<dyn std::error::Error>> {
+    ) -> Result<FrameworkGuidance, GuidanceError> {
         debug!("=== FRAMEWORK GUIDANCE AGENT DEBUG ===");
         debug!(
             "Generating {:?} guidance for frameworks: {:?}",
@@ -308,7 +315,7 @@ impl FrameworkGuidanceAgent {
         category: &str,
         framework_detection: &DetectionResult,
         protocol: Protocol,
-    ) -> Result<Keyed<Vec<PatternExample>>, Box<dyn std::error::Error>> {
+    ) -> Result<Keyed<Vec<PatternExample>>, GuidanceError> {
         let mut body = Self::guidance_request_body(
             "patterns",
             framework_detection,
@@ -339,7 +346,7 @@ impl FrameworkGuidanceAgent {
         &self,
         framework_detection: &DetectionResult,
         protocol: Protocol,
-    ) -> Result<Keyed<GeneralGuidanceResponse>, Box<dyn std::error::Error>> {
+    ) -> Result<Keyed<GeneralGuidanceResponse>, GuidanceError> {
         let body = Self::guidance_request_body(
             "general",
             framework_detection,

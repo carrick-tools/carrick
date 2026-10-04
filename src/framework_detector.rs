@@ -278,6 +278,17 @@ fn extract_json_from_response(response: &str) -> Result<String, Box<dyn std::err
     }
 }
 
+/// The `/framework-detect` request body a service's manifests and import
+/// sample make, as the bytes that are sent. Two asks with one body are one
+/// ask to the cloud, which caches the answer by the body's hash; the engine
+/// reads this to know when two services ask the same thing, and when an
+/// answer asked for ahead of a service is the answer to what that service
+/// would send (carrick#1895).
+pub(crate) fn request_body(packages: &Packages, imports: &ImportSample) -> String {
+    serde_json::to_string(&build_detection_input(packages, imports))
+        .expect("the detection body is strings, lists and maps keyed by strings")
+}
+
 /// Build the `/framework-detect` request body from a service's manifests and
 /// its import sample. Pure and total: the same inputs always produce the same
 /// bytes, whatever order the files were parsed in (carrick#954).

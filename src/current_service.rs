@@ -21,7 +21,13 @@
 //! That is why [`enter`] hands back a guard rather than setting a value:
 //! the scope ends when the guard drops, including on the `?` that carries an
 //! error out of the middle of the analysis.
+//!
+//! One kind of call is made for a service the loop has not reached: its
+//! detection and guidance, asked ahead of its analysis (carrick#1895). Those
+//! run on a task of their own inside [`asked_for`], which names the service
+//! for every call that task makes, whatever the loop is analysing meanwhile.
 
+use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// The service whose analysis is running, or `None` outside the loop.
@@ -34,11 +40,38 @@ fn current_slot() -> MutexGuard<'static, Option<String>> {
     CURRENT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The name of the service being analysed, or `None` when no analysis is in
-/// scope (the cross-repo phase, the upload) or when the service in scope is
-/// unnamed.
+tokio::task_local! {
+    /// The service the running task is asking for, when that is not the one
+    /// the loop is analysing. See [`asked_for`].
+    static ASKED_FOR: Option<String>;
+}
+
+/// The name of the service a call is made for: the one the running task was
+/// started for ([`asked_for`]), otherwise the one being analysed. `None` when
+/// no analysis is in scope (the cross-repo phase, the upload) or when the
+/// service is unnamed.
 pub fn name() -> Option<String> {
-    current_slot().clone()
+    match ASKED_FOR.try_with(Clone::clone) {
+        Ok(asked_for) => asked_for,
+        Err(_) => current_slot().clone(),
+    }
+}
+
+/// Whether the running task is asking for a service ahead of its analysis
+/// ([`asked_for`]), and for which. The outer `None` is "no": the call belongs
+/// to whatever the loop is analysing.
+pub fn asked_ahead() -> Option<Option<String>> {
+    ASKED_FOR.try_with(Clone::clone).ok()
+}
+
+/// Run `work` as `service`'s: every call it makes names `service`, and none
+/// names the service the loop is analysing while it runs. `None` is an
+/// unnamed service, which names nobody, as in [`enter`].
+///
+/// The name follows the task, not the process, so it covers what `work`
+/// awaits and nothing it spawns.
+pub async fn asked_for<Work: Future>(service: Option<String>, work: Work) -> Work::Output {
+    ASKED_FOR.scope(service, work).await
 }
 
 /// Marks `service` as the one being analysed until the returned guard drops.
@@ -100,6 +133,32 @@ mod tests {
             assert_eq!(name().as_deref(), Some("web"));
         }
         assert_eq!(name(), None, "the cross-repo phase names no service");
+    }
+
+    /// A service's detection and guidance are asked while the loop analyses
+    /// another service (carrick#1895). Each call names the service it is for,
+    /// on its own task, and the loop's name is untouched beside it.
+    #[tokio::test]
+    #[serial_test::serial(current_service)]
+    async fn a_task_asking_ahead_names_its_own_service_and_not_the_loops() {
+        let _scope = enter(Some("api"));
+        let ahead = tokio::spawn(asked_for(Some("web".to_string()), async {
+            tokio::task::yield_now().await;
+            (name(), asked_ahead())
+        }));
+        let unnamed = tokio::spawn(asked_for(None, async { (name(), asked_ahead()) }));
+
+        assert_eq!(
+            ahead.await.unwrap(),
+            (Some("web".to_string()), Some(Some("web".to_string())))
+        );
+        assert_eq!(
+            unnamed.await.unwrap(),
+            (None, Some(None)),
+            "an unnamed service asked ahead names nobody, not the loop's service"
+        );
+        assert_eq!(name().as_deref(), Some("api"));
+        assert_eq!(asked_ahead(), None, "the loop itself asks ahead for nobody");
     }
 
     /// An unnamed service — the single-service case — is in scope but has no

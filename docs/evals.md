@@ -178,6 +178,7 @@ Label conventions the scorer normalizes for you:
 | `CARRICK_SKIP_INTENTS=1` | Skip intent generation (dominant cost term; no eval dimension consumes intents) |
 | `CARRICK_INTENT_CONCURRENCY=N` | Concurrent `/generate-intent` requests per dependency level (default 20; `CARRICK_CONCURRENCY_LIMIT`, default 28, caps model calls in flight across the scan, shared with file analysis) |
 | `CARRICK_INTENT_BATCH_SIZE=N` | Functions per `/generate-intent` request (default and maximum 20, the lambda's limit; `1` sends one function per request, the request shape from before batching). A function a batch leaves unanswered is sent again on its own |
+| `CARRICK_SETUPS_AHEAD=N` | Services whose detection and guidance are asked for at once, ahead of their analysis (default and maximum 4; `0` asks none ahead, so each service asks when the scan reaches it, carrick#1895) |
 | `CARRICK_XREPO_CORPUS=<path>` | Offline harness corpus override |
 | `CARRICK_MOCK_ALL=1` | Fully offline scanner run (mocked LLM responses) |
 | `CARRICK_LOCAL_STORAGE_DIR` | Local upload cache dir — eval runs never write the real cloud index |
