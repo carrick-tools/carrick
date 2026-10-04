@@ -11,10 +11,13 @@
 //! The helper is a stand-in, named through the variable that exists for it,
 //! because the platform's own exists on one platform and CI runs on another.
 //! It does the two things the real one does that matter here: it is started
-//! with `-i -w <pid>`, and it stays for exactly as long as that pid does. It
-//! also writes down its own pid and what it was started with, which is how a
-//! test knows the hold was asked for, how many times, and for whom. The last
-//! test runs the real helper where there is one.
+//! with `-i -w <pid> -t <ceiling>`, and it stays for exactly as long as that
+//! pid does. It also writes down its own pid and what it was started with,
+//! which is how a test knows the hold was asked for, how many times, for whom
+//! and with what ceiling. The last test runs the real helper where there is
+//! one. The ceiling itself is three hours and is not waited for here: that
+//! the helper is asked for it is pinned by every test below, and what says so
+//! when it passes is tested with the module.
 //!
 //! Serial, because each test writes its stand-in and then has a scan execute
 //! it: a file another thread's fork still holds open for writing cannot be
@@ -41,6 +44,14 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// What a helper holding for `pid` is started with: idle sleep only, tied to
+/// that pid, and no longer than the ceiling.
+fn asked_for(pid: u32) -> String {
+    let asked = carrick::keep_awake::helper_args(pid).join(" ");
+    assert_eq!(asked, format!("-i -w {pid} -t 10800"));
+    asked
 }
 
 /// Where a test keeps its stand-in, its record and the scan's home.
@@ -216,8 +227,8 @@ fn a_scan_ended_by(signal: libc::c_int, name: &str) -> std::process::ExitStatus 
     let (helper, arguments) = bench.first_hold();
     assert_eq!(
         arguments,
-        format!("-i -w {scan}"),
-        "the hold is tied to the scan's own pid"
+        asked_for(scan),
+        "the hold is tied to the scan's own pid, and has its ceiling"
     );
     assert!(alive(helper), "the scan holds while it runs");
     assert!(
@@ -252,7 +263,7 @@ fn a_scan_that_finishes_held_once_said_so_once_and_released() {
 
     let holds = bench.holds();
     assert_eq!(holds.len(), 1, "one hold for one scan: {holds:?}");
-    assert_eq!(holds[0].1, format!("-i -w {scan}"));
+    assert_eq!(holds[0].1, asked_for(scan));
     assert_eq!(
         occurrences(&stderr, LINE),
         1,
@@ -462,7 +473,7 @@ fn a_build_holds_once_for_every_scan_it_runs() {
         1,
         "one hold for the build, none for the scans it ran: {holds:?}"
     );
-    assert_eq!(holds[0].1, format!("-i -w {build_pid}"));
+    assert_eq!(holds[0].1, asked_for(build_pid));
     assert_eq!(
         occurrences(&stdout, LINE),
         1,
@@ -509,7 +520,7 @@ fn a_detached_build_holds_for_itself_and_the_command_that_started_it_says_so() {
     let (helper, arguments) = bench.first_hold();
     assert_eq!(
         arguments,
-        format!("-i -w {detached}"),
+        asked_for(detached),
         "the hold is tied to the build that is still running"
     );
 
@@ -549,7 +560,7 @@ fn a_detached_build_holds_for_itself_and_the_command_that_started_it_says_so() {
 fn on_a_mac_the_real_helper_goes_when_the_scan_is_killed() {
     fn helpers_watching(pid: u32) -> Vec<i32> {
         let output = Command::new("pgrep")
-            .args(["-f", &format!("caffeinate -i -w {pid}$")])
+            .args(["-f", &format!("caffeinate {}$", asked_for(pid))])
             .output()
             .expect("run pgrep");
         String::from_utf8_lossy(&output.stdout)

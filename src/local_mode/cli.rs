@@ -1771,8 +1771,9 @@ USAGE:
     refresh    Re-scan one service (or every repo) and re-join.
 
 On macOS, index, resume and refresh keep this machine from idle-sleeping until
-they finish, and say so once. Closing the lid still sleeps it. --no-keep-awake
-on any of the three, or CARRICK_NO_KEEP_AWAKE=1, lets it sleep.
+they finish, for at most three hours, and say so once. Closing the lid still
+sleeps it. --no-keep-awake on any of the three, or CARRICK_NO_KEEP_AWAKE=1,
+lets it sleep.
 
 The workspace is a repository or the folder holding its sibling repositories.
 Optional carrick-workspace.json overrides add paths with `repos` and remove

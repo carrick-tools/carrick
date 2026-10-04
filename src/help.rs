@@ -70,9 +70,9 @@ OPTIONS:
                    deliberately checks out without installing passes this.
     --no-keep-awake
                    Let this machine idle-sleep during a scan. By default a scan
-                   on macOS keeps it awake until the scan finishes, and says
-                   so; closing the lid still sleeps it. Applies to a scan of a
-                   path and to index, resume and refresh.
+                   on macOS keeps it awake until the scan finishes, for at most
+                   three hours, and says so; closing the lid still sleeps it.
+                   Applies to a scan of a path and to index, resume and refresh.
 
 ENVIRONMENT VARIABLES:
     ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set

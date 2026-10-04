@@ -20,6 +20,11 @@
 //! `-i` is idle sleep only. The display still sleeps, and closing the lid
 //! still sleeps the machine, which is what a person who closes a lid means.
 //!
+//! **The hold has a ceiling.** "As long as the scan's process" is only as
+//! good as the process, and a process can hang. So the helper is also given
+//! [`CEILING`] (`-t`), and lets go at whichever comes first. A scan still
+//! running then says once that the machine may sleep again.
+//!
 //! **One hold per scan the user started.** A build (`index`, `resume`,
 //! `refresh`) holds for its whole length and tells every scan it spawns that
 //! it does ([`OFF_ENV`]), so a workspace of ten repos starts one helper and
@@ -33,6 +38,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tracing::debug;
 
@@ -48,18 +56,37 @@ pub const OFF_ENV: &str = "CARRICK_NO_KEEP_AWAKE";
 /// file, and the line belongs where the user is looking, once.
 pub const SAID_ENV: &str = "CARRICK_KEEP_AWAKE_SAID";
 
-/// The program that holds the assertion, run as `<program> -i -w <pid>`, in
-/// place of the one this platform is known to ship. What a test points at a
-/// stand-in that records what it was asked.
+/// The program that holds the assertion, run as `<program> -i -w <pid> -t
+/// <seconds>`, in place of the one this platform is known to ship. What a
+/// test points at a stand-in that records what it was asked.
 pub const HELPER_ENV: &str = "CARRICK_KEEP_AWAKE_HELPER";
 
 /// Part of macOS since 10.8, on the system volume, so there is nothing to
 /// install and no permission to ask for.
 const MACOS_HELPER: &str = "/usr/bin/caffeinate";
 
+/// The longest a scan keeps the machine awake.
+///
+/// The hold lasts as long as the scan's process, and a process can hang: a
+/// detached scan stuck on a wait would keep somebody's laptop awake overnight,
+/// which is worse than the sleep this module is here to prevent. Three hours
+/// is well above the longest real scan seen (100 minutes) and the 30 to 45
+/// minutes a large first index is expected to take, so a scan that reaches it
+/// is far likelier to be stuck than to be working.
+///
+/// The helper enforces it, so it holds for a process too stuck to act on
+/// anything. [`LINE`] and [`CEILING_LINE`] state it in words, and a test holds
+/// the three to one another.
+pub const CEILING: Duration = Duration::from_secs(3 * 60 * 60);
+
 /// What a scan says once, where the user is looking, when it holds.
-pub const LINE: &str = "Keeping this machine awake until the scan finishes. To let it sleep, \
-                        pass --no-keep-awake or set CARRICK_NO_KEEP_AWAKE=1.";
+pub const LINE: &str = "Keeping this machine awake until the scan finishes, for at most three \
+                        hours. To let it sleep, pass --no-keep-awake or set \
+                        CARRICK_NO_KEEP_AWAKE=1.";
+
+/// What a scan that is still running says once, when [`CEILING`] has passed.
+pub const CEILING_LINE: &str = "This scan has run for three hours, so the machine is no longer \
+                                kept awake and may sleep.";
 
 /// Whether [`OFF_FLAG`] was passed to this process.
 static OFF: AtomicBool = AtomicBool::new(false);
@@ -155,9 +182,16 @@ pub fn decide(asked: &Asked) -> Decision {
     }
 }
 
-/// What the helper is run with: idle sleep only, for as long as `pid` lives.
-pub fn helper_args(pid: u32) -> [String; 3] {
-    ["-i".to_string(), "-w".to_string(), pid.to_string()]
+/// What the helper is run with: idle sleep only, for as long as `pid` lives
+/// and no longer than [`CEILING`], whichever ends first.
+pub fn helper_args(pid: u32) -> [String; 5] {
+    [
+        "-i".to_string(),
+        "-w".to_string(),
+        pid.to_string(),
+        "-t".to_string(),
+        CEILING.as_secs().to_string(),
+    ]
 }
 
 /// What ends a hold early. The watched pid going away ends it regardless.
@@ -170,6 +204,9 @@ pub type Release = Box<dyn FnOnce() + Send>;
 /// that the pid it watches has gone, which is the path that cannot be skipped.
 pub struct Hold {
     release: Option<Release>,
+    /// Dropped with the hold, which is what tells the watcher of the ceiling
+    /// that the scan ended first and there is nothing to say.
+    ceiling: Option<Sender<()>>,
 }
 
 impl Drop for Hold {
@@ -188,12 +225,44 @@ impl Drop for Hold {
 /// stream the npm renderer shows as it stands, and a bare scan logs it beside
 /// its other lines.
 pub fn begin(say: impl FnOnce(&str)) -> Option<Hold> {
-    begin_with(
+    let mut hold = begin_with(
         &Asked::of_this_process(),
         std::process::id(),
         start_helper,
         say,
-    )
+    )?;
+    // Said the way a scan says why it is slow: logged, which a terminal and
+    // the run's log both show, and crossed to a parent that is rendering this
+    // run, which puts it beside the phase it is drawing.
+    let (ended, _watcher) = say_at_ceiling(CEILING, || crate::progress::announce(CEILING_LINE));
+    hold.ceiling = Some(ended);
+    Some(hold)
+}
+
+/// Say that the ceiling has passed, once, unless the hold ends first.
+///
+/// The helper lets go at the ceiling on its own; this only keeps the words
+/// true, so a scan that said "until the scan finishes" and is still running
+/// says that the machine may sleep again. Dropping the returned sender is the
+/// hold ending, and ends the wait with nothing said.
+///
+/// A thread rather than a timer on the runtime: a build runs on a blocking
+/// thread and a scan's passes keep the runtime's own for minutes at a time,
+/// and neither stops a parked thread from waking.
+fn say_at_ceiling(
+    ceiling: Duration,
+    say: impl FnOnce() + Send + 'static,
+) -> (Sender<()>, Option<JoinHandle<()>>) {
+    let (ended, wait) = std::sync::mpsc::channel::<()>();
+    let watcher = std::thread::Builder::new()
+        .name("keep-awake-ceiling".to_string())
+        .spawn(move || {
+            if wait.recv_timeout(ceiling) == Err(RecvTimeoutError::Timeout) {
+                say();
+            }
+        })
+        .ok();
+    (ended, watcher)
 }
 
 /// [`begin`], with what was asked, the pid to hold for and the platform call
@@ -218,6 +287,7 @@ where
             }
             Some(Hold {
                 release: Some(release),
+                ceiling: None,
             })
         }
         Err(error) => {
@@ -252,9 +322,10 @@ fn start_helper(helper: &Path, pid: u32) -> std::io::Result<Release> {
         .stderr(Stdio::null())
         .spawn()?;
     debug!(
-        "Keeping this machine awake: {} (pid {}) holds until pid {pid} exits",
+        "Keeping this machine awake: {} (pid {}) holds until pid {pid} exits, for at most {}s",
         helper.display(),
-        child.id()
+        child.id(),
+        CEILING.as_secs()
     );
     Ok(Box::new(move || {
         let _ = child.kill();
@@ -297,14 +368,60 @@ mod tests {
     }
 
     /// The default: a scan on a Mac holds with the system's own helper, and
-    /// asks it for idle sleep only, tied to the pid it was given.
+    /// asks it for idle sleep only, tied to the pid it was given, for no
+    /// longer than the ceiling.
     #[test]
     fn a_scan_on_a_mac_holds_with_the_system_helper() {
         assert_eq!(
             decide(&on_a_mac()),
             Decision::Hold(PathBuf::from("/usr/bin/caffeinate"))
         );
-        assert_eq!(helper_args(4242), ["-i", "-w", "4242"]);
+        assert_eq!(helper_args(4242), ["-i", "-w", "4242", "-t", "10800"]);
+    }
+
+    /// The ceiling is three hours, and the two lines that state it in words
+    /// state that number: changing one without the others fails here.
+    #[test]
+    fn the_ceiling_is_three_hours_and_both_lines_say_so() {
+        assert_eq!(CEILING, Duration::from_secs(3 * 60 * 60));
+        assert!(LINE.contains("for at most three hours"), "{LINE}");
+        assert!(CEILING_LINE.contains("three hours"), "{CEILING_LINE}");
+        assert!(!CEILING_LINE.contains('\n'), "one line");
+    }
+
+    /// A scan still running when the ceiling passes is told, once, that the
+    /// machine may sleep again.
+    #[test]
+    fn a_scan_still_running_at_the_ceiling_says_so_once() {
+        let said = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&said);
+        let (still_held, watcher) = say_at_ceiling(Duration::from_millis(20), move || {
+            *counted.lock().unwrap() += 1;
+        });
+        watcher
+            .expect("a thread to watch the ceiling")
+            .join()
+            .expect("the watcher ends");
+        assert_eq!(*said.lock().unwrap(), 1);
+        drop(still_held);
+        assert_eq!(*said.lock().unwrap(), 1, "and not again when the hold goes");
+    }
+
+    /// A scan that ends before the ceiling says nothing about it: the hold
+    /// going is what ends the wait.
+    #[test]
+    fn a_scan_that_ends_before_the_ceiling_says_nothing_about_it() {
+        let said = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&said);
+        let (held, watcher) = say_at_ceiling(Duration::from_secs(3600), move || {
+            *counted.lock().unwrap() += 1;
+        });
+        drop(held);
+        watcher
+            .expect("a thread to watch the ceiling")
+            .join()
+            .expect("the watcher ends when the hold does, not an hour later");
+        assert_eq!(*said.lock().unwrap(), 0);
     }
 
     /// Each way of saying no holds nothing, whatever else is true.
