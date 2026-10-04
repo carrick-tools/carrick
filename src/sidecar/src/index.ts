@@ -284,6 +284,12 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
 function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): CaptureV2Response {
   try {
     log(`capture_v2 for service '${request.service_name}' (${request.anchors.length} anchor(s))`);
+    // A frame for each stage as the capture reaches it, and within a stage
+    // (one report per anchor) at most one per interval.
+    let stage: string | undefined;
+    const withinStage = atMostEvery(PROGRESS_INTERVAL_MS, (phase: string, message: string) =>
+      writeProgress(request.request_id, phase, message)
+    );
     const result = captureStub({
       repoRoot: request.repo_root,
       serviceName: request.service_name,
@@ -291,6 +297,11 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
       outDir: request.out_dir,
       tsconfigPath: request.tsconfig_path,
       scanRoot: request.scan_root,
+      onProgress: (phase, message) => {
+        if (phase === stage) return withinStage(phase, message);
+        stage = phase;
+        writeProgress(request.request_id, phase, message);
+      },
     });
     return {
       request_id: request.request_id,

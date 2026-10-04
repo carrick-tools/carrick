@@ -29,9 +29,9 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureV2Result, CheckPairEndpoint,
-    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, ProbeProtocol,
-    ProbeTypeKind, RetypeItem, RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest,
-    VerdictBucket, VerdictSide,
+    CheckPairSpec, CheckStubInput, InferKind, InferRequestItem, ManifestEntry, OperationProgress,
+    ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem, RetypeOutcome, RetypeVerdict,
+    SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -620,7 +620,9 @@ pub(crate) enum CaptureFailure {
     TimedOut,
     /// The sidecar process ended before it answered, in the process the
     /// capture was first asked of and again in the fresh one it was retried
-    /// in; or no process could be started to ask. The text says which.
+    /// in; or no process could be started to ask. The text says which, and
+    /// for two deaths how each process ended and at which stage of the
+    /// capture (`two_deaths`).
     SidecarDied(String),
     /// The sidecar answered, and the answer was not a stub: the capture's own
     /// error, or a stub package this side could not read.
@@ -785,6 +787,12 @@ fn capture_once(
 /// rest of the scan: the next service's init and the check phase would
 /// otherwise write to a closed pipe, and one service's capture would cost
 /// every later service its types.
+///
+/// **What the two deaths were.** A capture reports each stage as it reaches
+/// it, so a process that dies leaves the stage it had reached, and the OS
+/// says how it ended. Both go into the failure (`two_deaths`): the index then
+/// says whether the heap ran out and on what, where it used to say only that
+/// the process was gone.
 fn capture_in_a_fresh_process(
     sidecar: &TypeSidecar,
     repo_root: &Path,
@@ -793,7 +801,7 @@ fn capture_in_a_fresh_process(
     tsconfig_path: Option<&str>,
 ) -> Result<CaptureV2Result, CaptureFailure> {
     let not_started = |e: SidecarError| CaptureFailure::SidecarDied(e.to_string());
-    let mut died_before: Option<SidecarError> = None;
+    let mut died_before: Option<CaptureDeath> = None;
     loop {
         sidecar
             .restart(match died_before {
@@ -829,11 +837,21 @@ fn capture_in_a_fresh_process(
                 other => CaptureFailure::Failed(other.to_string()),
             });
         }
-        let Some(first) = died_before.replace(error.clone()) else {
+        // Read before anything else is asked of the sidecar: the next wait
+        // starts the progress empty, and the restart replaces the process.
+        let death = CaptureDeath {
+            error: error.to_string(),
+            progress: sidecar.last_progress(),
+            end: sidecar.how_the_process_ended(),
+        };
+        let Some(first) = died_before.replace(death.clone()) else {
             warn!(
-                "The type sidecar died during the capture for {} ({}); retrying once in a \
-                 fresh process",
-                service_id, error
+                "The type sidecar died during the capture for {} ({}): it {} {}; retrying \
+                 once in a fresh process",
+                service_id,
+                error,
+                death.ended(false),
+                death.stage()
             );
             continue;
         };
@@ -841,10 +859,114 @@ fn capture_in_a_fresh_process(
         // deaths; a failure to start is left in the sidecar's state for
         // whoever asks next.
         let _ = sidecar.restart("the sidecar died during a capture and during its retry");
-        return Err(CaptureFailure::SidecarDied(format!(
-            "the type sidecar process ended during the capture ({first}) and again when the \
-             capture was retried in a fresh process ({error})"
+        return Err(CaptureFailure::SidecarDied(two_deaths(
+            &first,
+            &death,
+            crate::services::type_sidecar::heap_cap_mb(),
         )));
+    }
+}
+
+/// What is known about a capture process that ended before it answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureDeath {
+    /// The client's own error for it.
+    error: String,
+    /// The last stage the capture reported, when it reported any.
+    progress: Option<OperationProgress>,
+    /// How the process ended, when the OS said.
+    end: Option<ProcessEnd>,
+}
+
+impl CaptureDeath {
+    /// How the process ended, as the verb of a sentence about one process or
+    /// about `both`; plain "ended" when the OS did not say.
+    fn ended(&self, both: bool) -> String {
+        let was = if both { "were" } else { "was" };
+        match self.end {
+            Some(end) if end.is_abort() => {
+                format!("{was} aborted (SIGABRT), as Node aborts when its heap is full,")
+            }
+            Some(ProcessEnd::Signal(9)) => format!("{was} killed (SIGKILL)"),
+            Some(ProcessEnd::Signal(signal)) => format!("{was} ended by signal {signal}"),
+            Some(ProcessEnd::Code(code)) => format!("ended with exit code {code}"),
+            None => "ended".to_string(),
+        }
+    }
+
+    /// The stage of the capture the process had reached.
+    fn stage(&self) -> String {
+        let Some(progress) = &self.progress else {
+            return "before reporting any progress".to_string();
+        };
+        match progress.phase.as_str() {
+            "program" => {
+                "while building the service's program, before any anchor was resolved".to_string()
+            }
+            "anchors" => format!(
+                "while resolving anchors (last report: {})",
+                progress.message
+            ),
+            "emit" => "while emitting declarations, after every anchor was resolved".to_string(),
+            "self-check" => "while type-checking the emitted declarations, after every anchor \
+                             was resolved"
+                .to_string(),
+            other => format!("at stage '{other}' ({})", progress.message),
+        }
+    }
+
+    /// What the stage held in the heap, for the stages that say: the thing
+    /// that did not fit when the process aborted there.
+    fn held(&self) -> Option<&'static str> {
+        match self.progress.as_ref()?.phase.as_str() {
+            "program" => Some("the service's program"),
+            "anchors" => Some("the service's program and the types of its anchors"),
+            "emit" => Some("the declarations being emitted"),
+            "self-check" => Some("the emitted declarations and the packages they import"),
+            _ => None,
+        }
+    }
+}
+
+/// The failure of a capture whose process ended twice: the two deaths as the
+/// client saw them, then how each process ended and at which stage, then,
+/// when both aborted at one stage, what did not fit the heap they were given.
+///
+/// `heap_cap_mb` is the cap every sidecar of this run is started with, or
+/// `None` when it runs under V8's own default.
+fn two_deaths(first: &CaptureDeath, retry: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
+    let lead = format!(
+        "the type sidecar process ended during the capture ({}) and again when the capture \
+         was retried in a fresh process ({})",
+        first.error, retry.error
+    );
+    let (heap, under) = match heap_cap_mb {
+        Some(mb) => (
+            format!("the {mb} MB heap it was given"),
+            format!("under a heap cap of {mb} MB"),
+        ),
+        None => (
+            "V8's default heap".to_string(),
+            "under V8's default heap cap".to_string(),
+        ),
+    };
+    let same = first.end == retry.end && first.stage() == retry.stage();
+    if !same {
+        return format!(
+            "{lead}; the first {} {}, the retry {} {}, {under}",
+            first.ended(false),
+            first.stage(),
+            retry.ended(false),
+            retry.stage()
+        );
+    }
+    let both = format!("{lead}; both {} {}", first.ended(true), first.stage());
+    match first
+        .held()
+        .filter(|_| first.end.is_some_and(|end| end.is_abort()))
+    {
+        Some(held) => format!("{both}: {held} did not fit {heap}"),
+        None => format!("{both}, {under}"),
     }
 }
 
@@ -3705,6 +3827,190 @@ mod tests {
             Some("emit skipped"),
         )];
         assert!(backfill_anchors(&anchors, &demoted, &HashMap::new()).is_none());
+    }
+
+    fn death(phase: Option<(&str, &str)>, end: Option<ProcessEnd>) -> CaptureDeath {
+        CaptureDeath {
+            error: "Sidecar process died unexpectedly".to_string(),
+            progress: phase.map(|(phase, message)| OperationProgress {
+                phase: phase.to_string(),
+                message: message.to_string(),
+            }),
+            end,
+        }
+    }
+
+    const ABORTED: Option<ProcessEnd> = Some(ProcessEnd::Signal(ProcessEnd::SIGABRT));
+    const TWICE: &str = "the type sidecar process ended during the capture (Sidecar process \
+                         died unexpectedly) and again when the capture was retried in a fresh \
+                         process (Sidecar process died unexpectedly)";
+
+    /// Two processes that aborted before any anchor was resolved are a
+    /// program that does not fit the heap, and the failure says so with the
+    /// cap (carrick#1916).
+    #[test]
+    fn two_aborts_while_building_the_program_say_the_program_did_not_fit() {
+        let building = death(Some(("program", "building the program")), ABORTED);
+        assert_eq!(
+            two_deaths(&building, &building, Some(2048)),
+            format!(
+                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                 while building the service's program, before any anchor was resolved: the \
+                 service's program did not fit the 2048 MB heap it was given"
+            )
+        );
+    }
+
+    /// The stage is the last one the capture reported. A capture that got
+    /// through every anchor and aborted on its last stage ran out of heap on
+    /// what that stage holds, which is not the anchors.
+    #[test]
+    fn two_aborts_name_the_stage_they_reached_and_what_it_held() {
+        let checking = death(Some(("self-check", "checking the stub")), ABORTED);
+        assert_eq!(
+            two_deaths(&checking, &checking, Some(8192)),
+            format!(
+                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                 while type-checking the emitted declarations, after every anchor was \
+                 resolved: the emitted declarations and the packages they import did not fit \
+                 the 8192 MB heap it was given"
+            )
+        );
+        let resolving = death(Some(("anchors", "412 of 817")), ABORTED);
+        assert_eq!(
+            two_deaths(&resolving, &resolving, None),
+            format!(
+                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                 while resolving anchors (last report: 412 of 817): the service's program \
+                 and the types of its anchors did not fit V8's default heap"
+            )
+        );
+    }
+
+    /// Nothing is said to have run out of heap unless the processes aborted:
+    /// one the OS killed, or one that exited, is reported as that.
+    #[test]
+    fn a_death_that_was_not_an_abort_claims_no_heap() {
+        let killed = death(
+            Some(("emit", "emitting declarations")),
+            Some(ProcessEnd::Signal(9)),
+        );
+        assert_eq!(
+            two_deaths(&killed, &killed, Some(8192)),
+            format!(
+                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
+                 anchor was resolved, under a heap cap of 8192 MB"
+            )
+        );
+        // A sidecar that writes no frames, and a platform that reports no
+        // signal: the two deaths, and nothing guessed.
+        let silent = death(None, Some(ProcessEnd::Code(134)));
+        assert_eq!(
+            two_deaths(&silent, &silent, Some(8192)),
+            format!(
+                "{TWICE}; both ended with exit code 134 before reporting any progress, under \
+                 a heap cap of 8192 MB"
+            )
+        );
+        let unknown = death(None, None);
+        assert_eq!(
+            two_deaths(&unknown, &unknown, None),
+            format!(
+                "{TWICE}; both ended before reporting any progress, under V8's default heap cap"
+            )
+        );
+    }
+
+    /// Two deaths at different stages, or of different kinds, are told apart
+    /// and nothing is concluded from them.
+    #[test]
+    fn two_different_deaths_are_each_described() {
+        let building = death(Some(("program", "building the program")), ABORTED);
+        let resolving = death(Some(("anchors", "3 of 9")), Some(ProcessEnd::Signal(9)));
+        assert_eq!(
+            two_deaths(&building, &resolving, Some(4096)),
+            format!(
+                "{TWICE}; the first was aborted (SIGABRT), as Node aborts when its heap is \
+                 full, while building the service's program, before any anchor was resolved, \
+                 the retry was killed (SIGKILL) while resolving anchors (last report: 3 of 9), \
+                 under a heap cap of 4096 MB"
+            )
+        );
+    }
+
+    /// End to end through a stand-in sidecar: a capture whose process reports
+    /// its stages and is killed, twice, fails with the stage it had reached
+    /// and how it ended, read from the process and not guessed.
+    #[test]
+    fn a_capture_that_dies_twice_reports_the_stage_and_the_end_of_each_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  write({ request_id, status: 'progress', phase: 'program', message: 'building the program the anchors are read in' });
+  write({ request_id, status: 'progress', phase: 'anchors', message: '0 of 1' });
+  write({ request_id, status: 'progress', phase: 'emit', message: 'emitting declarations' });
+  process.kill(process.pid, 'SIGKILL');
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+
+        let failure = run_capture(
+            &sidecar,
+            root.to_str().unwrap(),
+            "fixture",
+            &[CaptureAnchor::Literal {
+                alias: "Only".to_string(),
+                type_text: "string".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+            }],
+            &HashMap::new(),
+            None,
+        )
+        .expect_err("a capture whose process dies twice produces no stub");
+
+        let under = match crate::services::type_sidecar::heap_cap_mb() {
+            Some(mb) => format!("under a heap cap of {mb} MB"),
+            None => "under V8's default heap cap".to_string(),
+        };
+        // Unix says which signal; elsewhere the end is an exit code.
+        #[cfg(unix)]
+        assert_eq!(
+            failure,
+            CaptureFailure::SidecarDied(format!(
+                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
+                 anchor was resolved, {under}"
+            ))
+        );
+        let CaptureFailure::SidecarDied(detail) = failure else {
+            panic!("expected the two deaths, got {failure:?}");
+        };
+        assert!(
+            detail.contains("while emitting declarations") && detail.ends_with(&under),
+            "{detail}"
+        );
+        assert!(
+            sidecar.is_ready(),
+            "a live sidecar is left for the rest of the scan"
+        );
     }
 
     /// Acceptance is fail-closed: adopt only a clean backfill self-check with

@@ -91,6 +91,7 @@ A client must skip progress frames rather than treat the first frame as the answ
 |---|---|
 | `infer` | One when the first request of the batch is done, then at most one every 1.5 s as more finish. `message` is `<done> of <total>`. |
 | `bundle`, `verify_library_claims` | One per program the request reads, when that program is ready. |
+| `capture_v2` | One as it reaches each stage, `phase` naming it: `program` (the program the anchors are read in is being built), `anchors` (they are being resolved; `message` is `<done> of <total>`, starting at `0`, then at most one every 1.5 s), `emit` (declarations), `self-check` (the stub). The last one written says how far a capture whose process died had got. |
 | `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
 | every other action | None. |
 
@@ -102,7 +103,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 `capture_v2`, `check_v2`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
-`capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. A `resolve_definitions` after it builds the init'd project again in the fresh process.
+`capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. When both die, the service is recorded with how each process ended and the stage its last progress frame named. A `resolve_definitions` after it builds the init'd project again in the fresh process.
 
 ### Actions
 

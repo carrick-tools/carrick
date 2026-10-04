@@ -11,6 +11,8 @@
 //!    a timed-out operation uses (`sidecar_operation_timeout_test.rs`).
 //! 2. A process that ends while it is writing an answer is a process that
 //!    died. The part of the answer that reached the pipe is not an answer.
+//! 3. A process that died leaves what it last reported and how it ended, so
+//!    the capture's failure can say which stage ran out and of what.
 //!
 //! As in `sidecar_operation_timeout_test.rs`, these drive a stand-in sidecar
 //! (a few lines of Node speaking the stdout protocol), and every wait runs on
@@ -18,8 +20,8 @@
 //! instead of hanging the suite. They need `node` on PATH and nothing else.
 
 use carrick::services::type_sidecar::{
-    AnchorOrigin, CaptureAnchor, InferKind, InferRequestItem, SidecarError, SidecarResponse,
-    TypeSidecar,
+    AnchorOrigin, CaptureAnchor, InferKind, InferRequestItem, OperationProgress, ProcessEnd,
+    SidecarError, SidecarResponse, TypeSidecar,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -51,6 +53,8 @@ fn node_available() -> bool {
 /// alias:
 /// - `cut-off` writes the first 40 bytes of its answer, with no newline, and
 ///   exits: what the pipe holds when a process dies mid-answer;
+/// - `killed-resolving` reports two stages of its work, as a capture does,
+///   and is then killed;
 /// - anything else answers at once, naming the alias and its own pid in
 ///   `errors`.
 ///
@@ -88,6 +92,14 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
   if (what === 'cut-off') {{
     fs.writeSync(1, JSON.stringify(answer).slice(0, 40));
     process.exit(134);
+  }}
+  if (what === 'killed-resolving') {{
+    const report = (phase, message) =>
+      fs.writeSync(1, JSON.stringify({{ request_id, status: 'progress', phase, message }}) + '\n');
+    report('program', 'building the program the anchors are read in');
+    report('anchors', '3 of 9');
+    process.kill(process.pid, 'SIGKILL');
+    return;
   }}
   write(answer);
 }});
@@ -277,6 +289,50 @@ fn a_restart_gives_a_fresh_process_scoped_as_the_old_one_was() {
     assert_eq!(scope["repo_root"], dir.path().to_string_lossy().as_ref());
     assert_eq!(scope["tsconfig_path"], "tsconfig.app.json");
     assert_eq!(scope["scan_root"], dir.path().to_string_lossy().as_ref());
+}
+
+/// A process that died with a request in hand leaves two things to say about
+/// it (carrick#1916): the last stage the request reported, and how the
+/// process ended. With them a capture's failure says whether the heap ran
+/// out and on what, where it could only say the process was gone.
+#[test]
+fn a_process_that_died_leaves_the_stage_it_reported_and_how_it_ended() {
+    if !node_available() {
+        eprintln!("Skipping: node is not on PATH");
+        return;
+    }
+    let (_dir, _script, sidecar) = ready_stand_in("");
+    assert_eq!(sidecar.last_progress(), None, "nothing has reported yet");
+    assert_eq!(
+        sidecar.how_the_process_ended(),
+        None,
+        "a process that is running has not ended"
+    );
+
+    let (sidecar, error) = capture(sidecar, "killed-resolving");
+    assert!(matches!(error, SidecarError::ProcessDied), "{error:?}");
+    assert_eq!(
+        sidecar.last_progress(),
+        Some(OperationProgress {
+            phase: "anchors".to_string(),
+            message: "3 of 9".to_string(),
+        }),
+        "the last frame the capture wrote before it died"
+    );
+    #[cfg(unix)]
+    assert_eq!(sidecar.how_the_process_ended(), Some(ProcessEnd::Signal(9)));
+
+    // The next wait starts with nothing reported: a request never inherits
+    // the progress of the one before it.
+    let (sidecar, restarted, _) = restart(sidecar);
+    restarted.expect("a dead process can be replaced");
+    assert_eq!(sidecar.last_progress(), None);
+
+    // A process that exits says so with its code.
+    let (sidecar, error) = capture(sidecar, "cut-off");
+    assert!(matches!(error, SidecarError::ProcessDied), "{error:?}");
+    assert_eq!(sidecar.last_progress(), None, "it wrote no frame");
+    assert_eq!(sidecar.how_the_process_ended(), Some(ProcessEnd::Code(134)));
 }
 
 /// Whether a process with this pid exists. `kill -0` asks without signalling.

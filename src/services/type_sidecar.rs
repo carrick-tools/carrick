@@ -1476,20 +1476,23 @@ fn total_memory_mb() -> Option<u64> {
     None
 }
 
+/// The V8 old-space cap every sidecar process of this run is started with,
+/// in MB, or `None` when the override disables it and V8's own default
+/// applies.
+pub fn heap_cap_mb() -> Option<u64> {
+    match std::env::var(MAX_OLD_SPACE_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) | Err(_) => None,
+            Ok(mb) => Some(mb),
+        },
+        Err(_) => Some(old_space_cap_mb(total_memory_mb())),
+    }
+}
+
 /// The `--max-old-space-size` argument for this run, or `None` when the
 /// override disables it.
 fn max_old_space_arg() -> Option<String> {
-    match std::env::var(MAX_OLD_SPACE_ENV) {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(mb) => Some(format!("--max-old-space-size={}", mb)),
-            Err(_) => None,
-        },
-        Err(_) => Some(format!(
-            "--max-old-space-size={}",
-            old_space_cap_mb(total_memory_mb())
-        )),
-    }
+    heap_cap_mb().map(|mb| format!("--max-old-space-size={}", mb))
 }
 
 // ============================================================================
@@ -1616,6 +1619,35 @@ struct ProgressFrame {
     message: Option<String>,
 }
 
+/// The last thing a sidecar said about the request it was working on: the
+/// `phase` and `message` of its most recent progress frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationProgress {
+    pub phase: String,
+    pub message: String,
+}
+
+/// How a sidecar process that is gone came to an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessEnd {
+    /// Ended by a signal. Node ends itself with `SIGABRT` when V8 cannot
+    /// allocate inside its heap cap; the OS ends a process with `SIGKILL`.
+    Signal(i32),
+    /// Exited with a code.
+    Code(i32),
+}
+
+impl ProcessEnd {
+    /// The signal a runtime raises on itself to abort.
+    pub const SIGABRT: i32 = 6;
+
+    /// Whether the process aborted itself, which is how Node ends when its
+    /// heap is full.
+    pub fn is_abort(&self) -> bool {
+        *self == ProcessEnd::Signal(Self::SIGABRT)
+    }
+}
+
 /// `line` as a progress frame, or `None` when it is anything else.
 ///
 /// An answer is read here too, to find out that it is not one: its other
@@ -1687,6 +1719,9 @@ pub struct TypeSidecar {
     /// How long an operation waits for an answer or a progress frame:
     /// [`OPERATION_TIMEOUT`] unless [`Self::with_operation_timeout`] set it.
     operation_timeout: Duration,
+    /// The last progress frame of the wait in hand, or of the one that last
+    /// ended: see [`Self::last_progress`].
+    last_progress: Mutex<Option<OperationProgress>>,
 }
 
 impl TypeSidecar {
@@ -1725,7 +1760,40 @@ impl TypeSidecar {
             scope: Mutex::new(None),
             scan_root: Mutex::new(None),
             operation_timeout: OPERATION_TIMEOUT,
+            last_progress: Mutex::new(None),
         })
+    }
+
+    /// How far the last request got, by its own account: its most recent
+    /// progress frame, or `None` when it wrote none (carrick#1916).
+    ///
+    /// It is what is left to say about a request whose process died: the
+    /// stage it had reached. Each wait for an answer starts it empty, so it
+    /// is read after the request failed and before anything else is asked,
+    /// a restart included.
+    pub fn last_progress(&self) -> Option<OperationProgress> {
+        self.last_progress.lock().unwrap().clone()
+    }
+
+    /// How the current process ended, when it has: the signal or the exit
+    /// code. `None` while it is still running, and on a platform that cannot
+    /// say.
+    ///
+    /// For a process whose stdout has closed. That happens a moment before
+    /// the process is reaped, so this waits for it, briefly: a process that
+    /// closed its stdout and lives on is not waited for.
+    pub fn how_the_process_ended(&self) -> Option<ProcessEnd> {
+        let mut child = self.child.lock().ok()?;
+        let waited = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return process_end(status),
+                Ok(None) if waited.elapsed() < Duration::from_secs(2) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Wait this long, not [`OPERATION_TIMEOUT`], for each operation's answer.
@@ -2649,6 +2717,7 @@ impl TypeSidecar {
         let responses = self.responses.lock().unwrap();
         let mut last_sign_of_life = Instant::now();
         let mut last_logged: Option<Instant> = None;
+        *self.last_progress.lock().unwrap() = None;
 
         loop {
             let remaining = timeout.saturating_sub(last_sign_of_life.elapsed());
@@ -2673,6 +2742,10 @@ impl TypeSidecar {
             if let Some(frame) = progress_frame(trimmed) {
                 if request_id.is_none_or(|id| id == frame.request_id) {
                     last_sign_of_life = Instant::now();
+                    *self.last_progress.lock().unwrap() = Some(OperationProgress {
+                        phase: frame.phase.clone().unwrap_or_default(),
+                        message: frame.message.clone().unwrap_or_default(),
+                    });
                     if last_logged.is_none_or(|at| at.elapsed() >= PROGRESS_LOG_INTERVAL) {
                         last_logged = Some(Instant::now());
                         debug!(
@@ -2691,6 +2764,18 @@ impl TypeSidecar {
             }
         }
     }
+}
+
+/// An exit status as a [`ProcessEnd`].
+fn process_end(status: std::process::ExitStatus) -> Option<ProcessEnd> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return Some(ProcessEnd::Signal(signal));
+        }
+    }
+    status.code().map(ProcessEnd::Code)
 }
 
 /// Join the `errors` array of a terminal sidecar frame into one message.

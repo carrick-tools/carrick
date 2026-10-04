@@ -7,9 +7,15 @@
  * `verify_library_claims` write one when the program they read is ready,
  * which is the part of their work whose size the request does not bound.
  *
+ * A capture is four pieces of compiler work, each as large as the service
+ * and none bounded by the request, so `capture_v2` writes a frame as it
+ * reaches each stage and as it resolves anchors (carrick#1916). The frames
+ * are also what is left of a capture whose process dies: the stage it had
+ * reached.
+ *
  * Two layers are pinned:
- * - the inferrer tells its caller as it gets past each request, between
- *   requests and not at the end, whatever the request answered;
+ * - the inferrer and the capture tell their caller as they get past each
+ *   unit, between units and not at the end, whatever the unit answered;
  * - over stdio, those requests write `progress` frames before their terminal
  *   frame, under their own request id, and never after it.
  *
@@ -27,6 +33,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { Project } from 'ts-morph';
+import { captureStub } from '../src/capture/index.js';
+import type { CaptureAnchorRequest } from '../src/capture/api.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
 import type { InferRequestItem } from '../src/types.js';
 import { SIDECAR_PATH } from './helpers.js';
@@ -190,6 +198,96 @@ describe('long requests report progress (carrick#1914)', () => {
     });
   });
 
+  /** Three anchors of three kinds, so every stage of a capture has work. */
+  const anchors: CaptureAnchorRequest[] = [
+    { kind: 'symbol', alias: 'Capture_Receipt', symbol_name: 'Receipt', source_file: 'src/work.ts', anchor_origin: 'llm-symbol' },
+    { kind: 'handler_return', alias: 'Capture_One', symbol_name: 'one', source_file: 'src/work.ts', anchor_origin: 'llm-symbol' },
+    { kind: 'literal', alias: 'Capture_Text', type_text: '{ id: string }', anchor_origin: 'deterministic-infer' },
+  ];
+
+  /** Every file under `dir`, by relative path. */
+  const filesOf = (dir: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const walk = (current: string) => {
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const abs = path.join(current, entry.name);
+        if (entry.isDirectory()) walk(abs);
+        else out[path.relative(dir, abs)] = fs.readFileSync(abs, 'utf8');
+      }
+    };
+    walk(dir);
+    return out;
+  };
+
+  describe('the capture', () => {
+    it('reports each stage as it reaches it, and each anchor as it resolves it', () => {
+      const out = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-progress-stub-'));
+      try {
+        const reports: string[] = [];
+        const result = captureStub({
+          repoRoot: root,
+          serviceName: 'progress',
+          anchors,
+          outDir: path.join(out, 'reported'),
+          onProgress: (phase, message) => reports.push(`${phase}: ${message}`),
+        });
+        assert.ok(result.success, JSON.stringify(result.errors));
+        assert.deepStrictEqual(reports, [
+          'program: building the program the anchors are read in',
+          'anchors: 0 of 3',
+          'anchors: 1 of 3',
+          'anchors: 2 of 3',
+          'anchors: 3 of 3',
+          'emit: emitting declarations',
+          'self-check: checking the stub',
+        ]);
+
+        // Reporting changes nothing the capture writes.
+        const silent = captureStub({
+          repoRoot: root,
+          serviceName: 'progress',
+          anchors,
+          outDir: path.join(out, 'silent'),
+        });
+        assert.deepStrictEqual(filesOf(path.join(out, 'reported')), filesOf(path.join(out, 'silent')));
+        assert.deepStrictEqual(
+          { ...result, stub_dir: '' },
+          { ...silent, stub_dir: '' }
+        );
+      } finally {
+        fs.rmSync(out, { recursive: true, force: true });
+      }
+    });
+
+    it('reports a stage before that stage runs, so a capture that dies in one has named it', () => {
+      const out = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-progress-stub-'));
+      try {
+        const surface = path.join(out, 'stub', 'types', 'surface.d.ts');
+        // The emit writes the surface: it is not there when `emit` is
+        // reported, and is when `self-check` is.
+        const surfaceWrittenAt: Record<string, boolean> = {};
+        const result = captureStub({
+          repoRoot: root,
+          serviceName: 'progress',
+          anchors,
+          outDir: path.join(out, 'stub'),
+          onProgress: (phase) => {
+            surfaceWrittenAt[phase] = fs.existsSync(surface);
+          },
+        });
+        assert.ok(result.success, JSON.stringify(result.errors));
+        assert.deepStrictEqual(surfaceWrittenAt, {
+          program: false,
+          anchors: false,
+          emit: false,
+          'self-check': true,
+        });
+      } finally {
+        fs.rmSync(out, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('over stdio', () => {
     let sidecar: RawSidecar;
 
@@ -257,6 +355,36 @@ describe('long requests report progress (carrick#1914)', () => {
         [['progress-verify', 'verify_library_claims', 'program ready']]
       );
       assert.strictEqual(frames.length, 2);
+    });
+
+    it('capture_v2 names each stage once, in order, then answers', async () => {
+      const out = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-progress-stub-'));
+      try {
+        const frames = await sidecar.exchange({
+          action: 'capture_v2',
+          request_id: 'progress-capture',
+          repo_root: root,
+          service_name: 'progress',
+          anchors,
+          out_dir: path.join(out, 'stub'),
+        });
+        const terminal = frames[frames.length - 1];
+        assert.strictEqual(terminal.status, 'success', JSON.stringify(terminal.errors));
+        const progress = progressOf(frames);
+        assert.strictEqual(progress.length, frames.length - 1, 'only progress frames precede the answer');
+        for (const frame of progress) assert.strictEqual(frame.request_id, 'progress-capture');
+        // A stage's first report is never held back; the reports within one
+        // (an anchor each) are paced, so a fast capture writes only the first.
+        const stages = progress.map((f) => f.phase);
+        assert.deepStrictEqual([...new Set(stages)], ['program', 'anchors', 'emit', 'self-check']);
+        assert.deepStrictEqual(stages, [...stages].sort((a, b) => stages.indexOf(a) - stages.indexOf(b)));
+        assert.strictEqual(progress.find((f) => f.phase === 'anchors')?.message, '0 of 3');
+        for (const frame of progress.filter((f) => f.phase === 'anchors')) {
+          assert.match(frame.message ?? '', /^[0-3] of 3$/);
+        }
+      } finally {
+        fs.rmSync(out, { recursive: true, force: true });
+      }
     });
 
     it('a request that fails before any work writes its error and no progress', async () => {

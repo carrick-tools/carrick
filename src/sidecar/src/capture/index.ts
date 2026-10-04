@@ -35,6 +35,7 @@ import type {
   AnchorOrigin,
   CaptureAliasRecord,
   CaptureFidelity,
+  CapturePhase,
   CaptureStubOptions,
   CaptureStubResult,
   SelfCheckOutcome,
@@ -277,7 +278,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
-  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard };
+  const progress = opts.onProgress ?? (() => {});
+  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress };
   try {
     resolved = ownerGroups && emitProject
       ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
@@ -312,6 +314,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const sourceByEmitted = new Map<string, string>();
   let emitPartial = false;
   try {
+    progress('emit', 'emitting declarations');
     guard.writeFile(entryPath, entryLines.join('\n') + '\n');
     const emitOptions: ts.CompilerOptions = {
       ...parsed.options,
@@ -534,6 +537,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   );
 
   // ---- Capture-time self-check (per-alias closure attribution) ----
+  progress('self-check', 'checking the stub');
   const aliases = selfCheckStub({
     guard: stubGuard,
     stubDir,
@@ -697,7 +701,7 @@ function resolveAnchorsByOwner(
   opts: CaptureStubOptions,
   groups: Map<ServiceProject, number[]>,
   emit: ServiceProject,
-  ctx: { repoRoot: string; entryDir: string; entryPath: string; guard: WriteGuard },
+  ctx: AnalysisContext,
   errors: string[]
 ): ResolvedAnchor[] {
   const resolved = new Array<ResolvedAnchor>(opts.anchors.length);
@@ -735,11 +739,20 @@ function resolveAnchorsByOwner(
   return resolved;
 }
 
+/** What Phase A reads beside the anchors and the options they are typed under. */
+interface AnalysisContext {
+  repoRoot: string;
+  entryDir: string;
+  entryPath: string;
+  guard: WriteGuard;
+  progress: (phase: CapturePhase, message: string) => void;
+}
+
 /** Phase A: build the placeholder entry, then resolve every anchor. */
 function resolveAnchors(
   opts: CaptureStubOptions,
   parsed: ts.ParsedCommandLine,
-  ctx: { repoRoot: string; entryDir: string; entryPath: string; guard: WriteGuard },
+  ctx: AnalysisContext,
   deno?: DenoProject,
 ): ResolvedAnchor[] {
   const placeholderLines = ['// Carrick capture v2 analysis placeholder.'];
@@ -749,6 +762,7 @@ function resolveAnchors(
 
   ctx.guard.writeFile(ctx.entryPath, placeholderLines.join('\n') + '\n');
   try {
+    ctx.progress('program', 'building the program the anchors are read in');
     const anchorSources = [
       ...new Set(
         opts.anchors
@@ -760,6 +774,11 @@ function resolveAnchors(
       noEmit: true,
     };
     const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, deno?.host(options));
+    // The checker binds every file of the program when it is first asked for,
+    // which the first anchor would otherwise do: asked for here, so that the
+    // report below says the program is whole before any anchor is read.
+    program.getTypeChecker();
+    ctx.progress('anchors', `0 of ${opts.anchors.length}`);
     const entrySource = program.getSourceFile(ctx.entryPath);
     const placeholders = new Map<string, ts.TypeAliasDeclaration>();
     if (entrySource) {
@@ -797,15 +816,17 @@ function resolveAnchors(
         );
       }
     }
-    return opts.anchors.map((request) =>
-      resolveAnchor(program, request, {
+    return opts.anchors.map((request, index) => {
+      const anchor = resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,
         entryDir: ctx.entryDir,
         placeholder: placeholders.get(request.alias),
         siblingSymbolSpecs,
         resolveFromEntry,
-      })
-    );
+      });
+      ctx.progress('anchors', `${index + 1} of ${opts.anchors.length}`);
+      return anchor;
+    });
   } finally {
     if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);
   }

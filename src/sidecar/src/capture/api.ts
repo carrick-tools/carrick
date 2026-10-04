@@ -378,6 +378,15 @@ export interface CaptureStubResult {
   errors: string[];
 }
 
+/**
+ * The stages of a capture that it reports as it reaches them (carrick#1916),
+ * in order: the program the anchors are read in is being built; the anchors
+ * are being resolved in it; the declarations are being emitted; the stub is
+ * being checked. A capture whose anchors belong to several projects goes
+ * through the first two once per project.
+ */
+export type CapturePhase = 'program' | 'anchors' | 'emit' | 'self-check';
+
 export interface CaptureStubOptions {
   repoRoot: string;
   serviceName: string;
@@ -392,6 +401,13 @@ export interface CaptureStubOptions {
    * lie inside it only beneath a `.carrick` directory (carrick#1768).
    */
   scanRoot?: string;
+  /**
+   * Told each stage as the capture reaches it, and each anchor as it is
+   * resolved (`message` is then `<done> of <total>`). Called by the work
+   * itself, between units, so a capture that stops finishing them stops
+   * reporting. It changes nothing the capture writes.
+   */
+  onProgress?: (phase: CapturePhase, message: string) => void;
 }
 
 // ===========================================================================
