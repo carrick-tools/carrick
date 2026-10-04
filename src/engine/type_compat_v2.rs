@@ -2855,7 +2855,7 @@ mod tests {
     /// `type_string: "any"` with NO `primary_type_symbol` and NO `array_depth`
     /// (measured offline against the real source). `apply_inferred_array_depth`
     /// then has nothing to copy, the `Order` symbol anchor captures at depth 0,
-    /// and the surface line is `import('./types/order.js').Order` — so the correct
+    /// and the surface line is `import('./types/order').Order` — so the correct
     /// `Order[]` producer reads incompatible against the correct `Order[]`
     /// consumer and ships a CAUTION type_mismatch on every PR.
     ///

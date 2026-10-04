@@ -169,9 +169,9 @@ Generation:
    the effective `rootDir` (an entry at repo root with `rootDir: "src"` fails
    with `TS6059`) — that aliases each manifest anchor:
    - Explicit symbol: `export type Endpoint_abc_Response =
-     import('./types/order.js').OrderResponse;`
+     import('./types/order').OrderResponse;`
    - Addressable handler (implicit): `export type Endpoint_def_Response =
-     Awaited<ReturnType<typeof import('./routes/orders.js').getOrder>>;`
+     Awaited<ReturnType<typeof import('./routes/orders').getOrder>>;`
      (after machinery unwrap — see below). **Guards required before choosing
      this form** (all verified failure modes): the symbol must actually be
      exported (`checker.getExportsOfModule`), must not be an overload set

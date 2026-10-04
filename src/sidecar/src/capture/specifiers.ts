@@ -22,9 +22,9 @@ export function isDeclarationFileName(name: string): boolean {
  * A specifier names its module with no extension (`./a`: `a.d.ts`, or the
  * directory's `index.d.ts`), by the file the module compiles to (`./a.js`:
  * `a.d.ts`, `./a.mjs`: `a.d.mts`, `./a.cjs`: `a.d.cts`), or by the
- * declaration file itself. The surface names every anchor's module the
- * second way (carrick#1911), and so does any source written for
- * `node16`..`nodenext`.
+ * declaration file itself. The surface names an anchor's module the second
+ * way where the first does not resolve (carrick#1911), and so does any source
+ * written for `node16`..`nodenext`.
  */
 export function declarationCandidates(resolved: string): string[] {
   const output = /\.([cm]?)jsx?$/.exec(resolved);

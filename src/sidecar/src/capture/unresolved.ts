@@ -31,7 +31,7 @@ const reachableCache = new WeakMap<ts.Program, Map<string, string[]>>();
  *
  * `pathPrefix` maps the anchor type's member paths onto the paths of the alias
  * the surface declares when the two differ: a symbol anchor restoring array
- * depth prints `import('./m.js').Row[]`, whose members sit under `<0>`.
+ * depth prints `import('./m').Row[]`, whose members sit under `<0>`.
  */
 export function unresolvedAtAnchor(
   program: ts.Program,

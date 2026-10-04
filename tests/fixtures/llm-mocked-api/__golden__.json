@@ -13,7 +13,7 @@
       "line": 6,
       "type_alias": "Endpoint_a9cce7d0d8d0d9e6_Response_Ata11d465d76586930",
       "type_state": "Explicit",
-      "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response_Ata11d465d76586930 = import('./src/types.js').User[];",
+      "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response_Ata11d465d76586930 = import('./src/types').User[];",
       "expanded_definition": "{ id: number; name: string; email: string; }[]",
       "is_explicit": true,
       "primary_type_symbol": "User",

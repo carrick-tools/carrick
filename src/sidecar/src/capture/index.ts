@@ -767,6 +767,24 @@ function resolveAnchors(
         if (ts.isTypeAliasDeclaration(stmt)) placeholders.set(stmt.name.text, stmt);
       }
     }
+    // A module specifier as the entry resolves it, under the program's own
+    // resolution (the Deno graph's, for a Deno service). Asked once per
+    // specifier: every anchor of a module asks for the same one.
+    const entryMode = entrySource?.impliedNodeFormat;
+    const fromEntry = new Map<string, string | undefined>();
+    const resolveFromEntry = (specifier: string): string | undefined => {
+      if (!fromEntry.has(specifier)) {
+        fromEntry.set(
+          specifier,
+          (deno
+            ? deno.resolve(specifier, ctx.entryPath, options)
+            : ts.resolveModuleName(specifier, ctx.entryPath, options, ts.sys, undefined, undefined, entryMode)
+                .resolvedModule
+          )?.resolvedFileName
+        );
+      }
+      return fromEntry.get(specifier);
+    };
     // A literal anchor whose text is a bare identifier resolves through a
     // sibling symbol anchor's module when one names the same symbol.
     const siblingSymbolSpecs = new Map<string, string>();
@@ -775,19 +793,10 @@ function resolveAnchors(
       if (!siblingSymbolSpecs.has(anchor.symbol_name)) {
         siblingSymbolSpecs.set(
           anchor.symbol_name,
-          entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file)
+          entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file, resolveFromEntry)
         );
       }
     }
-    // A module specifier as the entry resolves it, under the program's own
-    // resolution (the Deno graph's, for a Deno service).
-    const entryMode = entrySource?.impliedNodeFormat;
-    const resolveFromEntry = (specifier: string): string | undefined =>
-      (deno
-        ? deno.resolve(specifier, ctx.entryPath, options)
-        : ts.resolveModuleName(specifier, ctx.entryPath, options, ts.sys, undefined, undefined, entryMode)
-            .resolvedModule
-      )?.resolvedFileName;
     return opts.anchors.map((request) =>
       resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,

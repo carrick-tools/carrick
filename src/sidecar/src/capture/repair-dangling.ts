@@ -3,7 +3,7 @@
  * (carrick#1397).
  *
  * A `symbol` anchor prints nothing: its surface line is
- * `import('./m.js').RenderRequest` and the shape lives in the `.d.ts` the
+ * `import('./m').RenderRequest` and the shape lives in the `.d.ts` the
  * compiler emitted for `m`. When that file imports a module the scanned
  * checkout does not have — a dependency that was not installed, a generated
  * module that was never generated — the stub reports the module missing, the

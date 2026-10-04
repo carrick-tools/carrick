@@ -1,5 +1,5 @@
 /**
- * The surface entry names an anchor's module by the file it compiles to
+ * The surface entry names an anchor's module in a form the entry resolves
  * (carrick#1911).
  *
  * The entry is a `.ts` file written inside the service, and every `symbol`
@@ -14,7 +14,9 @@
  * everywhere.
  *
  * The output file's name resolves in every mode: `.js` for `.ts`/`.tsx`,
- * `.mjs` for `.mts`, `.cjs` for `.cts`.
+ * `.mjs` for `.mts`, `.cjs` for `.cts`. The entry uses it where the bare path
+ * does not resolve, and keeps the bare path where it does, so a service that
+ * captured before captures the same surface.
  */
 
 import { describe, it, after } from 'node:test';
@@ -46,12 +48,14 @@ interface Layout {
   options?: Record<string, unknown>;
   /** The package's `"type"`. */
   type?: 'module' | 'commonjs';
+  /** Whether the entry is an ES module that must name a `.ts` module's output. */
+  named?: true;
 }
 
 const LAYOUTS: Layout[] = [
   // The ticket's shape: an ES module package under NodeNext.
-  { name: 'nodenext, "type": "module"', options: { module: 'NodeNext' }, type: 'module' },
-  { name: 'node16, "type": "module"', options: { module: 'Node16' }, type: 'module' },
+  { name: 'nodenext, "type": "module"', options: { module: 'NodeNext' }, type: 'module', named: true },
+  { name: 'node16, "type": "module"', options: { module: 'Node16' }, type: 'module', named: true },
   { name: 'nodenext, "type": "commonjs"', options: { module: 'NodeNext' }, type: 'commonjs' },
   { name: 'nodenext, no "type"', options: { module: 'NodeNext' } },
   {
@@ -131,7 +135,26 @@ function standalone(stubDir: string, base: string): { diagnostics: string[]; mem
 }
 
 describe('carrick#1911: the entry names a module by the file it compiles to', () => {
-  it('maps each source kind to its output extension', () => {
+  it('keeps the bare path where the entry resolves it to the module', () => {
+    const asked: string[] = [];
+    const resolves = (to: string | undefined) => (specifier: string) => {
+      asked.push(specifier);
+      return to;
+    };
+    assert.strictEqual(
+      entryRelativeSpecifier('/repo/lib', '/repo', 'lib/parcels.ts', resolves('/repo/lib/parcels.ts')),
+      './parcels'
+    );
+    // Unresolved, or resolved to another file of that name: the output name.
+    assert.strictEqual(entryRelativeSpecifier('/repo/lib', '/repo', 'lib/parcels.ts', resolves(undefined)), './parcels.js');
+    assert.strictEqual(
+      entryRelativeSpecifier('/repo/lib', '/repo', 'lib/panel.tsx', resolves('/repo/lib/panel.ts')),
+      './panel.js'
+    );
+    assert.deepStrictEqual(asked, ['./parcels', './parcels', './panel']);
+  });
+
+  it('maps each source kind to its output extension where the bare path does not resolve', () => {
     const spec = (file: string) => entryRelativeSpecifier('/repo/lib', '/repo', file);
     assert.strictEqual(spec('lib/parcels.ts'), './parcels.js');
     assert.strictEqual(spec('lib/panel.tsx'), './panel.js');
@@ -201,6 +224,17 @@ describe('carrick#1911: the entry names a module by the file it compiles to', ()
         ...(tsx ? ['types/lib/panel.d.ts'] : []),
       ].sort();
       assert.deepStrictEqual(result.emitted_files, expected);
+
+      // The form each module is named in: the bare path wherever the entry
+      // resolves it, as before, and the output name where it does not.
+      const surface = fs.readFileSync(path.join(result.stub_dir, 'types/surface.d.ts'), 'utf8');
+      const line = (alias: string) => surface.split('\n').find((text) => text.includes(`type ${alias} `));
+      assert.strictEqual(
+        line('Endpoint_parcel_Response'),
+        `export type Endpoint_parcel_Response = import('./lib/parcels${layout.named ? '.js' : ''}').Parcel;`
+      );
+      assert.strictEqual(line('Endpoint_label_Response'), "export type Endpoint_label_Response = import('./lib/labels.mjs').Label;");
+      assert.strictEqual(line('Endpoint_rate_Response'), "export type Endpoint_rate_Response = import('./lib/rates.cjs').Rate;");
 
       const stub = standalone(result.stub_dir, base);
       assert.deepStrictEqual(stub.diagnostics, []);
