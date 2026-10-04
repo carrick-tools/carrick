@@ -4380,6 +4380,14 @@ impl LibrarySiteIndex {
         index
     }
 
+    /// `file` relative to the repo root, whichever form the caller holds.
+    ///
+    /// The model's answers are keyed as discovered on a full scan and
+    /// repo-relative on a rescan, and a deterministic pass's rows always carry
+    /// the path the file was discovered at. So every fold that asks whether
+    /// two rows are one site compares both sides through this, the socket-twin
+    /// and event-bus folds included (carrick#1874): compared as written, the
+    /// two forms never met on a rescan and both rows were stated.
     fn relative(&self, file: &Path) -> PathBuf {
         let file = normalize_protocol_file(file);
         file.strip_prefix(&self.repo_root)
@@ -4626,7 +4634,7 @@ fn append_event_bus_operations(
     if event_bus.is_empty() {
         return;
     }
-    let reported = llm_pubsub_sites(file_results);
+    let reported = llm_pubsub_sites(file_results, library);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut deferred = 0usize;
@@ -4641,11 +4649,7 @@ fn append_event_bus_operations(
                 deferred += 1;
                 continue;
             }
-            let site = (
-                normalize_protocol_file(&op.file_path),
-                op.event.clone(),
-                role,
-            );
+            let site = (library.relative(&op.file_path), op.event.clone(), role);
             if reported.contains(&site) {
                 debug!(
                     event = %op.event,
@@ -4679,17 +4683,18 @@ fn append_event_bus_operations(
     );
 }
 
-/// Sites the file-analyzer already reported as pub/sub, as (normalized file,
-/// topic, role). Read by [`append_event_bus_operations`] to know which of its
-/// own rows would be a second copy of one the model already produced. An op
-/// with no role names no site: it was dropped from `cloud_data` entirely, so it
-/// covers nothing.
+/// Sites the file-analyzer already reported as pub/sub, as (file relative to
+/// the repo root, topic, role). Read by [`append_event_bus_operations`] to know
+/// which of its own rows would be a second copy of one the model already
+/// produced. An op with no role names no site: it was dropped from
+/// `cloud_data` entirely, so it covers nothing.
 fn llm_pubsub_sites(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    files: &LibrarySiteIndex,
 ) -> HashSet<(PathBuf, String, crate::operation::PubsubRole)> {
     let mut sites = HashSet::new();
     for (path, result) in file_results {
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = files.relative(Path::new(path));
         for op in &result.pubsub_operations {
             if let Some(role) = op.role {
                 sites.insert((file_norm.clone(), op.topic.clone(), role));
@@ -4730,15 +4735,18 @@ fn normalize_protocol_file(p: &Path) -> PathBuf {
 /// without socket ops) safe.
 ///
 /// Keyed as a map of file → event set (rather than a set of owned pairs) so
-/// membership checks borrow `&Path`/`&str` without per-op cloning.
+/// membership checks borrow `&Path`/`&str` without per-op cloning. The file is
+/// relative to the repo root ([`LibrarySiteIndex::relative`]), and so is the
+/// `file_results` key every reader looks up with.
 fn socket_event_twins(
     sockets: &crate::socket_io::SocketExtraction,
+    files: &LibrarySiteIndex,
 ) -> HashMap<PathBuf, HashSet<String>> {
     let mut twins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for op in sockets.listeners.iter().chain(sockets.emitters.iter()) {
         if let Some(event) = op.key.socket_event() {
             twins
-                .entry(normalize_protocol_file(&op.file_path))
+                .entry(files.relative(&op.file_path))
                 .or_default()
                 .insert(event.to_string());
         }
@@ -4793,7 +4801,7 @@ fn append_pubsub_operations(
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets, library);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
@@ -4805,7 +4813,7 @@ fn append_pubsub_operations(
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Same-file socket twin → the file-analyzer double-classified a
             // socket emit/listen site; keep the deterministic socket op, drop
@@ -4924,13 +4932,13 @@ fn append_pubsub_manifest_entries(
 ) {
     use crate::operation::PubsubRole;
 
-    let twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets, library);
     // Deterministic order: sort paths before emitting manifest entries.
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
     for path in paths {
         let result = &file_results[path];
-        let file_norm = normalize_protocol_file(Path::new(path));
+        let file_norm = library.relative(Path::new(path));
         for op in &result.pubsub_operations {
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
@@ -20330,6 +20338,122 @@ mod tests {
                 .count(),
             1,
             "the model's op must keep its anchor"
+        );
+    }
+
+    /// carrick#1874: the two folds above hold on a rescan too.
+    ///
+    /// A rescan keys the model's answers repo-relative, and a deterministic
+    /// pass's rows always carry the path the file was discovered at, under the
+    /// repo root. The two are one site whichever form each side is in: the
+    /// event-bus row defers to the model's row, and the model's pub/sub row
+    /// folds into its socket twin, exactly as on the cold scan. Before, a
+    /// rescan compared the two forms as written, found no site in common, and
+    /// stated both rows.
+    #[test]
+    fn a_rescan_s_relative_keys_and_a_pass_s_discovered_paths_are_one_site() {
+        use crate::operation::{PubsubRole, SocketDirection};
+
+        let repo_root = "/checkout/shop";
+        let emit_file = "worker-svc/src/event-bus.ts";
+        let socket_file = "payments-svc/realtime/server.ts";
+        let discovered = |file: &str| PathBuf::from(format!("{repo_root}/{file}"));
+
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![],
+                publishers: vec![crate::event_emitter::BusOp {
+                    key: OperationKey::pubsub("workerNotification"),
+                    event: "workerNotification".to_string(),
+                    file_path: discovered(emit_file),
+                    line: 389,
+                }],
+            },
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![],
+                emitters: vec![crate::socket_io::SocketOp {
+                    key: OperationKey::socket("payment:settled", SocketDirection::ServerToClient),
+                    file_path: discovered(socket_file),
+                    line: 28,
+                    payload_type_symbol: None,
+                    payload_type_source: None,
+                }],
+            },
+            ..Default::default()
+        };
+
+        // The model's answers, keyed as a rescan holds them.
+        let model_row = |topic: &str| FileAnalysisResult {
+            pubsub_operations: vec![pubsub_op(
+                topic,
+                PubsubRole::Publisher,
+                Some("Payload"),
+                Some("./types"),
+            )],
+            ..Default::default()
+        };
+        let file_results: HashMap<String, FileAnalysisResult> = [
+            (emit_file.to_string(), model_row("workerNotification")),
+            (socket_file.to_string(), model_row("payment:settled")),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut cloud_data = repo_with_bundle("shop", None, "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &file_results,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            repo_root,
+            &Config::default(),
+        );
+
+        let rows = |key: &str| -> Vec<&ApiEndpointDetails> {
+            cloud_data
+                .calls
+                .iter()
+                .filter(|call| call.key.canonical() == key)
+                .collect()
+        };
+        let bus_rows = rows("pubsub|workerNotification");
+        assert_eq!(
+            bus_rows.len(),
+            1,
+            "one emit is one row: the event-bus row defers to the model's: {bus_rows:#?}"
+        );
+        assert_eq!(
+            bus_rows[0].file_path,
+            PathBuf::from(format!("{emit_file}:14")),
+            "the row kept is the model's, which carries the payload anchor"
+        );
+        assert_eq!(
+            rows("socket|SERVER->CLIENT|payment:settled").len(),
+            1,
+            "the socket emit is stated once, as the socket row"
+        );
+        assert_eq!(
+            rows("pubsub|payment:settled").len(),
+            0,
+            "the model's pub/sub row for the same emit folds into its socket twin"
+        );
+
+        // The manifest folds the same way: no anchor for a row that was not
+        // stated. The index is rooted at the repo, as both scan paths build it.
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(
+            &mut entries,
+            &file_results,
+            &extractions.sockets,
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            &LibrarySiteIndex::of(&Default::default(), repo_root),
+            repo_root,
+        );
+        let anchored: Vec<String> = entries.iter().map(|entry| entry.key.canonical()).collect();
+        assert_eq!(
+            anchored,
+            vec!["pubsub|workerNotification".to_string()],
+            "only the row that was stated anchors a manifest entry"
         );
     }
 

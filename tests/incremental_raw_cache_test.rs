@@ -136,8 +136,14 @@ fn committed_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
 /// add a source file of its own and still start from a tree `git diff` reports
 /// as clean.
 fn committed_fixture_with(tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/env-var-whole-url");
+    committed_copy_of("env-var-whole-url", tmp, extra)
+}
+
+/// A committed copy of any fixture that carries its own cassette in `__llm__`.
+fn committed_copy_of(name: &str, tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     let repo_path = tmp.join("service");
     copy_dir(&fixture, &repo_path);
     for (relative, contents) in extra {
@@ -325,6 +331,71 @@ async fn an_unchanged_scan_replays_the_cached_model_answer_and_re_emits_the_rest
             .any(|call| call.key.to_string().contains("/api/answer")),
         "the projection must still carry the resolved whole-URL call: {:#?}",
         scan_two.calls
+    );
+}
+
+/// Every row the stored generation holds, as `service side key site source`,
+/// sorted, so two scans' rows compare whatever order they were stated in.
+fn stored_rows(storage: &StubStorage) -> Vec<String> {
+    let mut rows = Vec::new();
+    for blob in storage.repos.lock().unwrap().iter() {
+        let service = blob.service_name.as_deref().unwrap_or_default();
+        for (side, list) in [("endpoint", &blob.endpoints), ("call", &blob.calls)] {
+            for row in list {
+                rows.push(format!(
+                    "{service} {side} {} {} {:?}",
+                    row.key.canonical(),
+                    row.file_path.display(),
+                    row.resolution_source
+                ));
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// carrick#1874: a rescan of an unchanged tree states the rows the cold scan
+/// stated.
+///
+/// The tree is two services around an in-process event bus: one calls
+/// `bus.emit("itemArchived", ...)` and the other `bus.on("itemArchived", ...)`.
+/// The event-bus pass and the model both read each call, and the pass defers
+/// to the model's row for the same site. A rescan holds the model's answers
+/// under repo-relative keys and the pass's rows under the path each file was
+/// discovered at, so the two were never seen as one site, and from the second
+/// scan on every such call was stated twice.
+#[tokio::test]
+#[serial]
+async fn a_rescan_states_the_rows_the_cold_scan_stated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_copy_of("pubsub-wrapper-monorepo", tmp.path(), &[]);
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (_, dispatched_cold) = scan(&storage, &repo_path).await;
+    assert!(dispatched_cold > 0, "scan #1 is the cold scan");
+    let cold = stored_rows(&storage);
+    let on_the_bus = |rows: &[String]| {
+        rows.iter()
+            .filter(|row| row.contains("pubsub|itemArchived"))
+            .count()
+    };
+    assert_eq!(
+        on_the_bus(&cold),
+        2,
+        "the cold scan states the publish and the subscription once each: {cold:#?}"
+    );
+
+    let (_, dispatched_rescan) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_rescan, 0,
+        "an unchanged tree reaches the model zero times"
+    );
+    assert_eq!(
+        stored_rows(&storage),
+        cold,
+        "the rescan and the cold scan state different rows for one tree"
     );
 }
 
