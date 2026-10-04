@@ -68,6 +68,7 @@ import {
 } from './unwidened.js';
 import {
   expandTypeStructural,
+  jsonWireType,
   type ExpandOrigin,
   type MemberOverrides,
   type WireFormat,
@@ -1280,12 +1281,69 @@ export class TypeInferrer {
           true
         );
       }
+      // carrick#807: the request named an expression and the file holds none
+      // that matches. Where its line declares the handler, that handler is
+      // still the row's, and what it returns is still the question. Without
+      // this the unmatched text also fails the function lookup below, and a
+      // row a line-only request answers is lost to a locator that added
+      // nothing.
+      const declaredHandler = request.expression_text
+        ? this.handlerDeclaredAtLine(sourceFile, request.line_number)
+        : undefined;
+      if (declaredHandler) {
+        this.log(
+          `No node matches the located expression at ${request.file_path}:${request.line_number}; ` +
+            'reading what the handler this line declares returns'
+        );
+        return this.buildFunctionReturnInferredType(
+          request,
+          declaredHandler,
+          extractionConfig,
+          true
+        );
+      }
       // No locator, or locator didn't resolve — likely a payload-less handler
       // (redirect, 204, streaming). Infer the containing function's return type.
       this.log(
         `No payload node found for request at ${request.file_path}:${request.line_number}; falling back to function return`
       );
       return this.inferFunctionReturn(sourceFile, request, extractionConfig);
+    }
+
+    // carrick#807: the row's line declares the handler itself, as it does for
+    // a route its module's place in the project states, and the located
+    // expression sits inside that handler. What the handler returns is the
+    // answer a line-only request gets, and a locator must not change it.
+    // The ancestor test comes first because it is free: only a node inside a
+    // function that opens on the row's line can be inside the one the line
+    // declares, and most rows are not.
+    const insideFunctionOnLine = node
+      .getAncestors()
+      .some(
+        (ancestor) =>
+          (Node.isFunctionDeclaration(ancestor) ||
+            Node.isArrowFunction(ancestor) ||
+            Node.isFunctionExpression(ancestor) ||
+            Node.isMethodDeclaration(ancestor)) &&
+          ancestor.getStartLineNumber() === request.line_number
+      );
+    const declaredHandler = insideFunctionOnLine
+      ? this.handlerDeclaredAtLine(sourceFile, request.line_number)
+      : undefined;
+    if (
+      declaredHandler &&
+      declaredHandler.getStart() <= node.getStart() &&
+      node.getEnd() <= declaredHandler.getEnd()
+    ) {
+      const returned = this.responseOfDeclaredHandler(
+        request,
+        declaredHandler,
+        node,
+        extractionConfig
+      );
+      if (returned !== undefined) {
+        return returned;
+      }
     }
 
     // Route-registry object literal: the locator lands on the registry entry
@@ -1471,6 +1529,177 @@ export class TypeInferrer {
   }
 
   /**
+   * The handler a module exports on `line`: a function that opens on exactly
+   * that line, exported at the top of its module, where no call on the line
+   * registers a route (carrick#807).
+   *
+   * That is the anchor of a route its module's place in the project states:
+   * the row's line is the handler's own export, and the module's exports are
+   * how the framework finds it. Each condition keeps another kind of row out:
+   *
+   *  - the line has to be the function's first, with no tolerance. A model
+   *    row that names no site of its own can sit on any line of a handler,
+   *    and the nearest function to such a line is whatever is declared
+   *    beside it;
+   *  - a method of a class is a controller's handler, whose rows are
+   *    anchored on what a model located before the method's own return;
+   *  - a line that registers a route has a registration to read.
+   */
+  private handlerDeclaredAtLine(
+    sourceFile: SourceFile,
+    line: number
+  ): FunctionLike | undefined {
+    const declared = this.exportedFunctionOpeningOn(sourceFile, line);
+    return declared && !this.registrationAtLine(sourceFile, line) ? declared : undefined;
+  }
+
+  /**
+   * `handlerDeclaredAtLine` without its registration test, for a caller that
+   * has already looked for a registration on the line.
+   */
+  private exportedFunctionOpeningOn(
+    sourceFile: SourceFile,
+    line: number
+  ): FunctionLike | undefined {
+    const declared = this.findFunctionByLine(sourceFile, line);
+    if (!declared || declared.getStartLineNumber() !== line) return undefined;
+
+    if (Node.isFunctionDeclaration(declared)) {
+      return Node.isSourceFile(declared.getParent()) && declared.isExported()
+        ? declared
+        : undefined;
+    }
+    if (!Node.isArrowFunction(declared) && !Node.isFunctionExpression(declared)) {
+      return undefined;
+    }
+    const binding = declared.getParent();
+    if (!Node.isVariableDeclaration(binding) || binding.getInitializer() !== declared) {
+      return undefined;
+    }
+    const statement = binding.getVariableStatement();
+    return statement && Node.isSourceFile(statement.getParent()) && statement.isExported()
+      ? declared
+      : undefined;
+  }
+
+  /**
+   * The response of a handler the request's line declares, for a request
+   * that also located an expression inside it (carrick#807).
+   *
+   * The handler's own return is read first, exactly as a `function_return`
+   * request at the line reads it, and that reading stands: a body it
+   * recovered, and a decision it made not to publish one. The located
+   * expression is consulted in one case only. Where the handler returns a
+   * call nothing resolves (its library is not installed), the return walk
+   * reads no argument the source does not annotate, because it cannot tell a
+   * response sender from a query. A located payload that is an ARGUMENT of
+   * such a returned call says which it is, so the same walk runs again with
+   * that callee taken as a sender: every success body the handler returns
+   * through it, error branches dropped as before. The located expression's
+   * own type is never what is published here.
+   *
+   * Returns `undefined` when the located expression is something the return
+   * walk never looked at, so it is left to the readings below:
+   *  - the handler returns nothing (`void`): it sends through a parameter;
+   *  - the handler returns transport the walk read no body out of, and the
+   *    located expression is not part of what it returns. A body built before
+   *    the response is returned (`const res = send(body); ...; return res`)
+   *    is one. Named on a send that states an error or redirect status, it is
+   *    no success body and the row abstains.
+   */
+  private responseOfDeclaredHandler(
+    request: InferRequestItem,
+    handler: FunctionLike,
+    located: Node,
+    extractionConfig?: ExtractionConfig
+  ): InferredType | null | undefined {
+    const walked = this.buildFunctionReturnInferredType(request, handler, extractionConfig);
+    const returned = this.responseReturnedExpressions(handler);
+    if (walked === null) {
+      // The walk read everything the handler returns and published nothing.
+      // A located expression inside one of those returns was part of that.
+      if (this.returnedSendHolding(returned, located)) {
+        this.log(
+          `Response locator at ${request.file_path}:${request.line_number} names a send ` +
+            'its handler returns, which carries no body a contract can describe; abstaining'
+        );
+        return null;
+      }
+      // Outside the return, it is either a send itself or what one was handed.
+      const sends = [
+        this.peelTransparentExpression(located),
+        this.receivingCallOf(located, () => true),
+      ];
+      const statesNoBody = sends.some((send) => {
+        const status = send ? this.responseSiteStatus(send) : 'undecided';
+        return status === 'error' || status === 'redirect';
+      });
+      if (statesNoBody) {
+        this.log(
+          `Response locator at ${request.file_path}:${request.line_number} names an error ` +
+            'or redirect send and its handler returns no success body; abstaining'
+        );
+        return null;
+      }
+      return undefined;
+    }
+    const text = walked.type_string.trim();
+    if (text === 'void' || text === 'undefined' || text === 'never' || text === '') {
+      return undefined;
+    }
+    const unresolvedCallee = (walked.any_provenance ?? []).some(
+      (entry) => entry.reason === 'no_payload_evidence'
+    );
+    if (!unresolvedCallee) {
+      return walked;
+    }
+
+    const sender = this.returnedSendHolding(returned, located);
+    const identity = sender ? this.calleeIdentity(sender) : undefined;
+    if (identity) {
+      const recovered = this.recoverPayloadFromResponseExpressions(
+        returned,
+        true,
+        this.wireFormatFor(request),
+        new Set([identity])
+      );
+      if (recovered) {
+        this.log(
+          `Return type at ${request.file_path}:${request.line_number} resolves to nothing; ` +
+            'the located payload is an argument of a call the handler returns, so that ' +
+            "call is a response sender and its success bodies are the route's"
+        );
+        return this.inferredFromRecoveredPayload(request, recovered);
+      }
+    }
+    return walked;
+  }
+
+  /**
+   * The call inside one of `returned` that the located expression is, or is
+   * an argument of: the send a located payload was handed to. `undefined`
+   * when the located expression is not part of what the handler returns.
+   */
+  private returnedSendHolding(returned: Node[], located: Node): Node | undefined {
+    const branches = returned.flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    const isReturned = (candidate: Node): boolean =>
+      branches.some(
+        (branch) =>
+          branch.getStart() <= candidate.getStart() && candidate.getEnd() <= branch.getEnd()
+      );
+    const peeled = this.peelTransparentExpression(located);
+    if (
+      (Node.isCallExpression(peeled) || Node.isNewExpression(peeled)) &&
+      branches.includes(peeled)
+    ) {
+      return peeled;
+    }
+    return this.receivingCallOf(located, isReturned);
+  }
+
+  /**
    * True when a located call's own result is the route's payload, so the
    * transitional drill into its first argument must not run (carrick#1732).
    *
@@ -1493,7 +1722,10 @@ export class TypeInferrer {
     if (this.symbolIsLibOrExternalOrigin(element.getSymbol() ?? element.getAliasSymbol())) {
       return false;
     }
-    return this.nodeCarriesPayloadContract(call, false);
+    // Asked of the result as DECLARED. A value of the repo's own that
+    // serialises to a string is still what the route sends, and drilling into
+    // the call that built it would publish what it was built from.
+    return this.nodeCarriesPayloadContract(call, false, false);
   }
 
   /**
@@ -2177,6 +2409,18 @@ export class TypeInferrer {
    * else, and is not reported.
    */
   private statedBodyAtRead(terminal: Node): StatedBody | undefined {
+    const typeNode = this.typeNodeStatedAtRead(terminal);
+    return typeNode ? this.statedRoot(typeNode) : undefined;
+  }
+
+  /**
+   * The type node `statedBodyAtRead` reads, for a caller that wants the
+   * annotation itself: a consumer's response read reports its root, and a
+   * handler's request read prints it (carrick#807). One reading of "stated at
+   * the read" for both, so the two cannot disagree about which annotation
+   * belongs to a read.
+   */
+  private typeNodeStatedAtRead(terminal: Node): Node | undefined {
     const typeNode = this.explicitTypeNodeFromAncestor(terminal);
     const owner = typeNode?.getParent();
     if (!typeNode || !owner || this.leavesAPositionOpen(typeNode)) return undefined;
@@ -2204,7 +2448,7 @@ export class TypeInferrer {
       }
       current = parent;
     }
-    return this.statedRoot(typeNode);
+    return typeNode;
   }
 
   /**
@@ -2402,19 +2646,43 @@ export class TypeInferrer {
       // expression in the body (`c.req.json<T>()`, `req.body as T`).
       const atLine = this.registrationAtLine(sourceFile, request.line_number);
       if (atLine) {
-        const requestType = this.requestContractFromRegistration(
+        const declared = this.declaredRequestContract(
           atLine.registration,
           atLine.handler
         );
-        if (requestType) {
+        if (declared) {
           return this.declaredRequestInferredType(
             request,
-            requestType,
+            declared,
             this.getNodeLocation(atLine.handler)
           );
         }
       }
-      return null;
+      // With no call registering a route on this line, the line is the
+      // handler's own export: all that anchors a route its module's place in
+      // the project states (carrick#807). Either way the body is what the
+      // handler reads off the platform request it was handed, where the
+      // source says what it read.
+      const handler =
+        atLine?.handler ?? this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+      if (!handler) {
+        return null;
+      }
+      const read = this.platformBodyReadIn(handler);
+      const stated = read ? this.requestStatedAtBodyRead(request, read) : null;
+      if (stated) {
+        return stated;
+      }
+      // The first typed read anywhere in the handler is a looser reading, and
+      // is kept only where a registration already had it.
+      const typedRead = atLine ? this.inferRequestReadFromHandler(atLine.handler) : null;
+      return typedRead
+        ? this.declaredRequestInferredType(
+            request,
+            { text: typedRead },
+            this.getNodeLocation(handler)
+          )
+        : null;
     }
 
     // Inline-handler registration (`app.post('/x', async (c) => { … })`) or a
@@ -4588,7 +4856,8 @@ export class TypeInferrer {
   private recoverPayloadFromResponseExpressions(
     expressions: Node[],
     statedOnly: boolean,
-    wire: WireFormat
+    wire: WireFormat,
+    alsoSerialisers?: ReadonlySet<string>
   ): RecoveredPayload | null {
     const candidates: Array<{
       typeString: string;
@@ -4601,7 +4870,12 @@ export class TypeInferrer {
     const returned = expressions.flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
+    // `alsoSerialisers` are callees a caller has its own evidence for
+    // (`calleeIdentity` keys), beside the ones these expressions prove.
     const serialisers = this.calleesProvenSerialiser(returned);
+    for (const identity of alsoSerialisers ?? []) {
+      serialisers.add(identity);
+    }
 
     for (const expression of returned) {
       const payloadNode = this.responseHelperPayloadNode(
@@ -4878,8 +5152,15 @@ export class TypeInferrer {
    *
    * Under `statedOnly` the annotation is the ONLY thing that counts, so an
    * unresolvable callee's arguments never become a contract by accident.
+   *
+   * `asSent` judges the object in the form it is sent in, which is what an
+   * ARGUMENT handed to a sender is asked; see `typeIsObjectShaped`.
    */
-  private nodeCarriesPayloadContract(node: Node, statedOnly: boolean): boolean {
+  private nodeCarriesPayloadContract(
+    node: Node,
+    statedOnly: boolean,
+    asSent = true
+  ): boolean {
     if (this.statedTypeNodeOf(node)) return true;
     if (statedOnly) return false;
 
@@ -4896,24 +5177,36 @@ export class TypeInferrer {
     }
     if (type.getCallSignatures().length > 0) return false;
     if (this.typeIsOrContainsResponseMachinery(type)) return false;
-    return this.typeIsObjectShaped(type, 0);
+    return this.typeIsObjectShaped(type, 0, asSent);
   }
 
-  /** Object, array-of-object, or a union/intersection containing one. */
-  private typeIsObjectShaped(type: Type, depth: number): boolean {
+  /**
+   * Object, array-of-object, or a union/intersection containing one.
+   *
+   * With `asSent` the object is judged in the form it is SENT in
+   * (carrick#1163): a value that declares `toJSON()` travels as what that
+   * returns. A `URL` or a `Date` is therefore the string it serialises to,
+   * the bare primitive this rule already refuses, and `redirect(new URL(path,
+   * base))` hands over a location exactly as `redirect("/next")` does
+   * (carrick#807). A value whose JSON form is itself an object is a body like
+   * any other.
+   */
+  private typeIsObjectShaped(type: Type, depth: number, asSent: boolean): boolean {
     if (depth > 2) return false;
     if (type.isUnion()) {
-      return type.getUnionTypes().some((m) => this.typeIsObjectShaped(m, depth + 1));
+      return type.getUnionTypes().some((m) => this.typeIsObjectShaped(m, depth + 1, asSent));
     }
     if (type.isIntersection()) {
       return type
         .getIntersectionTypes()
-        .some((m) => this.typeIsObjectShaped(m, depth + 1));
+        .some((m) => this.typeIsObjectShaped(m, depth + 1, asSent));
     }
     if (type.isArray()) {
       const element = type.getArrayElementType();
-      return element ? this.typeIsObjectShaped(element, depth + 1) : false;
+      return element ? this.typeIsObjectShaped(element, depth + 1, asSent) : false;
     }
+    const sent = asSent ? jsonWireType(type) : undefined;
+    if (sent) return this.typeIsObjectShaped(sent, depth + 1, asSent);
     return type.isObject() && !type.isTuple();
   }
 
@@ -5844,6 +6137,105 @@ export class TypeInferrer {
   }
 
   /**
+   * The call in a handler that reads the request's body off the platform
+   * request the handler was handed, or `undefined` (carrick#807).
+   *
+   * Read by shape, with no method name consulted:
+   *
+   *  - a call that takes nothing, on a member of a value whose type is request
+   *    machinery (`typeIsFrameworkMachinery`: declared by the platform or an
+   *    installed library, and carrying its body readers);
+   *  - that value is rooted at one of the handler's OWN parameters, named or
+   *    destructured. A response read off an outbound call inside the handler
+   *    (`(await upstream.json()) as Rate`) has the same shape one variable
+   *    away, and is the opposite side of a different exchange;
+   *  - and the call's result, awaited, is `any` or `unknown`: the platform's
+   *    untyped parse. A read that states its own type (`formData()`, a typed
+   *    `json<T>()`) is not this shape and is left to the readers that
+   *    already handle it.
+   *
+   * The first such call in source order: a body is read once.
+   */
+  private platformBodyReadIn(handler: FunctionLike): CallExpression | undefined {
+    const parameters = new Set<Node>(handler.getParameters());
+    const rootedAtParameter = (expression: Node): boolean => {
+      let root = expression;
+      while (
+        Node.isPropertyAccessExpression(root) ||
+        Node.isNonNullExpression(root) ||
+        Node.isParenthesizedExpression(root)
+      ) {
+        root = root.getExpression();
+      }
+      if (!Node.isIdentifier(root)) return false;
+      return (root.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
+        const parameter = Node.isParameterDeclaration(declaration)
+          ? declaration
+          : Node.isBindingElement(declaration)
+            ? declaration.getFirstAncestorByKind(SyntaxKind.Parameter)
+            : undefined;
+        return parameter !== undefined && parameters.has(parameter);
+      });
+    };
+
+    for (const call of handler.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      if (call.getArguments().length > 0) continue;
+      const callee = call.getExpression();
+      if (!Node.isPropertyAccessExpression(callee)) continue;
+      const receiver = callee.getExpression();
+      if (!rootedAtParameter(receiver)) continue;
+      const yielded = this.unwrapPromiseType(call.getType());
+      if (!yielded.isAny() && !yielded.isUnknown()) continue;
+      if (!this.typeIsFrameworkMachinery(receiver.getType())) continue;
+      return call;
+    }
+    return undefined;
+  }
+
+  /**
+   * The request contract the source states AT a body read, or null when it
+   * states none there (carrick#807).
+   *
+   * Three statements count, each of them on the read itself:
+   *
+   *  - a cast on it: `(await request.json()) as NewWidget`;
+   *  - the annotation of the binding it initialises:
+   *    `const input: NewWidget = await request.json()`;
+   *  - a schema the read, or the binding that holds it, is handed to
+   *    (`schemaConsumingRead`): the schema's input is what a caller may send.
+   *
+   * The first two are `typeNodeStatedAtRead`, the reading a consumer's
+   * response read already gets. An annotation further out is not one of them:
+   * `const saved: Saved = await save(await request.json())` types what `save`
+   * returned, and reading it as the body would publish the wrong side of the
+   * handler. Nor is a placeholder (`as unknown`, `Record<string, unknown>`).
+   */
+  private requestStatedAtBodyRead(
+    request: InferRequestItem,
+    read: CallExpression
+  ): InferredType | null {
+    const statedNode = this.typeNodeStatedAtRead(read);
+    const statedText = statedNode ? this.structuralTextFromTypeNode(statedNode) : null;
+    if (statedText) {
+      this.log(
+        `Request at ${request.file_path}:${request.line_number} is the body its handler ` +
+          'reads off the platform request, as the source types that read'
+      );
+      return this.createInferredType(request, statedText, true, this.getNodeLocation(read));
+    }
+
+    const validated = this.schemaConsumingRead(read);
+    if (validated) {
+      this.log(
+        `Request at ${request.file_path}:${request.line_number} is the body its handler ` +
+          "reads off the platform request and validates with a schema; publishing the schema's input"
+      );
+      return this.declaredRequestInferredType(request, validated, this.getNodeLocation(read));
+    }
+    return null;
+  }
+
+  /**
    * Resolve a type-annotation/type-argument node to fully-structural text,
    * dropping any `Promise<…>` wrapper (`c.req.json<T>()` returns `Promise<T>`,
    * but the annotation node is `T` directly; the guard is harmless either way).
@@ -6348,6 +6740,14 @@ export class TypeInferrer {
    * request type resolves `body` to `unknown`/`any`, which the useless-type
    * guard rejects. So a handler that declares nothing yields null and the next
    * anchor runs.
+   *
+   * The member has to be one the route's own annotation can have filled
+   * (carrick#807). The platform `Request` declares `body` too, as the byte
+   * stream every request carries, and so does each library type that extends
+   * it. That is concrete, so it passed the useless-type guard and a handler
+   * taking the platform request published a stream as its request contract,
+   * ahead of the body read inside it. A `body` a library declares with one
+   * fixed type says nothing about this route and is skipped.
    */
   private requestBodyFromHandlerParams(func: FunctionLike): string | null {
     for (const param of func.getParameters()) {
@@ -6358,7 +6758,7 @@ export class TypeInferrer {
         continue;
       }
       const bodySymbol = paramType.getProperty('body');
-      if (!bodySymbol) {
+      if (!bodySymbol || this.memberIsFixedByItsLibrary(bodySymbol)) {
         continue;
       }
       let bodyType: Type;
@@ -6373,6 +6773,47 @@ export class TypeInferrer {
       }
     }
     return null;
+  }
+
+  /**
+   * True when a member is declared by a library, or by the platform, with a
+   * type that names none of its declaring type's parameters: the same type on
+   * every value, whichever route the value belongs to.
+   *
+   * `body: ReqBody` on a request type generic in its body is a slot, and the
+   * handler's annotation fills it. `readonly body: ReadableStream<Uint8Array>
+   * | null` on the platform request is not. A member the repo declares itself
+   * is never fixed in this sense: writing `body: NewWidget` on the handler's
+   * own request type is the annotation, and one declaration of the repo's
+   * among several (an intersection with the platform type) decides it. A
+   * declaration that states no type at all is left to the guards that read
+   * the type.
+   */
+  private memberIsFixedByItsLibrary(member: TsSymbol): boolean {
+    const declarations = member.getDeclarations();
+    if (declarations.length === 0) return false;
+    const program = this.project.getProgram().compilerObject;
+    const imports = externalImportsOf(this.project);
+    return declarations.every((declaration) => {
+      const declaredByLibrary = isExternalOrigin(
+        program,
+        declaration.getSourceFile().compilerNode,
+        this.repoRoot,
+        imports
+      );
+      if (!declaredByLibrary) return false;
+      const typeNode =
+        Node.isPropertySignature(declaration) || Node.isPropertyDeclaration(declaration)
+          ? declaration.getTypeNode()
+          : Node.isGetAccessorDeclaration(declaration)
+            ? declaration.getReturnTypeNode()
+            : undefined;
+      if (!typeNode) return false;
+      const names = [typeNode, ...typeNode.getDescendants()].filter(Node.isIdentifier);
+      return !names.some((name) =>
+        (name.getSymbol()?.getDeclarations() ?? []).some(Node.isTypeParameterDeclaration)
+      );
+    });
   }
 
   /**

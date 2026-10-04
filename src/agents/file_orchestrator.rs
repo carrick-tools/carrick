@@ -4134,40 +4134,61 @@ impl FileOrchestrator {
                     }
                 }
 
-                // File-based routes (Next.js app router, etc.) have no call-site
-                // payload expression: the handler's return type *is* the response
-                // contract (e.g., `export async function GET(): Promise<Response>` or `Promise<NextResponse<User[]>>`, or an
-                // inferred `return new Response(...)`). Their stored span points at
-                // the whole handler declaration, which the response-body locators
-                // would misread as the payload — so request a `FunctionReturn`
-                // anchored on the handler line instead, which the sidecar resolves
-                // via `findFunctionByLine` and Promise-unwraps.
+                // A file-based route has no call that registers it. Its row's
+                // line is the handler's own export, and its stored span is the
+                // whole handler declaration, which a span locator would read
+                // as the payload. So neither side is ever asked by span.
                 //
-                // The request side is a body the handler READS, which no
-                // signature states and no line locates (a line-anchored
-                // request resolves through a registration call this route has
-                // none of). The only anchor is the payload expression a model
-                // that read the file located, folded onto this row at the join
-                // (carrick#1401); `push_infer` abstains when the row carries
-                // none, so a row with no anchor asks nothing and the manifest
-                // entry stays honestly unknown (carrick#1420).
+                // The response is what the handler returns, asked at the
+                // export's line: the sidecar finds the function there, reads a
+                // declared return as the contract, and reads the argument of a
+                // returned send where the return is transport.
+                //
+                // A model that read the file may also have located the payload
+                // the handler sends, folded onto this row at the join
+                // (carrick#1401). On a line that exports the handler the
+                // sidecar answers what the handler returns either way, and
+                // takes the located expression only as evidence that a
+                // returned call it cannot resolve is a response sender
+                // (carrick#807). So the locator can add an answer where the
+                // handler's dependencies are not installed, and cannot change
+                // one. A handler whose RETURN VALUE is the payload states
+                // nothing to locate, and is asked by line.
+                //
+                // The request side is a body the handler READS. The located
+                // payload is asked first. With none, the line is asked: the
+                // sidecar reads the body off the platform request the handler
+                // was handed, where the source types that read (a cast, an
+                // annotated binding, a schema), and answers nothing where it
+                // does not (carrick#807).
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
-                    // Structurally derived endpoints never carry an
-                    // emission_style today, but the no-payload gate must hold
-                    // here too if that ever changes — a no-payload claim is
-                    // about what the handler SENDS, so the response entry
-                    // stays honestly unknown while the request side, which the
-                    // claim says nothing about, is asked for as usual.
+                    // A no-payload claim is about what the handler SENDS, so
+                    // the response entry stays honestly unknown while the
+                    // request side, which the claim says nothing about, is
+                    // asked for as usual.
                     if !no_payload {
-                        // The Line locator is infallible, so no inline-alias
-                        // fallback is needed here.
-                        push_infer(
-                            &file_path_absolute,
-                            line_number,
-                            InferKind::FunctionReturn,
-                            response_alias.clone(),
-                            InferLocator::Line,
-                        );
+                        let located = endpoint.emission_style != Some(EmissionStyle::ReturnValue)
+                            && push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::ResponseBody,
+                                response_alias.clone(),
+                                InferLocator::Text {
+                                    expression_text: endpoint.response_expression_text.as_deref(),
+                                    expression_line: endpoint.response_expression_line,
+                                },
+                            );
+                        if !located {
+                            // The Line locator is infallible, so no
+                            // inline-alias fallback is needed here.
+                            push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::FunctionReturn,
+                                response_alias.clone(),
+                                InferLocator::Line,
+                            );
+                        }
                     }
                     if should_infer_request_body(&method) {
                         let _ = push_infer(
@@ -4179,6 +4200,12 @@ impl FileOrchestrator {
                                 expression_text: endpoint.payload_expression_text.as_deref(),
                                 expression_line: endpoint.payload_expression_line,
                             },
+                        ) || push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Line,
                         );
                     }
                     continue;
@@ -14196,10 +14223,10 @@ export * from "./aFetch.js";"#,
 
     #[test]
     fn test_collect_type_requests_file_based_route_uses_function_return() {
-        // A file-based route endpoint (sentinel owner) carries a handler span but
-        // no call-site payload expression. Its response type must be requested as
-        // a line-anchored FunctionReturn (the handler's return type), NOT a
-        // span/text ResponseBody — which would misread the function declaration.
+        // A file-based route endpoint (sentinel owner) carries a handler span, and
+        // this one no located response expression. Its response type must be
+        // requested as a line-anchored FunctionReturn (the handler's return
+        // type), NOT by span — which would misread the function declaration.
         let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
@@ -14402,15 +14429,78 @@ export * from "./aFetch.js";"#,
     }
 
     #[test]
-    fn test_collect_type_requests_file_based_route_abstains_with_no_payload_anchor() {
-        // No model row for the file, or a fold that carried no payload: there
-        // is no anchor, so the request question is not asked at all rather
-        // than asked about the wrong node. The manifest entry stays honestly
-        // unknown.
+    fn test_collect_type_requests_file_based_route_asks_at_the_line_with_no_payload_anchor() {
+        // No model row for the file, or a fold that carried no payload. The
+        // request is asked at the export's own line, with no span and no
+        // text: the sidecar reads the body off the platform request the
+        // handler was handed where the source types that read, and answers
+        // nothing where it does not (carrick#807). Never by span, which is
+        // the whole declaration.
         let infer = collect_file_route_requests(vec![file_route_endpoint("POST", 7, None)]);
 
-        assert_eq!(infer.len(), 1, "response only, got {infer:?}");
+        assert_eq!(infer.len(), 2, "response and request, got {infer:?}");
+        let request = infer
+            .iter()
+            .find(|item| item.infer_kind == InferKind::RequestBody)
+            .expect("a body-carrying method asks for its request");
+        assert_eq!(request.line_number, 7);
+        assert!(request.expression_text.is_none());
+        assert!(request.span_start.is_none());
+        assert!(request.span_end.is_none());
+        let alias = request.alias.as_deref().unwrap_or_default();
+        assert!(alias.contains("Request"), "alias was {alias}");
+        assert!(
+            infer
+                .iter()
+                .any(|item| item.infer_kind == InferKind::FunctionReturn)
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_sends_the_located_response() {
+        // A model's reading of the file located the payload the handler
+        // sends, and the fold carried it onto the row (carrick#1401). It goes
+        // out with the response question, on the export's own line: the
+        // sidecar answers what the handler returns and uses the located
+        // expression as evidence only (carrick#807). One question per alias,
+        // so the line-only FunctionReturn is not sent beside it.
+        let located = EndpointResult {
+            response_expression_text: Some("widgets".to_string()),
+            response_expression_line: Some(9),
+            emission_style: Some(EmissionStyle::ImperativeSend),
+            ..file_route_endpoint("GET", 7, None)
+        };
+        let infer = collect_file_route_requests(vec![located]);
+
+        assert_eq!(infer.len(), 1, "one response question, got {infer:?}");
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::ResponseBody);
+        assert_eq!(item.line_number, 7);
+        assert_eq!(item.expression_text.as_deref(), Some("widgets"));
+        assert_eq!(item.expression_line, Some(9));
+        assert!(item.span_start.is_none());
+        assert!(item.span_end.is_none());
+        let alias = item.alias.as_deref().unwrap_or_default();
+        assert!(alias.contains("Response"), "alias was {alias}");
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_asks_a_returned_payload_by_line() {
+        // A handler whose RETURN VALUE is the payload has no send to locate:
+        // the expression the model reported is the value itself, and the
+        // handler's return type is the question, asked by line as before.
+        let returned = EndpointResult {
+            response_expression_text: Some("widgets".to_string()),
+            response_expression_line: Some(9),
+            emission_style: Some(EmissionStyle::ReturnValue),
+            ..file_route_endpoint("GET", 7, None)
+        };
+        let infer = collect_file_route_requests(vec![returned]);
+
+        assert_eq!(infer.len(), 1, "one response question, got {infer:?}");
         assert_eq!(infer[0].infer_kind, InferKind::FunctionReturn);
+        assert!(infer[0].expression_text.is_none());
+        assert!(infer[0].span_start.is_none());
     }
 
     /// A route emitted from a controller class, in the shape both controller
