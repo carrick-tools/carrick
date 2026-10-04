@@ -11,8 +11,10 @@
  *
  * The inference now records what each such name meant (`printed_names`), and
  * the capture imports the name from the module that declares it, when that
- * module is inside the repo. A name recorded for two declarations is left as
- * written: the text no longer says which one a position meant.
+ * module is inside the repo, or inside an installed package the surface entry
+ * reaches (carrick#1855, `capture-v2-printed-names-package.test.ts`). A name
+ * recorded for two declarations is left as written: the text no longer says
+ * which one a position meant.
  *
  * The capture's own self-check is not the oracle here; the test reads the
  * stub's surface with the compiler.
@@ -124,7 +126,7 @@ describe('capture imports a printed name from the declaration the inference name
           { name: 'Status', file: model, export_path: ['Status'] },
           { name: 'Status', file: legacy, export_path: ['Status'] },
         ]),
-        // A package's type: the stub ships no node_modules (#1789's class).
+        // A package's type is imported by the package's name (#1855).
         literal('Endpoint_package_Response', '{ ext: Ext; }', [
           { name: 'Ext', file: path.join(repoDir, 'node_modules', 'kit', 'index.d.ts'), export_path: ['Ext'] },
         ]),
@@ -218,8 +220,8 @@ describe('capture imports a printed name from the declaration the inference name
     assert.match(surfaceText, /export type Endpoint_ambiguous_Response = \{ status: Status; \};/);
   });
 
-  it('a package type is not imported by path', () => {
-    assert.match(surfaceText, /export type Endpoint_package_Response = \{ ext: Ext; \};/);
+  it('a package type is imported by the package name, never by path', () => {
+    assert.match(surfaceText, /export type Endpoint_package_Response = \{ ext: import\("kit"\)\.Ext; \};/);
     assert.ok(!surfaceText.includes('node_modules'), surfaceText);
   });
 
@@ -236,6 +238,6 @@ describe('capture imports a printed name from the declaration the inference name
       .filter((d) => d.code === 2304 || d.code === 2503 || d.code === 2552)
       .map((d) => /Cannot find (?:name|namespace) '([^']+)'/.exec(d.text)?.[1] ?? d.text)
       .sort();
-    assert.deepStrictEqual(unresolved, ['Ext', 'Status', 'Status', 'Status']);
+    assert.deepStrictEqual(unresolved, ['Status', 'Status', 'Status']);
   });
 });

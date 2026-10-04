@@ -589,9 +589,10 @@ function substituteUndeclaredNamesInText(
  * carrick#1836: a name the source file cannot see at all was printed without
  * its scope (the inferrer's structural printer writes names bare). When the
  * inference recorded one declaration for it (`printed`), the name is imported
- * from that declaration's module, under the same repo rule. A name recorded
- * for two declarations is left as written: the text no longer says which one
- * a position meant.
+ * from that declaration's module: under the same repo rule, or (carrick#1855)
+ * under the same package rule when an installed package declares it. A name
+ * recorded for two declarations is left as written: the text no longer says
+ * which one a position meant.
  *
  * Returns the rewritten text, or undefined when nothing was rewritten, so a
  * text with no such name stays byte-identical.
@@ -648,7 +649,7 @@ function qualifyNamesFromSource(
       if (chosen) found = { spec, exportPath: [chosen.getName()] };
     }
     if (!found && atSource) found = packageImportOf(program, atSource, args.resolveFromEntry);
-    if (!found && !atSource) found = printedImportOf(program, name, printed, specOf);
+    if (!found && !atSource) found = printedImportOf(program, name, printed, specOf, args.resolveFromEntry);
     imports.set(name, found);
     return found;
   };
@@ -763,9 +764,7 @@ function packageImportOf(
   const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
   const moduleFile = moduleSymbol?.declarations?.find(ts.isSourceFile);
   if (!moduleSymbol || !moduleFile) return undefined;
-  const installed = installedPackageSpecifier(moduleFile.fileName, exportName);
-  const fromEntry = installed && resolveFromEntry(installed.specifier);
-  if (!fromEntry || realPath(fromEntry) !== realPath(moduleFile.fileName)) return undefined;
+  if (!entryReachesPackageFile(moduleFile.fileName, exportName, resolveFromEntry)) return undefined;
 
   const spec = moduleFile.fileName;
   const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
@@ -774,27 +773,59 @@ function packageImportOf(
 }
 
 /**
+ * The package gate (carrick#1789): `file` lies inside an installed package,
+ * and the bare specifier that package gives it resolves from the surface entry
+ * to that same file. `importedName` is the first name read off the import.
+ *
+ * So a module the repo links in (no installed copy to pin), a file the
+ * package's `exports` do not reach, a package the entry cannot resolve by
+ * name, and another installed copy than the one the entry reaches all fail.
+ */
+function entryReachesPackageFile(
+  file: string,
+  importedName: string | undefined,
+  resolveFromEntry: (specifier: string) => string | undefined
+): boolean {
+  const installed = installedPackageSpecifier(file, importedName);
+  const fromEntry = installed && resolveFromEntry(installed.specifier);
+  return fromEntry !== undefined && realPath(fromEntry) === realPath(file);
+}
+
+/**
  * carrick#1836: the import for `name` from the one declaration the inference
  * recorded printing it for, or undefined.
  *
+ * The recorded module is named by its entry-relative path when it is inside
+ * the repo (`specOf`). carrick#1855: a module inside an installed package is
+ * named by its file path when it passes the package gate, as a name the
+ * source imports from a package is (`packageImportOf`); the specifier rewrite
+ * turns that path into the package's bare specifier and a pin.
+ *
  * Undefined when the name was recorded for no declaration or for several,
- * when the recorded module is not in this program or not inside the repo
- * (`specOf`), and when its export path does not lead to a type there: a record
- * that does not check out names nothing, and the text stays as written.
+ * when the recorded module is not in this program, is neither inside the repo
+ * nor reachable in an installed package, and when its export path is empty or
+ * does not lead to a type there: a record that does not check out names
+ * nothing, and the text stays as written.
  */
 function printedImportOf(
   program: ts.Program,
   name: string,
   printed: readonly PrintedName[] | undefined,
-  specOf: (file: ts.SourceFile) => string | undefined
+  specOf: (file: ts.SourceFile) => string | undefined,
+  resolveFromEntry: ((specifier: string) => string | undefined) | undefined
 ): ImportedName | undefined {
   const recorded = (printed ?? []).filter((entry) => entry.name === name);
   const identities = new Set(recorded.map((entry) => `${entry.file}\0${entry.export_path.join('.')}`));
   if (identities.size !== 1) return undefined;
   const entry = recorded[0];
   const declaring = program.getSourceFile(entry.file);
-  const spec = declaring && specOf(declaring);
-  if (!declaring || !spec) return undefined;
+  if (!declaring || entry.export_path.length === 0) return undefined;
+  const spec =
+    specOf(declaring) ??
+    (resolveFromEntry && entryReachesPackageFile(declaring.fileName, entry.export_path[0], resolveFromEntry)
+      ? declaring.fileName
+      : undefined);
+  if (!spec) return undefined;
   const checker = program.getTypeChecker();
   let current = checker.getSymbolAtLocation(declaring);
   for (const part of entry.export_path) {
