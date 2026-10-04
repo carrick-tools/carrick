@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.107](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.106...carrick-v0.3.107) (2026-10-04)
+
+
+### Features
+
+* **scanner:** a scan keeps the machine from idle-sleeping until it ends, says so once, and can be told not to ([#1889](https://github.com/carrick-tools/carrick/issues/1889)) ([#1937](https://github.com/carrick-tools/carrick/issues/1937)) ([517571e](https://github.com/carrick-tools/carrick/commit/517571e29305bbc054a8744f35e2a4085dfeb364))
+
+
+### Bug Fixes
+
+* **scanner:** a capacity refusal costs a file no attempt while its route's refusal budget lasts ([#1893](https://github.com/carrick-tools/carrick/issues/1893)) ([#1908](https://github.com/carrick-tools/carrick/issues/1908)) ([d686981](https://github.com/carrick-tools/carrick/commit/d68698164aefb325ac46cc78555a6e9ebd0d5e2f))
+* **scanner:** a consumer response whose source states a generic body is anchored at the outer named type ([#1863](https://github.com/carrick-tools/carrick/issues/1863)) ([1f3577c](https://github.com/carrick-tools/carrick/commit/1f3577cd8b9198cfdb45f56b4012705fd9daeb06)), closes [#1817](https://github.com/carrick-tools/carrick/issues/1817)
+* **scanner:** a file whose answer does not fit one response is asked in parts ([#1898](https://github.com/carrick-tools/carrick/issues/1898)) ([#1939](https://github.com/carrick-tools/carrick/issues/1939)) ([d865523](https://github.com/carrick-tools/carrick/commit/d8655238b8e0787b8eccde812bfa31db47de8d4e))
+* **scanner:** a git checkout inside a service is not scanned as part of it, so a worktree copy of the repository is neither analysed nor indexed again ([#1902](https://github.com/carrick-tools/carrick/issues/1902)) ([#1906](https://github.com/carrick-tools/carrick/issues/1906)) ([6bad9a2](https://github.com/carrick-tools/carrick/commit/6bad9a2a3bb2120b7da9f4541e59c581f89dbe6f))
+* **scanner:** a last attempt the gateway cut is collected, and a file whose answer is final is not asked for again ([#1897](https://github.com/carrick-tools/carrick/issues/1897)) ([#1920](https://github.com/carrick-tools/carrick/issues/1920)) ([da43014](https://github.com/carrick-tools/carrick/commit/da43014e08fb02a408d8e37bc3a97d59ea76a26a))
+* **scanner:** a rescan states an event-bus call and a socket emit once, as the cold scan does ([#1874](https://github.com/carrick-tools/carrick/issues/1874)) ([#1879](https://github.com/carrick-tools/carrick/issues/1879)) ([05bda35](https://github.com/carrick-tools/carrick/commit/05bda35903b1e0c07ce804c9f17c956a0c68af2b))
+* **scanner:** a service's walk leaves out the services nested in it ([#553](https://github.com/carrick-tools/carrick/issues/553)) ([#1867](https://github.com/carrick-tools/carrick/issues/1867)) ([34258aa](https://github.com/carrick-tools/carrick/commit/34258aaad953be4530ac6e13ebb80474c46cb2f6))
+* **scanner:** an anchor the inference fills states where its type is declared ([#1885](https://github.com/carrick-tools/carrick/issues/1885)) ([f2ce2cb](https://github.com/carrick-tools/carrick/commit/f2ce2cb0bfada86a0f855cd32ccc3ec1e3771637)), closes [#1819](https://github.com/carrick-tools/carrick/issues/1819)
+* **scanner:** one git repository is one repository to workspace detection, whatever package directories it holds ([#1858](https://github.com/carrick-tools/carrick/issues/1858)) ([#1871](https://github.com/carrick-tools/carrick/issues/1871)) ([08090cc](https://github.com/carrick-tools/carrick/commit/08090cca6a83aa6ec33cd9ff45ba54c0593f155a))
+* **scanner:** the retry of owed work waits only for what the model refused for capacity ([#1896](https://github.com/carrick-tools/carrick/issues/1896)) ([#1905](https://github.com/carrick-tools/carrick/issues/1905)) ([8207bb9](https://github.com/carrick-tools/carrick/commit/8207bb9808fe903feec7969df9bf1fa1ad38c55f))
+* **scanner:** the type requests go out in file order, so two scans write the bundle and the capture stub in one order ([#1876](https://github.com/carrick-tools/carrick/issues/1876)) ([#1886](https://github.com/carrick-tools/carrick/issues/1886)) ([90dc621](https://github.com/carrick-tools/carrick/commit/90dc621b06cd89e2b98eb243339631ced0a1760a))
+* **scanner:** two scans of one tree upload the same bytes: the blob's maps are written with their keys sorted ([#1847](https://github.com/carrick-tools/carrick/issues/1847)) ([#1878](https://github.com/carrick-tools/carrick/issues/1878)) ([d44d7b0](https://github.com/carrick-tools/carrick/commit/d44d7b00fbae8aa67cf57a91abccd60181430c65))
+* **sidecar:** a body read taken in place on the call's value is the call's payload ([#1851](https://github.com/carrick-tools/carrick/issues/1851)) ([#1883](https://github.com/carrick-tools/carrick/issues/1883)) ([c26d8e0](https://github.com/carrick-tools/carrick/commit/c26d8e0058158909ace5f4ebed6206bb2297eabf))
+* **sidecar:** a call's result holds what await yields for the call's type ([#1877](https://github.com/carrick-tools/carrick/issues/1877)) ([#1888](https://github.com/carrick-tools/carrick/issues/1888)) ([9708e0e](https://github.com/carrick-tools/carrick/commit/9708e0ed6c2d9da679e163f9cc7cb2f5b16c983b))
+* **sidecar:** a capture runs in a fresh sidecar process, is asked again if that process dies, and says why it failed ([#1916](https://github.com/carrick-tools/carrick/issues/1916), [#1921](https://github.com/carrick-tools/carrick/issues/1921)) ([#1931](https://github.com/carrick-tools/carrick/issues/1931)) ([9699c6b](https://github.com/carrick-tools/carrick/commit/9699c6b94d7e911bb37efd2614709351368c1b70))
+* **sidecar:** a timed-out operation stops its sidecar, and a deadline measures silence ([#1914](https://github.com/carrick-tools/carrick/issues/1914)) ([#1919](https://github.com/carrick-tools/carrick/issues/1919)) ([2cf148d](https://github.com/carrick-tools/carrick/commit/2cf148d95921092e490763cecf40587b81c7af35))
+* **sidecar:** a wrapper rule that names a type alias unwraps it ([#1843](https://github.com/carrick-tools/carrick/issues/1843)) ([#1861](https://github.com/carrick-tools/carrick/issues/1861)) ([d6c032d](https://github.com/carrick-tools/carrick/commit/d6c032d84ac724289dff49e925aa70dda760e6e3))
+* **sidecar:** every path that names an anchor symbol reports the file that declares it ([#1819](https://github.com/carrick-tools/carrick/issues/1819)) ([#1887](https://github.com/carrick-tools/carrick/issues/1887)) ([a63f82d](https://github.com/carrick-tools/carrick/commit/a63f82d2ce0161505492676984a5f3ef995c0379))
+* **sidecar:** partial-emit recovery keeps an alias whose path names a module the stub resolves ([#1773](https://github.com/carrick-tools/carrick/issues/1773)) ([#1856](https://github.com/carrick-tools/carrick/issues/1856)) ([c8aa29e](https://github.com/carrick-tools/carrick/commit/c8aa29ecc298a136ad4cc948b8bd17f475cc361f))
+* **sidecar:** the signature pass finds each function from a per-file index and is sent in batches ([#1915](https://github.com/carrick-tools/carrick/issues/1915)) ([#1932](https://github.com/carrick-tools/carrick/issues/1932)) ([0bc23fa](https://github.com/carrick-tools/carrick/commit/0bc23fa94cd3630d2360280b0f95bbe7d43d29fb))
+* **sidecar:** the surface entry names an anchor's module in a form the entry resolves ([#1911](https://github.com/carrick-tools/carrick/issues/1911)) ([#1918](https://github.com/carrick-tools/carrick/issues/1918)) ([ec2edc2](https://github.com/carrick-tools/carrick/commit/ec2edc2a959a996a30156a61e2e812b43495c061))
+
 ## [0.3.106](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.105...carrick-v0.3.106) (2026-10-03)
 
 
