@@ -113,6 +113,89 @@ fn retry_exhausted_message(action: &str, transient_error: &str, attempts: u32) -
 /// a large monorepo measured past 10 MB after #483.
 pub(crate) const INLINE_PAYLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
+/// The most files one write names in `unanalysed_files` (carrick#1955).
+///
+/// The cloud refuses a longer list as malformed, `400 validation_failed`,
+/// which is not sent again, so a service that lost more files than this
+/// reached no index at all where it should have landed pending. The rule is
+/// the cloud's: `MAX_UNANALYSED_FILES` in carrick-cloud
+/// `lambdas/check-or-upload/laptop_upload.js`, which calls the list a
+/// diagnostic and not a payload. What the cloud reads of it is whether it is
+/// empty (the first-scan partial rule), how long it is (a log line and the
+/// record of a refused write), and the entries it echoes back. Nothing there
+/// needs every entry, so a list cut to the bound decides the write exactly as
+/// the whole one would.
+///
+/// The count goes beside the list as `unanalysed_total`, and the cloud
+/// answers the same key on its 200 partial and its 409 (carrick-cloud
+/// `docs/internal/reference/laptop-scan-seam.md` §4). The list is cut for
+/// every cloud: one that reads the count still takes no more entries.
+pub(crate) const MAX_UNANALYSED_FILES_SENT: usize = 500;
+
+/// What a write says about the files its service lost.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LostFilesSent {
+    /// The files it names, `unanalysed_files` on the body. `None` when the
+    /// service lost none.
+    named: Option<Vec<UnanalysedFile>>,
+    /// How many the service lost, `unanalysed_total` on the body, and only
+    /// when the write names fewer than that. The cloud's write actions read
+    /// the body field by field and refuse no key they do not know, so a
+    /// cloud that has never heard of this one ignores it.
+    total: Option<usize>,
+}
+
+/// A count as an answer may carry it: a whole number, or nothing. A cloud
+/// that does not send the key, and anything that is not a whole number, read
+/// as nothing, so an answer is never refused over its count.
+fn whole_number_or_nothing<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok()))
+}
+
+/// What a write sends of `lost`, the files its service lost
+/// ([`MAX_UNANALYSED_FILES_SENT`]).
+///
+/// A list within the bound goes exactly as it is, so such a write's body is
+/// byte for byte what it was. A longer one is put in path order, so that
+/// every write of a run names the same files, cut to the bound, and sent with
+/// the true total beside it.
+fn lost_files_to_send(mut lost: Vec<UnanalysedFile>) -> LostFilesSent {
+    if lost.is_empty() {
+        return LostFilesSent::default();
+    }
+    if lost.len() <= MAX_UNANALYSED_FILES_SENT {
+        return LostFilesSent {
+            named: Some(lost),
+            total: None,
+        };
+    }
+    let total = lost.len();
+    lost.sort_by(|a, b| a.path.cmp(&b.path));
+    lost.truncate(MAX_UNANALYSED_FILES_SENT);
+    LostFilesSent {
+        named: Some(lost),
+        total: Some(total),
+    }
+}
+
+/// The line a run prints when a write names fewer files than its service
+/// lost: how many there are, how many it names and why, and where the rest
+/// are named.
+fn lost_files_cut_line(service: &str, total: usize) -> String {
+    format!(
+        "{service} has {total} files with no analysis. Its upload names the first \
+         {MAX_UNANALYSED_FILES_SENT} by path, the most Carrick Cloud takes, and states the total. \
+         This run's log names each one."
+    )
+}
+
 fn retry_backoff(retries_so_far: u32) -> Duration {
     // 2s, 4s, 8s
     Duration::from_secs(2u64 << retries_so_far)
@@ -138,6 +221,11 @@ struct RefusalBody {
     /// exactly which files the cloud would not accept.
     #[serde(default)]
     unanalysed_files: Option<Vec<UnanalysedFile>>,
+    /// How many files the refused write stood for, when the cloud says so
+    /// (carrick#1955). The echoed list holds at most the first
+    /// [`MAX_UNANALYSED_FILES_SENT`] of them.
+    #[serde(default, deserialize_with = "whole_number_or_nothing")]
+    unanalysed_total: Option<usize>,
 }
 
 impl RefusalBody {
@@ -163,14 +251,30 @@ fn refusal_message(status: reqwest::StatusCode, body: &str) -> String {
     // `partial_refused` echoes the list it would not accept. Naming the files
     // is the difference between "re-run the scan" and "re-run the scan and
     // watch these", so the refusal carries them rather than only its code.
+    //
+    // The echo is the list the write sent, and a write names no more than
+    // [`MAX_UNANALYSED_FILES_SENT`] files (carrick#1955). The count is the
+    // one the cloud answers beside it. A cloud that answers none leaves the
+    // echo to count: one of exactly that many may stand for more, so its
+    // count is a floor and is worded as one.
     if let Some(files) = refusal.unanalysed_files.filter(|f| !f.is_empty()) {
         let named: Vec<&str> = files.iter().take(5).map(|f| f.path.as_str()).collect();
+        let stated = refusal
+            .unanalysed_total
+            .filter(|total| *total >= files.len());
+        let total = stated.unwrap_or(files.len());
+        let at_least = if stated.is_none() && files.len() >= MAX_UNANALYSED_FILES_SENT {
+            "At least "
+        } else {
+            ""
+        };
         message.push_str(&format!(
-            ". {} file(s) had no analysis: {}{}",
-            files.len(),
+            ". {}{} file(s) had no analysis: {}{}",
+            at_least,
+            total,
             named.join(", "),
-            if files.len() > named.len() {
-                format!(" and {} more", files.len() - named.len())
+            if total > named.len() {
+                format!(" and {} more", total - named.len())
             } else {
                 String::new()
             }
@@ -214,26 +318,45 @@ fn report_partial_acceptance(response: &WriteActionResponse, data: &CloudRepoDat
     if response.partial != Some(true) {
         return;
     }
-    let files = response.unanalysed_files.as_deref().unwrap_or_default();
-    let named: Vec<&str> = files.iter().take(3).map(|f| f.path.as_str()).collect();
-    let and_more = if files.len() > named.len() {
-        format!(" and {} more", files.len() - named.len())
+    let losses = crate::scan_health::service_losses(data.service_name.as_deref());
+    warn!(
+        "{}",
+        partial_acceptance_line(
+            data.service_name.as_deref().unwrap_or(&data.repo_name),
+            response.unanalysed_files.as_deref().unwrap_or_default(),
+            // The cloud's own count of what it accepted, when it answers
+            // one; the service's own for a cloud that does not.
+            response.unanalysed_total.unwrap_or(losses.files),
+            &partial_acceptance_advice(losses),
+        )
+    );
+}
+
+/// The sentence for an index the cloud accepted without some of its files.
+///
+/// `echoed` is the list the cloud took, and `lost` is how many files the
+/// index is missing. The two differ when the write named fewer than its
+/// service lost ([`MAX_UNANALYSED_FILES_SENT`]), and then the count is
+/// `lost`: the index is missing every one of them, not only the ones the
+/// write named (carrick#1955).
+fn partial_acceptance_line(
+    service: &str,
+    echoed: &[UnanalysedFile],
+    lost: usize,
+    advice: &str,
+) -> String {
+    let total = lost.max(echoed.len());
+    let named: Vec<&str> = echoed.iter().take(3).map(|f| f.path.as_str()).collect();
+    let and_more = if total > named.len() {
+        format!(" and {} more", total - named.len())
     } else {
         String::new()
     };
-    let service = data.service_name.as_deref().unwrap_or(&data.repo_name);
-    warn!(
-        "Carrick indexed {} without {} file(s) the model did not answer for ({}{}). \
-         This was accepted because {} had no index yet. {}",
-        service,
-        files.len(),
+    format!(
+        "Carrick indexed {service} without {total} file(s) the model did not answer for \
+         ({}{and_more}). This was accepted because {service} had no index yet. {advice}",
         named.join(", "),
-        and_more,
-        service,
-        partial_acceptance_advice(crate::scan_health::service_losses(
-            data.service_name.as_deref()
-        ))
-    );
+    )
 }
 
 /// What to do about the files a partial index landed without: run the scan
@@ -485,9 +608,17 @@ struct LambdaRequest {
     /// with no hosted rows accepts the partial index and echoes the list back,
     /// one that already has rows refuses with `409 partial_refused`. Omitted
     /// when empty, and never sent on the CI path where the scanner's own gate
-    /// already stopped the run (§4).
+    /// already stopped the run (§4). It names at most
+    /// [`MAX_UNANALYSED_FILES_SENT`] files, which is the most the cloud takes.
     #[serde(skip_serializing_if = "Option::is_none")]
     unanalysed_files: Option<Vec<UnanalysedFile>>,
+    /// How many files the service lost, when `unanalysed_files` names fewer
+    /// than that (carrick#1955). Omitted on every other write, so a body
+    /// whose list is whole is byte for byte what it was. A cloud that does
+    /// not read it ignores it: the write actions read the body field by
+    /// field and refuse no unknown key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unanalysed_total: Option<usize>,
     /// The last write action of the run, which is what releases the cloud's
     /// in-flight scan slot. A multi-service repo sends N write actions and
     /// only this one carries it; absent, the slot falls to its TTL.
@@ -731,6 +862,12 @@ struct WriteActionResponse {
     /// the server took rather than what the scanner sent.
     #[serde(default)]
     unanalysed_files: Option<Vec<UnanalysedFile>>,
+    /// How many files the accepted index is missing, when the cloud says so
+    /// (carrick#1955): the count the write sent, where the echoed list holds
+    /// at most the first [`MAX_UNANALYSED_FILES_SENT`] of them. Absent from
+    /// a cloud that does not read the count.
+    #[serde(default, deserialize_with = "whole_number_or_nothing")]
+    unanalysed_total: Option<usize>,
     /// What this scan cost, on the write action that carried `scan_final` and
     /// on a `cli` credential only (carrick-cloud#806/#813). Absent on every
     /// other response, including every CI upload, and on a cloud deployed
@@ -982,12 +1119,27 @@ impl AwsStorage {
     ///
     /// Only the files of the service this payload is: the cloud's partial rule
     /// is decided per row (see [`crate::scan_health::unanalysed_files_for`]).
-    fn unanalysed_files(&self, data: &CloudRepoData) -> Option<Vec<UnanalysedFile>> {
+    ///
+    /// Never more of them than the cloud takes ([`lost_files_to_send`]). A
+    /// write that names fewer than its service lost says so on the terminal
+    /// and in the run's log.
+    fn unanalysed_files(&self, data: &CloudRepoData) -> LostFilesSent {
         if !self.auth.is_bearer() {
-            return None;
+            return LostFilesSent::default();
         }
-        let lost = crate::scan_health::unanalysed_files_for(data.service_name.as_deref());
-        (!lost.is_empty()).then_some(lost)
+        let sent = lost_files_to_send(crate::scan_health::unanalysed_files_for(
+            data.service_name.as_deref(),
+        ));
+        if let Some(total) = sent.total {
+            warn!(
+                "{}",
+                lost_files_cut_line(
+                    data.service_name.as_deref().unwrap_or(&data.repo_name),
+                    total
+                )
+            );
+        }
+        sent
     }
 
     /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
@@ -1328,6 +1480,7 @@ impl AwsStorage {
         staged: Option<&StagedPayload>,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
+        let lost = self.unanalysed_files(data);
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
             repo: data.repo_name.clone(),
@@ -1342,7 +1495,8 @@ impl AwsStorage {
             payload_size: staged.map(|s| s.size),
             force_reindex: self.forces_reindex().then_some(true),
             scan_id: self.scan_id(),
-            unanalysed_files: self.unanalysed_files(data),
+            unanalysed_files: lost.named,
+            unanalysed_total: lost.total,
             scan_final: final_in_run.then_some(true),
             pending_services: self.pending_services_on(final_in_run),
         };
@@ -1893,6 +2047,7 @@ impl CloudStorage for AwsStorage {
             // cloud to accept or refuse, and the slot is not released by a
             // check.
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -1915,6 +2070,7 @@ impl CloudStorage for AwsStorage {
                 self.upload_to_s3(&upload_url, bundled_types).await?;
 
                 // Step 3: Complete the upload by storing metadata
+                let lost = self.unanalysed_files(data);
                 let complete_request = LambdaRequest {
                     action: "complete-upload".to_string(),
                     repo: repo.clone(),
@@ -1929,7 +2085,8 @@ impl CloudStorage for AwsStorage {
                     payload_size: staged.as_ref().map(|s| s.size),
                     force_reindex: self.forces_reindex().then_some(true),
                     scan_id: self.scan_id(),
-                    unanalysed_files: self.unanalysed_files(data),
+                    unanalysed_files: lost.named,
+                    unanalysed_total: lost.total,
                     scan_final: final_in_run.then_some(true),
                     pending_services: self.pending_services_on(final_in_run),
                 };
@@ -1984,6 +2141,7 @@ impl CloudStorage for AwsStorage {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -2354,6 +2512,7 @@ impl CloudStorage for AwsStorage {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -2588,6 +2747,7 @@ mod tests {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -2686,6 +2846,7 @@ mod tests {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -2728,6 +2889,7 @@ mod tests {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -3318,6 +3480,7 @@ mod tests {
             force_reindex: None,
             scan_id: None,
             unanalysed_files: None,
+            unanalysed_total: None,
             scan_final: None,
             pending_services: None,
         };
@@ -3347,6 +3510,442 @@ mod tests {
         assert_eq!(v["pending_services"], serde_json::json!(["billing"]));
         assert_eq!(v["unanalysed_files"][0]["path"], "src/a.ts");
         assert_eq!(v["unanalysed_files"][0]["reason"], "model_error");
+        assert!(
+            v.get("unanalysed_total").is_none(),
+            "a list that names every file states no total: {v}"
+        );
+    }
+
+    /// The cloud's bound on `unanalysed_files`, copied from carrick-cloud
+    /// `lambdas/check-or-upload/laptop_upload.js` (`MAX_UNANALYSED_FILES`).
+    /// Kept apart from [`MAX_UNANALYSED_FILES_SENT`] on purpose: this is the
+    /// rule the deployed cloud applies, and that is what the scanner sends.
+    /// If the cloud's number moves, this one is the copy to move with it.
+    const CLOUD_MAX_UNANALYSED_FILES: usize = 500;
+
+    /// The cloud's validation of a write body's `unanalysed_files`, as
+    /// `normalizeUnanalysedFiles` in that file states it: absent or null is
+    /// no list; anything else must be an array of at most
+    /// [`CLOUD_MAX_UNANALYSED_FILES`] entries, each an object with a
+    /// non-empty `path` string. `reason` is taken as it comes. A body that
+    /// fails it is answered `400 validation_failed`. `Ok` is how many files
+    /// the cloud reads.
+    fn the_clouds_rule_for_unanalysed_files(body: &serde_json::Value) -> Result<usize, String> {
+        let raw = match body.get("unanalysed_files") {
+            None | Some(serde_json::Value::Null) => return Ok(0),
+            Some(raw) => raw,
+        };
+        let entries = raw
+            .as_array()
+            .ok_or("unanalysed_files must be an array of { path, reason }")?;
+        if entries.len() > CLOUD_MAX_UNANALYSED_FILES {
+            return Err(format!(
+                "unanalysed_files may not exceed {CLOUD_MAX_UNANALYSED_FILES} entries"
+            ));
+        }
+        for entry in entries {
+            let object = entry
+                .as_object()
+                .ok_or("unanalysed_files must be an array of { path, reason }")?;
+            let path = object.get("path").and_then(|path| path.as_str());
+            if path.is_none_or(|path| path.trim().is_empty()) {
+                return Err("every unanalysed_files entry needs a non-empty path".to_string());
+            }
+        }
+        Ok(entries.len())
+    }
+
+    /// `count` lost files of one service, in the order a run records them,
+    /// which is the order their calls ended in and not the order of their
+    /// paths.
+    fn lost_files(count: usize) -> Vec<UnanalysedFile> {
+        (0..count)
+            .rev()
+            .map(|i| UnanalysedFile {
+                path: format!("src/routes/r{i:04}.ts"),
+                reason: "model_error".to_string(),
+            })
+            .collect()
+    }
+
+    /// The body of a write for a service that lost `lost`, as it goes on the
+    /// wire.
+    fn write_body_for(lost: Vec<UnanalysedFile>) -> serde_json::Value {
+        let sent = lost_files_to_send(lost);
+        serde_json::to_value(LambdaRequest {
+            action: "store-metadata".to_string(),
+            repo: "r".to_string(),
+            service_name: Some("api".to_string()),
+            hash: "h".to_string(),
+            filename: "types.d.ts".to_string(),
+            cloud_repo_data: None,
+            s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
+            force_reindex: None,
+            scan_id: Some("scan_01J".to_string()),
+            unanalysed_files: sent.named,
+            unanalysed_total: sent.total,
+            scan_final: Some(true),
+            pending_services: Some(vec!["api".to_string()]),
+        })
+        .unwrap()
+    }
+
+    /// carrick#1955: a service that owes more files than the cloud takes in
+    /// one list still sends a write the cloud accepts. At 501 and at 1,000
+    /// owed files the body passes the cloud's rule, names the first 500 by
+    /// path and states the true total beside them. The whole list would have
+    /// been answered `400 validation_failed`, and the service would have
+    /// reached no index.
+    #[test]
+    fn a_write_for_more_lost_files_than_the_cloud_takes_passes_the_clouds_rule() {
+        for owed in [501, 1000] {
+            let whole = serde_json::json!({ "unanalysed_files": lost_files(owed) });
+            assert_eq!(
+                the_clouds_rule_for_unanalysed_files(&whole),
+                Err("unanalysed_files may not exceed 500 entries".to_string()),
+                "the rule this test copies no longer refuses {owed} entries"
+            );
+
+            let body = write_body_for(lost_files(owed));
+            assert_eq!(
+                the_clouds_rule_for_unanalysed_files(&body),
+                Ok(CLOUD_MAX_UNANALYSED_FILES),
+                "{owed} owed files"
+            );
+            assert_eq!(body["unanalysed_total"], owed);
+            let named: Vec<&str> = body["unanalysed_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["path"].as_str().unwrap())
+                .collect();
+            let mut first_by_path: Vec<String> =
+                lost_files(owed).into_iter().map(|file| file.path).collect();
+            first_by_path.sort();
+            first_by_path.truncate(MAX_UNANALYSED_FILES_SENT);
+            assert_eq!(named, first_by_path, "{owed} owed files");
+            assert_eq!(body["unanalysed_files"][0]["reason"], "model_error");
+        }
+    }
+
+    /// A list the cloud takes whole goes exactly as it was: every file, in
+    /// the order the run recorded them, and no total. So a write for 500
+    /// lost files or fewer is byte for byte what it was, and a service that
+    /// lost none sends neither key.
+    #[test]
+    fn a_write_within_the_clouds_bound_sends_its_list_as_it_was() {
+        for owed in [1, 499, 500] {
+            let body = write_body_for(lost_files(owed));
+            assert_eq!(the_clouds_rule_for_unanalysed_files(&body), Ok(owed));
+            assert_eq!(
+                body["unanalysed_files"],
+                serde_json::to_value(lost_files(owed)).unwrap(),
+                "{owed} owed files were reordered or cut"
+            );
+            assert!(body.get("unanalysed_total").is_none(), "{body}");
+        }
+        let none = write_body_for(Vec::new());
+        assert!(none.get("unanalysed_files").is_none(), "{none}");
+        assert!(none.get("unanalysed_total").is_none(), "{none}");
+        assert_eq!(the_clouds_rule_for_unanalysed_files(&none), Ok(0));
+    }
+
+    /// The scanner's bound is the cloud's. A scanner that sent more would be
+    /// refused, and one that sent fewer would name fewer files than it could.
+    #[test]
+    fn the_scanner_sends_as_many_lost_files_as_the_cloud_takes_and_no_more() {
+        assert_eq!(MAX_UNANALYSED_FILES_SENT, CLOUD_MAX_UNANALYSED_FILES);
+    }
+
+    /// What is cut is said: the line names the service, the true total, how
+    /// many the upload names and where the rest are named.
+    #[test]
+    fn the_cut_line_says_how_many_files_there_are_and_how_many_the_upload_names() {
+        assert_eq!(
+            lost_files_cut_line("api", 1000),
+            "api has 1000 files with no analysis. Its upload names the first 500 by path, the \
+             most Carrick Cloud takes, and states the total. This run's log names each one."
+        );
+    }
+
+    /// The sentence for an accepted partial index counts the files the
+    /// service lost, not the ones its write named: with 1,000 lost and 500
+    /// echoed, the index is missing 1,000. With nothing cut it reads as it
+    /// always did.
+    #[test]
+    fn an_accepted_partial_index_counts_every_file_the_service_lost() {
+        let echoed = lost_files_to_send(lost_files(1000)).named.unwrap();
+        assert_eq!(
+            partial_acceptance_line("api", &echoed, 1000, "Run the scan again to fill them in."),
+            "Carrick indexed api without 1000 file(s) the model did not answer for \
+             (src/routes/r0000.ts, src/routes/r0001.ts, src/routes/r0002.ts and 997 more). This \
+             was accepted because api had no index yet. Run the scan again to fill them in."
+        );
+
+        let two = lost_files(2);
+        assert_eq!(
+            partial_acceptance_line("api", &two, 2, "Run the scan again to fill them in."),
+            "Carrick indexed api without 2 file(s) the model did not answer for \
+             (src/routes/r0001.ts, src/routes/r0000.ts). This was accepted because api had no \
+             index yet. Run the scan again to fill them in."
+        );
+    }
+
+    /// A `409 partial_refused` for a write of `files`, with whatever the
+    /// cloud answers under `unanalysed_total`.
+    fn refused_partial(files: Vec<UnanalysedFile>, total: Option<serde_json::Value>) -> String {
+        let mut body = serde_json::json!({
+            "error": "This service already has an index.",
+            "code": "partial_refused",
+            "unanalysed_files": files,
+        });
+        if let Some(total) = total {
+            body["unanalysed_total"] = total;
+        }
+        refusal_message(StatusCode::CONFLICT, &body.to_string())
+    }
+
+    /// A refused partial upload echoes the list the write sent, and a cloud
+    /// that reads the count answers it beside the list: the refusal then
+    /// says how many files the write stood for, not how many it named.
+    #[test]
+    fn a_refusal_counts_the_files_the_cloud_says_the_write_stood_for() {
+        let named = || lost_files_to_send(lost_files(1000)).named.unwrap();
+        let stated = refused_partial(named(), Some(serde_json::json!(1000)));
+        assert!(
+            stated.contains(". 1000 file(s) had no analysis: src/routes/r0000.ts"),
+            "{stated}"
+        );
+        assert!(stated.ends_with("and 995 more"), "{stated}");
+        assert!(stated.contains("already has an index"), "{stated}");
+    }
+
+    /// The cloud deployed before the count answers none. An echo as long as
+    /// a write's list can be may then stand for more, so its count is worded
+    /// as the floor it is. A count that is no whole number, or is lower than
+    /// the list beside it, is read as none, and the refusal still says its
+    /// sentence and its code.
+    #[test]
+    fn a_refusal_with_no_count_words_a_full_list_as_a_floor() {
+        let named = || lost_files_to_send(lost_files(1000)).named.unwrap();
+        for unusable in [
+            None,
+            Some(serde_json::json!("many")),
+            Some(serde_json::json!(999.5)),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(499)),
+            Some(serde_json::Value::Null),
+        ] {
+            let full = refused_partial(named(), unusable.clone());
+            assert!(
+                full.contains(". At least 500 file(s) had no analysis: src/routes/r0000.ts"),
+                "{unusable:?}: {full}"
+            );
+            assert!(full.ends_with("and 495 more"), "{unusable:?}: {full}");
+            assert!(
+                full.contains("already has an index") && full.contains("partial_refused"),
+                "{unusable:?}: {full}"
+            );
+        }
+
+        let short = refused_partial(lost_files(499), None);
+        assert!(short.contains(". 499 file(s) had no analysis: "), "{short}");
+    }
+
+    /// The 200 that accepts a partial index answers the count too. It is
+    /// read when it is a whole number and as nothing otherwise, and never
+    /// costs the answer its other fields.
+    #[test]
+    fn an_accepted_partial_index_reads_the_count_the_cloud_answers() {
+        let accepted = |total: &str| -> WriteActionResponse {
+            serde_json::from_str(&format!(
+                r#"{{"success":true,"partial":true,"unanalysed_total":{total},
+                    "unanalysed_files":[{{"path":"src/a.ts","reason":"model_error"}}]}}"#
+            ))
+            .expect("the 200 acceptance parses whatever its count")
+        };
+        assert_eq!(accepted("1000").unanalysed_total, Some(1000));
+        for unusable in [r#""many""#, "999.5", "-1", "null"] {
+            let answer = accepted(unusable);
+            assert_eq!(answer.unanalysed_total, None, "{unusable}");
+            assert_eq!(answer.partial, Some(true), "{unusable}");
+            assert_eq!(answer.unanalysed_files.map(|files| files.len()), Some(1));
+        }
+        let before_the_count: WriteActionResponse = serde_json::from_str(
+            r#"{"success":true,"partial":true,
+                "unanalysed_files":[{"path":"src/a.ts","reason":"model_error"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(before_the_count.unanalysed_total, None);
+
+        // The sentence counts what the cloud says it accepted.
+        let echoed = lost_files_to_send(lost_files(1000)).named.unwrap();
+        let line = partial_acceptance_line("api", &echoed, 1000, "Run the scan again.");
+        assert!(line.contains("without 1000 file(s)"), "{line}");
+    }
+
+    /// carrick#1955 with carrick#1909, end to end and offline. A service's
+    /// file route has stopped answering, so the file stage leaves more files
+    /// owed than the cloud takes in one list, every one of them never sent
+    /// (`model_busy_not_asked`). The write the storage client then puts on
+    /// the wire passes the cloud's rule: 500 entries, the first by path, and
+    /// the true total beside them, where the whole list would have been
+    /// answered `400 validation_failed`. Nothing the run holds is cut: it
+    /// still names every owed file, which is what its summary and its retry
+    /// of owed work read.
+    ///
+    /// The file stage is the real one, offline: each file raises a candidate,
+    /// is dispatched, and ends on the injected error, which is the one the
+    /// retry loop returns for a call it never sent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_service_owing_more_files_than_the_cloud_takes_sends_a_write_the_cloud_accepts() {
+        use crate::agents::file_orchestrator::FileOrchestrator;
+        use crate::agents::framework_guidance_agent::{
+            FrameworkGuidance, PatternExample, ProtocolGuidance,
+        };
+
+        const OWED: usize = CLOUD_MAX_UNANALYSED_FILES + 1;
+        const SERVICE: &str = "owes-more-than-one-list-holds";
+        const FILE_ROUTE: &str = "/analyze-file";
+        // Only this test's files hold it, so only their calls are ended.
+        const MARKER: &str = "/owed-by-carrick-1955/";
+
+        // SAFETY: `#[serial]`, so no other test that reads these runs beside
+        // this one.
+        unsafe {
+            std::env::set_var("CARRICK_MOCK_ALL", "1");
+            std::env::set_var("CARRICK_SKIP_INTENTS", "1");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        let files: Vec<std::path::PathBuf> = (0..OWED)
+            .map(|i| {
+                let path = root.join(format!("src/routes/r{i:04}.ts"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "import express from \"express\";\n\nconst app = express();\n\n\
+                         app.get(\"{MARKER}{i}\", (_req, res) => {{\n  res.json({{ ok: true }});\n}});\n"
+                    ),
+                )
+                .unwrap();
+                path
+            })
+            .collect();
+        let guidance = ProtocolGuidance::from([(
+            crate::operation::Protocol::Http,
+            FrameworkGuidance {
+                mount_patterns: vec![],
+                endpoint_patterns: vec![PatternExample {
+                    pattern: ".get(".to_string(),
+                    description: "a route registration".to_string(),
+                    framework: "generic".to_string(),
+                }],
+                middleware_patterns: vec![],
+                data_fetching_patterns: vec![],
+                triage_hints: String::new(),
+                parsing_notes: String::new(),
+                guidance_key: None,
+            },
+        )]);
+
+        crate::scan_health::enter_service(Some(SERVICE));
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        crate::agent_service::inject_mock_not_asked(FILE_ROUTE, MARKER, OWED);
+        let requested = || {
+            crate::agent_service::request_counts()
+                .get(FILE_ROUTE)
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = requested();
+        FileOrchestrator::new(crate::agent_service::AgentService::new())
+            .analyze_files(
+                &files,
+                &std::collections::HashMap::new(),
+                &guidance,
+                &crate::framework_detector::DetectionResult::default(),
+                &root,
+                &root,
+                &[],
+                &Default::default(),
+                &Default::default(),
+                &crate::url_normalizer::UrlNormalizer::default_permissive(),
+                &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
+                None,
+            )
+            .await
+            .expect("the analysis runs");
+        let requests_made = requested() - before;
+        let losses = crate::scan_health::service_losses(Some(SERVICE));
+
+        // The write, as the storage client sends it for this service.
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    200,
+                    serde_json::json!({ "success": true, "partial": true }).to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+        let data = CloudRepoData {
+            service_name: Some(SERVICE.to_string()),
+            ..blob()
+        };
+        let uploaded = storage.upload_repo_data(&data, true).await;
+        let held = crate::scan_health::unanalysed_files_for(Some(SERVICE));
+        // The run's losses are the process's: leave none for a later test.
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        crate::scan_health::enter_service(None);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("CARRICK_MOCK_ALL");
+            std::env::remove_var("CARRICK_SKIP_INTENTS");
+        }
+
+        assert_eq!(
+            (losses.files, losses.capacity_files, losses.final_files),
+            (OWED, OWED, 0),
+            "{losses:?}"
+        );
+        assert_eq!(requests_made, 0, "a file that was never sent is no request");
+        uploaded.expect("a first index that owes files lands");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "the existence check and one write");
+        let write = body_of(&requests[1]);
+        assert_eq!(
+            the_clouds_rule_for_unanalysed_files(&write),
+            Ok(CLOUD_MAX_UNANALYSED_FILES)
+        );
+        assert_eq!(write["unanalysed_total"], OWED);
+        let sent = write["unanalysed_files"].as_array().unwrap();
+        assert!(
+            sent.iter()
+                .all(|file| file["reason"] == crate::agent_service::NOT_ASKED_CODE),
+            "every owed file names the scanner's code for a call that was never sent"
+        );
+        let named: Vec<&str> = sent
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        let mut first_by_path: Vec<String> = held.iter().map(|file| file.path.clone()).collect();
+        first_by_path.sort();
+        first_by_path.truncate(MAX_UNANALYSED_FILES_SENT);
+        assert_eq!(named, first_by_path);
+        assert_eq!(
+            held.len(),
+            OWED,
+            "the run still holds every owed file after the write named 500 of them"
+        );
     }
 
     /// Every cloud request this client makes names its run and its release.
@@ -3874,7 +4473,7 @@ mod tests {
     #[test]
     fn the_unanalysed_list_is_never_sent_on_the_ci_path() {
         let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
-        assert!(ci.unanalysed_files(&blob()).is_none());
+        assert_eq!(ci.unanalysed_files(&blob()), LostFilesSent::default());
         assert!(ci.scan_id().is_none());
         assert!(ci.uploads_run_logs());
     }
