@@ -316,6 +316,17 @@ impl RetryPolicy {
         refusal_budget: REFUSAL_BUDGET,
     };
 
+    /// A call a service can go without and must not be held up by: the seven
+    /// attempts of [`Self::STANDARD`] with a capacity refusal counted among
+    /// them, so it ends in about two minutes whatever refuses it. The
+    /// extraction config is one. It is asked beside a service's guidance,
+    /// before the first file, and a wait on it would hold the whole service
+    /// for the sake of unwrap rules the scan proceeds without.
+    pub const BRIEF: Self = Self {
+        refusal_budget: Duration::ZERO,
+        ..Self::STANDARD
+    };
+
     /// A call a whole service depends on: exponential with jitter, sleeps of
     /// up to two minutes, and up to ten minutes of sleeping before it fails,
     /// all of it drawn from the run's retry budget ([`crate::retry_budget`]).
@@ -4569,6 +4580,58 @@ pub(crate) mod tests {
         );
         // What the ledger holds is what the files waited, and it stops there.
         assert!(charged <= REFUSAL_BUDGET + OVERRUN, "{charged:?}");
+    }
+
+    /// Only per-file and per-function calls wait a refusal out. A call a
+    /// service can go without (the extraction config, asked beside guidance
+    /// before the service's first file) is refused seven times and ends, in
+    /// minutes, and charges no route: a wait on it would hold the whole
+    /// service for something the scan proceeds without.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_a_service_can_go_without_ends_in_minutes_on_a_route_that_refuses() {
+        use std::sync::atomic::AtomicUsize;
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let service = scripted(move |_route, _attempt| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {
+                sleep(REFUSED_AFTER).await;
+                scripted_refusal()
+            }
+        })
+        .with_retry_policy(RetryPolicy::BRIEF);
+
+        let started = tokio::time::Instant::now();
+        let error = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                "http://scripted",
+                "/framework-guidance",
+                &serde_json::json!({}),
+            )
+            .await
+            .expect_err("a refused call ends");
+        assert_eq!(error.code, "model_error");
+        assert_eq!(asked.load(Ordering::SeqCst), MAX_RETRIES as usize);
+        assert!(
+            started.elapsed() <= Duration::from_secs(5 * 60),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            service.refusals.for_route("/framework-guidance").spent(),
+            Duration::ZERO
+        );
+        // The same count as a per-file call's for every error that spends an
+        // attempt: the two differ in the refusal budget and nothing else.
+        assert_eq!(
+            RetryPolicy::BRIEF,
+            RetryPolicy {
+                refusal_budget: Duration::ZERO,
+                ..RetryPolicy::STANDARD
+            }
+        );
     }
 
     /// The file route's refusal windows on one large first index, in seconds

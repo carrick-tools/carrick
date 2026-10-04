@@ -2982,8 +2982,8 @@ async fn analyze_current_repo_incremental(
                     let extraction = match &prev.cached_extraction_config {
                         Some(config) => Some(config.clone()),
                         None => {
-                            let agent = FrameworkGuidanceAgent::new(AgentService::new());
-                            generate_extraction_config(&agent, &det, packages).await
+                            generate_extraction_config(&extraction_config_agent(), &det, packages)
+                                .await
                         }
                     };
                     ModelSetup::ready(det, guid.clone(), extraction)
@@ -3665,10 +3665,7 @@ async fn model_setup(
     };
 
     let guidance_agent = FrameworkGuidanceAgent::new(patient);
-    // The extraction config is non-fatal and asked under the ordinary policy:
-    // a service that goes without it keeps machinery types wrapped, which is
-    // not worth ten minutes of waiting.
-    let extraction_agent = FrameworkGuidanceAgent::new(AgentService::new());
+    let extraction_agent = extraction_config_agent();
     // Guidance and extraction config both depend only on detection — run
     // them concurrently instead of paying a lone extra lambda round-trip.
     let (guidance, extraction_config) = tokio::join!(
@@ -3684,6 +3681,15 @@ async fn model_setup(
         Ok(guidance) => ModelSetup::ready(detection, guidance, extraction_config),
         Err(error) => ModelSetup::guidance_deferred(detection, extraction_config, error.as_ref()),
     }
+}
+
+/// The agent the extraction config is asked through. The config is non-fatal:
+/// a service that goes without it keeps machinery types wrapped, which is not
+/// worth ten minutes of waiting, so it is asked neither under the patient
+/// policy nor under the per-file one, whose capacity refusals wait on a
+/// route's refusal budget (carrick#1893). Seven attempts, whatever refuses.
+fn extraction_config_agent() -> FrameworkGuidanceAgent {
+    FrameworkGuidanceAgent::new(AgentService::new().with_retry_policy(RetryPolicy::BRIEF))
 }
 
 /// Generate machinery-unwrap rules via the cloud's extraction_config task.
