@@ -85,10 +85,11 @@ struct Registry {
     /// at a time and each of those decisions is about ONE service's losses.
     /// The engine analyses services sequentially, so one slot is exact.
     current: Scope,
-    /// Function intents that failed after their retries, per service. Not a
+    /// Function intents that failed after their retries, per service: how
+    /// many, and how many of those the model refused for capacity. Not a
     /// reason to hold a service back (a missing intent never was), only a
     /// reason to retry it before the run ends.
-    intents_failed: Vec<(Scope, usize)>,
+    intents_failed: Vec<(Scope, usize, usize)>,
     /// One entry per file the model was deliberately not asked about, because
     /// a budget refused the call. Not a loss the scan can fix by re-running,
     /// and not a reason to fail: the file keeps its deterministic rows and its
@@ -129,6 +130,13 @@ pub struct ServiceLosses {
     pub files: usize,
     /// Function intents that failed after their retries.
     pub intents: usize,
+    /// How many of `files` ended on the model refusing for capacity
+    /// ([`crate::agent_service::CAPACITY_REFUSAL_CODE`]). They, and
+    /// `capacity_intents`, are the losses a wait before the retry can mend
+    /// (carrick#1896).
+    pub capacity_files: usize,
+    /// How many of `intents` ended the same way.
+    pub capacity_intents: usize,
 }
 
 impl ServiceLosses {
@@ -152,27 +160,32 @@ impl Registry {
         });
     }
 
-    /// Records that `count` intents of the current service failed.
-    fn record_intents_failed(&mut self, count: usize) {
+    /// Records that `count` intents of the current service failed,
+    /// `for_capacity` of them because the model refused for capacity.
+    fn record_intents_failed(&mut self, count: usize, for_capacity: usize) {
         if count == 0 {
             return;
         }
         let scope = self.current.clone();
-        match self.intents_failed.iter_mut().find(|(s, _)| *s == scope) {
-            Some((_, total)) => *total += count,
-            None => self.intents_failed.push((scope, count)),
+        match self.intents_failed.iter_mut().find(|(s, _, _)| *s == scope) {
+            Some((_, total, total_for_capacity)) => {
+                *total += count;
+                *total_for_capacity += for_capacity;
+            }
+            None => self.intents_failed.push((scope, count, for_capacity)),
         }
     }
 
     fn service_losses(&self, scope: &Scope) -> ServiceLosses {
+        let files = self.lost.iter().filter(|l| l.scope == *scope);
+        let intents = self.intents_failed.iter().filter(|(s, _, _)| s == scope);
         ServiceLosses {
-            files: self.lost.iter().filter(|l| l.scope == *scope).count(),
-            intents: self
-                .intents_failed
-                .iter()
-                .filter(|(s, _)| s == scope)
-                .map(|(_, n)| *n)
-                .sum(),
+            files: files.clone().count(),
+            intents: intents.clone().map(|(_, n, _)| *n).sum(),
+            capacity_files: files
+                .filter(|l| l.reason == crate::agent_service::CAPACITY_REFUSAL_CODE)
+                .count(),
+            capacity_intents: intents.map(|(_, _, for_capacity)| *for_capacity).sum(),
         }
     }
 
@@ -185,7 +198,7 @@ impl Registry {
         let before = self.lost.len();
         self.lost.retain(|l| l.scope != *scope);
         self.attempted = self.attempted.saturating_sub(before - self.lost.len());
-        self.intents_failed.retain(|(s, _)| s != scope);
+        self.intents_failed.retain(|(s, _, _)| s != scope);
     }
 
     fn unanalysed_files_for(&self, scope: &Scope) -> Vec<crate::cloud_storage::UnanalysedFile> {
@@ -509,12 +522,13 @@ pub fn enter_service(service: Option<&str>) {
 }
 
 /// Records that `count` of the current service's function intents failed
-/// after their retries.
-pub fn record_intents_failed(count: usize) {
+/// after their retries, `for_capacity` of them because the model refused for
+/// capacity.
+pub fn record_intents_failed(count: usize, for_capacity: usize) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_intents_failed(count);
+        .record_intents_failed(count, for_capacity);
 }
 
 /// What `service` still owes the model.
@@ -842,7 +856,7 @@ mod tests {
         run.current = billing.clone();
         run.record_files_attempted(2);
         run.record_unanalysed_file("billing/src/b.ts", "gateway_error");
-        run.record_intents_failed(3);
+        run.record_intents_failed(3, 0);
 
         assert_eq!(run.service_losses(&api).files, 1);
         assert_eq!(run.service_losses(&api).intents, 0);
@@ -858,6 +872,52 @@ mod tests {
         // The forgotten file leaves the attempted count, because the retry
         // dispatches and counts it again.
         assert_eq!(run.attempted, 5);
+    }
+
+    /// carrick#1896: what a service owes is split by whether waiting can mend
+    /// it. A file or an intent the model refused for capacity is counted as
+    /// one; a file the gateway cut, a lost connection and an intent the model
+    /// answered with nothing are not, whatever their number.
+    #[test]
+    fn only_what_the_model_refused_for_capacity_is_counted_as_such() {
+        let api = Some("api".to_string());
+        let billing = Some("billing".to_string());
+        let mut run = run();
+        run.current = api.clone();
+        run.record_unanalysed_file("api/src/a.ts", "gateway_error");
+        run.record_unanalysed_file("api/src/b.ts", "network_error");
+        run.record_unanalysed_file("api/src/c.ts", "analysis_in_flight");
+        run.record_intents_failed(4, 0);
+        run.current = billing.clone();
+        run.record_unanalysed_file(
+            "billing/src/a.ts",
+            crate::agent_service::CAPACITY_REFUSAL_CODE,
+        );
+        run.record_unanalysed_file("billing/src/b.ts", "gateway_error");
+        run.record_intents_failed(5, 2);
+        run.record_intents_failed(1, 1);
+
+        assert_eq!(
+            run.service_losses(&api),
+            ServiceLosses {
+                files: 3,
+                intents: 4,
+                capacity_files: 0,
+                capacity_intents: 0,
+            }
+        );
+        assert_eq!(
+            run.service_losses(&billing),
+            ServiceLosses {
+                files: 2,
+                intents: 6,
+                capacity_files: 1,
+                capacity_intents: 3,
+            }
+        );
+
+        run.forget_service_losses(&billing);
+        assert_eq!(run.service_losses(&billing), ServiceLosses::default());
     }
 
     /// Reasons are grouped and ordered by how many files each cost, so the

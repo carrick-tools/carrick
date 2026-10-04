@@ -151,6 +151,17 @@ pub const LLM_DISABLED_CODE: &str = "llm_disabled";
 /// way ([`is_analysis_in_flight`]).
 pub const ANALYSIS_IN_FLIGHT_CODE: &str = "analysis_in_flight";
 
+/// The cloud's code for a model that was asked and did not answer for want of
+/// capacity: every prompt lambda answers `503 model_error`, `retriable: true`,
+/// once its own tries at the model are spent on a failure of the provider's
+/// that clears by itself, which in practice is a 429 or a 503. It is the one
+/// failure that waiting mends, which is why the run's retry of owed work
+/// waits only for this (carrick#1896). A request the gateway cut, a lost
+/// connection and a lease that never cleared end a call under codes of their
+/// own, and their answer is either in the cloud already or no nearer for a
+/// wait.
+pub const CAPACITY_REFUSAL_CODE: &str = "model_error";
+
 /// Whether an error envelope is the lease wait ([`ANALYSIS_IN_FLIGHT_CODE`]),
 /// in either wire shape: the code itself, or the reason on a `model_error`.
 fn is_analysis_in_flight(err: &AgentError) -> bool {
@@ -222,6 +233,12 @@ impl AgentCallError {
     /// file, so the file is not lost and the run does not fail.
     pub fn is_budget_refusal(&self) -> bool {
         self.code == LLM_DISABLED_CODE
+    }
+
+    /// Whether the call ended on the model refusing for capacity
+    /// ([`CAPACITY_REFUSAL_CODE`]).
+    pub fn is_capacity_refusal(&self) -> bool {
+        self.code == CAPACITY_REFUSAL_CODE
     }
 }
 

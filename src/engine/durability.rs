@@ -13,8 +13,10 @@
 //!    kept when only its guidance failed ([`ModelSetup::guidance_deferred`]).
 //! 2. Once every service has been through, the work still owed — a deferred
 //!    service, files the analyzer never answered for, intents that failed —
-//!    gets ONE more try in the same run, after a wait of minutes
-//!    ([`retry_delay`]). What a limit refused is not retried: it would be
+//!    gets ONE more try in the same run. The try comes after a wait of
+//!    minutes when the model refused any of it for capacity, and at once when
+//!    it refused none ([`retry_delay`], carrick#1896): a wait mends a refusal
+//!    and nothing else. What a limit refused is not retried: it would be
 //!    refused again.
 //!
 //!    Both kinds of waiting, the patient retries inside detection and guidance
@@ -211,6 +213,31 @@ impl OwedWork {
         !self.is_empty() && !self.deferred_by_refusal()
     }
 
+    /// What of this the model refused for capacity
+    /// ([`crate::agent_service::CAPACITY_REFUSAL_CODE`]), which is what a wait
+    /// before the retry is for: a deferral that ended on one, a file, or an
+    /// intent. `None` when it refused nothing here, whatever else is owed. A
+    /// request the gateway cut is owed too, and its answer is either in the
+    /// cloud already or still being computed there; neither is nearer for
+    /// three idle minutes.
+    ///
+    /// Not the refusal [`Self::only_refused`] reads: that one is a limit of
+    /// the cloud's saying no (`llm_disabled`), which no wait in this run
+    /// changes and which is never retried.
+    pub fn refused_for_capacity(&self) -> Option<RefusedForCapacity> {
+        let deferred = self
+            .deferred
+            .as_deref()
+            .is_some_and(|reason| reason.ends_with(crate::agent_service::CAPACITY_REFUSAL_CODE));
+        if deferred || self.losses.capacity_files > 0 {
+            Some(RefusedForCapacity::Thinning)
+        } else if self.losses.capacity_intents > 0 {
+            Some(RefusedForCapacity::Intents)
+        } else {
+            None
+        }
+    }
+
     /// The parenthesis the summary puts after the service's name.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
@@ -261,36 +288,78 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
 }
 
 /// Set to a number of seconds to change how long a run waits before it
-/// retries the work it still owes. Read for tests, which cannot wait minutes;
-/// capped at [`MAX_RETRY_DELAY`] so a typo cannot park a scan for a day.
+/// retries owed work the model refused for capacity. It sets the length of
+/// that wait and never adds one: a run that owes nothing of the kind does not
+/// wait. Read for tests, which cannot wait minutes; capped at
+/// [`MAX_RETRY_DELAY`] so a typo cannot park a scan for a day.
 pub const RETRY_DELAY_ENV: &str = "CARRICK_PENDING_RETRY_DELAY_SECS";
 
-/// How long a run waits before its one retry. Minutes, because the failure
-/// this retries is a shared model quota that refills on that scale, and the
-/// calls themselves already waited up to ten.
+/// How long a run waits before its one retry of work the model refused for
+/// capacity. Minutes, because that is a shared model quota that refills on
+/// that scale, and the calls themselves already waited up to ten.
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(180);
-/// The wait when the only work owed is function descriptions: they thin no
-/// index, and a CI job should not idle three minutes for a sentence.
+/// The wait when the only work the model refused is function descriptions:
+/// they thin no index, and a CI job should not idle three minutes for a
+/// sentence.
 const INTENTS_ONLY_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(900);
 
-/// The wait before the retry. `thinning` is whether any service being retried
-/// owes work that thins its index ([`OwedWork::thins_the_index`]).
-pub fn retry_delay(thinning: bool) -> Duration {
-    retry_delay_from(std::env::var(RETRY_DELAY_ENV).ok().as_deref(), thinning)
+/// The owed work a model refused for capacity, by what its absence costs.
+/// Ordered, so the most a set of services was refused is its `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RefusedForCapacity {
+    /// Function descriptions only.
+    Intents,
+    /// A file, or a service's model stages: the index is thinner without it.
+    Thinning,
 }
 
-fn retry_delay_from(value: Option<&str>, thinning: bool) -> Duration {
-    let default = if thinning {
-        DEFAULT_RETRY_DELAY
-    } else {
-        INTENTS_ONLY_RETRY_DELAY
+/// The wait before the retry, given the most the model refused any service
+/// being retried ([`OwedWork::refused_for_capacity`]). Nothing refused is no
+/// wait at all, whatever [`RETRY_DELAY_ENV`] says (carrick#1896): on one large
+/// first index the run idled three minutes before asking again for eight
+/// files, six of which a gateway cut had ended and four of which the cloud
+/// already held the answer to.
+pub fn retry_delay(refused: Option<RefusedForCapacity>) -> Duration {
+    retry_delay_from(std::env::var(RETRY_DELAY_ENV).ok().as_deref(), refused)
+}
+
+fn retry_delay_from(value: Option<&str>, refused: Option<RefusedForCapacity>) -> Duration {
+    let default = match refused {
+        None => return Duration::ZERO,
+        Some(RefusedForCapacity::Thinning) => DEFAULT_RETRY_DELAY,
+        Some(RefusedForCapacity::Intents) => INTENTS_ONLY_RETRY_DELAY,
     };
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(default)
         .min(MAX_RETRY_DELAY)
+}
+
+/// The line the run's log gets as the retry starts: how many services, how
+/// long it waits first, and why. Written because the wait was once a constant
+/// and is now a decision, and a log that does not state a decision leaves the
+/// next reader to infer it.
+pub fn retry_wait_line(
+    services: usize,
+    delay: Duration,
+    refused: Option<RefusedForCapacity>,
+) -> String {
+    let what = match refused {
+        None => {
+            return format!(
+                "Retrying {services} service(s) now: nothing they owe was refused for capacity, \
+                 so there is nothing to wait for"
+            );
+        }
+        Some(RefusedForCapacity::Thinning) => "a file or a service's setup",
+        Some(RefusedForCapacity::Intents) => "function descriptions and nothing else",
+    };
+    format!(
+        "Retrying {services} service(s) in {}s: the model refused {what} for capacity",
+        delay.as_secs()
+    )
 }
 
 /// Sleep `delay` as the run's in-run retry wait: charged to the run's retry
@@ -344,16 +413,147 @@ pub fn pending_summary(
 mod tests {
     use super::*;
 
+    /// What the model refused for capacity waits minutes, or half a minute
+    /// when it is only function descriptions, unless told otherwise and never
+    /// unbounded.
     #[test]
     fn the_retry_waits_minutes_unless_told_otherwise_and_never_unbounded() {
-        assert_eq!(retry_delay_from(None, true), Duration::from_secs(180));
-        assert_eq!(retry_delay_from(None, false), Duration::from_secs(30));
-        assert_eq!(retry_delay_from(Some("0"), true), Duration::ZERO);
+        let thinning = Some(RefusedForCapacity::Thinning);
+        let intents = Some(RefusedForCapacity::Intents);
+        assert_eq!(retry_delay_from(None, thinning), Duration::from_secs(180));
+        assert_eq!(retry_delay_from(None, intents), Duration::from_secs(30));
+        assert_eq!(retry_delay_from(Some("0"), thinning), Duration::ZERO);
         assert_eq!(
-            retry_delay_from(Some("nonsense"), true),
+            retry_delay_from(Some("nonsense"), thinning),
             Duration::from_secs(180)
         );
-        assert_eq!(retry_delay_from(Some("86400"), true), MAX_RETRY_DELAY);
+        assert_eq!(retry_delay_from(Some("86400"), thinning), MAX_RETRY_DELAY);
+    }
+
+    /// carrick#1896: with nothing refused for capacity there is nothing a wait
+    /// mends, so the retry starts at once, and no setting makes it wait.
+    #[test]
+    fn the_retry_does_not_wait_when_nothing_owed_was_refused_for_capacity() {
+        assert_eq!(retry_delay_from(None, None), Duration::ZERO);
+        assert_eq!(retry_delay_from(Some("600"), None), Duration::ZERO);
+    }
+
+    fn lost(files: usize, capacity_files: usize) -> OwedWork {
+        OwedWork {
+            losses: ServiceLosses {
+                files,
+                capacity_files,
+                ..ServiceLosses::default()
+            },
+            ..OwedWork::default()
+        }
+    }
+
+    fn deferred_on(code: &str) -> OwedWork {
+        OwedWork {
+            deferred: Some(format!("framework detection: {code}")),
+            ..OwedWork::default()
+        }
+    }
+
+    /// What decides the wait is why each thing is owed, not how much is. The
+    /// shape is the one large first index the rule was written from: eight
+    /// files owed by four services, six ended by a gateway cut and two by the
+    /// model refusing. Those two make the run wait; once a refusal no longer
+    /// ends a file, the same eight owe no wait at all.
+    #[test]
+    fn only_a_capacity_refusal_among_the_owed_work_makes_the_retry_wait() {
+        let cut = [lost(1, 0), lost(5, 0), lost(1, 0), lost(1, 0)];
+        let most = |owed: &[OwedWork]| owed.iter().filter_map(OwedWork::refused_for_capacity).max();
+        assert_eq!(most(&cut), None);
+        assert_eq!(retry_delay_from(None, most(&cut)), Duration::ZERO);
+
+        let as_logged = [lost(1, 0), lost(5, 1), lost(1, 1), lost(1, 0)];
+        assert_eq!(most(&as_logged), Some(RefusedForCapacity::Thinning));
+        assert_eq!(
+            retry_delay_from(None, most(&as_logged)),
+            Duration::from_secs(180)
+        );
+
+        // A deferral is read by the code it ended on: the model refusing
+        // waits, and anything else that deferred a service does not.
+        assert_eq!(
+            deferred_on(crate::agent_service::CAPACITY_REFUSAL_CODE).refused_for_capacity(),
+            Some(RefusedForCapacity::Thinning)
+        );
+        assert_eq!(deferred_on("gateway_error").refused_for_capacity(), None);
+        assert_eq!(
+            deferred_on("unparseable_response").refused_for_capacity(),
+            None
+        );
+
+        // Intents the model refused wait the short wait, and only when nothing
+        // that thins an index was refused beside them.
+        let intents = OwedWork {
+            losses: ServiceLosses {
+                intents: 4,
+                capacity_intents: 1,
+                ..ServiceLosses::default()
+            },
+            ..OwedWork::default()
+        };
+        assert_eq!(
+            intents.refused_for_capacity(),
+            Some(RefusedForCapacity::Intents)
+        );
+        assert_eq!(
+            most(&[intents.clone(), lost(2, 0)]),
+            Some(RefusedForCapacity::Intents),
+            "a cut file beside refused intents does not lengthen the wait"
+        );
+        assert_eq!(
+            most(&[intents, lost(2, 1)]),
+            Some(RefusedForCapacity::Thinning)
+        );
+        // An intent that came back empty is owed and was not refused.
+        let discarded = OwedWork {
+            losses: ServiceLosses {
+                intents: 3,
+                ..ServiceLosses::default()
+            },
+            ..OwedWork::default()
+        };
+        assert!(discarded.worth_retrying());
+        assert_eq!(discarded.refused_for_capacity(), None);
+    }
+
+    /// The log says what was decided and why, in a line short enough to read.
+    #[test]
+    fn the_retry_line_says_how_long_it_waits_and_why() {
+        let now = retry_wait_line(4, Duration::ZERO, None);
+        assert_eq!(
+            now,
+            "Retrying 4 service(s) now: nothing they owe was refused for capacity, so there is \
+             nothing to wait for"
+        );
+        let waiting = retry_wait_line(
+            2,
+            Duration::from_secs(180),
+            Some(RefusedForCapacity::Thinning),
+        );
+        assert_eq!(
+            waiting,
+            "Retrying 2 service(s) in 180s: the model refused a file or a service's setup for \
+             capacity"
+        );
+        let intents = retry_wait_line(
+            1,
+            Duration::from_secs(30),
+            Some(RefusedForCapacity::Intents),
+        );
+        assert_eq!(
+            intents,
+            "Retrying 1 service(s) in 30s: the model refused function descriptions and nothing \
+             else for capacity"
+        );
+        for line in [now, waiting, intents] {
+            assert!(line.split_whitespace().count() <= 20, "{line}");
+        }
     }
 
     #[test]
@@ -362,17 +562,11 @@ mod tests {
             deferred: Some("framework detection: model_error".to_string()),
             ..OwedWork::default()
         };
-        let lost = OwedWork {
-            losses: ServiceLosses {
-                files: 2,
-                intents: 0,
-            },
-            ..OwedWork::default()
-        };
+        let lost = lost(2, 0);
         let intents_only = OwedWork {
             losses: ServiceLosses {
-                files: 0,
                 intents: 4,
+                ..ServiceLosses::default()
             },
             ..OwedWork::default()
         };
@@ -402,8 +596,8 @@ mod tests {
     fn a_missing_intent_is_owed_work_but_does_not_thin_the_index() {
         let owed = OwedWork {
             losses: ServiceLosses {
-                files: 0,
                 intents: 3,
+                ..ServiceLosses::default()
             },
             ..OwedWork::default()
         };
@@ -435,7 +629,7 @@ mod tests {
         let refused_and_lost = OwedWork {
             losses: ServiceLosses {
                 files: 1,
-                intents: 0,
+                ..ServiceLosses::default()
             },
             ..owed.clone()
         };

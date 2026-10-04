@@ -1006,3 +1006,100 @@ async fn the_in_run_retry_of_a_guidance_failure_does_not_ask_detection_again() {
     assert!(storage.uploads().last().unwrap().final_in_run);
     assert!(storage.scan_failed.lock().unwrap().is_empty());
 }
+
+/// What a file's call ends on when the gateway cut its last attempt: the
+/// scanner's own code for it, in the envelope shape the injection reads. The
+/// gateway sends no envelope; the code is what the run records either way.
+const ENDED_BY_A_GATEWAY_CUT: &str = r#"{"success":false,"error":{"code":"gateway_error","message":"Agent proxy returned status 503 Service Unavailable","retriable":true}}"#;
+
+/// One scan of the three-service repo in which beta's file fails once with
+/// `failure`, under a retry wait of `wait_secs` for owed work the model
+/// refused. Returns the storage, the file requests the run made, and what the
+/// run's retry budget was charged, which is the wait it took: nothing else in
+/// this run sleeps on that budget.
+async fn scan_with_one_owed_file(
+    wait_secs: u64,
+    fail: impl FnOnce(),
+) -> (StubStorage, usize, std::time::Duration) {
+    offline_env();
+    // SAFETY: as in `offline_env`.
+    unsafe {
+        std::env::set_var(
+            carrick::engine::durability::RETRY_DELAY_ENV,
+            wait_secs.to_string(),
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop_on_current_cloud(&[]);
+
+    fail();
+    let before = analyze_file_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a file the in-run retry recovers does not fail the run");
+    let waited = carrick::retry_budget::spent();
+    offline_env();
+    (storage, analyze_file_requests() - before, waited)
+}
+
+/// The owed file was answered by the retry: one file per service, then
+/// beta's again, and every service lands complete.
+fn assert_the_retry_recovered_the_file(storage: &StubStorage, file_requests: usize) {
+    assert_eq!(
+        file_requests, 4,
+        "three files on the first pass, and the owed one again"
+    );
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let beta = storage.latest("beta").unwrap();
+    assert!(
+        beta.file_results
+            .unwrap_or_default()
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "the retry records the answer the first pass did not get"
+    );
+    assert!(storage.uploads().last().unwrap().final_in_run);
+    assert!(storage.pending_named.lock().unwrap().is_empty());
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
+}
+
+/// carrick#1896: a file whose call a gateway cut ended is asked again at
+/// once. Its answer is in the cloud already or still being computed there,
+/// and neither is nearer for a wait, so the run takes none: with the wait set
+/// to a minute, the run's retry budget is charged nothing.
+#[tokio::test]
+#[serial]
+async fn a_file_a_gateway_cut_ended_is_asked_again_without_a_wait() {
+    let (storage, file_requests, waited) = scan_with_one_owed_file(60, || {
+        carrick::agent_service::inject_mock_envelope(
+            "/analyze-file",
+            BETA_ONLY_ROUTE,
+            1,
+            ENDED_BY_A_GATEWAY_CUT,
+        );
+    })
+    .await;
+    assert_the_retry_recovered_the_file(&storage, file_requests);
+    assert_eq!(
+        waited,
+        std::time::Duration::ZERO,
+        "the retry waited although nothing owed was refused for capacity"
+    );
+}
+
+/// The other half: a file the model refused for capacity still waits before
+/// it is asked again, for as long as the wait is set to.
+#[tokio::test]
+#[serial]
+async fn a_file_the_model_refused_for_capacity_still_waits_before_the_retry() {
+    let (storage, file_requests, waited) = scan_with_one_owed_file(2, || {
+        carrick::agent_service::inject_mock_failure("/analyze-file", BETA_ONLY_ROUTE, 1);
+    })
+    .await;
+    assert_the_retry_recovered_the_file(&storage, file_requests);
+    assert!(
+        waited >= std::time::Duration::from_secs(2),
+        "the retry of a refused file waited {waited:?}"
+    );
+}

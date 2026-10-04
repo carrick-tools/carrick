@@ -948,9 +948,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // 4b. The work the run still owes gets one more try before it ends: a
     // deferred service's detection, the files and intents the model did not
-    // answer for. After minutes, not
-    // seconds, because what usually causes all of them is a shared model
-    // quota that refills on that scale.
+    // answer for. After minutes when the model refused any of it for
+    // capacity, because that is a shared model quota that refills on that
+    // scale; at once when it refused none, because nothing else that is owed
+    // is nearer for a wait (carrick#1896).
     let retrying: Vec<usize> = runs
         .iter()
         .enumerate()
@@ -969,29 +970,46 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             crate::retry_budget::BUDGET_ENV
         );
     } else if !retrying.is_empty() && !crate::local_mode::no_model() {
-        // The wait is charged to the run's budget and never outlasts it.
-        let delay = durability::retry_delay(
-            retrying
-                .iter()
-                .any(|index| runs[*index].owed.thins_the_index()),
-        )
-        .min(retry_budget_left);
+        // The most the model refused any of them for capacity decides the
+        // wait. It is charged to the run's budget and never outlasts it.
+        let refused = retrying
+            .iter()
+            .filter_map(|index| runs[*index].owed.refused_for_capacity())
+            .max();
+        let delay = durability::retry_delay(refused).min(retry_budget_left);
+        // The decision, in the run's log: a wait that depends on why work is
+        // owed is one a reader of the log cannot work out from its length.
+        info!(
+            "{}",
+            durability::retry_wait_line(retrying.len(), delay, refused)
+        );
         let names: Vec<String> = retrying
             .iter()
             .map(|index| format!("{} ({})", runs[*index].label, runs[*index].owed.describe()))
             .collect();
-        durability::wait_with_progress(delay, |left| {
+        if delay.is_zero() {
             logging::progress(
                 &sp,
                 &format!(
-                    "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                    "{} service(s) still owe model work: {}. Asking again now",
                     retrying.len(),
-                    names.join(", "),
-                    left.as_secs()
+                    names.join(", ")
                 ),
             );
-        })
-        .await;
+        } else {
+            durability::wait_with_progress(delay, |left| {
+                logging::progress(
+                    &sp,
+                    &format!(
+                        "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                        retrying.len(),
+                        names.join(", "),
+                        left.as_secs()
+                    ),
+                );
+            })
+            .await;
+        }
         for index in retrying {
             let service = &services[index];
             // Whatever this service lost is recorded again if it is lost again.

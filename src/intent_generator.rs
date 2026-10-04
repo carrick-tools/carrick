@@ -764,6 +764,9 @@ async fn describe_functions<S, SFut>(
 
         let mut succeeded = 0usize;
         let mut failed = 0usize;
+        // Of the failed, the ones the model refused for capacity: what the
+        // run's retry waits for before it asks again (carrick#1896).
+        let mut failed_for_capacity = 0usize;
 
         for (pending, result) in outcomes {
             describing.item();
@@ -800,6 +803,9 @@ async fn describe_functions<S, SFut>(
                     failed_calls.insert(name.clone());
                     warn!("Failed to generate intent for {}: {}", name, e);
                     failed += 1;
+                    if e.is_capacity_refusal() {
+                        failed_for_capacity += 1;
+                    }
                 }
             }
         }
@@ -816,7 +822,7 @@ async fn describe_functions<S, SFut>(
         );
         // Counted against the service being analysed, so the engine can give
         // it one more try before the run ends.
-        crate::scan_health::record_intents_failed(failed);
+        crate::scan_health::record_intents_failed(failed, failed_for_capacity);
         if failed > 0 {
             warn!("{}", summary);
         } else {
