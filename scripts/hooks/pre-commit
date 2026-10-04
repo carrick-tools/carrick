@@ -51,7 +51,6 @@ if ! cargo fmt --check; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Run 'cargo fmt' to fix formatting issues and try again."
-    echo "To bypass this hook (not recommended): git commit --no-verify"
     echo ""
     exit 1
 fi
@@ -74,7 +73,6 @@ if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Fix the clippy warnings and try again."
-    echo "To bypass this hook (not recommended): git commit --no-verify"
     echo ""
     exit 1
 fi
@@ -131,7 +129,6 @@ else
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "Fix the failing tests and try again."
-    echo "To bypass this hook (not recommended): git commit --no-verify"
     echo ""
 
     exit 1
