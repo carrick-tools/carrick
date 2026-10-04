@@ -751,8 +751,8 @@ impl SetupSource {
     /// (carrick#1126).
     ///
     /// A deferred service is never analysed under a stand-in guidance. The
-    /// analyzer's cache key names the guidance it embedded, so answers bought
-    /// under a placeholder would be paid for again the moment the real
+    /// analyzer's cache key names the guidance it embedded, so answers asked
+    /// for under a placeholder would be asked for again the moment the real
     /// guidance arrived.
     pub(super) async fn settle(
         self,
