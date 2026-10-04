@@ -663,8 +663,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // What every upload of this run passes through last (carrick#1204).
     let boundary = upload_boundary::UploadBoundary::for_scan(repo_path);
     debug!(upload = should_upload, "Running Carrick in CI mode");
-    // The run's one ceiling on waiting out a refusing model (carrick#1126).
+    // The run's ceilings on waiting out a refusing model: the one its
+    // service-level calls and its in-run retry share (carrick#1126), and each
+    // route's for the per-file calls a capacity refusal holds up
+    // (carrick#1893).
     crate::retry_budget::reset();
+    crate::agent_service::reset_refusal_budgets();
 
     // Said before the scan, not after it: the point is that a capture pass set
     // up this way costs a full pass and leaves nothing behind (carrick#966).

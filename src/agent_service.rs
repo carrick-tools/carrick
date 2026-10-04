@@ -12,7 +12,9 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 
 mod limiter;
+mod refusals;
 use limiter::{RatePacer, RouteLimits};
+use refusals::RouteRefusals;
 
 /// How many HTTP attempts this process has retried, across every call.
 static RETRIES: AtomicU64 = AtomicU64::new(0);
@@ -245,6 +247,19 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(64);
 /// Ceiling on a single sleep for a [`RetryPolicy::PATIENT`] call.
 const PATIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
+/// How long one run's per-file calls wait out capacity refusals on one route,
+/// overlapping waits counted once (`refusals.rs`, carrick#1893).
+///
+/// Sized on the large first index the rule was written from. Its file route
+/// was refused in nine windows that add up to 21.7 minutes, the longest
+/// twelve and a half, and a replay that refuses every request inside them
+/// charges the route 20.3
+/// (`the_refusal_windows_of_a_large_first_index_lose_no_file`). An earlier
+/// first index met two windows of about twenty minutes each
+/// (carrick-cloud#869). Forty-five covers both, and it is what a route that
+/// refuses the whole run adds to a scan before its calls go back to counting
+/// attempts.
+const REFUSAL_BUDGET: Duration = Duration::from_secs(45 * 60);
 
 /// How long one call keeps trying before it gives up.
 ///
@@ -258,9 +273,15 @@ const PATIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
 /// (2026-09-15: one detection call, seven `model_error` answers over 106 s,
 /// and a seven-service first index aborted). A refused call costs nothing, so
 /// those calls wait far longer before the engine defers the service.
+///
+/// A capacity refusal is not counted against a per-file call's seven attempts
+/// (carrick#1893). The model refuses in windows that outlast those attempts
+/// and then answers, so the file waits on its route's refusal budget instead
+/// (`refusals.rs`), and every other retriable error keeps the count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Attempts in total, the first included.
+    /// Attempts in total, the first included. A lease wait costs none, and
+    /// neither does a capacity refusal while [`Self::refusal_budget`] lasts.
     max_attempts: u32,
     /// Ceiling on one sleep, and on the `Retry-After` hint honoured.
     max_delay: Duration,
@@ -273,10 +294,18 @@ pub struct RetryPolicy {
     /// Lease waits ([`ANALYSIS_IN_FLIGHT_CODE`]) sat out without spending an
     /// attempt. Past it a lease wait is a retriable error like any other.
     max_in_flight_waits: u32,
+    /// How long this run's calls on one route may wait out capacity refusals
+    /// without spending attempts, overlapping waits counted once
+    /// (`refusals.rs`). Zero: a capacity refusal costs an attempt, as every
+    /// other retriable error does.
+    refusal_budget: Duration,
 }
 
 impl RetryPolicy {
-    /// Every per-file and per-function call.
+    /// Every per-file and per-function call: seven attempts, about two
+    /// minutes of backoff, for everything but a capacity refusal, which waits
+    /// on the route's [`REFUSAL_BUDGET`] and costs no attempt until that is
+    /// spent.
     pub const STANDARD: Self = Self {
         max_attempts: MAX_RETRIES,
         max_delay: RETRY_MAX_DELAY,
@@ -284,31 +313,35 @@ impl RetryPolicy {
         wait_budget: Duration::from_secs(3600),
         run_budgeted: false,
         max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
+        refusal_budget: REFUSAL_BUDGET,
     };
 
     /// A call a whole service depends on: exponential with jitter, sleeps of
     /// up to two minutes, and up to ten minutes of sleeping before it fails,
     /// all of it drawn from the run's retry budget ([`crate::retry_budget`]).
-    /// Once that is spent the call gets its first attempt and no sleep.
+    /// Once that is spent the call gets its first attempt and no sleep. Its
+    /// patience was already a time budget, so a refusal spends an attempt.
     pub const PATIENT: Self = Self {
         max_attempts: 32,
         max_delay: PATIENT_RETRY_MAX_DELAY,
         wait_budget: Duration::from_secs(600),
         run_budgeted: true,
         max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
+        refusal_budget: Duration::ZERO,
     };
 
     /// A best-effort call whose failure costs nothing: one HTTP attempt, no
-    /// retry, and no re-send after a lease wait either. The re-ask for
-    /// library semantics is one (carrick#1564): a failure keeps what the
-    /// service already has, and the next scan asks again, so a retry only
-    /// spends.
+    /// retry, and no re-send after a lease wait or a capacity refusal either.
+    /// The re-ask for library semantics is one (carrick#1564): a failure keeps
+    /// what the service already has, and the next scan asks again, so a retry
+    /// only spends.
     pub const ONCE: Self = Self {
         max_attempts: 1,
         max_delay: Duration::ZERO,
         wait_budget: Duration::ZERO,
         run_budgeted: false,
         max_in_flight_waits: 0,
+        refusal_budget: Duration::ZERO,
     };
 
     /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
@@ -333,6 +366,12 @@ impl RetryPolicy {
             return false;
         }
         true
+    }
+
+    /// Whether a capacity refusal is waited out for `next` on the route's
+    /// refusal budget, costing no attempt. Never, for a policy without one.
+    fn waits_out_refusal(&self, route: &refusals::RouteRefusal, next: Duration) -> bool {
+        !self.refusal_budget.is_zero() && route.fits(next, self.refusal_budget)
     }
 
     /// Sleep before the next attempt, charged to the run's budget when the
@@ -576,6 +615,23 @@ fn global_pacer() -> Arc<RatePacer> {
     PACER.get_or_init(|| Arc::new(RatePacer::new())).clone()
 }
 
+/// How long this run's per-file calls have waited out capacity refusals, per
+/// route (carrick#1893; see `refusals.rs`). Process-global for the same reason
+/// as the limits: the budget is the run's, whichever `AgentService` asks.
+fn global_refusals() -> Arc<RouteRefusals> {
+    static REFUSALS: OnceLock<Arc<RouteRefusals>> = OnceLock::new();
+    REFUSALS
+        .get_or_init(|| Arc::new(RouteRefusals::new()))
+        .clone()
+}
+
+/// Start every route's refusal budget from nothing. The engine calls it as a
+/// run opens, beside [`crate::retry_budget::reset`]; tests run several scans
+/// in one process.
+pub fn reset_refusal_budgets() {
+    global_refusals().reset();
+}
+
 /// Whether a retriable error ENVELOPE says the route's model is out of
 /// capacity. The lambda answers 503 `model_error` with a `Retry-After` when
 /// the model's own retries ran out, and that is per model, so it cuts the
@@ -596,6 +652,25 @@ fn is_gateway_throttle(status: u16) -> bool {
     status == 429
 }
 
+/// A cloud a test scripts: called with the route and the attempt number the
+/// request carries, it answers in the test's own time with the response the
+/// retry loop then reads as it reads any other. So a test can walk minutes of
+/// refusals on a paused clock, which no socket can.
+#[cfg(test)]
+#[derive(Clone)]
+struct Script(
+    Arc<
+        dyn Fn(String, u32) -> futures::future::BoxFuture<'static, reqwest::Response> + Send + Sync,
+    >,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for Script {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Script")
+    }
+}
+
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
@@ -603,7 +678,11 @@ pub struct AgentService {
     semaphore: Arc<Semaphore>,
     limits: Arc<RouteLimits>,
     pacer: Arc<RatePacer>,
+    refusals: Arc<RouteRefusals>,
     retry: RetryPolicy,
+    /// Answers every request in place of the cloud.
+    #[cfg(test)]
+    script: Option<Script>,
 }
 
 impl AgentService {
@@ -623,7 +702,10 @@ impl AgentService {
             semaphore: global_semaphore(),
             limits: global_route_limits(),
             pacer: global_pacer(),
+            refusals: global_refusals(),
             retry: RetryPolicy::STANDARD,
+            #[cfg(test)]
+            script: None,
         }
     }
 
@@ -719,11 +801,37 @@ impl AgentService {
             .await
     }
 
+    /// Put one request on the wire.
+    #[cfg(not(test))]
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        _path: &str,
+        _attempt: u32,
+    ) -> reqwest::Result<reqwest::Response> {
+        request.send().await
+    }
+
+    /// Put one request on the wire, or hand it to the test's [`Script`].
+    #[cfg(test)]
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+        attempt: u32,
+    ) -> reqwest::Result<reqwest::Response> {
+        match &self.script {
+            Some(script) => Ok((script.0)(path.to_string(), attempt).await),
+            None => request.send().await,
+        }
+    }
+
     /// Shared HTTP + retry implementation for all lambda calls. Sends
     /// the version header, parses the structured error envelope, and
     /// only consumes a backoff attempt when the error is marked
-    /// retriable=true (or on bare network failures). A 2xx body is read as
-    /// the route says ([`SuccessBody::of`]).
+    /// retriable=true (or on bare network failures). A capacity refusal
+    /// consumes none while the route's refusal budget lasts (carrick#1893).
+    /// A 2xx body is read as the route says ([`SuccessBody::of`]).
     ///
     /// `auth` and `api_base` are parameters rather than the globals the
     /// public entry point reads, so the retry loop can be driven against a
@@ -762,6 +870,10 @@ impl AgentService {
         // response is a floor under the backoff (see `retry_wait`), and each
         // request numbers itself in `X-Carrick-Attempt` so the lambda sizes
         // its own model retries to this loop (carrick-cloud#875).
+        //
+        // Two answers cost no attempt: a lease wait (carrick#1131), and a
+        // capacity refusal while the route's refusal budget has room
+        // (carrick#1893).
         let policy = self.retry;
         let max_retries = policy.max_attempts;
         // What this call has slept so far, against the policy's wait budget.
@@ -770,6 +882,15 @@ impl AgentService {
         // Lease waits sat out so far, against the policy's cap. Counted
         // by hand, with `attempt`, so a wait can hand its attempt back.
         let mut in_flight_waits: u32 = 0;
+        // The route's refused time this run, and this call's open wait on it:
+        // held from a capacity refusal until the request sent after it comes
+        // back, so the route is charged for the sleep, the queue for a slot
+        // and the request, which is the time this call spends on the refusal.
+        let route_refusal = self.refusals.for_route(path);
+        let mut refused: Option<refusals::Waiting> = None;
+        // Capacity refusals this call has met in a row. The backoff after one
+        // grows with this, since the attempt it would grow with is not spent.
+        let mut refusals_in_a_row: u32 = 0;
         let mut attempt: u32 = 0;
         while attempt < max_retries {
             attempt += 1;
@@ -858,7 +979,11 @@ impl AgentService {
                 }
             };
 
-            match request_builder.send().await {
+            let sent = self.send(request_builder, path, lambda_attempt).await;
+            // The request a refusal was waited out for has come back, so the
+            // wait is over. Another refusal opens the next one below.
+            let was_refused = refused.take().is_some();
+            match sent {
                 Ok(response) => {
                     let status = response.status();
                     // Read before the body consumes the response.
@@ -1114,6 +1239,54 @@ impl AgentService {
                     // Past the cap, a lease wait is retried like any retriable
                     // error below, but it is still no verdict on capacity.
                     let model_busy = !in_flight && is_model_busy(status.as_u16(), retry_after);
+
+                    // A capacity refusal is waited out on the route's refusal
+                    // budget and costs no attempt (carrick#1893): the model
+                    // refuses in windows that outlast seven attempts and
+                    // answers once they pass. The model was asked, so
+                    // `X-Carrick-Attempt` advances and the limit hears the
+                    // refusal, as on the counted path below. With the budget
+                    // spent the refusal falls through to that path and costs
+                    // an attempt like any other retriable error, so a route
+                    // that refuses the whole run still ends the call.
+                    if model_busy && call_err.retriable {
+                        if !was_refused {
+                            refusals_in_a_row = 0;
+                        }
+                        let wait_time = retry_wait_within(
+                            refusals_in_a_row + 1,
+                            jitter_seed(),
+                            retry_after,
+                            policy.max_delay,
+                        );
+                        if policy.waits_out_refusal(&route_refusal, wait_time) {
+                            refusals_in_a_row += 1;
+                            // File-log detail, like every refusal. The
+                            // terminal hears from the limiter when the limit
+                            // moves, and from the route's ledger every few
+                            // refused minutes.
+                            debug!(
+                                "{} was refused for capacity, asking again in {:?} (refusal {} in \
+                                 a row for this call, no attempt spent; the route has been \
+                                 refused for {}s of its {}s this run): {}",
+                                path,
+                                wait_time,
+                                refusals_in_a_row,
+                                route_refusal.spent().as_secs(),
+                                policy.refusal_budget.as_secs(),
+                                call_err.message
+                            );
+                            drop(permit);
+                            route_slot.overloaded();
+                            route_refusal.say_waiting(policy.refusal_budget);
+                            refused = Some(route_refusal.wait());
+                            sleep(wait_time).await;
+                            attempt -= 1;
+                            lambda_attempt += 1;
+                            continue;
+                        }
+                        route_refusal.say_spent(policy.refusal_budget, max_retries);
+                    }
 
                     // The cloud's Retry-After on a 503 `model_error` is the
                     // floor: re-firing after one or two seconds lands in the
@@ -2849,13 +3022,17 @@ pub(crate) mod tests {
         assert!(!is_gateway_throttle(504));
     }
 
+    /// A service with its own slots, limits, pace and refusal budgets, so a
+    /// test neither reads nor spends the process's.
     fn service_with(permits: usize, route_max: usize) -> AgentService {
         AgentService {
             client: Client::builder().no_proxy().build().unwrap(),
             semaphore: Arc::new(Semaphore::new(permits)),
             limits: Arc::new(RouteLimits::new(route_max)),
             pacer: Arc::new(RatePacer::new()),
+            refusals: Arc::new(RouteRefusals::new()),
             retry: RetryPolicy::STANDARD,
+            script: None,
         }
     }
 
@@ -3080,8 +3257,11 @@ pub(crate) mod tests {
         assert_eq!(parse_retry_after(Some("43200")), Some(RETRY_AFTER_CAP));
     }
 
-    /// Walk a policy's worst case: every attempt answered retriable with the
-    /// longest jitter, and return (attempts made, seconds slept).
+    /// Walk a policy's worst case for an error that spends attempts: every
+    /// attempt answered retriable with the longest jitter, and return
+    /// (attempts made, seconds slept). A capacity refusal under a refusal
+    /// budget spends none, and its bound is the budget's
+    /// (`a_route_that_refuses_the_whole_run_costs_its_refusal_budget_once`).
     fn worst_case(policy: RetryPolicy, retry_after: Option<Duration>) -> (u32, Duration) {
         let mut waited = Duration::ZERO;
         let mut attempt = 1;
@@ -3095,9 +3275,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The per-file policy is the seven attempts it always was; the patient
-    /// one, for the calls a whole service depends on, sleeps for up to ten
-    /// minutes and never longer, whatever the cloud's hint says.
+    /// The per-file policy is the seven attempts it always was for every
+    /// error that spends one; the patient one, for the calls a whole service
+    /// depends on, sleeps for up to ten minutes and never longer, whatever
+    /// the cloud's hint says.
     #[test]
     fn a_service_level_call_waits_minutes_and_a_file_call_does_not() {
         let (attempts, waited) = worst_case(RetryPolicy::STANDARD, None);
@@ -3934,7 +4115,8 @@ pub(crate) mod tests {
     }
 
     /// A retry policy with the standard shape and millisecond sleeps, so a
-    /// test can walk a whole attempt chain.
+    /// test can walk a whole attempt chain. It has no refusal budget: every
+    /// retriable answer spends an attempt, a capacity refusal included.
     fn quick_policy(max_attempts: u32) -> RetryPolicy {
         RetryPolicy {
             max_attempts,
@@ -3942,6 +4124,7 @@ pub(crate) mod tests {
             wait_budget: Duration::from_secs(60),
             run_budgeted: false,
             max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
+            refusal_budget: Duration::ZERO,
         }
     }
 
@@ -4122,6 +4305,432 @@ pub(crate) mod tests {
         assert_eq!(result.unwrap().text, "analysed");
         assert_eq!(limit.limit(), 4);
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    /// [`quick_policy`] with a refusal budget: a capacity refusal is waited
+    /// out without spending an attempt, as under [`RetryPolicy::STANDARD`].
+    fn quick_refusal_policy(max_attempts: u32, refusal_budget: Duration) -> RetryPolicy {
+        RetryPolicy {
+            refusal_budget,
+            ..quick_policy(max_attempts)
+        }
+    }
+
+    /// The model refused for capacity, as the lambda says it.
+    fn capacity_refusal() -> StubResponse {
+        (
+            503,
+            MODEL_BUSY_503.to_string(),
+            vec![("Retry-After", "0".to_string())],
+        )
+    }
+
+    /// The API Gateway gave up on a request that ran past its limit: its own
+    /// 503, whose body is JSON and not an envelope.
+    fn gateway_cut() -> StubResponse {
+        (
+            503,
+            r#"{"message":"Service Unavailable"}"#.to_string(),
+            Vec::new(),
+        )
+    }
+
+    fn answered() -> StubResponse {
+        (200, ANSWERED.to_string(), Vec::new())
+    }
+
+    const ANSWERED: &str = r#"{"success":true,"text":"analysed"}"#;
+
+    /// carrick#1893: a refusal window longer than a call's attempts loses no
+    /// file. Twelve capacity refusals and then an answer: with a refusal
+    /// budget the call is answered, having spent no attempt, and each request
+    /// still tells the lambda the model was already asked. Without one, which
+    /// is what every release up to 0.3.106 did, the same route ends the call
+    /// on its seventh refusal.
+    #[tokio::test]
+    async fn a_refusal_window_longer_than_seven_attempts_loses_no_file() {
+        const REFUSALS: usize = 12;
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+
+        let mut window: Vec<StubResponse> = (0..REFUSALS).map(|_| capacity_refusal()).collect();
+        window.push(answered());
+        let (api_base, server) = stub_server_with_headers(window);
+        let service = service_with(4, 4)
+            .with_retry_policy(quick_refusal_policy(MAX_RETRIES, Duration::from_secs(60)));
+        let limit = service.limits.for_route("/analyze-file");
+        let result = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), REFUSALS + 1);
+        for (sent, request) in requests.iter().enumerate() {
+            assert_eq!(
+                header_of(request, "x-carrick-attempt"),
+                Some((sent + 1).to_string()),
+                "the model was asked on every request, and the lambda is told so"
+            );
+        }
+        assert!(
+            limit.limit() < 4,
+            "a capacity refusal no longer cuts the limit"
+        );
+        assert!(
+            service.refusals.for_route("/analyze-file").spent() > Duration::ZERO,
+            "the waits were not charged to the route"
+        );
+
+        let (api_base, server) =
+            stub_server_with_headers((0..MAX_RETRIES).map(|_| capacity_refusal()).collect());
+        let counted = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        let error = counted
+            .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+            .await
+            .expect_err("seven refusals spend seven attempts when nothing waits them out");
+        assert_eq!(error.code, "model_error");
+        assert!(error.retriable);
+        assert_eq!(server.join().unwrap().len(), MAX_RETRIES as usize);
+    }
+
+    /// Only a capacity refusal keeps its attempt. A request the gateway cut
+    /// spends one, as it always did, so with three attempts a call survives
+    /// two cuts among any number of refusals and ends on the third cut, named
+    /// for the cut. What a cut request came to is carrick#1897's question.
+    #[tokio::test]
+    async fn a_gateway_cut_still_spends_an_attempt_between_refusals() {
+        const ATTEMPTS: u32 = 3;
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let policy = quick_refusal_policy(ATTEMPTS, Duration::from_secs(60));
+
+        let (api_base, server) = stub_server_with_headers(vec![
+            capacity_refusal(),
+            gateway_cut(),
+            capacity_refusal(),
+            capacity_refusal(),
+            gateway_cut(),
+            capacity_refusal(),
+            answered(),
+        ]);
+        let result = service_with(4, 4)
+            .with_retry_policy(policy)
+            .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        assert_eq!(server.join().unwrap().len(), 7);
+
+        let (api_base, server) = stub_server_with_headers(vec![
+            capacity_refusal(),
+            gateway_cut(),
+            capacity_refusal(),
+            gateway_cut(),
+            capacity_refusal(),
+            gateway_cut(),
+        ]);
+        let error = service_with(4, 4)
+            .with_retry_policy(policy)
+            .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+            .await
+            .expect_err("the third cut spends the third attempt");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// A call whose failure costs nothing waits out no refusal either: one
+    /// request, whatever the route's budget holds.
+    #[tokio::test]
+    async fn a_best_effort_call_is_not_sent_again_after_a_capacity_refusal() {
+        let (api_base, server) = stub_server_with_headers(vec![capacity_refusal()]);
+        let error = service_with(4, 4)
+            .with_retry_policy(RetryPolicy::ONCE)
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/framework-detect",
+                &serde_json::json!({}),
+            )
+            .await
+            .expect_err("a refusal ends a best-effort call");
+        assert_eq!(error.code, "model_error");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// The process-wide cap and each route's starting limit in the scripted
+    /// tests: the scanner's own default.
+    const SCRIPTED_CAP: usize = DEFAULT_CONCURRENCY_LIMIT;
+
+    /// How long the scripted cloud takes to refuse a request and to answer
+    /// one: the medians of the large first index the windows below are from.
+    const REFUSED_AFTER: Duration = Duration::from_secs(14);
+    const ANSWERED_AFTER: Duration = Duration::from_secs(8);
+
+    /// A service that asks `script` instead of the cloud, on a clock a paused
+    /// test moves.
+    ///
+    /// The limiter's quiet restore reads the machine's clock, which a paused
+    /// test does not move, so it is switched off and a cut limit comes back by
+    /// its additive climb alone. That is slower than a real scan, which makes
+    /// a replay harder to pass, not easier.
+    fn scripted<F, Fut>(script: F) -> AgentService
+    where
+        F: Fn(String, u32) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = reqwest::Response> + Send + 'static,
+    {
+        AgentService {
+            limits: Arc::new(RouteLimits::with_quiet(SCRIPTED_CAP, Duration::MAX)),
+            script: Some(Script(Arc::new(move |route, attempt| {
+                Box::pin(script(route, attempt))
+            }))),
+            ..service_with(SCRIPTED_CAP, SCRIPTED_CAP)
+        }
+    }
+
+    /// The lambda's capacity refusal, with the `Retry-After` it sends.
+    fn scripted_refusal() -> reqwest::Response {
+        http::Response::builder()
+            .status(503)
+            .header("Retry-After", "10")
+            .body(MODEL_BUSY_503.to_string())
+            .unwrap()
+            .into()
+    }
+
+    fn scripted_answer() -> reqwest::Response {
+        http::Response::builder()
+            .status(200)
+            .body(ANSWERED.to_string())
+            .unwrap()
+            .into()
+    }
+
+    /// Send `files` calls to `/analyze-file` the way a service's file stage
+    /// does, and count the ones that failed.
+    async fn analyse_files(service: &AgentService, files: usize) -> usize {
+        use futures::StreamExt;
+
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        futures::stream::iter(0..files)
+            .map(|_| service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body))
+            .buffer_unordered(crate::agents::file_orchestrator::FILE_ANALYSIS_QUEUE_DEPTH)
+            .filter(|answer| std::future::ready(answer.is_err()))
+            .count()
+            .await
+    }
+
+    /// The bound carrick#1893 has to state: a route that refuses for the
+    /// whole run still ends every call. Its files wait out the route's
+    /// refusal budget once, between them, and from there each refusal costs
+    /// an attempt, so the run is longer than it was by the budget and by the
+    /// requests in flight when it ran out, and by nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn a_route_that_refuses_the_whole_run_costs_its_refusal_budget_once() {
+        const FILES: usize = 60;
+        let refusing = || {
+            scripted(|_route, _attempt| async {
+                sleep(REFUSED_AFTER).await;
+                scripted_refusal()
+            })
+        };
+
+        let counted = refusing().with_retry_policy(RetryPolicy {
+            refusal_budget: Duration::ZERO,
+            ..RetryPolicy::STANDARD
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(analyse_files(&counted, FILES).await, FILES);
+        let counting_took = started.elapsed();
+
+        let waiting = refusing();
+        let started = tokio::time::Instant::now();
+        assert_eq!(analyse_files(&waiting, FILES).await, FILES);
+        let waiting_took = started.elapsed();
+        let charged = waiting.refusals.for_route("/analyze-file").spent();
+        // What the budget may overrun by: the calls asleep when it ran out
+        // finish that sleep (40 s at most) and queue for the two slots a
+        // refused route is cut to, twenty calls at fourteen seconds a refusal.
+        // About three and a half minutes here; the sleeps are jittered off
+        // the machine's clock, so the bound leaves room.
+        const OVERRUN: Duration = Duration::from_secs(6 * 60);
+
+        eprintln!(
+            "a route that never answers, {FILES} files: {:.1} min counting attempts, {:.1} min \
+             with the refusal budget ({:.1} min charged to the route)",
+            counting_took.as_secs_f64() / 60.0,
+            waiting_took.as_secs_f64() / 60.0,
+            charged.as_secs_f64() / 60.0
+        );
+        assert!(waiting_took >= counting_took + REFUSAL_BUDGET - Duration::from_secs(60));
+        assert!(
+            waiting_took <= counting_took + REFUSAL_BUDGET + OVERRUN,
+            "the budget added {:?} to a run that took {counting_took:?} without it",
+            waiting_took - counting_took
+        );
+        // What the ledger holds is what the files waited, and it stops there.
+        assert!(charged <= REFUSAL_BUDGET + OVERRUN, "{charged:?}");
+    }
+
+    /// The file route's refusal windows on one large first index, in seconds
+    /// from the start of the run: each is a run of capacity refusals no more
+    /// than ninety seconds apart, from its first to its last. 83 refusals in
+    /// nine windows, 21.7 minutes between them, the longest twelve and a half.
+    ///
+    /// The run's log holds 84 refusals of per-file calls. One, 29 seconds
+    /// after the first here, was the intent route's and is left out, which is
+    /// why the first window is a single moment.
+    const LOGGED_WINDOWS: [(u64, u64); 9] = [
+        (776, 776),
+        (1087, 1188),
+        (1416, 1471),
+        (2039, 2789),
+        (3508, 3508),
+        (3601, 3647),
+        (3749, 3859),
+        (4005, 4215),
+        (4770, 4798),
+    ];
+
+    /// What that run sent the file route: for each service that sent any, the
+    /// second its first file request went out and how many files followed.
+    /// 1,024 files over 39 services, one service after another.
+    const LOGGED_LOAD: [(u64, usize); 39] = [
+        (25, 8),
+        (92, 4),
+        (143, 42),
+        (259, 1),
+        (281, 10),
+        (305, 1),
+        (315, 1),
+        (353, 1),
+        (379, 3),
+        (416, 5),
+        (449, 19),
+        (466, 3),
+        (538, 3),
+        (571, 40),
+        (679, 8),
+        (688, 4),
+        (714, 6),
+        (765, 1),
+        (821, 17),
+        (981, 8),
+        (1013, 6),
+        (1067, 2),
+        (1289, 3),
+        (1358, 24),
+        (1596, 32),
+        (1727, 5),
+        (1745, 24),
+        (1797, 17),
+        (1875, 6),
+        (1917, 8),
+        (1935, 30),
+        (2005, 426),
+        (3426, 84),
+        (3733, 2),
+        (3792, 8),
+        (3923, 13),
+        (3980, 122),
+        (4688, 10),
+        (4727, 17),
+    ];
+
+    /// What one replay of [`LOGGED_WINDOWS`] came to.
+    struct Replay {
+        /// Files whose call ended in an error.
+        lost: usize,
+        /// Requests the route refused.
+        refused: usize,
+        /// What the route's refusal ledger was charged.
+        charged: Duration,
+        took: Duration,
+    }
+
+    /// Send [`LOGGED_LOAD`] at a route that refuses EVERY request in flight
+    /// while one of [`LOGGED_WINDOWS`] is open, and answers every other.
+    ///
+    /// Harsher than the run it is from, where at most a third of the requests
+    /// inside a window were refused: a file here is refused for as long as
+    /// the window lasts, so no file gets through a window by luck. Services
+    /// run one after another, each no earlier than it did.
+    async fn replay_logged_windows(policy: RetryPolicy) -> Replay {
+        use std::sync::atomic::AtomicUsize;
+
+        let started = tokio::time::Instant::now();
+        let refused = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&refused);
+        let service = scripted(move |_route, _attempt| {
+            let sent = started.elapsed();
+            let in_a_window = LOGGED_WINDOWS.iter().any(|(first, last)| {
+                sent <= Duration::from_secs(*last)
+                    && sent + REFUSED_AFTER >= Duration::from_secs(*first)
+            });
+            let counter = Arc::clone(&counter);
+            async move {
+                if in_a_window {
+                    sleep(REFUSED_AFTER).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    scripted_refusal()
+                } else {
+                    sleep(ANSWERED_AFTER).await;
+                    scripted_answer()
+                }
+            }
+        })
+        .with_retry_policy(policy);
+
+        let mut lost = 0;
+        for (first_request, files) in LOGGED_LOAD {
+            tokio::time::sleep_until(started + Duration::from_secs(first_request)).await;
+            lost += analyse_files(&service, files).await;
+        }
+        Replay {
+            lost,
+            refused: refused.load(Ordering::SeqCst),
+            charged: service.refusals.for_route("/analyze-file").spent(),
+            took: started.elapsed(),
+        }
+    }
+
+    /// carrick#1893 on the run it was written from: the refusal windows of a
+    /// large first index, replayed through the retry loop on a paused clock,
+    /// lose no file. Counting attempts, the same windows lose every file that
+    /// meets one of them for longer than its seven attempts last.
+    ///
+    /// The route's ledger must also end well inside the budget: the windows
+    /// add up to 21.7 minutes, and what is charged on top of that is each
+    /// window's last backoff and the queue for a slot behind it.
+    #[tokio::test(start_paused = true)]
+    async fn the_refusal_windows_of_a_large_first_index_lose_no_file() {
+        let counted = replay_logged_windows(RetryPolicy {
+            refusal_budget: Duration::ZERO,
+            ..RetryPolicy::STANDARD
+        })
+        .await;
+        let waited = replay_logged_windows(RetryPolicy::STANDARD).await;
+
+        for (rule, replay) in [("counting attempts", &counted), ("refusal budget", &waited)] {
+            eprintln!(
+                "logged refusal windows, {rule}: {} of 1024 files lost, {} requests refused, \
+                 {:.1} min charged to the route, run took {:.1} min",
+                replay.lost,
+                replay.refused,
+                replay.charged.as_secs_f64() / 60.0,
+                replay.took.as_secs_f64() / 60.0
+            );
+        }
+
+        assert!(
+            counted.lost > 0,
+            "the windows cost no file when attempts are counted, so this replay proves nothing"
+        );
+        assert_eq!(waited.lost, 0, "a file was given up on inside a window");
+        assert!(
+            waited.charged <= REFUSAL_BUDGET * 3 / 4,
+            "the logged windows charged {:?} of a {REFUSAL_BUDGET:?} budget",
+            waited.charged
+        );
     }
 
     /// carrick#1131 under load: forty calls start together under a route limit
@@ -4967,16 +5576,17 @@ pub(crate) mod tests {
             wait_budget: Duration::from_secs(600),
             run_budgeted: false,
             max_in_flight_waits: MAX_IN_FLIGHT_WAITS,
+            // The probes count the calls a limit rule loses, which is a count
+            // of attempts spent: a refusal budget would hide it.
+            refusal_budget: Duration::ZERO,
         }
     }
 
     fn service_with_quiet(permits: usize, route_max: usize, quiet: Duration) -> AgentService {
         AgentService {
-            client: Client::builder().no_proxy().build().unwrap(),
-            semaphore: Arc::new(Semaphore::new(permits)),
             limits: Arc::new(RouteLimits::with_quiet(route_max, quiet)),
-            pacer: Arc::new(RatePacer::new()),
             retry: probe_policy(),
+            ..service_with(permits, route_max)
         }
     }
 

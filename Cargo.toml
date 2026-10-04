@@ -60,6 +60,10 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2.5.0"
 
 [dev-dependencies]
+# What a scripted cloud answers with: `reqwest::Response` is built from an
+# `http::Response`, so the retry loop reads a test's answer exactly as it reads
+# the wire's (carrick#1893). Already in the graph through reqwest.
+http = "1"
 tempfile = "3.0"
 serial_test = "3.0"
 # `test-util` is the one tokio feature `full` leaves out, and it is what lets a

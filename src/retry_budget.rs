@@ -27,7 +27,11 @@
 //!
 //! Knob: [`BUDGET_ENV`], in seconds. Per-file and per-function calls retry
 //! under the standard policy and are not charged: they cost one file, and the
-//! run goes on without it.
+//! run goes on without it. The capacity refusals they wait out are charged to
+//! a ledger of their own, one per route (`agent_service::refusals`,
+//! carrick#1893), so a file waiting on a busy model never spends the patience
+//! a service's detection needs. A refused request still reaches the cloud, so
+//! those waits keep the scan's slot too.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -42,33 +46,89 @@ pub const BUDGET_ENV: &str = "CARRICK_RETRY_BUDGET_SECS";
 const DEFAULT_BUDGET: Duration = Duration::from_secs(20 * 60);
 const MAX_BUDGET: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Default)]
-struct Ledger {
+/// Wall-clock time during which at least one wait is open, added up.
+///
+/// The run's own ledger is one of these, and so is each route's refusal
+/// budget (`agent_service::refusals`, carrick#1893): both bound how long a
+/// scan stands still, and a scan stands still for as long as ANY of its waits
+/// is open, not for their sum.
+#[derive(Debug, Default)]
+pub(crate) struct Ledger {
+    state: Mutex<LedgerState>,
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
     /// Charged time from waits that have finished.
     spent: Duration,
-    /// When the current stretch of waiting began, while any wait sleeps.
+    /// When the current stretch of waiting began, while any wait is open.
     since: Option<Instant>,
-    /// Budgeted waits sleeping right now.
+    /// Waits open right now.
     waiters: usize,
 }
 
 impl Ledger {
-    fn spent(&self) -> Duration {
-        self.spent + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(LedgerState {
+                spent: Duration::ZERO,
+                since: None,
+                waiters: 0,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Time charged so far, the stretch still open included.
+    pub(crate) fn spent(&self) -> Duration {
+        let state = self.state();
+        state.spent + state.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// Start the ledger from nothing.
+    pub(crate) fn reset(&self) {
+        *self.state() = LedgerState::default();
+    }
+
+    /// Open one wait. The ledger is charged until the returned guard drops.
+    pub(crate) fn open<L>(ledger: L) -> Charge<L>
+    where
+        L: std::ops::Deref<Target = Ledger>,
+    {
+        {
+            let mut state = ledger.state();
+            if state.waiters == 0 {
+                state.since = Some(Instant::now());
+            }
+            state.waiters += 1;
+        }
+        Charge(ledger)
     }
 }
 
-static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
-    spent: Duration::ZERO,
-    since: None,
-    waiters: 0,
-});
+/// One open wait on a [`Ledger`]. Counted for as long as it lives, so a wait
+/// dropped mid sleep (an interrupted run) stops charging too.
+#[derive(Debug)]
+pub(crate) struct Charge<L: std::ops::Deref<Target = Ledger>>(L);
 
-fn ledger() -> std::sync::MutexGuard<'static, Ledger> {
-    LEDGER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl<L: std::ops::Deref<Target = Ledger>> Drop for Charge<L> {
+    fn drop(&mut self) {
+        let mut state = self.0.state();
+        state.waiters = state.waiters.saturating_sub(1);
+        if state.waiters == 0
+            && let Some(since) = state.since.take()
+        {
+            state.spent += since.elapsed();
+        }
+    }
 }
+
+static LEDGER: Ledger = Ledger::new();
 
 /// The run's budget, read from [`BUDGET_ENV`].
 pub fn budget() -> Duration {
@@ -86,12 +146,12 @@ fn budget_from(value: Option<&str>) -> Duration {
 /// Start a run's ledger from nothing. The engine calls it as a run opens;
 /// tests run several scans in one process.
 pub fn reset() {
-    *ledger() = Ledger::default();
+    LEDGER.reset();
 }
 
 /// Waiting charged so far this run.
 pub fn spent() -> Duration {
-    ledger().spent()
+    LEDGER.spent()
 }
 
 /// What is left of the budget.
@@ -106,35 +166,8 @@ pub fn fits(wait: Duration) -> bool {
 
 /// Sleep `duration`, charging the budget for it.
 pub async fn wait(duration: Duration) {
-    let _charge = Charge::start();
+    let _charge = Ledger::open(&LEDGER);
     tokio::time::sleep(duration).await;
-}
-
-/// Counts one sleeping wait for as long as it lives, so a wait dropped mid
-/// sleep (an interrupted run) stops charging too.
-struct Charge;
-
-impl Charge {
-    fn start() -> Self {
-        let mut ledger = ledger();
-        if ledger.waiters == 0 {
-            ledger.since = Some(Instant::now());
-        }
-        ledger.waiters += 1;
-        Charge
-    }
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        let mut ledger = ledger();
-        ledger.waiters = ledger.waiters.saturating_sub(1);
-        if ledger.waiters == 0
-            && let Some(since) = ledger.since.take()
-        {
-            ledger.spent += since.elapsed();
-        }
-    }
 }
 
 #[cfg(test)]
