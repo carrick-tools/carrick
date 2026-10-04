@@ -53,6 +53,7 @@ import { validateInferRequestItem } from './validators.js';
 import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
+import { functionAtLine } from './function-line-index.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -5527,51 +5528,7 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     line: number
   ): FunctionLike | undefined {
-    const LINE_TOLERANCE = 2;
-    const functions: FunctionLike[] = [];
-    /** Statements opening inside the forward window, in source order. */
-    const windowStatements: Node[] = [];
-    for (const node of sourceFile.getDescendants()) {
-      if (
-        Node.isFunctionDeclaration(node) ||
-        Node.isArrowFunction(node) ||
-        Node.isFunctionExpression(node) ||
-        Node.isMethodDeclaration(node)
-      ) {
-        functions.push(node);
-      }
-      if (Node.isStatement(node)) {
-        const start = node.getStartLineNumber();
-        if (start >= line && start <= line + LINE_TOLERANCE) {
-          windowStatements.push(node);
-        }
-      }
-    }
-
-    const separatedFromAnchor = (fn: FunctionLike): boolean =>
-      windowStatements.some(
-        (statement) =>
-          statement.getStartLineNumber() < fn.getStartLineNumber() &&
-          !(statement.getStart() <= fn.getStart() && statement.getEnd() >= fn.getEnd())
-      );
-
-    let best: FunctionLike | undefined;
-    let bestDelta = Infinity;
-    for (const fn of functions) {
-      const delta = Math.abs(fn.getStartLineNumber() - line);
-      if (delta > LINE_TOLERANCE) continue;
-      if (fn.getStartLineNumber() > line && separatedFromAnchor(fn)) continue;
-      const isCloser = delta < bestDelta;
-      const isInnermostTie =
-        delta === bestDelta &&
-        best !== undefined &&
-        fn.getEnd() - fn.getStart() < best.getEnd() - best.getStart();
-      if (isCloser || isInnermostTie) {
-        best = fn;
-        bestDelta = delta;
-      }
-    }
-    return best;
+    return functionAtLine(sourceFile, line);
   }
 
   /**

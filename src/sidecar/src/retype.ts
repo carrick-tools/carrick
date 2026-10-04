@@ -35,6 +35,7 @@ import {
   testsOnPath,
   type Statuses,
 } from './failure-path.js';
+import { lineIndex } from './line-index.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import type {
   InferRequestItem,
@@ -958,18 +959,3 @@ function mapBack(pos: number, edits: Edit[]): Origin {
   return { kind: 'original', pos: pos - shift };
 }
 
-/** 1-based line of an original-file position. */
-function lineIndex(text: string): (pos: number) => number {
-  const starts = [0];
-  for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1);
-  return (pos) => {
-    let lo = 0;
-    let hi = starts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (starts[mid] <= pos) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo + 1;
-  };
-}

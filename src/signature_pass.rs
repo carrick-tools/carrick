@@ -11,7 +11,9 @@
 //! out of scope here — the named types in a signature become drill-downable via
 //! the bundle pipeline in follow-up work (issues #116/#117).
 
-use crate::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar, ready_budget};
+use crate::services::type_sidecar::{
+    InferKind, InferRequestItem, SidecarError, SidecarResponse, TypeSidecar, ready_budget,
+};
 use crate::visitor::FunctionDefinition;
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +22,23 @@ use tracing::{debug, warn};
 /// Shown in the signature hint when a return type is neither annotated nor
 /// successfully inferred.
 const RETURN_UNKNOWN: &str = "unknown";
+
+/// The most slots one inference request carries (carrick#1915).
+///
+/// The pass used to be one request, so a request that got no answer kept
+/// nothing: a first index sent 15,786 slots, the sidecar needed 38 minutes,
+/// and the scan had stopped waiting at 15. A request that fails now costs its
+/// own slots and no others.
+///
+/// The size does not bound how long a batch may run: the sidecar reports
+/// progress per slot, and the deadline measures silence (carrick#1914). It
+/// bounds what one stalled slot takes with it.
+///
+/// The slots are cut into batches in the order they were always sent. The
+/// compiler prints a union's members in the order it first met them, so
+/// sending the same slots in another order (by file, say) changes how some
+/// signatures read without changing what they say: 227 of 6,653 on one tree.
+const BATCH_SLOTS: usize = 500;
 
 /// Which slot of a function signature an inference request targets.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,8 +80,23 @@ pub fn populate_function_signatures(
     }
 }
 
-/// Build infer requests for unannotated slots, call the sidecar, and merge the
-/// results back onto the function definitions.
+/// What the pass over the batches came to.
+#[derive(Debug, Default, PartialEq)]
+struct PassOutcome {
+    /// Slots the sidecar typed, now on their function definitions.
+    inferred: usize,
+    /// Slots with no answer: those of every batch that failed, and `unsent`.
+    lost: usize,
+    /// Batches that were sent and got no answer.
+    failed_batches: usize,
+    /// Slots never sent, because a batch failed in a way that left no
+    /// sidecar to ask.
+    unsent: usize,
+}
+
+/// Build infer requests for unannotated slots, send them to the sidecar in
+/// batches, and merge each batch's results onto the function definitions as
+/// it returns.
 fn infer_missing_types(
     sidecar: &TypeSidecar,
     function_definitions: &mut HashMap<String, FunctionDefinition>,
@@ -73,32 +107,120 @@ fn infer_missing_types(
     if requests.is_empty() {
         return;
     }
-
-    debug!("Inferring {} unannotated signature slot(s)", requests.len());
-
-    // Timed on its own: the phase line's `signatures` covers this round trip
-    // AND the scanner-side request build, and only the split says which grew
-    // (carrick#767).
-    let round_trip = std::time::Instant::now();
-    let response = match sidecar.infer_types(&requests, None) {
-        Ok(response) => response,
-        Err(e) => {
-            warn!("Signature inference failed: {e}");
-            return;
-        }
-    };
+    let slots = requests.len();
 
     debug!(
-        "Signature inference: {} slot(s) in {:.1}s of sidecar time",
-        requests.len(),
-        round_trip.elapsed().as_secs_f64()
+        "Inferring {slots} unannotated signature slot(s) in {} batch(es)",
+        slots.div_ceil(BATCH_SLOTS)
     );
 
-    let Some(inferred) = response.inferred_types else {
-        return;
-    };
+    // Timed on its own: the phase line's `signatures` covers these round trips
+    // AND the scanner-side request build, and only the split says which grew
+    // (carrick#767).
+    let round_trips = std::time::Instant::now();
+    let outcome = infer_in_batches(
+        &requests,
+        BATCH_SLOTS,
+        &targets,
+        function_definitions,
+        |batch| sidecar.infer_types(batch, None),
+    );
+    let seconds = round_trips.elapsed().as_secs_f64();
 
-    for ty in &inferred {
+    if outcome.lost > 0 {
+        warn!(
+            "Signature inference: {} of {slots} slot(s) inferred, {} lost ({} batch(es) got no \
+             answer, {} slot(s) were never sent), in {seconds:.1}s of sidecar time",
+            outcome.inferred, outcome.lost, outcome.failed_batches, outcome.unsent,
+        );
+    } else {
+        debug!(
+            "Signature inference: {} of {slots} slot(s) inferred, none lost, in {seconds:.1}s of \
+             sidecar time",
+            outcome.inferred
+        );
+    }
+}
+
+/// Ask for the requests `batch_slots` at a time, in their order, and merge
+/// what comes back before asking for the next batch, so a batch that fails
+/// takes nothing a previous one brought.
+///
+/// `infer` is the sidecar call. A batch it fails on is lost and the next one
+/// is asked, unless the failure says there is no sidecar left
+/// ([`sidecar_still_answers`]): then the batches not yet sent are lost with
+/// it, without being sent.
+fn infer_in_batches(
+    requests: &[InferRequestItem],
+    batch_slots: usize,
+    targets: &HashMap<String, SigTarget>,
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+    mut infer: impl FnMut(&[InferRequestItem]) -> Result<SidecarResponse, SidecarError>,
+) -> PassOutcome {
+    let mut outcome = PassOutcome::default();
+    let mut batches = requests.chunks(batch_slots);
+    while let Some(batch) = batches.next() {
+        let error = match infer(batch) {
+            Ok(response) => {
+                outcome.inferred += merge_inferred(&response, targets, function_definitions);
+                continue;
+            }
+            Err(error) => error,
+        };
+        outcome.lost += batch.len();
+        outcome.failed_batches += 1;
+        if sidecar_still_answers(&error) {
+            warn!(
+                "Signature inference failed for a batch of {} slot(s): {error}",
+                batch.len()
+            );
+            continue;
+        }
+        let unsent: usize = batches.by_ref().map(<[InferRequestItem]>::len).sum();
+        warn!(
+            "Signature inference stopped at a batch of {} slot(s), with {unsent} slot(s) not yet \
+             sent: {error}",
+            batch.len()
+        );
+        outcome.lost += unsent;
+        outcome.unsent = unsent;
+    }
+    outcome
+}
+
+/// Whether the sidecar can be asked the next batch after failing this way.
+///
+/// A timed-out operation has already had its sidecar replaced by a fresh one
+/// (carrick#1914), and a frame that could not be written or read says nothing
+/// about the process. The rest say there is no process to ask: sending the
+/// remaining batches would fail each the same way.
+fn sidecar_still_answers(error: &SidecarError) -> bool {
+    match error {
+        SidecarError::Timeout
+        | SidecarError::SerializationError(_)
+        | SidecarError::DeserializationError(_)
+        // Failures of other operations; an inference does not return them.
+        | SidecarError::ResolutionFailed(_)
+        | SidecarError::CaptureFailed(_)
+        | SidecarError::CheckFailed(_) => true,
+        SidecarError::SpawnFailed(_)
+        | SidecarError::InitFailed(_)
+        | SidecarError::NotReady(_)
+        | SidecarError::ProcessDied
+        | SidecarError::IoError(_)
+        | SidecarError::Interrupted(_) => false,
+    }
+}
+
+/// Put one batch's inferred types on the function definitions they belong
+/// to. Returns how many slots were filled.
+fn merge_inferred(
+    response: &SidecarResponse,
+    targets: &HashMap<String, SigTarget>,
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+) -> usize {
+    let mut filled = 0;
+    for ty in response.inferred_types.iter().flatten() {
         let Some(target) = targets.get(&ty.alias) else {
             continue;
         };
@@ -109,15 +231,18 @@ fn infer_missing_types(
             SigSlot::Return => {
                 def.return_type = Some(ty.type_string.clone());
                 def.return_is_explicit = ty.is_explicit;
+                filled += 1;
             }
             SigSlot::Param(index) => {
                 if let Some(arg) = def.arguments.get_mut(index) {
                     arg.is_explicit = ty.is_explicit;
                     arg.type_string = Some(ty.type_string.clone());
+                    filled += 1;
                 }
             }
         }
     }
+    filled
 }
 
 /// Build one infer request per unannotated slot, with a generated alias keyed
@@ -441,5 +566,196 @@ mod tests {
             .find(|r| r.infer_kind == InferKind::FunctionParam)
             .expect("param request");
         assert_eq!(param_req.param_name.as_deref(), Some("args"));
+    }
+
+    // ---- carrick#1915: the pass is sent in batches ----
+
+    /// A function in `file` with one unannotated parameter and no return
+    /// annotation: two slots.
+    fn two_slot_def(name: &str, file: &str) -> FunctionDefinition {
+        let mut d = def(vec![arg("input", None)], None);
+        d.name = name.to_string();
+        d.file_path = file.into();
+        d
+    }
+
+    /// A sidecar answer that types every slot of the batch as `typed`.
+    fn answer(batch: &[InferRequestItem]) -> SidecarResponse {
+        let inferred: Vec<serde_json::Value> = batch
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "alias": request.alias,
+                    "type_string": "typed",
+                    "is_explicit": false,
+                    "source_location": {
+                        "file_path": request.file_path,
+                        "start_line": 1,
+                        "end_line": 1
+                    },
+                    "infer_kind": request.infer_kind,
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "request_id": "req",
+            "status": "success",
+            "inferred_types": inferred,
+        }))
+        .expect("a sidecar answer")
+    }
+
+    #[test]
+    fn the_slots_go_in_the_order_they_were_built_a_batch_at_a_time() {
+        // Names sort one way and their files the other.
+        let mut definitions = HashMap::new();
+        for (name, file) in [
+            ("a", "/r/z.ts"),
+            ("b", "/r/y.ts"),
+            ("c", "/r/z.ts"),
+            ("d", "/r/x.ts"),
+            ("e", "/r/y.ts"),
+        ] {
+            definitions.insert(name.to_string(), two_slot_def(name, file));
+        }
+        let (requests, targets) = build_infer_requests(&definitions, Path::new("/r"));
+        let built: Vec<String> = requests.iter().map(|r| r.alias.clone().unwrap()).collect();
+        assert_eq!(built.len(), 10);
+
+        let mut sent: Vec<Vec<String>> = Vec::new();
+        let outcome = infer_in_batches(&requests, 4, &targets, &mut definitions, |batch| {
+            sent.push(batch.iter().map(|r| r.alias.clone().unwrap()).collect());
+            Ok(answer(batch))
+        });
+
+        let sizes: Vec<usize> = sent.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![4, 4, 2]);
+        assert_eq!(
+            sent.concat(),
+            built,
+            "batching changes how many slots a request carries, not their order"
+        );
+        assert_eq!(outcome.inferred, 10);
+        assert!(
+            definitions
+                .values()
+                .all(|d| d.return_type.as_deref() == Some("typed")
+                    && d.arguments[0].type_string.as_deref() == Some("typed"))
+        );
+    }
+
+    /// Three functions of two slots each, a file each: at two slots a batch,
+    /// one batch per function. Returns the definitions, their targets and the
+    /// requests.
+    fn three_functions() -> (
+        HashMap<String, FunctionDefinition>,
+        HashMap<String, SigTarget>,
+        Vec<InferRequestItem>,
+    ) {
+        let definitions = HashMap::from([
+            ("inA".to_string(), two_slot_def("inA", "/r/a.ts")),
+            ("inB".to_string(), two_slot_def("inB", "/r/b.ts")),
+            ("inC".to_string(), two_slot_def("inC", "/r/c.ts")),
+        ]);
+        let (requests, targets) = build_infer_requests(&definitions, Path::new("/r"));
+        assert_eq!(requests.len(), 6);
+        (definitions, targets, requests)
+    }
+
+    #[test]
+    fn a_batch_that_times_out_costs_that_batch_only() {
+        let (mut definitions, targets, requests) = three_functions();
+        let mut asked = Vec::new();
+        let outcome = infer_in_batches(&requests, 2, &targets, &mut definitions, |batch| {
+            asked.push(batch[0].file_path.clone());
+            if batch[0].file_path == "/r/b.ts" {
+                // The sidecar is replaced by a fresh one (carrick#1914).
+                Err(SidecarError::Timeout)
+            } else {
+                Ok(answer(batch))
+            }
+        });
+
+        assert_eq!(asked, vec!["/r/a.ts", "/r/b.ts", "/r/c.ts"]);
+        assert_eq!(
+            outcome,
+            PassOutcome {
+                inferred: 4,
+                lost: 2,
+                failed_batches: 1,
+                unsent: 0,
+            }
+        );
+        for kept in ["inA", "inC"] {
+            assert_eq!(definitions[kept].return_type.as_deref(), Some("typed"));
+            assert_eq!(
+                definitions[kept].arguments[0].type_string.as_deref(),
+                Some("typed")
+            );
+        }
+        assert_eq!(definitions["inB"].return_type, None);
+        assert_eq!(definitions["inB"].arguments[0].type_string, None);
+    }
+
+    #[test]
+    fn a_sidecar_that_is_gone_ends_the_pass_and_keeps_what_was_merged() {
+        let (mut definitions, targets, requests) = three_functions();
+        let mut asked = 0;
+        let outcome = infer_in_batches(&requests, 2, &targets, &mut definitions, |batch| {
+            asked += 1;
+            if batch[0].file_path == "/r/a.ts" {
+                Ok(answer(batch))
+            } else {
+                Err(SidecarError::ProcessDied)
+            }
+        });
+
+        assert_eq!(asked, 2, "the third batch is not sent to a dead process");
+        assert_eq!(
+            outcome,
+            PassOutcome {
+                inferred: 2,
+                lost: 4,
+                failed_batches: 1,
+                unsent: 2,
+            }
+        );
+        assert_eq!(definitions["inA"].return_type.as_deref(), Some("typed"));
+        assert_eq!(definitions["inC"].return_type, None);
+    }
+
+    #[test]
+    fn a_slot_the_sidecar_could_not_type_is_neither_inferred_nor_lost() {
+        let (mut definitions, targets, requests) = three_functions();
+        let outcome = infer_in_batches(&requests, 2, &targets, &mut definitions, |batch| {
+            // Only the first slot of each batch comes back.
+            Ok(answer(&batch[..1]))
+        });
+        assert_eq!(
+            outcome,
+            PassOutcome {
+                inferred: 3,
+                lost: 0,
+                failed_batches: 0,
+                unsent: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_sidecar_that_can_still_answer_is_asked_again() {
+        // Replaced by a fresh process, or an answer that could not be read.
+        assert!(sidecar_still_answers(&SidecarError::Timeout));
+        assert!(sidecar_still_answers(&SidecarError::DeserializationError(
+            "bad frame".into()
+        )));
+        // No process to ask.
+        assert!(!sidecar_still_answers(&SidecarError::ProcessDied));
+        assert!(!sidecar_still_answers(&SidecarError::IoError(
+            "broken pipe".into()
+        )));
+        assert!(!sidecar_still_answers(&SidecarError::NotReady(
+            "its replacement was not ready".into()
+        )));
     }
 }
