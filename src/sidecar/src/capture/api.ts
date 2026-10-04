@@ -39,7 +39,7 @@ export type AnchorOrigin =
  */
 export type SerializationTier = 'emitted' | 'node_builder' | 'structural_fallback';
 
-/** Explicit exported symbol: `export type A = import('./m').Sym;` */
+/** Explicit exported symbol: `export type A = import('./m.js').Sym;` */
 export interface SymbolAnchorRequest {
   kind: 'symbol';
   /** Manifest alias, e.g. Endpoint_abc123_Response */
@@ -53,7 +53,7 @@ export interface SymbolAnchorRequest {
    * Wrap the captured symbol in this many TS array levels (#248/#306): an
    * anchor is the ELEMENT symbol by contract (`User[]` -> `User`), so the
    * use-site's array-ness rides here and the surface alias becomes
-   * `import('./m').Sym[]`. Omitted/0 captures the symbol as-is.
+   * `import('./m.js').Sym[]`. Omitted/0 captures the symbol as-is.
    */
   array_depth?: number;
 }
@@ -113,7 +113,7 @@ export interface PrintedName {
 
 /**
  * Addressable handler: `export type A = Awaited<ReturnType<typeof
- * import('./m').fn>>;` -- guarded (design doc, Capture step 1): the symbol
+ * import('./m.js').fn>>;` -- guarded (design doc, Capture step 1): the symbol
  * must be exported, must not be an overload set (ReturnType silently resolves
  * the last overload), and must not be generic (type params erase). Guard
  * failures demote to structural_fallback with the reason recorded.

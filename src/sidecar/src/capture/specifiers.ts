@@ -4,8 +4,36 @@
  * pattern matching for the post-emit rewrite pass.
  */
 
+import * as path from 'node:path';
+
 export function isRelative(spec: string): boolean {
   return spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/');
+}
+
+/** A declaration file of any module format: `.d.ts`, `.d.mts`, `.d.cts`. */
+export function isDeclarationFileName(name: string): boolean {
+  return /\.d\.[cm]?ts$/.test(name);
+}
+
+/**
+ * The declaration files a relative specifier can name in a stub's tree, in
+ * the order tried, given the path it resolves to from the file that holds it.
+ *
+ * A specifier names its module with no extension (`./a`: `a.d.ts`, or the
+ * directory's `index.d.ts`), by the file the module compiles to (`./a.js`:
+ * `a.d.ts`, `./a.mjs`: `a.d.mts`, `./a.cjs`: `a.d.cts`), or by the
+ * declaration file itself. The surface names every anchor's module the
+ * second way (carrick#1911), and so does any source written for
+ * `node16`..`nodenext`.
+ */
+export function declarationCandidates(resolved: string): string[] {
+  const output = /\.([cm]?)jsx?$/.exec(resolved);
+  return [
+    `${resolved}.d.ts`,
+    path.join(resolved, 'index.d.ts'),
+    ...(output ? [`${resolved.slice(0, output.index)}.d.${output[1]}ts`] : []),
+    resolved,
+  ];
 }
 
 /** zod -> zod, @scope/pkg/sub -> @scope/pkg, pkg/sub -> pkg */

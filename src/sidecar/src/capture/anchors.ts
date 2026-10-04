@@ -77,16 +77,28 @@ export interface ResolvedAnchor {
   namesUnemittedModule?: true;
 }
 
-/** Repo-root-relative source file -> extensionless specifier from entryDir. */
+/**
+ * Repo-root-relative source file -> the specifier the surface entry imports
+ * it by (carrick#1911): its path from `entryDir`, named by the file the
+ * module compiles to.
+ *
+ * That name is the one form every module setting resolves. A path with no
+ * extension resolves only where the importing file's format allows it: under
+ * `module` `node16`..`nodenext` the entry in a `"type": "module"` package is
+ * an ES module, which must name the output file, and a `.mts` or `.cts`
+ * module has no extensionless form under any setting. The compiler maps an
+ * output name back to its source (`./a.js` to `a.ts`, `a.tsx` or `a.d.ts`),
+ * and to the declaration the stub holds for it.
+ */
 export function entryRelativeSpecifier(
   entryDir: string,
   repoRoot: string,
   sourceFile: string
 ): string {
-  const target = path
-    .join(repoRoot, sourceFile)
-    .replace(/\.(ts|tsx|mts|cts)$/, '');
-  let rel = path.relative(entryDir, target).split(path.sep).join('/');
+  const target = path.join(repoRoot, sourceFile);
+  const kind = /(?:\.d)?\.([cm]?)[jt]sx?$/.exec(target);
+  const named = kind ? `${target.slice(0, kind.index)}.${kind[1]}js` : target;
+  let rel = path.relative(entryDir, named).split(path.sep).join('/');
   if (!rel.startsWith('.')) rel = `./${rel}`;
   return rel;
 }
@@ -215,7 +227,7 @@ export function resolveAnchor(
     // #438/#439: an LLM symbol anchor may name a schema VALUE const
     // (`export const ZFooSchema = z.object({...})`) whose sibling
     // `export type TFoo = z.infer<typeof ZFooSchema>` was the intended anchor.
-    // A value has no type-space meaning, so `import('./m').ZFooSchema` in TYPE
+    // A value has no type-space meaning, so `import('./m.js').ZFooSchema` in TYPE
     // position raises TS2694 in the stub tree and (before #438 part 2) poisons
     // every producer pair. Guard structurally on symbol meaning, never on the
     // name: resolve re-exports, then test for any type-space flag.

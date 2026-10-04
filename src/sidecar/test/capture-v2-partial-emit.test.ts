@@ -174,7 +174,7 @@ describe('capture v2: partially skipped declaration emit keeps the emitted subse
     assert.match(surface, /export type P_RouteReply = unknown;/);
     assert.ok(!surface.includes('src/http/routes'), surface);
     // The healthy alias keeps its real emitted reference.
-    assert.match(surface, /export type P_Event = import\(.\.\/src\/types\/events.\)\.OrderPlacedEvent;/);
+    assert.match(surface, /export type P_Event = import\(.\.\/src\/types\/events\.js.\)\.OrderPlacedEvent;/);
   });
 });
 

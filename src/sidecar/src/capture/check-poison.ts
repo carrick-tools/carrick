@@ -29,7 +29,12 @@ import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { AssembledWorkspace } from './check-workspace.js';
-import { collectSpecifiers, isRelative } from './specifiers.js';
+import {
+  collectSpecifiers,
+  declarationCandidates,
+  isDeclarationFileName,
+  isRelative,
+} from './specifiers.js';
 
 export interface StubPoisonIndex {
   serviceName: string;
@@ -67,13 +72,13 @@ function buildOne(
   const keyPrefix = `packages/${packageDir}/types`;
   const surfaceFile = `${keyPrefix}/surface.d.ts`;
 
-  // Collect the whole `.d.ts` tree, keyed as `packages/<dir>/types/<rel>`.
+  // Collect the whole declaration tree, keyed as `packages/<dir>/types/<rel>`.
   const treeAbs: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const p = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(p);
-      else if (entry.name.endsWith('.d.ts')) treeAbs.push(p);
+      else if (isDeclarationFileName(entry.name)) treeAbs.push(p);
     }
   };
   walk(typesDirAbs);
@@ -84,16 +89,7 @@ function buildOne(
   const resolveRel = (fromAbs: string, spec: string): string | undefined => {
     if (!isRelative(spec)) return undefined;
     const base = path.resolve(path.dirname(fromAbs), spec);
-    const candidates = [
-      `${base}.d.ts`,
-      path.join(base, 'index.d.ts'),
-      base.endsWith('.js') ? `${base.slice(0, -3)}.d.ts` : undefined,
-      base, // already `.d.ts`
-    ].filter((c): c is string => c !== undefined);
-    for (const c of candidates) {
-      if (treeAbsSet.has(path.resolve(c))) return c;
-    }
-    return undefined;
+    return declarationCandidates(base).find((candidate) => treeAbsSet.has(candidate));
   };
 
   // Per-file relative-import adjacency, over the fileKey namespace.

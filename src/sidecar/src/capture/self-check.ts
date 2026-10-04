@@ -35,7 +35,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { CaptureAliasRecord, CaptureAnchorRequest, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
-import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
+import {
+  collectSpecifiers,
+  declarationCandidates,
+  isDeclarationFileName,
+  isRelative,
+  packageNameOf,
+} from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
 import type { WriteGuard } from './guarded-fs.js';
 import {
@@ -77,7 +83,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const p = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(p);
-      else if (entry.name.endsWith('.d.ts')) treeFiles.push(p);
+      else if (isDeclarationFileName(entry.name)) treeFiles.push(p);
     }
   };
   walk(typesDir);
@@ -533,14 +539,5 @@ function resolveTreeSpecifier(
 ): string | undefined {
   if (!isRelative(spec)) return undefined;
   const base = path.resolve(path.dirname(fromAbs), spec);
-  const candidates = [
-    `${base}.d.ts`,
-    path.join(base, 'index.d.ts'),
-    base.endsWith('.js') ? `${base.slice(0, -3)}.d.ts` : undefined,
-    base, // already .d.ts
-  ].filter((c): c is string => c !== undefined);
-  for (const candidate of candidates) {
-    if (tree.has(candidate)) return candidate;
-  }
-  return undefined;
+  return declarationCandidates(base).find((candidate) => tree.has(candidate));
 }

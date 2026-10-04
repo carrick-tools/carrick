@@ -238,14 +238,21 @@ describe('partial emit keeps an alias whose specifier names a module that was no
   });
 
   it('a module outside rootDir is kept, by absolute path and by ../, under __outside__', () => {
-    for (const alias of ['Kept_AbsOutside', 'Kept_RelOutside', 'Kept_SymbolOutside']) {
+    // A literal's text keeps the specifier it was printed with; a symbol
+    // anchor names its module by the file it compiles to (carrick#1911).
+    for (const [alias, module] of [
+      ['Kept_AbsOutside', 'tag'],
+      ['Kept_RelOutside', 'tag'],
+      ['Kept_SymbolOutside', 'tag.js'],
+    ]) {
       const record = partial.records.get(alias)!;
       assert.strictEqual(record.capture_failure_reason, undefined, alias);
       assert.strictEqual(record.self_check, 'ok', `${alias}: ${record.self_check_detail}`);
-      assert.match(
-        surfaceLine(partial.surface, alias),
-        /import\(["']\.\/__outside__\/packages\/shared\/src\/tag["']\)\.Tag/,
-        alias
+      assert.ok(
+        /import\((["'])\.\/__outside__\/packages\/shared\/src\/([^"']+)\1\)\.Tag/.exec(
+          surfaceLine(partial.surface, alias)
+        )?.[2] === module,
+        `${alias}: ${surfaceLine(partial.surface, alias)}`
       );
     }
     assert.strictEqual(partial.records.get('Kept_SymbolOutside')!.serialization, 'emitted');
@@ -287,9 +294,13 @@ describe('partial emit keeps an alias whose specifier names a module that was no
       const record = partial.records.get(alias)!;
       assert.strictEqual(record.serialization, 'structural_fallback', alias);
       assert.strictEqual(record.self_check, 'decayed_internal', alias);
+      // The reason quotes the specifier as the alias wrote it: a symbol
+      // anchor's names the output file (carrick#1911).
       assert.match(
         record.capture_failure_reason ?? '',
-        /declaration emit was skipped for module '[^']*src\/http\/routes'/,
+        alias === 'Demoted_Symbol'
+          ? /declaration emit was skipped for module '\.\/src\/http\/routes\.js'/
+          : /declaration emit was skipped for module '[^']*src\/http\/routes'/,
         alias
       );
       assert.strictEqual(surfaceLine(partial.surface, alias), `export type ${alias} = unknown;`);

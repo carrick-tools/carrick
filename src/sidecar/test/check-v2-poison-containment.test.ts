@@ -227,3 +227,75 @@ describe('check_v2: install failure still degrades service-wide (#438 part 2)', 
     }
   });
 });
+
+// carrick#1911: the surface names an anchor's module by the file it compiles
+// to (`./schema.js`, `./labels.mjs`), and a module written for
+// `node16`..`nodenext` names its own imports the same way. A closure that
+// could not follow `.mjs` to a `.d.mts` reached no alias from that file, so
+// one broken declaration poisoned every pair of the service.
+describe('check_v2: a closure follows a specifier that names the output file (carrick#1911)', () => {
+  let verdicts: Map<string, CheckVerdict>;
+  let degraded: string[];
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-poison-output-name-'));
+    writeStub(root, 'orders', [
+      {
+        rel: 'surface.d.ts',
+        text: [
+          "export type Js_Sent = import('./schema.js').Order;",
+          "export type Mjs_Sent = import('./rates.mjs').Rate;",
+          "export type Cjs_Sent = import('./zones.cjs').Zone;",
+          // Reaches a `.d.mts` that does not typecheck.
+          "export type Mjs_Poisoned_Sent = import('./labels.mjs').Label;",
+          'export type Clean_Sent = { a: string; };',
+        ].join('\n') + '\n',
+      },
+      { rel: 'schema.d.ts', text: 'export interface Order { a: string }\n' },
+      { rel: 'rates.d.mts', text: 'export interface Rate { a: string }\n' },
+      { rel: 'zones.d.cts', text: 'export interface Zone { a: string }\n' },
+      { rel: 'labels.d.mts', text: 'export interface Label { a: AnotherMissingType }\n' },
+    ]);
+    writeStub(root, 'web', [
+      {
+        rel: 'surface.d.ts',
+        text: ['Js', 'Mjs', 'Cjs', 'Mjs_Poisoned', 'Clean']
+          .map((name) => `export type ${name}_Exp = { a: string; };`)
+          .join('\n') + '\n',
+      },
+    ]);
+    stubs = [
+      { service_name: 'orders', stub_dir: path.join(root, 'orders') },
+      { service_name: 'web', stub_dir: path.join(root, 'web') },
+    ];
+    const result = await runCheck({
+      stubs,
+      pairs: ['Js', 'Mjs', 'Cjs', 'Mjs_Poisoned', 'Clean'].map((name) =>
+        mk(name, `${name}_Sent`, `${name}_Exp`)
+      ),
+    });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    verdicts = byKey(result.verdicts);
+    degraded = result.degraded_services.map((d) => d.service_name);
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads each module the surface names by its output file', () => {
+    for (const key of ['Js', 'Mjs', 'Cjs']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    }
+  });
+
+  it('poisons the alias that reaches the broken .d.mts, and no other', () => {
+    const poisoned = verdicts.get('Mjs_Poisoned')!;
+    assert.strictEqual(poisoned.bucket, 'unverifiable', JSON.stringify(poisoned));
+    assert.strictEqual(poisoned.gate, 'poison:producer');
+    const clean = verdicts.get('Clean')!;
+    assert.strictEqual(clean.bucket, 'compatible', JSON.stringify(clean));
+    assert.ok(!degraded.includes('orders'), `degraded: ${degraded.join(', ')}`);
+  });
+});

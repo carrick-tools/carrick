@@ -4,7 +4,7 @@
  *
  * Two forms are produced per alias:
  *  - `definition`: the declaration *as written* (named refs preserved). For a
- *    surface alias `export type A = import('./m').Order;` this follows the
+ *    surface alias `export type A = import('./m.js').Order;` this follows the
  *    alias to its target declaration in the stub tree (`interface Order {...}`)
  *    so the definition keeps its real name and members; when the target is
  *    anonymous (inline object types, node-builder prints) the surface alias
@@ -59,11 +59,12 @@ export class DefinitionResolver {
    * (`<stub_dir>/types/surface.d.ts` + its declaration tree).
    *
    * Uses a DEDICATED project with `moduleResolution: Bundler`, not the
-   * repo's own project: the stub tree's relative import-types are
-   * extensionless, which a NodeNext-configured repo project silently fails
-   * to resolve (the alias then reads as `any`). Bundler resolution accepts
-   * both extensionless and `.js`-suffixed specifiers — the same policy the
-   * check-phase workspace uses.
+   * repo's own project: a stub tree holds relative specifiers with no
+   * extension (what the compiler prints, and what a bundler-style source
+   * writes), which a NodeNext-configured repo project silently fails to
+   * resolve (the alias then reads as `any`). Bundler resolution accepts
+   * both those and specifiers that name the output file (`./a.js`,
+   * `./a.mjs`) — the same policy the check-phase workspace uses.
    */
   resolveFromStub(stubDir: string, aliases: string[]): ResolvedDefinition[] {
     const typesDir = path.join(stubDir, 'types');
