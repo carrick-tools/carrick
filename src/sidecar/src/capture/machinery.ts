@@ -212,7 +212,7 @@ const checkoutRoots = new Map<string, string>();
 /** The checkout the service root sits in: the nearest ancestor holding a
  * `.git` entry (a directory, or the file a worktree carries), else the service
  * root itself. */
-function checkoutRootOf(repoRoot: string): string {
+export function checkoutRootOf(repoRoot: string): string {
   const key = path.resolve(repoRoot);
   const cached = checkoutRoots.get(key);
   if (cached) return cached;

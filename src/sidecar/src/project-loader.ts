@@ -10,12 +10,20 @@
  * - Pinned dependency snapshots for deterministic builds
  */
 
-import { Project, type CompilerOptions } from 'ts-morph';
+import { Project, type CompilerOptions, type ts } from 'ts-morph';
+import type tsc from 'typescript';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
-import { DenoProject, findDenoConfig, findServiceTsconfig, serviceConfigPath } from './capture/index.js';
-import { moduleFormatResolutionHost } from './module-format.js';
+import {
+  DenoProject,
+  findDenoConfig,
+  findServiceTsconfig,
+  serviceConfigPath,
+  unbuiltPackageSource,
+  workspaceScopeOf,
+} from './capture/index.js';
+import { moduleFormatResolutionHost, type UnresolvedModule } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 
 /**
@@ -371,12 +379,33 @@ export class ProjectLoader {
       tsConfigFilePath: configPath,
       skipAddingFilesFromTsConfig: false,
       // Each import resolves in its file's own module format (carrick#1619),
-      // and every external-library answer is kept past the program rebuilds
-      // that drop it (carrick#1731).
-      resolutionHost: imports.recording(moduleFormatResolutionHost),
+      // an unbuilt package of the checkout is read from its source
+      // (carrick#1910), and every external-library answer is kept past the
+      // program rebuilds that drop it (carrick#1731).
+      resolutionHost: imports.recording(moduleFormatResolutionHost(this.unbuiltPackage())),
     });
     registerExternalImports(project, imports);
     return project;
+  }
+
+  /**
+   * An import the compiler did not resolve, answered with the source of an
+   * unbuilt package of the scanned checkout (carrick#1910). The capture
+   * bundle compiles against its own copy of the compiler; the two copies'
+   * options, hosts and results are the same values.
+   */
+  private unbuiltPackage(): UnresolvedModule {
+    const workspace = workspaceScopeOf(this.repoRoot, this.scanRoot);
+    return (name, containingFile, options, host, mode) =>
+      unbuiltPackageSource(
+        name,
+        containingFile,
+        options as unknown as tsc.CompilerOptions,
+        host as unknown as tsc.ModuleResolutionHost,
+        workspace,
+        undefined,
+        mode as unknown as tsc.ResolutionMode
+      ) as unknown as ts.ResolvedModuleFull | undefined;
   }
 
   /**

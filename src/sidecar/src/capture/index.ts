@@ -41,7 +41,7 @@ import type {
   SelfCheckOutcome,
   SerializationTier,
 } from './api.js';
-import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
+import { anchorModuleSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
@@ -53,11 +53,20 @@ import { emitsAlike, ProjectGraph, type ServiceProject } from './project-referen
 import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
+import {
+  resolveModule,
+  unbuiltPackageNote,
+  workspaceCompilerHost,
+  workspaceScopeOf,
+  type WorkspaceScope,
+} from './workspace-source.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { serviceConfigPath } from './project-references.js';
 export { findServiceTsconfig } from './service-config.js';
+export { unbuiltPackageSource, workspaceScopeOf } from './workspace-source.js';
+export type { WorkspaceScope } from './workspace-source.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
@@ -276,10 +285,14 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
 
+  // The checkout whose packages are read from source when the service imports
+  // them by name (carrick#1910): the scanned root, else the service's checkout.
+  const workspace = workspaceScopeOf(repoRoot, opts.scanRoot);
+
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
   let resolved: ResolvedAnchor[];
   const progress = opts.onProgress ?? (() => {});
-  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress };
+  const analysisCtx = { repoRoot, entryDir: path.dirname(entryPath), entryPath, guard, progress, workspace };
   try {
     resolved = ownerGroups && emitProject
       ? resolveAnchorsByOwner(opts, ownerGroups, emitProject, analysisCtx, errors)
@@ -330,7 +343,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       outDir: staging,
       rootDir: entryDir,
     };
-    const program = ts.createProgram([entryPath, ...augmentationSources], emitOptions, deno?.host(emitOptions));
+    const program = ts.createProgram(
+      [entryPath, ...augmentationSources],
+      emitOptions,
+      deno ? deno.host(emitOptions) : workspaceCompilerHost(emitOptions, workspace)
+    );
     const emitResult = program.emit(
       undefined,
       (fileName, text, _bom, _error, sources) => {
@@ -452,6 +469,24 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
+  // What a bare specifier in a declaration names, read from the source that
+  // declaration was emitted for (the entry, for the surface), as the emit
+  // resolved it. A Deno tree was rewritten from its graph just above.
+  const treeResolutions = ts.createModuleResolutionCache(repoRoot, (file) => file, parsed.options);
+  const moduleFromTree = deno
+    ? undefined
+    : (spec: string, rel: string): string | undefined => {
+        const source = rel === 'surface.d.ts' ? entryPath : sourceByEmitted.get(rel);
+        if (source === undefined) return undefined;
+        const mode = ts.getImpliedNodeFormatForFile(
+          source,
+          treeResolutions.getPackageJsonInfoCache(),
+          ts.sys,
+          parsed.options
+        );
+        return resolveModule(spec, source, parsed.options, ts.sys, workspace, treeResolutions, undefined, mode)
+          ?.resolvedFileName;
+      };
   const rewritten = rewriteEmittedSpecifiers({
     guard: stubGuard,
     outside: placed.outside,
@@ -460,6 +495,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     options: parsed.options,
     configPath: projectConfigPath,
     entryDir,
+    moduleFromTree,
   });
   const specifierRewrites = denoRewrites + placed.rewrites + rewritten.rewrites;
 
@@ -746,6 +782,7 @@ interface AnalysisContext {
   entryPath: string;
   guard: WriteGuard;
   progress: (phase: CapturePhase, message: string) => void;
+  workspace: WorkspaceScope;
 }
 
 /** Phase A: build the placeholder entry, then resolve every anchor. */
@@ -773,7 +810,43 @@ function resolveAnchors(
       ...parsed.options,
       noEmit: true,
     };
-    const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, deno?.host(options));
+    // A module specifier as the entry resolves it, under the program's own
+    // resolution (the Deno graph's, for a Deno service).
+    const entryMode = deno
+      ? undefined
+      : ts.getImpliedNodeFormatForFile(ctx.entryPath, undefined, ts.sys, options);
+    const fromEntry = new Map<string, string | undefined>();
+    const resolveFromEntry = (specifier: string): string | undefined => {
+      if (!fromEntry.has(specifier)) {
+        fromEntry.set(
+          specifier,
+          (deno
+            ? deno.resolve(specifier, ctx.entryPath, options)
+            : resolveModule(specifier, ctx.entryPath, options, ts.sys, ctx.workspace, undefined, undefined, entryMode)
+          )?.resolvedFileName
+        );
+      }
+      return fromEntry.get(specifier);
+    };
+    // carrick#1175: an anchor's source can arrive as the specifier the type
+    // was imported by (a package name, a `paths` alias) where the scanner
+    // found no file for it. It is resolved as the module it names, and that
+    // module joins the program.
+    const moduleSources = new Map<string, string>();
+    // A Deno service names its packages through the graph; its sources are
+    // left as they arrive.
+    for (const anchor of deno ? [] : opts.anchors) {
+      if (anchor.kind !== 'symbol' && anchor.kind !== 'handler_return') continue;
+      if (moduleSources.has(anchor.source_file)) continue;
+      if (fs.existsSync(path.join(ctx.repoRoot, anchor.source_file))) continue;
+      const file = resolveFromEntry(anchor.source_file);
+      if (file !== undefined) moduleSources.set(anchor.source_file, file);
+    }
+    const program = ts.createProgram(
+      [ctx.entryPath, ...anchorSources, ...new Set(moduleSources.values()), ...(deno?.globals ?? [])],
+      options,
+      deno ? deno.host(options) : workspaceCompilerHost(options, ctx.workspace)
+    );
     // The checker binds every file of the program when it is first asked for,
     // which the first anchor would otherwise do: asked for here, so that the
     // report below says the program is whole before any anchor is read.
@@ -786,24 +859,6 @@ function resolveAnchors(
         if (ts.isTypeAliasDeclaration(stmt)) placeholders.set(stmt.name.text, stmt);
       }
     }
-    // A module specifier as the entry resolves it, under the program's own
-    // resolution (the Deno graph's, for a Deno service). Asked once per
-    // specifier: every anchor of a module asks for the same one.
-    const entryMode = entrySource?.impliedNodeFormat;
-    const fromEntry = new Map<string, string | undefined>();
-    const resolveFromEntry = (specifier: string): string | undefined => {
-      if (!fromEntry.has(specifier)) {
-        fromEntry.set(
-          specifier,
-          (deno
-            ? deno.resolve(specifier, ctx.entryPath, options)
-            : ts.resolveModuleName(specifier, ctx.entryPath, options, ts.sys, undefined, undefined, entryMode)
-                .resolvedModule
-          )?.resolvedFileName
-        );
-      }
-      return fromEntry.get(specifier);
-    };
     // A literal anchor whose text is a bare identifier resolves through a
     // sibling symbol anchor's module when one names the same symbol.
     const siblingSymbolSpecs = new Map<string, string>();
@@ -812,10 +867,20 @@ function resolveAnchors(
       if (!siblingSymbolSpecs.has(anchor.symbol_name)) {
         siblingSymbolSpecs.set(
           anchor.symbol_name,
-          entryRelativeSpecifier(ctx.entryDir, ctx.repoRoot, anchor.source_file, resolveFromEntry)
+          anchorModuleSpecifier({ ...ctx, moduleSources, resolveFromEntry }, anchor.source_file)
         );
       }
     }
+    // An unresolved import that names one of the checkout's own packages
+    // says so (carrick#1910): the cause is a build that was not run.
+    const noteFor = new Map<string, string | undefined>();
+    const unbuiltNotes = (specifiers: readonly string[]): string[] =>
+      specifiers.flatMap((specifier) => {
+        if (!noteFor.has(specifier)) {
+          noteFor.set(specifier, unbuiltPackageNote(specifier, ctx.entryPath, options, ctx.workspace));
+        }
+        return noteFor.get(specifier) ?? [];
+      });
     return opts.anchors.map((request, index) => {
       const anchor = resolveAnchor(program, request, {
         repoRoot: ctx.repoRoot,
@@ -823,9 +888,12 @@ function resolveAnchors(
         placeholder: placeholders.get(request.alias),
         siblingSymbolSpecs,
         resolveFromEntry,
+        moduleSources,
+        workspace: ctx.workspace,
       });
       ctx.progress('anchors', `${index + 1} of ${opts.anchors.length}`);
-      return anchor;
+      const notes = deno || !anchor.unresolved ? [] : unbuiltNotes(anchor.unresolved.specifiers);
+      return notes.length > 0 ? { ...anchor, unresolved: { ...anchor.unresolved!, notes } } : anchor;
     });
   } finally {
     if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);

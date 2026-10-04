@@ -44,6 +44,13 @@ export interface RewriteArgs {
    * (carrick#1770): absolute source-side path without extension -> tree path.
    */
   outside: Map<string, string>;
+  /**
+   * The file a bare specifier in tree file `file` names, as the emit resolved
+   * it (carrick#1620). A specifier that names a module whose declaration the
+   * tree holds is rewritten to that declaration: a package of the checkout
+   * read from its source is emitted into the tree, and nothing pins it.
+   */
+  moduleFromTree?: (spec: string, file: string) => string | undefined;
 }
 
 export function parsePathsPatterns(
@@ -178,7 +185,10 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
         // self-check to classify (never guess).
         return undefined;
       }
-      return undefined;
+      // A module whose declaration the tree holds, named by a bare specifier.
+      const named = args.moduleFromTree?.(spec, file);
+      const target = named && treeFileFor(named, args.entryDir, emitted, args.outside);
+      return target ? relativeSpecifier(file, target) : undefined;
     });
     if (rewrites + importTypeRewrites > 0) {
       args.guard.writeFile(absFile, rewritten);

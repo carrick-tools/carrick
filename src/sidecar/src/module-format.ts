@@ -27,9 +27,22 @@
  * of the name is being resolved; when only some of them are (the compiler
  * reusing earlier answers) and their modes differ, the entry cannot be placed
  * and is left unresolved rather than given another import's mode.
+ *
+ * An import the compiler does not resolve is offered to `unresolved`, which
+ * the loader uses to read an unbuilt package of the scanned checkout from its
+ * source, as the capture reads it (carrick#1910).
  */
 
 import { ts, type ResolutionHostFactory } from 'ts-morph';
+
+/** A last answer for an import the compiler did not resolve, in its mode. */
+export type UnresolvedModule = (
+  name: string,
+  containingFile: string,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost,
+  mode: ts.ResolutionMode
+) => ts.ResolvedModuleFull | undefined;
 
 /** Whether the compiler decides an import's mode from the importing file's format. */
 function formatDecidesMode(options: ts.CompilerOptions): boolean {
@@ -61,7 +74,7 @@ function usagesOf(file: ts.SourceFile): Map<string, ts.StringLiteralLike[]> {
 /** Why a module name cannot be given one mode: see the header. */
 const UNPLACED = Symbol('unplaced');
 
-export const moduleFormatResolutionHost: ResolutionHostFactory = (host, getOptions) => {
+export const moduleFormatResolutionHost = (unresolved?: UnresolvedModule): ResolutionHostFactory => (host, getOptions) => {
   let cache: ts.ModuleResolutionCache | undefined;
   let cacheOptions: ts.CompilerOptions | undefined;
   const cacheFor = (options: ts.CompilerOptions): ts.ModuleResolutionCache => {
@@ -106,7 +119,7 @@ export const moduleFormatResolutionHost: ResolutionHostFactory = (host, getOptio
       return moduleNames.map((name) => {
         const mode = modeOf(name);
         if (mode === UNPLACED) return undefined;
-        return ts.resolveModuleName(
+        const resolved = ts.resolveModuleName(
           name,
           containingFile,
           compilerOptions,
@@ -115,6 +128,7 @@ export const moduleFormatResolutionHost: ResolutionHostFactory = (host, getOptio
           redirectedReference,
           mode
         ).resolvedModule;
+        return resolved ?? unresolved?.(name, containingFile, compilerOptions, host, mode);
       });
     },
   };

@@ -323,6 +323,14 @@ export interface UnresolvedAtAnchor {
    * empty: a name the program never declared leaves the same placeholder.
    */
   specifiers: readonly string[];
+  /**
+   * One sentence for each of those specifiers that names a package of the
+   * scanned checkout whose entry is not on disk and has no source to read in
+   * its place (carrick#1910): the cause a build would remove, where "an
+   * import did not resolve" alone sends a reader to look for a dependency
+   * that was not installed.
+   */
+  notes?: readonly string[];
 }
 
 /** How many specifiers or names a detail lists before it counts the rest. */
@@ -361,7 +369,7 @@ export function provenanceOf(
       path: finding.path,
       kind: finding.kind,
       reason: 'unresolved_import',
-      detail: unresolvedDetail(unresolved.specifiers),
+      detail: unresolvedDetail(unresolved.specifiers, unresolved.notes ?? []),
     };
   }
   return {
@@ -372,11 +380,12 @@ export function provenanceOf(
   };
 }
 
-function unresolvedDetail(specifiers: readonly string[]): string {
+function unresolvedDetail(specifiers: readonly string[], notes: readonly string[]): string {
   const lead =
     "the type at this position did not resolve on the scanned checkout, so the compiler printed a placeholder 'any' rather than a declared type";
   if (specifiers.length === 0) return lead;
-  return `${lead}; unresolved imports reachable from the anchor: ${quotedList(specifiers)}`;
+  const named = `${lead}; unresolved imports reachable from the anchor: ${quotedList(specifiers)}`;
+  return [named, ...notes.slice(0, MAX_NAMED_IN_DETAIL)].join('; ');
 }
 
 /**
