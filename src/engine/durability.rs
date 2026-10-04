@@ -19,6 +19,13 @@
 //!    and nothing else. What a limit refused is not retried: it would be
 //!    refused again.
 //!
+//!    A file that was not sent, because its route had spent its refusal
+//!    budget and had just refused another file's request (carrick#1909,
+//!    `agent_service/refusals.rs`), is owed for capacity like a file the
+//!    model refused, and is asked again here. The first of them to be asked
+//!    is the route's probe: on a route that is still silent the retry costs
+//!    that one request, and on one that has come back every file is sent.
+//!
 //!    Both kinds of waiting, the patient retries inside detection and guidance
 //!    and this wait, draw on one run-wide budget ([`crate::retry_budget`],
 //!    `CARRICK_RETRY_BUDGET_SECS`, 20 minutes by default). Once it is spent a
@@ -569,6 +576,55 @@ mod tests {
         };
         assert!(discarded.worth_retrying());
         assert_eq!(discarded.refused_for_capacity(), None);
+    }
+
+    /// carrick#1909: a route that has stopped answering refuses one of a
+    /// service's files and the rest are not sent. Every one of them is owed
+    /// for capacity (`scan_health` counts both kinds as such) and none is a
+    /// final answer, so the service is retried in the run after the wait a
+    /// refusal gets, and when that changes nothing it is pending, with the
+    /// advice to re-run, which can finish it.
+    #[test]
+    fn files_left_by_a_silent_route_are_retried_and_then_pending_with_a_rerun() {
+        for left in [
+            crate::agent_service::AgentCallError::from_cloud(
+                crate::agent_service::CAPACITY_REFUSAL_CODE,
+                "model busy",
+                true,
+            ),
+            crate::agent_service::not_asked("/analyze-file"),
+        ] {
+            let reason = crate::scan_health::analysis_failure_reason(&left);
+            assert!(!reason.is_final, "{left}");
+            assert!(crate::agent_service::is_capacity_code(&reason.code));
+        }
+
+        let owed = lost(60, 60);
+        assert!(owed.worth_retrying());
+        assert!(owed.thins_the_index());
+        assert!(!owed.owes_only_final_files(), "a refusal was read as final");
+        assert_eq!(
+            owed.refused_for_capacity(),
+            Some(RefusedForCapacity::Thinning)
+        );
+        assert_eq!(
+            retry_delay_from(None, owed.refused_for_capacity()),
+            DEFAULT_RETRY_DELAY
+        );
+
+        let pending = [("api".to_string(), owed)];
+        assert_eq!(
+            pending_summary(&[], &pending, true),
+            "Complete: none. Pending model analysis: api (60 file(s) not analysed). Re-run \
+             `carrick index` to finish them: it asks the model only for the pending work and \
+             replays everything else from cache."
+        );
+        assert_eq!(
+            pending_summary(&[], &pending, false),
+            "Complete: none. Pending model analysis: api (60 file(s) not analysed). The next \
+             scan asks the model only for the pending work and replays everything else from \
+             cache."
+        );
     }
 
     /// The log says what was decided and why, in a line short enough to read.

@@ -1105,6 +1105,146 @@ async fn a_file_the_model_refused_for_capacity_still_waits_before_the_retry() {
     );
 }
 
+/// The model's capacity refusal, as a prompt lambda sends it. A route that has
+/// spent its refusal budget and answers nothing ends a file's call on this
+/// (carrick#1909). Offline no retry loop runs, so the injection ends the call
+/// on it the same way.
+const REFUSED_FOR_CAPACITY: &str =
+    r#"{"success":false,"error":{"code":"model_error","message":"model busy","retriable":true}}"#;
+
+/// carrick#1909, what a run does about a file that is owed for capacity on
+/// every ask. `leave_beta_owed` makes beta's file end that way twice: when
+/// beta is analysed, and again when the run retries what it owes, after the
+/// wait a capacity refusal gets.
+///
+/// The file is owed, by name and under `reason`: counted as owed for capacity
+/// and not as a final answer, with nothing stored as its answer. Its service
+/// lands pending on a first index and is named on the final write. The next
+/// scan asks about that file again, and about no other. `file_requests` is
+/// what the first scan's two passes are counted as having requested.
+async fn a_file_owed_for_capacity_on_every_ask(
+    leave_beta_owed: impl FnOnce(),
+    reason: &str,
+    file_requests: usize,
+) {
+    offline_env();
+    // SAFETY: as in `offline_env`.
+    unsafe {
+        std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "1");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop_on_current_cloud(&[]);
+
+    leave_beta_owed();
+    let before = analyze_file_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a file owed for capacity does not fail a laptop run");
+    let waited = carrick::retry_budget::spent();
+    offline_env();
+
+    assert_eq!(analyze_file_requests() - before, file_requests);
+    assert!(
+        waited >= std::time::Duration::from_secs(1),
+        "the retry of a file owed for capacity waited {waited:?}"
+    );
+
+    let losses = carrick::scan_health::service_losses(Some("beta"));
+    let lost = carrick::scan_health::unanalysed_files_for(Some("beta"));
+    // The run's losses are the process's: what this scan leaves on beta
+    // would be owed by beta in every later scan of this binary.
+    carrick::scan_health::forget_service_losses(Some("beta"));
+    assert_eq!(
+        (losses.files, losses.capacity_files, losses.final_files),
+        (1, 1, 0),
+        "{losses:?}"
+    );
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert!(lost[0].path.ends_with("server.ts"), "{lost:?}");
+    assert_eq!(lost[0].reason, reason);
+
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let beta = storage.latest("beta").unwrap();
+    assert!(
+        !beta
+            .file_results
+            .unwrap_or_default()
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "nothing is stored as the answer of a file that got none"
+    );
+    assert_eq!(
+        *storage.pending_named.lock().unwrap(),
+        [vec!["beta".to_string()]],
+        "its service is pending, by name"
+    );
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
+
+    // The next scan: same commit, every service indexed, the model answering.
+    let rescan = StubStorage {
+        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        ..storage.clone()
+    };
+    let before = analyze_file_requests();
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("the rescan succeeds");
+    assert_eq!(
+        analyze_file_requests() - before,
+        1,
+        "the owed file is asked about again, and only it"
+    );
+    assert!(
+        rescan
+            .latest("beta")
+            .unwrap()
+            .file_results
+            .unwrap_or_default()
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "the next scan records the answer this one did not get"
+    );
+    assert!(rescan.scan_failed.lock().unwrap().is_empty());
+}
+
+/// A file the model refuses on every ask is owed under the cloud's own code,
+/// and each ask is one of the run's requests: one file a service, and the
+/// refused one again in the run's retry.
+#[tokio::test]
+#[serial]
+async fn a_file_refused_for_capacity_on_every_ask_is_owed_and_asked_again_by_the_next_scan() {
+    a_file_owed_for_capacity_on_every_ask(
+        || {
+            carrick::agent_service::inject_mock_envelope(
+                "/analyze-file",
+                BETA_ONLY_ROUTE,
+                2,
+                REFUSED_FOR_CAPACITY,
+            );
+        },
+        "model_error",
+        3 + 1,
+    )
+    .await;
+}
+
+/// A file that is not sent on either ask, because its route had stopped
+/// answering and had just refused another file, is owed the same way under
+/// the scanner's own code. The run waits and asks again exactly as it does
+/// for a refusal, and neither ask is one of the run's requests: the two files
+/// that were sent are all it counts.
+#[tokio::test]
+#[serial]
+async fn a_file_never_sent_behind_a_refusal_is_owed_and_asked_again_by_the_next_scan() {
+    a_file_owed_for_capacity_on_every_ask(
+        || carrick::agent_service::inject_mock_not_asked("/analyze-file", BETA_ONLY_ROUTE, 2),
+        carrick::agent_service::NOT_ASKED_CODE,
+        2,
+    )
+    .await;
+}
+
 /// What the cloud answers a file whose every try came back incomplete: the
 /// verdict it keeps for the request, final by its own flag. Named by that
 /// flag here and nowhere by its code.

@@ -67,16 +67,19 @@ fn retry_announcement_due(last: Option<Instant>, now: Instant) -> bool {
 ///
 /// Process-global for the same reason the breaker above is: a scan builds
 /// several `AgentService` instances and the count that matters is the one the
-/// whole run issued. Counted at the entry point, BEFORE the mock short-circuit,
-/// so an offline run reports what a real scan would send rather than what it
-/// actually sent — which is the only way to state request volume without
-/// paying for it (carrick#767).
+/// whole run issued. An offline run counts a call at the entry point, where
+/// the mock answers it, so it reports what a real scan would send rather than
+/// what it actually sent — which is the only way to state request volume
+/// without paying for it (carrick#767). A real run counts a call as its first
+/// request goes out.
 ///
 /// A cached answer replayed by the scanner never reaches here, so a route
 /// counted here is a round trip the run really made: the number is the answer
 /// to "the boundary says nothing was sent, so where did those invocations come
 /// from". One per CALL, not per HTTP attempt — a call the retry loop repeats
-/// is one row here and more than one invocation in the cloud.
+/// is one row here and more than one invocation in the cloud. A call that
+/// ended without a request, behind another call's refusal on a route that had
+/// stopped answering ([`NOT_ASKED_CODE`], carrick#1909), is no row at all.
 static REQUEST_COUNTS: OnceLock<Mutex<RequestCounts>> = OnceLock::new();
 
 /// Every request the scan has issued, by route, and which of them were asked
@@ -237,6 +240,39 @@ pub const ANALYSIS_IN_FLIGHT_CODE: &str = "analysis_in_flight";
 /// wait.
 pub const CAPACITY_REFUSAL_CODE: &str = "model_error";
 
+/// The scanner's own code for a call that ended without ever being sent
+/// (carrick#1909). Its route had spent its refusal budget and was answering
+/// nothing, and a request another call sent to it had just been refused for
+/// capacity, so this one was not sent (`refusals.rs`). The cloud never sends
+/// this code: no request reached it.
+///
+/// Such a call is owed for capacity, exactly as one the model refused is
+/// ([`is_capacity_code`]): the run's retry of owed work waits and asks again,
+/// and so does the next scan. It is told apart by this code wherever a loss
+/// is counted or named, and it is not one of the run's requests.
+pub const NOT_ASKED_CODE: &str = "model_busy_not_asked";
+
+/// Whether a call that ended under `code` is owed for capacity: the model
+/// refused it ([`CAPACITY_REFUSAL_CODE`]), or refused the request ahead of it
+/// on a route that had stopped answering ([`NOT_ASKED_CODE`]). Either way a
+/// wait is what mends it.
+pub fn is_capacity_code(code: &str) -> bool {
+    code == CAPACITY_REFUSAL_CODE || code == NOT_ASKED_CODE
+}
+
+/// What a call that was never sent ends on ([`NOT_ASKED_CODE`]): transient,
+/// and nothing the cloud said, so it is never read as a final answer.
+pub(crate) fn not_asked(path: &str) -> AgentCallError {
+    AgentCallError::transient(
+        NOT_ASKED_CODE,
+        format!(
+            "Not sent: {} has answered nothing since this scan's refusal budget for it was \
+             spent, and the last request sent to it was refused for capacity",
+            path.trim_start_matches('/')
+        ),
+    )
+}
+
 /// Whether an error envelope is the lease wait ([`ANALYSIS_IN_FLIGHT_CODE`]),
 /// in either wire shape: the code itself, or the reason on a `model_error`.
 fn is_analysis_in_flight(err: &AgentError) -> bool {
@@ -363,10 +399,11 @@ impl AgentCallError {
         self.code == LLM_DISABLED_CODE
     }
 
-    /// Whether the call ended on the model refusing for capacity
-    /// ([`CAPACITY_REFUSAL_CODE`]).
+    /// Whether the call ended on the model refusing for capacity: its own
+    /// request, or the one ahead of it on a route that had stopped answering
+    /// ([`is_capacity_code`]).
     pub fn is_capacity_refusal(&self) -> bool {
-        self.code == CAPACITY_REFUSAL_CODE
+        is_capacity_code(&self.code)
     }
 
     /// Whether the cloud answered that this request cannot succeed: an error
@@ -415,8 +452,10 @@ const PATIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
 /// (`the_refusal_windows_of_a_large_first_index_lose_no_file`). An earlier
 /// first index met two windows of about twenty minutes each
 /// (carrick-cloud#869). Forty-five covers both, and it is what a route that
-/// refuses the whole run adds to a scan before its calls go back to counting
-/// attempts.
+/// refuses the whole run adds to a scan: from there the route is silent, one
+/// request at a time is sent to it, and the calls behind a refused one end
+/// owed without a request (carrick#1909). `refusals.rs` states that rule, and
+/// how long such a route holds a scan.
 const REFUSAL_BUDGET: Duration = Duration::from_secs(45 * 60);
 
 /// How long one call keeps trying before it gives up.
@@ -435,11 +474,15 @@ const REFUSAL_BUDGET: Duration = Duration::from_secs(45 * 60);
 /// A capacity refusal is not counted against a per-file call's seven attempts
 /// (carrick#1893). The model refuses in windows that outlast those attempts
 /// and then answers, so the file waits on its route's refusal budget instead
-/// (`refusals.rs`), and every other retriable error keeps the count.
+/// (`refusals.rs`), and every other retriable error keeps the count. Once
+/// that budget is spent and the route's model has answered nothing since it
+/// last refused, the route is silent: a refusal ends its call, and the calls
+/// behind it end without being sent (carrick#1909).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Attempts in total, the first included. A lease wait costs none, and
     /// neither does a capacity refusal while [`Self::refusal_budget`] lasts.
+    /// A silent route ends a call whatever is left of them (`refusals.rs`).
     max_attempts: u32,
     /// Ceiling on one sleep, and on the `Retry-After` hint honoured.
     max_delay: Duration,
@@ -455,7 +498,8 @@ pub struct RetryPolicy {
     /// How long this run's calls on one route may wait out capacity refusals
     /// without spending attempts, overlapping waits counted once
     /// (`refusals.rs`). Zero: a capacity refusal costs an attempt, as every
-    /// other retriable error does.
+    /// other retriable error does, and the call is sent and counted whatever
+    /// its route is doing.
     refusal_budget: Duration,
 }
 
@@ -463,7 +507,9 @@ impl RetryPolicy {
     /// Every per-file and per-function call: seven attempts, about two
     /// minutes of backoff, for everything but a capacity refusal, which waits
     /// on the route's [`REFUSAL_BUDGET`] and costs no attempt until that is
-    /// spent.
+    /// spent. From then on a refusal ends the call, or costs it an attempt
+    /// when the route's model has answered since it last refused, and a call
+    /// behind a refused one is not sent.
     pub const STANDARD: Self = Self {
         max_attempts: MAX_RETRIES,
         max_delay: RETRY_MAX_DELAY,
@@ -535,12 +581,6 @@ impl RetryPolicy {
             return false;
         }
         true
-    }
-
-    /// Whether a capacity refusal is waited out for `next` on the route's
-    /// refusal budget, costing no attempt. Never, for a policy without one.
-    fn waits_out_refusal(&self, route: &refusals::RouteRefusal, next: Duration) -> bool {
-        !self.refusal_budget.is_zero() && route.fits(next, self.refusal_budget)
     }
 
     /// Whether a last attempt the gateway cut is followed by a collecting
@@ -891,6 +931,11 @@ pub struct AgentService {
     refusals: Arc<RouteRefusals>,
     capabilities: Arc<CloudCapabilities>,
     retry: RetryPolicy,
+    /// Whether a call this service sends is one of the run's requests
+    /// ([`record_request`]). Every service a scan builds counts its calls. A
+    /// test that drives the retry loop against a stub does not, so it neither
+    /// reads nor adds to the process's counts.
+    counts_requests: bool,
     /// Answers every request in place of the cloud.
     #[cfg(test)]
     script: Option<Script>,
@@ -916,6 +961,7 @@ impl AgentService {
             refusals: global_refusals(),
             capabilities: global_capabilities(),
             retry: RetryPolicy::STANDARD,
+            counts_requests: true,
             #[cfg(test)]
             script: None,
         }
@@ -977,13 +1023,18 @@ impl AgentService {
         body: &B,
         mock_seed: &str,
     ) -> Result<LambdaOutcome, AgentCallError> {
-        // Counted here, before the mock short-circuit: this is every request
-        // the scan would put on the wire. The concurrency permit is taken per
-        // HTTP attempt inside `post_with_retry`, so an offline run takes none.
-        record_request(task_path);
-
+        // A call is counted as its first request goes: here for an offline
+        // run, so the count is every request the scan would put on the wire,
+        // and in `post_with_retry` otherwise. A call that ends without being
+        // sent ([`NOT_ASKED_CODE`]) is none of the run's requests on either
+        // path (carrick#1909). The concurrency permit is taken per HTTP
+        // attempt inside `post_with_retry`, so an offline run takes none.
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            if let Some(outcome) = take_mock_override(task_path, body) {
+            let injected = take_mock_override(task_path, body);
+            if !matches!(&injected, Some(Err(error)) if error.code == NOT_ASKED_CODE) {
+                record_request(task_path);
+            }
+            if let Some(outcome) = injected {
                 return outcome.map(|text| LambdaOutcome {
                     text,
                     guidance_key: mock_guidance_key(task_path, body),
@@ -1043,6 +1094,9 @@ impl AgentService {
     /// only consumes a backoff attempt when the error is marked
     /// retriable=true (or on bare network failures). A capacity refusal
     /// consumes none while the route's refusal budget lasts (carrick#1893).
+    /// Once that budget is spent and the route is silent, a refusal ends the
+    /// call, and a call behind a refused one ends without being sent
+    /// (carrick#1909, `refusals.rs`).
     /// A 2xx body is read as the route says ([`SuccessBody::of`]).
     ///
     /// `auth` and `api_base` are parameters rather than the globals the
@@ -1085,7 +1139,10 @@ impl AgentService {
         //
         // Two answers cost no attempt: a lease wait (carrick#1131), and a
         // capacity refusal while the route's refusal budget has room
-        // (carrick#1893).
+        // (carrick#1893). A silent route, whose budget is spent and whose
+        // model has answered nothing since it last refused, ends a call
+        // whatever attempts are left: on the refusal of its own request, or
+        // before its request goes, behind another call's (carrick#1909).
         let policy = self.retry;
         let max_retries = policy.max_attempts;
         // What this call has slept so far, against the policy's wait budget.
@@ -1094,38 +1151,96 @@ impl AgentService {
         // Lease waits sat out so far, against the policy's cap. Counted
         // by hand, with `attempt`, so a wait can hand its attempt back.
         let mut in_flight_waits: u32 = 0;
-        // The route's refused time this run, and this call's open wait on it:
-        // held from a capacity refusal until the request sent after it comes
-        // back, so the route is charged for the sleep, the queue for a slot
-        // and the request, which is the time this call spends on the refusal.
+        // The route's refused time this run and what its model did last, and
+        // this call's open wait on it: held from a capacity refusal until the
+        // request sent after it comes back, so the route is charged for the
+        // sleep, the queue for a slot and the request, which is the time this
+        // call spends on the refusal.
         let route_refusal = self.refusals.for_route(path);
         let mut refused: Option<refusals::Waiting> = None;
         // Capacity refusals this call has met in a row. The backoff after one
         // grows with this, since the attempt it would grow with is not spent.
         let mut refusals_in_a_row: u32 = 0;
+        // Whether this call has put a request on the wire, and what the last
+        // of its requests to fail came to. A silent route that ends the call
+        // before its next request ends it on that, or on [`NOT_ASKED_CODE`]
+        // when it has sent none.
+        let mut asked = false;
+        let mut own_failure: Option<AgentCallError> = None;
         let mut attempt: u32 = 0;
         while attempt < max_retries {
             attempt += 1;
 
-            // Read the token per attempt, not once per call. A scan of a
-            // large repo outlives a token, and the provider mints a fresh one
-            // as soon as the cached one nears its expiry — so the retry that
-            // happens ten minutes into a call chain carries a valid credential
-            // instead of the one this call started with (#461). A Bearer
-            // credential is long-lived and unchanged between attempts, but it
-            // is read the same way so the two branches differ only in the
-            // header they set.
-            let token = auth.token().await?;
+            let (token, route_slot, permit, reservation) = loop {
+                // The request's turn on its route (carrick#1909,
+                // `refusals.rs`). A route that is not silent sends every
+                // request, and so does a policy with no refusal budget. A
+                // silent route carries one request at a time, the probe. A
+                // call that finds one out waits here, holding nothing, and
+                // when the probe is refused, or a refusal still stands as
+                // the call arrives, it ends without sending: no attempt is
+                // spent and nothing is asked of the model.
+                let probe = match route_refusal.turn(policy.refusal_budget).await {
+                    refusals::Turn::Send => None,
+                    refusals::Turn::Probe(probe) => Some(probe),
+                    refusals::Turn::Owed => {
+                        route_refusal.say_silent();
+                        let ended = own_failure.unwrap_or_else(|| not_asked(path));
+                        debug!(
+                            "{} is left pending without {} request: its model has answered \
+                             nothing since the route's {}s refusal budget was spent, and the \
+                             last request sent to it was refused. The call ends on {}",
+                            path,
+                            if asked { "another" } else { "a" },
+                            policy.refusal_budget.as_secs(),
+                            ended.code
+                        );
+                        return Err(ended);
+                    }
+                };
 
-            // One slot per HTTP attempt, not per call (carrick#1077). The
-            // permit covers the send and the body read, and is dropped before
-            // every retry sleep: a call waiting out a 10-15 s `Retry-After`
-            // is not a request on the wire, so it must not idle a slot another
-            // call could use. It re-queues for a slot when it wakes. Taken
-            // after the token read, so minting a token holds no slot either.
-            let (route_slot, permit, reservation) = self.wire_slots(&route_limit).await?;
+                // Read the token per attempt, not once per call. A scan of a
+                // large repo outlives a token, and the provider mints a fresh
+                // one as soon as the cached one nears its expiry — so the
+                // retry that happens ten minutes into a call chain carries a
+                // valid credential instead of the one this call started with
+                // (#461). A Bearer credential is long-lived and unchanged
+                // between attempts, but it is read the same way so the two
+                // branches differ only in the header they set.
+                let token = auth.token().await?;
+
+                // One slot per HTTP attempt, not per call (carrick#1077). The
+                // permit covers the send and the body read, and is dropped
+                // before every retry sleep: a call waiting out a 10-15 s
+                // `Retry-After` is not a request on the wire, so it must not
+                // idle a slot another call could use. It re-queues for a slot
+                // when it wakes. Taken after the token read, so minting a
+                // token holds no slot either.
+                let (route_slot, permit, reservation) = self.wire_slots(&route_limit).await?;
+
+                // The route may have gone silent while this request queued
+                // for its slot. It was given no turn as a probe, so it takes
+                // its turn again, with the slots handed back.
+                if probe.is_none() && route_refusal.is_silent(policy.refusal_budget) {
+                    drop(permit);
+                    drop(route_slot);
+                    continue;
+                }
+
+                // The probe's turn is kept with the process-wide slot and
+                // goes when that goes: both cover the send and the body read,
+                // and neither covers a sleep.
+                break (token, route_slot, (permit, probe), reservation);
+            };
+
+            // The call is one of the run's requests from its first send.
+            if !asked && self.counts_requests {
+                record_request(path);
+            }
+            asked = true;
 
             let request_builder = self.request(&endpoint, body, auth, &token, lambda_attempt);
+            let asked_at = tokio::time::Instant::now();
             let sent = self.send(request_builder, path, lambda_attempt).await;
             // The request a refusal was waited out for has come back, so the
             // wait is over. Another refusal opens the next one below.
@@ -1155,6 +1270,10 @@ impl AgentService {
                             // application, so it is retriable by definition.
                             let wait_time =
                                 backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
+                            let lost = AgentCallError::transient(
+                                "network_error",
+                                format!("Failed to read agent proxy response {}: {}", status, e),
+                            );
                             if policy.permits_in_run(attempt, waited, wait_time) {
                                 note_retry();
                                 warn!(
@@ -1167,6 +1286,7 @@ impl AgentService {
                                 policy.sleep(wait_time).await;
                                 waited += wait_time;
                                 lambda_attempt += 1;
+                                own_failure = Some(lost);
                                 continue;
                             }
                             // The answer was lost on the way back, so what
@@ -1181,13 +1301,7 @@ impl AgentService {
                                     body,
                                     lambda_attempt,
                                     None,
-                                    AgentCallError::transient(
-                                        "network_error",
-                                        format!(
-                                            "Failed to read agent proxy response {}: {}",
-                                            status, e
-                                        ),
-                                    ),
+                                    lost,
                                 )
                                 .await;
                         }
@@ -1269,6 +1383,9 @@ impl AgentService {
                                 ),
                             ));
                         }
+                        // Said before the probe's turn goes with the permit,
+                        // so the calls behind a probe wake to an answer.
+                        route_refusal.answered();
                         drop(permit);
                         route_slot.succeeded();
                         self.pacer.admitted();
@@ -1293,6 +1410,12 @@ impl AgentService {
                                 retry_after,
                                 policy.max_delay,
                             );
+                            let message = format!(
+                                "Agent proxy returned status {} with unparseable body ({}): {}",
+                                status,
+                                e,
+                                body_excerpt(&response_text)
+                            );
                             if is_transient_gateway_status
                                 && policy.permits_in_run(attempt, waited, wait_time)
                             {
@@ -1305,6 +1428,8 @@ impl AgentService {
                                     attempt,
                                     max_retries
                                 );
+                                own_failure =
+                                    Some(AgentCallError::transient("gateway_error", message));
                                 drop(permit);
                                 drop(route_slot);
                                 if is_gateway_throttle(status.as_u16()) {
@@ -1336,12 +1461,6 @@ impl AgentService {
                             if is_gateway_throttle(status.as_u16()) {
                                 self.pacer.throttled(reservation.epoch);
                             }
-                            let message = format!(
-                                "Agent proxy returned status {} with unparseable body ({}): {}",
-                                status,
-                                e,
-                                body_excerpt(&response_text)
-                            );
                             if !is_transient_gateway_status {
                                 return Err(AgentCallError::permanent("bad_response", message));
                             }
@@ -1371,6 +1490,15 @@ impl AgentService {
                     }
 
                     if status.is_success() && body.success {
+                        // The model answered, which ends the route's silence
+                        // (`refusals.rs`). An answer from what the cloud
+                        // already held is not one: no model was asked, so it
+                        // says nothing about whether the route is back. Said
+                        // before the probe's turn goes with the permit, so
+                        // the calls behind a probe wake to an answer.
+                        if body.cached != Some(true) {
+                            route_refusal.answered();
+                        }
                         drop(permit);
                         route_slot.succeeded();
                         self.pacer.admitted();
@@ -1420,6 +1548,7 @@ impl AgentService {
                         drop(route_slot);
                         sleep(wait_time).await;
                         attempt -= 1;
+                        own_failure = Some(call_err);
                         continue;
                     }
                     // Past the cap, a lease wait is retried like any retriable
@@ -1431,10 +1560,18 @@ impl AgentService {
                     // refuses in windows that outlast seven attempts and
                     // answers once they pass. The model was asked, so
                     // `X-Carrick-Attempt` advances and the limit hears the
-                    // refusal, as on the counted path below. With the budget
-                    // spent the refusal falls through to that path and costs
-                    // an attempt like any other retriable error, so a route
-                    // that refuses the whole run still ends the call.
+                    // refusal, as on the counted path below.
+                    //
+                    // With the budget spent, what the route did last decides
+                    // (carrick#1909, `refusals.rs`). A route that has answered
+                    // nothing since it last refused is silent, and its
+                    // refusal ends the call, which is owed. The refusal also
+                    // decides for the calls behind this one: those waiting on
+                    // it as the route's probe, and those that arrive while it
+                    // stands, end without a request of their own. After an
+                    // answer the refusal falls through to the counted path
+                    // and costs an attempt like any other retriable error. A
+                    // policy with no refusal budget always takes that path.
                     if model_busy && call_err.retriable {
                         if !was_refused {
                             refusals_in_a_row = 0;
@@ -1445,33 +1582,59 @@ impl AgentService {
                             retry_after,
                             policy.max_delay,
                         );
-                        if policy.waits_out_refusal(&route_refusal, wait_time) {
-                            refusals_in_a_row += 1;
-                            // File-log detail, like every refusal. The
-                            // terminal hears from the limiter when the limit
-                            // moves, and from the route's ledger every few
-                            // refused minutes.
-                            debug!(
-                                "{} was refused for capacity, asking again in {:?} (refusal {} in \
-                                 a row for this call, no attempt spent; the route has been \
-                                 refused for {}s of its {}s this run): {}",
-                                path,
-                                wait_time,
-                                refusals_in_a_row,
-                                route_refusal.spent().as_secs(),
-                                policy.refusal_budget.as_secs(),
-                                call_err.message
-                            );
-                            drop(permit);
-                            route_slot.overloaded();
-                            route_refusal.say_waiting(policy.refusal_budget);
-                            refused = Some(route_refusal.wait());
-                            sleep(wait_time).await;
-                            attempt -= 1;
-                            lambda_attempt += 1;
-                            continue;
+                        let stands_for =
+                            refusals::stands_for(retry_after, asked_at.elapsed(), policy.max_delay);
+                        match route_refusal.refused(wait_time, policy.refusal_budget, stands_for) {
+                            refusals::Refusal::WaitedOut => {
+                                refusals_in_a_row += 1;
+                                // File-log detail, like every refusal. The
+                                // terminal hears from the limiter when the
+                                // limit moves, and from the route's ledger
+                                // every few refused minutes.
+                                debug!(
+                                    "{} was refused for capacity, asking again in {:?} (refusal \
+                                     {} in a row for this call, no attempt spent; the route has \
+                                     been refused for {}s of its {}s this run): {}",
+                                    path,
+                                    wait_time,
+                                    refusals_in_a_row,
+                                    route_refusal.spent().as_secs(),
+                                    policy.refusal_budget.as_secs(),
+                                    call_err.message
+                                );
+                                drop(permit);
+                                route_slot.overloaded();
+                                route_refusal.say_waiting(policy.refusal_budget);
+                                refused = Some(route_refusal.wait());
+                                sleep(wait_time).await;
+                                attempt -= 1;
+                                lambda_attempt += 1;
+                                own_failure = Some(call_err);
+                                continue;
+                            }
+                            refusals::Refusal::EndsTheCall => {
+                                route_refusal.say_spent(policy.refusal_budget);
+                                route_refusal.say_silent();
+                                debug!(
+                                    "{} was refused for capacity and is left pending after this \
+                                     request: the route's {}s refusal budget is spent and its \
+                                     model has answered nothing since it last refused. Calls \
+                                     that arrive in the next {:?} are not sent: {}",
+                                    path,
+                                    policy.refusal_budget.as_secs(),
+                                    stands_for,
+                                    call_err.message
+                                );
+                                // The refusal is still a verdict on the
+                                // model, as on the last attempt below.
+                                drop(permit);
+                                route_slot.overloaded();
+                                return Err(call_err);
+                            }
+                            refusals::Refusal::CostsAnAttempt => {
+                                route_refusal.say_spent(policy.refusal_budget);
+                            }
                         }
-                        route_refusal.say_spent(policy.refusal_budget, max_retries);
                     }
 
                     // The cloud's Retry-After on a 503 `model_error` is the
@@ -1500,6 +1663,7 @@ impl AgentService {
                         policy.sleep(wait_time).await;
                         waited += wait_time;
                         lambda_attempt += 1;
+                        own_failure = Some(call_err);
                         continue;
                     }
 
@@ -1514,6 +1678,10 @@ impl AgentService {
                 Err(e) => {
                     // Bare network failure (no response received) — retriable by definition.
                     let wait_time = backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
+                    let lost = AgentCallError::transient(
+                        "network_error",
+                        format!("Agent proxy call failed: {}", e),
+                    );
                     if policy.permits_in_run(attempt, waited, wait_time) {
                         note_retry();
                         warn!(
@@ -1526,6 +1694,7 @@ impl AgentService {
                         policy.sleep(wait_time).await;
                         waited += wait_time;
                         lambda_attempt += 1;
+                        own_failure = Some(lost);
                         continue;
                     }
 
@@ -1534,18 +1703,7 @@ impl AgentService {
                     drop(permit);
                     drop(route_slot);
                     return self
-                        .collect_after_cut(
-                            auth,
-                            &endpoint,
-                            path,
-                            body,
-                            lambda_attempt,
-                            None,
-                            AgentCallError::transient(
-                                "network_error",
-                                format!("Agent proxy call failed: {}", e),
-                            ),
-                        )
+                        .collect_after_cut(auth, &endpoint, path, body, lambda_attempt, None, lost)
                         .await;
                 }
             }
@@ -1922,6 +2080,19 @@ pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
     );
 }
 
+/// Make the next `times` offline calls to `task_path` whose serialized body
+/// contains `body_contains` end the way a call ends that a silent route never
+/// sent (carrick#1909): on [`NOT_ASKED_CODE`], with the error the retry loop
+/// itself returns for it, and counted among no route's requests.
+///
+/// The retry loop is not run offline, so nothing here decides that the call
+/// is not sent; `refusals.rs` and its tests do. This is for what a run then
+/// makes of such a call.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_not_asked(task_path: &str, body_contains: &str, times: usize) {
+    push_mock_override(task_path, body_contains, times, Err(not_asked(task_path)));
+}
+
 /// The same, answered with `envelope`: an error body exactly as a prompt
 /// lambda sends it, read by the parser and the conversion a real answer goes
 /// through ([`call_error_from_envelope`]). For the tests that pin what each
@@ -2010,11 +2181,14 @@ struct AgentResponse {
     /// (carrick-cloud#871).
     #[serde(default)]
     guidance_key: Option<String>,
-    /// file-analyzer only: `true` when the text came from what the cloud
-    /// already held and no model call was made for this request. Read for one
-    /// thing: a collecting request is only ever answered that way, so a 200
-    /// to one without it is a cloud that ran the request as an ordinary one
-    /// ([`AgentService::collect_after_cut`]).
+    /// `true` when the text came from what the cloud already held and no
+    /// model call was made for this request; every prompt lambda states it on
+    /// such an answer. Read for two things. A collecting request is only ever
+    /// answered that way, so a 200 to one without it is a cloud that ran the
+    /// request as an ordinary one ([`AgentService::collect_after_cut`]). And
+    /// such an answer is not the model answering, so it does not end a
+    /// route's silence (`refusals.rs`, carrick#1909). Absent reads as an
+    /// answer of the model's.
     #[serde(default)]
     cached: Option<bool>,
 }
@@ -3529,6 +3703,7 @@ pub(crate) mod tests {
             refusals: Arc::new(RouteRefusals::new()),
             capabilities: Arc::new(CloudCapabilities::new()),
             retry: RetryPolicy::STANDARD,
+            counts_requests: false,
             script: None,
         }
     }
@@ -5756,70 +5931,508 @@ pub(crate) mod tests {
     }
 
     /// Send `files` calls to `/analyze-file` the way a service's file stage
-    /// does, and count the ones that failed.
-    async fn analyse_files(service: &AgentService, files: usize) -> usize {
+    /// does, and count the ones that failed by the code each ended on.
+    async fn analyse_files_by_code(
+        service: &AgentService,
+        files: usize,
+    ) -> BTreeMap<String, usize> {
         use futures::StreamExt;
 
         let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
         let body = serde_json::json!({});
-        futures::stream::iter(0..files)
+        let answers: Vec<Result<LambdaOutcome, AgentCallError>> = futures::stream::iter(0..files)
             .map(|_| service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body))
             .buffer_unordered(crate::agents::file_orchestrator::FILE_ANALYSIS_QUEUE_DEPTH)
-            .filter(|answer| std::future::ready(answer.is_err()))
-            .count()
-            .await
+            .collect()
+            .await;
+        let mut ended = BTreeMap::new();
+        for error in answers.into_iter().filter_map(Result::err) {
+            *ended.entry(error.code).or_insert(0) += 1;
+        }
+        ended
     }
 
-    /// The bound carrick#1893 has to state: a route that refuses for the
-    /// whole run still ends every call. Its files wait out the route's
-    /// refusal budget once, between them, and from there each refusal costs
-    /// an attempt, so the run is longer than it was by the budget and by the
-    /// requests in flight when it ran out, and by nothing else.
-    #[tokio::test(start_paused = true)]
-    async fn a_route_that_refuses_the_whole_run_costs_its_refusal_budget_once() {
-        const FILES: usize = 60;
-        let refusing = || {
-            scripted(|_route, _attempt| async {
+    /// [`analyse_files_by_code`], counting every call that failed.
+    async fn analyse_files(service: &AgentService, files: usize) -> usize {
+        analyse_files_by_code(service, files).await.values().sum()
+    }
+
+    /// A 200 the cloud gives from what it already holds: it says so
+    /// (`cached: true`), it takes no time, and no model was asked.
+    fn scripted_cached_answer() -> reqwest::Response {
+        http::Response::builder()
+            .status(200)
+            .body(r#"{"success":true,"text":"analysed","cached":true}"#.to_string())
+            .unwrap()
+            .into()
+    }
+
+    /// When each request of a scripted run was sent, and the attempt number
+    /// it carried.
+    type SentLog = Arc<Mutex<Vec<(tokio::time::Instant, u32)>>>;
+
+    /// A cloud that refuses every request for capacity, and the log of what
+    /// it was sent.
+    fn never_answering() -> (AgentService, SentLog) {
+        let sent = SentLog::default();
+        let log = Arc::clone(&sent);
+        let service = scripted(move |_route, attempt| {
+            log.lock()
+                .unwrap()
+                .push((tokio::time::Instant::now(), attempt));
+            async {
                 sleep(REFUSED_AFTER).await;
                 scripted_refusal()
-            })
-        };
-
-        let counted = refusing().with_retry_policy(RetryPolicy {
-            refusal_budget: Duration::ZERO,
-            ..RetryPolicy::STANDARD
+            }
         });
-        let started = tokio::time::Instant::now();
-        assert_eq!(analyse_files(&counted, FILES).await, FILES);
-        let counting_took = started.elapsed();
+        (service, sent)
+    }
 
-        let waiting = refusing();
-        let started = tokio::time::Instant::now();
-        assert_eq!(analyse_files(&waiting, FILES).await, FILES);
-        let waiting_took = started.elapsed();
-        let charged = waiting.refusals.for_route("/analyze-file").spent();
-        // What the budget may overrun by: the calls asleep when it ran out
-        // finish that sleep (40 s at most) and queue for the two slots a
-        // refused route is cut to, twenty calls at fourteen seconds a refusal.
-        // About three and a half minutes here; the sleeps are jittered off
-        // the machine's clock, so the bound leaves room.
-        const OVERRUN: Duration = Duration::from_secs(6 * 60);
+    /// carrick#1909, the bound in time: how long a route that never answers
+    /// holds a scan, at 60 files and at 1,000, on the first pass and on the
+    /// run's retry of owed work.
+    ///
+    /// The files wait out the route's refusal budget once, between them.
+    /// From there the route is silent (`refusals.rs`). The refusal that finds
+    /// the budget spent ends its call and decides for the calls behind it:
+    /// the ones queued for a slot, and every file not yet started, end
+    /// without a request. The calls asleep at that moment finish their sleep,
+    /// and one of them at a time is the route's probe. So the scan is held
+    /// for the budget, that last sleep and a probe, whatever the number of
+    /// files. The retry of owed work asks again, its first call is the probe,
+    /// and the pass is held for that one request.
+    ///
+    /// The arm it is measured against counts seven attempts a file from the
+    /// first refusal, which is what every release up to 0.3.106 did, and what
+    /// 0.3.107 went back to once the budget was spent. On the commit before
+    /// this rule, this test's predecessor measured 0.3.107 at 93.5 minutes
+    /// for 60 files and 861.5 for 1,000: the counting arm plus the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_route_that_never_answers_holds_a_scan_for_its_budget_whatever_the_files() {
+        use crate::agents::file_orchestrator::FILE_ANALYSIS_QUEUE_DEPTH;
 
-        eprintln!(
-            "a route that never answers, {FILES} files: {:.1} min counting attempts, {:.1} min \
-             with the refusal budget ({:.1} min charged to the route)",
-            counting_took.as_secs_f64() / 60.0,
-            waiting_took.as_secs_f64() / 60.0,
-            charged.as_secs_f64() / 60.0
-        );
-        assert!(waiting_took >= counting_took + REFUSAL_BUDGET - Duration::from_secs(60));
+        // The route is charged from its first refusal on, without a gap while
+        // any call is waiting, so its budget is found spent within two
+        // refused requests of the budget's length: one before the charge
+        // starts, one for the refusal that finds it spent. The calls asleep
+        // then finish their sleep, and the last of them to wake is the probe
+        // or waits for the one that is out. No term holds the file count.
+        let spent_within = REFUSAL_BUDGET + REFUSED_AFTER * 2;
+        let bound = spent_within + RETRY_MAX_DELAY + REFUSED_AFTER;
+        let ended_on =
+            |ended: &BTreeMap<String, usize>, code: &str| ended.get(code).copied().unwrap_or(0);
+
+        for files in [60, 1000] {
+            let (counted, _) = never_answering();
+            let counted = counted.with_retry_policy(RetryPolicy {
+                refusal_budget: Duration::ZERO,
+                ..RetryPolicy::STANDARD
+            });
+            let started = tokio::time::Instant::now();
+            assert_eq!(analyse_files(&counted, files).await, files);
+            let counting_took = started.elapsed();
+
+            let (silent, sent) = never_answering();
+            let started = tokio::time::Instant::now();
+            let ended = analyse_files_by_code(&silent, files).await;
+            let took = started.elapsed();
+            let route = silent.refusals.for_route("/analyze-file");
+            let charged = route.spent();
+            let spent_at = route
+                .budget_spent_at()
+                .expect("a route that never answers spends its budget");
+            let (refused, unasked) = (
+                ended_on(&ended, CAPACITY_REFUSAL_CODE),
+                ended_on(&ended, NOT_ASKED_CODE),
+            );
+            let after_the_budget = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, _)| *at > spent_at)
+                .count();
+
+            // The run's retry of owed work asks about every one of them
+            // again, after the wait a capacity refusal gets. The route is in
+            // the state the first pass left it in, and no refusal stands any
+            // longer: the first call is the probe and the rest wait on it.
+            sleep(Duration::from_secs(180)).await;
+            let asked_before_the_retry = sent.lock().unwrap().len();
+            let retry_started = tokio::time::Instant::now();
+            let retried = analyse_files_by_code(&silent, files).await;
+            let retry_took = retry_started.elapsed();
+            let asked_by_the_retry = sent.lock().unwrap().len() - asked_before_the_retry;
+
+            eprintln!(
+                "a route that never answers, {files} files: first pass {:.1} min (budget found \
+                 spent at {:.1} min, {after_the_budget} requests after that, {refused} calls \
+                 refused, {unasked} never sent, {:.1} min charged to the route, bound {:.1} \
+                 min); retry pass {:.0} s ({asked_by_the_retry} request); counting seven \
+                 attempts a file takes {:.1} min from the first refusal and {:.1} min after the \
+                 budget",
+                took.as_secs_f64() / 60.0,
+                (spent_at - started).as_secs_f64() / 60.0,
+                charged.as_secs_f64() / 60.0,
+                bound.as_secs_f64() / 60.0,
+                retry_took.as_secs_f64(),
+                counting_took.as_secs_f64() / 60.0,
+                (counting_took + REFUSAL_BUDGET).as_secs_f64() / 60.0
+            );
+
+            assert!(
+                spent_at <= started + spent_within,
+                "the budget was found spent {:?} into the pass",
+                spent_at - started
+            );
+            assert!(
+                took <= bound,
+                "{files} files held the scan for {took:?}, past the bound of {bound:?}"
+            );
+            assert!(
+                took >= REFUSAL_BUDGET - RETRY_MAX_DELAY,
+                "{files} files were given up on after {took:?}, before the budget was spent"
+            );
+            // Every file is owed, for capacity. The ones the stage had
+            // started when the budget ran out were refused themselves; no
+            // other was ever sent.
+            assert_eq!(refused + unasked, files, "{ended:?}");
+            assert_eq!(refused, FILE_ANALYSIS_QUEUE_DEPTH, "{ended:?}");
+            // After the budget, the route sees its probes and nothing else:
+            // the calls asleep wake within one sleep of it, and a probe and
+            // the time its refusal stands keep two of them apart.
+            let probes = RETRY_MAX_DELAY.as_secs()
+                / (REFUSED_AFTER + refusals::STANDS_FOR_AT_LEAST).as_secs()
+                + 1;
+            assert!(
+                after_the_budget as u64 <= probes + 1,
+                "{after_the_budget} requests went out after the budget was spent"
+            );
+            // What the ledger holds is what the files waited, and it ends
+            // with the first pass.
+            assert!(charged <= took, "{charged:?}");
+
+            assert_eq!(asked_by_the_retry, 1, "the retry's first call is the probe");
+            assert!(
+                retry_took >= REFUSED_AFTER
+                    && retry_took < REFUSED_AFTER + Duration::from_millis(10),
+                "the retry of {files} files held the scan for {retry_took:?}"
+            );
+            assert_eq!(ended_on(&retried, CAPACITY_REFUSAL_CODE), 1, "{retried:?}");
+            assert_eq!(ended_on(&retried, NOT_ASKED_CODE), files - 1, "{retried:?}");
+        }
+    }
+
+    /// What a scripted route does with one request.
+    #[derive(Debug, Clone, Copy)]
+    enum Says {
+        /// The model refuses for capacity.
+        Refuses,
+        /// The model answers.
+        Answers,
+        /// The cloud answers from what it already holds; no model is asked.
+        AnswersFromCache,
+        /// The gateway cuts the request: its own 503, which says nothing
+        /// about the model.
+        Cut,
+    }
+
+    /// A scripted route that does what the test tells it, request by
+    /// request: the head of `next`, or a refusal when nothing is queued. It
+    /// counts the requests it is sent.
+    #[derive(Default)]
+    struct ToldRoute {
+        next: Mutex<std::collections::VecDeque<Says>>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToldRoute {
+        fn say(&self, says: impl IntoIterator<Item = Says>) {
+            self.next.lock().unwrap().extend(says);
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+
+        fn service(self: &Arc<Self>) -> AgentService {
+            let route = Arc::clone(self);
+            scripted(move |_route, _attempt| {
+                route.asked.fetch_add(1, Ordering::SeqCst);
+                let says = route.next.lock().unwrap().pop_front();
+                async move {
+                    match says.unwrap_or(Says::Refuses) {
+                        Says::Refuses => {
+                            sleep(REFUSED_AFTER).await;
+                            scripted_refusal()
+                        }
+                        Says::Answers => {
+                            sleep(ANSWERED_AFTER).await;
+                            scripted_answer()
+                        }
+                        Says::AnswersFromCache => scripted_cached_answer(),
+                        Says::Cut => http::Response::builder()
+                            .status(503)
+                            .body(r#"{"message":"Service Unavailable"}"#.to_string())
+                            .unwrap()
+                            .into(),
+                    }
+                }
+            })
+        }
+    }
+
+    /// A [`ToldRoute`] gone silent: one call has waited out its whole refusal
+    /// budget and been ended by the refusal that found it spent, and that
+    /// refusal no longer stands. Returns the route and the service to ask.
+    async fn gone_silent(path: &str) -> (Arc<ToldRoute>, AgentService) {
+        let route = Arc::new(ToldRoute::default());
+        let service = route.service();
+        let error = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                "http://scripted",
+                path,
+                &serde_json::json!({}),
+            )
+            .await
+            .expect_err("a route that never answers");
+        assert_eq!(error.code, CAPACITY_REFUSAL_CODE);
+        assert!(service.refusals.for_route(path).is_silent(REFUSAL_BUDGET));
+        sleep(refusals::STANDS_FOR_AT_LEAST).await;
+        (route, service)
+    }
+
+    /// What a call the route's model refused comes to: the cloud's own
+    /// refusal, which is owed for capacity and never final.
+    fn was_refused(error: AgentCallError) {
+        assert_eq!(error.code, CAPACITY_REFUSAL_CODE);
+        assert!(error.is_capacity_refusal() && error.retriable && error.cloud_stated);
+        assert!(!error.is_final_answer(), "a refusal was read as final");
+    }
+
+    /// What a call that was never sent comes to: the scanner's own code,
+    /// owed for capacity like the refusal it stands behind, and never final.
+    fn was_not_sent(error: AgentCallError) {
+        assert_eq!(error.code, NOT_ASKED_CODE);
+        assert!(error.is_capacity_refusal() && error.retriable);
+        assert!(!error.cloud_stated, "the cloud never sends this code");
+        assert!(!error.is_final_answer(), "an unsent call was read as final");
+        assert!(!error.is_budget_refusal());
+    }
+
+    /// carrick#1909, call by call: what "the route has answered nothing
+    /// since" means, and what ends it.
+    ///
+    /// One call waits out the whole budget alone and is then ended by the
+    /// refusal that finds it spent. From there the route is silent. While a
+    /// refusal stands, a call that arrives is not sent and takes no time.
+    /// When it stands no longer, the next call is the probe: one request,
+    /// and its time. An answer the cloud gives from what it holds changes
+    /// nothing. One answer from the model ends the silence for the calls
+    /// after it: a call refused once and then answered gets its answer, as
+    /// it always did. A route that stops again costs one request more and is
+    /// silent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_route_sends_one_call_at_a_time_until_its_model_answers() {
+        let stands = refusals::STANDS_FOR_AT_LEAST;
+        let route = Arc::new(ToldRoute::default());
+        let service = route.service();
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let ask = || service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body);
+
+        let started = tokio::time::Instant::now();
+        was_refused(ask().await.expect_err("a route that never answers"));
+        let waited = started.elapsed();
         assert!(
-            waiting_took <= counting_took + REFUSAL_BUDGET + OVERRUN,
-            "the budget added {:?} to a run that took {counting_took:?} without it",
-            waiting_took - counting_took
+            waited >= REFUSAL_BUDGET - RETRY_MAX_DELAY,
+            "the call was given up on after {waited:?}, before the budget was spent"
         );
-        // What the ledger holds is what the files waited, and it stops there.
-        assert!(charged <= REFUSAL_BUDGET + OVERRUN, "{charged:?}");
+        assert!(
+            waited <= REFUSAL_BUDGET + REFUSED_AFTER * 2,
+            "the call went on for {waited:?} after the budget was spent"
+        );
+
+        // That refusal stands for the `Retry-After` it carried. A call that
+        // arrives in that time is not sent, and is ended at once.
+        for _ in 0..3 {
+            let (asked, started) = (route.asked(), tokio::time::Instant::now());
+            was_not_sent(ask().await.expect_err("a refusal stands"));
+            assert_eq!(route.asked(), asked, "a call behind a refusal was sent");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+
+        // It stands no longer, so the next call is the probe: one request,
+        // and nothing but that request's time (the room is a timer's grain).
+        sleep(stands).await;
+        let (asked, started) = (route.asked(), tokio::time::Instant::now());
+        was_refused(ask().await.expect_err("the probe is refused"));
+        assert_eq!(route.asked() - asked, 1);
+        let took = started.elapsed();
+        assert!(
+            took >= REFUSED_AFTER && took < REFUSED_AFTER + Duration::from_millis(10),
+            "{took:?}"
+        );
+        // And the probe's refusal stands in its turn.
+        let asked = route.asked();
+        was_not_sent(ask().await.expect_err("the probe's refusal stands"));
+        assert_eq!(route.asked(), asked);
+
+        // An answer from what the cloud already held is not the model's: the
+        // probe that got it has its answer, and the next call is a probe too.
+        sleep(stands).await;
+        route.say([Says::AnswersFromCache]);
+        assert_eq!(ask().await.unwrap().text, "analysed");
+        let asked = route.asked();
+        was_refused(
+            ask()
+                .await
+                .expect_err("the model has still answered nothing"),
+        );
+        assert_eq!(
+            route.asked() - asked,
+            1,
+            "a cached answer ended the silence"
+        );
+
+        // One answer from the model ends it. The calls after it are asked as
+        // they always were: refused once and then answered is an answer.
+        sleep(stands).await;
+        route.say([Says::Answers]);
+        assert_eq!(ask().await.unwrap().text, "analysed");
+        route.say([Says::Refuses, Says::Answers]);
+        let asked = route.asked();
+        assert_eq!(ask().await.unwrap().text, "analysed");
+        assert_eq!(route.asked() - asked, 2);
+
+        // The route stops again. The first refusal after an answer is
+        // counted, and the request sent for it is refused with no answer
+        // between, which ends the call. The call after that is not sent.
+        let asked = route.asked();
+        was_refused(ask().await.expect_err("the route stopped answering"));
+        assert_eq!(
+            route.asked() - asked,
+            2,
+            "the first refusal after an answer is counted, the second ends the call"
+        );
+        let asked = route.asked();
+        was_not_sent(ask().await.expect_err("the route is silent again"));
+        assert_eq!(route.asked(), asked);
+    }
+
+    /// The probe, under load: calls that arrive together on a silent route
+    /// put one request on the wire between them. The one that is refused
+    /// ends on its refusal, and the calls that waited on it end without a
+    /// request, at the moment it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn calls_that_arrive_together_on_a_silent_route_send_one_request_between_them() {
+        let (route, service) = gone_silent("/analyze-file").await;
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+
+        let (asked, started) = (route.asked(), tokio::time::Instant::now());
+        let ended =
+            futures::future::join_all((0..12).map(|_| {
+                service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body)
+            }))
+            .await;
+        assert_eq!(route.asked() - asked, 1, "more than the probe was sent");
+        let took = started.elapsed();
+        assert!(
+            took >= REFUSED_AFTER && took < REFUSED_AFTER + Duration::from_millis(10),
+            "{took:?}"
+        );
+        let mut errors = ended.into_iter().map(|answer| answer.expect_err("refused"));
+        was_refused(errors.next().unwrap());
+        errors.for_each(was_not_sent);
+    }
+
+    /// A probe the gateway cut says nothing about the model, so it decides
+    /// for nobody: the call behind it takes the turn and is sent. That one is
+    /// refused, which ends it, and ends the first call too, which by then is
+    /// waiting on it. The first call ends on what its own request came to,
+    /// the cut, since it was sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_the_gateway_cut_hands_its_turn_to_the_call_behind_it() {
+        let (route, service) = gone_silent("/analyze-file").await;
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+
+        route.say([Says::Cut]);
+        let asked = route.asked();
+        let (first, second) = tokio::join!(
+            service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body),
+            service.post_with_retry(&auth, "http://scripted", "/analyze-file", &body),
+        );
+        assert_eq!(
+            route.asked() - asked,
+            2,
+            "the cut probe and the one after it"
+        );
+        let first = first.expect_err("ended behind the second call's refusal");
+        assert_eq!(first.code, "gateway_error");
+        assert!(first.retriable && !first.is_final_answer());
+        was_refused(second.expect_err("the probe is refused"));
+    }
+
+    /// A call is one of the run's requests from its first send, however many
+    /// times the loop sends it, and a call that was never sent is none of
+    /// them. Its own route, because the counts are the process's.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_was_never_sent_is_not_one_of_the_runs_requests() {
+        const ROUTE: &str = "/a-route-counted-by-carrick-1909";
+        let counted = || request_counts().get(ROUTE).copied().unwrap_or(0);
+        let route = Arc::new(ToldRoute::default());
+        let service = AgentService {
+            counts_requests: true,
+            ..route.service()
+        };
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let ask = || service.post_with_retry(&auth, "http://scripted", ROUTE, &body);
+
+        // One call waits out the budget: many requests, one row.
+        was_refused(ask().await.expect_err("a route that never answers"));
+        assert!(route.asked() > 7);
+        assert_eq!(counted(), 1);
+
+        // Its refusal stands: three calls, none sent, none counted.
+        for _ in 0..3 {
+            was_not_sent(ask().await.expect_err("a refusal stands"));
+        }
+        assert_eq!(counted(), 1);
+
+        // Five arrive together once it stands no longer: the probe is a row.
+        sleep(refusals::STANDS_FOR_AT_LEAST).await;
+        let asked = route.asked();
+        futures::future::join_all((0..5).map(|_| ask())).await;
+        assert_eq!(route.asked() - asked, 1);
+        assert_eq!(counted(), 2);
+    }
+
+    /// The code a call that was never sent ends on is the scanner's own: it
+    /// counts as owed for capacity, beside the cloud's refusal and no other
+    /// code, and its sentence names the route.
+    #[test]
+    fn only_a_refusal_and_a_call_behind_one_are_owed_for_capacity() {
+        was_not_sent(not_asked("/analyze-file"));
+        assert!(
+            not_asked("/analyze-file")
+                .message
+                .contains("analyze-file has answered nothing")
+        );
+        assert!(is_capacity_code(CAPACITY_REFUSAL_CODE));
+        assert!(is_capacity_code(NOT_ASKED_CODE));
+        for other in [
+            "gateway_error",
+            "network_error",
+            "retries_exhausted",
+            "output_truncated",
+            ANALYSIS_IN_FLIGHT_CODE,
+            LLM_DISABLED_CODE,
+        ] {
+            assert!(!is_capacity_code(other), "{other}");
+        }
     }
 
     /// Only per-file and per-function calls wait a refusal out. A call a
@@ -5947,6 +6560,8 @@ pub(crate) mod tests {
         refused: usize,
         /// What the route's refusal ledger was charged.
         charged: Duration,
+        /// Whether any refusal found the route's budget spent.
+        budget_spent: bool,
         took: Duration,
     }
 
@@ -5989,10 +6604,12 @@ pub(crate) mod tests {
             tokio::time::sleep_until(started + Duration::from_secs(first_request)).await;
             lost += analyse_files(&service, files).await;
         }
+        let route = service.refusals.for_route("/analyze-file");
         Replay {
             lost,
             refused: refused.load(Ordering::SeqCst),
-            charged: service.refusals.for_route("/analyze-file").spent(),
+            charged: route.spent(),
+            budget_spent: route.budget_is_spent(),
             took: started.elapsed(),
         }
     }
@@ -6034,6 +6651,14 @@ pub(crate) mod tests {
             waited.charged <= REFUSAL_BUDGET * 3 / 4,
             "the logged windows charged {:?} of a {REFUSAL_BUDGET:?} budget",
             waited.charged
+        );
+        // carrick#1909 changes what a refusal costs once the budget is found
+        // spent, and nothing before that. No refusal here found it spent, so
+        // on a route that answers, as this one does between its windows,
+        // every request, attempt and wait is what it was.
+        assert!(
+            !waited.budget_spent,
+            "a refusal found the budget spent on a route that answers"
         );
     }
 

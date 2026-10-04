@@ -817,6 +817,79 @@ async fn a_part_lost_for_another_reason_loses_the_file_with_that_reason() {
     assert_eq!(lost_reason(&fx.table).as_deref(), Some("model_error"));
 }
 
+/// carrick#1909: a part the model refuses for capacity is the provider being
+/// busy, and no verdict on the file. The file is owed under the refusal's
+/// code and counted as refused for capacity, so the run's retry waits and
+/// asks again. It is not counted as a final answer, although the verdict
+/// that split the file was one, and nothing of the parts that did answer is
+/// stored.
+#[tokio::test]
+#[serial]
+async fn a_part_refused_for_capacity_leaves_the_file_owed_and_not_final() {
+    offline();
+    let tag = "partbusy";
+    let fx = Fixture::table(tag);
+
+    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
+    agent_service::inject_mock_envelope(
+        ROUTE,
+        &single_marker(tag, LOCAL_SINGLES),
+        1,
+        &refusal("model_error", true),
+    );
+
+    let result = fx.analyze().await;
+    let losses = carrick::scan_health::service_losses(None);
+    assert_eq!(lost_reason(&fx.table).as_deref(), Some("model_error"));
+    assert_eq!(
+        (losses.files, losses.capacity_files, losses.final_files),
+        (1, 1, 0),
+        "{losses:?}"
+    );
+    assert!(
+        !result.raw_model_results.contains_key(&fx.table),
+        "no partial answer is stored"
+    );
+}
+
+/// carrick#1909: a part that is not sent, because the route had stopped
+/// answering and had just refused another request, leaves the file owed the
+/// same way, under the scanner's own code for a call that was never sent.
+/// The part is not one of the run's requests: the whole request and the two
+/// parts that were sent are.
+#[tokio::test]
+#[serial]
+async fn a_part_that_is_never_sent_leaves_the_file_owed_and_is_not_a_request() {
+    offline();
+    let tag = "partunsent";
+    let fx = Fixture::table(tag);
+
+    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
+    agent_service::inject_mock_not_asked(ROUTE, &single_marker(tag, LOCAL_SINGLES), 1);
+
+    let before = requests();
+    let result = fx.analyze().await;
+    assert_eq!(
+        requests() - before,
+        HANDLER_MODULES + 1 + 2,
+        "the whole request and the two parts that were sent"
+    );
+    let losses = carrick::scan_health::service_losses(None);
+    assert_eq!(
+        lost_reason(&fx.table).as_deref(),
+        Some(agent_service::NOT_ASKED_CODE)
+    );
+    assert_eq!(
+        (losses.files, losses.capacity_files, losses.final_files),
+        (1, 1, 0),
+        "{losses:?}"
+    );
+    assert!(
+        !result.raw_model_results.contains_key(&fx.table),
+        "no partial answer is stored"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn a_part_prompt_is_the_whole_prompt_with_its_own_candidates_and_modules() {

@@ -156,8 +156,10 @@ pub struct ServiceLosses {
     pub files: usize,
     /// Function intents that failed after their retries.
     pub intents: usize,
-    /// How many of `files` ended on the model refusing for capacity
-    /// ([`crate::agent_service::CAPACITY_REFUSAL_CODE`]). They, and
+    /// How many of `files` are owed for capacity
+    /// ([`crate::agent_service::is_capacity_code`]): the model refused the
+    /// file's own request, or the file was not sent behind a refusal on a
+    /// route that had stopped answering (carrick#1909). They, and
     /// `capacity_intents`, are the losses a wait before the retry can mend
     /// (carrick#1896).
     pub capacity_files: usize,
@@ -214,7 +216,7 @@ impl Registry {
             intents: intents.clone().map(|(_, n, _)| *n).sum(),
             capacity_files: files
                 .clone()
-                .filter(|l| l.reason.code == crate::agent_service::CAPACITY_REFUSAL_CODE)
+                .filter(|l| crate::agent_service::is_capacity_code(&l.reason.code))
                 .count(),
             capacity_intents: intents.map(|(_, _, for_capacity)| *for_capacity).sum(),
             final_files: files.filter(|l| l.reason.is_final).count(),
@@ -951,6 +953,83 @@ mod tests {
 
         run.forget_service_losses(&billing);
         assert_eq!(run.service_losses(&billing), ServiceLosses::default());
+    }
+
+    /// carrick#1909: a route that has stopped answering refuses one file's
+    /// request and the files behind it are not sent. Both are lost files of
+    /// the run, named and owed by their service, and both are counted as
+    /// owed for capacity and never as a final answer: the provider was busy,
+    /// which says nothing about either file. The summary tells them apart by
+    /// code, the cloud's for the file that was asked and the scanner's own
+    /// for the ones that were not. The retry of owed work forgets them all
+    /// and asks again.
+    #[test]
+    fn files_behind_a_refusal_on_a_silent_route_are_owed_for_capacity_and_told_apart() {
+        let refused = AgentCallError::from_cloud(
+            crate::agent_service::CAPACITY_REFUSAL_CODE,
+            "model busy",
+            true,
+        );
+        let unasked = crate::agent_service::not_asked("/analyze-file");
+        for error in [&refused, &unasked] {
+            assert!(counts_as_lost_file(error));
+            assert!(!is_budget_refusal(error));
+            assert!(!analysis_failure_reason(error).is_final, "{error}");
+        }
+        assert_eq!(
+            analysis_failure_reason(&unasked),
+            LossReason::owed(crate::agent_service::NOT_ASKED_CODE)
+        );
+
+        let api = Some("api".to_string());
+        let mut run = run();
+        run.current = api.clone();
+        run.record_files_attempted(3);
+        run.record_unanalysed_file("api/src/a.ts", &analysis_failure_reason(&refused));
+        run.record_unanalysed_file("api/src/b.ts", &analysis_failure_reason(&unasked));
+        run.record_unanalysed_file("api/src/c.ts", &analysis_failure_reason(&unasked));
+
+        assert_eq!(
+            run.service_losses(&api),
+            ServiceLosses {
+                files: 3,
+                intents: 0,
+                capacity_files: 3,
+                capacity_intents: 0,
+                final_files: 0,
+            }
+        );
+        assert_eq!(
+            run.summary_line().as_deref(),
+            Some(
+                "3 of 3 files were not analysed: 2 model_busy_not_asked, 1 model_error. Their \
+                 endpoints and calls are missing from this run's results (api/src/a.ts, \
+                 api/src/b.ts, api/src/c.ts)"
+            )
+        );
+        let named: Vec<(String, String)> = run
+            .unanalysed_files_for(&api)
+            .into_iter()
+            .map(|file| (file.path, file.reason))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("api/src/a.ts".to_string(), "model_error".to_string()),
+                (
+                    "api/src/b.ts".to_string(),
+                    "model_busy_not_asked".to_string()
+                ),
+                (
+                    "api/src/c.ts".to_string(),
+                    "model_busy_not_asked".to_string()
+                ),
+            ]
+        );
+
+        run.forget_service_losses(&api);
+        assert!(run.service_losses(&api).is_empty());
+        assert_eq!(run.attempted, 0);
     }
 
     /// Reasons are grouped and ordered by how many files each cost, so the
