@@ -59,6 +59,29 @@
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
 //!   what it returns, with the call's arguments in its parameters.
+//! - **A key of an object parameter is a parameter** (carrick#1950). A
+//!   wrapper that takes its request as one object (`send({ url, body })`)
+//!   reads each key as the caller writes it: through a destructured
+//!   parameter (`{ url }`, `{ url: target }`), through the parameter itself
+//!   (`options.url`), or unpacked in the body (`const { url } = options`).
+//!   The object literal a caller passes fills the key in, and a caller that
+//!   passes its own parameter on leaves it to its own caller. Nothing is read
+//!   through a binding the function assigns again, a key with a default, a
+//!   `??`/`||` fallback on one, or a key the caller's object does not state
+//!   (it is missing, or a spread or a computed key after it may overwrite
+//!   it). A key waits on a caller only where the request states no route
+//!   without it (the whole URL, a path glued after a base). Where it does
+//!   (a base before a literal path, a whole path segment), the request is
+//!   stated at its own line with the key under the name the function reads
+//!   it by, as it was before keys were read ([`Effect::settle_keys`]).
+//! - **A built query says nothing about the route** (carrick#1950). A call
+//!   to a function of the same class (`this.query(ref)`) or the same module
+//!   (`pageQuery(cursor)`) whose every `return` is the empty string or text
+//!   starting with a literal `?` yields nothing or a query. It ends the path:
+//!   a value before it is a whole segment, and the row's target leaves it
+//!   out. The function must not be `async`, must end in a `return`, and must
+//!   not be one a subclass in the file overrides or the class assigns over.
+//!   Any other value glued after a segment still states no row.
 //! - **A callback counts only where it is invoked.** A function passed to a
 //!   callee this service defines contributes its requests when that callee
 //!   calls the parameter it arrives in. Passed to anything else, nothing says
@@ -161,12 +184,29 @@ pub enum Piece {
     /// The summarised function's own parameter, by position, with the name
     /// the function gives it. Filled in at each call site.
     Param(usize, String),
+    /// One key of the summarised function's own parameter (carrick#1950): the
+    /// parameter's position, the key, and the text the function reads it by
+    /// (`url` for `{ url }`, `options.url`). Filled in at each call site from
+    /// the object the caller writes at that position.
+    ParamKey(usize, String, String),
     /// A value the source names and this pass does not read, kept as written
     /// (`process.env.API_URL`, `config.apiEndpoint`).
     Opaque(String),
+    /// A query one of the service's own functions builds (carrick#1950):
+    /// nothing, or text that starts with `?`. It ends the path and states
+    /// nothing about the route, so it is read only as the last piece of a URL.
+    Query,
     /// A value that cannot be written as text at all (an object in a URL, a
     /// missing argument). A URL holding one states nothing.
     Unknown,
+}
+
+impl Piece {
+    /// Whether the piece is the summarised function's own parameter, whole or
+    /// by one of its keys: what a call site may fill in.
+    fn is_parameter(&self) -> bool {
+        matches!(self, Piece::Param(..) | Piece::ParamKey(..))
+    }
 }
 
 /// A value as far as the source states it.
@@ -900,17 +940,26 @@ pub fn extract_file_ir(
         .keys()
         .filter_map(|name| Some((name.clone(), uses.uses.get(name)?.clone())))
         .collect();
+    // Names the module assigns again: a function declaration one of them
+    // names may be replaced by the time it is called.
+    let mut reassigned = Reassigned::default();
+    module.visit_with(&mut reassigned);
+    let classes = classes_by_name(module);
     let mut module_scope = ModuleScope {
         consts: HashMap::new(),
         texts: HashMap::new(),
         named: HashSet::new(),
         builders: HashMap::new(),
+        // Read before any constant or body that may call one: a declaration
+        // is hoisted.
+        query_builders: module_query_builders(module, &reassigned),
         receivers: HashMap::new(),
         lazy_clients: HashMap::new(),
         imports: HashSet::new(),
         uses: uses.uses,
         object_consts: object_consts(module),
-        subclass_fields: subclass_fields(module),
+        subclass_fields: subclass_members(&classes, |class| &class.fields),
+        subclass_methods: subclass_members(&classes, |class| &class.methods),
         class_this: library_sites::class_this(module),
         declared_below: redeclared_names(module),
     };
@@ -1044,8 +1093,6 @@ pub fn extract_file_ir(
     // builder a name may read through (carrick#1562), unless the module
     // assigns its binding again. Read once every constant is known, since a
     // declaration is hoisted.
-    let mut reassigned = Reassigned::default();
-    module.visit_with(&mut reassigned);
     for item in &module.body {
         if let Some(Decl::Fn(fn_decl)) = module_decl(item)
             && !reassigned.names.contains(fn_decl.ident.sym.as_ref())
@@ -1245,6 +1292,11 @@ struct ModuleScope {
     /// returns an expression ([`Reader::eval`] reads it with the call's
     /// arguments in its parameters).
     builders: HashMap<(BindingKey, Vec<String>), Builder>,
+    /// Each module-scope function a call of which yields nothing or a query
+    /// ([`function_builds_query`], carrick#1950), by binding: a function
+    /// declaration nothing assigns again, or a `const` arrow or function
+    /// expression.
+    query_builders: HashSet<BindingKey>,
     receivers: HashMap<String, ClientRef>,
     /// Each module-scope `let` a getter builds a client into on first use,
     /// with the instance it holds (carrick#1790,
@@ -1262,6 +1314,10 @@ struct ModuleScope {
     /// Class name -> the fields a class in this file that extends it
     /// declares or writes again.
     subclass_fields: HashMap<String, HashSet<String>>,
+    /// Class name -> the methods a class in this file that extends it
+    /// declares: on one of its instances, a call through `this` in the base
+    /// class reaches the subclass's method (carrick#1950).
+    subclass_methods: HashMap<String, HashSet<String>>,
     /// Each class the file declares, by its binding -> what the class does
     /// with `this`, for the message-role field rule (carrick#1665).
     class_this: HashMap<BindingKey, ClassThis>,
@@ -2214,12 +2270,22 @@ fn object_consts(module: &Module) -> HashSet<String> {
         .collect()
 }
 
-/// Every class this file declares by name, with the class it extends (when
-/// that is a name) and the fields it declares or writes.
-fn class_fields_by_name(module: &Module) -> HashMap<String, (Option<String>, HashSet<String>)> {
+/// One class a file declares by name.
+#[derive(Default)]
+struct DeclaredClass {
+    /// The class it extends, when that is a name.
+    superclass: Option<String>,
+    /// The fields it declares or writes.
+    fields: HashSet<String>,
+    /// The instance methods and accessors it declares (carrick#1950).
+    methods: HashSet<String>,
+}
+
+/// Every class this file declares by name.
+fn classes_by_name(module: &Module) -> HashMap<String, DeclaredClass> {
     #[derive(Default)]
     struct Classes {
-        found: HashMap<String, (Option<String>, HashSet<String>)>,
+        found: HashMap<String, DeclaredClass>,
     }
     impl Classes {
         fn record(&mut self, name: String, class: &Class) {
@@ -2228,6 +2294,7 @@ fn class_fields_by_name(module: &Module) -> HashMap<String, (Option<String>, Has
                 _ => None,
             };
             let mut fields = HashSet::new();
+            let mut methods = HashSet::new();
             let mut writes = ThisWrites::default();
             for member in &class.body {
                 match member {
@@ -2248,12 +2315,24 @@ fn class_fields_by_name(module: &Module) -> HashMap<String, (Option<String>, Has
                             }
                         }
                     }
+                    ClassMember::Method(method) if !method.is_static => {
+                        if let Some(name) = prop_name(&method.key) {
+                            methods.insert(name);
+                        }
+                    }
                     _ => {}
                 }
                 member.visit_with(&mut writes);
             }
             fields.extend(writes.fields);
-            self.found.insert(name, (superclass, fields));
+            self.found.insert(
+                name,
+                DeclaredClass {
+                    superclass,
+                    fields,
+                    methods,
+                },
+            );
         }
     }
     impl Visit for Classes {
@@ -2273,27 +2352,118 @@ fn class_fields_by_name(module: &Module) -> HashMap<String, (Option<String>, Has
     classes.found
 }
 
-/// Class name -> every field a class extending it, directly or through
-/// others in this file, declares or writes. Such a field holds the
-/// subclass's value on a subclass instance, so the base class's own
-/// methods cannot read it as the base class writes it.
-fn subclass_fields(module: &Module) -> HashMap<String, HashSet<String>> {
-    let classes = class_fields_by_name(module);
+/// Class name -> every member (`members` picks which: its fields, or its
+/// methods) that a class extending it, directly or through others in this
+/// file, declares or writes. Such a member is the subclass's on a subclass
+/// instance, so the base class's own methods cannot read it as the base
+/// class writes it.
+fn subclass_members(
+    classes: &HashMap<String, DeclaredClass>,
+    members: impl Fn(&DeclaredClass) -> &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-    for (name, (superclass, fields)) in &classes {
+    for (name, class) in classes {
         let mut seen: HashSet<&str> = HashSet::from([name.as_str()]);
-        let mut ancestor = superclass.as_deref();
+        let mut ancestor = class.superclass.as_deref();
         while let Some(base) = ancestor {
             if !seen.insert(base) {
                 break;
             }
             out.entry(base.to_string())
                 .or_default()
-                .extend(fields.iter().cloned());
-            ancestor = classes.get(base).and_then(|(sup, _)| sup.as_deref());
+                .extend(members(class).iter().cloned());
+            ancestor = classes
+                .get(base)
+                .and_then(|class| class.superclass.as_deref());
         }
     }
     out
+}
+
+/// The instance methods of `class` a call of which, through `this`, yields
+/// nothing or a query ([`ClassFields::query_builders`], carrick#1950).
+///
+/// `fields` is the class's own table, which holds every name the class
+/// assigns through `this` or declares as a field: a method one of them names
+/// may have been replaced. `overridden` is what a class in this file that
+/// extends this one declares as a method: on its instances the call reaches
+/// that method instead.
+fn class_query_builders(
+    class: &Class,
+    fields: &ClassFields,
+    overridden: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    // Each method name, with whether every declaration of it that has a body
+    // builds a query, and how many have one (overloads have none).
+    let mut bodies: HashMap<String, (bool, usize)> = HashMap::new();
+    for member in &class.body {
+        let (name, function, plain) = match member {
+            ClassMember::Method(method) if !method.is_static => (
+                prop_name(&method.key),
+                &method.function,
+                method.kind == MethodKind::Method,
+            ),
+            ClassMember::PrivateMethod(method) if !method.is_static => (
+                Some(format!("#{}", method.key.name)),
+                &method.function,
+                method.kind == MethodKind::Method,
+            ),
+            _ => continue,
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        if function.body.is_none() {
+            continue;
+        }
+        let entry = bodies.entry(name).or_insert((true, 0));
+        entry.0 &= plain && function_builds_query(function);
+        entry.1 += 1;
+    }
+    bodies
+        .into_iter()
+        .filter(|(name, (builds, count))| {
+            *builds
+                && *count == 1
+                && !fields.values.contains_key(name)
+                && overridden.is_none_or(|methods| !methods.contains(name))
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The module-scope functions a call of which yields nothing or a query
+/// ([`ModuleScope::query_builders`], carrick#1950).
+fn module_query_builders(module: &Module, reassigned: &Reassigned) -> HashSet<BindingKey> {
+    let mut builders = HashSet::new();
+    for item in &module.body {
+        match module_decl(item) {
+            Some(Decl::Fn(declared))
+                if !reassigned.names.contains(declared.ident.sym.as_ref())
+                    && function_builds_query(&declared.function) =>
+            {
+                builders.insert(ident_key(&declared.ident));
+            }
+            Some(Decl::Var(var)) if var.kind == VarDeclKind::Const => {
+                for declarator in &var.decls {
+                    let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init)
+                    else {
+                        continue;
+                    };
+                    let builds = match crate::graphql_document_sites::unwrap_expression(init) {
+                        Expr::Arrow(arrow) => arrow_builds_query(arrow),
+                        Expr::Fn(function) => function_builds_query(&function.function),
+                        _ => false,
+                    };
+                    if builds {
+                        builders.insert(ident_key(&ident.id));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    builders
 }
 
 /// A class's field table: the value each field holds, and the fields that
@@ -2310,6 +2480,11 @@ struct ClassFields {
     /// write, to the global or to a constructor parameter whose default it
     /// is ([`platform_fetch`]).
     fetches: HashSet<String>,
+    /// The instance methods a call of which, through `this`, yields nothing
+    /// or a query ([`function_builds_query`], carrick#1950): declared once
+    /// with a body, never assigned over as a field, and declared again by no
+    /// class in this file that extends this one.
+    query_builders: HashSet<String>,
 }
 
 /// What a function written inside another can read of it, by binding.
@@ -2740,6 +2915,18 @@ fn redeclared_names(module: &Module) -> Declarations {
 /// an identifier resolves to (carrick#1648).
 struct Scope<'a> {
     params: Vec<Option<BindingKey>>,
+    /// Each binding that holds one key of an object parameter, with the
+    /// parameter's position and the key (carrick#1950): a name a destructured
+    /// parameter binds (`{ url }`, `{ url: target }`), or one the body unpacks
+    /// from a plain parameter (`const { url } = options`). Never a binding
+    /// the body assigns again, one with a default, a rest element or a
+    /// nested pattern: each may hold something other than what the caller
+    /// wrote under that key.
+    keyed: HashMap<BindingKey, (usize, String)>,
+    /// The plain parameters whose keys the body may read as the caller wrote
+    /// them (`options.url`, `const { url } = options`): never one the body
+    /// assigns again, nor one whose name the file writes through.
+    key_objects: HashSet<BindingKey>,
     locals: HashMap<BindingKey, Value>,
     /// The locals whose initialiser is text and that nothing assigns again
     /// ([`library_sites::text_pieces`], carrick#1661), the enclosing
@@ -2770,6 +2957,8 @@ impl<'a> Scope<'a> {
     fn module(module: &'a ModuleScope) -> Self {
         Self {
             params: Vec::new(),
+            keyed: HashMap::new(),
+            key_objects: HashSet::new(),
             locals: HashMap::new(),
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
@@ -2785,6 +2974,53 @@ impl<'a> Scope<'a> {
     fn param_index(&self, ident: &Ident) -> Option<usize> {
         let key = ident_key(ident);
         self.params.iter().position(|p| p.as_ref() == Some(&key))
+    }
+
+    /// The parameters of `function` (a function or an arrow, whose
+    /// parameters are `params`), as a scope reads them: each plain one by
+    /// position, and what may be read through a key of one ([`Self::keyed`],
+    /// [`Self::key_objects`], carrick#1950).
+    ///
+    /// A key is read only through a binding the function declares once and
+    /// never assigns again, by `=`, by an update or as a destructuring
+    /// target: any of those leaves it holding something the caller did not
+    /// write.
+    fn read_params<'p, N>(
+        &mut self,
+        params: impl IntoIterator<Item = &'p Pat>,
+        function: &N,
+        module: &ModuleScope,
+    ) where
+        N: VisitWith<Declarations> + VisitWith<Reassigned>,
+    {
+        let declared = Declarations::of(function);
+        let mut reassigned = Reassigned::default();
+        function.visit_with(&mut reassigned);
+        let settled = |binding: &BindingKey| {
+            declared.binding_count(binding) == 1 && !reassigned.names.contains(&binding.0)
+        };
+        for (index, pat) in params.into_iter().enumerate() {
+            let key = pat_key(pat);
+            if let Some(key) = &key
+                && settled(key)
+                && !module.written_through(&key.0)
+            {
+                self.key_objects.insert(key.clone());
+            }
+            self.params.push(key);
+            // `{ url }: Options = {}`: the pattern is the left side.
+            let pattern = match pat {
+                Pat::Assign(assign) => &*assign.left,
+                other => other,
+            };
+            if let Pat::Object(object) = pattern {
+                for (binding, key) in keyed_names(object) {
+                    if settled(&binding) {
+                        self.keyed.insert(binding, (index, key));
+                    }
+                }
+            }
+        }
     }
 
     /// The library client `ident` holds here, if it holds one. A parameter or
@@ -2873,7 +3109,9 @@ impl Reader<'_> {
     ) {
         let name = ident.sym.as_ref();
         let redeclared = module.subclass_fields.get(name);
-        let fields = self.class_fields(class, module, redeclared);
+        let mut fields = self.class_fields(class, module, redeclared);
+        fields.query_builders =
+            class_query_builders(class, &fields, module.subclass_methods.get(name));
         let none = Captured::default();
         let key = |member: &str, is_static: bool| {
             let plain = format!("{name}.{member}");
@@ -3124,6 +3362,7 @@ impl Reader<'_> {
             values,
             receivers,
             fetches,
+            query_builders: HashSet::new(),
         }
     }
 
@@ -3134,13 +3373,14 @@ impl Reader<'_> {
         module: &ModuleScope,
         captured: &Captured,
     ) -> FnIr {
-        let params = function.params.iter().map(|p| pat_key(&p.pat)).collect();
         let mut fetches = captured.fetches.clone();
         for param in &function.params {
             fetch_bindings(&param.pat, module, &mut fetches);
         }
         let mut scope = Scope {
-            params,
+            params: Vec::new(),
+            keyed: HashMap::new(),
+            key_objects: HashSet::new(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
@@ -3150,6 +3390,11 @@ impl Reader<'_> {
             fields,
             module,
         };
+        scope.read_params(
+            function.params.iter().map(|param| &param.pat),
+            function,
+            module,
+        );
         let mut ir = FnIr {
             params: ParamDecl::all(
                 function.params.iter().map(|param| &param.pat),
@@ -3174,13 +3419,14 @@ impl Reader<'_> {
         module: &ModuleScope,
         captured: &Captured,
     ) -> FnIr {
-        let params = arrow.params.iter().map(pat_key).collect();
         let mut fetches = captured.fetches.clone();
         for param in &arrow.params {
             fetch_bindings(param, module, &mut fetches);
         }
         let mut scope = Scope {
-            params,
+            params: Vec::new(),
+            keyed: HashMap::new(),
+            key_objects: HashSet::new(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
@@ -3190,6 +3436,7 @@ impl Reader<'_> {
             fields,
             module,
         };
+        scope.read_params(&arrow.params, arrow, module);
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
@@ -3259,6 +3506,24 @@ impl Reader<'_> {
                             .map(|client| scope.module.with_uses(client, name))
                             .collect();
                         scope.let_makers.insert(ident_key(&ident.id), makers);
+                    }
+                    // `const { url } = options`: each name holds one key of
+                    // the parameter it is unpacked from (carrick#1950), where
+                    // the body declares the name once and never assigns it
+                    // again.
+                    if let (Pat::Object(object), Some(init)) = (&declarator.name, &declarator.init)
+                        && let Expr::Ident(source) =
+                            crate::graphql_document_sites::unwrap_expression(init)
+                        && scope.key_objects.contains(&ident_key(source))
+                        && let Some(index) = scope.param_index(source)
+                    {
+                        for (binding, key) in keyed_names(object) {
+                            if !reassigned.names.contains(&binding.0)
+                                && declared.binding_count(&binding) == 1
+                            {
+                                scope.keyed.insert(binding, (index, key));
+                            }
+                        }
                     }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
@@ -3345,6 +3610,26 @@ impl Reader<'_> {
                 if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) =>
             {
                 match self.eval(&bin.left, scope) {
+                    // A key of a parameter (carrick#1950): a caller that
+                    // writes no such key sends the fallback, which nothing
+                    // here reads, so the value is not a caller's to state.
+                    // It is the opaque value it was before keys were read,
+                    // under the name the function reads it by.
+                    Value::Str(pieces)
+                        if pieces
+                            .iter()
+                            .any(|piece| matches!(piece, Piece::ParamKey(..))) =>
+                    {
+                        Value::Str(
+                            pieces
+                                .into_iter()
+                                .map(|piece| match piece {
+                                    Piece::ParamKey(_, _, name) => Piece::Opaque(name),
+                                    other => other,
+                                })
+                                .collect(),
+                        )
+                    }
                     left @ Value::Str(_) => left,
                     _ => Value::opaque(self.text(bin.span)),
                 }
@@ -3358,6 +3643,14 @@ impl Reader<'_> {
                     return Value::Str(vec![Piece::Param(index, name.to_string())]);
                 }
                 let key = ident_key(ident);
+                // One key of an object parameter (carrick#1950).
+                if let Some((index, param_key)) = scope.keyed.get(&key) {
+                    return Value::Str(vec![Piece::ParamKey(
+                        *index,
+                        param_key.clone(),
+                        name.to_string(),
+                    )]);
+                }
                 if let Some(value) = scope
                     .locals
                     .get(&key)
@@ -3388,7 +3681,19 @@ impl Reader<'_> {
                 // `usersPath(id)`, `ENDPOINTS.users.byId(id)`: what the
                 // builder returns, with the call's arguments in its
                 // parameters (carrick#1562).
-                if let Some(value) = self.builder_call(call, scope) {
+                let built = self.builder_call(call, scope);
+                // `this.query(ref)`, `pageQuery(cursor)`: a query one of the
+                // class's or the module's own functions builds
+                // (carrick#1950). A builder's return that is all text the
+                // source writes is kept as that text, as it always was; any
+                // other is read here, since the builder rule has no way to
+                // say "nothing, or a query".
+                let all_written = matches!(&built, Some(Value::Str(pieces))
+                    if pieces.iter().all(|piece| matches!(piece, Piece::Lit(_))));
+                if !all_written && self.is_query_call(call, scope) {
+                    return Value::Str(vec![Piece::Query]);
+                }
+                if let Some(value) = built {
                     return value;
                 }
                 // `url.toString()` is the URL.
@@ -3454,6 +3759,15 @@ impl Reader<'_> {
                 return inner;
             }
         }
+        // `options.url` on the function's own parameter: the key of the
+        // object a caller writes there (carrick#1950).
+        if let Expr::Ident(object) = crate::graphql_document_sites::unwrap_expression(&member.obj)
+            && scope.key_objects.contains(&ident_key(object))
+            && let Some(index) = scope.param_index(object)
+            && let Some(key) = member_prop(member)
+        {
+            return Value::Str(vec![Piece::ParamKey(index, key, self.text(member.span))]);
+        }
         // A key of an object the source writes as a literal.
         if let Some(key) = member_prop(member)
             && let Value::Obj(obj) = self.eval(&member.obj, scope)
@@ -3462,6 +3776,30 @@ impl Reader<'_> {
             return value.clone();
         }
         Value::opaque(self.text(member.span))
+    }
+
+    /// Whether `call` is a call of a query builder the enclosing class or
+    /// the module declares ([`function_builds_query`], carrick#1950): `this.query(…)`
+    /// on a method of the class, or `pageQuery(…)` on a function the module
+    /// binds. Whatever it is handed, it yields nothing or a query.
+    ///
+    /// Only where it is declared: a builder another module exports is read
+    /// by nobody here, and one reached any other way (a parameter, a member
+    /// of some object) is not a binding whose body this can name.
+    fn is_query_call(&self, call: &CallExpr, scope: &Scope<'_>) -> bool {
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        match crate::graphql_document_sites::unwrap_expression(callee) {
+            Expr::Ident(ident) => scope.module.query_builders.contains(&ident_key(ident)),
+            Expr::Member(member) if matches!(&*member.obj, Expr::This(_)) => this_field(member)
+                .is_some_and(|name| {
+                    scope
+                        .fields
+                        .is_some_and(|fields| fields.query_builders.contains(&name))
+                }),
+            _ => false,
+        }
     }
 
     /// A call to a module-scope builder ([`ModuleScope::builders`]), read
@@ -3973,7 +4311,13 @@ fn bound(name: String, value: Value) -> Value {
         return value;
     }
     match pieces.as_slice() {
-        [Piece::Param(..)] => value,
+        [Piece::Param(..) | Piece::Query] => value,
+        // One key of a parameter (carrick#1950): still a caller's to fill
+        // in, and where no caller does, written by this binding's name, as
+        // the request writes it.
+        [Piece::ParamKey(index, key, _)] => {
+            Value::Str(vec![Piece::ParamKey(*index, key.clone(), name)])
+        }
         [Piece::Opaque(text)]
             if text.starts_with("new ")
                 || text.starts_with("process.env.")
@@ -3992,6 +4336,7 @@ fn body_of(value: &Value) -> BodyValue {
         Value::Obj(body) => BodyValue::Fields(body.clone()),
         Value::Str(pieces) => match pieces.as_slice() {
             [Piece::Param(index, _)] => BodyValue::Param(*index),
+            [Piece::ParamKey(index, key, _)] => BodyValue::ParamKey(*index, key.clone()),
             _ => BodyValue::Unstated,
         },
         Value::Callback(_) => BodyValue::Unstated,
@@ -4098,7 +4443,111 @@ fn method_of(pieces: &[Piece]) -> MethodValue {
     match pieces {
         [Piece::Lit(method)] if is_http_method(method) => MethodValue::Lit(method.to_uppercase()),
         [Piece::Param(index, _)] => MethodValue::Param(*index),
+        [Piece::ParamKey(index, key, _)] => MethodValue::ParamKey(*index, key.clone()),
         _ => MethodValue::Unknown,
+    }
+}
+
+/// The bindings an object pattern introduces that hold exactly one key of the
+/// object it unpacks, each with its key (carrick#1950): `{ url }` and
+/// `{ url: target }`. Not one with a default (`{ url = "/x" }`), which holds
+/// the default where the key is missing, nor a rest element, a computed key
+/// or a nested pattern.
+fn keyed_names(object: &ObjectPat) -> Vec<(BindingKey, String)> {
+    object
+        .props
+        .iter()
+        .filter_map(|prop| match prop {
+            ObjectPatProp::Assign(assign) if assign.value.is_none() => {
+                Some((ident_key(&assign.key.id), assign.key.id.sym.to_string()))
+            }
+            ObjectPatProp::KeyValue(kv) => match &*kv.value {
+                Pat::Ident(binding) => Some((ident_key(&binding.id), prop_name(&kv.key)?)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a call of `function` yields nothing or a query, whatever it is
+/// handed (carrick#1950): it is neither `async` nor a generator, its body
+/// ends in a `return`, and every `return` in it hands back the empty string
+/// or text that starts with a literal `?` ([`is_query_text`]).
+///
+/// Strict on purpose. A function with one other `return`, one whose value
+/// arrives through a promise, and one that can run off its end (and so
+/// return `undefined`) may put anything after the path, and is no builder.
+fn function_builds_query(function: &Function) -> bool {
+    !function.is_async
+        && !function.is_generator
+        && function
+            .body
+            .as_ref()
+            .is_some_and(|body| returns_only_queries(&body.stmts))
+}
+
+/// [`function_builds_query`] for an arrow, whose expression body is what it
+/// returns.
+fn arrow_builds_query(arrow: &ArrowExpr) -> bool {
+    !arrow.is_async
+        && !arrow.is_generator
+        && match &*arrow.body {
+            BlockStmtOrExpr::Expr(returned) => is_query_text(returned),
+            BlockStmtOrExpr::BlockStmt(block) => returns_only_queries(&block.stmts),
+        }
+}
+
+/// Whether a body's last statement is a `return` and every `return` it makes
+/// (a nested function's are its own) hands back a query or the empty string.
+fn returns_only_queries(stmts: &[Stmt]) -> bool {
+    struct Returns {
+        only_queries: bool,
+    }
+    impl Visit for Returns {
+        fn visit_return_stmt(&mut self, returned: &ReturnStmt) {
+            self.only_queries &= returned.arg.as_deref().is_some_and(is_query_text);
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+        fn visit_class(&mut self, _: &Class) {}
+        fn visit_getter_prop(&mut self, _: &GetterProp) {}
+        fn visit_setter_prop(&mut self, _: &SetterProp) {}
+    }
+    if !matches!(stmts.last(), Some(Stmt::Return(_))) {
+        return false;
+    }
+    let mut returns = Returns { only_queries: true };
+    stmts.visit_with(&mut returns);
+    returns.only_queries
+}
+
+/// Whether `expr` is the empty string, or text that starts with a literal `?`
+/// ([`starts_with_query`]), on every branch of a conditional.
+fn is_query_text(expr: &Expr) -> bool {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Lit(Lit::Str(text)) => text.value.is_empty() || starts_with_query(expr),
+        Expr::Tpl(tpl) => {
+            (tpl.exprs.is_empty() && tpl.quasis.iter().all(|quasi| quasi.raw.is_empty()))
+                || starts_with_query(expr)
+        }
+        Expr::Cond(cond) => is_query_text(&cond.cons) && is_query_text(&cond.alt),
+        _ => starts_with_query(expr),
+    }
+}
+
+/// Whether `expr` is text whose first character is a `?` the source writes:
+/// a string, a template, or a concatenation that one of them leads. The empty
+/// string leads nothing, so what follows it would.
+fn starts_with_query(expr: &Expr) -> bool {
+    match crate::graphql_document_sites::unwrap_expression(expr) {
+        Expr::Lit(Lit::Str(text)) => text.value.to_string().starts_with('?'),
+        Expr::Tpl(tpl) => tpl
+            .quasis
+            .first()
+            .is_some_and(|quasi| quasi.raw.starts_with('?')),
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => starts_with_query(&bin.left),
+        _ => false,
     }
 }
 
@@ -4522,7 +4971,7 @@ impl Effect {
             BodyValue::ParamKey(index, key) => (BTreeMap::new(), Some((*index, Some(key.clone())))),
             BodyValue::Unstated => (BTreeMap::new(), None),
         };
-        Effect {
+        let mut effect = Effect {
             site: RequestSite {
                 file: file.to_path_buf(),
                 line,
@@ -4535,6 +4984,41 @@ impl Effect {
             base: shape.base.clone(),
             base_scope: shape.base_scope.clone(),
             semantics: shape.semantics.clone(),
+        };
+        effect.settle_keys();
+        effect
+    }
+
+    /// A key of a parameter is a caller's to fill in only where the request
+    /// states no route without it (carrick#1950).
+    ///
+    /// Where the URL states a route with every key read as the name the
+    /// function reads it by (a base before a literal path, a whole path
+    /// segment), the request is stated as it was before a key could be filled
+    /// in: at its own line, with the key an opaque value under that name. So
+    /// reading keys only adds rows, at callers of a wrapper that stated none.
+    fn settle_keys(&mut self) {
+        let keyed = |pieces: &[Piece]| {
+            pieces
+                .iter()
+                .any(|piece| matches!(piece, Piece::ParamKey(..)))
+        };
+        if !keyed(&self.url) && !keyed(&self.base) {
+            return;
+        }
+        let as_written = |pieces: &[Piece]| -> Vec<Piece> {
+            pieces
+                .iter()
+                .map(|piece| match piece {
+                    Piece::ParamKey(_, _, name) => Piece::Opaque(name.clone()),
+                    other => other.clone(),
+                })
+                .collect()
+        };
+        let (url, base) = (as_written(&self.url), as_written(&self.base));
+        if render_target(&join_base(&base, &url)).is_some() {
+            self.url = url;
+            self.base = base;
         }
     }
 
@@ -4547,16 +5031,25 @@ impl Effect {
         matches!(
             self.method,
             MethodValue::Param(_) | MethodValue::ParamKey(..)
-        ) || self.url.iter().enumerate().any(|(position, piece)| {
-            matches!(piece, Piece::Param(..)) && !is_whole_segment(&self.url, position)
-        }) || self
-            .base
+        ) || self
+            .url
             .iter()
-            .any(|piece| matches!(piece, Piece::Param(..)))
+            .enumerate()
+            .any(|(position, piece)| piece.is_parameter() && !is_whole_segment(&self.url, position))
+            || self.base.iter().any(Piece::is_parameter)
     }
 
     /// This effect as seen from a call passing `args`.
     fn instantiate(&self, args: &[Value]) -> Effect {
+        // What the caller wrote where the callee reads `name`, at `position`
+        // of the URL. An opaque value standing for a path segment is a path
+        // parameter, and keeps the name the callee gives it. Leading the URL
+        // it is the base, and the caller's own expression is what says where
+        // the request goes.
+        let written = |arg: &[Piece], position: usize, name: &str| match arg {
+            [Piece::Opaque(_)] if position > 0 => vec![Piece::Opaque(name.to_string())],
+            _ => arg.to_vec(),
+        };
         let fill = |pieces: &[Piece]| -> Vec<Piece> {
             concat(
                 pieces
@@ -4566,22 +5059,34 @@ impl Effect {
                         // A path parameter stays one, under the callee's own
                         // name: the caller's argument is its value, not the
                         // route's.
-                        Piece::Param(_, name) if is_whole_segment(pieces, position) => {
+                        Piece::Param(_, name) | Piece::ParamKey(_, _, name)
+                            if is_whole_segment(pieces, position) =>
+                        {
                             vec![Piece::Opaque(name.clone())]
                         }
                         Piece::Param(index, name) => match args.get(*index) {
-                            Some(Value::Str(arg)) => match arg.as_slice() {
-                                // An opaque value standing for a path segment is a
-                                // path parameter, and keeps the name the callee gives
-                                // it. Leading the URL it is the base, and the caller's
-                                // own expression is what says where the request goes.
-                                [Piece::Opaque(_)] if position > 0 => {
-                                    vec![Piece::Opaque(name.clone())]
-                                }
-                                _ => arg.clone(),
-                            },
+                            Some(Value::Str(arg)) => written(arg, position, name),
                             Some(other) => other.pieces(),
                             None => vec![Piece::Unknown],
+                        },
+                        // A key of the object the caller writes there
+                        // (carrick#1950). A key the object does not state (a
+                        // spread or a computed key may hold it, or nothing
+                        // does) and one holding anything but text say
+                        // nothing. A caller that passes its own parameter on
+                        // leaves the key to its own caller.
+                        Piece::ParamKey(index, key, name) => match args.get(*index) {
+                            Some(Value::Obj(object)) => match object.fields.get(key) {
+                                Some(Value::Str(arg)) => written(arg, position, name),
+                                _ => vec![Piece::Unknown],
+                            },
+                            Some(Value::Str(arg)) => match arg.as_slice() {
+                                [Piece::Param(outer, _)] => {
+                                    vec![Piece::ParamKey(*outer, key.clone(), name.clone())]
+                                }
+                                _ => vec![Piece::Unknown],
+                            },
+                            _ => vec![Piece::Unknown],
                         },
                         other => vec![other.clone()],
                     }),
@@ -4634,7 +5139,7 @@ impl Effect {
                 None,
             ),
         };
-        Effect {
+        let mut instantiated = Effect {
             site: self.site.clone(),
             method,
             url: fill(&self.url),
@@ -4644,7 +5149,11 @@ impl Effect {
             base: fill(&self.base),
             base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
-        }
+        };
+        // A key of the caller's own parameter may have arrived in what it
+        // wrote (`get(`${options.base}/users`)`).
+        instantiated.settle_keys();
+        instantiated
     }
 
     /// This effect as a call at `site` in `file` sends it. Where the call
@@ -5431,7 +5940,7 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
         Some(scope) if scope != file => effect.base.iter().all(|piece| match piece {
             Piece::Lit(_) => true,
             Piece::Opaque(text) => reads_the_environment(text),
-            Piece::Param(..) | Piece::Unknown => false,
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::Query | Piece::Unknown => false,
         }),
         _ => true,
     }
@@ -5679,10 +6188,11 @@ fn join_base(base: &[Piece], path: &[Piece]) -> Vec<Piece> {
     if base.is_empty() {
         return path.to_vec();
     }
-    if base
-        .iter()
-        .any(|piece| matches!(piece, Piece::Lit(text) if text.contains(['?', '#'])))
-    {
+    if base.iter().any(|piece| match piece {
+        Piece::Lit(text) => text.contains(['?', '#']),
+        Piece::Query => true,
+        _ => false,
+    }) {
         return vec![Piece::Unknown];
     }
     let Some(Piece::Lit(first)) = path.first() else {
@@ -5723,11 +6233,15 @@ fn is_absolute_url(text: &str) -> bool {
 ///
 /// `None` unless the URL states a route: an optional opaque base, then a path
 /// starting with `/` that holds at least one literal segment, where every
-/// other opaque value stands for a whole segment.
+/// other opaque value stands for a whole segment. A query one of the
+/// service's own functions builds may end it (carrick#1950), and is not
+/// written: it may be nothing, and it is no part of the route.
 fn render_target(url: &[Piece]) -> Option<String> {
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
-        Piece::Param(..) => !is_whole_segment(url, position),
+        Piece::Param(..) | Piece::ParamKey(..) => !is_whole_segment(url, position),
+        // Text after a query that may be empty would continue the path.
+        Piece::Query => position + 1 != url.len(),
         _ => false,
     }) {
         return None;
@@ -5751,12 +6265,13 @@ fn render_target(url: &[Piece]) -> Option<String> {
                 literal_segment |= route.split('/').any(|segment| !segment.is_empty());
                 rendered.push_str(text);
             }
-            Piece::Opaque(name) | Piece::Param(_, name) => {
+            Piece::Opaque(name) | Piece::Param(_, name) | Piece::ParamKey(_, _, name) => {
                 if !is_whole_segment(path, position) {
                     return None;
                 }
                 rendered.push_str(&format!("${{{name}}}"));
             }
+            Piece::Query => {}
             Piece::Unknown => return None,
         }
     }
@@ -5770,13 +6285,13 @@ fn render_target(url: &[Piece]) -> Option<String> {
 }
 
 /// Whether the piece at `position` stands for a whole path segment: it
-/// follows a literal ending in `/`, and ends at the next `/`, `?`, `#` or the
-/// end of the URL.
+/// follows a literal ending in `/`, and ends at the next `/`, `?`, `#`, a
+/// built query ([`Piece::Query`]) or the end of the URL.
 fn is_whole_segment(url: &[Piece], position: usize) -> bool {
     let after_slash = position > 0
         && matches!(url.get(position - 1), Some(Piece::Lit(prev)) if prev.ends_with('/'));
     let segment_ends = match url.get(position + 1) {
-        None => true,
+        None | Some(Piece::Query) => true,
         Some(Piece::Lit(next)) => next.starts_with(['/', '?', '#']),
         Some(_) => false,
     };
@@ -5842,6 +6357,269 @@ mod tests {
         assert_eq!(
             render_target(&[lit("/users/"), Piece::Param(0, "id".to_string())]).as_deref(),
             Some("/users/${id}")
+        );
+    }
+
+    fn keyed(index: usize, key: &str) -> Piece {
+        Piece::ParamKey(index, key.to_string(), key.to_string())
+    }
+
+    /// A request whose URL is `url`, sent with `POST`.
+    fn effect(url: Vec<Piece>) -> Effect {
+        Effect {
+            site: RequestSite {
+                file: PathBuf::from("src/client.ts"),
+                line: 1,
+            },
+            method: MethodValue::Lit("POST".to_string()),
+            url,
+            body: BTreeMap::new(),
+            body_param: None,
+            verb: false,
+            base: Vec::new(),
+            base_scope: None,
+            semantics: BTreeSet::new(),
+        }
+    }
+
+    fn object(fields: &[(&str, Vec<Piece>)], open: bool) -> Value {
+        Value::Obj(ObjValue {
+            fields: fields
+                .iter()
+                .map(|(key, pieces)| (key.to_string(), Value::Str(pieces.clone())))
+                .collect(),
+            open,
+        })
+    }
+
+    /// carrick#1950: a built query ends the path, and the target leaves it
+    /// out.
+    #[test]
+    fn a_built_query_ends_the_path_and_is_left_out_of_the_target() {
+        assert_eq!(
+            render_target(&[
+                opaque("this.base"),
+                lit("/sessions/open/"),
+                Piece::Param(0, "kind".to_string()),
+                Piece::Query,
+            ])
+            .as_deref(),
+            Some("${this.base}/sessions/open/${kind}")
+        );
+        assert_eq!(
+            render_target(&[lit("/sessions"), Piece::Query]).as_deref(),
+            Some("/sessions")
+        );
+        // Text after a query that may be empty would continue the path.
+        assert_eq!(
+            render_target(&[lit("/sessions/"), opaque("id"), Piece::Query, lit("/tail")]),
+            None
+        );
+        // A query is no route, and no base.
+        assert_eq!(render_target(&[opaque("base"), Piece::Query]), None);
+        assert_eq!(render_target(&[Piece::Query, lit("/sessions")]), None);
+        assert_eq!(
+            join_base(&[lit("/api"), Piece::Query], &[lit("/sessions")]),
+            vec![Piece::Unknown]
+        );
+    }
+
+    /// carrick#1950: a key of a parameter waits on a caller only where the
+    /// request states no route without it.
+    #[test]
+    fn a_key_waits_on_a_caller_only_where_the_url_states_no_route_without_it() {
+        // The whole URL, or a path glued after a base: no route as written.
+        for url in [
+            vec![keyed(0, "url")],
+            vec![opaque("process.env.API"), keyed(0, "path")],
+            vec![keyed(0, "base"), keyed(0, "path")],
+        ] {
+            let mut waiting = effect(url.clone());
+            waiting.settle_keys();
+            assert_eq!(waiting.url, url);
+            assert!(waiting.has_params(), "{url:?}");
+            assert_eq!(render_target(&waiting.url), None, "{url:?}");
+        }
+
+        // A base before a literal path, and a whole path segment: the route
+        // is stated as it was before a key could be filled in, with the key
+        // an opaque value under the name the function reads it by.
+        let mut based = effect(vec![keyed(0, "base"), lit("/users/"), keyed(0, "id")]);
+        based.settle_keys();
+        assert_eq!(
+            based.url,
+            vec![opaque("base"), lit("/users/"), opaque("id")]
+        );
+        assert!(!based.has_params());
+        assert_eq!(
+            render_target(&based.url).as_deref(),
+            Some("${base}/users/${id}")
+        );
+
+        // A positional parameter still leaves the request open, and the key
+        // beside it is filled in with it.
+        let mut mixed = effect(vec![
+            Piece::Param(0, "base".to_string()),
+            lit("/users/"),
+            keyed(1, "id"),
+        ]);
+        mixed.settle_keys();
+        assert!(mixed.has_params());
+        assert_eq!(mixed.url[2], keyed(1, "id"));
+    }
+
+    /// carrick#1950: the object a caller writes fills the key in, and
+    /// anything the object does not state says nothing.
+    #[test]
+    fn a_key_is_filled_only_from_what_the_callers_object_states() {
+        let wrapper = effect(vec![keyed(0, "url")]);
+        let route = vec![opaque("process.env.API"), lit("/users")];
+
+        // The key, written.
+        let filled = wrapper.instantiate(&[object(&[("url", route.clone())], false)]);
+        assert_eq!(filled.url, route);
+        assert!(!filled.has_params());
+        // Written after a spread: an open object still states the key.
+        let after_spread = wrapper.instantiate(&[object(&[("url", route.clone())], true)]);
+        assert_eq!(after_spread.url, route);
+
+        // Missing, or overwritten by a spread or a computed key (which empty
+        // the object's known keys).
+        for args in [
+            vec![object(&[("body", vec![lit("x")])], false)],
+            vec![object(&[], true)],
+            // Not an object at all.
+            vec![Value::Str(vec![lit("/users")])],
+            vec![Value::Str(vec![opaque("request")])],
+            // No argument.
+            vec![],
+        ] {
+            assert_eq!(
+                wrapper.instantiate(&args).url,
+                vec![Piece::Unknown],
+                "{args:?}"
+            );
+        }
+        // A key that holds an object, not text.
+        let nested = Value::Obj(ObjValue {
+            fields: BTreeMap::from([("url".to_string(), object(&[], false))]),
+            open: false,
+        });
+        assert_eq!(wrapper.instantiate(&[nested]).url, vec![Piece::Unknown]);
+    }
+
+    /// carrick#1950: a caller that passes its own parameter on leaves the key
+    /// to its own caller, and the site that writes the object states the row.
+    #[test]
+    fn a_key_passed_on_stays_open_for_the_next_caller() {
+        let wrapper = effect(vec![keyed(0, "url")]);
+        let passed_on =
+            wrapper.instantiate(&[Value::Str(vec![Piece::Param(1, "options".to_string())])]);
+        assert_eq!(
+            passed_on.url,
+            vec![Piece::ParamKey(1, "url".to_string(), "url".to_string())]
+        );
+        assert!(passed_on.has_params());
+        let route = vec![lit("/users")];
+        let filled = passed_on.instantiate(&[
+            Value::Str(vec![lit("first")]),
+            object(&[("url", route.clone())], false),
+        ]);
+        assert_eq!(filled.url, route);
+    }
+
+    /// The functions of `source` that [`module_query_builders`] reads as
+    /// query builders, by name, sorted.
+    fn query_builders_in(source: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("input.ts");
+        std::fs::write(&path, source).expect("write file");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = swc_common::errors::Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            true,
+            false,
+            Some(cm.clone()),
+        );
+        let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
+        let mut reassigned = Reassigned::default();
+        module.visit_with(&mut reassigned);
+        let mut names: Vec<String> = module_query_builders(&module, &reassigned)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// carrick#1950: a query builder is a function whose every `return` is
+    /// the empty string or text that starts with a literal `?`.
+    #[test]
+    fn a_function_whose_every_return_is_a_query_or_nothing_builds_a_query() {
+        assert_eq!(
+            query_builders_in(
+                "function conditional(c?: string) { return c ? `?c=${c}` : \"\"; }\n\
+                 function early(c?: string) { if (!c) { return \"\"; } return \"?c=\" + c; }\n\
+                 function joined(parts: string[]) {\n\
+                   return parts.length === 0 ? '' : '?' + parts.join('&');\n\
+                 }\n\
+                 const arrow = (c?: string) => (c ? `?c=${c}` : ``);\n\
+                 const block = (c: string) => { return `?c=${c}`; };\n\
+                 export function exported(c: string) { return (`?c=${c}` as string); }\n",
+            ),
+            [
+                "arrow",
+                "block",
+                "conditional",
+                "early",
+                "exported",
+                "joined"
+            ]
+        );
+    }
+
+    /// carrick#1950: one `return` that is anything else, a value that
+    /// arrives through a promise, and a body that can end without returning
+    /// are each no query builder.
+    #[test]
+    fn a_function_that_may_return_anything_else_builds_no_query() {
+        assert_eq!(
+            query_builders_in(
+                "function path(c?: string) { return c ? `/${c}` : \"\"; }\n\
+                 function held(c: string) { const q = `?c=${c}`; return q; }\n\
+                 function oneOther(c?: string) { if (!c) { return c; } return `?c=${c}`; }\n\
+                 function emptyFirst(c: string) { return \"\" + c; }\n\
+                 function fallsOff(c?: string) { if (c) { return `?c=${c}`; } }\n\
+                 function bare(c?: string) { if (!c) { return; } return `?c=${c}`; }\n\
+                 function recursive(c: string[]) {\n\
+                   if (c.length > 1) { return recursive(c.slice(1)); }\n\
+                   return `?c=${c[0]}`;\n\
+                 }\n\
+                 function called(c: string) { return encode(`?c=${c}`); }\n\
+                 async function promised(c: string) { return `?c=${c}`; }\n\
+                 function* generated(c: string) { return `?c=${c}`; }\n\
+                 const promisedArrow = async (c: string) => `?c=${c}`;\n\
+                 let rebound = (c: string) => `?c=${c}`;\n\
+                 function replaced(c: string) { return `?c=${c}`; }\n\
+                 replaced = path;\n\
+                 function fragment(c: string) { return `#${c}`; }\n",
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// carrick#1950: a nested function's `return` is its own, so it neither
+    /// makes nor breaks the function it is written in.
+    #[test]
+    fn a_nested_functions_return_is_not_the_builders() {
+        assert_eq!(
+            query_builders_in(
+                "function outer(parts: string[]) {\n\
+                   const shown = parts.map((part) => { return part.trim(); });\n\
+                   return shown.length === 0 ? \"\" : \"?\" + shown.join(\"&\");\n\
+                 }\n",
+            ),
+            ["outer"]
         );
     }
 
