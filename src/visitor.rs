@@ -6,7 +6,7 @@ use crate::receiver_type::{
     ReceiverTypes, annotated_type_ident, class_field_types, constructed_type_ident,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 use swc_common::{SourceMapper, Spanned};
@@ -61,7 +61,10 @@ pub enum Json {
     Number(f64),
     String(String),
     Array(Vec<Json>),
-    Object(HashMap<String, Json>),
+    /// Sorted, because a row's `request_body` and `response_body` are written
+    /// into the index blob, which must hold the same bytes on every scan of
+    /// one tree (carrick#1847).
+    Object(BTreeMap<String, Json>),
 }
 
 /// The definition key a file's own module scope is indexed under

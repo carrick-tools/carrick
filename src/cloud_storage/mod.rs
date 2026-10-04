@@ -566,6 +566,40 @@ impl ScannerBuild {
     }
 }
 
+/// Writes a hash map with its keys sorted (carrick#1847).
+///
+/// Whatever stores the blob compares it byte for byte, and a `HashMap` writes
+/// its entries in an order that differs with every process and every map, so
+/// two scans of one tree uploaded different bytes for the same index. The
+/// three maps this is used on stay `HashMap`s in memory, because the passes
+/// that fill them share the type; only what is written is ordered. The wire
+/// shape does not move: the same object, with the same keys and values.
+mod sorted_keys {
+    use serde::{Serialize, Serializer};
+    use std::collections::{BTreeMap, HashMap};
+
+    pub fn map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        serializer.collect_map(map.iter().collect::<BTreeMap<_, _>>())
+    }
+
+    pub fn optional_map<S, V>(
+        map: &Option<HashMap<String, V>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        V: Serialize,
+    {
+        map.as_ref()
+            .map(|map| map.iter().collect::<BTreeMap<_, _>>())
+            .serialize(serializer)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -574,8 +608,10 @@ pub struct CloudRepoData {
     pub endpoints: Vec<ApiEndpointDetails>,
     pub calls: Vec<ApiEndpointDetails>,
     pub mounts: Vec<Mount>,
+    #[serde(serialize_with = "sorted_keys::map")]
     pub apps: HashMap<String, AppContext>,
     pub imported_handlers: Vec<(String, String, String, String)>,
+    #[serde(serialize_with = "sorted_keys::map")]
     pub function_definitions: HashMap<String, FunctionDefinition>,
     pub config_json: Option<String>,
     pub package_json: Option<String>,
@@ -604,7 +640,10 @@ pub struct CloudRepoData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_manifest: Option<Vec<TypeManifestEntry>>,
     /// Cached per-file LLM analysis results for incremental re-analysis
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "sorted_keys::optional_map"
+    )]
     pub file_results: Option<HashMap<String, FileAnalysisResult>>,
     /// Cached framework detection result
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1811,6 +1850,124 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(data.scanner_build, ScannerBuild::current());
+    }
+
+    /// carrick#1847: every map in the blob is written with its keys sorted, so
+    /// one index is one sequence of bytes whatever order its maps were filled
+    /// in. Forty entries a map: two hash maps of that size do not share an
+    /// order by chance.
+    ///
+    /// The shape on the wire is what it was: each map is still a JSON object
+    /// keyed by the same strings, and the blob reads back and writes the same
+    /// bytes again.
+    #[test]
+    fn a_blob_serializes_identically_whatever_order_its_maps_were_filled_in() {
+        use crate::mount_graph::{GraphNode, NodeType};
+        use crate::visitor::Json;
+
+        let blob = |names: &[String]| {
+            let mut data = empty_repo("org/api", Some("api"));
+            data.last_updated = DateTime::UNIX_EPOCH;
+            data.apps = names
+                .iter()
+                .map(|name| (name.clone(), AppContext { name: name.clone() }))
+                .collect();
+            data.function_definitions = names
+                .iter()
+                .map(|name| {
+                    let definition = serde_json::json!({
+                        "name": name,
+                        "file_path": format!("src/{name}.ts"),
+                        "node_type": "Placeholder",
+                        "arguments": [],
+                    });
+                    (name.clone(), serde_json::from_value(definition).unwrap())
+                })
+                .collect();
+            data.file_results = Some(
+                names
+                    .iter()
+                    .map(|name| (format!("src/{name}.ts"), FileAnalysisResult::default()))
+                    .collect(),
+            );
+            let mut graph = MountGraph::new();
+            graph.nodes = names
+                .iter()
+                .map(|name| {
+                    let node = GraphNode {
+                        name: name.clone(),
+                        node_type: NodeType::Mountable,
+                        creation_site: None,
+                        file_location: format!("src/{name}.ts:1"),
+                    };
+                    (name.clone(), node)
+                })
+                .collect();
+            let fields = || {
+                Json::Object(
+                    names
+                        .iter()
+                        .map(|name| (name.clone(), Json::Null))
+                        .collect(),
+                )
+            };
+            data.endpoints = vec![ApiEndpointDetails {
+                owner: None,
+                key: OperationKey::http("POST", "/orders".to_string()),
+                params: vec![],
+                request_body: Some(fields()),
+                response_body: Some(fields()),
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("src/orders.ts:1"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: None,
+                view_module: false,
+                dispatch: None,
+                schema_binding: None,
+                handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
+            }];
+            data.mount_graph = Some(graph);
+            data
+        };
+
+        let names: Vec<String> = (0..40).map(|n| format!("entry{n:02}")).collect();
+        let reversed: Vec<String> = names.iter().rev().cloned().collect();
+        let forward = serde_json::to_string(&blob(&names)).unwrap();
+        let backward = serde_json::to_string(&blob(&reversed)).unwrap();
+        assert_eq!(
+            forward, backward,
+            "one index filled in two orders must be written as the same bytes"
+        );
+
+        let wire: serde_json::Value = serde_json::from_str(&forward).unwrap();
+        for map in [
+            &wire["apps"],
+            &wire["function_definitions"],
+            &wire["file_results"],
+            &wire["mount_graph"]["nodes"],
+            &wire["endpoints"][0]["request_body"]["Object"],
+            &wire["endpoints"][0]["response_body"]["Object"],
+        ] {
+            let object = map.as_object().expect("each map is a JSON object");
+            assert_eq!(object.len(), 40, "every entry is written: {map}");
+        }
+        assert_eq!(wire["apps"]["entry07"]["name"], "entry07");
+        assert_eq!(wire["function_definitions"]["entry07"]["name"], "entry07");
+        assert!(wire["file_results"]["src/entry07.ts"]["endpoints"].is_array());
+        assert_eq!(wire["mount_graph"]["nodes"]["entry07"]["name"], "entry07");
+
+        let back: CloudRepoData = serde_json::from_str(&forward).expect("the blob reads back");
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            forward,
+            "a blob read back and written again is the same bytes"
+        );
     }
 
     /// The build stamp (carrick#1739) rides the wire as its own nested object

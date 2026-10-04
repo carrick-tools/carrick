@@ -1,6 +1,6 @@
 use crate::url_normalizer::UrlNormalizer;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// Represents a node in the mount graph (router or app)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -337,7 +337,9 @@ pub struct DataFetchingCall {
 /// The complete mount and endpoint graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountGraph {
-    pub nodes: HashMap<String, GraphNode>,
+    /// Sorted, because the graph is written into the index blob, which must
+    /// hold the same bytes on every scan of one tree (carrick#1847).
+    pub nodes: BTreeMap<String, GraphNode>,
     pub mounts: Vec<MountEdge>,
     pub endpoints: Vec<ResolvedEndpoint>,
     pub data_calls: Vec<DataFetchingCall>,
@@ -346,7 +348,7 @@ pub struct MountGraph {
 impl MountGraph {
     pub fn new() -> Self {
         Self {
-            nodes: HashMap::new(),
+            nodes: BTreeMap::new(),
             mounts: Vec::new(),
             endpoints: Vec::new(),
             data_calls: Vec::new(),
@@ -484,7 +486,7 @@ impl MountGraph {
     }
 
     /// Get all nodes in the graph
-    pub fn get_nodes(&self) -> &HashMap<String, GraphNode> {
+    pub fn get_nodes(&self) -> &BTreeMap<String, GraphNode> {
         &self.nodes
     }
 

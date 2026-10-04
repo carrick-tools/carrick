@@ -1,5 +1,5 @@
 use crate::visitor::Json;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use swc_ecma_ast::*;
 
 pub trait CoreExtractor {
@@ -189,7 +189,7 @@ pub trait CoreExtractor {
 
             // Handle objects
             Expr::Object(obj) => {
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
 
                 for prop in &obj.props {
                     if let PropOrSpread::Prop(boxed_prop) = prop
@@ -260,7 +260,7 @@ pub trait CoreExtractor {
 
                 // Extract fields from destructuring pattern
                 if let Pat::Object(obj_pat) = &decl.name {
-                    let mut fields = HashMap::new();
+                    let mut fields = BTreeMap::new();
 
                     for prop in &obj_pat.props {
                         if let ObjectPatProp::Assign(assign_prop) = prop {
@@ -296,7 +296,7 @@ pub trait CoreExtractor {
             // Found req.body.something
             if let MemberProp::Ident(field_prop) = &member.prop {
                 let field_name = field_prop.sym.to_string();
-                let mut fields = HashMap::new();
+                let mut fields = BTreeMap::new();
                 fields.insert(field_name, Json::Null);
                 return Some(Json::Object(fields));
             }
