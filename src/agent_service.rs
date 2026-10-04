@@ -11,8 +11,10 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 
+mod capabilities;
 mod limiter;
 mod refusals;
+use capabilities::CloudCapabilities;
 use limiter::{RatePacer, RouteLimits};
 use refusals::RouteRefusals;
 
@@ -188,7 +190,16 @@ fn call_error_from_envelope(err: AgentError) -> AgentCallError {
         code,
         message: err.message,
         retriable: err.retriable,
+        cloud_stated: true,
+        details: err.details,
     }
+}
+
+/// One key of an error envelope's `details`, when `details` is an object that
+/// holds it. `details` has no fixed shape, so every read of it goes through
+/// here and an absent or oddly shaped one reads as nothing.
+fn detail<'a>(details: &'a Option<serde_json::Value>, key: &str) -> Option<&'a serde_json::Value> {
+    details.as_ref()?.get(key)
 }
 
 /// A failed lambda call, carrying the cloud's own transient/permanent verdict
@@ -209,6 +220,15 @@ pub struct AgentCallError {
     pub message: String,
     /// Whether the failure class is transient. See the type doc.
     pub retriable: bool,
+    /// Whether `retriable` is the cloud's own word, read off an error
+    /// envelope, and not the scanner's reading of a failure that produced
+    /// none. See [`Self::is_final_answer`].
+    pub cloud_stated: bool,
+    /// The envelope's `error.details`, as the JSON value it arrived as
+    /// (carrick#1897). `None` when the cloud sent none and for every failure
+    /// that never produced an envelope. It has no fixed shape: read it through
+    /// [`Self::detail`], or through the accessor of the one field wanted.
+    pub details: Option<serde_json::Value>,
 }
 
 impl AgentCallError {
@@ -218,6 +238,8 @@ impl AgentCallError {
             code: code.to_string(),
             message,
             retriable: false,
+            cloud_stated: false,
+            details: None,
         }
     }
 
@@ -227,7 +249,40 @@ impl AgentCallError {
             code: code.to_string(),
             message,
             retriable: true,
+            cloud_stated: false,
+            details: None,
         }
+    }
+
+    /// The error an envelope with this code, sentence and verdict makes of a
+    /// call, for a test that needs one and has no envelope to parse.
+    #[cfg(test)]
+    pub(crate) fn from_cloud(code: &str, message: &str, retriable: bool) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            retriable,
+            cloud_stated: true,
+            details: None,
+        }
+    }
+
+    /// One key of `details`, when the cloud sent an object that holds it.
+    pub fn detail(&self, key: &str) -> Option<&serde_json::Value> {
+        detail(&self.details, key)
+    }
+
+    /// `details.max_part_candidates`: the most candidates one part of a file
+    /// may hold when the file is asked again in parts. The cloud sends it on
+    /// an answer cut at its output ceiling (`output_truncated`, carrick#1898).
+    ///
+    /// Parsed here and nowhere else. Absent, zero, negative, a fraction or
+    /// not a number at all reads as `None`, and the caller keeps its own
+    /// constant.
+    #[allow(dead_code)] // Its reader is the file orchestrator's split (carrick#1898), not yet built.
+    pub fn max_part_candidates(&self) -> Option<usize> {
+        let stated = self.detail("max_part_candidates")?.as_u64()?;
+        usize::try_from(stated).ok().filter(|count| *count > 0)
     }
 
     /// Whether the model was deliberately not asked, rather than asked and
@@ -241,6 +296,21 @@ impl AgentCallError {
     /// ([`CAPACITY_REFUSAL_CODE`]).
     pub fn is_capacity_refusal(&self) -> bool {
         self.code == CAPACITY_REFUSAL_CODE
+    }
+
+    /// Whether the cloud answered that this request cannot succeed: an error
+    /// envelope with `retriable: false` (carrick#1897). The same request gets
+    /// the same answer, so the run does not send it again and does not tell
+    /// anyone that running again would finish it. `output_truncated` is the
+    /// one a file meets today, and the rule reads the flag, never the code.
+    ///
+    /// Two things with `retriable: false` are not this. A limit of the cloud's
+    /// ([`Self::is_budget_refusal`]) is about the account and is handled as a
+    /// refusal. A failure the scanner classified itself (a rejected
+    /// credential, a body that is no envelope) is nothing the cloud said about
+    /// the request, and stays owed as it was.
+    pub fn is_final_answer(&self) -> bool {
+        self.cloud_stated && !self.retriable && !self.is_budget_refusal()
     }
 }
 
@@ -402,6 +472,13 @@ impl RetryPolicy {
         !self.refusal_budget.is_zero() && route.fits(next, self.refusal_budget)
     }
 
+    /// Whether a last attempt the gateway cut is followed by a collecting
+    /// request ([`COLLECT_HEADER`]). Not for a call that is one request and
+    /// no other ([`Self::ONCE`]).
+    fn collects_after_cut(&self) -> bool {
+        self.max_attempts > 1
+    }
+
     /// Sleep before the next attempt, charged to the run's budget when the
     /// policy draws on it.
     async fn sleep(&self, duration: Duration) {
@@ -473,6 +550,27 @@ const ATTEMPT_HEADER: &str = "X-Carrick-Attempt";
 /// what makes a monorepo's model spend attributable to one tree. See
 /// [`crate::current_service`] for when it is present.
 const SERVICE_HEADER: &str = "X-Carrick-Service";
+
+/// The request header that makes a request a collecting one (carrick#1897):
+/// the route, body and headers of the call's last attempt, answered only from
+/// what an earlier request for that body left behind and never by a model
+/// call of its own.
+///
+/// The gateway cuts a caller at 30 s while the lambda behind it runs on, so
+/// when a call's last attempt was cut, its answer, or the cloud's verdict
+/// that every try at it was incomplete, lands after the scanner has stopped
+/// asking. One collecting request fetches it. The cloud's answers to it, and
+/// what each means for the call, are on [`AgentService::collect_after_cut`].
+///
+/// Sent only to a route that has stated the `collect` capability in this run
+/// (`capabilities.rs`): a cloud that does not read this header would run the
+/// request as an ordinary one.
+const COLLECT_HEADER: &str = "X-Carrick-Collect";
+
+/// The one route a collecting request is sent to. Its lambda is the one that
+/// holds a lease on a request in flight and keeps its answer, so it is the
+/// one with something a later request could collect.
+const COLLECT_ROUTE: &str = "/analyze-file";
 
 /// A `Retry-After` value in delta-seconds, the only form the cloud sends. The
 /// HTTP-date form and anything unparseable read as no hint, which leaves the
@@ -653,11 +751,24 @@ fn global_refusals() -> Arc<RouteRefusals> {
         .clone()
 }
 
-/// Start every route's refusal budget from nothing. The engine calls it as a
-/// run opens, beside [`crate::retry_budget::reset`]; tests run several scans
-/// in one process.
-pub fn reset_refusal_budgets() {
+/// What the cloud has stated it can do, as this run has heard it
+/// (carrick#1897; see `capabilities.rs`). Process-global for the same reason
+/// as the limits: the cloud that stated it is the same cloud, whichever
+/// `AgentService` asks.
+fn global_capabilities() -> Arc<CloudCapabilities> {
+    static CAPABILITIES: OnceLock<Arc<CloudCapabilities>> = OnceLock::new();
+    CAPABILITIES
+        .get_or_init(|| Arc::new(CloudCapabilities::new()))
+        .clone()
+}
+
+/// Start what this module keeps for one run from nothing: every route's
+/// refusal budget, and what the cloud has stated it can do. The engine calls
+/// it as a run opens, beside [`crate::retry_budget::reset`]; tests run
+/// several scans in one process.
+pub fn reset_for_run() {
     global_refusals().reset();
+    global_capabilities().reset();
 }
 
 /// Whether a retriable error ENVELOPE says the route's model is out of
@@ -707,6 +818,7 @@ pub struct AgentService {
     limits: Arc<RouteLimits>,
     pacer: Arc<RatePacer>,
     refusals: Arc<RouteRefusals>,
+    capabilities: Arc<CloudCapabilities>,
     retry: RetryPolicy,
     /// Answers every request in place of the cloud.
     #[cfg(test)]
@@ -731,6 +843,7 @@ impl AgentService {
             limits: global_route_limits(),
             pacer: global_pacer(),
             refusals: global_refusals(),
+            capabilities: global_capabilities(),
             retry: RetryPolicy::STANDARD,
             #[cfg(test)]
             script: None,
@@ -931,13 +1044,7 @@ impl AgentService {
             // credential is long-lived and unchanged between attempts, but it
             // is read the same way so the two branches differ only in the
             // header they set.
-            let token = match auth {
-                RequestAuth::Oidc(provider) => provider
-                    .token()
-                    .await
-                    .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?,
-                RequestAuth::Bearer(token) => token.clone(),
-            };
+            let token = auth.token().await?;
 
             // One slot per HTTP attempt, not per call (carrick#1077). The
             // permit covers the send and the body read, and is dropped before
@@ -945,68 +1052,9 @@ impl AgentService {
             // is not a request on the wire, so it must not idle a slot another
             // call could use. It re-queues for a slot when it wakes. Taken
             // after the token read, so minting a token holds no slot either.
-            //
-            // Two slots, in this order: the route's adaptive one, then the
-            // process-wide one. The other order would idle a process-wide
-            // slot while this attempt queues behind a busy route. Each slot
-            // is released at the same points; the route slot also carries the
-            // attempt's verdict back to its limit (carrick-cloud#869).
-            let route_slot = route_limit.acquire().await;
-            let permit = self.semaphore.acquire().await.map_err(|e| {
-                AgentCallError::permanent(
-                    "semaphore_closed",
-                    format!("Failed to acquire semaphore permit: {}", e),
-                )
-            })?;
+            let (route_slot, permit, reservation) = self.wire_slots(&route_limit).await?;
 
-            // Paced last, holding both slots, so the reserved time is the
-            // time the request goes. A wait here is the throttle working, not
-            // a retry sleep: while the gateway is rate-limiting the scan, the
-            // rate is what bounds the stage, and the slots are not idle so
-            // much as queued behind it.
-            let reservation = self.pacer.reserve();
-            tokio::time::sleep_until(reservation.at).await;
-
-            let mut request_builder = self
-                .client
-                .post(&endpoint)
-                .json(body)
-                .timeout(std::time::Duration::from_secs(60))
-                .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Carrick-Run-Id", crate::logging::run_id())
-                .header(ATTEMPT_HEADER, lambda_attempt.to_string());
-            // Which tree of a monorepo is spending. Log-only on the cloud
-            // side: it is read where `ctx` is built and reaches no cache key,
-            // so two services asking about the same file still share one
-            // cached analysis (carrick-cloud#978). Absent outside the service
-            // loop and for an unnamed service, which read the same there.
-            //
-            // A name that is not a legal header value is dropped rather than
-            // sent: `.header()` would store the error and fail the send, so a
-            // `serviceName` with an accent in it would otherwise stop every
-            // prompt call of the scan over a log field.
-            if let Some(service) = crate::current_service::name()
-                .and_then(|name| reqwest::header::HeaderValue::from_str(&name).ok())
-            {
-                request_builder = request_builder.header(SERVICE_HEADER, service);
-            }
-            request_builder = match auth {
-                RequestAuth::Oidc(_) => request_builder.header("X-Carrick-OIDC", &token),
-                RequestAuth::Bearer(_) => {
-                    // The scan slot rides every prompt call of a laptop run:
-                    // it is how the cloud knows which repo is spending, and the
-                    // money gates read the repo out of the slot rather than out
-                    // of anything this client asserts (C4). Absent on the CI
-                    // path, where none was minted.
-                    let builder =
-                        request_builder.header("Authorization", format!("Bearer {token}"));
-                    match crate::credentials::scan_id() {
-                        Some(scan_id) => builder.header("X-Carrick-Scan-Id", scan_id),
-                        None => builder,
-                    }
-                }
-            };
-
+            let request_builder = self.request(&endpoint, body, auth, &token, lambda_attempt);
             let sent = self.send(request_builder, path, lambda_attempt).await;
             // The request a refusal was waited out for has come back, so the
             // wait is over. Another refusal opens the next one below.
@@ -1021,6 +1069,8 @@ impl AgentService {
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|v| v.to_str().ok()),
                     );
+                    let states_collect =
+                        capabilities::states(response.headers(), capabilities::COLLECT);
 
                     // Read the body as text once. Going through `.json()`
                     // discarded it, so a non-envelope response was logged as
@@ -1048,10 +1098,27 @@ impl AgentService {
                                 lambda_attempt += 1;
                                 continue;
                             }
-                            return Err(AgentCallError::transient(
-                                "network_error",
-                                format!("Failed to read agent proxy response {}: {}", status, e),
-                            ));
+                            // The answer was lost on the way back, so what
+                            // the lambda made of the request is still there.
+                            drop(permit);
+                            drop(route_slot);
+                            return self
+                                .collect_after_cut(
+                                    auth,
+                                    &endpoint,
+                                    path,
+                                    body,
+                                    lambda_attempt,
+                                    None,
+                                    AgentCallError::transient(
+                                        "network_error",
+                                        format!(
+                                            "Failed to read agent proxy response {}: {}",
+                                            status, e
+                                        ),
+                                    ),
+                                )
+                                .await;
                         }
                     };
 
@@ -1204,13 +1271,33 @@ impl AgentService {
                                 e,
                                 body_excerpt(&response_text)
                             );
-                            return Err(if is_transient_gateway_status {
-                                AgentCallError::transient("gateway_error", message)
-                            } else {
-                                AgentCallError::permanent("bad_response", message)
-                            });
+                            if !is_transient_gateway_status {
+                                return Err(AgentCallError::permanent("bad_response", message));
+                            }
+                            // The gateway gave up on the request, and the
+                            // lambda behind it may still be at work on it.
+                            drop(permit);
+                            drop(route_slot);
+                            return self
+                                .collect_after_cut(
+                                    auth,
+                                    &endpoint,
+                                    path,
+                                    body,
+                                    lambda_attempt,
+                                    Some(status),
+                                    AgentCallError::transient("gateway_error", message),
+                                )
+                                .await;
                         }
                     };
+
+                    // An envelope is the lambda's own answer, so this is
+                    // where the route says whether it answers a collecting
+                    // request (`capabilities.rs`).
+                    if path == COLLECT_ROUTE {
+                        self.capabilities.heard(&endpoint, states_collect);
+                    }
 
                     if status.is_success() && body.success {
                         drop(permit);
@@ -1371,10 +1458,24 @@ impl AgentService {
                         continue;
                     }
 
-                    return Err(AgentCallError::transient(
-                        "network_error",
-                        format!("Agent proxy call failed: {}", e),
-                    ));
+                    // No response at all: the request may have reached the
+                    // lambda before the connection was lost.
+                    drop(permit);
+                    drop(route_slot);
+                    return self
+                        .collect_after_cut(
+                            auth,
+                            &endpoint,
+                            path,
+                            body,
+                            lambda_attempt,
+                            None,
+                            AgentCallError::transient(
+                                "network_error",
+                                format!("Agent proxy call failed: {}", e),
+                            ),
+                        )
+                        .await;
                 }
             }
         }
@@ -1383,6 +1484,286 @@ impl AgentService {
             "retries_exhausted",
             "Maximum retry attempts exceeded".to_string(),
         ))
+    }
+
+    /// Everything one HTTP request waits for before it goes: the route's
+    /// adaptive slot, the process-wide one, and its turn under the pace.
+    ///
+    /// Two slots, in this order. The other order would idle a process-wide
+    /// slot while this request queues behind a busy route. Each slot is
+    /// released at the same points; the route slot also carries an attempt's
+    /// verdict back to its limit (carrick-cloud#869).
+    ///
+    /// Paced last, holding both slots, so the reserved time is the time the
+    /// request goes. A wait here is the throttle working, not a retry sleep:
+    /// while the gateway is rate-limiting the scan, the rate is what bounds
+    /// the stage, and the slots are not idle so much as queued behind it.
+    async fn wire_slots(
+        &self,
+        route_limit: &Arc<limiter::AdaptiveLimit>,
+    ) -> Result<
+        (
+            limiter::Slot,
+            tokio::sync::SemaphorePermit<'_>,
+            limiter::Reservation,
+        ),
+        AgentCallError,
+    > {
+        let route_slot = route_limit.acquire().await;
+        let permit = self.semaphore.acquire().await.map_err(|e| {
+            AgentCallError::permanent(
+                "semaphore_closed",
+                format!("Failed to acquire semaphore permit: {}", e),
+            )
+        })?;
+        let reservation = self.pacer.reserve();
+        tokio::time::sleep_until(reservation.at).await;
+        Ok((route_slot, permit, reservation))
+    }
+
+    /// One request of a call, as every attempt at it and the collecting
+    /// request after them build it: the body, the scanner's version, the run,
+    /// the attempt number the lambda reads, the service and the credential.
+    fn request<B>(
+        &self,
+        endpoint: &str,
+        body: &B,
+        auth: &RequestAuth<'_>,
+        token: &str,
+        lambda_attempt: u32,
+    ) -> reqwest::RequestBuilder
+    where
+        B: Serialize + ?Sized,
+    {
+        let mut request_builder = self
+            .client
+            .post(endpoint)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(60))
+            .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-Carrick-Run-Id", crate::logging::run_id())
+            .header(ATTEMPT_HEADER, lambda_attempt.to_string());
+        // Which tree of a monorepo is spending. Log-only on the cloud
+        // side: it is read where `ctx` is built and reaches no cache key,
+        // so two services asking about the same file still share one
+        // cached analysis (carrick-cloud#978). Absent outside the service
+        // loop and for an unnamed service, which read the same there.
+        //
+        // A name that is not a legal header value is dropped rather than
+        // sent: `.header()` would store the error and fail the send, so a
+        // `serviceName` with an accent in it would otherwise stop every
+        // prompt call of the scan over a log field.
+        if let Some(service) = crate::current_service::name()
+            .and_then(|name| reqwest::header::HeaderValue::from_str(&name).ok())
+        {
+            request_builder = request_builder.header(SERVICE_HEADER, service);
+        }
+        match auth {
+            RequestAuth::Oidc(_) => request_builder.header("X-Carrick-OIDC", token),
+            RequestAuth::Bearer(_) => {
+                // The scan slot rides every prompt call of a laptop run:
+                // it is how the cloud knows which repo is spending, and the
+                // money gates read the repo out of the slot rather than out
+                // of anything this client asserts (C4). Absent on the CI
+                // path, where none was minted.
+                let builder = request_builder.header("Authorization", format!("Bearer {token}"));
+                match crate::credentials::scan_id() {
+                    Some(scan_id) => builder.header("X-Carrick-Scan-Id", scan_id),
+                    None => builder,
+                }
+            }
+        }
+    }
+
+    /// What a call comes to once its last permitted attempt ended with no
+    /// answer from the lambda: `ended`, or what one collecting request
+    /// ([`COLLECT_HEADER`]) brings back (carrick#1897).
+    ///
+    /// `status` is the last attempt's, `None` when it failed in transport.
+    /// The collecting request is sent when all of these hold, and otherwise
+    /// the call returns `ended` as it always did:
+    ///
+    /// - the route is [`COLLECT_ROUTE`], and the call is not a single request
+    ///   ([`RetryPolicy::ONCE`]);
+    /// - the lambda may still be at work on the request, or have finished it
+    ///   since: a transport failure, or a gateway 502, 503 or 504. A gateway
+    ///   429 was refused before any lambda ran. The line is the one a write
+    ///   action draws ([`crate::cloud_storage::handler_may_still_run`]);
+    /// - the route has stated the `collect` capability in this run. A cloud
+    ///   that has not would run the request as an ordinary one and may call
+    ///   the model for it (`capabilities.rs`).
+    ///
+    /// The request is the last attempt's, header for header, its attempt
+    /// number included, plus [`COLLECT_HEADER`]. It takes both slots and its
+    /// turn under the pace as an attempt does. What the cloud answers, and
+    /// what the call returns for it:
+    ///
+    /// | Answer | The call returns |
+    /// |---|---|
+    /// | 2xx, `success: true` | `Ok`, that text. The route's limit hears a success |
+    /// | an envelope with `details.replayed: true` | `Err`, that envelope's code, message, `retriable` and details: the verdict the cut request reached |
+    /// | the lease wait ([`ANALYSIS_IN_FLIGHT_CODE`]) | nothing yet: both slots released, the wait a lease wait sleeps, and the collecting request again, up to the policy's lease waits |
+    /// | anything else: `404 nothing_to_collect`, another envelope, a body that is no envelope, a transport failure | `Err(ended)` |
+    ///
+    /// It follows the `replayed` flag and never a code, so a verdict the
+    /// cloud starts keeping later needs no scanner release. It is sent again
+    /// only after a lease wait: it is never retried and never becomes an
+    /// ordinary attempt. Apart from that one success it gives the route's
+    /// limit no verdict, because it says nothing about the model's capacity.
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_after_cut<B>(
+        &self,
+        auth: &RequestAuth<'_>,
+        endpoint: &str,
+        path: &str,
+        body: &B,
+        lambda_attempt: u32,
+        status: Option<reqwest::StatusCode>,
+        ended: AgentCallError,
+    ) -> Result<LambdaOutcome, AgentCallError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let policy = self.retry;
+        if path != COLLECT_ROUTE
+            || !policy.collects_after_cut()
+            || !crate::cloud_storage::handler_may_still_run(status)
+        {
+            return Err(ended);
+        }
+        if !self.capabilities.collects(endpoint) {
+            debug!(
+                "No collecting request for this {path} call: the route has not stated `collect` \
+                 in this run. The call ends on {}",
+                ended.code
+            );
+            return Err(ended);
+        }
+
+        let route_limit = self.limits.for_route(path);
+        let mut waits: u32 = 0;
+        loop {
+            let Ok(token) = auth.token().await else {
+                return Err(ended);
+            };
+            let Ok((route_slot, permit, _reservation)) = self.wire_slots(&route_limit).await else {
+                return Err(ended);
+            };
+            let request = self
+                .request(endpoint, body, auth, &token, lambda_attempt)
+                .header(COLLECT_HEADER, "1");
+            let response = match self.send(request, path, lambda_attempt).await {
+                Ok(response) => response,
+                Err(e) => {
+                    debug!("The collecting request for this {path} call failed in transport: {e}");
+                    return Err(ended);
+                }
+            };
+            let status = response.status();
+            let retry_after = parse_retry_after(
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let answer = response
+                .text()
+                .await
+                .ok()
+                .and_then(|text| serde_json::from_str::<AgentResponse>(&text).ok());
+            let Some(answer) = answer else {
+                debug!(
+                    "The collecting request for this {path} call got no answer from the lambda \
+                     (status {status})"
+                );
+                return Err(ended);
+            };
+
+            if status.is_success() && answer.success {
+                if answer.cached != Some(true) {
+                    // A cloud that reads the header answers a 200 only from
+                    // what it holds, and says so.
+                    warn!(
+                        target: crate::logging::RETRY_TARGET,
+                        "{}",
+                        ran_as_ordinary_line(path, "a 200 without `cached: true`")
+                    );
+                }
+                debug!("Collected the answer a cut {path} request left behind");
+                drop(permit);
+                route_slot.succeeded();
+                self.pacer.admitted();
+                return Ok(LambdaOutcome {
+                    text: answer.text.unwrap_or_default(),
+                    guidance_key: answer.guidance_key,
+                });
+            }
+
+            let Some(err) = answer.error else {
+                return Err(ended);
+            };
+            if err.replayed() {
+                let verdict = call_error_from_envelope(err);
+                debug!(
+                    "Collected the verdict a cut {path} request reached: {}",
+                    verdict.code
+                );
+                return Err(verdict);
+            }
+            if is_analysis_in_flight(&err) && err.retriable && waits < policy.max_in_flight_waits {
+                waits += 1;
+                let wait_time = in_flight_wait(jitter_seed(), retry_after, policy.max_delay);
+                debug!(
+                    "The cut {path} request is still being analysed; collecting again in {:?} \
+                     (wait {}/{})",
+                    wait_time, waits, policy.max_in_flight_waits
+                );
+                drop(permit);
+                drop(route_slot);
+                sleep(wait_time).await;
+                continue;
+            }
+            if err.code == CAPACITY_REFUSAL_CODE && !is_analysis_in_flight(&err) {
+                // A cloud that reads the header never asks the model for a
+                // collecting request, so the model cannot have refused it.
+                warn!(
+                    target: crate::logging::RETRY_TARGET,
+                    "{}",
+                    ran_as_ordinary_line(path, "`model_error`")
+                );
+            }
+            debug!(
+                "Nothing to collect for this {path} call ({}); it ends on {}",
+                err.code, ended.code
+            );
+            return Err(ended);
+        }
+    }
+}
+
+/// The line the log gets when a collecting request's answer shows the cloud
+/// ran it as an ordinary request, which a route that stated `collect` never
+/// does. Nothing acts on it: it is there for whoever reads the log of a scan
+/// against a cloud just deployed.
+fn ran_as_ordinary_line(path: &str, answer: &str) -> String {
+    format!(
+        "A collecting request to {path} was answered {answer}: the cloud ran it as an ordinary \
+         request, and may have called the model for it"
+    )
+}
+
+impl RequestAuth<'_> {
+    /// The credential's token, as one request sends it: minted afresh by the
+    /// OIDC provider when the cached one nears its expiry, the Bearer key
+    /// itself otherwise.
+    async fn token(&self) -> Result<String, AgentCallError> {
+        match self {
+            RequestAuth::Oidc(provider) => provider
+                .token()
+                .await
+                .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string())),
+            RequestAuth::Bearer(token) => Ok(token.clone()),
+        }
     }
 }
 
@@ -1558,6 +1939,13 @@ struct AgentResponse {
     /// (carrick-cloud#871).
     #[serde(default)]
     guidance_key: Option<String>,
+    /// file-analyzer only: `true` when the text came from what the cloud
+    /// already held and no model call was made for this request. Read for one
+    /// thing: a collecting request is only ever answered that way, so a 200
+    /// to one without it is a cloud that ran the request as an ordinary one
+    /// ([`AgentService::collect_after_cut`]).
+    #[serde(default)]
+    cached: Option<bool>,
 }
 
 /// How a route's 2xx body is read. A non-2xx body is read as the error
@@ -1618,7 +2006,15 @@ struct AgentError {
 impl AgentError {
     /// `details.reason`, when the cloud sent one as a string.
     fn reason(&self) -> Option<&str> {
-        self.details.as_ref()?.get("reason")?.as_str()
+        detail(&self.details, "reason")?.as_str()
+    }
+
+    /// Whether this envelope is a verdict the cloud kept from an earlier
+    /// request and read back, with no model call of this request's own:
+    /// `details.replayed`, and only the boolean `true`. Absent, or anything
+    /// that is not a boolean, is false (carrick#1897).
+    fn replayed(&self) -> bool {
+        detail(&self.details, "replayed").and_then(serde_json::Value::as_bool) == Some(true)
     }
 }
 
@@ -3050,8 +3446,9 @@ pub(crate) mod tests {
         assert!(!is_gateway_throttle(504));
     }
 
-    /// A service with its own slots, limits, pace and refusal budgets, so a
-    /// test neither reads nor spends the process's.
+    /// A service with its own slots, limits, pace, refusal budgets and record
+    /// of what the cloud stated, so a test neither reads nor spends the
+    /// process's.
     fn service_with(permits: usize, route_max: usize) -> AgentService {
         AgentService {
             client: Client::builder().no_proxy().build().unwrap(),
@@ -3059,6 +3456,7 @@ pub(crate) mod tests {
             limits: Arc::new(RouteLimits::new(route_max)),
             pacer: Arc::new(RatePacer::new()),
             refusals: Arc::new(RouteRefusals::new()),
+            capabilities: Arc::new(CloudCapabilities::new()),
             retry: RetryPolicy::STANDARD,
             script: None,
         }
@@ -3378,32 +3776,52 @@ pub(crate) mod tests {
         );
     }
 
-    /// A stub `/framework-detect` that counts every connection it accepts
-    /// until told to stop: each is answered with the next canned response,
-    /// and any beyond them with a failure nothing sends again.
+    /// A header on a canned response that makes the stub fail the request in
+    /// transport instead of answering it: [`HANG_UP`] or [`LOSE_THE_BODY`].
+    const STUB_FAULT: &str = "X-Stub-Fault";
+    /// The connection is closed with nothing written.
+    const HANG_UP: &str = "hang-up";
+    /// The head promises more body than is sent before the connection closes.
+    const LOSE_THE_BODY: &str = "lose-the-body";
+
+    /// A stub cloud that takes every connection it is offered until told to
+    /// stop, and keeps each request: a connection is answered with the next
+    /// canned response, and any beyond them with a failure nothing sends
+    /// again. So a test can count a request that should not have been sent,
+    /// which a stub that serves a fixed number of connections cannot.
     struct CountingStub {
         api_base: String,
-        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        seen: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
         server: std::thread::JoinHandle<()>,
     }
 
     impl CountingStub {
         fn start(responses: Vec<(u16, String)>) -> Self {
+            Self::start_with_headers(
+                responses
+                    .into_iter()
+                    .map(|(status, body)| (status, body, Vec::new()))
+                    .collect(),
+            )
+        }
+
+        fn start_with_headers(responses: Vec<StubResponse>) -> Self {
             use std::io::{Read, Write};
             use std::net::TcpListener;
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let api_base = format!("http://{}", listener.local_addr().unwrap());
-            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
-            let (counted, stopped) = (attempts.clone(), stop.clone());
+            let (kept, stopped) = (seen.clone(), stop.clone());
             let server = std::thread::spawn(move || {
-                let beyond = (
+                let beyond: StubResponse = (
                     500,
                     r#"{"success":false,"error":{"code":"bad_request","message":"no more answers","retriable":false}}"#
                         .to_string(),
+                    Vec::new(),
                 );
                 while !stopped.load(Ordering::SeqCst) {
                     let Ok((mut stream, _)) = listener.accept() else {
@@ -3432,31 +3850,56 @@ pub(crate) mod tests {
                             break;
                         }
                     }
-                    let (status, body) = responses
-                        .get(counted.fetch_add(1, Ordering::SeqCst))
-                        .unwrap_or(&beyond);
+                    let served = {
+                        let mut kept = kept.lock().unwrap();
+                        kept.push(String::from_utf8_lossy(&raw).to_string());
+                        kept.len() - 1
+                    };
+                    let (status, body, headers) = responses.get(served).unwrap_or(&beyond);
+                    let fault = headers
+                        .iter()
+                        .find(|(name, _)| *name == STUB_FAULT)
+                        .map(|(_, fault)| fault.as_str());
+                    if fault == Some(HANG_UP) {
+                        continue;
+                    }
+                    let extra: String = headers
+                        .iter()
+                        .filter(|(name, _)| *name != STUB_FAULT)
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect();
+                    let promised = if fault == Some(LOSE_THE_BODY) {
+                        body.len() + 64
+                    } else {
+                        body.len()
+                    };
                     let response = format!(
                         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len(),
+                         {extra}Content-Length: {promised}\r\nConnection: close\r\n\r\n{body}",
                     );
                     let _ = stream.write_all(response.as_bytes());
                 }
             });
             Self {
                 api_base,
-                attempts,
+                seen,
                 stop,
                 server,
             }
         }
 
-        /// Every connection the server accepted. Called once the calls under
-        /// test have returned, so any attempt they made has already arrived.
-        fn attempts(self) -> usize {
+        /// Every request the server was sent, in the order they arrived.
+        /// Called once the calls under test have returned, so any request
+        /// they made has already arrived.
+        fn requests(self) -> Vec<String> {
             self.stop.store(true, Ordering::SeqCst);
             self.server.join().unwrap();
-            self.attempts.load(Ordering::SeqCst)
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+
+        /// How many requests the server was sent.
+        fn attempts(self) -> usize {
+            self.requests().len()
         }
     }
 
@@ -4424,7 +4867,8 @@ pub(crate) mod tests {
     /// Only a capacity refusal keeps its attempt. A request the gateway cut
     /// spends one, as it always did, so with three attempts a call survives
     /// two cuts among any number of refusals and ends on the third cut, named
-    /// for the cut. What a cut request came to is carrick#1897's question.
+    /// for the cut. This cloud never states `collect`, so no collecting
+    /// request follows that last cut (carrick#1897).
     #[tokio::test]
     async fn a_gateway_cut_still_spends_an_attempt_between_refusals() {
         const ATTEMPTS: u32 = 3;
@@ -4484,12 +4928,720 @@ pub(crate) mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
+    // carrick#1897: the collecting request. "Cut" below is the gateway's own
+    // 503, whose body is not an envelope. Every test counts the requests the
+    // stub was sent, because the point of each is a request that is or is not
+    // made, and the stub keeps taking requests past the ones it expects.
+
+    const FILE_ROUTE: &str = COLLECT_ROUTE;
+
+    /// The header file-analyzer puts on every response it builds itself
+    /// (carrick-cloud#1726).
+    fn stating_collect() -> Vec<(&'static str, String)> {
+        vec![(capabilities::CAPABILITIES_HEADER, "collect".to_string())]
+    }
+
+    fn cuts(count: u32) -> Vec<StubResponse> {
+        (0..count).map(|_| gateway_cut()).collect()
+    }
+
+    /// What a collecting request is answered when the cut request's answer
+    /// is stored: a 200 that says the text was held.
+    fn collected(text: &str) -> StubResponse {
+        (
+            200,
+            serde_json::json!({ "success": true, "text": text, "cached": true }).to_string(),
+            stating_collect(),
+        )
+    }
+
+    /// What the cloud sends in `details` with a verdict read back, for an
+    /// answer cut at the output ceiling (carrick-cloud#1715, #1725).
+    fn replayed_details() -> serde_json::Value {
+        serde_json::json!({
+            "reason": "finish_max_tokens",
+            "finish_reason": "MAX_TOKENS",
+            "response_bytes": 61234,
+            "max_part_candidates": 32,
+            "replayed": true,
+        })
+    }
+
+    /// The verdict a cut request reached, read back: every try at the file
+    /// was incomplete.
+    fn replayed_verdict() -> StubResponse {
+        (
+            502,
+            serde_json::json!({
+                "success": false,
+                "error": {
+                    "code": "output_truncated",
+                    "message": "every try at the file was incomplete",
+                    "retriable": false,
+                    "details": replayed_details(),
+                },
+            })
+            .to_string(),
+            stating_collect(),
+        )
+    }
+
+    /// The cut request is still running: the lease wait.
+    fn still_in_flight() -> StubResponse {
+        let mut headers = stating_collect();
+        headers.push(("Retry-After", "0".to_string()));
+        (409, IN_FLIGHT_409.to_string(), headers)
+    }
+
+    /// No answer, no verdict and no request running. Nothing was started.
+    fn nothing_to_collect() -> StubResponse {
+        (
+            404,
+            r#"{"success":false,"error":{"code":"nothing_to_collect","message":"nothing is stored and nothing is running","retriable":false,"details":{"requestId":"r","reason":"nothing_to_collect"}}}"#
+                .to_string(),
+            stating_collect(),
+        )
+    }
+
+    /// A service of seven quick attempts that has heard the file route at
+    /// `api_base` state `collect` in this run, as any answered file of the
+    /// run leaves it.
+    fn heard_collect(api_base: &str) -> AgentService {
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        service
+            .capabilities
+            .heard(&format!("{api_base}{FILE_ROUTE}"), true);
+        service
+    }
+
+    async fn ask(
+        service: &AgentService,
+        api_base: &str,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, AgentCallError> {
+        service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                api_base,
+                route,
+                body,
+            )
+            .await
+            .map(|outcome| outcome.text)
+    }
+
+    async fn analyse(
+        service: &AgentService,
+        api_base: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, AgentCallError> {
+        ask(service, api_base, FILE_ROUTE, body).await
+    }
+
+    fn is_collecting(request: &str) -> bool {
+        header_of(request, COLLECT_HEADER).is_some()
+    }
+
+    fn body_of(request: &str) -> &str {
+        request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+    }
+
+    /// Spec test 1, with the gate in it: a file of the run is answered by a
+    /// cloud that states `collect`, and then another file's seven attempts
+    /// are all cut. One more request follows, it alone carries the header,
+    /// and it is the seventh attempt's request otherwise: the same body, the
+    /// same attempt number, the same credential. Its answer is the call's.
+    #[tokio::test]
+    async fn a_last_attempt_the_gateway_cut_is_followed_by_one_collecting_request() {
+        let mut responses = vec![(200, ANSWERED.to_string(), stating_collect())];
+        responses.extend(cuts(MAX_RETRIES));
+        responses.push(collected("A"));
+        let stub = CountingStub::start_with_headers(responses);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        let limit = service.limits.for_route(FILE_ROUTE);
+
+        let first = serde_json::json!({ "file": "answered" });
+        assert_eq!(
+            analyse(&service, &stub.api_base, &first).await.unwrap(),
+            "analysed"
+        );
+        let cut = serde_json::json!({ "file": "cut seven times" });
+        assert_eq!(analyse(&service, &stub.api_base, &cut).await.unwrap(), "A");
+        assert_eq!(limit.limit(), 4);
+
+        let requests = stub.requests();
+        assert_eq!(
+            requests.len(),
+            9,
+            "an answered file, seven cut attempts and one collecting request"
+        );
+        assert!(!is_collecting(&requests[0]));
+        let call = &requests[1..];
+        for (sent, request) in call.iter().enumerate() {
+            assert_eq!(is_collecting(request), sent == 7, "request {}", sent + 1);
+            assert_eq!(body_of(request), cut.to_string(), "request {}", sent + 1);
+        }
+        assert_eq!(header_of(&call[7], COLLECT_HEADER).as_deref(), Some("1"));
+        for name in [
+            ATTEMPT_HEADER,
+            "Authorization",
+            "X-Carrick-Scanner-Version",
+            "X-Carrick-Run-Id",
+        ] {
+            let on_the_last_attempt = header_of(&call[6], name);
+            assert!(on_the_last_attempt.is_some(), "{name}");
+            assert_eq!(header_of(&call[7], name), on_the_last_attempt, "{name}");
+        }
+        assert_eq!(header_of(&call[7], ATTEMPT_HEADER).as_deref(), Some("7"));
+    }
+
+    /// Spec test 2: the verdict the cut request reached is the call's error,
+    /// under the cloud's own code and not as a gateway error, final, and
+    /// carrying the cloud's `details` as they arrived.
+    #[tokio::test]
+    async fn a_collected_verdict_is_the_calls_error() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.push(replayed_verdict());
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("a verdict is a failed call");
+        assert_eq!(error.code, "output_truncated");
+        assert!(!error.retriable);
+        assert!(error.is_final_answer());
+        assert_eq!(error.message, "every try at the file was incomplete");
+        assert_eq!(error.details, Some(replayed_details()));
+        assert_eq!(error.max_part_candidates(), Some(32));
+        assert_eq!(stub.attempts(), 8);
+    }
+
+    /// Spec test 3: a cut request still running is waited on, with no
+    /// verdict on the route's limit, and its answer collected when it lands.
+    #[tokio::test]
+    async fn a_collecting_request_waits_out_a_request_still_running() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.extend([still_in_flight(), still_in_flight(), collected("A")]);
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+        let limit = service.limits.for_route(FILE_ROUTE);
+
+        assert_eq!(
+            analyse(&service, &stub.api_base, &serde_json::json!({}))
+                .await
+                .unwrap(),
+            "A"
+        );
+        assert_eq!(
+            limit.limit(),
+            4,
+            "a wait on a collecting request cut the limit"
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 10);
+        for (sent, request) in requests.iter().enumerate() {
+            assert_eq!(is_collecting(request), sent >= 7, "request {}", sent + 1);
+        }
+    }
+
+    /// Spec test 4: with nothing to collect the call ends as its last attempt
+    /// left it, a gateway error another ask may mend.
+    #[tokio::test]
+    async fn nothing_to_collect_leaves_the_call_as_its_last_attempt_left_it() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.push(nothing_to_collect());
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("nothing was collected");
+        assert_eq!(error.code, "gateway_error");
+        assert!(error.retriable);
+        assert!(!error.is_final_answer());
+        assert_eq!(stub.attempts(), 8);
+    }
+
+    /// Spec test 5: a collecting request is never retried. Cut by the
+    /// gateway, or lost in transport, it is not sent again and the call ends
+    /// as its last attempt left it.
+    #[tokio::test]
+    async fn a_collecting_request_that_is_cut_is_not_sent_again() {
+        let hang_up: StubResponse = (0, String::new(), vec![(STUB_FAULT, HANG_UP.to_string())]);
+        for lost in [gateway_cut(), hang_up] {
+            let mut responses = cuts(MAX_RETRIES);
+            responses.push(lost);
+            let stub = CountingStub::start_with_headers(responses);
+            let service = heard_collect(&stub.api_base);
+
+            let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+                .await
+                .expect_err("nothing was collected");
+            assert_eq!(error.code, "gateway_error");
+            let requests = stub.requests();
+            assert_eq!(requests.len(), 8, "never a ninth");
+            assert!(is_collecting(&requests[7]));
+        }
+    }
+
+    /// Spec test 6: a request that never stops running ends the collecting
+    /// too, at the policy's cap on lease waits, counted on its own.
+    #[tokio::test]
+    async fn a_collecting_request_stops_waiting_at_the_cap() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.extend((0..MAX_IN_FLIGHT_WAITS + 4).map(|_| still_in_flight()));
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("the request never finished");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(
+            stub.attempts(),
+            (MAX_RETRIES + MAX_IN_FLIGHT_WAITS + 1) as usize
+        );
+    }
+
+    /// Spec test 7: the call follows `details.replayed` and not a code, so a
+    /// verdict the cloud starts keeping after this build is still the call's
+    /// error, and still final.
+    #[tokio::test]
+    async fn a_verdict_this_build_has_never_heard_of_is_still_the_calls_error() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.push((
+            502,
+            r#"{"success":false,"error":{"code":"a_later_verdict","message":"kept","retriable":false,"details":{"replayed":true}}}"#
+                .to_string(),
+            stating_collect(),
+        ));
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("a verdict is a failed call");
+        assert_eq!(error.code, "a_later_verdict");
+        assert!(!error.retriable);
+        assert!(error.is_final_answer());
+        assert_eq!(error.max_part_candidates(), None);
+        assert_eq!(stub.attempts(), 8);
+    }
+
+    fn envelope_with_details(details: Option<&str>) -> AgentError {
+        let details = details.map_or(String::new(), |d| format!(r#","details":{d}"#));
+        envelope_error(&format!(
+            r#"{{"success":false,"error":{{"code":"output_truncated","message":"x","retriable":false{details}}}}}"#
+        ))
+    }
+
+    /// Spec test 8: `details.replayed` is a verdict read back only when it is
+    /// the boolean `true`. The same shape as the table for `reason()`.
+    #[test]
+    fn replayed_is_read_leniently() {
+        for not_replayed in [
+            None,
+            Some("{}"),
+            Some(r#"{"replayed":"yes"}"#),
+            Some(r#"{"replayed":"true"}"#),
+            Some(r#"{"replayed":1}"#),
+            Some(r#"{"replayed":null}"#),
+            Some(r#"{"replayed":false}"#),
+            Some(r#"{"reason":"replayed"}"#),
+            Some(r#""replayed""#),
+            Some("[true]"),
+            Some("true"),
+        ] {
+            assert!(
+                !envelope_with_details(not_replayed).replayed(),
+                "{not_replayed:?}"
+            );
+        }
+        assert!(envelope_with_details(Some(r#"{"replayed":true}"#)).replayed());
+        assert!(
+            envelope_with_details(Some(r#"{"reason":"finish_max_tokens","replayed":true}"#))
+                .replayed()
+        );
+    }
+
+    /// The error a call returns keeps the envelope's `details` as the JSON
+    /// they arrived as, whatever is in them, and `max_part_candidates` is a
+    /// positive integer or nothing: absent, zero, negative, a fraction, a
+    /// string or any other shape leaves the caller with its own constant.
+    #[test]
+    fn an_error_keeps_its_details_and_the_part_size_is_a_positive_integer_or_nothing() {
+        let call = |details: Option<&str>| call_error_from_envelope(envelope_with_details(details));
+
+        let fresh = call(Some(
+            r#"{"reason":"finish_max_tokens","finish_reason":"MAX_TOKENS","response_bytes":61234,"max_part_candidates":48,"later":{"nested":[1,2]}}"#,
+        ));
+        assert_eq!(
+            fresh.details,
+            Some(serde_json::json!({
+                "reason": "finish_max_tokens",
+                "finish_reason": "MAX_TOKENS",
+                "response_bytes": 61234,
+                "max_part_candidates": 48,
+                "later": { "nested": [1, 2] },
+            }))
+        );
+        assert_eq!(fresh.max_part_candidates(), Some(48));
+        assert_eq!(
+            fresh.detail("reason"),
+            Some(&serde_json::json!("finish_max_tokens"))
+        );
+        assert_eq!(fresh.detail("absent"), None);
+        assert!(fresh.cloud_stated);
+
+        assert_eq!(call(None).details, None);
+        assert_eq!(
+            call(Some(r#""text""#)).details,
+            Some(serde_json::json!("text"))
+        );
+        assert_eq!(
+            call(Some(r#"{"max_part_candidates":1}"#)).max_part_candidates(),
+            Some(1)
+        );
+        for no_part_size in [
+            None,
+            Some("{}"),
+            Some(r#"{"max_part_candidates":0}"#),
+            Some(r#"{"max_part_candidates":-32}"#),
+            Some(r#"{"max_part_candidates":32.5}"#),
+            Some(r#"{"max_part_candidates":"32"}"#),
+            Some(r#"{"max_part_candidates":true}"#),
+            Some(r#"{"max_part_candidates":null}"#),
+            Some(r#"{"max_part_candidates":[32]}"#),
+            Some(r#"{"MAX_PART_CANDIDATES":32}"#),
+            Some(r#""32""#),
+            Some("32"),
+        ] {
+            assert_eq!(
+                call(no_part_size).max_part_candidates(),
+                None,
+                "{no_part_size:?}"
+            );
+        }
+
+        // An error the scanner made itself has no details and is nothing the
+        // cloud stated.
+        let cut = AgentCallError::transient("gateway_error", "cut".to_string());
+        assert_eq!(cut.details, None);
+        assert_eq!(cut.max_part_candidates(), None);
+        assert!(!cut.cloud_stated);
+    }
+
+    /// Spec test 9, a near miss: an envelope on the last attempt is the
+    /// lambda's own answer, so nothing is still running and nothing is
+    /// collected.
+    #[tokio::test]
+    async fn an_envelope_on_the_last_attempt_sends_no_collecting_request() {
+        let responses = (0..MAX_RETRIES).map(|_| capacity_refusal()).collect();
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("seven refusals end the call");
+        assert_eq!(error.code, "model_error");
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 7);
+        assert!(!requests.iter().any(|request| is_collecting(request)));
+    }
+
+    /// Spec test 10, a near miss: the gateway refuses a throttled request
+    /// before any lambda runs, so there is nothing behind it to collect.
+    #[tokio::test]
+    async fn a_throttle_on_the_last_attempt_sends_no_collecting_request() {
+        let responses = (0..MAX_RETRIES)
+            .map(|_| {
+                (
+                    429,
+                    r#"{"message":"Too Many Requests"}"#.to_string(),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("seven throttles end the call");
+        assert_eq!(error.code, "gateway_error");
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 7);
+        assert!(!requests.iter().any(|request| is_collecting(request)));
+    }
+
+    /// Spec test 11, a near miss: only the file route's lambda has anything
+    /// a later request could collect. Another route sends none, even where
+    /// its own answers were to state the capability.
+    #[tokio::test]
+    async fn another_route_sends_no_collecting_request() {
+        const INTENTS: &str = "/generate-intent";
+        let stub = CountingStub::start_with_headers(cuts(MAX_RETRIES));
+        let service = heard_collect(&stub.api_base);
+        service
+            .capabilities
+            .heard(&format!("{}{INTENTS}", stub.api_base), true);
+
+        let error = ask(&service, &stub.api_base, INTENTS, &serde_json::json!({}))
+            .await
+            .expect_err("seven cuts end the call");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(stub.attempts(), 7);
+    }
+
+    /// Spec test 12, a near miss: an attempt is never a collecting request.
+    /// A call answered at once, and a call answered on its third attempt
+    /// after two cuts, send the header on nothing.
+    #[tokio::test]
+    async fn an_ordinary_attempt_never_carries_the_header() {
+        let stub = CountingStub::start_with_headers(vec![
+            answered(),
+            gateway_cut(),
+            gateway_cut(),
+            answered(),
+        ]);
+        let service = heard_collect(&stub.api_base);
+        for _ in 0..2 {
+            assert_eq!(
+                analyse(&service, &stub.api_base, &serde_json::json!({}))
+                    .await
+                    .unwrap(),
+                "analysed"
+            );
+        }
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(!requests.iter().any(|request| is_collecting(request)));
+    }
+
+    /// Spec test 13, the path a released scanner already takes, pinned: a
+    /// re-send after a cut waits on the lease and is then answered from the
+    /// verdict. `retriable: false` ends the call there, under the cloud's
+    /// code, with its details, having spent two attempts and sent no
+    /// collecting request. This cloud states nothing and needs to state
+    /// nothing for it.
+    #[tokio::test]
+    async fn a_verdict_read_back_on_a_re_send_ends_the_call() {
+        let mut verdict = replayed_verdict();
+        verdict.2.clear();
+        let mut waiting = still_in_flight();
+        waiting.2.retain(|(name, _)| *name == "Retry-After");
+        let stub = CountingStub::start_with_headers(vec![gateway_cut(), waiting, verdict]);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("a verdict is a failed call");
+        assert_eq!(error.code, "output_truncated");
+        assert!(!error.retriable);
+        assert!(error.is_final_answer());
+        assert_eq!(error.max_part_candidates(), Some(32));
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests.iter().any(|request| is_collecting(request)));
+        assert_eq!(
+            header_of(&requests[2], ATTEMPT_HEADER).as_deref(),
+            Some("2")
+        );
+    }
+
+    /// The gate (carrick#1897, carrick-cloud#1726): a cloud that has not
+    /// stated `collect` in this run is sent no collecting request, because it
+    /// would run one as an ordinary request and may call the model for it.
+    /// Never heard from, and heard from without the header, are both no, and
+    /// the file ends as its last attempt left it.
+    #[tokio::test]
+    async fn no_collecting_request_goes_to_a_cloud_that_has_not_stated_collect() {
+        let quiet = CountingStub::start_with_headers(cuts(MAX_RETRIES));
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        let error = analyse(&service, &quiet.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("seven cuts end the call");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(quiet.attempts(), 7, "a cloud never heard from was sent one");
+
+        let mut responses = vec![answered()];
+        responses.extend(cuts(MAX_RETRIES));
+        let older = CountingStub::start_with_headers(responses);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        assert_eq!(
+            analyse(&service, &older.api_base, &serde_json::json!({ "file": 1 }))
+                .await
+                .unwrap(),
+            "analysed"
+        );
+        let error = analyse(&service, &older.api_base, &serde_json::json!({ "file": 2 }))
+            .await
+            .expect_err("seven cuts end the call");
+        assert_eq!(error.code, "gateway_error");
+        assert!(error.retriable);
+        let requests = older.requests();
+        assert_eq!(
+            requests.len(),
+            8,
+            "a cloud that answered without the header was sent one"
+        );
+        assert!(!requests.iter().any(|request| is_collecting(request)));
+    }
+
+    /// The statement is the lambda's own, for its own route. `collect` heard
+    /// from another cloud's file route, or from another route of this cloud,
+    /// sends nothing here, and neither does the header on a response the
+    /// gateway built, which is no answer of the lambda's.
+    #[tokio::test]
+    async fn collect_stated_elsewhere_or_by_the_gateway_sends_no_collecting_request() {
+        let stub = CountingStub::start_with_headers(cuts(MAX_RETRIES));
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        service
+            .capabilities
+            .heard(&format!("http://another.cloud{FILE_ROUTE}"), true);
+        service
+            .capabilities
+            .heard(&format!("{}/generate-intent", stub.api_base), true);
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("seven cuts end the call");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(stub.attempts(), 7);
+
+        let cut_with_the_header = || {
+            let (status, body, _) = gateway_cut();
+            (status, body, stating_collect())
+        };
+        let stub = CountingStub::start_with_headers(
+            (0..MAX_RETRIES).map(|_| cut_with_the_header()).collect(),
+        );
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("seven cuts end the call");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(stub.attempts(), 7);
+    }
+
+    /// `collect` is heard from any response the lambda built, an error as
+    /// much as an answer: here the call's own first attempt is refused for
+    /// capacity by a lambda that states it, its other six are cut, and the
+    /// collecting request follows.
+    #[tokio::test]
+    async fn collect_is_heard_from_an_error_the_lambda_built() {
+        let (status, body, mut headers) = capacity_refusal();
+        headers.extend(stating_collect());
+        let mut responses = vec![(status, body, headers)];
+        responses.extend(cuts(MAX_RETRIES - 1));
+        responses.push(collected("A"));
+        let stub = CountingStub::start_with_headers(responses);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(MAX_RETRIES));
+
+        assert_eq!(
+            analyse(&service, &stub.api_base, &serde_json::json!({}))
+                .await
+                .unwrap(),
+            "A"
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 8);
+        assert!(is_collecting(&requests[7]));
+    }
+
+    /// A last attempt lost in transport leaves the lambda as possibly at
+    /// work as a cut does: a connection closed with no response, and a
+    /// response whose body never arrived in full, are each followed by the
+    /// collecting request.
+    #[tokio::test]
+    async fn a_last_attempt_lost_in_transport_is_followed_by_a_collecting_request() {
+        let hang_up =
+            || -> StubResponse { (0, String::new(), vec![(STUB_FAULT, HANG_UP.to_string())]) };
+        let lose_the_body = || -> StubResponse {
+            (
+                200,
+                ANSWERED.to_string(),
+                vec![(STUB_FAULT, LOSE_THE_BODY.to_string())],
+            )
+        };
+        for lost in [hang_up as fn() -> StubResponse, lose_the_body] {
+            let mut responses: Vec<StubResponse> = (0..MAX_RETRIES).map(|_| lost()).collect();
+            responses.push(collected("A"));
+            let stub = CountingStub::start_with_headers(responses);
+            let service = heard_collect(&stub.api_base);
+
+            assert_eq!(
+                analyse(&service, &stub.api_base, &serde_json::json!({}))
+                    .await
+                    .unwrap(),
+                "A"
+            );
+            let requests = stub.requests();
+            assert_eq!(requests.len(), 8);
+            assert!(is_collecting(&requests[7]));
+            assert!(!requests[..7].iter().any(|request| is_collecting(request)));
+        }
+    }
+
+    /// A call that is one request and no other sends no collecting request
+    /// either, whatever the route has stated.
+    #[tokio::test]
+    async fn a_single_request_call_sends_no_collecting_request() {
+        let stub = CountingStub::start_with_headers(cuts(1));
+        let service = heard_collect(&stub.api_base).with_retry_policy(RetryPolicy::ONCE);
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("a cut ends a best-effort call");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(stub.attempts(), 1);
+    }
+
+    /// What only a cloud that ran a collecting request as an ordinary one
+    /// answers: a 200 that does not say the text was held, and the model
+    /// refusing. Neither changes what the call does. The answer is used,
+    /// since it is there, and the refusal is nothing to collect: no further
+    /// request, and no verdict on the route's limit. The log line says what
+    /// was seen.
+    #[tokio::test]
+    async fn a_collecting_request_run_as_an_ordinary_one_changes_nothing_but_the_log() {
+        let mut responses = cuts(MAX_RETRIES);
+        responses.push((200, ANSWERED.to_string(), stating_collect()));
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+        assert_eq!(
+            analyse(&service, &stub.api_base, &serde_json::json!({}))
+                .await
+                .unwrap(),
+            "analysed"
+        );
+        assert_eq!(stub.attempts(), 8);
+
+        let mut responses = cuts(MAX_RETRIES);
+        responses.push(capacity_refusal());
+        let stub = CountingStub::start_with_headers(responses);
+        let service = heard_collect(&stub.api_base);
+        let limit = service.limits.for_route(FILE_ROUTE);
+        let error = analyse(&service, &stub.api_base, &serde_json::json!({}))
+            .await
+            .expect_err("nothing was collected");
+        assert_eq!(error.code, "gateway_error");
+        assert_eq!(limit.limit(), 4, "a collecting request cut the limit");
+        assert_eq!(stub.attempts(), 8);
+
+        let line = ran_as_ordinary_line(FILE_ROUTE, "a 200 without `cached: true`");
+        assert!(line.contains("ran it as an ordinary request"), "{line}");
+        assert!(line.split_whitespace().count() <= 30, "{line}");
+    }
+
     /// The process-wide cap and each route's starting limit in the scripted
     /// tests: the scanner's own default.
     const SCRIPTED_CAP: usize = DEFAULT_CONCURRENCY_LIMIT;
 
     /// How long the scripted cloud takes to refuse a request and to answer
-    /// one: the medians of the large first index the windows below are from.
+    /// one. The fourteen seconds is the median for a refused request on the
+    /// run the windows below are from. The eight is the median answer on
+    /// another large first index, and no test turns on it.
     const REFUSED_AFTER: Duration = Duration::from_secs(14);
     const ANSWERED_AFTER: Duration = Duration::from_secs(8);
 
@@ -4654,7 +5806,7 @@ pub(crate) mod tests {
     /// The file route's refusal windows on one large first index, in seconds
     /// from the start of the run: each is a run of capacity refusals no more
     /// than ninety seconds apart, from its first to its last. 83 refusals in
-    /// nine windows, 21.7 minutes between them, the longest twelve and a half.
+    /// nine windows that add up to 21.7 minutes, the longest twelve and a half.
     ///
     /// The run's log holds 84 refusals of per-file calls. One, 29 seconds
     /// after the first here, was the intent route's and is left out, which is
@@ -4730,10 +5882,11 @@ pub(crate) mod tests {
     /// Send [`LOGGED_LOAD`] at a route that refuses EVERY request in flight
     /// while one of [`LOGGED_WINDOWS`] is open, and answers every other.
     ///
-    /// Harsher than the run it is from, where at most a third of the requests
-    /// inside a window were refused: a file here is refused for as long as
-    /// the window lasts, so no file gets through a window by luck. Services
-    /// run one after another, each no earlier than it did.
+    /// Harsher than the run it is from, where about a third of the requests
+    /// were refused in the worst six minutes of a window and fewer in the
+    /// rest: a file here is refused for as long as the window lasts, so no
+    /// file gets through a window by luck. Services run one after another,
+    /// each no earlier than it did.
     async fn replay_logged_windows(policy: RetryPolicy) -> Replay {
         use std::sync::atomic::AtomicUsize;
 

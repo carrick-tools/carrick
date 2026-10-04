@@ -1103,3 +1103,67 @@ async fn a_file_the_model_refused_for_capacity_still_waits_before_the_retry() {
         "the retry of a refused file waited {waited:?}"
     );
 }
+
+/// What the cloud answers a file whose every try came back incomplete: the
+/// verdict it keeps for the request, final by its own flag. Named by that
+/// flag here and nowhere by its code.
+const ANSWERED_WITH_A_FINAL_VERDICT: &str = r#"{"success":false,"error":{"code":"output_truncated","message":"every try at the file was incomplete","retriable":false,"details":{"reason":"finish_max_tokens","max_part_candidates":32,"replayed":true}}}"#;
+
+/// carrick#1897: a file the cloud says cannot be answered is not asked about
+/// again in the run. Its service owes nothing another ask could mend, so the
+/// retry of owed work passes it by: three file requests, one a service, where
+/// a file a gateway cut ended makes four. The injected verdict answers once,
+/// so a second ask would be answered and the file would read as recovered.
+///
+/// The file is still missing from the index and is recorded under the
+/// cloud's own code, so its service lands pending on a first index, named on
+/// the final write, exactly as a service with any other lost file does.
+#[tokio::test]
+#[serial]
+async fn a_file_with_a_final_answer_is_not_asked_again_in_the_run() {
+    let (storage, file_requests, waited) = scan_with_one_owed_file(60, || {
+        carrick::agent_service::inject_mock_envelope(
+            "/analyze-file",
+            BETA_ONLY_ROUTE,
+            1,
+            ANSWERED_WITH_A_FINAL_VERDICT,
+        );
+    })
+    .await;
+
+    assert_eq!(
+        file_requests, 3,
+        "one file a service, and the one with a final answer is not asked again"
+    );
+    assert_eq!(waited, std::time::Duration::ZERO);
+
+    let losses = carrick::scan_health::service_losses(Some("beta"));
+    let lost = carrick::scan_health::unanalysed_files_for(Some("beta"));
+    // The run's losses are the process's: what this scan leaves on beta
+    // would be owed by beta in every later scan of this binary.
+    carrick::scan_health::forget_service_losses(Some("beta"));
+    assert_eq!((losses.files, losses.final_files), (1, 1), "{losses:?}");
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert!(lost[0].path.ends_with("server.ts"), "{lost:?}");
+    assert_eq!(
+        lost[0].reason, "output_truncated",
+        "the file is recorded under the cloud's code, not as a gateway error"
+    );
+
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let beta = storage.latest("beta").unwrap();
+    assert!(
+        !beta
+            .file_results
+            .unwrap_or_default()
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "the file has no answer in the index"
+    );
+    assert_eq!(
+        *storage.pending_named.lock().unwrap(),
+        [vec!["beta".to_string()]],
+        "its service is pending, as with any lost file"
+    );
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
+}

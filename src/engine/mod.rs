@@ -666,9 +666,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The run's ceilings on waiting out a refusing model: the one its
     // service-level calls and its in-run retry share (carrick#1126), and each
     // route's for the per-file calls a capacity refusal holds up
-    // (carrick#1893).
+    // (carrick#1893). With them, what the cloud has stated it can do, which
+    // is heard afresh in every run (carrick#1897).
     crate::retry_budget::reset();
-    crate::agent_service::reset_refusal_budgets();
+    crate::agent_service::reset_for_run();
 
     // Said before the scan, not after it: the point is that a capture pass set
     // up this way costs a full pass and leaves nothing behind (carrick#966).

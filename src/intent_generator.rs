@@ -1841,11 +1841,11 @@ mod tests {
             transport.sent.lock().unwrap().push(payload.clone());
             async move {
                 if payload.get("functions").is_some() {
-                    Err(AgentCallError {
-                        code: "validation_failed".to_string(),
-                        message: "name (non-empty string) is required".to_string(),
-                        retriable: false,
-                    })
+                    Err(AgentCallError::from_cloud(
+                        "validation_failed",
+                        "name (non-empty string) is required",
+                        false,
+                    ))
                 } else {
                     single_answer(&payload)
                 }
@@ -1872,13 +1872,7 @@ mod tests {
             let state = BatchState::new();
             let out = describe_unit(vec![pending("a"), pending("b")], &state, |payload| {
                 transport.sent.lock().unwrap().push(payload.clone());
-                async move {
-                    Err(AgentCallError {
-                        code: code.to_string(),
-                        message: "no".to_string(),
-                        retriable,
-                    })
-                }
+                async move { Err(AgentCallError::from_cloud(code, "no", retriable)) }
             })
             .await;
             assert!(transport.singles().is_empty(), "{code}");
@@ -2011,11 +2005,11 @@ mod tests {
 
         let outcomes = generate_level(level, 2, |p| async move {
             if p.name == "boom" {
-                let err = AgentCallError {
-                    code: "model_error".to_string(),
-                    message: "Gemini overloaded; retries exhausted".to_string(),
-                    retriable: true,
-                };
+                let err = AgentCallError::from_cloud(
+                    "model_error",
+                    "Gemini overloaded; retries exhausted",
+                    true,
+                );
                 return (p, Err(err));
             }
             let intent = format!("intent for {}", p.name);
@@ -2178,11 +2172,11 @@ mod tests {
                         .collect();
                     Ok(answer(&rows))
                 } else if recorder.fail.contains(&names[0]) {
-                    Err(AgentCallError {
-                        code: "model_error".to_string(),
-                        message: "retries exhausted".to_string(),
-                        retriable: true,
-                    })
+                    Err(AgentCallError::from_cloud(
+                        "model_error",
+                        "retries exhausted",
+                        true,
+                    ))
                 } else {
                     Ok(format!("describes {}", names[0]))
                 }

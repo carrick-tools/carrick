@@ -208,9 +208,23 @@ impl OwedWork {
     }
 
     /// Whether another try in this run could change anything. A budget that
-    /// refused the model will refuse it again a few minutes later.
+    /// refused the model will refuse it again a few minutes later, and a file
+    /// whose answer the cloud called final gets that answer again
+    /// (carrick#1897).
     pub fn worth_retrying(&self) -> bool {
-        !self.is_empty() && !self.deferred_by_refusal()
+        !self.is_empty() && !self.deferred_by_refusal() && !self.owes_only_final_files()
+    }
+
+    /// Whether all this service owes is files whose answer the cloud called
+    /// final ([`ServiceLosses::final_files`]). They are still missing from its
+    /// index, so the service is pending and held back like any other that lost
+    /// a file; what changes is that nothing asks for them again.
+    fn owes_only_final_files(&self) -> bool {
+        self.deferred.is_none()
+            && self.retry_error.is_none()
+            && self.losses.intents == 0
+            && self.losses.files > 0
+            && self.losses.files == self.losses.final_files
     }
 
     /// What of this the model refused for capacity
@@ -244,8 +258,15 @@ impl OwedWork {
         if let Some(reason) = &self.deferred {
             parts.push(reason.clone());
         }
-        if self.losses.files > 0 {
-            parts.push(format!("{} file(s) not analysed", self.losses.files));
+        let owed_files = self.losses.files.saturating_sub(self.losses.final_files);
+        if owed_files > 0 {
+            parts.push(format!("{owed_files} file(s) not analysed"));
+        }
+        if self.losses.final_files > 0 {
+            parts.push(format!(
+                "{} file(s) the cloud cannot analyse",
+                self.losses.final_files
+            ));
         }
         if self.losses.intents > 0 {
             parts.push(format!(
@@ -384,6 +405,11 @@ pub async fn wait_with_progress(delay: Duration, mut progress: impl FnMut(Durati
 ///
 /// `laptop` picks the sentence about what to run: `carrick index` is the
 /// command on a laptop, and the next push is what re-scans in CI.
+///
+/// A file whose answer the cloud called final is not something a re-run
+/// finishes, so the advice to re-run covers the rest of what is pending and
+/// is left out when there is no rest; such files get the sentence that says
+/// what a re-run does for them (carrick#1897).
 pub fn pending_summary(
     complete: &[String],
     pending: &[(String, OwedWork)],
@@ -399,14 +425,37 @@ pub fn pending_summary(
         .map(|(service, owed)| format!("{service} ({})", owed.describe()))
         .collect::<Vec<_>>()
         .join(", ");
-    let rerun = if laptop {
-        "Re-run `carrick index` to finish them: it asks the model only for the pending work and \
-         replays everything else from cache."
-    } else {
-        "The next scan asks the model only for the pending work and replays everything else \
-         from cache."
-    };
-    format!("{complete_line} Pending model analysis: {pending_line}. {rerun}")
+    let final_files: usize = pending
+        .iter()
+        .map(|(_, owed)| owed.losses.final_files)
+        .sum();
+    let a_rerun_finishes_some = pending
+        .iter()
+        .any(|(_, owed)| !owed.owes_only_final_files());
+    let what = if final_files > 0 { "the rest" } else { "them" };
+    let rerun = a_rerun_finishes_some.then(|| {
+        if laptop {
+            format!(
+                "Re-run `carrick index` to finish {what}: it asks the model only for the pending \
+                 work and replays everything else from cache."
+            )
+        } else {
+            "The next scan asks the model only for the pending work and replays everything else \
+             from cache."
+                .to_string()
+        }
+    });
+    let closing: Vec<String> = [
+        rerun,
+        crate::scan_health::final_answer_sentence(final_files),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    format!(
+        "{complete_line} Pending model analysis: {pending_line}. {}",
+        closing.join(" ")
+    )
 }
 
 #[cfg(test)]
@@ -639,11 +688,8 @@ mod tests {
 
     #[test]
     fn a_guidance_failure_keeps_the_detection_and_analyses_with_the_stand_ins() {
-        let error = crate::agent_service::AgentCallError {
-            code: "model_error".to_string(),
-            message: "overloaded".to_string(),
-            retriable: true,
-        };
+        let error =
+            crate::agent_service::AgentCallError::from_cloud("model_error", "overloaded", true);
         let detection = DetectionResult {
             frameworks: vec!["express".to_string()],
             ..DetectionResult::default()
@@ -691,11 +737,8 @@ mod tests {
     /// `tests/scan_durability_test.rs`, which reads the uploaded payload.
     #[test]
     fn a_deferred_setup_names_the_stage_and_the_cloud_code() {
-        let error = crate::agent_service::AgentCallError {
-            code: "model_error".to_string(),
-            message: "overloaded".to_string(),
-            retriable: true,
-        };
+        let error =
+            crate::agent_service::AgentCallError::from_cloud("model_error", "overloaded", true);
         let setup = ModelSetup::deferred("framework detection", &error);
         assert_eq!(
             setup.deferred.as_deref(),
@@ -722,5 +765,118 @@ mod tests {
         );
         assert!(line.contains("carrick index"), "{line}");
         assert!(line.contains("only for the pending work"), "{line}");
+    }
+
+    /// `files` lost files, `final_files` of them on an answer the cloud
+    /// called final.
+    fn lost_with_final(files: usize, final_files: usize) -> OwedWork {
+        OwedWork {
+            losses: ServiceLosses {
+                files,
+                final_files,
+                ..ServiceLosses::default()
+            },
+            ..OwedWork::default()
+        }
+    }
+
+    /// carrick#1897: a service that owes only files whose answer is final is
+    /// not retried, because asking again gets that answer again. It is still
+    /// pending and still held back: the files are missing from its index like
+    /// any other lost file. One thing another ask may mend beside them, and
+    /// the service is retried as it always was.
+    #[test]
+    fn a_service_that_owes_only_final_files_is_pending_and_not_retried() {
+        let only_final = lost_with_final(2, 2);
+        assert!(!only_final.is_empty());
+        assert!(!only_final.worth_retrying());
+        assert!(only_final.thins_the_index());
+        assert!(!only_final.only_refused());
+        assert_eq!(only_final.refused_for_capacity(), None);
+        assert!(holds_back(&only_final, true, true, false));
+        assert!(holds_back(&only_final, false, false, false));
+        assert!(!holds_back(&only_final, false, true, false));
+
+        assert!(lost_with_final(2, 1).worth_retrying());
+        assert!(lost_with_final(2, 0).worth_retrying());
+        let with_intents = OwedWork {
+            losses: ServiceLosses {
+                files: 1,
+                final_files: 1,
+                intents: 3,
+                ..ServiceLosses::default()
+            },
+            ..OwedWork::default()
+        };
+        assert!(with_intents.worth_retrying());
+        let deferred = OwedWork {
+            deferred: Some("framework guidance: model_error".to_string()),
+            ..lost_with_final(1, 1)
+        };
+        assert!(deferred.worth_retrying());
+    }
+
+    const FINAL_ANSWER_FOR_ONE: &str = "The cloud's answer for 1 file(s) is final: a re-run gets \
+                                        the same until the file or Carrick changes.";
+
+    /// carrick#1897: the run's closing lines never advise a re-run for a file
+    /// whose answer is final. A service that owes nothing else gets no such
+    /// advice at all, on a laptop or in CI, and the sentence that stands in
+    /// its place says what a re-run does.
+    #[test]
+    fn the_summary_advises_no_rerun_for_a_file_whose_answer_is_final() {
+        let pending = [("billing".to_string(), lost_with_final(1, 1))];
+        for laptop in [true, false] {
+            assert_eq!(
+                pending_summary(&["api".to_string()], &pending, laptop),
+                format!(
+                    "Complete: api. Pending model analysis: billing (1 file(s) the cloud cannot \
+                     analyse). {FINAL_ANSWER_FOR_ONE}"
+                )
+            );
+        }
+    }
+
+    /// Beside work a re-run does finish, the advice covers that work and the
+    /// final file keeps its own sentence. With no final file the lines are
+    /// the ones they always were.
+    #[test]
+    fn the_summary_advises_a_rerun_for_the_rest_beside_a_final_file() {
+        let mixed = [
+            ("billing".to_string(), lost_with_final(3, 1)),
+            ("worker".to_string(), lost_with_final(1, 0)),
+        ];
+        assert_eq!(
+            pending_summary(&[], &mixed, true),
+            format!(
+                "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
+                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). Re-run \
+                 `carrick index` to finish the rest: it asks the model only for the pending work \
+                 and replays everything else from cache. {FINAL_ANSWER_FOR_ONE}"
+            )
+        );
+        assert_eq!(
+            pending_summary(&[], &mixed, false),
+            format!(
+                "Complete: none. Pending model analysis: billing (2 file(s) not analysed; 1 \
+                 file(s) the cloud cannot analyse), worker (1 file(s) not analysed). The next \
+                 scan asks the model only for the pending work and replays everything else from \
+                 cache. {FINAL_ANSWER_FOR_ONE}"
+            )
+        );
+
+        let owed = [("worker".to_string(), lost_with_final(2, 0))];
+        assert_eq!(
+            pending_summary(&[], &owed, true),
+            "Complete: none. Pending model analysis: worker (2 file(s) not analysed). Re-run \
+             `carrick index` to finish them: it asks the model only for the pending work and \
+             replays everything else from cache."
+        );
+        assert_eq!(
+            pending_summary(&[], &owed, false),
+            "Complete: none. Pending model analysis: worker (2 file(s) not analysed). The next \
+             scan asks the model only for the pending work and replays everything else from \
+             cache."
+        );
     }
 }

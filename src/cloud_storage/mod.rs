@@ -23,7 +23,9 @@ mod mock_storage;
 pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::{AwsStorage, RUN_REPO_COUNT_ENV};
-pub(crate) use aws_storage::{INLINE_PAYLOAD_LIMIT_BYTES, indexed_service_slug};
+pub(crate) use aws_storage::{
+    INLINE_PAYLOAD_LIMIT_BYTES, handler_may_still_run, indexed_service_slug,
+};
 mod local_dir_storage;
 mod tee_storage;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage, PEERS_ENV};

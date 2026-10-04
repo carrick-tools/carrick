@@ -120,7 +120,33 @@ type Scope = Option<String>;
 struct LostFile {
     scope: Scope,
     path: String,
-    reason: String,
+    reason: LossReason,
+}
+
+/// Why a file has no analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LossReason {
+    /// A stable code, not a sentence: the cloud's error code, or a
+    /// scanner-side pseudo-code. The summary groups by it and the upload
+    /// names it.
+    pub code: String,
+    /// The cloud answered that the request cannot succeed
+    /// ([`crate::agent_service::AgentCallError::is_final_answer`]). Asking
+    /// again gets the same answer, so the file is not asked about again in
+    /// this run and nobody is told that running again finishes it
+    /// (carrick#1897).
+    pub is_final: bool,
+}
+
+impl LossReason {
+    /// A loss another ask may mend: the file is owed, as every loss was
+    /// before the cloud kept a final answer.
+    pub fn owed(code: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            is_final: false,
+        }
+    }
 }
 
 /// What one service still owes the model at a point in the run.
@@ -137,6 +163,10 @@ pub struct ServiceLosses {
     pub capacity_files: usize,
     /// How many of `intents` ended the same way.
     pub capacity_intents: usize,
+    /// How many of `files` ended on an answer the cloud called final
+    /// ([`LossReason::is_final`]). They have no analysis, like the rest, and
+    /// no further ask changes that.
+    pub final_files: usize,
 }
 
 impl ServiceLosses {
@@ -152,11 +182,11 @@ impl Registry {
     }
 
     /// Records that `path` has no analysis, and why.
-    fn record_unanalysed_file(&mut self, path: &str, reason: &str) {
+    fn record_unanalysed_file(&mut self, path: &str, reason: &LossReason) {
         self.lost.push(LostFile {
             scope: self.current.clone(),
             path: path.to_string(),
-            reason: reason.to_string(),
+            reason: reason.clone(),
         });
     }
 
@@ -183,9 +213,11 @@ impl Registry {
             files: files.clone().count(),
             intents: intents.clone().map(|(_, n, _)| *n).sum(),
             capacity_files: files
-                .filter(|l| l.reason == crate::agent_service::CAPACITY_REFUSAL_CODE)
+                .clone()
+                .filter(|l| l.reason.code == crate::agent_service::CAPACITY_REFUSAL_CODE)
                 .count(),
             capacity_intents: intents.map(|(_, _, for_capacity)| *for_capacity).sum(),
+            final_files: files.filter(|l| l.reason.is_final).count(),
         }
     }
 
@@ -207,7 +239,7 @@ impl Registry {
             .filter(|l| l.scope == *scope)
             .map(|l| crate::cloud_storage::UnanalysedFile {
                 path: l.path.clone(),
-                reason: l.reason.clone(),
+                reason: l.reason.code.clone(),
             })
             .collect()
     }
@@ -331,7 +363,7 @@ impl Registry {
 
         let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
         for lost in &self.lost {
-            *by_reason.entry(lost.reason.as_str()).or_default() += 1;
+            *by_reason.entry(lost.reason.code.as_str()).or_default() += 1;
         }
         let mut reasons: Vec<(&str, usize)> = by_reason.into_iter().collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -381,11 +413,9 @@ pub fn record_files_attempted(count: usize) {
         .record_files_attempted(count);
 }
 
-/// Records that `path` has no analysis in this run's index, and why.
-///
-/// `reason` is a stable code (the cloud's error code, or a scanner-side
-/// pseudo-code), not a sentence: the summary groups by it.
-pub fn record_unanalysed_file(path: &str, reason: &str) {
+/// Records that `path` has no analysis in this run's index, and why
+/// ([`analysis_failure_reason`]).
+pub fn record_unanalysed_file(path: &str, reason: &LossReason) {
     registry()
         .lock()
         .expect("scan health lock")
@@ -442,16 +472,32 @@ pub fn refusal_sentence<'a>(error: &'a (dyn std::error::Error + 'static)) -> Opt
         .filter(|sentence| !sentence.is_empty())
 }
 
-/// Reason code for a failed file analysis, for [`record_unanalysed_file`].
+/// Why a file analysis failed, for [`record_unanalysed_file`].
 ///
 /// Reads the cloud's own error code where the failure came from a lambda call,
 /// so the summary says `gateway_error` or `oidc_rejected` rather than a
-/// paragraph. Anything else is a malformed answer rather than an absent one.
-pub fn analysis_failure_reason(error: &(dyn std::error::Error + 'static)) -> String {
-    error
-        .downcast_ref::<crate::agent_service::AgentCallError>()
-        .map(|e| e.code.clone())
-        .unwrap_or_else(|| "unparseable_response".to_string())
+/// paragraph, and whether the cloud called its answer final. Anything else is
+/// a malformed answer rather than an absent one, and is owed.
+pub fn analysis_failure_reason(error: &(dyn std::error::Error + 'static)) -> LossReason {
+    match error.downcast_ref::<crate::agent_service::AgentCallError>() {
+        Some(call) => LossReason {
+            code: call.code.clone(),
+            is_final: call.is_final_answer(),
+        },
+        None => LossReason::owed("unparseable_response"),
+    }
+}
+
+/// What a run says about `files` files whose answer the cloud called final,
+/// in place of advice to run again: a re-run sends the same request and is
+/// answered the same. `None` when there are none.
+pub fn final_answer_sentence(files: usize) -> Option<String> {
+    (files > 0).then(|| {
+        format!(
+            "The cloud's answer for {files} file(s) is final: a re-run gets the same until the \
+             file or Carrick changes."
+        )
+    })
 }
 
 /// How many files this run lost.
@@ -625,11 +671,11 @@ mod tests {
     /// the run does not fail, and the upload proceeds facts-only.
     #[test]
     fn a_budget_refusal_is_not_a_lost_file_and_does_not_fail_the_run() {
-        let refused = AgentCallError {
-            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
-            message: "past the monthly allowance".to_string(),
-            retriable: false,
-        };
+        let refused = AgentCallError::from_cloud(
+            crate::agent_service::LLM_DISABLED_CODE,
+            "past the monthly allowance",
+            false,
+        );
         assert!(!counts_as_lost_file(&refused));
         assert!(is_budget_refusal(&refused));
 
@@ -660,11 +706,8 @@ mod tests {
     fn the_line_quotes_the_refusal_the_cloud_sent() {
         const SENT: &str = "Carrick has reached today's limit. This scan finished with facts only; \
              inferred results resume after 00:00 UTC.";
-        let refused = AgentCallError {
-            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
-            message: SENT.to_string(),
-            retriable: false,
-        };
+        let refused =
+            AgentCallError::from_cloud(crate::agent_service::LLM_DISABLED_CODE, SENT, false);
         assert_eq!(refusal_sentence(&refused), Some(SENT));
 
         let mut registry = run();
@@ -708,11 +751,8 @@ mod tests {
     /// message — still gets a line, in the scanner's own fallback.
     #[test]
     fn a_refusal_that_carried_no_sentence_falls_back() {
-        let wordless = AgentCallError {
-            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
-            message: "   ".to_string(),
-            retriable: false,
-        };
+        let wordless =
+            AgentCallError::from_cloud(crate::agent_service::LLM_DISABLED_CODE, "   ", false);
         assert_eq!(refusal_sentence(&wordless), None, "blank is not a sentence");
 
         let mut registry = run();
@@ -732,11 +772,7 @@ mod tests {
     /// tells somebody why their scan was facts-only.
     #[test]
     fn a_failure_that_is_not_a_refusal_has_no_sentence() {
-        let failed = AgentCallError {
-            code: "model_error".to_string(),
-            message: "the model returned nothing".to_string(),
-            retriable: true,
-        };
+        let failed = AgentCallError::from_cloud("model_error", "the model returned nothing", true);
         assert_eq!(refusal_sentence(&failed), None);
         assert_eq!(
             refusal_sentence(&std::io::Error::other("connection reset")),
@@ -750,11 +786,7 @@ mod tests {
     /// good one (#461).
     #[test]
     fn a_call_that_was_made_and_failed_is_still_a_lost_file() {
-        let failed = AgentCallError {
-            code: "model_error".to_string(),
-            message: "the model returned nothing".to_string(),
-            retriable: true,
-        };
+        let failed = AgentCallError::from_cloud("model_error", "the model returned nothing", true);
         assert!(counts_as_lost_file(&failed));
         assert!(!is_budget_refusal(&failed));
 
@@ -772,11 +804,7 @@ mod tests {
     /// not a refusal, whatever the word sounds like (carrick-cloud#401).
     #[test]
     fn a_spent_rate_limited_answer_is_a_loss_not_a_refusal() {
-        let spent = AgentCallError {
-            code: "rate_limited".to_string(),
-            message: "Gemini quota exceeded".to_string(),
-            retriable: true,
-        };
+        let spent = AgentCallError::from_cloud("rate_limited", "Gemini quota exceeded", true);
         assert!(counts_as_lost_file(&spent));
         assert!(!is_budget_refusal(&spent));
     }
@@ -788,7 +816,10 @@ mod tests {
         let untyped = std::io::Error::other("connection reset");
         assert!(counts_as_lost_file(&untyped));
         assert!(!is_budget_refusal(&untyped));
-        assert_eq!(analysis_failure_reason(&untyped), "unparseable_response");
+        assert_eq!(
+            analysis_failure_reason(&untyped),
+            LossReason::owed("unparseable_response")
+        );
     }
 
     /// A run that lost nothing says nothing and passes.
@@ -826,7 +857,7 @@ mod tests {
     fn a_lost_file_is_named_and_owed_by_its_service() {
         let mut run = run();
         run.record_files_attempted(3);
-        run.record_unanalysed_file("src/routes/orders.ts", "gateway_error");
+        run.record_unanalysed_file("src/routes/orders.ts", &LossReason::owed("gateway_error"));
 
         let summary = run
             .summary_line()
@@ -852,10 +883,10 @@ mod tests {
         let mut run = run();
         run.current = api.clone();
         run.record_files_attempted(4);
-        run.record_unanalysed_file("api/src/a.ts", "model_error");
+        run.record_unanalysed_file("api/src/a.ts", &LossReason::owed("model_error"));
         run.current = billing.clone();
         run.record_files_attempted(2);
-        run.record_unanalysed_file("billing/src/b.ts", "gateway_error");
+        run.record_unanalysed_file("billing/src/b.ts", &LossReason::owed("gateway_error"));
         run.record_intents_failed(3, 0);
 
         assert_eq!(run.service_losses(&api).files, 1);
@@ -884,16 +915,16 @@ mod tests {
         let billing = Some("billing".to_string());
         let mut run = run();
         run.current = api.clone();
-        run.record_unanalysed_file("api/src/a.ts", "gateway_error");
-        run.record_unanalysed_file("api/src/b.ts", "network_error");
-        run.record_unanalysed_file("api/src/c.ts", "analysis_in_flight");
+        run.record_unanalysed_file("api/src/a.ts", &LossReason::owed("gateway_error"));
+        run.record_unanalysed_file("api/src/b.ts", &LossReason::owed("network_error"));
+        run.record_unanalysed_file("api/src/c.ts", &LossReason::owed("analysis_in_flight"));
         run.record_intents_failed(4, 0);
         run.current = billing.clone();
         run.record_unanalysed_file(
             "billing/src/a.ts",
-            crate::agent_service::CAPACITY_REFUSAL_CODE,
+            &LossReason::owed(crate::agent_service::CAPACITY_REFUSAL_CODE),
         );
-        run.record_unanalysed_file("billing/src/b.ts", "gateway_error");
+        run.record_unanalysed_file("billing/src/b.ts", &LossReason::owed("gateway_error"));
         run.record_intents_failed(5, 2);
         run.record_intents_failed(1, 1);
 
@@ -904,6 +935,7 @@ mod tests {
                 intents: 4,
                 capacity_files: 0,
                 capacity_intents: 0,
+                final_files: 0,
             }
         );
         assert_eq!(
@@ -913,6 +945,7 @@ mod tests {
                 intents: 6,
                 capacity_files: 1,
                 capacity_intents: 3,
+                final_files: 0,
             }
         );
 
@@ -927,12 +960,12 @@ mod tests {
         let mut run = run();
         run.record_files_attempted(2987);
         for i in 0..8 {
-            run.record_unanalysed_file(&format!("a/{i}.ts"), "gateway_error");
+            run.record_unanalysed_file(&format!("a/{i}.ts"), &LossReason::owed("gateway_error"));
         }
         for i in 0..3 {
-            run.record_unanalysed_file(&format!("b/{i}.ts"), "model_error");
+            run.record_unanalysed_file(&format!("b/{i}.ts"), &LossReason::owed("model_error"));
         }
-        run.record_unanalysed_file("c/0.ts", "oidc_rejected");
+        run.record_unanalysed_file("c/0.ts", &LossReason::owed("oidc_rejected"));
 
         let summary = run.summary_line().unwrap();
         assert!(
@@ -1009,23 +1042,111 @@ mod tests {
         assert!(!should_fail_on_missing_types(false, false));
     }
 
-    /// The reason comes from the cloud's own error code when there is one.
+    /// The reason comes from the call's own error code when there is one. A
+    /// rejected token is the scanner's own reading of a failure, permanent
+    /// for the call and nothing the cloud said about the request, so the file
+    /// is owed as it always was.
     #[test]
     fn failure_reason_reads_the_cloud_error_code() {
-        let call_error: Box<dyn std::error::Error> = Box::new(AgentCallError {
-            code: "oidc_rejected".to_string(),
-            message: "token expired".to_string(),
-            retriable: false,
-        });
+        let call_error: Box<dyn std::error::Error> = Box::new(AgentCallError::permanent(
+            "oidc_rejected",
+            "token expired".to_string(),
+        ));
         assert_eq!(
             analysis_failure_reason(call_error.as_ref()),
-            "oidc_rejected"
+            LossReason::owed("oidc_rejected")
         );
 
         let other: Box<dyn std::error::Error> = "not JSON".into();
         assert_eq!(
             analysis_failure_reason(other.as_ref()),
-            "unparseable_response"
+            LossReason::owed("unparseable_response")
+        );
+    }
+
+    /// carrick#1897: a file is final only on the cloud's own word. An error
+    /// envelope with `retriable: false` is one whatever its code, a code this
+    /// build has never heard of included. A retriable envelope is not, a
+    /// failure the scanner classified itself is not, and a limit of the
+    /// cloud's never reaches the lost files at all.
+    #[test]
+    fn a_file_is_final_only_when_the_cloud_said_its_request_cannot_succeed() {
+        fn final_answer(error: &(dyn std::error::Error + 'static)) -> bool {
+            analysis_failure_reason(error).is_final
+        }
+        assert!(final_answer(&AgentCallError::from_cloud(
+            "output_truncated",
+            "every try was cut",
+            false
+        )));
+        assert!(final_answer(&AgentCallError::from_cloud(
+            "a_later_verdict",
+            "no",
+            false
+        )));
+        assert!(!final_answer(&AgentCallError::from_cloud(
+            "model_error",
+            "overloaded",
+            true
+        )));
+        assert!(!final_answer(&AgentCallError::permanent(
+            "bad_response",
+            "not an envelope".to_string()
+        )));
+        let refused = AgentCallError::from_cloud(
+            crate::agent_service::LLM_DISABLED_CODE,
+            "past the allowance",
+            false,
+        );
+        assert!(!counts_as_lost_file(&refused));
+        assert!(!refused.is_final_answer());
+        assert!(!final_answer(&std::io::Error::other("connection reset")));
+    }
+
+    /// What a service owes says how many of its lost files are final, the
+    /// summary names them by the code they ended on, and the upload's list
+    /// carries that code like any other.
+    #[test]
+    fn final_files_are_counted_apart_and_named_by_their_code() {
+        let truncated = AgentCallError::from_cloud("output_truncated", "every try was cut", false);
+        let mut run = run();
+        run.record_files_attempted(3);
+        run.record_unanalysed_file("src/routes.ts", &analysis_failure_reason(&truncated));
+        run.record_unanalysed_file("src/orders.ts", &LossReason::owed("gateway_error"));
+
+        assert_eq!(
+            run.service_losses(&None),
+            ServiceLosses {
+                files: 2,
+                final_files: 1,
+                ..ServiceLosses::default()
+            }
+        );
+        let summary = run.summary_line().expect("two files were lost");
+        assert!(
+            summary
+                .starts_with("2 of 3 files were not analysed: 1 gateway_error, 1 output_truncated"),
+            "{summary}"
+        );
+        let listed = run.unanalysed_files_for(&None);
+        assert_eq!(listed[0].reason, "output_truncated");
+        assert_eq!(listed[1].reason, "gateway_error");
+    }
+
+    /// The sentence that stands where "run again" would: how many files, that
+    /// a re-run changes nothing, and what would. Short enough to read.
+    #[test]
+    fn the_final_answer_sentence_says_what_a_rerun_does() {
+        assert_eq!(final_answer_sentence(0), None);
+        let sentence = final_answer_sentence(2).unwrap();
+        assert_eq!(
+            sentence,
+            "The cloud's answer for 2 file(s) is final: a re-run gets the same until the file or \
+             Carrick changes."
+        );
+        assert!(
+            sentence.split_whitespace().count() <= 20,
+            "a line a person reads, not a paragraph: {sentence}"
         );
     }
 }

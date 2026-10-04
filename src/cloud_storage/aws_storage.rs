@@ -60,7 +60,10 @@ fn max_retries_for_action(action: &str) -> u32 {
 /// response is lost while the write goes on (carrick#1067; on 2026-09-14 it
 /// landed 25 s after the cut). A 408 or a 429 is the edge refusing, and
 /// nothing is running behind it.
-fn handler_may_still_run(status: Option<reqwest::StatusCode>) -> bool {
+///
+/// The prompt calls draw the same line for a file analysis whose last attempt
+/// got no answer from its lambda ([`crate::agent_service`], carrick#1897).
+pub(crate) fn handler_may_still_run(status: Option<reqwest::StatusCode>) -> bool {
     match status {
         Some(status) => status.is_server_error(),
         // No status at all: the request failed in transport, having already
@@ -221,13 +224,36 @@ fn report_partial_acceptance(response: &WriteActionResponse, data: &CloudRepoDat
     let service = data.service_name.as_deref().unwrap_or(&data.repo_name);
     warn!(
         "Carrick indexed {} without {} file(s) the model did not answer for ({}{}). \
-         This was accepted because {} had no index yet; run the scan again to fill them in.",
+         This was accepted because {} had no index yet. {}",
         service,
         files.len(),
         named.join(", "),
         and_more,
-        service
+        service,
+        partial_acceptance_advice(crate::scan_health::service_losses(
+            data.service_name.as_deref()
+        ))
     );
+}
+
+/// What to do about the files a partial index landed without: run the scan
+/// again for those another ask may answer, and for those whose answer the
+/// cloud called final, the sentence that says a re-run changes nothing
+/// (carrick#1897). Read off the service's own losses, which are the list the
+/// cloud echoed.
+fn partial_acceptance_advice(losses: crate::scan_health::ServiceLosses) -> String {
+    let final_answer = crate::scan_health::final_answer_sentence(losses.final_files);
+    let rerun = match (&final_answer, losses.files > losses.final_files) {
+        (None, _) => Some("Run the scan again to fill them in."),
+        (Some(_), true) => Some("Run the scan again to fill in the rest."),
+        (Some(_), false) => None,
+    };
+    rerun
+        .map(str::to_string)
+        .into_iter()
+        .chain(final_answer)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether a refusal is about the credential rather than about the request.
@@ -3851,6 +3877,33 @@ mod tests {
         assert!(ci.unanalysed_files(&blob()).is_none());
         assert!(ci.scan_id().is_none());
         assert!(ci.uploads_run_logs());
+    }
+
+    /// carrick#1897: a partial index that landed is followed by advice to run
+    /// again only for the files another ask may answer. A file whose answer
+    /// the cloud called final gets the sentence that says a re-run changes
+    /// nothing, and when every missing file is one, no advice to run again.
+    #[test]
+    fn a_partial_index_advises_a_rerun_only_for_files_another_ask_may_answer() {
+        let losses = |files, final_files| crate::scan_health::ServiceLosses {
+            files,
+            final_files,
+            ..Default::default()
+        };
+        assert_eq!(
+            partial_acceptance_advice(losses(2, 0)),
+            "Run the scan again to fill them in."
+        );
+        assert_eq!(
+            partial_acceptance_advice(losses(3, 1)),
+            "Run the scan again to fill in the rest. The cloud's answer for 1 file(s) is final: \
+             a re-run gets the same until the file or Carrick changes."
+        );
+        assert_eq!(
+            partial_acceptance_advice(losses(2, 2)),
+            "The cloud's answer for 2 file(s) is final: a re-run gets the same until the file or \
+             Carrick changes."
+        );
     }
 
     /// Both credentials ship their run log now (carrick#1063). The laptop's
