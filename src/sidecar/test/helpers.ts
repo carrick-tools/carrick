@@ -77,6 +77,8 @@ export class SidecarClient {
           if (line.trim()) {
             try {
               const response = JSON.parse(line);
+              // A progress frame is not an answer (carrick#1914).
+              if (response?.status === 'progress') continue;
               const promise = this.responsePromises.shift();
               if (promise) {
                 promise.resolve(response);

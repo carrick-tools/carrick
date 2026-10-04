@@ -410,15 +410,25 @@ export interface TypeInferrerOptions {
 /**
  * How long the unwidened reading of one batch may take by default. The
  * reading adds a field and never an answer, so running out costs only the
- * readings not yet made; the rewrite is always undone.
+ * readings not yet made; the rewrite is always undone. It reports no
+ * progress, so this is also the longest a batch goes silent after its last
+ * request: well inside the 900s the scanner allows between two signs of life.
  */
 const UNWIDENED_BUDGET_MS = 120_000;
 /**
- * No reading starts or continues past this long after the batch began: the
- * scanner's read deadline for one request is 900s, and the inferences the
- * batch already made must reach it.
+ * No reading starts or continues past this long after the batch began. The
+ * number dates from when the scanner allowed a whole request 900s; it now
+ * allows that long between progress reports (carrick#1914), so a batch can
+ * run past this and still be read. A batch that does publishes no unwidened
+ * reading, as before.
  */
 const UNWIDENED_LATEST_MS = 600_000;
+
+/**
+ * Called each time an `infer` batch is done with one of its requests,
+ * whatever that request answered: skipped, refused, failed or inferred.
+ */
+export type InferRequestDone = () => void;
 
 /**
  * Result of unwrapping a type
@@ -532,11 +542,13 @@ export class TypeInferrer {
    *
    * @param requests - Array of inference requests
    * @param extractionConfig - Agent-generated extraction config for payload unwrapping
+   * @param onRequestDone - Called once per request, as the batch is done with it
    * @returns InferResult with inferred types or errors
    */
   infer(
     requests: InferRequestItem[],
-    extractionConfig?: ExtractionConfig
+    extractionConfig?: ExtractionConfig,
+    onRequestDone?: InferRequestDone
   ): InferResult {
     const started = performance.now();
     const inferredTypes: InferredType[] = [];
@@ -545,15 +557,15 @@ export class TypeInferrer {
     const responses: Array<{ request: InferRequestItem; result: InferredType }> = [];
 
     for (const request of requests) {
-      // Plain JavaScript has no type annotations to extract, and `checkJs` is
-      // off, so inferring against a `.js` file yields nothing useful — it only
-      // crashes deep in the compiler API on undefined symbols (`escapedName`,
-      // `flags`) and floods the log with the resulting error strings. Skip it.
-      // `allowJs` stays on so `.ts` files can still resolve `.js` imports.
-      if (/\.(js|jsx|mjs|cjs)$/i.test(request.file_path)) {
-        continue;
-      }
       try {
+        // Plain JavaScript has no type annotations to extract, and `checkJs` is
+        // off, so inferring against a `.js` file yields nothing useful — it only
+        // crashes deep in the compiler API on undefined symbols (`escapedName`,
+        // `flags`) and floods the log with the resulting error strings. Skip it.
+        // `allowJs` stays on so `.ts` files can still resolve `.js` imports.
+        if (/\.(js|jsx|mjs|cjs)$/i.test(request.file_path)) {
+          continue;
+        }
         const loc = this.formatRequestLocation(request);
         const itemError = validateInferRequestItem(request);
         if (itemError) {
@@ -585,6 +597,8 @@ export class TypeInferrer {
         errors.push(
           `Error inferring type at ${request.file_path}:${loc}: ${error}`
         );
+      } finally {
+        onRequestDone?.();
       }
     }
 

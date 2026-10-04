@@ -10,6 +10,11 @@
  * - stdout is ONLY for JSON responses
  * - stderr is for logging
  * - Process stays alive between requests (warm standby)
+ * - One request at a time. A handler that runs the compiler blocks the event
+ *   loop until it returns, so a request sent meanwhile waits in the pipe, and
+ *   nothing can cancel the one that is running. The scanner kills a process
+ *   that goes silent past its deadline; a long handler stays alive by writing
+ *   `progress` frames as it finishes units of work (writeProgress).
  */
 
 import * as path from 'node:path';
@@ -27,6 +32,7 @@ import {
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
+import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -230,7 +236,11 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
     // A symbol named by a path is bundled from the program of the project
     // that owns that file (carrick#1604).
     const results = [...byProject(request.symbols, (symbol) => symbol.source_file)].map(
-      ([key, symbols]) => projectComponents(key).typeBundler.bundle(symbols)
+      ([key, symbols]) => {
+        const { typeBundler } = projectComponents(key);
+        writeProgress(request.request_id, 'bundle', 'program ready');
+        return typeBundler.bundle(symbols);
+      }
     );
     const result = results.length === 1 ? results[0] : mergeBundles(results);
 
@@ -356,8 +366,17 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
+    // One count for the request, whichever programs its items span.
+    let done = 0;
+    const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+      writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
+    );
     const results = [...byProject(request.requests, (item) => item.file_path)].map(
-      ([key, items]) => projectComponents(key).typeInferrer.infer(items, request.extraction_config)
+      ([key, items]) =>
+        projectComponents(key).typeInferrer.infer(items, request.extraction_config, () => {
+          done += 1;
+          report();
+        })
     );
     const result =
       results.length === 1
@@ -480,6 +499,8 @@ function handleVerifyLibraryClaims(
   const started = performance.now();
   try {
     const { claimsVerifier } = projectComponents();
+    // The verifier's budget starts now, and so does the scanner's wait.
+    writeProgress(request.request_id, 'verify_library_claims', 'program ready');
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
     const { semantics, modules } = claimsVerifier.run(fromDir, request.checks, request.budget_ms ?? SEMANTICS_BUDGET_MS);
@@ -647,9 +668,15 @@ function writeResponse(response: SidecarResponse): void {
 }
 
 /**
- * Write a non-terminal progress/keepalive frame (async install protocol).
- * Distinct `status: 'progress'` so clients skip it and wait for the terminal
- * success/error frame.
+ * Write a non-terminal progress frame. Distinct `status: 'progress'` so
+ * clients skip it and wait for the terminal success/error frame; the scanner
+ * restarts its deadline for the request on each one (carrick#1914).
+ *
+ * A synchronous handler calls this between units of its work, with the event
+ * loop blocked. The frame still leaves at once: a write this small to a pipe
+ * with room in it completes inside the call, and the reader on the other end
+ * drains the pipe on its own thread, so there is room. It is written through
+ * the same stream as every answer, so a frame can never land inside one.
  */
 function writeProgress(requestId: string, phase: string, message: string): void {
   process.stdout.write(

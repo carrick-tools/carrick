@@ -75,6 +75,27 @@ JSON over stdio:
 
 Every request carries `request_id` and `action`. Every response echoes `request_id` and carries `status`.
 
+### One request at a time, and progress frames
+
+The sidecar handles requests in order, one at a time. `bundle`, `infer`, `capture_v2` and the other compiler actions are synchronous: the handler blocks the event loop until it returns, so a request sent meanwhile waits in the pipe, and nothing can cancel the one that is running. A client that stops waiting for an answer must kill the process and start another; a request sent to the old one would queue behind work nobody reads.
+
+A request may answer with more than one frame. Before its one terminal frame (`success` or `error`), it can write any number of progress frames under the same `request_id`:
+
+```json
+{ "request_id": "7", "status": "progress", "phase": "infer", "message": "1200 of 5000" }
+```
+
+A client must skip progress frames rather than treat the first frame as the answer. Each one says a unit of the request's work finished, so a client's deadline should be the longest silence it accepts, restarted on every frame, not a limit on the whole request. The Rust client allows 900 s of silence, then kills the process and starts a fresh one scoped to the same root.
+
+| Action | Progress frames |
+|---|---|
+| `infer` | One when the first request of the batch is done, then at most one every 1.5 s as more finish. `message` is `<done> of <total>`. |
+| `bundle`, `verify_library_claims` | One per program the request reads, when that program is ready. |
+| `check_v2` | A keepalive every 1.5 s while it installs and checks; `phase` names the stage. |
+| every other action | None. |
+
+Frames are written by the work itself, between units, except for `check_v2`, whose work runs in child processes. A handler that stops finishing units stops writing them.
+
 ### Which actions need a project
 
 `init` resolves a project; `bundle`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
@@ -266,7 +287,7 @@ Response (`result` is a `CaptureStubResult`, abbreviated here):
 
 #### `check_v2` - Judge matched pairs
 
-Assembles the given stub packages into a scratch synthetic monorepo, installs the pins, and typechecks one generated probe per pair. Stateless. This is the only action that answers with more than one frame: while it installs and checks it emits `status: "progress"` keepalives, then exactly one terminal `success` or `error` frame. A client must skip progress frames rather than treat the first frame as the answer.
+Assembles the given stub packages into a scratch synthetic monorepo, installs the pins, and typechecks one generated probe per pair. Stateless. It runs asynchronously (the install and the check are child processes): while they run it emits `status: "progress"` keepalives, then exactly one terminal `success` or `error` frame.
 
 ```json
 {
@@ -821,7 +842,7 @@ Response, written before the process exits:
 - `"ready"` / `"not_ready"` — `init` and `health` only
 - `"success"` — the request answered
 - `"error"` — the request failed; read `errors`
-- `"progress"` — a `check_v2` keepalive, never terminal
+- `"progress"` — the request is still being worked on; never terminal (see "One request at a time, and progress frames")
 
 A request that fails validation answers with `status: "error"` and the zod message, e.g. `Invalid request: requests.0.infer_kind: Required`:
 ```json
