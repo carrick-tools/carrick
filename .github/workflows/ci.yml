@@ -202,6 +202,7 @@ jobs:
           --test inline_handler_response_test
           --test integration_test
           --test interrupted_scan_test
+          --test keep_awake_test
           --test llm_cassette_hard_gate_test
           --test method_per_site_test
           --test one_row_per_request_test

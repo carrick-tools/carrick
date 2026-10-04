@@ -68,6 +68,11 @@ OPTIONS:
                    there. Both are refused by default: the types through them
                    are `any`, and the scan costs the same. A CI job that
                    deliberately checks out without installing passes this.
+    --no-keep-awake
+                   Let this machine idle-sleep during a scan. By default a scan
+                   on macOS keeps it awake until the scan finishes, and says
+                   so; closing the lid still sleeps it. Applies to a scan of a
+                   path and to index, resume and refresh.
 
 ENVIRONMENT VARIABLES:
     ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set
@@ -107,6 +112,8 @@ ENVIRONMENT VARIABLES:
     CARRICK_ALLOW_UNPREPARED        The --allow-unprepared flag as a variable,
                                     for a pipeline that sets the scan up rather
                                     than spelling the command
+    CARRICK_NO_KEEP_AWAKE           The --no-keep-awake flag as a variable, for
+                                    a machine that should never be kept awake
     CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
                                     never became ready. Off by default: such a
                                     run would index every endpoint with no

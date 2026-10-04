@@ -125,6 +125,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut dispatch = false;
     let mut recheck = false;
     let mut allow_unprepared = false;
+    let mut no_keep_awake = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -167,6 +168,10 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             // answered with "unknown option" (carrick#1315).
             "--verbose" | "-v" => {}
             crate::preflight::ALLOW_FLAG => allow_unprepared = true,
+            // Global in the same way: `main` reads it off the argument list
+            // and records it for the process. Noted here so it can be refused
+            // on a command that scans nothing (carrick#1889).
+            crate::keep_awake::OFF_FLAG => no_keep_awake = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -201,6 +206,14 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
         return Err(format!(
             "unknown option for `carrick {name}`: {}",
             crate::preflight::ALLOW_FLAG
+        ));
+    }
+    // The three builds are the commands that keep the machine awake, so they
+    // are the three with anything to turn off.
+    if no_keep_awake && !matches!(name, "index" | "resume" | "refresh") {
+        return Err(format!(
+            "unknown option for `carrick {name}`: {}",
+            crate::keep_awake::OFF_FLAG
         ));
     }
 
@@ -1120,6 +1133,15 @@ fn build_workspace(
         );
     }
 
+    // The build is going to run, and this process waits on every scan in it:
+    // hold the machine awake until this function is left, and say so
+    // (carrick#1889). One hold for the whole build, because the scans it
+    // starts are told the build holds for them (`index::scan_command`). On
+    // stdout, ahead of the first phase, for the reason the line below is: it
+    // is the one stream a renderer shows as it stands. `keep_awake` has why
+    // the hold cannot outlive this process when the drop is never reached.
+    let _awake = crate::keep_awake::begin(|line| crate::outln!("{line}"));
+
     if infer {
         crate::errln!(
             "carrick: this scan asks Carrick Cloud to classify what the deterministic passes \
@@ -1325,18 +1347,23 @@ fn start_detached(
     let exe = std::env::current_exe()
         .map_err(|e| format!("could not find the carrick binary to run the scan with: {e}"))?;
 
+    // The build this starts is the process that keeps the machine awake: it is
+    // the one still running when this command has answered, and a helper
+    // started here would be tied to a pid that is about to exit. This command
+    // is the one being read, though, so it says the line and tells the build
+    // it has (carrick#1889).
+    let keeps_awake = crate::keep_awake::planned();
+
     let mut command = std::process::Command::new(exe);
-    command.arg("index");
-    // The two compose: the hand-off happens after this machine has parsed
-    // every file and asked the type sidecar, which on a large monorepo is
-    // itself longer than an agent's shell will wait (carrick#1229).
-    if dispatch {
-        command.arg("--dispatch");
-    }
-    // The refusal this process just passed is the detached build's too, and it
-    // re-runs this command from scratch (carrick#1254).
-    if allow_unprepared {
-        command.arg(crate::preflight::ALLOW_FLAG);
+    command.args(detached_args(
+        dispatch,
+        allow_unprepared,
+        crate::keep_awake::off_by_flag(),
+    ));
+    if keeps_awake {
+        command.env(crate::keep_awake::SAID_ENV, "1");
+    } else {
+        command.env_remove(crate::keep_awake::SAID_ENV);
     }
     command
         .arg("--workspace")
@@ -1385,7 +1412,36 @@ fn start_detached(
         "The scan keeps running after this shell closes. `carrick status` names the service it \
          is on, how far through it is, and how long it has been running."
     );
+    if keeps_awake {
+        crate::outln!("{}", crate::keep_awake::LINE);
+    }
     Ok(())
+}
+
+/// What the detached build is started with, ahead of its workspace: the
+/// command, and every flag of this one that decides what the build does.
+///
+/// Apart from the spawn so a test reads it back. A flag dropped here is a
+/// build that silently does something other than what was typed.
+fn detached_args(dispatch: bool, allow_unprepared: bool, no_keep_awake: bool) -> Vec<&'static str> {
+    let mut args = vec!["index"];
+    // The two compose: the hand-off happens after this machine has parsed
+    // every file and asked the type sidecar, which on a large monorepo is
+    // itself longer than an agent's shell will wait (carrick#1229).
+    if dispatch {
+        args.push("--dispatch");
+    }
+    // The refusal this process just passed is the detached build's too, and it
+    // re-runs this command from scratch (carrick#1254).
+    if allow_unprepared {
+        args.push(crate::preflight::ALLOW_FLAG);
+    }
+    // A flag is not inherited the way the variable is, and the build is the
+    // process that would hold (carrick#1889).
+    if no_keep_awake {
+        args.push(crate::keep_awake::OFF_FLAG);
+    }
+    args
 }
 
 /// Put the child in a session (Unix) or a process group (Windows) of its own.
@@ -1713,6 +1769,10 @@ USAGE:
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
                one and says so.
     refresh    Re-scan one service (or every repo) and re-join.
+
+On macOS, index, resume and refresh keep this machine from idle-sleeping until
+they finish, and say so once. Closing the lid still sleeps it. --no-keep-awake
+on any of the three, or CARRICK_NO_KEEP_AWAKE=1, lets it sleep.
 
 The workspace is a repository or the folder holding its sibling repositories.
 Optional carrick-workspace.json overrides add paths with `repos` and remove
@@ -2338,6 +2398,56 @@ mod tests {
         assert_eq!(
             parse(&args(&["status", "--detach"])).unwrap(),
             Err("unknown option for `carrick status`: --detach".to_string())
+        );
+    }
+
+    /// The three builds take the flag that lets the machine sleep, and the
+    /// command each one parses to is the command it was without it: the flag
+    /// is the process's, read by `main`. A command that scans nothing has
+    /// nothing to turn off and refuses it (carrick#1889).
+    #[test]
+    fn the_builds_take_the_flag_that_lets_the_machine_sleep() {
+        let off = crate::keep_awake::OFF_FLAG;
+        for name in ["index", "resume", "refresh"] {
+            assert_eq!(
+                parse(&args(&[name, off])).unwrap(),
+                parse(&args(&[name])).unwrap(),
+                "`carrick {name} {off}`"
+            );
+            assert!(parse(&args(&[name, off])).unwrap().is_ok());
+        }
+        for name in ["status", "derive"] {
+            assert_eq!(
+                parse(&args(&[name, off])).unwrap(),
+                Err(format!("unknown option for `carrick {name}`: {off}"))
+            );
+        }
+        for name in ["check", "touch"] {
+            assert_eq!(
+                parse(&args(&[name, "src/a.ts", off])).unwrap(),
+                Err(format!("unknown option for `carrick {name}`: {off}"))
+            );
+        }
+    }
+
+    /// A detached build is started with every flag that decides what it does,
+    /// and the one that lets the machine sleep is among them: the build is the
+    /// process that would hold, and a flag is not inherited (carrick#1889).
+    #[test]
+    fn a_detached_build_is_handed_the_flags_it_was_typed_with() {
+        assert_eq!(detached_args(false, false, false), ["index"]);
+        assert_eq!(
+            detached_args(true, true, true),
+            [
+                "index",
+                "--dispatch",
+                crate::preflight::ALLOW_FLAG,
+                crate::keep_awake::OFF_FLAG
+            ]
+        );
+        assert_eq!(
+            detached_args(false, false, true),
+            ["index", crate::keep_awake::OFF_FLAG]
         );
     }
 

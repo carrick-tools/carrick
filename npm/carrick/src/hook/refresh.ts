@@ -141,6 +141,13 @@ export function refreshInBackground(
   const cooldown = cooldownMs(env);
   if (now - lastHostedRead(status, marker) < cooldown) return null;
   if (!claimRefresh(marker, now, cooldown)) return null;
-  (options.start ?? startDetached)(binary(env), ["refresh", "--workspace", root], env);
+  // Nobody started this refresh and nobody is reading it, so it does not keep
+  // the machine awake: that hold is for a scan a person is waiting on, and it
+  // comes with a line saying so that this one has nowhere to print
+  // (carrick#1889).
+  (options.start ?? startDetached)(binary(env), ["refresh", "--workspace", root], {
+    ...env,
+    CARRICK_NO_KEEP_AWAKE: "1",
+  });
   return "Carrick: a repo here is connected with no hosted index yet, so a refresh is running in the background. Its rows arrive in the next session.";
 }

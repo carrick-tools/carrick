@@ -42,6 +42,7 @@ pub mod import_bindings;
 pub mod imported_request_member;
 pub mod in_process_pubsub;
 pub mod intent_generator;
+pub mod keep_awake;
 pub mod library_claims;
 pub mod library_store;
 pub mod local_http_wrapper;

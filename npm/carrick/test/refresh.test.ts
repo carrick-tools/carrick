@@ -93,6 +93,24 @@ test("a workspace waiting for its first CI scan refreshes once, in the backgroun
   }
 });
 
+// A scan a person started keeps the machine awake and says so. This refresh
+// was started by a hook, detached, with its output thrown away: it has nobody
+// to say it to, so it is told not to hold (carrick#1889).
+test("a background refresh does not keep the machine awake", () => {
+  const { root, cleanup } = workspace();
+  try {
+    const environments: NodeJS.ProcessEnv[] = [];
+    refreshInBackground(root, statusWith(["no_index_yet"]), {
+      now: Date.parse("2026-09-11T12:00:00Z"),
+      start: (_command, _args, env) => void environments.push(env),
+      env: { CARRICK_BIN: "carrick" },
+    });
+    assert.deepEqual(environments, [{ CARRICK_BIN: "carrick", CARRICK_NO_KEEP_AWAKE: "1" }]);
+  } finally {
+    cleanup();
+  }
+});
+
 // The first `carrick index` reads the hosted side as it builds, so a session
 // opened straight afterwards has nothing new to ask for.
 test("an index that just read the hosted side is not asked to read it again", () => {

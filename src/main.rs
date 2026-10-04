@@ -42,6 +42,7 @@ mod import_bindings;
 mod imported_request_member;
 mod in_process_pubsub;
 mod intent_generator;
+mod keep_awake;
 mod library_claims;
 mod library_store;
 mod local_http_wrapper;
@@ -143,6 +144,10 @@ impl CliArgs {
                 preflight::ALLOW_FLAG => {
                     allow_unprepared = true;
                 }
+                // Read by `main` off the argument list, for this path and the
+                // builds alike, the way `--verbose` is. Named here so the
+                // parser accepts it (carrick#1889).
+                keep_awake::OFF_FLAG => {}
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
                 }
@@ -174,6 +179,10 @@ async fn main() {
     // and nothing else, so every existing invocation — `carrick .`,
     // `carrick /repo --no-cache` — reaches the scan exactly as before.
     let argv: Vec<String> = env::args().skip(1).collect();
+    // Whether this run may keep the machine awake is one answer for the
+    // process, whichever command it is, so the flag is read here and both
+    // parsers only accept it (carrick#1889).
+    keep_awake::turn_off(argv.iter().any(|arg| arg == keep_awake::OFF_FLAG));
     if let Some(parsed) = local_mode::cli::parse(&argv) {
         match parsed {
             Ok(command) => {
@@ -558,6 +567,13 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !local_mode::no_model() && env::var_os(analysis_channel::ANSWERS_ENV).is_none() {
         preflight::require_prepared(Path::new(&args.repo_path), &services)?;
     }
+    // From here the run is going to happen, and its first wait is the
+    // sidecar's: hold the machine awake until this function is left
+    // (carrick#1889). After every refusal above, so a run that is refused says
+    // nothing about a hold it never took. A scan a build started holds
+    // nothing: the build holds for it. See `keep_awake` for why the hold
+    // cannot outlive this process on the paths that never reach the drop.
+    let _awake = keep_awake::begin(|line| info!("{line}"));
     let initial_service = services.first().cloned().unwrap_or_default();
 
     // =======================================================================
@@ -862,6 +878,16 @@ mod tests {
         let cli = CliArgs::parse_from(&args(&["-v", "--no-cache", "/my/repo"]));
         assert!(cli.verbose);
         assert!(cli.no_cache);
+        assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    /// The scan path accepts the flag that lets the machine sleep
+    /// (carrick#1889). An argument this parser does not know ends the process,
+    /// so returning at all is the assertion, and the path beside the flag is
+    /// still read as the path.
+    #[test]
+    fn the_scan_accepts_the_flag_that_lets_the_machine_sleep() {
+        let cli = CliArgs::parse_from(&args(&[keep_awake::OFF_FLAG, "/my/repo"]));
         assert_eq!(cli.repo_path, "/my/repo");
     }
 

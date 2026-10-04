@@ -717,6 +717,7 @@ pub(super) fn scan_command(
     // variables would select the wrong credential entirely.
     strip_ci_env(&mut command);
     no_colour(&mut command);
+    held_awake_by_parent(&mut command);
     command
 }
 
@@ -762,6 +763,7 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
     no_colour(&mut command);
+    held_awake_by_parent(&mut command);
     command
 }
 
@@ -1224,6 +1226,17 @@ fn no_colour(command: &mut Command) {
     command.env("NO_COLOR", "1");
     command.env_remove("FORCE_COLOR");
     command.env_remove("CLICOLOR_FORCE");
+}
+
+/// Tell a child that it keeps nothing awake and says nothing about it
+/// (carrick#1889).
+///
+/// Every child this module starts is one phase of something that is already
+/// deciding that for the whole of itself: a build holds for every scan and for
+/// the join, so a workspace of ten repos starts one helper and says one line,
+/// and a re-check is a hook's ten seconds, which hold nothing at all.
+fn held_awake_by_parent(command: &mut Command) {
+    command.env(crate::keep_awake::OFF_ENV, "1");
 }
 
 /// Strip the ambient CI context, exactly as the offline harness does. Without
@@ -2346,6 +2359,26 @@ mod tests {
             env.get(crate::logging::RUN_PHASE_ENV),
             Some(&Some("workspace join".into()))
         );
+    }
+
+    /// A build holds the machine awake for the whole of itself, so every
+    /// child it starts is told to hold nothing and say nothing: each scan,
+    /// whatever the pass, and the join (carrick#1889). Without this a
+    /// workspace of ten repos starts eleven helpers and a re-check on a hook
+    /// starts two.
+    #[test]
+    fn every_child_of_a_build_is_told_the_build_keeps_the_machine_awake() {
+        let off = crate::keep_awake::OFF_ENV;
+        for pass in [Pass::Infer, Pass::Facts, Pass::Dispatch] {
+            assert_eq!(scan_env(&pass).get(off), Some(&Some("1".into())));
+        }
+        let join = env_of(&join_command(
+            Path::new("/bin/carrick"),
+            Path::new("/repos/api"),
+            Path::new("/build/repos"),
+            Path::new("/build/join.json"),
+        ));
+        assert_eq!(join.get(off), Some(&Some("1".into())));
     }
 
     /// One email per `carrick index` run (cloud#1363): the inferred pass tells
