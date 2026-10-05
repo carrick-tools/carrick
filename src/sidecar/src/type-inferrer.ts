@@ -1007,14 +1007,18 @@ export class TypeInferrer {
     // just above the registration. Unanswered, the capture ran the line again
     // and published the registration call's own value, the router. The
     // handler the registration names is the one to read.
+    //
+    // Only for a handler declared OUTSIDE the registration. One written inline
+    // further down than the line search reaches (a factory call that takes an
+    // options object first) is unanswered as before (carrick#1975): reading
+    // those rows moved four verdicts on a benchmark to incompatible that two
+    // other open defects made false (carrick#1933, carrick#1862).
     const lineOnly = request.span_start === undefined && !request.expression_text;
-    if (
-      lineOnly &&
-      registration &&
-      !(func && registration.getStart() <= func.getStart() && func.getEnd() <= registration.getEnd())
-    ) {
+    const within = (inner: Node, outer: Node): boolean =>
+      outer.getStart() <= inner.getStart() && inner.getEnd() <= outer.getEnd();
+    if (lineOnly && registration && !(func && within(func, registration))) {
       const named = this.resolveRegisteredHandler(registration);
-      if (named) {
+      if (named && !within(named, registration)) {
         this.log(
           `Line ${request.line_number} registers a handler declared elsewhere; reading that handler`
         );
@@ -6401,8 +6405,10 @@ export class TypeInferrer {
    *    end of a chain of calls on it. A call on an object the parameter holds
    *    (`res.locals.audit.record(entry)`) is not one, and neither is a call OF
    *    a parameter (`next(error)`);
-   *  - where that parameter's type is transport the repo does not declare
-   *    (`isTransportParameter`): the test a returned response already gets;
+   *  - where that parameter's type is transport the repo does not declare,
+   *    and transport something can be sent through
+   *    (`isTransportParameter`): the test a returned response already gets,
+   *    and one method of it that takes a body;
    *  - made in the handler's own body, not in a function it declares;
    *  - the last thing the handler does with its parameters on that path
    *    (`lastOnItsPath`). A header object set before the body is not last.
@@ -6716,8 +6722,9 @@ export class TypeInferrer {
   /**
    * True when a parameter (or the element of a destructured one) is transport
    * a library or the platform declares, or a type of the repo's that extends
-   * it: what a handler is HANDED to answer through. A response-like type the
-   * repo declares from nothing is the repo's own object and is not read.
+   * it, and a body can be handed to it (`takesABody`): what a handler is
+   * HANDED to answer through. A response-like type the repo declares from
+   * nothing is the repo's own object and is not read.
    */
   private isTransportParameter(parameter: Node): boolean {
     let type: Type;
@@ -6726,7 +6733,43 @@ export class TypeInferrer {
     } catch {
       return false;
     }
-    return this.typeIsFrameworkMachinery(type) || this.typeDerivesFromMachinery(type);
+    return (
+      (this.typeIsFrameworkMachinery(type) || this.typeDerivesFromMachinery(type)) &&
+      this.takesABody(type, parameter)
+    );
+  }
+
+  /**
+   * True when something can be SENT through a transport type: one of its
+   * methods leaves its first parameter open, as a body slot is declared
+   * (`declaresAnOpenFirstParameter`). The platform request is transport and
+   * has no such method (every one of them takes nothing), so a handler that is
+   * handed a request and returns its response is not read as sending through
+   * the request, whatever it does with it on the way.
+   */
+  private takesABody(type: Type, at: Node): boolean {
+    for (const member of type.getProperties()) {
+      for (const declaration of member.getDeclarations()) {
+        if (Node.isMethodSignature(declaration) || Node.isMethodDeclaration(declaration)) {
+          if (this.declaresAnOpenFirstParameter(declaration)) return true;
+          continue;
+        }
+        if (!Node.isPropertySignature(declaration) && !Node.isPropertyDeclaration(declaration)) {
+          continue;
+        }
+        // A member whose TYPE is a function: `json: Send<Body, this>`.
+        try {
+          const opens = member
+            .getTypeAtLocation(at)
+            .getCallSignatures()
+            .some((signature) => this.declaresAnOpenFirstParameter(signature.getDeclaration()));
+          if (opens) return true;
+        } catch {
+          // A signature with no declaration states nothing about its parameters.
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -6768,19 +6811,21 @@ export class TypeInferrer {
    * `memberIsFixedByItsLibrary` asked of a parameter.
    */
   private firstParameterIsOpen(call: CallExpression): boolean {
-    let parameter: ParameterDeclaration | undefined;
     try {
-      const declaration = this.project
-        .getTypeChecker()
-        .getResolvedSignature(call)
-        ?.getDeclaration();
-      parameter =
-        declaration && 'getParameters' in declaration
-          ? (declaration.getParameters()[0] as ParameterDeclaration | undefined)
-          : undefined;
+      return this.declaresAnOpenFirstParameter(
+        this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration()
+      );
     } catch {
       return false;
     }
+  }
+
+  /** `firstParameterIsOpen` asked of a signature's own declaration. */
+  private declaresAnOpenFirstParameter(declaration: Node | undefined): boolean {
+    const parameter =
+      declaration && 'getParameters' in declaration
+        ? (declaration as unknown as { getParameters(): ParameterDeclaration[] }).getParameters()[0]
+        : undefined;
     if (!parameter || parameter.isRestParameter()) return false;
     const typeNode = parameter.getTypeNode();
     // No annotation is an implicit `any`.

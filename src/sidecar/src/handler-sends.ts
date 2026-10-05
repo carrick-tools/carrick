@@ -300,10 +300,12 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
       else acted();
       continue;
     }
-    // A test of the parameter reads it without keeping it.
+    // A test of the parameter reads it without keeping it, and returning it
+    // hands it back to the caller that handed it in.
     if (
       Node.isTypeOfExpression(parent) ||
       Node.isPrefixUnaryExpression(parent) ||
+      Node.isReturnStatement(parent) ||
       (Node.isIfStatement(parent) && parent.getExpression() === value)
     ) {
       continue;

@@ -415,6 +415,21 @@ export const readsInACallback = async (_req: Req, res: Res) => {
   res.json({ logged: true });
 };
 
+declare function allowed(request: Request): Promise<boolean>;
+
+export async function platformHandler(request: Request): Promise<Response> {
+  if (!(await allowed(request))) {
+    return Response.json({ error: 'not allowed' }, { status: 403 });
+  }
+  await request.text();
+  return Response.json({ platform: true });
+}
+
+export const sendsThenReturnsIt = async (_req: Req, res: Res) => {
+  res.json({ returned: true });
+  return res;
+};
+
 declare function toLabel(widget: Widget): { label: string };
 
 export const mapsWithANamedFunction = async (_req: Req, res: Res) => {
@@ -453,6 +468,14 @@ router.delete('/widgets/:id', removeWidget);
 router.get('/widgets/:id/audit', auditWidget);
 router.post('/widgets/:id/name', renameWidget);
 router.put('/widgets/:id', requireKey, renameWidget);
+
+router.get(
+  '/widgets/inline',
+  requireKey,
+  async (_req, res) => {
+    res.json({ inline: true });
+  }
+);
 `;
 
 interface Inferred {
@@ -1006,6 +1029,25 @@ describe('carrick#1913: a route whose handler is a named function in another fil
       );
     });
 
+    it('does not read a request as something a handler sends through', async () => {
+      // The platform request is transport, and nothing can be sent through
+      // it: no method of it takes a body. The handler answers by what it
+      // returns, whatever it does with the request on the way.
+      assertBody(
+        await inSends('async function platformHandler'),
+        '{ platform: boolean; }',
+        'handing the request to a helper, or reading it, sends nothing'
+      );
+    });
+
+    it('reads a send whose transport the handler then returns', async () => {
+      assertBody(
+        await inSends('sendsThenReturnsIt = async'),
+        '{ returned: boolean; }',
+        'returning the parameter hands it back and sends nothing more'
+      );
+    });
+
     it('does not read a send on a response type the repo declares', async () => {
       assertDecided(
         await inSends('sendsOnItsOwnType = async'),
@@ -1120,6 +1162,19 @@ describe('carrick#1913: a route whose handler is a named function in another fil
         '{ audited: number; by: string; }',
         'a handler that returns nothing is read for what it sends'
       );
+    });
+
+    it('leaves a function_return at a registration whose handler is inline and lines below as it was', async () => {
+      // The fix above is for a handler declared somewhere else. An inline one
+      // the line search does not reach is unanswered, as it was.
+      const line = ROUTES_TS.split('\n').findIndex((text) => text === 'router.get(') + 1;
+      assert.ok(line > 0, 'the fixture registers one route over several lines');
+      const inferred = await ask({
+        file_path: fileOf('routes.ts'),
+        line_number: line,
+        infer_kind: 'function_return',
+      });
+      assert.strictEqual(inferred, undefined, `expected no answer, got ${inferred?.type_string}`);
     });
 
     it('reads the handler, not the named middleware in front of it', async () => {
