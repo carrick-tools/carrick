@@ -1239,6 +1239,22 @@ fn paths_match(a: &str, b: &str) -> bool {
         .all(|(x, y)| x == y || x.starts_with(':') || y.starts_with(':'))
 }
 
+/// Whether the call has a placeholder at a position where the route states a
+/// literal segment (carrick#2004): `PATCH /things/${id}` against
+/// `PATCH /things/move`, or `POST /orgs/${id}/${target}` against every
+/// `POST /orgs/:orgId/<literal>`. The call's value there is unknown, so the
+/// pair is a guess that the call reaches this route and not another, and it
+/// is not compared. A route placeholder over a call literal is the ordinary
+/// case (`/users/:id` serves `/users/me`) and is not a guess.
+fn call_placeholder_over_route_literal(producer_path: &str, consumer_path: &str) -> bool {
+    let route = normalize_match_path(producer_path);
+    let call = normalize_match_path(consumer_path);
+    route
+        .split('/')
+        .zip(call.split('/'))
+        .any(|(route_seg, call_seg)| call_seg.starts_with(':') && !route_seg.starts_with(':'))
+}
+
 /// Producer-specificity score, ported from ts_check's `calculateMatchScore`:
 /// literal routes outrank parameterized ones for the same consumer.
 fn match_score(producer_path: &str, consumer_path: &str) -> u8 {
@@ -1303,7 +1319,10 @@ struct ServiceEntry<'a> {
 ///
 /// Port of the ts_check manifest-matcher pairing semantics:
 /// - HTTP: method + route-aware path match + type_kind, keeping only the
-///   most specific producer(s) per consumer. The consumer's own service is a
+///   most specific producer(s) per consumer. A route that states a literal
+///   where the call has a placeholder is never a candidate: which route the
+///   call reaches is then unknown, and the call is not compared
+///   (carrick#2004). The consumer's own service is a
 ///   candidate like any other (carrick#1945): a call to a route of its own
 ///   service is a consumer of that route (carrick#1926), and the HTTP matcher
 ///   keeps that edge (carrick#1944). Its routes are ranked with every
@@ -1356,6 +1375,9 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
     for consumer in &consumers {
         // Candidate producers, protocol-dispatched.
         let mut candidates: Vec<(&ServiceEntry, u8)> = Vec::new();
+        // Routes the call could only be paired with by guessing its
+        // placeholder's value (carrick#2004).
+        let mut guessed: Vec<&str> = Vec::new();
         for producer in &producers {
             // One service on both ends is a pair for HTTP only (see above).
             if producer.service_id == consumer.service_id && consumer.entry.key.as_http().is_none()
@@ -1376,6 +1398,10 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                         path: cp,
                     },
                 ) if pm.eq_ignore_ascii_case(cm) && paths_match(pp, cp) => {
+                    if call_placeholder_over_route_literal(pp, cp) {
+                        guessed.push(pp.as_str());
+                        continue;
+                    }
                     candidates.push((producer, match_score(pp, cp)));
                 }
                 // Exact-key protocols: socket / graphql / pubsub.
@@ -1391,6 +1417,23 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             }
         }
         if candidates.is_empty() {
+            if !guessed.is_empty() {
+                guessed.sort_unstable();
+                guessed.dedup();
+                debug!(
+                    "v2 check: {} {} at {}:{} is not compared: its placeholder stands where {} route(s) state a literal segment ({})",
+                    consumer
+                        .entry
+                        .key
+                        .as_http()
+                        .map_or("", |(method, _)| method),
+                    consumer.entry.key.as_http().map_or("", |(_, path)| path),
+                    consumer.entry.file_path,
+                    consumer.entry.line_number,
+                    guessed.len(),
+                    guessed.join(", ")
+                );
+            }
             continue;
         }
         // HTTP specificity: keep only the best-scoring producer(s), mirroring
@@ -1696,11 +1739,49 @@ pub(crate) fn run_check(
         local_consumers,
         &mut outcomes,
     );
+    hold_back_same_service_mismatches(&mut outcomes);
 
     // Deterministic order for every downstream consumer.
     outcomes.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
     log_unresolved_pairs(&outcomes, &pairs, local_consumers);
     outcomes
+}
+
+/// Why a same-service half the check found incompatible is published as
+/// unverifiable (carrick#1945). The cloud's readers quote it, so it is one
+/// sentence, stated once.
+pub(crate) const SAME_SERVICE_MISMATCH_NOT_REPORTED: &str =
+    "a mismatch between a call and a route of its own service, which Carrick does not report yet";
+
+/// Publish every same-service pair the check found incompatible as
+/// unverifiable, saying why ([`SAME_SERVICE_MISMATCH_NOT_REPORTED`]).
+///
+/// Ruled for the first release that pairs a service with itself
+/// (carrick#1945): hand-checked on a one-service app, most of those
+/// mismatches came from the way a route's response is read (error sends
+/// joined to the success body, one handler's methods joined), not from a
+/// call that breaks. Until those causes are fixed a same-service mismatch is
+/// not a fact a pull request should fail on. A same-service `compatible`, an
+/// unverifiable half and every pair of two services are unchanged.
+///
+/// Done here, on the outcomes, because every reader starts from them: the
+/// stored verdict rows, the edges' `type_compatible`, and the findings a pull
+/// request's output is written from.
+fn hold_back_same_service_mismatches(outcomes: &mut [PairCheckOutcome]) {
+    for outcome in outcomes.iter_mut() {
+        if outcome.producer_service != outcome.consumer_service
+            || outcome.bucket != VerdictBucket::Incompatible
+        {
+            continue;
+        }
+        outcome.bucket = VerdictBucket::Unverifiable;
+        outcome.gate = Some("same_service".to_string());
+        outcome.diagnostic = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.resolved = false;
+        outcome.unresolved_reason = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.notes.clear();
+        outcome.consumer_reads.clear();
+    }
 }
 
 // ===========================================================================
@@ -4588,6 +4669,174 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(pairs[0].consumer_alias, "C_me");
     }
 
+    /// carrick#1945: only a same-service `incompatible` is held back. Its
+    /// half reads unverifiable with the one sentence; a same-service
+    /// `compatible` and `unverifiable`, and a mismatch between two services,
+    /// are exactly as the check left them.
+    #[test]
+    fn a_same_service_mismatch_is_published_as_not_reported_and_nothing_else_moves() {
+        let outcome = |producer: &str, consumer: &str, bucket: VerdictBucket| PairCheckOutcome {
+            pair_key: format!("{producer}~{consumer}~{bucket:?}"),
+            pseudo_method: "GET".to_string(),
+            identity: "/api/items".to_string(),
+            consumer_file: "components/list.tsx".to_string(),
+            consumer_line: 12,
+            type_kind: ManifestTypeKind::Response,
+            bucket,
+            gate: (bucket == VerdictBucket::Unverifiable).then(|| "consumer:unknown".to_string()),
+            diagnostic: (bucket != VerdictBucket::Compatible)
+                .then(|| "the check's text".to_string()),
+            producer_alias: "P".to_string(),
+            consumer_alias: "C".to_string(),
+            producer_service: producer.to_string(),
+            consumer_service: consumer.to_string(),
+            resolved: bucket != VerdictBucket::Unverifiable,
+            unresolved_reason: (bucket == VerdictBucket::Unverifiable)
+                .then(|| "the consumer type is 'unknown'".to_string()),
+            notes: vec!["a note".to_string()],
+            consumer_reads: if bucket == VerdictBucket::Incompatible {
+                vec![14]
+            } else {
+                Vec::new()
+            },
+        };
+        let before = vec![
+            outcome("app", "app", VerdictBucket::Incompatible),
+            outcome("app", "app", VerdictBucket::Compatible),
+            outcome("app", "app", VerdictBucket::Unverifiable),
+            outcome("api", "web", VerdictBucket::Incompatible),
+        ];
+        let mut after = before.clone();
+        hold_back_same_service_mismatches(&mut after);
+
+        let held = &after[0];
+        assert_eq!(held.bucket, VerdictBucket::Unverifiable);
+        assert_eq!(held.gate.as_deref(), Some("same_service"));
+        assert_eq!(
+            held.diagnostic.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert_eq!(
+            held.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert!(!held.resolved);
+        assert!(held.notes.is_empty() && held.consumer_reads.is_empty());
+        assert_eq!(
+            format!("{:?}", &after[1..]),
+            format!("{:?}", &before[1..]),
+            "nothing else moves"
+        );
+
+        // Stored, the half reads unverifiable with the sentence, and the
+        // edge carries no mismatch.
+        let directions = crate::analyzer::PairDirections::from_outcomes(&after[..1]);
+        let edge = crate::analyzer::CrossRepoMatch {
+            producer_repo: "app".to_string(),
+            producer_key: "http|GET|/api/items".to_string(),
+            consumer_repo: "app".to_string(),
+            consumer_key: "http|GET|/api/items".to_string(),
+            consumer_location: Some("components/list.tsx:12".to_string()),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        };
+        let response = directions
+            .for_edge(&edge)
+            .response
+            .expect("the half is stored");
+        assert_eq!(
+            response.verdict,
+            crate::operation::TypeVerdict::Unverifiable
+        );
+        assert_eq!(response.reason, None);
+        assert_eq!(
+            response.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        let mut edges = vec![edge];
+        crate::analyzer::apply_pair_outcomes(&after[..1], &mut edges);
+        assert_eq!(edges[0].type_compatible, None);
+        assert_eq!(edges[0].mismatch_reason, None);
+    }
+
+    /// carrick#2004: a route that states a literal where the call has a
+    /// placeholder is never paired, because which route the call reaches is
+    /// unknown. A call path that is literal there keeps its pair, and a
+    /// placeholder route at that position is still the call's route.
+    #[test]
+    fn a_call_placeholder_over_a_route_literal_makes_no_pair() {
+        let producer = |method: &str, path: &str, alias: &str| {
+            entry(
+                OperationKey::http(method, path),
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                alias,
+                "pages/api/routes.ts",
+                1,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let consumer = |method: &str, path: &str, alias: &str| {
+            entry(
+                OperationKey::http(method, path),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+                alias,
+                "components/form.tsx",
+                9,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let paired = |entries: Vec<TypeManifestEntry>| -> Vec<(String, String)> {
+            build_check_pairs(&[repo("app", None, entries, Some(fake_artifact()))])
+                .into_iter()
+                .map(|pair| (pair.consumer_alias, pair.producer_alias))
+                .collect()
+        };
+        let siblings = || {
+            vec![
+                producer("POST", "/api/orgs/:orgId/folders", "P_folders"),
+                producer("POST", "/api/orgs/:orgId/documents", "P_documents"),
+                producer("POST", "/api/orgs/:orgId/agreements", "P_agreements"),
+            ]
+        };
+
+        // A placeholder last segment against three literal siblings: no pair.
+        let mut entries = siblings();
+        entries.push(consumer("POST", "/api/orgs/:id/:target", "C_target"));
+        assert_eq!(paired(entries), vec![]);
+
+        // The same call with its last segment literal keeps its one pair.
+        let mut entries = siblings();
+        entries.push(consumer("POST", "/api/orgs/:id/folders", "C_folders"));
+        assert_eq!(
+            paired(entries),
+            vec![("C_folders".to_string(), "P_folders".to_string())]
+        );
+
+        // `:id` against a literal `move` alone: no pair.
+        let move_only = vec![
+            producer("PATCH", "/api/things/move", "P_move"),
+            consumer("PATCH", "/api/things/:id", "C_thing"),
+        ];
+        assert_eq!(paired(move_only), vec![]);
+
+        // With an `:id` route beside it, the `:id` route only.
+        let both = vec![
+            producer("PATCH", "/api/things/move", "P_move"),
+            producer("PATCH", "/api/things/:thingId", "P_thing"),
+            consumer("PATCH", "/api/things/:id", "C_thing"),
+        ];
+        assert_eq!(
+            paired(both),
+            vec![("C_thing".to_string(), "P_thing".to_string())]
+        );
+    }
+
     /// Only HTTP pairs a service with itself. The exact-key matcher drops a
     /// same-service edge for GraphQL, socket and pub/sub (#397/#410), so a
     /// pair of those would be judged against no edge (carrick#1945).
@@ -5015,7 +5264,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// calls reach its own route is checked with its one stub on both sides
     /// of each pair, by the same judge as two services. A consumer read as
     /// `any` is unverifiable and says why, never compatible; a consumer that
-    /// agrees is compatible and one that disagrees is incompatible.
+    /// agrees is compatible; one that disagrees is found by the check and
+    /// published as unverifiable, not reported yet.
     #[test]
     #[serial(v2_capture_sidecar)]
     fn a_service_paired_with_itself_is_judged_by_the_same_check() {
@@ -5117,10 +5367,19 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             vec![
                 (10, "app", "app", VerdictBucket::Unverifiable),
                 (20, "app", "app", VerdictBucket::Compatible),
-                (30, "app", "app", VerdictBucket::Incompatible),
+                (30, "app", "app", VerdictBucket::Unverifiable),
             ],
             "{outcomes:#?}"
         );
+        // The mismatch the check found is published as not reported, and
+        // says so; nothing of the mismatch rides the half.
+        let held = &outcomes[2];
+        assert_eq!(held.gate.as_deref(), Some("same_service"));
+        assert_eq!(
+            held.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert!(!held.resolved && held.notes.is_empty() && held.consumer_reads.is_empty());
         let any = &outcomes[0];
         assert!(!any.resolved);
         assert!(
@@ -5129,10 +5388,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 .is_some_and(|reason| !reason.is_empty()),
             "an unverifiable pair says why: {any:#?}"
         );
-        assert!(
-            outcomes[1].resolved && outcomes[2].resolved,
-            "{outcomes:#?}"
-        );
+        assert!(outcomes[1].resolved, "{outcomes:#?}");
     }
 
     /// carrick#1821: when the check workspace's install fails, every pair the
