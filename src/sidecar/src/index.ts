@@ -33,6 +33,7 @@ import {
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
+import { mergeInferTimings } from './infer-timing.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -412,6 +413,9 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       request_id: request.request_id,
       status: result.success ? 'success' : 'error',
       inferred_types: result.inferred_types,
+      // Beside the answers and never in them: what the requests cost, for
+      // the caller's log (carrick#1985).
+      infer_timing: mergeInferTimings(results.map((r) => r.timing)),
       errors: result.errors,
     };
   } catch (err) {

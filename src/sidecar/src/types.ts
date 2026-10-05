@@ -622,8 +622,59 @@ export interface BundleResponse extends BaseResponse {
 export interface InferResponse extends BaseResponse {
   /** Successfully inferred types */
   inferred_types?: InferredType[];
+  /** How long the requests took, and which were slowest (carrick#1985) */
+  infer_timing?: InferTiming;
   /** General errors */
   errors?: string[];
+}
+
+/**
+ * How long one request of an `infer` batch took (carrick#1985).
+ *
+ * It names the request and measures its answer. It never holds the answer:
+ * the type a request printed is here as a length only.
+ */
+export interface InferSlotTiming {
+  /** The alias the request carried, when it carried one */
+  alias?: string;
+  /** The file the request named, as it named it */
+  file_path: string;
+  /** The line the request named */
+  line_number: number;
+  /** The kind of inference the request asked for */
+  infer_kind: InferKind;
+  /**
+   * Wall time, in milliseconds, from the batch taking the request up to it
+   * keeping the request's answer or its error.
+   */
+  ms: number;
+  /** Characters in the `type_string` the request answered; 0 when it answered none */
+  printed_length: number;
+  /**
+   * No earlier request named this file to the project that answered. Such a
+   * request does the work the file's later ones reuse: the index of the
+   * file's functions, and every type the checker resolves on the way that it
+   * had not resolved before.
+   */
+  first_in_file: boolean;
+}
+
+/**
+ * The timing of the requests of one `infer` batch (carrick#1985).
+ */
+export interface InferTiming {
+  /** Requests the batch was done with: answered, refused, skipped or failed */
+  slots: number;
+  /** Their wall times, added up, in milliseconds */
+  slots_ms: number;
+  /** How many of them were the first asked of their file */
+  first_in_file_slots: number;
+  /** The wall times of those, added up, in milliseconds */
+  first_in_file_ms: number;
+  /** The slowest requests, slowest first: `SLOWEST_SLOTS` of them at most */
+  slowest: InferSlotTiming[];
+  /** The request that printed the longest type; absent when none printed one */
+  longest_printed?: InferSlotTiming;
 }
 
 /**
@@ -1060,6 +1111,8 @@ export interface InferResult {
   success: boolean;
   /** Successfully inferred types */
   inferred_types?: InferredType[];
+  /** How long each request took, summed up (carrick#1985) */
+  timing: InferTiming;
   /** General error messages */
   errors?: string[];
 }

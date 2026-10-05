@@ -730,9 +730,45 @@ Response:
       "source_location": { "file_path": "src/routes/users.ts", "start_line": 25, "end_line": 25 }
     }
   ],
+  "infer_timing": {
+    "slots": 2,
+    "slots_ms": 41.3,
+    "first_in_file_slots": 1,
+    "first_in_file_ms": 40.1,
+    "slowest": [
+      {
+        "alias": "Endpoint_7a6b_Response",
+        "file_path": "src/routes/users.ts",
+        "line_number": 25,
+        "infer_kind": "response_body",
+        "ms": 40.1,
+        "printed_length": 31,
+        "first_in_file": true
+      },
+      {
+        "file_path": "src/routes/users.ts",
+        "line_number": 40,
+        "infer_kind": "function_param",
+        "ms": 1.2,
+        "printed_length": 0,
+        "first_in_file": false
+      }
+    ],
+    "longest_printed": {
+      "alias": "Endpoint_7a6b_Response",
+      "file_path": "src/routes/users.ts",
+      "line_number": 25,
+      "infer_kind": "response_body",
+      "ms": 40.1,
+      "printed_length": 31,
+      "first_in_file": true
+    }
+  },
   "errors": []
 }
 ```
+
+`infer_timing` says how long the batch's requests took (carrick#1985). It is for the caller's log: no answer depends on it, and it holds no type text. `slots` counts every request the batch was done with, answered or not, and `slots_ms` adds up their wall times in milliseconds. `slowest` names the 25 slowest, slowest first: each is the request as it was asked (`alias`, `file_path`, `line_number`, `infer_kind`), its `ms`, the length of the `type_string` it answered (`printed_length`, 0 when it answered none) and `first_in_file`. A request is the first in its file when no earlier request named that file to the project that answers it, so it does the work the file's later requests reuse; `first_in_file_slots` and `first_in_file_ms` add those up apart from the rest. `longest_printed` is the request that printed the longest type, and is absent when none printed one. A batch that names fewer requests than it timed left out none slower than the last one it names.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

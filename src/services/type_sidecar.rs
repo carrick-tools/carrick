@@ -1235,6 +1235,10 @@ pub struct SidecarResponse {
     /// Inferred types (for infer)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inferred_types: Option<Vec<InferredType>>,
+    /// How long the requests of an infer batch took, and which were slowest
+    /// (carrick#1985). Read for the log only: no answer depends on it.
+    #[serde(default)]
+    pub infer_timing: Option<InferTiming>,
     /// Resolved definitions (for resolve_definitions)
     #[serde(default)]
     pub definitions: Option<Vec<ResolvedDefinitionResult>>,
@@ -1260,6 +1264,51 @@ pub struct SidecarResponse {
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
+}
+
+/// How long one request of an `infer` batch took (carrick#1985). Mirrors the
+/// sidecar's `InferSlotTiming`: it names the request and measures its answer,
+/// and holds the type the request printed as a length only.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct InferSlotTiming {
+    /// The alias the request carried, when it carried one.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// The file the request named, as it named it.
+    pub file_path: String,
+    /// The line the request named.
+    pub line_number: u32,
+    /// The kind of inference the request asked for.
+    pub infer_kind: InferKind,
+    /// Wall time in milliseconds, from the batch taking the request up to it
+    /// keeping the request's answer or its error.
+    pub ms: f64,
+    /// Characters in the type the request answered; 0 when it answered none.
+    pub printed_length: u64,
+    /// No earlier request named this file to the project that answered, so
+    /// this one did the work the file's later requests reuse.
+    pub first_in_file: bool,
+}
+
+/// The timing of the requests of one `infer` batch (carrick#1985). Mirrors
+/// the sidecar's `InferTiming`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct InferTiming {
+    /// Requests the batch was done with: answered, refused, skipped or failed.
+    pub slots: u64,
+    /// Their wall times, added up, in milliseconds.
+    pub slots_ms: f64,
+    /// How many of them were the first asked of their file.
+    pub first_in_file_slots: u64,
+    /// The wall times of those, added up, in milliseconds.
+    pub first_in_file_ms: f64,
+    /// The slowest requests, slowest first. The sidecar names a fixed number
+    /// at most, so the last one named is the most any request it left out
+    /// can have taken.
+    pub slowest: Vec<InferSlotTiming>,
+    /// The request that printed the longest type; `None` when none printed.
+    #[serde(default)]
+    pub longest_printed: Option<InferSlotTiming>,
 }
 
 /// A single resolved type definition from the sidecar
@@ -2127,6 +2176,7 @@ impl TypeSidecar {
                 manifest: Some(vec![]),
                 symbol_failures: None,
                 inferred_types: None,
+                infer_timing: None,
                 definitions: None,
                 outcomes: None,
                 semantics: None,
@@ -2171,6 +2221,7 @@ impl TypeSidecar {
                 manifest: None,
                 symbol_failures: None,
                 inferred_types: Some(vec![]),
+                infer_timing: None,
                 definitions: None,
                 outcomes: None,
                 semantics: None,

@@ -1514,6 +1514,172 @@ export function onOrderPlaced(evt: OrderPlaced): void {
     );
 }
 
+/// A writer a test reads back: what a pass logged, as the log holds it.
+#[derive(Clone, Default)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+    type Writer = Logged;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// carrick#1985 end to end through the real sidecar: the answer to the
+/// signature pass's batch says how long its slots took, and the pass writes
+/// that to the log.
+///
+/// The sidecar is required, not skipped. The pass's own tests read timings
+/// written by hand, so this is the one place a member renamed on either side
+/// of the protocol would show: the scanner would read no timing and log
+/// nothing, with every other test green.
+#[test]
+fn test_signature_pass_logs_where_its_time_went() {
+    use carrick::services::type_sidecar::TypeSidecar;
+    use carrick::signature_pass::populate_function_signatures;
+    use carrick::visitor::{FunctionArgument, FunctionDefinition, FunctionNodeType};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let sidecar_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    assert!(
+        sidecar_path.exists(),
+        "build the sidecar first: cd src/sidecar && npm ci && npm run build"
+    );
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let repo = temp_dir
+        .path()
+        .canonicalize()
+        .expect("the temp directory resolves");
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fs::write(
+        repo.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "target": "ES2020", "module": "commonjs", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*.ts"] }"#,
+    )
+    .expect("write tsconfig");
+    // No return annotation, and one parameter without a type: two slots.
+    let file = repo.join("src/orders.ts");
+    fs::write(
+        &file,
+        "export function label(order: { id: string }, note) {\n  return { title: 'Order ' + order.id, lines: [1, 2, 3] };\n}\n",
+    )
+    .expect("write the source file");
+
+    let argument = |name: &str, ty: Option<&str>| FunctionArgument {
+        name: name.to_string(),
+        type_ann: None,
+        is_explicit: ty.is_some(),
+        type_string: ty.map(str::to_string),
+        is_optional: false,
+        has_default: false,
+        default_value: None,
+        is_rest: false,
+    };
+    let mut definitions = HashMap::from([(
+        "label".to_string(),
+        FunctionDefinition {
+            name: "label".to_string(),
+            file_path: file.clone(),
+            node_type: FunctionNodeType::Placeholder,
+            arguments: vec![
+                argument("order", Some("{ id: string }")),
+                argument("note", None),
+            ],
+            body_source: None,
+            is_exported: true,
+            line_number: 1,
+            end_line: 3,
+            intent: None,
+            calls: vec![],
+            tokens: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            intent_input_hash: None,
+            dispatch_table: None,
+        },
+    )]);
+
+    let sidecar = TypeSidecar::spawn(&sidecar_path).expect("the sidecar spawns");
+    sidecar.start_init(&repo, None);
+    sidecar
+        .wait_ready(Duration::from_secs(120))
+        .expect("the sidecar initialises on the fixture");
+
+    let logged = Logged::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logged.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        populate_function_signatures(Some(&sidecar), &mut definitions, repo.to_str().unwrap());
+    });
+    let log = String::from_utf8_lossy(&logged.0.lock().unwrap()).into_owned();
+
+    let returned = "{ title: string; lines: number[]; }";
+    assert_eq!(
+        definitions["label"].signature.as_deref(),
+        Some(format!("(order: {{ id: string }}, note: any) => {returned}").as_str()),
+        "the pass answers as it did: {log}"
+    );
+
+    let said = |start: &str| {
+        log.lines()
+            .filter_map(|line| line.split_once("carrick::signature_pass: "))
+            .map(|(_, said)| said)
+            .find(|said| said.starts_with(start))
+            .unwrap_or_else(|| panic!("the pass logged no line starting {start:?}: {log}"))
+            .to_string()
+    };
+    let batch = said("Signature inference batch 1 of 1: ");
+    assert!(
+        batch.starts_with("Signature inference batch 1 of 1: 2 slot(s) took "),
+        "{batch}"
+    );
+    assert!(
+        batch.contains("the 1 first asked of their file took "),
+        "{batch}"
+    );
+    let pass = said("Signature inference timing: ");
+    assert!(
+        pass.starts_with("Signature inference timing: 2 slot(s) took "),
+        "{pass}"
+    );
+    assert!(pass.contains("; the slowest 1 (1%) took "), "{pass}");
+    assert!(
+        !pass.contains("at least"),
+        "a batch that named every slot it timed left none out: {pass}"
+    );
+    assert!(
+        pass.ends_with(&format!(
+            "the longest type printed is {} character(s), by label return at {}:1",
+            returned.len(),
+            file.display()
+        )),
+        "{pass}"
+    );
+    // A length, never the type.
+    assert!(
+        !log.contains("title: string"),
+        "the log holds a type's text: {log}"
+    );
+}
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
