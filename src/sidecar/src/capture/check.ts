@@ -44,6 +44,7 @@ import {
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 import { openProbeProgram, probeDeepFindings } from './check-deep.js';
 import { pairFieldReports } from './check-fields.js';
+import { pairDispatchUnions } from './check-union.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -342,6 +343,9 @@ export async function runCheck(
   // incompatible (carrick-tools/carrick-cloud#1118). It names what the verdict
   // is about; it never decides one.
   const fieldsByPair = pairFieldReports(probeProgram, probing);
+  // And which pairs compared a union the expected side takes only in part,
+  // the rest failing by nothing but the weak-type check (carrick#1995).
+  const unionsByPair = pairDispatchUnions(probeProgram, probing);
 
   const verdicts = sortVerdicts([
     ...probing.map((plan) =>
@@ -352,6 +356,7 @@ export async function runCheck(
         scrubCtx,
         deepFindings: deepByPair.get(plan.pairId),
         fieldReport: fieldsByPair.get(plan.pairId),
+        dispatchUnion: unionsByPair.get(plan.pairId),
         rawTextSide: rawTextSideOf(plan, aliasRecords),
       })
     ),

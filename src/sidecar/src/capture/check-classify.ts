@@ -14,6 +14,8 @@
  *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
  *   IsByteBody gate fired (TS2344)        -> unverifiable (bytes, even agreeing)
  *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
+ *   assignment error, sent union taken in part by a weak expected type
+ *                                         -> unverifiable (carrick#1995)
  *   assignment-class error                -> incompatible
  *   no diagnostics                        -> compatible     [lowest precedence]
  *
@@ -28,6 +30,7 @@ import type { CheckVerdict } from './api.js';
 import { decisiveAssignmentLine, type GateName, type ProbePlan, type Side } from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
+import type { DispatchUnion } from './check-union.js';
 import {
   describeFieldReport,
   fieldReportNotes,
@@ -118,6 +121,12 @@ export interface ClassifyInput {
    * run, in which case the tsc text stands alone.
    */
   fieldReport?: PairFieldReport;
+  /**
+   * Set when the sent side is a union the expected side takes only in part,
+   * every other member failing by nothing but the compiler's weak-type check
+   * (carrick#1995). Read only where the decisive assignment failed.
+   */
+  dispatchUnion?: DispatchUnion;
   /**
    * The side whose capture record says it reads the body as raw text
    * (carrick#1842), the sent side when both do. Read from the record, not the
@@ -291,6 +300,26 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   const assignDiag = probeDiags.find(
     (d) => d.line === decisiveLine && ASSIGNMENT_CODES.has(d.code)
   );
+  // 5a. Unless the mismatch is a sent union the expected type takes in part,
+  //     the members it rejects sharing no field with a type whose every field
+  //     is optional (carrick#1995). That is a route answering a body per
+  //     branch read by a caller of one branch: no member breaks a reader whose
+  //     every read allows absence, and which member the call receives is not
+  //     in the types. Not a fact either way, and no side to retype.
+  if (assignDiag && input.dispatchUnion) {
+    const { members, agreeing } = input.dispatchUnion;
+    const sent = plan.direction.sent;
+    const expected = plan.direction.expected;
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${sent}:union`,
+      diagnostic: `the ${sent} type is a union of ${members} bodies; the ${expected} type, every field optional, accepts ${agreeing} of them and shares no field with the other ${members - agreeing}, so the call reads one of the bodies the route answers and the types do not say which.`,
+      ...notAFact(
+        `the ${sent} type is a union of bodies and the ${expected} type, every field optional, accepts only some of them`
+      ),
+    };
+  }
   if (assignDiag) {
     const text = scrubDiagnostic(
       assignDiag.message,
