@@ -59,6 +59,18 @@ CARRICK_BIN=/path/to/main/carrick scripts/fact-coverage.sh /path/to/checkout  # 
 
 Run it on the same tree with the branch and with main, and diff the two.
 
+## Recording a cassette
+
+A cassette is one real analyzer run, never hand-written. The recording run
+makes real model calls, so it is paid spend and needs the owner's yes first.
+
+```bash
+cargo build --release
+scripts/record-cassette.sh tests/fixtures/<fixture>
+```
+
+It writes `__llm__/analyze-file/` and `__golden__.json`, and uploads nothing.
+
 ## Cold-cache dispatch smoke
 
 Hands a fixture's prompts to Carrick Cloud for real and collects them, against
