@@ -362,6 +362,11 @@ pub enum MethodValue {
     /// A key of the function's parameter at this position: an options object
     /// the caller writes (`fetch(url, init)` reads `init.method`).
     ParamKey(usize, String),
+    /// A key of an enclosing function's parameter (carrick#1949): how many
+    /// functions out, its position there, and the key. `fetch(url, init)` in
+    /// a closure, with `init` the enclosing function's parameter. Becomes
+    /// [`MethodValue::ParamKey`] once lifted into that function.
+    Outer(u8, usize, String),
     Unknown,
 }
 
@@ -4185,6 +4190,18 @@ impl Reader<'_> {
             },
             _ => None,
         };
+        // The same, with `init` an enclosing function's parameter, read in a
+        // closure (carrick#1949).
+        let outer_options = match (kind, bag, args.get(1)) {
+            (RequestKind::Fetch, None, Some(Value::Str(pieces))) => match pieces.as_slice() {
+                [Piece::Outer(depth, inner)] => match &**inner {
+                    Piece::Param(index, _) => Some((*depth, *index)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
 
         // The options the request carries: the bag, or the object `fetch` is
         // handed, whether or not its own keys are written at the call
@@ -4196,6 +4213,10 @@ impl Reader<'_> {
         let method = match options {
             _ if options_param.is_some() => {
                 MethodValue::ParamKey(options_param.unwrap_or_default(), "method".to_string())
+            }
+            _ if outer_options.is_some() => {
+                let (depth, index) = outer_options.unwrap_or_default();
+                MethodValue::Outer(depth, index, "method".to_string())
             }
             Some(obj) => match obj.fields.get("method") {
                 Some(Value::Str(pieces)) => method_of(pieces),
@@ -4215,6 +4236,12 @@ impl Reader<'_> {
             },
             None => match &verb {
                 Some(verb) => MethodValue::Lit(verb.clone()),
+                // `fetch(url)` sends a GET. `fetch(url, init)` with an init
+                // this pass does not read (a call's value, a binding it does
+                // not follow) sends whatever that holds, and a GET read off
+                // it is a guess (carrick#1949: once a closure's URL could be
+                // filled in, such guesses reached callers).
+                None if kind == RequestKind::Fetch && call.args.len() > 1 => MethodValue::Unknown,
                 None => MethodValue::Lit("GET".to_string()),
             },
         };
@@ -5298,10 +5325,12 @@ impl Effect {
     /// Whether the effect waits on a call of a function enclosing the one it
     /// is written in (carrick#1949).
     fn has_outer(&self) -> bool {
-        self.url
-            .iter()
-            .chain(&self.base)
-            .any(|piece| matches!(piece, Piece::Outer(..)))
+        matches!(self.method, MethodValue::Outer(..))
+            || self
+                .url
+                .iter()
+                .chain(&self.base)
+                .any(|piece| matches!(piece, Piece::Outer(..)))
     }
 
     /// This effect as the function one out sends it: its enclosing
@@ -5309,9 +5338,16 @@ impl Effect {
     /// the ones that are now its own (carrick#1949).
     fn lifted(&self) -> Effect {
         let lift = |pieces: &[Piece]| pieces.iter().map(Piece::lifted).collect::<Vec<_>>();
+        let method = match &self.method {
+            MethodValue::Outer(1, index, key) => MethodValue::ParamKey(*index, key.clone()),
+            MethodValue::Outer(depth, index, key) => {
+                MethodValue::Outer(depth - 1, *index, key.clone())
+            }
+            other => other.clone(),
+        };
         Effect {
             site: self.site.clone(),
-            method: self.method.clone(),
+            method,
             url: lift(&self.url),
             body: self
                 .body

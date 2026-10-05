@@ -89,10 +89,22 @@ fn assert_rows(file: &str, line: i64, expected: &[(&str, &str)]) {
 fn a_url_in_a_hooks_options_is_stated_where_the_hook_is_called() {
     assert_rows(
         "BoardPage.tsx",
-        5,
+        6,
         &[("POST", "/resources/boards/:boardId/widgets")],
     );
     assert_rows("useBoardEditor.ts", 6, &[]);
+}
+
+/// A closure's `fetch(url, init)` takes its method from the enclosing
+/// function's `init` as the caller writes it. An init built by a call this
+/// pass does not read states no method, so no `GET` is guessed at the caller.
+#[test]
+fn a_closures_init_is_read_from_the_caller_or_states_nothing() {
+    assert_rows(
+        "BoardPage.tsx",
+        7,
+        &[("PUT", "/resources/boards/:boardId/sync")],
+    );
 }
 
 /// Shape 2 on the ticket: the element's props carry the URL, and the

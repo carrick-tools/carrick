@@ -12,8 +12,9 @@ the repository.
 
 | File | Line | Row | Why |
 |---|---|---|---|
-| BoardPage.tsx | 5 | `POST /resources/boards/:boardId/widgets` | the hook's options carry the URL its callback fetches |
+| BoardPage.tsx | 6 | `POST /resources/boards/:boardId/widgets` | the hook's options carry the URL its callback fetches |
 | useBoardEditor.ts | 6 | none | the URL is the caller's |
+| BoardPage.tsx | 7 | `PUT /resources/boards/:boardId/sync` | `fetch(syncUrl, init)` in a callback takes the method the caller writes in `init`; `fetch(syncUrl, withCache(init))` states no method, so nothing is guessed |
 | AgentPage.tsx | 8 | `POST` and `PUT /resources/agents/:agentId/chat` | the prop carries the URL a closure and a method handed to a package's hook fetch |
 | AgentPanel.tsx | 4 | none | the URL is the caller's |
 | AgentPage.tsx | 17 | none | a component hands its own prop on |
