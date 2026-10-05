@@ -74,6 +74,21 @@ describe('README protocol examples (#755)', () => {
     assert.ok(requests > 0, 'no request examples found in the README');
   });
 
+  // The schema drops a key it does not declare, so an example can parse and
+  // still document a member that never arrives (carrick#1980).
+  it('loses no key of a request example to the schema', () => {
+    for (const block of jsonBlocks) {
+      const json = JSON.parse(block.text) as Record<string, unknown>;
+      if (!('action' in json)) continue;
+      const result = parseRequest(json);
+      assert.deepStrictEqual(
+        result.success ? result.request : undefined,
+        json,
+        `block ${block.index} (${String(json.action)}) does not reach its handler as written`,
+      );
+    }
+  });
+
   it('documents every action the sidecar accepts', () => {
     const actions = SidecarRequestSchema.options.map(
       (option) => option.shape.action.value as string,

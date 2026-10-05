@@ -66,6 +66,8 @@ node dist/src/index.js
 
 Then write one JSON request per line on stdin. Every example below is a real request: they are validated against `src/validators.ts`, which is the authority on the shape.
 
+The schema drops a key it does not declare, so a new request field goes in three places: the request's type (`src/types.ts`, or `src/capture/api.ts` for a capture anchor), the schema, and the Rust client's struct. The build fails on a key the type and the schema do not both declare, and a test in `src/services/type_sidecar.rs` reads every request the client writes through the built schema (carrick#1980).
+
 ## Message Protocol
 
 JSON over stdio:
@@ -239,6 +241,14 @@ An anchor is one of four kinds, discriminated on `kind`:
       "unwrap": "awaited"
     },
     {
+      "kind": "infer",
+      "alias": "Subscriber_a7b8_Producer_Response",
+      "source_file": "src/events/orders.ts",
+      "anchor_origin": "deterministic-infer",
+      "line_number": 17,
+      "param_name": "event"
+    },
+    {
       "kind": "literal",
       "alias": "Endpoint_0011_Response",
       "type_text": "{ ok: boolean }",
@@ -254,6 +264,10 @@ An anchor is one of four kinds, discriminated on `kind`:
 declares but no type request reached: it is sent as a literal `unknown` so the
 surface carries every alias the check will import, and the check's IsUnknown
 gate reports the type as unknown rather than the export as missing.
+An `infer` anchor with a `param_name` is read as that parameter of the handler
+at or around its line, which is how a subscriber is anchored: what it receives
+is its contract. A name no parameter has demotes the alias to `unknown` with
+the reason recorded; the expression on the line is never read in its place.
 A literal anchor's optional `source_file` names the file its text was printed
 from; it joins the analysis program so names the text prints bare are found
 declared, and is omitted for inline text that has no file.

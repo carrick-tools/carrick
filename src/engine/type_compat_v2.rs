@@ -5704,6 +5704,136 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(control.bucket, VerdictBucket::Incompatible, "{control:#?}");
     }
 
+    /// carrick#1980: a subscriber the inference left unanswered is captured
+    /// by the parameter its request names, end to end against the real
+    /// sidecar ($0, no model): the request this client writes, read by the
+    /// sidecar process, answered by its capture.
+    ///
+    /// The anchor sits on a line inside the handler, where a comparison is
+    /// the first expression. The sidecar's request schema used to drop the
+    /// parameter name, so the capture typed that line and published
+    /// `boolean` as what the subscriber receives, self-checked clean. A name
+    /// no parameter has was typed the same way where it must abstain.
+    ///
+    /// No inference is handed to the derivation: the inferrer looks for the
+    /// handler within two lines of the anchor and answers nothing this far
+    /// into its body, which is the case that reaches the capture as a
+    /// located anchor rather than as printed text.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_subscriber_anchor_is_captured_by_the_parameter_it_names() {
+        let sidecar_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","skipLibCheck":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        // Line numbers are read off this text; keep the two in step.
+        std::fs::write(
+            root.join("src/listener.ts"),
+            "export interface PreviewMessage {\n  \
+             origin: string;\n  \
+             data?: { type: string };\n\
+             }\n\
+             \n\
+             declare const expectedOrigin: string;\n\
+             declare function setReady(ready: boolean): void;\n\
+             \n\
+             export function listener(message: PreviewMessage) {\n  \
+             if (message.origin !== expectedOrigin) {\n    \
+             return;\n  \
+             }\n\
+             \n  \
+             if (message?.data?.type === 'ready') {\n    \
+             setReady(true);\n  \
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        let comparison_line = 14;
+
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+
+        let (named, unnamed) = ("Named_Producer_Response", "Unnamed_Producer_Response");
+        let request = |alias: &str, param_name: &str| InferRequestItem {
+            file_path: root.join("src/listener.ts").to_string_lossy().into_owned(),
+            line_number: comparison_line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::FunctionParam,
+            alias: Some(alias.to_string()),
+            param_name: Some(param_name.to_string()),
+        };
+        let infer = vec![request(named, "message"), request(unnamed, "message.data")];
+        let anchors = derive_capture_anchors(
+            &[],
+            &infer,
+            &[],
+            &[],
+            &[named.to_string(), unnamed.to_string()],
+            root.to_str().unwrap(),
+        );
+        for (anchor, param) in anchors.iter().zip(["message", "message.data"]) {
+            assert!(
+                matches!(
+                    anchor,
+                    CaptureAnchor::Infer { param_name: Some(name), .. } if name == param
+                ),
+                "the request's parameter name rides its anchor: {anchor:#?}"
+            );
+        }
+
+        let (stub, artifact) = run_capture(
+            &sidecar,
+            root.to_str().unwrap(),
+            "listener",
+            &anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("capture");
+        let _ = std::fs::remove_dir_all(&stub);
+        let surface = artifact.files.get("types/surface.d.ts").unwrap();
+        let published = |alias: &str| {
+            surface
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("export type {alias} = ")))
+                .unwrap_or_else(|| panic!("no surface line for {alias}: {surface}"))
+        };
+        assert!(
+            published(named).contains("PreviewMessage"),
+            "the handler's parameter is the subscriber's type: {surface}"
+        );
+        assert_eq!(
+            published(unnamed),
+            "unknown;",
+            "a name no parameter has abstains: {surface}"
+        );
+        assert!(
+            !surface.contains("boolean"),
+            "neither is the comparison on the anchor's line: {surface}"
+        );
+        let records = artifact.files.get("carrick-manifest.json").unwrap();
+        assert!(
+            records.contains("no handler parameter 'message.data' resolved"),
+            "the abstention says which name resolved nothing: {records}"
+        );
+    }
+
     #[test]
     #[serial(v2_capture_sidecar)]
     fn explicit_config_survives_initial_capture_and_backfill() {

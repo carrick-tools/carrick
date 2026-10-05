@@ -3455,6 +3455,415 @@ mod tests {
         ));
     }
 
+    /// Every request this client writes, with every member present.
+    ///
+    /// Each struct and variant is written out in full, so a field added to
+    /// one stops this compiling until it is given a value here. Give it one
+    /// that is serialised (`Some`, non-empty, `true`): a member the request
+    /// omits proves nothing in the test below.
+    fn every_request_with_every_member() -> Vec<SidecarRequest> {
+        let id = || "r".to_string();
+        // A `match` with no wildcard: a new kind stops this compiling until
+        // it is listed, and a kind the sidecar's schema does not list is
+        // refused with every other item of its batch.
+        let infer_kinds = [
+            InferKind::FunctionReturn,
+            InferKind::Expression,
+            InferKind::CallResult,
+            InferKind::Variable,
+            InferKind::ResponseBody,
+            InferKind::RequestBody,
+            InferKind::SignatureReturn,
+            InferKind::FunctionParam,
+            InferKind::ReceiverType,
+        ];
+        for kind in &infer_kinds {
+            match kind {
+                InferKind::FunctionReturn
+                | InferKind::Expression
+                | InferKind::CallResult
+                | InferKind::Variable
+                | InferKind::ResponseBody
+                | InferKind::RequestBody
+                | InferKind::SignatureReturn
+                | InferKind::FunctionParam
+                | InferKind::ReceiverType => {}
+            }
+        }
+        let slot = || ClaimSlot {
+            arg: 0,
+            key: Some("key".into()),
+        };
+        let key_labels = || BTreeMap::from([("id".to_string(), KeyLabel::Name)]);
+        let name_scope = || NameScope {
+            scope: NameScopeKind::Service,
+            namespace: Some("task".into()),
+        };
+        let semantics = |claim: SemanticsClaim| SemanticsCheck {
+            claim_id: "c".into(),
+            package: "@fixture/http".into(),
+            export: "default".into(),
+            receiver: "export".into(),
+            claim,
+        };
+        let library = |claim: LibraryClaim| LibraryCheck {
+            claim_id: "c".into(),
+            package: "@fixture/queue".into(),
+            export: "default".into(),
+            role: LibraryRole::Broker,
+            receiver: "export".into(),
+            claim,
+        };
+        let pair = |protocol: ProbeProtocol, type_kind: ProbeTypeKind| CheckPairSpec {
+            pair_key: "p".into(),
+            protocol,
+            type_kind,
+            producer: CheckPairEndpoint {
+                service_name: "api".into(),
+                alias: "A".into(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: "web".into(),
+                alias: "B".into(),
+            },
+        };
+        vec![
+            SidecarRequest::Init {
+                request_id: id(),
+                repo_root: "/repo/apps/web".into(),
+                tsconfig_path: Some("tsconfig.json".into()),
+                scan_root: Some("/repo".into()),
+            },
+            SidecarRequest::Bundle {
+                request_id: id(),
+                symbols: vec![SymbolRequest {
+                    symbol_name: "Order".into(),
+                    source_file: "src/types.ts".into(),
+                    alias: Some("A".into()),
+                    array_depth: Some(1),
+                    payload_borrow_witness: true,
+                }],
+            },
+            SidecarRequest::Infer {
+                request_id: id(),
+                requests: infer_kinds
+                    .into_iter()
+                    .map(|infer_kind| InferRequestItem {
+                        file_path: "/repo/src/orders.ts".into(),
+                        line_number: 4,
+                        span_start: Some(10),
+                        span_end: Some(20),
+                        expression_text: Some("req.body".into()),
+                        expression_line: Some(4),
+                        infer_kind,
+                        alias: Some("A".into()),
+                        param_name: Some("event".into()),
+                    })
+                    .collect(),
+                extraction_config: Some(ExtractionConfig {
+                    rules: vec![ExtractionRule {
+                        wrapper_symbols: vec!["Envelope".into()],
+                        machinery_indicators: vec!["statusCode".into()],
+                        origin_module_globs: vec!["**/node_modules/http-lib/**".into()],
+                        payload_generic_index: Some(0),
+                        payload_property_path: vec!["data".into()],
+                        unwrap_recursively: Some(true),
+                        max_depth: Some(2),
+                    }],
+                }),
+            },
+            SidecarRequest::CaptureV2 {
+                request_id: id(),
+                repo_root: "/repo/apps/web".into(),
+                service_name: "web".into(),
+                anchors: vec![
+                    CaptureAnchor::Symbol {
+                        alias: "A".into(),
+                        symbol_name: "Order".into(),
+                        source_file: "src/types.ts".into(),
+                        anchor_origin: AnchorOrigin::LlmSymbol,
+                        array_depth: Some(1),
+                    },
+                    CaptureAnchor::HandlerReturn {
+                        alias: "B".into(),
+                        symbol_name: "getOrder".into(),
+                        source_file: "src/routes.ts".into(),
+                        anchor_origin: AnchorOrigin::AnchorBackfill,
+                    },
+                    CaptureAnchor::Infer {
+                        alias: "C".into(),
+                        source_file: "src/orders.ts".into(),
+                        anchor_origin: AnchorOrigin::DeterministicInfer,
+                        span_start: Some(10),
+                        span_end: Some(20),
+                        line_number: Some(4),
+                        expression_text: Some("req.body".into()),
+                        param_name: Some("event".into()),
+                    },
+                    CaptureAnchor::Literal {
+                        alias: "D".into(),
+                        type_text: "{ status: Status }".into(),
+                        anchor_origin: AnchorOrigin::ManifestPlaceholder,
+                        source_file: Some("src/routes.ts".into()),
+                        printed_names: vec![PrintedName {
+                            name: "Status".into(),
+                            file: "/repo/src/enums.ts".into(),
+                            export_path: vec!["Status".into()],
+                        }],
+                        raw_text_read: true,
+                    },
+                ],
+                out_dir: "/tmp/stub".into(),
+                tsconfig_path: Some("tsconfig.json".into()),
+                scan_root: Some("/repo".into()),
+            },
+            SidecarRequest::CheckV2 {
+                request_id: id(),
+                stubs: vec![CheckStubInput {
+                    service_name: "api".into(),
+                    stub_dir: "/tmp/stub".into(),
+                }],
+                pairs: vec![
+                    pair(ProbeProtocol::Http, ProbeTypeKind::Request),
+                    pair(ProbeProtocol::Graphql, ProbeTypeKind::Response),
+                    pair(ProbeProtocol::Socket, ProbeTypeKind::Both),
+                    pair(ProbeProtocol::Pubsub, ProbeTypeKind::Both),
+                ],
+                workspace_root: Some("/tmp/workspace".into()),
+            },
+            SidecarRequest::ResolveDefinitions {
+                request_id: id(),
+                stub_dir: "/tmp/stub".into(),
+                aliases: vec!["A".into()],
+            },
+            SidecarRequest::RetypeCheck {
+                request_id: id(),
+                items: vec![RetypeItem {
+                    item_id: "i".into(),
+                    file_path: "/repo/src/checkout.ts".into(),
+                    line_number: 2,
+                    span_start: Some(10),
+                    span_end: Some(20),
+                    expression_text: Some("fetch(url)".into()),
+                    expression_line: Some(2),
+                    producer_type: "{ id: string }".into(),
+                    producer_unwidened_type: Some("{ id: \"a\" }".into()),
+                    wire: true,
+                }],
+            },
+            SidecarRequest::VerifyClientSemantics {
+                request_id: id(),
+                from_dir: "/repo".into(),
+                checks: vec![
+                    semantics(SemanticsClaim::Factory {
+                        member: "create".into(),
+                        base_url_key: "baseURL".into(),
+                    }),
+                    semantics(SemanticsClaim::Verb {
+                        member: "get".into(),
+                        method: "GET".into(),
+                    }),
+                    semantics(SemanticsClaim::VerbBody {
+                        member: "post".into(),
+                        args: SemanticsVerbArgs::PathOptions,
+                        body_key: Some("json".into()),
+                    }),
+                    semantics(SemanticsClaim::Request {
+                        member: Some("request".into()),
+                        args: SemanticsRequestArgs::PathOptions,
+                        url_key: Some("url".into()),
+                        method_key: "method".into(),
+                    }),
+                    semantics(SemanticsClaim::RequestBody {
+                        member: Some("request".into()),
+                        args: SemanticsRequestArgs::Config,
+                        url_key: Some("url".into()),
+                        method_key: "method".into(),
+                        body_key: "data".into(),
+                    }),
+                ],
+                budget_ms: Some(500),
+            },
+            SidecarRequest::VerifyLibraryClaims {
+                request_id: id(),
+                from_dir: "/repo".into(),
+                checks: vec![
+                    library(LibraryClaim::Make {
+                        form: MakeForm::Call,
+                        member: Some("task".into()),
+                        base: Some(slot()),
+                        prefix: Some(slot()),
+                        name: Some(slot()),
+                        handler: Some(slot()),
+                        key_labels: key_labels(),
+                        name_scope: Some(name_scope()),
+                        picker: Some("model/q1".into()),
+                    }),
+                    library(LibraryClaim::Scope {
+                        member: "channel".into(),
+                        name: slot(),
+                        path: vec!["tasks".into()],
+                        on: Some(ClaimOn::Both),
+                        of: Some("instance:connect".into()),
+                        key_labels: key_labels(),
+                        name_scope: Some(name_scope()),
+                        picker: Some("model/q1".into()),
+                    }),
+                    library(LibraryClaim::Op {
+                        op: LibraryOp::Send,
+                        member: Some("trigger".into()),
+                        path: vec!["tasks".into()],
+                        on: Some(ClaimOn::Instance),
+                        of: Some("instance:task".into()),
+                        name: Some(OpName::Slot(slot())),
+                        payload: Some(slot()),
+                        handler: Some(slot()),
+                        ack: Some(slot()),
+                        key_labels: key_labels(),
+                        name_scope: Some(name_scope()),
+                        picker: Some("model/q1".into()),
+                        options: Some(slot()),
+                        method: Some("POST".into()),
+                        method_key: Some(slot()),
+                    }),
+                    library(LibraryClaim::Op {
+                        op: LibraryOp::Receive,
+                        member: Some("on".into()),
+                        path: vec!["tasks".into()],
+                        on: Some(ClaimOn::Export),
+                        of: Some("instance:task".into()),
+                        name: Some(OpName::Bound {
+                            bound: BoundName::Maker,
+                        }),
+                        payload: Some(slot()),
+                        handler: Some(slot()),
+                        ack: Some(slot()),
+                        key_labels: key_labels(),
+                        name_scope: Some(name_scope()),
+                        picker: Some("model/q1".into()),
+                        options: Some(slot()),
+                        method: Some("POST".into()),
+                        method_key: Some(slot()),
+                    }),
+                    library(LibraryClaim::Reserved {
+                        member: "on".into(),
+                        name: "ready".into(),
+                        path: vec!["tasks".into()],
+                        on: Some(ClaimOn::Instance),
+                        of: Some("instance:connect".into()),
+                        picker: Some("model/q1".into()),
+                    }),
+                ],
+                budget_ms: Some(500),
+            },
+            SidecarRequest::Shutdown { request_id: id() },
+        ]
+    }
+
+    /// What `sent` holds that `parsed` does not, each as the path that
+    /// reaches it. A request the schema refused is reported whole.
+    fn keys_the_schema_lost(
+        sent: &serde_json::Value,
+        parsed: &serde_json::Value,
+        at: &str,
+        lost: &mut Vec<String>,
+    ) {
+        use serde_json::Value;
+        match (sent, parsed) {
+            (Value::Object(sent), Value::Object(parsed)) => {
+                if let Some(refused) = parsed.get("refused") {
+                    lost.push(format!("{at}: {refused}"));
+                    return;
+                }
+                for (key, value) in sent {
+                    match parsed.get(key) {
+                        Some(kept) => {
+                            keys_the_schema_lost(value, kept, &format!("{at}.{key}"), lost)
+                        }
+                        None => lost.push(format!("{at}.{key}")),
+                    }
+                }
+            }
+            (Value::Array(sent), Value::Array(parsed)) => {
+                for (index, (value, kept)) in sent.iter().zip(parsed).enumerate() {
+                    keys_the_schema_lost(value, kept, &format!("{at}[{index}]"), lost);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// carrick#1980: the sidecar reads a request through a schema that drops
+    /// every key it does not declare, so a member this client writes and the
+    /// schema lacks never reaches the handler that reads it. A capture
+    /// anchor's `param_name` went that way from the day it was added: the
+    /// wire shape was right, the capture read the name, every test of either
+    /// side passed, and no request carried it across.
+    ///
+    /// Each request above goes through the built schema and must come back
+    /// whole. The sidecar has to be built for that, so one that is not fails
+    /// this test rather than skipping it.
+    #[test]
+    fn the_sidecar_schema_keeps_every_key_the_client_writes() {
+        let validators =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/validators.js");
+        assert!(
+            validators.exists(),
+            "the sidecar is not built, so its schema cannot be read \
+             (cd src/sidecar && npm ci && npm run build)"
+        );
+        let sent = serde_json::to_value(every_request_with_every_member()).unwrap();
+        let script = r#"
+            const { pathToFileURL } = await import('node:url');
+            const { parseRequest } = await import(pathToFileURL(process.argv[1]).href);
+            let text = '';
+            for await (const chunk of process.stdin) text += chunk;
+            const parsed = JSON.parse(text).map((request) => {
+              const result = parseRequest(request);
+              return result.success ? result.request : { refused: result.error };
+            });
+            process.stdout.write(JSON.stringify(parsed));
+        "#;
+        let mut node = Command::new("node")
+            .args(["--input-type=module", "-e", script])
+            .arg(&validators)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node runs the sidecar's schema");
+        node.stdin
+            .take()
+            .unwrap()
+            .write_all(sent.to_string().as_bytes())
+            .unwrap();
+        let output = node.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+        let mut lost = Vec::new();
+        for (request, answer) in sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(parsed.as_array().unwrap())
+        {
+            let action = request["action"].as_str().unwrap();
+            keys_the_schema_lost(request, answer, action, &mut lost);
+        }
+        assert!(
+            lost.is_empty(),
+            "the sidecar's request schema (src/sidecar/src/validators.ts) does not \
+             take what the client writes: {lost:#?}"
+        );
+        // Nothing lost, and nothing changed on the way through either.
+        assert_eq!(parsed, sent);
+    }
+
     /// Check-pair wire shapes: lowercase protocol/type_kind enums, and the
     /// verdict bucket parses all four classifier values.
     #[test]
