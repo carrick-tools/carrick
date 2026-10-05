@@ -321,6 +321,43 @@ fn the_stored_index_carries_the_mark_and_no_type_entries_for_it() {
         "and so no verdict row: {}",
         blob["compat_verdicts"]
     );
+
+    // The scan's own account of what it left untyped. The marked calls are
+    // not compared yet, which is not a type that failed to resolve, so they
+    // are counted apart and the untyped count keeps only the one call no own
+    // route serves. Ten operations, 35 calls: one reason per operation.
+    let boundary = &blob["boundary"];
+    assert_eq!(
+        boundary["calls_without_expected_type"]["total"], 1,
+        "{boundary:#}"
+    );
+    assert_eq!(boundary["own_route_calls_not_compared"]["total"], 35);
+    let reasons = boundary["own_route_calls_not_compared"]["reasons"]
+        .as_array()
+        .expect("the grouped reasons");
+    assert_eq!(reasons.len(), 10, "one line per operation: {reasons:#?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason == "http|GET|/api/items ×5"),
+        "{reasons:#?}"
+    );
+
+    let printed = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        printed.contains("1 call(s) with no resolved expected type"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(
+            "35 call(s) to this service's own route(s), types not compared yet (not counted above)"
+        ),
+        "{printed}"
+    );
 }
 
 #[test]
