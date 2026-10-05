@@ -56,6 +56,7 @@ import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { functionAtLine } from './function-line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
+import { stableSignatureText } from './signature-text.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -324,6 +325,12 @@ const WHOLE_BODY_READS = new Set(['json', 'text']);
 
 /** The body format a caller names to read a response as raw text (carrick#1842). */
 const RAW_TEXT_FORMAT = 'text';
+
+/**
+ * The kinds the signature pass asks, and nothing else does: their text is the
+ * function index's, printed in a stable union order (carrick#1993).
+ */
+const SIGNATURE_KINDS: ReadonlySet<InferKind> = new Set<InferKind>(['signature_return', 'signature_param']);
 
 interface DeclaredContract {
   text: string;
@@ -602,6 +609,13 @@ export class TypeInferrer {
         if (result) {
           printedLength = result.type_string.length;
           this.recordPrintedNames(result, request, prints);
+          // The function index's text, and only it, is put in an order that
+          // does not depend on what this process met first (carrick#1993).
+          // After the names are read: the checker is asked exactly what it
+          // was asked before, so no later print in this process moves.
+          if (SIGNATURE_KINDS.has(request.infer_kind)) {
+            result.type_string = timedPhase('print', () => stableSignatureText(result.type_string));
+          }
           inferredTypes.push(result);
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
@@ -890,6 +904,7 @@ export class TypeInferrer {
         return this.inferRequestBody(sourceFile, request, extractionConfig);
       case 'signature_return':
         return this.inferSignatureReturn(sourceFile, request);
+      case 'signature_param':
       case 'function_param':
         return this.inferFunctionParam(sourceFile, request);
       case 'receiver_type':
@@ -1180,6 +1195,10 @@ export class TypeInferrer {
    * even without an annotation). Uses ts-morph's default `getText()` form,
    * which keeps named types as names and bounds depth via the compiler's own
    * truncation.
+   *
+   * Asked as `function_param` for a contract (a handler's parameter read as a
+   * payload) and as `signature_param` by the signature pass. The two do the
+   * same work here; `infer` puts the second's text in the stable order.
    */
   private inferFunctionParam(
     sourceFile: SourceFile,
@@ -1193,7 +1212,9 @@ export class TypeInferrer {
     }
 
     if (!request.param_name) {
-      this.logError(`function_param request missing param_name at ${request.file_path}:${request.line_number}`);
+      this.logError(
+        `${request.infer_kind} request missing param_name at ${request.file_path}:${request.line_number}`
+      );
       return null;
     }
 
@@ -8117,6 +8138,8 @@ export class TypeInferrer {
         return 'Request';
       case 'signature_return':
         return 'SigReturn';
+      case 'signature_param':
+        return 'SigParam';
       case 'function_param':
         return 'Param';
       default:

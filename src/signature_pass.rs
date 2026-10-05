@@ -37,9 +37,12 @@ const RETURN_UNKNOWN: &str = "unknown";
 /// bounds what one stalled slot takes with it.
 ///
 /// The slots are cut into batches in the order they were always sent. The
-/// compiler prints a union's members in the order it first met them, so
-/// sending the same slots in another order (by file, say) changes how some
-/// signatures read without changing what they say: 227 of 6,653 on one tree.
+/// compiler prints a union's members in the order it first met them, and
+/// sending the same slots in another order (by file, say) changed how 227 of
+/// 6,653 signatures on one tree read without changing what they say. The
+/// sidecar now puts the unions of the signature kinds in one stable order
+/// (carrick#1993); whether anything else the compiler prints still moves with
+/// the order is measured before the order is changed.
 const BATCH_SLOTS: usize = 500;
 
 /// A slot is named in the log when it took this many milliseconds or more
@@ -266,7 +269,7 @@ fn describe_slot(
         Some(SigSlot::Return) => "return".to_string(),
         Some(SigSlot::Param(index)) => format!("parameter {}", index + 1),
         None => match slot.infer_kind {
-            InferKind::FunctionParam => "parameter".to_string(),
+            InferKind::SignatureParam | InferKind::FunctionParam => "parameter".to_string(),
             _ => "return".to_string(),
         },
     };
@@ -576,7 +579,11 @@ fn build_infer_requests(
                 span_end: None,
                 expression_text: None,
                 expression_line: None,
-                infer_kind: InferKind::FunctionParam,
+                // Not `FunctionParam`: that is the kind a contract's parameter
+                // is asked by, and its text keeps the compiler's own union
+                // order. This one's text is the function index's, printed in a
+                // stable order (carrick#1993).
+                infer_kind: InferKind::SignatureParam,
                 alias: Some(alias.clone()),
                 // ts-morph matches by getName(), which drops the rest `...`.
                 param_name: Some(arg.name.trim_start_matches("...").to_string()),
@@ -800,9 +807,16 @@ mod tests {
 
         let param_req = requests
             .iter()
-            .find(|r| r.infer_kind == InferKind::FunctionParam)
+            .find(|r| r.infer_kind == InferKind::SignatureParam)
             .expect("param request");
         assert_eq!(param_req.param_name.as_deref(), Some("opts"));
+        // The contract kind is never the pass's: its text is not put in the
+        // stable order (carrick#1993).
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.infer_kind != InferKind::FunctionParam)
+        );
 
         // every request alias maps back to a target
         for req in &requests {
@@ -833,7 +847,7 @@ mod tests {
         let (requests, _) = build_infer_requests(&defs, Path::new("/tmp/repo"));
         let param_req = requests
             .iter()
-            .find(|r| r.infer_kind == InferKind::FunctionParam)
+            .find(|r| r.infer_kind == InferKind::SignatureParam)
             .expect("param request");
         assert_eq!(param_req.param_name.as_deref(), Some("args"));
     }
@@ -1462,7 +1476,7 @@ mod tests {
             "alias": "not_ours",
             "file_path": "/r/elsewhere.ts",
             "line_number": 7,
-            "infer_kind": "function_param",
+            "infer_kind": "signature_param",
             "ms": 1.0,
             "type_ms": 0.2,
             "print_ms": 0.1,

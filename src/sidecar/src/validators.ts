@@ -23,6 +23,7 @@ export const InferKindSchema = z.enum([
   'response_body',
   'request_body',
   'signature_return',
+  'signature_param',
   'function_param',
   'receiver_type',
 ]);
@@ -132,7 +133,8 @@ export function validateInferRequestItem(item: InferRequestItem): string | null 
   const hasSpan = item.span_start !== undefined && item.span_end !== undefined;
   const hasText = item.expression_text !== undefined;
   // Function-anchored inference (function_return for file-based routes,
-  // signature_return / function_param for the signature pass) locates the
+  // signature_return / signature_param for the signature pass, function_param
+  // for a handler's parameter read as a payload) locates the
   // function by line_number alone, so it does not require a span or text.
   // response_body / request_body also accept a line-only anchor: for a
   // named-handler route registration the scanner falls back to the registration
@@ -142,6 +144,7 @@ export function validateInferRequestItem(item: InferRequestItem): string | null 
   const lineOnlyOk =
     item.infer_kind === 'function_return' ||
     item.infer_kind === 'signature_return' ||
+    item.infer_kind === 'signature_param' ||
     item.infer_kind === 'function_param' ||
     item.infer_kind === 'response_body' ||
     item.infer_kind === 'request_body';

@@ -161,9 +161,10 @@ function canonicalizeMember(member: string): string {
  * UTF-16 code unit. This is `orderMembers` in `type-structural-expander.ts`,
  * over the renderings that are all this side has — the two must agree member
  * for member, or one union prints two ways depending on whether the walk or
- * the compiler rendered it.
+ * the compiler rendered it. The signature pass's parsed rewrite
+ * (`signature-text.ts`) orders by it too.
  */
-function orderTextMembers(members: string[]): string[] {
+export function orderTextMembers(members: string[]): string[] {
   return foldBooleanLiterals(members.map((text) => text.trim()))
     .map((text, index) => ({ text, index }))
     .sort((a, b) => {

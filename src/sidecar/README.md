@@ -675,9 +675,11 @@ A specifier that lists nothing carries the verifier's module `reason` (`module_u
 
 #### `infer` - Resolve the type at a locator
 
-Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
+Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `signature_param`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
 
-`infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`.
+`infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `signature_param`, `function_param`, `receiver_type`.
+
+`signature_return` and `signature_param` are the function index's slots: a function's return and one parameter, read as `function_param` reads a parameter. Their text has every union, at every depth, in one order (each member by its own text), so it is the same whichever process printed it and whatever that process read first. `function_param` is the kind a contract's parameter is asked by, and keeps the compiler's print, whose union order is the order the compiler met the members.
 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
 
@@ -780,7 +782,7 @@ Response:
 
 - `slots` counts every request the batch was done with, answered or not, and `slots_ms` adds up their wall times in milliseconds.
 - `slowest` names the 25 slowest, slowest first. Each is the request as it was asked (`alias`, `file_path`, `line_number`, `infer_kind`), its `ms`, and the length of the `type_string` it printed (`printed_length`, 0 when it printed none).
-- `type_ms` is the part of a request's `ms` spent in the compiler call that computes the type (a function's `getReturnType()`, a parameter's `getType()`), and `print_ms` the part spent printing the type to text, at its whole length. `type_ms` is told apart for `signature_return` and `function_param` and is 0 for the other kinds. A type of four characters can take seconds to compute and one of a million half a second to print, so the length alone does not say which a slow request was. The batch's own `type_ms` and `print_ms` add its requests' up.
+- `type_ms` is the part of a request's `ms` spent in the compiler call that computes the type (a function's `getReturnType()`, a parameter's `getType()`), and `print_ms` the part spent printing the type to text, at its whole length. `type_ms` is told apart for `signature_return`, `signature_param` and `function_param` and is 0 for the other kinds. A type of four characters can take seconds to compute and one of a million half a second to print, so the length alone does not say which a slow request was. The batch's own `type_ms` and `print_ms` add its requests' up.
 - `first_in_file` marks a request whose file no earlier request named to the project that answers it, so it does the work the file's later requests reuse. `first_in_file_slots` and `first_in_file_ms` add those up apart from the rest.
 - `longest_printed` is the request that printed the longest type, and is absent when none printed one.
 

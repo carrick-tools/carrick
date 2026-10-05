@@ -1545,7 +1545,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
 /// written by hand, so this is the one place a member renamed on either side
 /// of the protocol would show: the scanner would read no timing and log
 /// nothing, with every other test green.
+// Serial with every other test that runs the signature pass: a callsite
+// first reached on a thread with no subscriber can be cached as uninteresting
+// before this test's scoped subscriber is registered, and the pass then logs
+// nothing here (seen one run in four beside the stable-order test).
 #[test]
+#[serial_test::serial(signature_pass)]
 fn test_signature_pass_logs_where_its_time_went() {
     use carrick::services::type_sidecar::TypeSidecar;
     use carrick::signature_pass::populate_function_signatures;
@@ -1685,6 +1690,122 @@ fn test_signature_pass_logs_where_its_time_went() {
     assert!(
         !log.contains("title: string"),
         "the log holds a type's text: {log}"
+    );
+}
+
+/// carrick#1993: the signature pass stores its unions in a stable order, the
+/// one the sidecar uses everywhere, and not in the order the compiler created
+/// their members. Here the program meets `Dog` before `Cat`, so the
+/// compiler's own print is `Dog | Cat`; the function index says `Cat | Dog`
+/// for the return slot and for the parameter slot, which travels as its own
+/// kind over the wire.
+#[test]
+#[serial_test::serial(signature_pass)]
+fn test_signature_pass_stores_unions_in_a_stable_order() {
+    use carrick::services::type_sidecar::TypeSidecar;
+    use carrick::signature_pass::populate_function_signatures;
+    use carrick::visitor::{FunctionArgument, FunctionDefinition, FunctionNodeType};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let sidecar_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    assert!(
+        sidecar_path.exists(),
+        "build the sidecar first: cd src/sidecar && npm ci && npm run build"
+    );
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let repo = temp_dir
+        .path()
+        .canonicalize()
+        .expect("the temp directory resolves");
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fs::write(
+        repo.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "target": "ES2020", "module": "commonjs", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*.ts"] }"#,
+    )
+    .expect("write tsconfig");
+    let file = repo.join("src/pets.ts");
+    fs::write(
+        &file,
+        "export interface Cat { kind: 'cat' }\n\
+         export interface Dog { kind: 'dog' }\n\
+         export function pick(n: number) {\n  return n ? ({ kind: 'dog' } as Dog) : ({ kind: 'cat' } as Cat);\n}\n\
+         export function adopt(pet = pick(1)) {\n  return [pet];\n}\n",
+    )
+    .expect("write the source file");
+
+    let definition =
+        |name: &str, line_number: u32, arguments: Vec<FunctionArgument>| FunctionDefinition {
+            name: name.to_string(),
+            file_path: file.clone(),
+            node_type: FunctionNodeType::Placeholder,
+            arguments,
+            body_source: None,
+            is_exported: true,
+            line_number,
+            end_line: line_number + 2,
+            intent: None,
+            calls: vec![],
+            tokens: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            intent_input_hash: None,
+            dispatch_table: None,
+        };
+    let mut definitions = HashMap::from([
+        (
+            "pick".to_string(),
+            definition(
+                "pick",
+                3,
+                vec![FunctionArgument {
+                    name: "n".to_string(),
+                    type_ann: None,
+                    is_explicit: true,
+                    type_string: Some("number".to_string()),
+                    is_optional: false,
+                    has_default: false,
+                    default_value: None,
+                    is_rest: false,
+                }],
+            ),
+        ),
+        (
+            "adopt".to_string(),
+            definition(
+                "adopt",
+                6,
+                vec![FunctionArgument {
+                    name: "pet".to_string(),
+                    type_ann: None,
+                    is_explicit: false,
+                    type_string: None,
+                    is_optional: false,
+                    has_default: true,
+                    default_value: Some("pick(1)".to_string()),
+                    is_rest: false,
+                }],
+            ),
+        ),
+    ]);
+
+    let sidecar = TypeSidecar::spawn(&sidecar_path).expect("the sidecar spawns");
+    sidecar.start_init(&repo, None);
+    sidecar
+        .wait_ready(Duration::from_secs(120))
+        .expect("the sidecar initialises on the fixture");
+    populate_function_signatures(Some(&sidecar), &mut definitions, repo.to_str().unwrap());
+
+    assert_eq!(
+        definitions["pick"].signature.as_deref(),
+        Some("(n: number) => Cat | Dog")
+    );
+    assert_eq!(
+        definitions["adopt"].signature.as_deref(),
+        Some("(pet?: Cat | Dog) => (Cat | Dog)[]")
     );
 }
 

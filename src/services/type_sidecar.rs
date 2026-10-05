@@ -62,6 +62,13 @@ pub enum InferKind {
     RequestBody,
     /// Function return for the signature hint — NO Promise/wrapper unwrapping
     SignatureReturn,
+    /// A parameter's type for the signature hint. The sidecar answers it as
+    /// it answers `FunctionParam` and puts the text's unions in a stable
+    /// order, so the function index reads the same whichever process printed
+    /// it (carrick#1993). The signature pass asks this kind and nothing else
+    /// does: a contract's parameter is asked as `FunctionParam` and keeps the
+    /// compiler's own print.
+    SignatureParam,
     /// Type of a single named parameter (explicit or contextually inferred)
     FunctionParam,
     /// Type of the RECEIVER of a member call (carrick#695). Answers what `x`
@@ -3550,6 +3557,7 @@ mod tests {
             InferKind::ResponseBody,
             InferKind::RequestBody,
             InferKind::SignatureReturn,
+            InferKind::SignatureParam,
             InferKind::FunctionParam,
             InferKind::ReceiverType,
         ];
@@ -3562,6 +3570,7 @@ mod tests {
                 | InferKind::ResponseBody
                 | InferKind::RequestBody
                 | InferKind::SignatureReturn
+                | InferKind::SignatureParam
                 | InferKind::FunctionParam
                 | InferKind::ReceiverType => {}
             }

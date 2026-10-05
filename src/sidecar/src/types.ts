@@ -18,6 +18,7 @@ export type InferKind =
   | 'response_body'     // Find response body (.json()/.send()/ctx.body)
   | 'request_body'      // Find request body (req.body/ctx.request.body or call payloads)
   | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
+  | 'signature_param'   // A parameter's type for the signature hint (carrick#1993)
   | 'function_param'    // Type of a single named parameter (explicit or contextually inferred)
   | 'receiver_type';    // Type of the RECEIVER of a member call (carrick#695)
 
@@ -572,7 +573,7 @@ export interface InferRequestItem {
   infer_kind: InferKind;
   /** Optional alias for the inferred type */
   alias?: string;
-  /** Target parameter name for `function_param` inference. */
+  /** Target parameter name for `function_param` and `signature_param` inference. */
   param_name?: string;
 }
 
@@ -651,16 +652,17 @@ export interface InferSlotTiming {
   /**
    * Of `ms`, the time in the compiler call that computes the type: a
    * function's `getReturnType()`, a parameter's `getType()`. It is told
-   * apart for `signature_return` and `function_param`, and is 0 for the
-   * other kinds, whose time in the compiler stays in `ms` alone.
+   * apart for `signature_return`, `signature_param` and `function_param`,
+   * and is 0 for the other kinds, whose time in the compiler stays in `ms`
+   * alone.
    */
   type_ms: number;
   /**
    * Of `ms`, the time in the inferrer's print of a type to text. Truncation
    * is off, so a type is printed at its whole length. For
-   * `signature_return` and `function_param` this is every print the request
-   * makes; the other kinds also print through the structural expander, and
-   * that time stays in `ms` alone.
+   * `signature_return`, `signature_param` and `function_param` this is every
+   * print the request makes; the other kinds also print through the
+   * structural expander, and that time stays in `ms` alone.
    */
   print_ms: number;
   /** Characters in the `type_string` the request printed; 0 when it printed none */
