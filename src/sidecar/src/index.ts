@@ -452,11 +452,21 @@ function handleRetypeCheck(
     );
     const deadline = performance.now() + budget;
     const outcomes = new Array<RetypeOutcome>(request.items.length);
+    // One count for the request, whichever programs its items span, reported
+    // as `infer` reports its batch (carrick#1914, carrick#1945).
+    let judged = 0;
+    const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+      writeProgress(request.request_id, 'retype', `${judged} of ${request.items.length}`)
+    );
+    const onJudged = () => {
+      judged += 1;
+      report();
+    };
     for (const [key, entries] of groups) {
       // One budget for the request, whichever programs it spans.
       const remaining = groups.size === 1 ? budget : Math.max(0, deadline - performance.now());
       projectComponents(key)
-        .retyper.run(entries.map(({ item }) => item), remaining)
+        .retyper.run(entries.map(({ item }) => item), remaining, onJudged)
         .forEach((outcome, position) => {
           outcomes[entries[position].index] = outcome;
         });

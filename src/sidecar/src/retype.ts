@@ -106,9 +106,11 @@ export class Retyper {
    * Judge every item, spending at most `budgetMs`. Each item rebuilds the
    * program at least twice, so a consumer with many calls could otherwise
    * outrun the caller's read deadline and lose every answer; the items the
-   * budget does not reach abstain and say so.
+   * budget does not reach abstain and say so. `onJudged` is called after each
+   * item the budget reached, so the caller can report progress while the
+   * event loop is blocked (carrick#1945).
    */
-  run(items: RetypeItem[], budgetMs: number): RetypeOutcome[] {
+  run(items: RetypeItem[], budgetMs: number, onJudged?: () => void): RetypeOutcome[] {
     const deadline = performance.now() + budgetMs;
     // What each file said before any rewrite. Every rewrite is undone, so it
     // is the same for every item in the file.
@@ -117,14 +119,17 @@ export class Retyper {
       if (performance.now() >= deadline) {
         return abstain(item, `the retype check ran out of its ${budgetMs}ms budget`);
       }
+      let outcome: RetypeOutcome;
       try {
-        return this.runOne(item, before);
+        outcome = this.runOne(item, before);
       } catch (err) {
-        return abstain(
+        outcome = abstain(
           item,
           `the retype check failed: ${err instanceof Error ? err.message : String(err)}`
         );
       }
+      onJudged?.();
+      return outcome;
     });
   }
 

@@ -231,30 +231,16 @@ fn each_marked_call_is_an_edge_whose_two_ends_are_the_service() {
         .filter(|key| !produced.contains(key.as_str()))
         .collect();
     assert_eq!(uncalled, vec!["http|GET|/api/settings".to_string()]);
-
-    // No type entry was built for a marked call, so no edge carries a
-    // verdict: an unchecked pair reads as not compared, never as compatible.
-    for edge in scan["cross_repo_matches"].as_array().expect("matches") {
-        assert!(
-            edge.get("type_compatible").is_none(),
-            "a same-service pair has no verdict until it is type-checked: {edge}"
-        );
-    }
-    for call in scan["calls"].as_array().expect("calls") {
-        if call.get("own_route").is_some() {
-            assert!(
-                call.get("type_alias").is_none(),
-                "a marked call has no type entry yet: {call}"
-            );
-        }
-    }
 }
 
 /// The index blob itself, which is what the cloud reads: the mark is on the
 /// mount-graph row, spelled `"own_route": true`, and absent from a row no own
-/// route serves. The marked rows add no consumer type entry and no verdict.
+/// route serves. A marked call is type-checked against its own route
+/// (carrick#1945): its verdict row names the service twice, and lists the
+/// call's site with a response half, and a request half where the route's
+/// method takes a body.
 #[test]
-fn the_stored_index_carries_the_mark_and_no_type_entries_for_it() {
+fn the_stored_index_carries_the_mark_and_a_verdict_for_each_marked_call() {
     let cache = tempfile::tempdir().expect("temp cache dir");
     let output = carrick(&fixture("own-route-calls"))
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
@@ -303,61 +289,64 @@ fn the_stored_index_carries_the_mark_and_no_type_entries_for_it() {
         "the projected call rows are the same rows"
     );
 
-    let consumer_entries = blob["type_manifest"]
+    // Each verdict row names the one service at both ends, and no field marks
+    // it as such.
+    let verdicts = blob["compat_verdicts"]
         .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| entry["role"] == "consumer")
-                .count()
-        })
-        .unwrap_or(0);
-    assert_eq!(
-        consumer_entries, 0,
-        "a marked call adds no type entry until same-service pairs are checked"
-    );
-    assert!(
-        blob.get("compat_verdicts").is_none_or(|v| v.is_null()),
-        "and so no verdict row: {}",
-        blob["compat_verdicts"]
-    );
+        .expect("a marked call is type-checked, so verdict rows are stored");
+    for row in verdicts {
+        assert_eq!(row["producer_repo"], row["consumer_repo"], "{row}");
+    }
+    // The halves each call site got, by `file:line`.
+    let mut halves: std::collections::BTreeMap<String, (bool, bool)> = Default::default();
+    for row in verdicts {
+        for site in row["sites"].as_array().expect("sites") {
+            let entry = halves
+                .entry(
+                    site["consumer_location"]
+                        .as_str()
+                        .expect("location")
+                        .to_string(),
+                )
+                .or_default();
+            entry.0 |= site.get("request").is_some();
+            entry.1 |= site.get("response").is_some();
+        }
+    }
+    for row in call_rows(&expected("own-route-calls")["calls"], false) {
+        let (file, line, method, _, own_route) = &row;
+        let site = format!("{file}:{line}");
+        let (request, response) = halves.get(&site).copied().unwrap_or_default();
+        if !own_route {
+            assert!(!request && !response, "no route serves {row:?}");
+            continue;
+        }
+        // A caller of `listItems()`, which returns a member of the body: the
+        // row states what the function returns, which is not the response
+        // (carrick#1601), so it has no response entry to pair.
+        let restated = matches!(
+            site.as_str(),
+            "components/ItemPicker.tsx:10" | "components/ItemPickerAlias.tsx:10"
+        );
+        assert_eq!(response, !restated, "a response half at {row:?}");
+        if *method != "GET" {
+            assert!(request, "a body method's call has a request half: {row:?}");
+        }
+    }
 
-    // The scan's own account of what it left untyped. The marked calls are
-    // not compared yet, which is not a type that failed to resolve, so they
-    // are counted apart and the untyped count keeps only the one call no own
-    // route serves. Ten operations, 35 calls: one reason per operation.
+    // A call to an own route with no resolved expected type is a shortfall
+    // like any other call's, and nothing counts it apart any more.
     let boundary = &blob["boundary"];
-    assert_eq!(
-        boundary["calls_without_expected_type"]["total"], 1,
+    assert!(
+        boundary.get("own_route_calls_not_compared").is_none(),
         "{boundary:#}"
     );
-    assert_eq!(boundary["own_route_calls_not_compared"]["total"], 35);
-    let reasons = boundary["own_route_calls_not_compared"]["reasons"]
-        .as_array()
-        .expect("the grouped reasons");
-    assert_eq!(reasons.len(), 10, "one line per operation: {reasons:#?}");
-    assert!(
-        reasons
-            .iter()
-            .any(|reason| reason == "http|GET|/api/items ×5"),
-        "{reasons:#?}"
-    );
-
     let printed = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        printed.contains("1 call(s) with no resolved expected type"),
-        "{printed}"
-    );
-    assert!(
-        printed.contains(
-            "35 call(s) to this service's own route(s), types not compared yet (not counted above)"
-        ),
-        "{printed}"
-    );
+    assert!(!printed.contains("types not compared yet"), "{printed}");
 }
 
 #[test]

@@ -98,9 +98,10 @@ the server; socket **listener** = producer; pub/sub **subscriber** = producer
 **Edge 13 is the same-service edge**: `inventory-svc` calls its own route, so
 the edge's producer and consumer are one repo, and the call row in
 `inventory-svc/expected.json` is labelled `own_route`. Its `type_compatible` is
-`null`, the one edge here without a verdict label: the type check pairs no
-service with itself yet (carrick#1945), so the edge carries no verdict and is
-skipped on the compat row. The label takes a verdict when that lands.
+`null`, the one edge here without a verdict label. The type check pairs a
+service with itself (carrick#1945), but the job reads nothing of the response,
+so there is no contract to compare: the pair is unverifiable, which states no
+`type_compatible`, and the edge is skipped on the compat row.
 
 **Edges 8/9 are the fan-out**: one publisher (catalog-api), two subscriber repos —
 two producers on one key (`pubsub|catalog.price.updated`), so two match edges

@@ -3786,9 +3786,10 @@ mod scoring_tests {
             .count();
         assert_eq!(incompatible, 4, "4 deliberately-incompatible edges");
         // Every edge between two services labels a verdict. The same-service
-        // edge labels none: the type check pairs no service with itself yet
-        // (carrick#1945), so the scan states no verdict for it, and an
-        // unlabelled edge is skipped on the compat row.
+        // edge labels none: its consumer reads nothing of the response, so
+        // the check (which pairs a service with itself, carrick#1945) finds no
+        // contract and states no `type_compatible`, and an unlabelled edge is
+        // skipped on the compat row.
         for m in &expected_output.matches {
             assert_eq!(
                 m.type_compatible.is_some(),
