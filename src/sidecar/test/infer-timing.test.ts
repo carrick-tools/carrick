@@ -4,15 +4,17 @@
  * A pass of thousands of requests can spend most of its time in a handful of
  * them, and its answer used to say nothing about which. Every request is now
  * timed, and the answer names the slowest few beside the types: for each, the
- * request (alias, file, line, kind), its wall time, how long the type it
+ * request (alias, file, line, kind), its wall time, how much of that went on
+ * computing the type and how much on printing it, how long the type it
  * printed is, and whether it was the first request this process was asked of
  * its file.
  *
- * Three layers are pinned:
+ * Four layers are pinned:
+ * - the phase clock: what is counted as computing a type and as printing one;
  * - the summary of a batch's timings: which requests it names, in what order,
  *   and what it adds up;
- * - the inferrer: every request is timed whatever it answered, and the
- *   timing sits beside the answers, never in them;
+ * - the inferrer: every request is timed whatever it answered, its time is
+ *   split, and the timing sits beside the answers, never in them;
  * - over stdio: the terminal frame carries the timing, for a request one
  *   project answers and for one two projects answer.
  *
@@ -28,7 +30,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { Project } from 'ts-morph';
-import { SLOWEST_SLOTS, inferTiming, mergeInferTimings } from '../src/infer-timing.js';
+import {
+  SLOWEST_SLOTS,
+  inferTiming,
+  mergeInferTimings,
+  phaseClock,
+  timedPhase,
+} from '../src/infer-timing.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
 import type { InferRequestItem, InferSlotTiming, InferTiming } from '../src/types.js';
 import { SIDECAR_PATH } from './helpers.js';
@@ -57,13 +65,25 @@ const lineOf = (source: string, text: string): number => {
   return index + 1;
 };
 
-/** A timing the test writes: request `alias` took `ms` and printed `printed` characters. */
-const slot = (alias: string, ms: number, printed = 0, first = false): InferSlotTiming => ({
+/**
+ * A timing the test writes: request `alias` took `ms` and printed `printed`
+ * characters. `parts` is how much of `ms` went on computing the type and on
+ * printing it.
+ */
+const slot = (
+  alias: string,
+  ms: number,
+  printed = 0,
+  first = false,
+  parts: { type?: number; print?: number } = {}
+): InferSlotTiming => ({
   alias,
   file_path: `/repo/src/${alias}.ts`,
   line_number: 1,
   infer_kind: 'signature_return',
   ms,
+  type_ms: parts.type ?? 0,
+  print_ms: parts.print ?? 0,
   printed_length: printed,
   first_in_file: first,
 });
@@ -71,6 +91,50 @@ const slot = (alias: string, ms: number, printed = 0, first = false): InferSlotT
 const aliases = (slots: InferSlotTiming[]): Array<string | undefined> => slots.map((s) => s.alias);
 
 describe('an infer batch names its slowest requests (carrick#1985)', () => {
+  describe('the phase clock', () => {
+    /** Burn a little time the clock can see. */
+    const work = (): number => {
+      const until = performance.now() + 2;
+      let turns = 0;
+      while (performance.now() < until) turns += 1;
+      return turns;
+    };
+
+    it('counts the time of what it runs under the phase it is given, and no other', () => {
+      const before = phaseClock();
+      const returned = timedPhase('print', work);
+      const after = phaseClock();
+      assert.ok(returned > 0, 'the work ran and its result came back');
+      assert.ok(after.print - before.print >= 2, `print moved ${after.print - before.print}`);
+      assert.strictEqual(after.type, before.type);
+
+      timedPhase('type', work);
+      const last = phaseClock();
+      assert.ok(last.type - after.type >= 2, `type moved ${last.type - after.type}`);
+      assert.strictEqual(last.print, after.print);
+    });
+
+    it('counts work that throws, and lets the error through', () => {
+      const before = phaseClock();
+      assert.throws(
+        () =>
+          timedPhase('type', () => {
+            work();
+            throw new Error('the compiler threw');
+          }),
+        /the compiler threw/
+      );
+      assert.ok(phaseClock().type - before.type >= 2);
+    });
+
+    it('hands back a reading, not the clock: a reader cannot move it', () => {
+      const reading = phaseClock() as { type: number; print: number };
+      const was = phaseClock();
+      reading.type += 1_000;
+      assert.strictEqual(phaseClock().type, was.type);
+    });
+  });
+
   describe('the summary of a batch', () => {
     it('names the slowest requests, slowest first, and counts every one', () => {
       const timing = inferTiming([slot('quick', 1), slot('slowest', 900), slot('slow', 40), slot('quicker', 0.5)]);
@@ -107,6 +171,26 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
       assert.strictEqual(timing.slots_ms, 353);
     });
 
+    it('adds up what went on computing types and on printing them, each apart', () => {
+      const timing = inferTiming([
+        slot('computed', 9_470, 4, true, { type: 9_468.5, print: 0.1 }),
+        slot('printed', 583, 904_246, false, { type: 0, print: 568.6 }),
+        slot('both', 50, 300, false, { type: 20.25, print: 25.5 }),
+      ]);
+      assert.strictEqual(timing.type_ms, 9_488.75);
+      assert.strictEqual(timing.print_ms, 594.2);
+      assert.strictEqual(timing.slots_ms, 10_103);
+      // Each named request keeps its own two parts.
+      assert.deepStrictEqual(
+        timing.slowest.map((named) => [named.alias, named.type_ms, named.print_ms]),
+        [
+          ['computed', 9_468.5, 0.1],
+          ['printed', 0, 568.6],
+          ['both', 20.25, 25.5],
+        ]
+      );
+    });
+
     it('names the request that printed the longest type, slow or not', () => {
       const many = [
         ...Array.from({ length: SLOWEST_SLOTS }, (_, i) => slot(`slow${i}`, 100 + i, 10)),
@@ -129,6 +213,8 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
       assert.deepStrictEqual(inferTiming([]), {
         slots: 0,
         slots_ms: 0,
+        type_ms: 0,
+        print_ms: 0,
         first_in_file_slots: 0,
         first_in_file_ms: 0,
         slowest: [],
@@ -136,12 +222,17 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
     });
 
     it('joins the timings of the projects that answered one request', () => {
-      const one = inferTiming([slot('a', 10, 30, true), slot('b', 400, 20)]);
-      const two = inferTiming([slot('c', 90, 700, true), slot('d', 1)]);
+      const one = inferTiming([
+        slot('a', 10, 30, true, { type: 6, print: 3 }),
+        slot('b', 400, 20, false, { type: 390, print: 1 }),
+      ]);
+      const two = inferTiming([slot('c', 90, 700, true, { type: 2, print: 80 }), slot('d', 1)]);
       const joined = mergeInferTimings([one, two]);
       assert.deepStrictEqual(aliases(joined.slowest), ['b', 'c', 'a', 'd']);
       assert.strictEqual(joined.slots, 4);
       assert.strictEqual(joined.slots_ms, 501);
+      assert.strictEqual(joined.type_ms, 398);
+      assert.strictEqual(joined.print_ms, 84);
       assert.strictEqual(joined.first_in_file_slots, 2);
       assert.strictEqual(joined.first_in_file_ms, 100);
       assert.strictEqual(joined.longest_printed?.alias, 'c');
@@ -223,7 +314,17 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
         assert.ok(request, `no request for ${named.alias}`);
         assert.deepStrictEqual(
           Object.keys(named).sort(),
-          ['alias', 'file_path', 'first_in_file', 'infer_kind', 'line_number', 'ms', 'printed_length']
+          [
+            'alias',
+            'file_path',
+            'first_in_file',
+            'infer_kind',
+            'line_number',
+            'ms',
+            'print_ms',
+            'printed_length',
+            'type_ms',
+          ]
         );
         assert.strictEqual(named.file_path, request.file_path);
         assert.strictEqual(named.line_number, request.line_number);
@@ -234,6 +335,49 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
       const label = result.timing.slowest.find((named) => named.alias === 'label_return');
       assert.strictEqual(label?.printed_length, '{ title: string; lines: number[]; }'.length);
       assert.strictEqual(result.timing.longest_printed?.alias, 'label_return');
+    });
+
+    it('splits a request\'s time into computing its type and printing it', () => {
+      // A fresh project: every type below is computed for the first time.
+      const result = inferrer().infer(batch);
+      const named = new Map(result.timing.slowest.map((timed) => [timed.alias, timed]));
+      for (const alias of ['total_return', 'total_discount', 'label_return', 'stock_return']) {
+        const timed = named.get(alias);
+        assert.ok(timed, `no timing for ${alias}`);
+        assert.ok(timed.type_ms > 0, `${alias} computed its type in ${timed.type_ms}ms`);
+        assert.ok(timed.print_ms > 0, `${alias} printed its type in ${timed.print_ms}ms`);
+        // The two parts are inside the whole, to the rounding of three figures.
+        assert.ok(
+          timed.type_ms + timed.print_ms <= timed.ms + 0.002,
+          `${alias}: ${timed.type_ms} + ${timed.print_ms} against ${timed.ms}`
+        );
+      }
+      // A request that reached no compiler call and printed nothing has no parts.
+      for (const alias of ['skipped', 'nowhere']) {
+        assert.strictEqual(named.get(alias)?.type_ms, 0, alias);
+        assert.strictEqual(named.get(alias)?.print_ms, 0, alias);
+      }
+      // The batch's two totals are its requests' parts added up.
+      const sum = (read: (timed: InferSlotTiming) => number): number =>
+        result.timing.slowest.reduce((total, timed) => total + read(timed), 0);
+      assert.ok(Math.abs(result.timing.type_ms - sum((timed) => timed.type_ms)) < 0.01);
+      assert.ok(Math.abs(result.timing.print_ms - sum((timed) => timed.print_ms)) < 0.01);
+    });
+
+    it('times no compiler call apart for a kind it does not split', () => {
+      const one = inferrer();
+      const result = one.infer([
+        {
+          file_path: ordersPath,
+          line_number: lineOf(ORDERS, 'function label'),
+          infer_kind: 'function_return',
+          alias: 'label_response',
+        },
+      ]);
+      assert.deepStrictEqual((result.inferred_types ?? []).map((t) => t.alias), ['label_response']);
+      const [timed] = result.timing.slowest;
+      assert.strictEqual(timed.type_ms, 0, 'only the signature kinds time the compiler call');
+      assert.ok(timed.ms > 0);
     });
 
     it('marks the first request it is asked of a file, across batches', () => {
@@ -256,7 +400,9 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
     it('keeps the timing beside the answers, never in them', () => {
       const result = inferrer().infer(batch);
       for (const answer of result.inferred_types ?? []) {
-        assert.ok(!('ms' in answer) && !('printed_length' in answer) && !('first_in_file' in answer));
+        for (const key of ['ms', 'type_ms', 'print_ms', 'printed_length', 'first_in_file']) {
+          assert.ok(!(key in answer), `an answer carries ${key}`);
+        }
       }
       // The text of a type is in the answer and nowhere in the timing.
       const written = JSON.stringify(result.timing);
@@ -327,6 +473,8 @@ describe('an infer batch names its slowest requests (carrick#1985)', () => {
         assert.deepStrictEqual(aliases(timing.slowest).sort(), ['label_return', 'total_return']);
         assert.strictEqual(timing.first_in_file_slots, 1);
         assert.strictEqual(timing.longest_printed?.alias, 'label_return');
+        assert.ok(timing.type_ms > 0 && timing.print_ms > 0, JSON.stringify(timing));
+        assert.ok(timing.type_ms + timing.print_ms <= timing.slots_ms + 0.01, JSON.stringify(timing));
         // The second request finds the file already asked of.
         assert.strictEqual(second.infer_timing?.first_in_file_slots, 0);
         // The timing changes nothing the request answers.

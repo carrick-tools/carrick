@@ -120,6 +120,10 @@ struct PassTiming {
     slots: u64,
     /// Their times, added up, in milliseconds.
     slots_ms: f64,
+    /// Of `slots_ms`, the time the compiler took to compute the types.
+    type_ms: f64,
+    /// Of `slots_ms`, the time printing the types to text.
+    print_ms: f64,
     /// How long the scanner waited for the batches those slots were in.
     waited: Duration,
     /// Slots that were the first asked of their file.
@@ -163,6 +167,8 @@ impl PassTiming {
     ) {
         self.slots += timing.slots;
         self.slots_ms += timing.slots_ms;
+        self.type_ms += timing.type_ms;
+        self.print_ms += timing.print_ms;
         self.waited += waited;
         self.first_in_file_slots += timing.first_in_file_slots;
         self.first_in_file_ms += timing.first_in_file_ms;
@@ -226,11 +232,13 @@ impl PassTiming {
         };
         Some(format!(
             "Signature inference timing: {} slot(s) took {:.1}s of the {:.1}s waited for their \
-             batches; the slowest {} (1%) took {}{:.1}s ({:.0}%); the {} first asked of their \
-             file took {:.1}s ({:.0}%); {longest}",
+             batches ({:.1}s computing types, {:.1}s printing them); the slowest {} (1%) took \
+             {}{:.1}s ({:.0}%); the {} first asked of their file took {:.1}s ({:.0}%); {longest}",
             self.slots,
             self.slots_ms / 1000.0,
             self.waited.as_secs_f64(),
+            self.type_ms / 1000.0,
+            self.print_ms / 1000.0,
             hundredth.slots,
             if hundredth.exact { "" } else { "at least " },
             hundredth.ms / 1000.0,
@@ -280,6 +288,10 @@ fn describe_slot(
 /// The lines the log holds for one answered batch (carrick#1985): one for
 /// the batch, then one for each slot it named that took [`SLOW_SLOT_MS`] or
 /// more, slowest first.
+///
+/// A slot's line splits its time into the compiler computing the type and
+/// the print of it. What is left over is finding the function and reading
+/// back the names the print wrote, which is small beside either.
 fn batch_timing_lines(
     batch_number: usize,
     batches: usize,
@@ -300,11 +312,14 @@ fn batch_timing_lines(
         && (slow.len() as u64) < timing.slots;
     let mut lines = vec![format!(
         "Signature inference batch {batch_number} of {batches}: {} slot(s) took {:.1}s of the \
-         {:.1}s waited; the slowest took {slowest_ms:.0}ms; {}{} took {SLOW_SLOT_MS:.0}ms or \
-         more; the {} first asked of their file took {:.1}s",
+         {:.1}s waited ({:.1}s computing types, {:.1}s printing them); the slowest took \
+         {slowest_ms:.0}ms; {}{} took {SLOW_SLOT_MS:.0}ms or more; the {} first asked of their \
+         file took {:.1}s",
         timing.slots,
         timing.slots_ms / 1000.0,
         waited.as_secs_f64(),
+        timing.type_ms / 1000.0,
+        timing.print_ms / 1000.0,
         if maybe_more { "at least " } else { "" },
         slow.len(),
         timing.first_in_file_slots,
@@ -312,9 +327,12 @@ fn batch_timing_lines(
     )];
     lines.extend(slow.into_iter().map(|slot| {
         format!(
-            "Signature inference slow slot: {} took {:.0}ms and printed {} character(s){}",
+            "Signature inference slow slot: {} took {:.0}ms ({:.0}ms computing its type, \
+             {:.0}ms printing {} character(s)){}",
             describe(slot),
             slot.ms,
+            slot.type_ms,
+            slot.print_ms,
             slot.printed_length,
             if slot.first_in_file {
                 ", first asked of its file"
@@ -1060,10 +1078,12 @@ mod tests {
         logged.lines()
     }
 
-    /// One slot's timing, as the sidecar writes it.
+    /// One slot's timing, as the sidecar writes it. `parts` is how much of
+    /// `ms` went on computing the type and on printing it.
     fn slot_timing(
         request: &InferRequestItem,
         ms: f64,
+        parts: (f64, f64),
         printed_length: u64,
         first_in_file: bool,
     ) -> serde_json::Value {
@@ -1073,16 +1093,20 @@ mod tests {
             "line_number": request.line_number,
             "infer_kind": request.infer_kind,
             "ms": ms,
+            "type_ms": parts.0,
+            "print_ms": parts.1,
             "printed_length": printed_length,
             "first_in_file": first_in_file,
         })
     }
 
     /// `answer(batch)` with the timing the sidecar puts beside the types:
-    /// `slowest` as given, and the totals a batch of these slots adds up to.
+    /// `slowest` as given, and the totals a batch of these slots adds up to
+    /// (`parts`: computing types, printing them).
     fn timed_answer(
         batch: &[InferRequestItem],
         slots_ms: f64,
+        parts: (f64, f64),
         first_in_file: (u64, f64),
         slowest: Vec<serde_json::Value>,
         longest_printed: Option<serde_json::Value>,
@@ -1106,6 +1130,8 @@ mod tests {
         let mut timing = serde_json::json!({
             "slots": batch.len(),
             "slots_ms": slots_ms,
+            "type_ms": parts.0,
+            "print_ms": parts.1,
             "first_in_file_slots": first_in_file.0,
             "first_in_file_ms": first_in_file.1,
             "slowest": slowest,
@@ -1151,13 +1177,20 @@ mod tests {
                 Ok(timed_answer(
                     batch,
                     31_250.0,
+                    (29_420.0, 1_790.0),
                     (3, 30_100.0),
                     vec![
-                        slot_timing(&slow_return, 30_000.4, 1_204_551, true),
-                        slot_timing(&slow_param, 1_100.0, 18, false),
-                        slot_timing(&quick, 99.9, 7, true),
+                        slot_timing(&slow_return, 30_000.4, (28_300.2, 1_690.0), 1_204_551, true),
+                        slot_timing(&slow_param, 1_100.0, (1_098.6, 0.4), 18, false),
+                        slot_timing(&quick, 99.9, (20.0, 79.0), 7, true),
                     ],
-                    Some(slot_timing(&slow_return, 30_000.4, 1_204_551, true)),
+                    Some(slot_timing(
+                        &slow_return,
+                        30_000.4,
+                        (28_300.2, 1_690.0),
+                        1_204_551,
+                        true,
+                    )),
                 ))
             });
         });
@@ -1172,13 +1205,14 @@ mod tests {
         assert_eq!(
             timing,
             vec![
-                "Signature inference batch 1 of 1: 6 slot(s) took 31.2s of the 0.0s waited; the \
-                 slowest took 30000ms; 2 took 100ms or more; the 3 first asked of their file \
-                 took 30.1s",
-                "Signature inference slow slot: inB return at /r/b.ts:42 took 30000ms and \
-                 printed 1204551 character(s), first asked of its file",
-                "Signature inference slow slot: inC parameter 1 at /r/c.ts:10 took 1100ms and \
-                 printed 18 character(s)",
+                "Signature inference batch 1 of 1: 6 slot(s) took 31.2s of the 0.0s waited \
+                 (29.4s computing types, 1.8s printing them); the slowest took 30000ms; 2 took \
+                 100ms or more; the 3 first asked of their file took 30.1s",
+                "Signature inference slow slot: inB return at /r/b.ts:42 took 30000ms (28300ms \
+                 computing its type, 1690ms printing 1204551 character(s)), first asked of its \
+                 file",
+                "Signature inference slow slot: inC parameter 1 at /r/c.ts:10 took 1100ms \
+                 (1099ms computing its type, 0ms printing 18 character(s))",
             ],
             "one line for the batch, then one for each slot that took {SLOW_SLOT_MS}ms or more"
         );
@@ -1203,17 +1237,31 @@ mod tests {
                 timed_answer(
                     batch,
                     10.5,
+                    (6.0, 3.5),
                     (1, 10.0),
-                    vec![slot_timing(&a_return, 10.0, 40, true)],
-                    Some(slot_timing(&a_return, 10.0, 40, true)),
+                    vec![slot_timing(&a_return, 10.0, (6.0, 3.0), 40, true)],
+                    Some(slot_timing(&a_return, 10.0, (6.0, 3.0), 40, true)),
                 )
             } else if first.file_path == "/r/b.ts" {
                 timed_answer(
                     batch,
                     9_000.0,
+                    (1_200.0, 7_750.5),
                     (1, 8_990.0),
-                    vec![slot_timing(&b_return, 8_990.0, 950_000, true)],
-                    Some(slot_timing(&b_return, 8_990.0, 950_000, true)),
+                    vec![slot_timing(
+                        &b_return,
+                        8_990.0,
+                        (1_195.0, 7_750.0),
+                        950_000,
+                        true,
+                    )],
+                    Some(slot_timing(
+                        &b_return,
+                        8_990.0,
+                        (1_195.0, 7_750.0),
+                        950_000,
+                        true,
+                    )),
                 )
             } else {
                 // A batch whose sidecar says nothing of its time still merges.
@@ -1231,6 +1279,8 @@ mod tests {
             "only the batches that said are counted"
         );
         assert_eq!(outcome.timing.slots_ms, 9_010.5);
+        assert_eq!(outcome.timing.type_ms, 1_206.0);
+        assert_eq!(outcome.timing.print_ms, 7_754.0);
         assert_eq!(outcome.timing.first_in_file_slots, 2);
         assert_eq!(outcome.timing.first_in_file_ms, 9_000.0);
         assert_eq!(
@@ -1246,9 +1296,9 @@ mod tests {
         assert_eq!(
             summary,
             "Signature inference timing: 4 slot(s) took 9.0s of the 9.4s waited for their \
-             batches; the slowest 1 (1%) took 9.0s (100%); the 2 first asked of their file took \
-             9.0s (100%); the longest type printed is 950000 character(s), by inB return at \
-             /r/b.ts:10"
+             batches (1.2s computing types, 7.8s printing them); the slowest 1 (1%) took 9.0s \
+             (100%); the 2 first asked of their file took 9.0s (100%); the longest type printed \
+             is 950000 character(s), by inB return at /r/b.ts:10"
         );
     }
 
@@ -1280,6 +1330,8 @@ mod tests {
                     "line_number": 1,
                     "infer_kind": "signature_return",
                     "ms": ms,
+                    "type_ms": 0.0,
+                    "print_ms": 0.0,
                     "printed_length": 0,
                     "first_in_file": false,
                 })
@@ -1288,6 +1340,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "slots": slots,
             "slots_ms": 1_000_000.0,
+            "type_ms": 600_000.0,
+            "print_ms": 390_000.0,
             "first_in_file_slots": 0,
             "first_in_file_ms": 0.0,
             "slowest": slowest,
@@ -1394,9 +1448,9 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "Signature inference batch 2 of 5: 500 slot(s) took 1000.0s of the 4.0s waited; \
-                 the slowest took 9ms; 0 took 100ms or more; the 0 first asked of their file \
-                 took 0.0s"
+                "Signature inference batch 2 of 5: 500 slot(s) took 1000.0s of the 4.0s waited \
+                 (600.0s computing types, 390.0s printing them); the slowest took 9ms; 0 took \
+                 100ms or more; the 0 first asked of their file took 0.0s"
             ]
         );
     }
@@ -1410,6 +1464,8 @@ mod tests {
             "line_number": 7,
             "infer_kind": "function_param",
             "ms": 1.0,
+            "type_ms": 0.2,
+            "print_ms": 0.1,
             "printed_length": 3,
             "first_in_file": false,
         }))

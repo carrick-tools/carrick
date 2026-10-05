@@ -55,7 +55,7 @@ import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { functionAtLine } from './function-line-index.js';
-import { elapsedMs, inferTiming } from './infer-timing.js';
+import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
   addedDiagnostics,
   applyInsertions,
@@ -342,7 +342,9 @@ const TYPE_TEXT_FLAGS =
   ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias;
 
 function typeText(type: Type, enclosingNode?: Node): string {
-  const text = type.getText(enclosingNode, TYPE_TEXT_FLAGS);
+  // Timed as the print (carrick#1985): the type is already computed when it
+  // gets here, so this is what its length costs.
+  const text = timedPhase('print', () => type.getText(enclosingNode, TYPE_TEXT_FLAGS));
   notePrintedType(type, enclosingNode, text);
   return text;
 }
@@ -570,6 +572,7 @@ export class TypeInferrer {
 
     for (const request of requests) {
       const slotStarted = performance.now();
+      const phasesStarted = phaseClock();
       const firstInFile = !this.filesAsked.has(request.file_path);
       this.filesAsked.add(request.file_path);
       let printedLength = 0;
@@ -617,12 +620,15 @@ export class TypeInferrer {
       } finally {
         // Before the caller is told: what it does with the news (a progress
         // frame) is not this request's time.
+        const phases = phaseClock();
         timings.push({
           ...(request.alias === undefined ? {} : { alias: request.alias }),
           file_path: request.file_path,
           line_number: request.line_number,
           infer_kind: request.infer_kind,
           ms: elapsedMs(slotStarted, performance.now()),
+          type_ms: elapsedMs(phasesStarted.type, phases.type),
+          print_ms: elapsedMs(phasesStarted.print, phases.print),
           printed_length: printedLength,
           first_in_file: firstInFile,
         });
@@ -1154,7 +1160,10 @@ export class TypeInferrer {
     }
 
     const isExplicit = func.getReturnTypeNode() !== undefined;
-    const typeString = typeText(func.getReturnType(), func);
+    // The compiler call is timed apart from the print of what it returns
+    // (carrick#1985).
+    const returnType = timedPhase('type', () => func.getReturnType());
+    const typeString = typeText(returnType, func);
 
     return this.createInferredType(
       request,
@@ -1198,7 +1207,7 @@ export class TypeInferrer {
     }
 
     const isExplicit = target.param.getTypeNode() !== undefined;
-    const paramType = target.node.getType();
+    const paramType = timedPhase('type', () => target.node.getType());
     const typeString = typeText(paramType, target.node);
 
     // Deterministic anchor for the pub/sub two-anchor arbitration

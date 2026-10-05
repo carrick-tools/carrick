@@ -648,7 +648,22 @@ export interface InferSlotTiming {
    * keeping the request's answer or its error.
    */
   ms: number;
-  /** Characters in the `type_string` the request answered; 0 when it answered none */
+  /**
+   * Of `ms`, the time in the compiler call that computes the type: a
+   * function's `getReturnType()`, a parameter's `getType()`. It is told
+   * apart for `signature_return` and `function_param`, and is 0 for the
+   * other kinds, whose time in the compiler stays in `ms` alone.
+   */
+  type_ms: number;
+  /**
+   * Of `ms`, the time in the inferrer's print of a type to text. Truncation
+   * is off, so a type is printed at its whole length. For
+   * `signature_return` and `function_param` this is every print the request
+   * makes; the other kinds also print through the structural expander, and
+   * that time stays in `ms` alone.
+   */
+  print_ms: number;
+  /** Characters in the `type_string` the request printed; 0 when it printed none */
   printed_length: number;
   /**
    * No earlier request named this file to the project that answered. Such a
@@ -667,6 +682,10 @@ export interface InferTiming {
   slots: number;
   /** Their wall times, added up, in milliseconds */
   slots_ms: number;
+  /** Of `slots_ms`, the time computing types (each request's `type_ms`) */
+  type_ms: number;
+  /** Of `slots_ms`, the time printing types (each request's `print_ms`) */
+  print_ms: number;
   /** How many of them were the first asked of their file */
   first_in_file_slots: number;
   /** The wall times of those, added up, in milliseconds */

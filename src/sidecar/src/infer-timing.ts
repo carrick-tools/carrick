@@ -1,11 +1,17 @@
 /**
- * Which requests of an `infer` batch were slow (carrick#1985).
+ * Which requests of an `infer` batch were slow, and at what (carrick#1985).
  *
  * A pass can send thousands of requests and spend most of its time in a few
  * of them. The inferrer times every request; this module turns those timings
  * into what the batch's answer carries: how many there were and what they
  * add up to, the slowest few by name, the request that printed the longest
  * type, and the requests that were the first asked of their file, apart.
+ *
+ * A request's time is also told apart by what it went on: the compiler call
+ * that computes the type, and the print of that type to text. The two have
+ * different remedies, and a printed length alone cannot say which one a slow
+ * request was: a type of four characters can take seconds to compute, and a
+ * type of a million can take half a second to print.
  *
  * It measures and names. It changes no answer and holds no type text.
  */
@@ -25,9 +31,39 @@ export const SLOWEST_SLOTS = 25;
 /** Milliseconds to the microsecond: sums of these stay readable. */
 const rounded = (ms: number): number => Math.round(ms * 1000) / 1000;
 
-/** How long a request that started at `startedMs` has taken by `nowMs`. */
+/** How long something that started at `startedMs` has taken by `nowMs`. */
 export function elapsedMs(startedMs: number, nowMs: number): number {
   return rounded(nowMs - startedMs);
+}
+
+/**
+ * The parts of a request's time that are told apart: `type` is the compiler
+ * call that computes a type, `print` is the print of a type to text.
+ */
+export type TimedPhase = 'type' | 'print';
+
+/** What this process has spent in each phase since it started, in milliseconds. */
+const spent: Record<TimedPhase, number> = { type: 0, print: 0 };
+
+/**
+ * Run `work`, and count how long it took as `phase`.
+ *
+ * The count is the process's, not a request's: whoever wants one request's
+ * share reads `phaseClock` before the request and after it. One request runs
+ * at a time, so the difference is that request's and nobody else's.
+ */
+export function timedPhase<T>(phase: TimedPhase, work: () => T): T {
+  const started = performance.now();
+  try {
+    return work();
+  } finally {
+    spent[phase] += performance.now() - started;
+  }
+}
+
+/** What each phase has come to so far, in milliseconds. */
+export function phaseClock(): Readonly<Record<TimedPhase, number>> {
+  return { ...spent };
 }
 
 /**
@@ -56,10 +92,14 @@ function longestPrintedOf(slots: readonly InferSlotTiming[]): InferSlotTiming | 
  */
 export function inferTiming(slots: readonly InferSlotTiming[]): InferTiming {
   let slotsMs = 0;
+  let typeMs = 0;
+  let printMs = 0;
   let firstInFile = 0;
   let firstInFileMs = 0;
   for (const slot of slots) {
     slotsMs += slot.ms;
+    typeMs += slot.type_ms;
+    printMs += slot.print_ms;
     if (slot.first_in_file) {
       firstInFile += 1;
       firstInFileMs += slot.ms;
@@ -69,6 +109,8 @@ export function inferTiming(slots: readonly InferSlotTiming[]): InferTiming {
   return {
     slots: slots.length,
     slots_ms: rounded(slotsMs),
+    type_ms: rounded(typeMs),
+    print_ms: rounded(printMs),
     first_in_file_slots: firstInFile,
     first_in_file_ms: rounded(firstInFileMs),
     slowest: slowestOf(slots, SLOWEST_SLOTS),
@@ -88,6 +130,8 @@ export function mergeInferTimings(parts: readonly InferTiming[]): InferTiming {
   return {
     slots: sum((part) => part.slots),
     slots_ms: rounded(sum((part) => part.slots_ms)),
+    type_ms: rounded(sum((part) => part.type_ms)),
+    print_ms: rounded(sum((part) => part.print_ms)),
     first_in_file_slots: sum((part) => part.first_in_file_slots),
     first_in_file_ms: rounded(sum((part) => part.first_in_file_ms)),
     slowest: slowestOf(

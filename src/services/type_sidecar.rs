@@ -1236,8 +1236,10 @@ pub struct SidecarResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inferred_types: Option<Vec<InferredType>>,
     /// How long the requests of an infer batch took, and which were slowest
-    /// (carrick#1985). Read for the log only: no answer depends on it.
-    #[serde(default)]
+    /// (carrick#1985). Read for the log only: no answer depends on it, so a
+    /// timing this reader cannot make sense of is no timing, never a frame
+    /// that failed to parse.
+    #[serde(default, deserialize_with = "timing_if_readable")]
     pub infer_timing: Option<InferTiming>,
     /// Resolved definitions (for resolve_definitions)
     #[serde(default)]
@@ -1266,6 +1268,20 @@ pub struct SidecarResponse {
     pub errors: Option<Vec<String>>,
 }
 
+/// The `infer_timing` of an answer, or `None` when it is absent or is not
+/// the shape this reader knows (carrick#1985).
+///
+/// The timing is for the log. A sidecar that words it another way must cost
+/// a line of the log and not the batch's types, which a failed parse of the
+/// whole frame would.
+fn timing_if_readable<'de, D>(deserializer: D) -> Result<Option<InferTiming>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let written = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(written.and_then(|timing| serde_json::from_value(timing).ok()))
+}
+
 /// How long one request of an `infer` batch took (carrick#1985). Mirrors the
 /// sidecar's `InferSlotTiming`: it names the request and measures its answer,
 /// and holds the type the request printed as a length only.
@@ -1283,7 +1299,12 @@ pub struct InferSlotTiming {
     /// Wall time in milliseconds, from the batch taking the request up to it
     /// keeping the request's answer or its error.
     pub ms: f64,
-    /// Characters in the type the request answered; 0 when it answered none.
+    /// Of `ms`, the time in the compiler call that computes the type. Told
+    /// apart for the two signature kinds; 0 for the others.
+    pub type_ms: f64,
+    /// Of `ms`, the time printing the type to text, at its whole length.
+    pub print_ms: f64,
+    /// Characters in the type the request printed; 0 when it printed none.
     pub printed_length: u64,
     /// No earlier request named this file to the project that answered, so
     /// this one did the work the file's later requests reuse.
@@ -1298,6 +1319,10 @@ pub struct InferTiming {
     pub slots: u64,
     /// Their wall times, added up, in milliseconds.
     pub slots_ms: f64,
+    /// Of `slots_ms`, the time computing types.
+    pub type_ms: f64,
+    /// Of `slots_ms`, the time printing types.
+    pub print_ms: f64,
     /// How many of them were the first asked of their file.
     pub first_in_file_slots: u64,
     /// The wall times of those, added up, in milliseconds.
@@ -4451,6 +4476,71 @@ mod tests {
         assert!(
             matches!(refused, Err(SidecarError::CheckFailed(m)) if m == "Invalid request: checks.0.claim")
         );
+    }
+
+    /// carrick#1985: an infer answer's timing is for the log. One this reader
+    /// knows is read; one it does not know is no timing, and the types that
+    /// came with it are still the answer.
+    #[test]
+    fn an_infer_timing_the_reader_does_not_know_costs_the_log_and_not_the_types() {
+        let answer = |timing: serde_json::Value| -> SidecarResponse {
+            serde_json::from_value(serde_json::json!({
+                "request_id": "req-9",
+                "status": "success",
+                "inferred_types": [{
+                    "alias": "__sig0",
+                    "type_string": "Promise<void>",
+                    "is_explicit": false,
+                    "source_location": { "file_path": "/r/a.ts", "start_line": 3, "end_line": 5 },
+                    "infer_kind": "signature_return"
+                }],
+                "infer_timing": timing,
+            }))
+            .expect("the frame parses whatever its timing holds")
+        };
+        let slot = serde_json::json!({
+            "alias": "__sig0", "file_path": "/r/a.ts", "line_number": 3,
+            "infer_kind": "signature_return", "ms": 9470.1, "type_ms": 9468.8,
+            "print_ms": 0.1, "printed_length": 13, "first_in_file": true
+        });
+
+        let known = answer(serde_json::json!({
+            "slots": 1, "slots_ms": 9470.1, "type_ms": 9468.8, "print_ms": 0.1,
+            "first_in_file_slots": 1, "first_in_file_ms": 9470.1,
+            "slowest": [slot.clone()], "longest_printed": slot.clone()
+        }));
+        let timing = known
+            .infer_timing
+            .expect("a timing in the known shape is read");
+        assert_eq!(timing.slots, 1);
+        assert_eq!(timing.type_ms, 9468.8);
+        assert_eq!(timing.slowest[0].alias.as_deref(), Some("__sig0"));
+        assert_eq!(timing.slowest[0].infer_kind, InferKind::SignatureReturn);
+        assert_eq!(timing.slowest[0].printed_length, 13);
+        assert_eq!(timing.longest_printed, Some(timing.slowest[0].clone()));
+
+        // A member renamed, a member missing, another type altogether, null.
+        for unknown in [
+            serde_json::json!({ "slots": 1, "total_ms": 9470.1, "slowest": [slot.clone()] }),
+            serde_json::json!({ "slots": "one" }),
+            serde_json::json!("9470ms"),
+            serde_json::Value::Null,
+        ] {
+            let parsed = answer(unknown.clone());
+            assert_eq!(parsed.infer_timing, None, "{unknown}");
+            assert_eq!(
+                parsed.inferred_types.as_ref().map(Vec::len),
+                Some(1),
+                "the types are kept: {unknown}"
+            );
+        }
+
+        // No timing at all: an answer from a sidecar that sends none.
+        let silent: SidecarResponse = serde_json::from_value(serde_json::json!({
+            "request_id": "req-9", "status": "success", "inferred_types": []
+        }))
+        .unwrap();
+        assert_eq!(silent.infer_timing, None);
     }
 
     /// The scanner pairs verdicts with claims by position, so a response that

@@ -1655,10 +1655,18 @@ fn test_signature_pass_logs_where_its_time_went() {
         batch.contains("the 1 first asked of their file took "),
         "{batch}"
     );
+    assert!(
+        batch.contains("s computing types, ") && batch.contains("s printing them); "),
+        "the batch says what its time went on: {batch}"
+    );
     let pass = said("Signature inference timing: ");
     assert!(
         pass.starts_with("Signature inference timing: 2 slot(s) took "),
         "{pass}"
+    );
+    assert!(
+        pass.contains("s computing types, ") && pass.contains("s printing them); "),
+        "the pass says what its time went on: {pass}"
     );
     assert!(pass.contains("; the slowest 1 (1%) took "), "{pass}");
     assert!(
