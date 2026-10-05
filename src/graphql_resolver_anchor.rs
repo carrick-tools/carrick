@@ -175,7 +175,7 @@ fn function_span(span: swc_common::Span) -> ResolverAnchor {
 }
 
 /// The span of the function literal `expr` is, if it is one.
-fn function_literal_span(expr: &Expr) -> Option<swc_common::Span> {
+pub(crate) fn function_literal_span(expr: &Expr) -> Option<swc_common::Span> {
     match expr {
         Expr::Arrow(arrow) => Some(arrow.span),
         Expr::Fn(fn_expr) => Some(fn_expr.function.span),
@@ -189,7 +189,7 @@ fn function_literal(expr: &Expr) -> Option<ResolverAnchor> {
 }
 
 /// Strip the wrappers TypeScript lets a value wear without changing it.
-fn unwrap_expr(expr: &Expr) -> &Expr {
+pub(crate) fn unwrap_expr(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(paren) => unwrap_expr(&paren.expr),
         Expr::TsAs(as_expr) => unwrap_expr(&as_expr.expr),

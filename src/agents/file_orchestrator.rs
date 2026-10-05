@@ -3877,6 +3877,15 @@ impl FileOrchestrator {
         // numbering needs the bytes between the file's start and the site, and
         // a file that states one operation usually states several.
         let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        // What following a row's named handler to its declaration reads
+        // (carrick#1913, `crate::route_handler_anchor`): each file's source and
+        // each module's export table, kept for the whole collection. The hop
+        // resolves specifiers the way the repo's own config says to, and may,
+        // for the reason a named GraphQL resolver's may: this builds a sidecar
+        // type request, so a module it newly reaches changes no prompt byte
+        // and re-keys no cached model answer.
+        let mut handler_sources: HashMap<String, Option<String>> = HashMap::new();
+        let mut handler_bindings = BindingResolver::with_workspace(modules.clone());
         /// Locator for type inference: either the SWC byte-offset span the
         /// operation stored (converted to the sidecar's numbering on the way
         /// out) or the model's expression text + line
@@ -4100,7 +4109,9 @@ impl FileOrchestrator {
                 // skip the explicit-symbol bundling as well as inference below,
                 // so the manifest entry stays honestly `unknown` (with its
                 // evidence) instead of publishing a phantom contract from a
-                // type hint the handler never sends.
+                // type hint the handler never sends. One whose handler is a
+                // name declared in another file is still asked, at the handler
+                // (carrick#1913); the type hint stays out either way.
                 let no_payload = endpoint.emission_style == Some(EmissionStyle::NoPayload);
 
                 if !no_payload {
@@ -4278,11 +4289,67 @@ impl FileOrchestrator {
                     continue;
                 }
 
+                // carrick#1913: the registration is handed its handler by name,
+                // and the name is declared in another file. The model read the
+                // registration file, so the style it gave is not a reading of
+                // the handler, `no-payload` included, and nothing in this file
+                // locates the response: a request at the registration reads
+                // the registration. The response is asked at the handler's own
+                // declaration instead, in its own file, whatever the style.
+                //
+                // The sidecar reads the function at that span as the route's
+                // handler and always answers: what it returns, what it sends
+                // through the transport it was handed, or `unknown` with the
+                // reason (`src/sidecar/README.md`, "A request located at a
+                // handler"). The alias stays this row's, built from the
+                // registration site, so the answer joins the row it was asked
+                // for.
+                //
+                // A row whose response the model did locate keeps that
+                // locator: the located expression is in the file it read. So
+                // does a row whose handler is declared in the registration's
+                // own file, and one whose name leads to no function.
+                let response_located = endpoint
+                    .response_expression_text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty());
+                let handler_anchor = match (
+                    endpoint.call_expression_span_start,
+                    endpoint.call_expression_span_end,
+                ) {
+                    (Some(call_start), Some(call_end)) if !response_located => {
+                        crate::route_handler_anchor::handler_declared_elsewhere(
+                            &file_path_absolute,
+                            call_start,
+                            call_end,
+                            endpoint.handler_name.trim(),
+                            &mut handler_sources,
+                            &mut handler_bindings,
+                        )
+                    }
+                    _ => None,
+                };
+                let asked_at_handler = handler_anchor.is_some_and(|anchor| {
+                    push_infer(
+                        &anchor.file,
+                        anchor.line,
+                        InferKind::ResponseBody,
+                        response_alias.clone(),
+                        InferLocator::Span {
+                            span_start: Some(anchor.lo),
+                            span_end: Some(anchor.hi),
+                        },
+                    )
+                });
+
                 // Route response inference by the model's emission_style
                 // classification. `None` (field omitted — e.g. cached
                 // pre-emission-style analysis) falls back to imperative-send,
                 // which is the historical behavior.
                 match endpoint.emission_style {
+                    // Asked at the handler above; the registration has
+                    // nothing to add.
+                    _ if asked_at_handler => {}
                     // The handler's return value IS the payload: ask for the
                     // handler's return type. Prefer the text locator — the
                     // sidecar resolves the expression's *containing* function,
@@ -4312,7 +4379,9 @@ impl FileOrchestrator {
                     // No recoverable payload expression (zero-arg sends,
                     // streams, helper-written payloads): skip inference. The
                     // manifest entry keeps `unknown` with its evidence —
-                    // honest, instead of inferring from the wrong node.
+                    // honest, instead of inferring from the wrong node. This
+                    // is the model's reading of a handler it could see; one
+                    // declared in another file was asked above.
                     Some(EmissionStyle::NoPayload) => {}
                     Some(EmissionStyle::ImperativeSend) | None => {
                         let response_inferred = push_infer(
