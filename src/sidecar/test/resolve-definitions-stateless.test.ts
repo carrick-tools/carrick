@@ -7,7 +7,7 @@
  * its resolver from the project's components, and the first request to do so
  * in a process builds the whole program. The scanner asks each capture of a
  * fresh process, so the `resolve_definitions` after it was always that first
- * request, and paid for a program the size of the service to read a tree the
+ * request, and built a program the size of the service to read a tree the
  * size of its surface.
  *
  * Three processes answer the same request over the same stub:
