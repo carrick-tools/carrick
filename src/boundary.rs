@@ -176,28 +176,8 @@ pub struct ServiceBoundary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes_without_body: Option<Counted>,
     /// Indexed calls with no resolved expected type, the consumer-side mirror
-    /// of the line above. Calls counted in `own_route_calls_not_compared` are
-    /// not in this count.
+    /// of the line above.
     pub calls_without_expected_type: Counted,
-    /// Indexed calls that a route of this service matches (`own_route` on the
-    /// call's mount-graph row, carrick#1926) and that have no resolved
-    /// expected type (carrick#1944).
-    ///
-    /// They are not a shortfall in `calls_without_expected_type`. Such a call
-    /// is given no type entries until the type check pairs a service with
-    /// itself (carrick#1945), so its types are NOT COMPARED, which is not the
-    /// same as a type that failed to resolve. They are counted here instead.
-    /// This count exists until carrick#1945 gives these calls their entries,
-    /// and goes with the gate in `build_type_manifest_entries`.
-    ///
-    /// `total` is the number of calls. The reasons are grouped, one per
-    /// operation as `<key> ×<calls>`, because an app that calls its own API
-    /// holds hundreds of these calls on a few dozen routes.
-    ///
-    /// `None` when the service has no such call, and on a blob from a scanner
-    /// that did not separate them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub own_route_calls_not_compared: Option<Counted>,
     /// Set when type extraction failed outright for this service, in which case
     /// the two counts above are the whole index, not a shortfall in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,8 +210,6 @@ impl ServiceBoundary {
         let no_body = no_body_sites(file_results, &prefix);
         let (routes_without_response_type, routes_without_body) =
             routes_without_a_type(data, &no_body);
-        let (calls_without_expected_type, own_route_calls_not_compared) =
-            calls_without_a_type(data);
         let lost = stats
             .errors
             .iter()
@@ -264,8 +242,7 @@ impl ServiceBoundary {
             ),
             routes_without_response_type,
             routes_without_body: Some(routes_without_body),
-            calls_without_expected_type,
-            own_route_calls_not_compared,
+            calls_without_expected_type: operations_without_a_type(data, ManifestRole::Consumer),
             types_degraded: data.types_degraded.clone(),
             bare_checkout: data
                 .capture_stub
@@ -328,12 +305,6 @@ impl ServiceBoundary {
             &self.calls_without_expected_type,
             "call(s) with no resolved expected type",
         );
-        if let Some(own_route) = &self.own_route_calls_not_compared {
-            push(
-                own_route,
-                "call(s) to this service's own route(s), types not compared yet (not counted above)",
-            );
-        }
         if self.unemitted_literal_candidates > 0 {
             out.push(format!(
                 "  {} bare route-literal call site(s) left unclassified{}",
@@ -464,74 +435,23 @@ fn unknown_call_paths(data: &CloudRepoData) -> Counted {
     Counted::from_reasons(reasons)
 }
 
-/// The calls with no resolved expected type, split in two: every untyped call
-/// no route of its own service matches, and the untyped calls one does
-/// (carrick#1944).
+/// Operations with no resolved type on the side that matters for them: the
+/// response a route sends, and the response a call expects.
 ///
-/// A call counts as typed when the manifest carries an entry for its key at
-/// its own site with a resolved definition. No manifest at all — a service
-/// whose type extraction failed — means every call counts, which is the
+/// An operation counts as typed when the manifest carries an entry for its key
+/// at its own site with a resolved definition. No manifest at all — a service
+/// whose type extraction failed — means every operation counts, which is the
 /// honest reading: the index has no type for any of them.
-///
-/// A call marked `own_route` has no manifest entry by design until the type
-/// check pairs a service with itself (carrick#1945). Counted with the rest it
-/// reads as a type that failed to resolve, hundreds of them on an app that
-/// calls its own API, when nothing was attempted. So it is counted apart, as
-/// "not compared yet", the way a route that sends no body is counted apart
-/// from a route whose type is missing.
-///
-/// The second count is `None` when there is no such call, so a service that
-/// calls none of its own routes writes no key. Its reasons are one line per
-/// operation with the number of calls, never one per call: these calls come
-/// in the hundreds, on a few dozen routes.
-fn calls_without_a_type(data: &CloudRepoData) -> (Counted, Option<Counted>) {
-    let own_route = own_route_call_sites(data);
-    let mut rest: Vec<String> = Vec::new();
-    let mut not_compared: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    for call in untyped_operations(data, ManifestRole::Consumer) {
-        if own_route.contains(&(call.key.clone(), call.location.clone())) {
-            *not_compared.entry(call.key).or_default() += 1;
-        } else {
-            rest.push(call.reason);
-        }
-    }
-    let total: usize = not_compared.values().sum();
-    let grouped = not_compared
-        .iter()
-        .map(|(key, calls)| format!("{key} ×{calls}"))
-        .collect();
-    (
-        Counted::from_reasons(rest),
-        (total > 0).then(|| Counted::new(total, grouped)),
+fn operations_without_a_type(data: &CloudRepoData, role: ManifestRole) -> Counted {
+    Counted::from_reasons(
+        untyped_operations(data, role)
+            .map(|(reason, _)| reason)
+            .collect(),
     )
 }
 
-/// The `(canonical key, file location)` of every call a route of its own
-/// service matches (`DataFetchingCall::own_route`, carrick#1926), which is
-/// how a call row and its mount-graph row name the same site: the call row is
-/// built from the mount-graph row, key and location both. A call with no
-/// mount-graph row is in no set, and is counted as it always was.
-fn own_route_call_sites(data: &CloudRepoData) -> HashSet<(String, String)> {
-    let Some(graph) = data.mount_graph.as_ref() else {
-        return HashSet::new();
-    };
-    graph
-        .get_data_calls()
-        .iter()
-        .filter(|call| call.own_route)
-        .map(|call| {
-            (
-                crate::operation::OperationKey::http(&call.method, call.canonical_path.clone())
-                    .canonical(),
-                call.file_location.clone(),
-            )
-        })
-        .collect()
-}
-
-/// The routes with no resolved response type, split in two: routes the
-/// analysis states send no body (carrick#1159), and every other untyped
+/// The producer half of [`operations_without_a_type`], split in two: routes
+/// the analysis states send no body (carrick#1159), and every other untyped
 /// route. A redirect or a 204 has no response contract to resolve, so counting
 /// it as a missing type overstates the shortfall.
 fn routes_without_a_type(
@@ -539,31 +459,15 @@ fn routes_without_a_type(
     no_body: &HashSet<(String, u32)>,
 ) -> (Counted, Counted) {
     let (bodiless, rest): (Vec<_>, Vec<_>) = untyped_operations(data, ManifestRole::Producer)
-        .partition(|route| {
-            route
-                .site
-                .as_ref()
-                .is_some_and(|site| no_body.contains(site))
-        });
+        .partition(|(_, site)| site.as_ref().is_some_and(|site| no_body.contains(site)));
     (
-        Counted::from_reasons(rest.into_iter().map(|route| route.reason).collect()),
-        Counted::from_reasons(bodiless.into_iter().map(|route| route.reason).collect()),
+        Counted::from_reasons(rest.into_iter().map(|(reason, _)| reason).collect()),
+        Counted::from_reasons(bodiless.into_iter().map(|(reason, _)| reason).collect()),
     )
 }
 
-/// One operation the index has no shape to serve for.
-struct UntypedOperation {
-    /// `<key> (<file>:<line>)`: what a count of these names as its reason.
-    reason: String,
-    /// The operation's canonical key.
-    key: String,
-    /// The row's own location, `<file>:<line>` as the row spells it.
-    location: String,
-    /// `(file, line)` when the row states a line.
-    site: Option<(String, u32)>,
-}
-
-/// Every operation of `role` the index has no shape to serve for.
+/// Every operation of `role` the index has no shape to serve for, as its
+/// reason line and its `(file, line)` site when the row states one.
 ///
 /// "Has a shape to serve" is the question `get_endpoint_types` answers, and
 /// there are two ways the index answers it: the manifest entry carries a
@@ -601,7 +505,7 @@ struct UntypedOperation {
 fn untyped_operations(
     data: &CloudRepoData,
     role: ManifestRole,
-) -> impl Iterator<Item = UntypedOperation> + '_ {
+) -> impl Iterator<Item = (String, Option<(String, u32)>)> + '_ {
     let operations = match role {
         ManifestRole::Producer => &data.endpoints,
         ManifestRole::Consumer => &data.calls,
@@ -642,12 +546,12 @@ fn untyped_operations(
         {
             return None;
         }
-        Some(UntypedOperation {
-            reason: format!("{key} ({})", operation.file_path.display()),
-            site: line.map(|line| (file.to_string(), line)),
-            location: location.to_string(),
-            key,
-        })
+        let reason = format!(
+            "{} ({})",
+            operation.key.canonical(),
+            operation.file_path.display()
+        );
+        Some((reason, line.map(|line| (file.to_string(), line))))
     })
 }
 
@@ -1117,63 +1021,63 @@ mod tests {
         );
     }
 
-    /// A blob with these calls and no type manifest. Each call is
-    /// `(method, path, site, mount-graph row)`: `Some(own_route)` gives the
-    /// call a mount-graph row carrying that mark, `None` gives it no row.
-    fn blob_with_calls(calls: &[(&str, &str, &str, Option<bool>)]) -> CloudRepoData {
+    /// carrick#1945: a call to a route of its own service has type entries
+    /// and a pair, so one with no resolved expected type is a shortfall like
+    /// any other call's. The count that set these calls apart while nothing
+    /// compared them (carrick#1944) is gone, and a boundary never writes it.
+    #[test]
+    fn a_call_to_an_own_route_without_a_type_is_counted_with_the_other_calls() {
         use crate::analyzer::ApiEndpointDetails;
         use crate::mount_graph::{DataFetchingCall, MountGraph};
         use crate::operation::OperationKey;
 
+        let call = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, path.to_string()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from(site),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+        };
         let mut graph = MountGraph::new();
-        let mut rows = Vec::new();
-        for (method, path, site, mark) in calls {
-            rows.push(ApiEndpointDetails {
-                view_module: false,
-                owner: None,
-                key: OperationKey::http(method, path.to_string()),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
-                file_path: std::path::PathBuf::from(site),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                dispatch: None,
-                schema_binding: None,
-                handler_span: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-            });
-            if let Some(own_route) = mark {
-                graph.data_calls.push(DataFetchingCall {
-                    method: method.to_string(),
-                    target_url: path.to_string(),
-                    canonical_path: path.to_string(),
-                    client: "fetch(".to_string(),
-                    file_location: site.to_string(),
-                    call_kind: None,
-                    repo_name: None,
-                    service_name: None,
-                    host: None,
-                    line: None,
-                    base: None,
-                    consumers_not_resolved: None,
-                    resolution_source: None,
-                    dispatch: None,
-                    role: None,
-                    reaches_request: None,
-                    library_semantics: Vec::new(),
-                    own_route: *own_route,
-                });
-            }
-        }
-        CloudRepoData {
-            calls: rows,
+        graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/api/items".to_string(),
+            canonical_path: "/api/items".to_string(),
+            client: "fetch(".to_string(),
+            file_location: "app/page.tsx:4".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route: true,
+        });
+        let data = CloudRepoData {
+            calls: vec![
+                call("GET", "/api/items", "app/page.tsx:4"),
+                call("GET", "/billing/invoices", "lib/billing.ts:7"),
+            ],
             mount_graph: Some(graph),
             ..serde_json::from_value(serde_json::json!({
                 "repo_name": "acme/app", "endpoints": [], "calls": [], "mounts": [],
@@ -1181,32 +1085,7 @@ mod tests {
                 "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234"
             }))
             .expect("the blob reads")
-        }
-    }
-
-    /// carrick#1944: a call a route of its own service matches has no type
-    /// entries until the type check pairs a service with itself
-    /// (carrick#1945). Its types are not compared yet, which is not a type
-    /// that failed to resolve, so it is counted apart from
-    /// `calls_without_expected_type` and never in it. A call no own route
-    /// matches is counted as it always was, and so is a call with no
-    /// mount-graph row to carry a mark.
-    ///
-    /// The reasons of the new count are one per operation with the number of
-    /// calls. One per call is hundreds of lines on an app that calls its own
-    /// API.
-    ///
-    /// Counting every untyped call in `calls_without_expected_type` again
-    /// puts five there and fails this.
-    #[test]
-    fn a_call_to_an_own_route_is_counted_as_not_compared_and_not_as_untyped() {
-        let data = blob_with_calls(&[
-            ("GET", "/api/items", "app/page.tsx:4", Some(true)),
-            ("GET", "/api/items", "components/list.tsx:12", Some(true)),
-            ("POST", "/api/items", "components/form.tsx:9", Some(true)),
-            ("GET", "/billing/invoices", "lib/billing.ts:7", Some(false)),
-            ("GET", "/legacy/report", "lib/legacy.ts:3", None),
-        ]);
+        };
 
         let boundary =
             ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
@@ -1214,131 +1093,22 @@ mod tests {
         assert_eq!(
             boundary.calls_without_expected_type,
             Counted::from_reasons(vec![
+                "http|GET|/api/items (app/page.tsx:4)".to_string(),
                 "http|GET|/billing/invoices (lib/billing.ts:7)".to_string(),
-                "http|GET|/legacy/report (lib/legacy.ts:3)".to_string(),
-            ]),
-            "only the calls no own route matches are a shortfall"
+            ])
         );
-        assert_eq!(
-            boundary.own_route_calls_not_compared,
-            Some(Counted {
-                total: 3,
-                reasons: vec![
-                    "http|GET|/api/items ×2".to_string(),
-                    "http|POST|/api/items ×1".to_string(),
-                ],
-                truncated: false,
-            }),
-            "three calls, stated as two operations"
-        );
-    }
-
-    /// The same call at two sites, one marked and one not, is split by site:
-    /// the join is the call's key AND its location, as the two rows of one
-    /// call share both.
-    #[test]
-    fn the_own_route_count_joins_a_call_to_its_row_by_key_and_site() {
-        let data = blob_with_calls(&[
-            ("GET", "/api/items", "app/page.tsx:4", Some(true)),
-            ("GET", "/api/items", "scripts/seed.ts:9", Some(false)),
-        ]);
-
-        let boundary =
-            ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
-
-        assert_eq!(
-            boundary.calls_without_expected_type.reasons,
-            vec!["http|GET|/api/items (scripts/seed.ts:9)".to_string()]
-        );
-        assert_eq!(
-            boundary
-                .own_route_calls_not_compared
-                .map(|count| count.total),
-            Some(1)
-        );
-    }
-
-    /// The new count is written only when there is something to count. A
-    /// service that calls none of its own routes writes no key, and a blob
-    /// from a scanner that did not separate these calls has none either: both
-    /// read `None`, and neither reads as zero calls compared.
-    #[test]
-    fn the_own_route_count_is_absent_when_there_is_none() {
-        let data =
-            blob_with_calls(&[("GET", "/billing/invoices", "lib/billing.ts:7", Some(false))]);
-        let boundary =
-            ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
-        assert_eq!(boundary.own_route_calls_not_compared, None);
-        assert_eq!(boundary.calls_without_expected_type.total, 1);
         let written = serde_json::to_value(&boundary).unwrap();
         assert!(
             written.get("own_route_calls_not_compared").is_none(),
-            "no key at zero: {written}"
+            "{written}"
         );
-
-        // A boundary written before the count existed.
-        let older: ServiceBoundary = serde_json::from_value(written).unwrap();
-        assert_eq!(older.own_route_calls_not_compared, None);
-
-        // And one that states it round-trips, spelled this way.
-        let stated = ServiceBoundary {
-            own_route_calls_not_compared: Some(Counted::new(
-                2,
-                vec!["http|GET|/api/items ×2".to_string()],
-            )),
-            ..Default::default()
-        };
-        let written = serde_json::to_value(&stated).unwrap();
-        assert_eq!(written["own_route_calls_not_compared"]["total"], 2);
-        assert_eq!(
-            written["own_route_calls_not_compared"]["reasons"][0],
-            "http|GET|/api/items ×2"
-        );
-        let back: ServiceBoundary = serde_json::from_value(written).unwrap();
-        assert_eq!(back, stated);
-    }
-
-    /// The printed block says these calls are not compared yet, on a line of
-    /// its own directly under the untyped calls, and only when there are any.
-    #[test]
-    fn the_not_compared_line_is_printed_under_the_calls_line_and_only_above_zero() {
-        let mut boundary = ServiceBoundary {
-            commit_hash: "0123456".to_string(),
-            calls_without_expected_type: Counted::from_reasons(vec![
-                "http|GET|/billing/invoices (lib/billing.ts:7)".to_string(),
-            ]),
-            ..Default::default()
-        };
-        let without = boundary.lines("web");
         assert!(
-            !without.iter().any(|line| line.contains("own route")),
-            "nothing to say when the scan did not count any: {without:?}"
-        );
-
-        boundary.own_route_calls_not_compared = Some(Counted::default());
-        assert_eq!(
-            boundary.lines("web"),
-            without,
-            "a count of zero prints nothing"
-        );
-
-        boundary.own_route_calls_not_compared = Some(Counted::new(
-            3,
-            vec![
-                "http|GET|/api/items ×2".to_string(),
-                "http|POST|/api/items ×1".to_string(),
-            ],
-        ));
-        let lines = boundary.lines("web");
-        let calls = lines
-            .iter()
-            .position(|line| line.contains("1 call(s) with no resolved expected type"))
-            .expect("the untyped calls line");
-        assert_eq!(
-            lines[calls + 1],
-            "  3 call(s) to this service's own route(s), types not compared yet \
-             (not counted above) (e.g. http|GET|/api/items ×2)",
-            "{lines:?}"
+            !boundary
+                .lines("app")
+                .iter()
+                .any(|line| line.contains("own route")),
+            "{:?}",
+            boundary.lines("app")
         );
     }
 

@@ -7,6 +7,9 @@
  * `verify_library_claims` write one when the program they read is ready,
  * which is the part of their work whose size the request does not bound.
  *
+ * `retype_check` rebuilds the program for each item it judges, so it writes
+ * a frame as it finishes them, as `infer` does (carrick#1945).
+ *
  * A capture is four pieces of compiler work, each as large as the service
  * and none bounded by the request, so `capture_v2` writes a frame as it
  * reaches each stage and as it resolves anchors (carrick#1916). The frames
@@ -326,6 +329,33 @@ describe('long requests report progress (carrick#1914)', () => {
         assert.ok(Number(done) > last && Number(done) <= 3, `count went ${last} -> ${done}`);
         last = Number(done);
       }
+    });
+
+    it('retype_check reports how far through its items it is, then answers (carrick#1945)', async () => {
+      const item = (id: string, name: string) => ({
+        item_id: id,
+        file_path: workPath,
+        line_number: lineOf(WORK, `return ${name}().length`),
+        expression_text: `${name}()`,
+        expression_line: lineOf(WORK, `return ${name}().length`),
+        producer_type: '{ id: string; total: number }[]',
+        wire: false,
+      });
+      const frames = await sidecar.exchange({
+        action: 'retype_check',
+        request_id: 'progress-retype',
+        items: [item('a', 'two'), item('b', 'two')],
+      });
+      const terminal = frames[frames.length - 1] as Frame & { outcomes?: Array<{ item_id: string }> };
+      assert.strictEqual(terminal.status, 'success', JSON.stringify(terminal.errors));
+      assert.deepStrictEqual((terminal.outcomes ?? []).map((o) => o.item_id), ['a', 'b']);
+      const progress = progressOf(frames);
+      assert.strictEqual(progress.length, frames.length - 1, 'only progress frames precede the answer');
+      // The first report is not paced, so it is always the first item.
+      assert.deepStrictEqual(
+        [progress[0]?.request_id, progress[0]?.phase, progress[0]?.message],
+        ['progress-retype', 'retype', '1 of 2']
+      );
     });
 
     it('bundle reports that its program is ready, then answers', async () => {

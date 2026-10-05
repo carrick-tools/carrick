@@ -45,7 +45,10 @@ state every call with the method and path it sends, so the test measures what
 the scanner does with a correct reading. The 4 rows at the helper's callers
 come from no answer: the scanner states them itself.
 
-A marked call has no type entries yet. Same-service pairs join the type check
-in carrick#1945, and the entries come with them.
+A marked call has its type entries, and the type check pairs it with the route
+it calls (carrick#1945): its verdict row names the service at both ends. The
+two rows at a caller of `listItems()` have no response half, because that
+function returns a member of the body, so the row states the function's value
+and not the response (carrick#1601).
 
 Used by `tests/own_route_calls_test.rs`.

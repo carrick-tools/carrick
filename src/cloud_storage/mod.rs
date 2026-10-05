@@ -3827,6 +3827,88 @@ mod tests {
         );
     }
 
+    /// carrick#1945: a call to a route of its own service is checked like any
+    /// other pair, and its verdict is stored like any other: one row whose
+    /// `producer_repo` equals its `consumer_repo`, with its sites, and no
+    /// field that marks it. The pair row is still the fold of its sites.
+    #[test]
+    fn a_service_paired_with_itself_stores_one_row_with_equal_ids_and_its_sites() {
+        let mut payloads = vec![empty_repo("org/app", Some("app"))];
+        let first = edge_at(
+            "app",
+            "http|POST|/api/items",
+            "app",
+            "http|POST|/api/items",
+            "components/form.tsx:9",
+        );
+        let second = edge_at(
+            "app",
+            "http|POST|/api/items",
+            "app",
+            "http|POST|/api/items",
+            "lib/items-api.ts:20",
+        );
+        let dirs = directions(&[
+            incompatible_outcome(&first, ManifestTypeKind::Request, "request mismatch"),
+            compatible_outcome(&first, ManifestTypeKind::Response),
+            compatible_outcome(&second, ManifestTypeKind::Request),
+            unverifiable_outcome(
+                &second,
+                ManifestTypeKind::Response,
+                "consumer side carries `any`",
+            ),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[first, second], &dirs);
+
+        let rows = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(rows.len(), 1, "two sites of one pair are one row");
+        let row = &rows[0];
+        assert_eq!(
+            (row.producer_repo.as_str(), row.consumer_repo.as_str()),
+            ("app", "app")
+        );
+        assert_eq!(
+            row.sites
+                .iter()
+                .map(|site| site.consumer_location.as_str())
+                .collect::<Vec<_>>(),
+            vec!["components/form.tsx:9", "lib/items-api.ts:20"]
+        );
+        let (request, response) = fold_of_sites(&row.sites);
+        assert_eq!(row.request, request);
+        assert_eq!(row.response, response);
+        assert_eq!(
+            row.request.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Incompatible
+        );
+        assert_eq!(
+            row.response.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Unverifiable
+        );
+        let written = serde_json::to_value(row).unwrap();
+        let mut keys: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "consumer_key",
+                "consumer_repo",
+                "producer_key",
+                "producer_repo",
+                "request",
+                "response",
+                "scanner_version",
+                "sites"
+            ],
+            "no field marks a same-service row"
+        );
+    }
+
     /// The wire spelling, and the two things a blob written before the field
     /// existed must still do (carrick#1385).
     #[test]

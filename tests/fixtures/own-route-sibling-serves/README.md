@@ -26,8 +26,8 @@ the calls a sibling serves better. Nothing that matches reads the mark.
 
 Before the mark, the scan deleted both rows, and `api` lost a real consumer.
 
-A marked call has no type entries until same-service pairs join the type check
-(carrick#1945), so the edge to `api` is not type-checked yet.
+A marked call has its type entries, and the type check pairs it like any other
+call (carrick#1945).
 
 `expected.json` is the answer key and `__llm__/` holds the mocked model answers
 for a `CARRICK_MOCK_ALL` scan. Used by `tests/own_route_calls_test.rs`.

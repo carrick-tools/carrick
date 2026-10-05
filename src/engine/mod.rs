@@ -7512,25 +7512,6 @@ fn build_type_manifest_entries(
     }
 
     for call in mount_graph.get_data_calls() {
-        // A call that a route of its own service matches is an index row
-        // (carrick#1926) with no type entries yet (carrick#1944). The type
-        // check builds no pair whose two ends are one service, so an entry
-        // here would be judged against nothing: it would add two manifest
-        // rows a call, an `unknown` capture anchor for each alias no request
-        // reaches, and no verdict. carrick#1945 gives these calls their pairs
-        // and removes this line with the skip in `build_check_pairs`.
-        //
-        // The cost is the call a sibling serves on a more literal route than
-        // the caller's own: its pair has two services and stays unchecked
-        // until then, as it was while the row was deleted.
-        //
-        // The type REQUESTS are not gated and did not change. They are
-        // collected from the per-file rows (`collect_type_requests`), which
-        // the mount graph's passes never edit, so these calls were inferred
-        // and captured while the graph deleted them and still are.
-        if call.own_route {
-            continue;
-        }
         if !normalizer.is_probable_url(&call.target_url) {
             continue;
         }
@@ -11713,15 +11694,13 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
-    /// carrick#1944: a call that a route of its own service matches is an
-    /// index row with no type entries, until the type check pairs a service
-    /// with itself (carrick#1945). An entry with no pair to be judged in is
-    /// two manifest rows and a capture anchor a call, for no verdict. A call
-    /// no own route matches keeps both of its entries. Taking the skip out of
-    /// `build_type_manifest_entries` puts two entries at line 4 and fails
+    /// carrick#1945: a call that a route of its own service matches gets
+    /// its two type entries like any other call, because the type check pairs
+    /// it with that route. Putting a skip on `own_route` back into
+    /// `build_type_manifest_entries` leaves line 4 without entries and fails
     /// this.
     #[test]
-    fn a_call_to_the_service_s_own_route_has_no_type_entries() {
+    fn a_call_to_the_service_s_own_route_has_its_type_entries() {
         let config = Config::default();
         let call = |path: &str, line: u32, own_route: bool| crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -11759,10 +11738,12 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             consumer,
             vec![
+                (4, ManifestTypeKind::Request),
+                (4, ManifestTypeKind::Response),
                 (9, ManifestTypeKind::Request),
                 (9, ManifestTypeKind::Response),
             ],
-            "only the call no own route matches is typed"
+            "a call to an own route is typed like any other"
         );
     }
 
