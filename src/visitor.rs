@@ -867,7 +867,7 @@ impl CalleeCollector<'_> {
 /// The TypeScript compiler's test for an intrinsic JSX element name
 /// (`isIntrinsicJsxName`): a lowercase ASCII first letter, or a `-` anywhere.
 /// Such a tag names a host element, never a binding in scope.
-fn is_intrinsic_jsx_name(name: &str) -> bool {
+pub(crate) fn is_intrinsic_jsx_name(name: &str) -> bool {
     name.starts_with(|c: char| c.is_ascii_lowercase()) || name.contains('-')
 }
 

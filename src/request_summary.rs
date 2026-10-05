@@ -208,13 +208,53 @@ pub enum Piece {
     /// A value that cannot be written as text at all (an object in a URL, a
     /// missing argument). A URL holding one states nothing.
     Unknown,
+    /// A parameter of a function this one is written inside, whole or by one
+    /// of its keys (carrick#1949): how many functions out, and the piece that
+    /// function reads it as ([`Piece::Param`] or [`Piece::ParamKey`]). A
+    /// callback or a closure is never called with the enclosing function's
+    /// arguments, so only a call of the enclosing function fills it in, once
+    /// the effect is lifted there ([`Effect::lifted`]).
+    Outer(u8, Box<Piece>),
 }
 
 impl Piece {
-    /// Whether the piece is the summarised function's own parameter, whole or
-    /// by one of its keys: what a call site may fill in.
+    /// Whether the piece is a parameter a caller may fill in: the summarised
+    /// function's own, whole or by one of its keys, or an enclosing
+    /// function's.
     fn is_parameter(&self) -> bool {
-        matches!(self, Piece::Param(..) | Piece::ParamKey(..))
+        matches!(
+            self,
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..)
+        )
+    }
+
+    /// The text a parameter is read by where it is written.
+    fn parameter_name(&self) -> Option<&str> {
+        match self {
+            Piece::Param(_, name) | Piece::ParamKey(_, _, name) => Some(name),
+            Piece::Outer(_, inner) => inner.parameter_name(),
+            _ => None,
+        }
+    }
+
+    /// The piece as a function written inside this one reads it: one more
+    /// function out (carrick#1949).
+    fn enclosed(&self) -> Piece {
+        match self {
+            Piece::Param(..) | Piece::ParamKey(..) => Piece::Outer(1, Box::new(self.clone())),
+            Piece::Outer(depth, inner) => Piece::Outer(depth.saturating_add(1), inner.clone()),
+            other => other.clone(),
+        }
+    }
+
+    /// The piece as the function one out reads it: an enclosing function's
+    /// parameter becomes its own (carrick#1949).
+    fn lifted(&self) -> Piece {
+        match self {
+            Piece::Outer(1, inner) => (**inner).clone(),
+            Piece::Outer(depth, inner) => Piece::Outer(depth - 1, inner.clone()),
+            other => other.clone(),
+        }
     }
 }
 
@@ -278,6 +318,23 @@ impl Value {
         match self {
             Value::Str(pieces) => pieces.clone(),
             Value::Obj(_) | Value::Callback(_) => vec![Piece::Unknown],
+        }
+    }
+
+    /// This value as a function written inside the one that holds it reads
+    /// it: every parameter piece one function further out (carrick#1949).
+    fn enclosed(&self) -> Value {
+        match self {
+            Value::Str(pieces) => Value::Str(pieces.iter().map(Piece::enclosed).collect()),
+            Value::Obj(obj) => Value::Obj(ObjValue {
+                fields: obj
+                    .fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.enclosed()))
+                    .collect(),
+                open: obj.open,
+            }),
+            Value::Callback(index) => Value::Callback(*index),
         }
     }
 }
@@ -593,6 +650,11 @@ struct CallIr {
     /// The line of the member the call names, or of the callee: where a
     /// library call a caller fills is placed ([`LibrarySite::line`]).
     name_line: u32,
+    /// A JSX element rendering a component, read as a call of it with its
+    /// attributes as one props object (carrick#1949): what the element's
+    /// props fill in of the component's requests, and nothing else
+    /// ([`Composer::compose`]).
+    jsx: bool,
 }
 
 /// One function body, reduced to what a request summary reads.
@@ -2509,6 +2571,10 @@ struct ClassFields {
 #[derive(Default)]
 struct Captured {
     values: HashMap<BindingKey, Value>,
+    /// The enclosing functions' plain parameters whose keys a body may read
+    /// as the caller wrote them ([`Scope::key_objects`]), with how many
+    /// functions out each is and its position there (carrick#1949).
+    objects: HashMap<BindingKey, (u8, usize)>,
     /// Literal text only: a hole is a parameter of the enclosing function,
     /// which the function written inside it is not called with.
     texts: HashMap<BindingKey, Vec<library_sites::TextPiece>>,
@@ -2945,6 +3011,10 @@ struct Scope<'a> {
     /// them (`options.url`, `const { url } = options`): never one the body
     /// assigns again, nor one whose name the file writes through.
     key_objects: HashSet<BindingKey>,
+    /// [`Captured::objects`]: an enclosing function's parameter whose keys
+    /// this body reads (`props.endpoint` in a closure), read as
+    /// [`Piece::Outer`] keys (carrick#1949).
+    outer_objects: HashMap<BindingKey, (u8, usize)>,
     locals: HashMap<BindingKey, Value>,
     /// The locals whose initialiser is text and that nothing assigns again
     /// ([`library_sites::text_pieces`], carrick#1661), the enclosing
@@ -2977,6 +3047,7 @@ impl<'a> Scope<'a> {
             params: Vec::new(),
             keyed: HashMap::new(),
             key_objects: HashSet::new(),
+            outer_objects: HashMap::new(),
             locals: HashMap::new(),
             texts: HashMap::new(),
             local_receivers: HashMap::new(),
@@ -3399,6 +3470,7 @@ impl Reader<'_> {
             params: Vec::new(),
             keyed: HashMap::new(),
             key_objects: HashSet::new(),
+            outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, function),
@@ -3445,6 +3517,7 @@ impl Reader<'_> {
             params: Vec::new(),
             keyed: HashMap::new(),
             key_objects: HashSet::new(),
+            outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
             local_receivers: inherited_receivers(captured, arrow),
@@ -3786,6 +3859,17 @@ impl Reader<'_> {
             && let Some(key) = member_prop(member)
         {
             return Value::Str(vec![Piece::ParamKey(index, key, self.text(member.span))]);
+        }
+        // `props.endpoint` in a closure, on an enclosing function's parameter:
+        // the key of the object that function's caller writes (carrick#1949).
+        if let Expr::Ident(object) = crate::graphql_document_sites::unwrap_expression(&member.obj)
+            && let Some((depth, index)) = scope.outer_objects.get(&ident_key(object))
+            && let Some(key) = member_prop(member)
+        {
+            return Value::Str(vec![Piece::Outer(
+                *depth,
+                Box::new(Piece::ParamKey(*index, key, self.text(member.span))),
+            )]);
         }
         // A key of an object the source writes as a literal.
         if let Some(key) = member_prop(member)
@@ -4740,7 +4824,66 @@ impl Visit for CallWalker<'_, '_, '_> {
             receiver,
             site_args,
             name_line,
+            jsx: false,
         });
+    }
+
+    // `<Panel endpoint={url} />`: compiled, the element is a call that hands
+    // the component one props object, and the call graph resolves it as one
+    // (carrick#1149). Read as that call, so a prop fills in the component's
+    // requests (carrick#1949). An intrinsic element (`<div>`) names no
+    // binding, and an element the call graph does not resolve to one of the
+    // service's components reads as nothing, as it always did.
+    fn visit_jsx_opening_element(&mut self, element: &JSXOpeningElement) {
+        let callee = match &element.name {
+            JSXElementName::Ident(ident) if !crate::visitor::is_intrinsic_jsx_name(&ident.sym) => {
+                Some(ident.sym.to_string())
+            }
+            JSXElementName::JSXMemberExpr(member) => Some(member.prop.sym.to_string()),
+            _ => None,
+        };
+        if let Some(callee) = callee {
+            let mut props = ObjValue::default();
+            for attr in &element.attrs {
+                let JSXAttrOrSpread::JSXAttr(attr) = attr else {
+                    // A spread may put any key in the props.
+                    props.open = true;
+                    continue;
+                };
+                let JSXAttrName::Ident(name) = &attr.name else {
+                    continue;
+                };
+                let value = match &attr.value {
+                    Some(JSXAttrValue::Lit(Lit::Str(text))) => {
+                        Value::Str(vec![Piece::Lit(text.value.to_string())])
+                    }
+                    Some(JSXAttrValue::JSXExprContainer(JSXExprContainer {
+                        expr: JSXExpr::Expr(expr),
+                        ..
+                    })) if !matches!(&**expr, Expr::Arrow(_) | Expr::Fn(_)) => {
+                        self.reader.eval(expr, self.scope)
+                    }
+                    // A flag (`<Panel open />`), an element, or a function:
+                    // nothing a URL is read from.
+                    _ => Value::Str(vec![Piece::Unknown]),
+                };
+                props.fields.insert(name.sym.to_string(), value);
+            }
+            self.ir.calls.push(CallIr {
+                site: self.reader.site(element.span),
+                callee,
+                args: vec![Value::Obj(props)],
+                request: None,
+                waited: false,
+                inert: false,
+                invokes_param: None,
+                receiver: None,
+                site_args: None,
+                name_line: self.reader.line(element.span),
+                jsx: true,
+            });
+        }
+        element.visit_children_with(self);
     }
 
     // A function written in the body and not handed to a call: its calls
@@ -4847,16 +4990,57 @@ impl Visit for CallWalker<'_, '_, '_> {
 }
 
 impl CallWalker<'_, '_, '_> {
-    /// What a callback written here can read: this body's constants, and its
-    /// parameters as opaque names (the callback is not called with them), and
-    /// the library instances this body holds.
+    /// What a callback written here can read: this body's constants, its
+    /// parameters and the keys it reads of them, and the library instances
+    /// this body holds.
+    ///
+    /// The callback is not called with this body's parameters, so it reads
+    /// each as [`Piece::Outer`]: a hole only a call of this body fills in
+    /// (carrick#1949). Where a request reads one in a place that states a
+    /// route without it, it is read as the name it is written by, as it
+    /// always was ([`Effect::settle_outer`]).
     fn captured(&self) -> Captured {
-        let mut values = self.scope.locals.clone();
-        for key in self.scope.params.iter().flatten() {
-            values.insert(key.clone(), Value::opaque(key.0.clone()));
+        let mut values: HashMap<BindingKey, Value> = self
+            .scope
+            .locals
+            .iter()
+            .map(|(key, value)| (key.clone(), value.enclosed()))
+            .collect();
+        for (index, key) in self.scope.params.iter().enumerate() {
+            if let Some(key) = key {
+                values.insert(
+                    key.clone(),
+                    Value::Str(vec![Piece::Param(index, key.0.clone()).enclosed()]),
+                );
+            }
+        }
+        for (key, (index, param_key)) in &self.scope.keyed {
+            values.insert(
+                key.clone(),
+                Value::Str(vec![
+                    Piece::ParamKey(*index, param_key.clone(), key.0.clone()).enclosed(),
+                ]),
+            );
+        }
+        let mut objects: HashMap<BindingKey, (u8, usize)> = self
+            .scope
+            .outer_objects
+            .iter()
+            .map(|(key, (depth, index))| (key.clone(), (depth.saturating_add(1), *index)))
+            .collect();
+        for key in &self.scope.key_objects {
+            if let Some(index) = self
+                .scope
+                .params
+                .iter()
+                .position(|p| p.as_ref() == Some(key))
+            {
+                objects.insert(key.clone(), (1, index));
+            }
         }
         Captured {
             values,
+            objects,
             texts: self
                 .scope
                 .texts
@@ -5042,6 +5226,7 @@ impl Effect {
             semantics: shape.semantics.clone(),
         };
         effect.settle_keys();
+        effect.settle_outer();
         effect
     }
 
@@ -5075,6 +5260,69 @@ impl Effect {
         if render_target(&join_base(&base, &url)).is_some() {
             self.url = url;
             self.base = base;
+        }
+    }
+
+    /// An enclosing function's parameter is its caller's to fill in only
+    /// where the request states no route without it (carrick#1949), the rule
+    /// [`Self::settle_keys`] applies to a key.
+    ///
+    /// Where the URL states a route with each such parameter read as the
+    /// name it is written by (a base before a literal path, a whole path
+    /// segment), the request is stated at its own line as it always was. So
+    /// reading a closure's parameters only adds rows, at the callers of the
+    /// function it is written in.
+    fn settle_outer(&mut self) {
+        let outer = |pieces: &[Piece]| pieces.iter().any(|piece| matches!(piece, Piece::Outer(..)));
+        if !outer(&self.url) && !outer(&self.base) {
+            return;
+        }
+        let as_written = |pieces: &[Piece]| -> Vec<Piece> {
+            pieces
+                .iter()
+                .map(|piece| match piece {
+                    Piece::Outer(..) => {
+                        Piece::Opaque(piece.parameter_name().unwrap_or_default().to_string())
+                    }
+                    other => other.clone(),
+                })
+                .collect()
+        };
+        let (url, base) = (as_written(&self.url), as_written(&self.base));
+        if render_target(&join_base(&base, &url)).is_some() {
+            self.url = url;
+            self.base = base;
+        }
+    }
+
+    /// Whether the effect waits on a call of a function enclosing the one it
+    /// is written in (carrick#1949).
+    fn has_outer(&self) -> bool {
+        self.url
+            .iter()
+            .chain(&self.base)
+            .any(|piece| matches!(piece, Piece::Outer(..)))
+    }
+
+    /// This effect as the function one out sends it: its enclosing
+    /// parameters one function nearer, so that function's callers fill in
+    /// the ones that are now its own (carrick#1949).
+    fn lifted(&self) -> Effect {
+        let lift = |pieces: &[Piece]| pieces.iter().map(Piece::lifted).collect::<Vec<_>>();
+        Effect {
+            site: self.site.clone(),
+            method: self.method.clone(),
+            url: lift(&self.url),
+            body: self
+                .body
+                .iter()
+                .map(|(key, pieces)| (key.clone(), lift(pieces)))
+                .collect(),
+            body_param: None,
+            verb: self.verb,
+            base: lift(&self.base),
+            base_scope: self.base_scope.clone(),
+            semantics: self.semantics.clone(),
         }
     }
 
@@ -5207,8 +5455,10 @@ impl Effect {
             semantics: self.semantics.clone(),
         };
         // A key of the caller's own parameter may have arrived in what it
-        // wrote (`get(`${options.base}/users`)`).
+        // wrote (`get(`${options.base}/users`)`), and so may an enclosing
+        // function's.
         instantiated.settle_keys();
+        instantiated.settle_outer();
         instantiated
     }
 
@@ -5674,11 +5924,26 @@ impl Composer<'_> {
             invokes: ir.invoked_params.clone(),
             passes_body: false,
         };
+        // What the functions written in this body send through its
+        // parameters (carrick#1949), kept apart until `passes_body` is read:
+        // that is a statement about the body's own request.
+        let mut lifted: BTreeSet<Effect> = BTreeSet::new();
         for call in &ir.calls {
             if call.invokes_param.is_some() {
                 continue;
             }
             match self.callee(file, call) {
+                // A JSX element fills in what its props reach of the
+                // component's requests, and nothing else: the component's
+                // other requests and its completeness are its own, as they
+                // were while an element read as nothing (carrick#1949).
+                Some((_, callee)) if call.jsx => {
+                    for effect in callee.effects.iter().filter(|effect| effect.has_params()) {
+                        summary
+                            .effects
+                            .insert(ir.settle_forward(effect.at_call(&call.args, file, call.site)));
+                    }
+                }
                 Some((_, callee)) => {
                     summary.complete &= callee.complete;
                     for effect in &callee.effects {
@@ -5691,9 +5956,15 @@ impl Composer<'_> {
                             Value::Callback(nested) if callee.invokes.contains(&index) => {
                                 let callback = self.compose(file, &ir.nested[*nested]);
                                 summary.complete &= callback.complete;
-                                summary
-                                    .effects
-                                    .extend(callback.effects.iter().map(Effect::detached));
+                                summary.effects.extend(
+                                    callback
+                                        .effects
+                                        .iter()
+                                        .map(|effect| effect.detached().lifted()),
+                                );
+                            }
+                            Value::Callback(nested) => {
+                                lifted.extend(self.lifted_from(file, &ir.nested[*nested]));
                             }
                             Value::Str(pieces) if callee.invokes.contains(&index) => {
                                 if let [Piece::Param(param, _)] = pieces.as_slice() {
@@ -5704,6 +5975,7 @@ impl Composer<'_> {
                         }
                     }
                 }
+                None if call.jsx => {}
                 None => {
                     if let Some(request) = self.request_of(file, call) {
                         summary.effects.insert(ir.settle_forward(Effect::from_shape(
@@ -5715,17 +5987,29 @@ impl Composer<'_> {
                         summary.complete = false;
                     }
                     // A callback handed to a callee this pass cannot read may
-                    // or may not run.
+                    // or may not run. What it sends through this body's
+                    // parameters is still this body's to state (carrick#1949),
+                    // and the body is still never complete.
                     for arg in &call.args {
                         if let Value::Callback(nested) = arg {
                             let callback = self.compose(file, &ir.nested[*nested]);
                             if !callback.effects.is_empty() || !callback.complete {
                                 summary.complete = false;
                             }
+                            lifted.extend(lift_outer(&callback));
                         }
                     }
                 }
             }
+        }
+        // A function written in the body and not handed to a call (a closure
+        // held in a local, an object's method handed to a package, a
+        // function returned): what it sends through this body's parameters.
+        // Whether and when it runs is not this body's to say, so it never
+        // makes the body complete, and what it sends without them is stated
+        // where it is written.
+        for detached in &ir.detached {
+            lifted.extend(self.lifted_from(file, detached));
         }
         summary.passes_body = summary.effects.len() == 1
             && !ir.body_returns.is_empty()
@@ -5734,8 +6018,33 @@ impl Composer<'_> {
                 .iter()
                 .all(|returned| self.hands_back_body(file, ir, *returned));
         summary
+            .effects
+            .extend(lifted.into_iter().map(|effect| ir.settle_forward(effect)));
+        summary
     }
 
+    /// What a function written inside another sends through the enclosing
+    /// function's parameters (carrick#1949).
+    fn lifted_from(&mut self, file: &Path, nested: &FnIr) -> Vec<Effect> {
+        lift_outer(&self.compose(file, nested))
+    }
+}
+
+/// The requests a function written inside another sends through the
+/// enclosing function's parameters, as the enclosing function sends them
+/// (carrick#1949). The inner function's own parameters are no caller's to
+/// fill in: nothing here calls it.
+fn lift_outer(summary: &Summary) -> Vec<Effect> {
+    summary
+        .effects
+        .iter()
+        .map(Effect::detached)
+        .filter(Effect::has_outer)
+        .map(|effect| effect.lifted())
+        .collect()
+}
+
+impl Composer<'_> {
     /// Whether one `return` of `ir` hands back its request's parsed body
     /// unchanged (carrick#1601): the response a request this body makes
     /// answers with, parsed, or what a call of a function that does the
@@ -5830,6 +6139,11 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 let mut sends = false;
                 for effect in &callee.effects {
                     sends = true;
+                    // A JSX element states only what its props fill in
+                    // (carrick#1949).
+                    if call.jsx && !effect.has_params() {
+                        continue;
+                    }
                     let instantiated = effect.instantiate(&call.args);
                     if instantiated.has_params() {
                         // Still open: a caller further up fills it.
@@ -5894,7 +6208,9 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         sends |= !callback.effects.is_empty();
                     }
                 }
-                if callee.complete && !sends {
+                // An element is never a site a model row can be withdrawn
+                // at: it reads only what its props fill in.
+                if callee.complete && !sends && !call.jsx {
                     index
                         .silent
                         .entry(file.to_path_buf())
@@ -6025,7 +6341,11 @@ fn base_reads_the_same_in(effect: &Effect, file: &Path) -> bool {
         Some(scope) if scope != file => effect.base.iter().all(|piece| match piece {
             Piece::Lit(_) => true,
             Piece::Opaque(text) => reads_the_environment(text),
-            Piece::Param(..) | Piece::ParamKey(..) | Piece::Query | Piece::Unknown => false,
+            Piece::Param(..)
+            | Piece::ParamKey(..)
+            | Piece::Outer(..)
+            | Piece::Query
+            | Piece::Unknown => false,
         }),
         _ => true,
     }
@@ -6325,7 +6645,9 @@ fn is_absolute_url(text: &str) -> bool {
 fn render_target(url: &[Piece]) -> Option<String> {
     if url.iter().enumerate().any(|(position, piece)| match piece {
         Piece::Unknown => true,
-        Piece::Param(..) | Piece::ParamKey(..) => !is_whole_segment(url, position),
+        Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..) => {
+            !is_whole_segment(url, position)
+        }
         // Text after a query that may be empty would continue the path.
         Piece::Query => position + 1 != url.len(),
         _ => false,
@@ -6355,6 +6677,13 @@ fn render_target(url: &[Piece]) -> Option<String> {
                 if !is_whole_segment(path, position) {
                     return None;
                 }
+                rendered.push_str(&format!("${{{name}}}"));
+            }
+            Piece::Outer(..) => {
+                if !is_whole_segment(path, position) {
+                    return None;
+                }
+                let name = piece.parameter_name().unwrap_or_default();
                 rendered.push_str(&format!("${{{name}}}"));
             }
             Piece::Query => {}
@@ -6476,6 +6805,38 @@ mod tests {
                 .collect(),
             open,
         })
+    }
+
+    /// carrick#1949: an enclosing function's parameter waits on that
+    /// function's caller only where the request states no route without it,
+    /// and lifting moves it one function out.
+    #[test]
+    fn an_enclosing_parameter_waits_only_where_no_route_is_stated_without_it() {
+        let outer = |name: &str| Piece::Param(0, name.to_string()).enclosed();
+
+        let mut whole = effect(vec![outer("endpoint")]);
+        whole.settle_outer();
+        assert!(whole.has_outer());
+        assert_eq!(
+            whole.lifted().url,
+            vec![Piece::Param(0, "endpoint".to_string())]
+        );
+
+        let mut based = effect(vec![outer("endpoint"), lit("/refresh")]);
+        based.settle_outer();
+        assert!(!based.has_outer());
+        assert_eq!(
+            render_target(&based.url).as_deref(),
+            Some("${endpoint}/refresh")
+        );
+
+        let twice = Piece::ParamKey(1, "url".to_string(), "url".to_string())
+            .enclosed()
+            .enclosed();
+        assert_eq!(
+            twice.lifted(),
+            Piece::ParamKey(1, "url".to_string(), "url".to_string()).enclosed()
+        );
     }
 
     /// carrick#1950: a built query ends the path, and the target leaves it

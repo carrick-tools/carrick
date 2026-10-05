@@ -1,0 +1,8 @@
+{
+  "name": "boards",
+  "private": true,
+  "dependencies": {
+    "a-ui-runtime": "^2.0.0",
+    "a-widget-kit": "^1.0.0"
+  }
+}

@@ -210,6 +210,7 @@ jobs:
           --test method_per_site_test
           --test one_row_per_request_test
           --test payload_without_method_test
+          --test props_and_hook_options_test
           --test pubsub_wrapper_type_capture_test
           --test response_init_bag_test
           --test run_log_isolation_test
