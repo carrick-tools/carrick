@@ -453,6 +453,12 @@ struct ExpCall {
     host_contains: Option<String>,
     #[serde(default)]
     path_contains: Option<String>,
+    /// Whether the scan marks the call as served by a route of its own
+    /// service (carrick#1926). A label that states it is matched only by a
+    /// call carrying the same mark, so a row kept without its mark is a miss.
+    /// A label that does not state it puts no constraint on the mark.
+    #[serde(default)]
+    own_route: Option<bool>,
     #[serde(default = "default_tier")]
     tier: String,
 }
@@ -478,10 +484,10 @@ struct ExpNonHttpOp {
 struct ExpMustNotEmit {
     /// `"endpoint"` or `"call"` — which projection set this decoy would leak
     /// into. The set matters when a decoy shares `(method, path)` with a legit
-    /// op on the OTHER side (corpus-3's intra-repo self-call decoy is a `call`
-    /// whose path is also a labelled endpoint). Other values (corpus-2's
-    /// non-HTTP `"pubsub"` decoys) match neither HTTP set — documented, not
-    /// yet scoreable.
+    /// op on the OTHER side: a mock route registration is an `endpoint` decoy,
+    /// and a real call to the same path elsewhere is no leak. Other values
+    /// (corpus-2's non-HTTP `"pubsub"` decoys) match neither HTTP set —
+    /// documented, not yet scoreable.
     kind: String,
     /// `"*"` matches any method.
     method: String,
@@ -576,6 +582,10 @@ struct EvalOp {
     expanded_definition: Option<String>,
     #[serde(default)]
     primary_type_symbol: Option<String>,
+    /// Calls only: a route of the call's own service serves it
+    /// (carrick#1926). The projection writes the key only when true.
+    #[serde(default)]
+    own_route: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -831,7 +841,14 @@ fn score_call_set(
 /// of the actual op's canonical key, and expected `path_contains` is a substring
 /// of the actual path. A null `host_contains`/`path_contains` constraint is
 /// vacuously satisfied (it is a "no host" / built-in label, e.g. `sendBeacon`).
+/// A label that states `own_route` also requires the call's mark to equal it.
 fn fuzzy_call_match(ec: &ExpCall, ac: &EvalOp) -> bool {
+    if ec
+        .own_route
+        .is_some_and(|expected| expected != ac.own_route)
+    {
+        return false;
+    }
     let method_ok = ac
         .method
         .as_deref()
@@ -2584,6 +2601,7 @@ mod scoring_tests {
             resolved_definition: None,
             expanded_definition: None,
             primary_type_symbol: None,
+            own_route: false,
         }
     }
 
@@ -2600,6 +2618,7 @@ mod scoring_tests {
             resolved_definition: None,
             expanded_definition: None,
             primary_type_symbol: None,
+            own_route: false,
         }
     }
 
@@ -3372,24 +3391,16 @@ mod scoring_tests {
 
     // --- Real-corpus-label tests (deterministic; load the committed labels) ---
 
-    #[test]
-    fn perfect_synthetic_projection_against_real_corpus() {
-        // Pins corpus-1's exact 3-repo structure; skip for any other corpus.
-        if corpus_name() != "xrepo-corpus-1" {
-            return;
-        }
-        let corpus = corpus_dir();
-        let repos = discover_repos(&corpus);
-        assert_eq!(repos.len(), 3, "the 3 top-level corpus repos");
-        let repo_expected = load_repo_expected(&repos);
-        let expected_output = load_expected_output(&corpus);
-
-        // Build a projection whose endpoint/call sets equal the union of all
-        // repos' expected ops, whose matches equal the expected edges (with their
-        // labelled compat verdict), and whose deps equal the labelled conflict.
+    /// A projection whose endpoint/call sets equal the union of all repos'
+    /// expected ops, whose matches equal the expected edges (with their
+    /// labelled compat verdict), and whose deps equal the labelled conflict.
+    fn perfect_projection(
+        repo_expected: &[(String, ExpectedRepo)],
+        expected_output: &ExpectedOutput,
+    ) -> EvalProjection {
         let mut endpoints: Vec<EvalOp> = Vec::new();
         let mut calls: Vec<EvalOp> = Vec::new();
-        for (_repo, exp) in &repo_expected {
+        for (_repo, exp) in repo_expected {
             for e in &exp.endpoints {
                 let mut op = http_ep(&e.method, &e.path);
                 op.handler = e.owner.clone();
@@ -3406,6 +3417,7 @@ mod scoring_tests {
                 let mut op = http_ep(&c.method, &path);
                 op.key = format!("http|{}|{}/{}", c.method.to_uppercase(), host, path);
                 op.path = Some(path);
+                op.own_route = c.own_route.unwrap_or(false);
                 calls.push(op);
             }
             for op in exp
@@ -3448,12 +3460,26 @@ mod scoring_tests {
                 severity: d.severity.clone(),
             })
             .collect();
-        let proj = EvalProjection {
+        EvalProjection {
             endpoints,
             calls,
             cross_repo_matches,
             dependency_conflicts,
-        };
+        }
+    }
+
+    #[test]
+    fn perfect_synthetic_projection_against_real_corpus() {
+        // Pins corpus-1's exact 3-repo structure; skip for any other corpus.
+        if corpus_name() != "xrepo-corpus-1" {
+            return;
+        }
+        let corpus = corpus_dir();
+        let repos = discover_repos(&corpus);
+        assert_eq!(repos.len(), 3, "the 3 top-level corpus repos");
+        let repo_expected = load_repo_expected(&repos);
+        let expected_output = load_expected_output(&corpus);
+        let proj = perfect_projection(&repo_expected, &expected_output);
 
         let score = score_corpus(
             &proj,
@@ -3617,27 +3643,103 @@ mod scoring_tests {
 
     #[test]
     fn decoy_leak_respects_projection_set_kind() {
-        // Corpus-3's intra-repo self-call decoy shares (method, path) with the
-        // repo's legit endpoint. The `kind: "call"` label must flag only a
-        // call-set emission — never the endpoint-set one.
+        // A mock route registration is an `endpoint` decoy: nothing serves
+        // that route. A real call to the same (method, path) is a call some
+        // code makes, and is no leak. The `kind` label must flag only an
+        // emission into the set it names.
+        //
+        // This test stood on corpus-3's call to its own service's route while
+        // that was labelled a `call` decoy. It is an expected row now
+        // (carrick#1926), so the test stands on a decoy that is still one.
         let repos = vec![(
-            "inventory-svc".to_string(),
+            "storefront-web".to_string(),
             serde_json::from_value::<ExpectedRepo>(serde_json::json!({
                 "_must_not_emit": [
-                    { "kind": "call", "method": "GET", "path": "/warehouses/:warehouseId/stock/:sku" }
+                    { "kind": "endpoint", "method": "GET", "path": "/api/v2/promotions/:id" }
                 ]
             }))
             .unwrap(),
         )];
         let mut proj = empty_proj();
-        // The legit producer endpoint on the same (method, path): clean.
-        proj.endpoints
-            .push(http_ep("GET", "/warehouses/:warehouseId/stock/:sku"));
-        assert_eq!(score_decoy_leak(&repos, &proj), 0);
-        // The self-call emitted into the call set: a leak.
+        // A call on the same (method, path): clean.
         proj.calls
-            .push(http_ep("GET", "/warehouses/:wid/stock/:sku"));
+            .push(http_ep("GET", "/api/v2/promotions/:promotionId"));
+        assert_eq!(score_decoy_leak(&repos, &proj), 0);
+        // The mock registration emitted into the endpoint set: a leak.
+        proj.endpoints
+            .push(http_ep("GET", "/api/v2/promotions/:id"));
         assert_eq!(score_decoy_leak(&repos, &proj), 1);
+    }
+
+    /// carrick#1926: corpus-3's job that fetches its own service's route is an
+    /// expected call row marked `own_route`, and an expected edge whose two
+    /// ends are that one repo. A projection without them, which is what a
+    /// build that deletes the row emits, misses the call and the edge. A
+    /// projection that keeps the row and drops its mark misses the call.
+    #[test]
+    fn corpus3_expects_the_own_route_call_and_its_same_service_edge() {
+        if corpus_name() != "xrepo-corpus-3" {
+            return;
+        }
+        let corpus = corpus_dir();
+        let repos = discover_repos(&corpus);
+        let repo_expected = load_repo_expected(&repos);
+        let expected_output = load_expected_output(&corpus);
+        let aliases = load_repo_aliases(&repos);
+
+        let marked: Vec<(&str, &ExpCall)> = repo_expected
+            .iter()
+            .flat_map(|(repo, exp)| exp.calls.iter().map(move |c| (repo.as_str(), c)))
+            .filter(|(_, c)| c.own_route == Some(true))
+            .collect();
+        assert_eq!(marked.len(), 1, "one call is labelled own_route");
+        assert_eq!(marked[0].0, "inventory-svc");
+        let same_service: Vec<&ExpMatch> = expected_output
+            .matches
+            .iter()
+            .filter(|m| m.producer_repo == m.consumer_repo)
+            .collect();
+        assert_eq!(same_service.len(), 1, "one edge has one repo at both ends");
+        assert_eq!(same_service[0].producer_repo, "inventory-svc");
+        assert_eq!(
+            same_service[0].producer_key,
+            "http|GET|/warehouses/:param/stock/:param"
+        );
+
+        // The call as the scanner projects it, with its mark and without.
+        let mut kept = http_ep("GET", "/warehouses/:wid/stock/:sku");
+        kept.own_route = true;
+        assert!(fuzzy_call_match(marked[0].1, &kept));
+        assert!(
+            !fuzzy_call_match(marked[0].1, &http_ep("GET", "/warehouses/:wid/stock/:sku")),
+            "the row without its mark is not the labelled row"
+        );
+
+        let full = score_corpus(
+            &perfect_projection(&repo_expected, &expected_output),
+            &repo_expected,
+            &expected_output,
+            &aliases,
+        );
+        let cap = full.by_tier.get(TIER_CAPABILITY).unwrap();
+        assert_eq!(cap.call_prf.1, 1.0, "every expected call is found");
+        assert_eq!(
+            cap.match_prf,
+            (1.0, 1.0, 1.0),
+            "every expected edge is found"
+        );
+        assert_eq!(full.decoy_leak, 0, "the kept call is no decoy");
+
+        // A build with the deleting pass restored: no row, no edge.
+        let mut restored = perfect_projection(&repo_expected, &expected_output);
+        restored.calls.retain(|call| !call.own_route);
+        restored
+            .cross_repo_matches
+            .retain(|m| m.producer_repo != m.consumer_repo);
+        let missed = score_corpus(&restored, &repo_expected, &expected_output, &aliases);
+        let cap = missed.by_tier.get(TIER_CAPABILITY).unwrap();
+        assert!(cap.call_prf.1 < 1.0, "the deleted call is a recall miss");
+        assert!(cap.match_prf.1 < 1.0, "and so is its edge");
     }
 
     #[test]
@@ -3652,8 +3754,10 @@ mod scoring_tests {
         let repo_expected = load_repo_expected(&repos);
         let expected_output = load_expected_output(&corpus);
 
-        // 12 matched edges: 4 http + 5 pubsub + 2 graphql + 1 socket, all capability.
-        assert_eq!(expected_output.matches.len(), 12);
+        // 13 matched edges: 5 http + 5 pubsub + 2 graphql + 1 socket, all
+        // capability. One of the HTTP edges has one repo at both ends: a
+        // service calling its own route (carrick#1926).
+        assert_eq!(expected_output.matches.len(), 13);
         let n_proto = |p: &str| {
             expected_output
                 .matches
@@ -3661,7 +3765,7 @@ mod scoring_tests {
                 .filter(|m| m.producer_key.starts_with(&format!("{p}|")))
                 .count()
         };
-        assert_eq!(n_proto("http"), 4, "4 HTTP edges");
+        assert_eq!(n_proto("http"), 5, "5 HTTP edges");
         assert_eq!(n_proto("pubsub"), 5, "5 pub/sub edges");
         assert_eq!(n_proto("graphql"), 2, "2 GraphQL edges");
         assert_eq!(n_proto("socket"), 1, "1 socket edge");
@@ -3681,13 +3785,17 @@ mod scoring_tests {
             .filter(|m| m.type_compatible == Some(false))
             .count();
         assert_eq!(incompatible, 4, "4 deliberately-incompatible edges");
-        assert!(
-            expected_output
-                .matches
-                .iter()
-                .all(|m| m.type_compatible.is_some()),
-            "every corpus edge labels a compat verdict"
-        );
+        // Every edge between two services labels a verdict. The same-service
+        // edge labels none: the type check pairs no service with itself yet
+        // (carrick#1945), so the scan states no verdict for it, and an
+        // unlabelled edge is skipped on the compat row.
+        for m in &expected_output.matches {
+            assert_eq!(
+                m.type_compatible.is_some(),
+                m.producer_repo != m.consumer_repo,
+                "a verdict label on every cross-service edge and on no other: {m:?}"
+            );
+        }
 
         // Fan-out: two producers (subscriber repos) on one pubsub key.
         let fanout = expected_output
@@ -3700,8 +3808,8 @@ mod scoring_tests {
             "catalog.price.updated fans out to two subscribers"
         );
 
-        // 7 orphans: 5 producers + 2 consumers; exactly one roadmap (SQS digest).
-        assert_eq!(expected_output.orphans.len(), 7);
+        // 6 orphans: 4 producers + 2 consumers; exactly one roadmap (SQS digest).
+        assert_eq!(expected_output.orphans.len(), 6);
         let roadmap_orphans: Vec<_> = expected_output
             .orphans
             .iter()
@@ -3718,12 +3826,13 @@ mod scoring_tests {
         });
         assert!(any_implicit, "corpus-3 keeps an Implicit type_state case");
 
-        // 3 formal HTTP-keyed decoys (supertest, msw, self-call).
+        // 2 formal HTTP-keyed decoys (supertest, msw). The call to the
+        // service's own route was the third until it was ruled a row.
         let n_decoys: usize = repo_expected
             .iter()
             .map(|(_r, e)| e.must_not_emit.len())
             .sum();
-        assert_eq!(n_decoys, 3, "3 _must_not_emit decoys across the corpus");
+        assert_eq!(n_decoys, 2, "2 _must_not_emit decoys across the corpus");
 
         // Dependency conflict: zod 3.23.0 vs 4.0.0, critical, used in code.
         assert_eq!(expected_output.dependency_conflicts.len(), 1);

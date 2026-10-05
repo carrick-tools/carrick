@@ -10,7 +10,16 @@
       "tier": "capability"
     }
   ],
-  "calls": [],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/warehouses/:param/stock/:param",
+      "path_contains": "/warehouses/",
+      "own_route": true,
+      "source": "src/jobs/reindex.ts",
+      "tier": "capability"
+    }
+  ],
   "pubsub_operations": [
     {
       "role": "producer",
@@ -38,8 +47,5 @@
       "type_state": "Explicit",
       "tier": "capability"
     }
-  ],
-  "_must_not_emit": [
-    { "kind": "call", "method": "GET", "path": "/warehouses/:warehouseId/stock/:sku" }
   ]
 }

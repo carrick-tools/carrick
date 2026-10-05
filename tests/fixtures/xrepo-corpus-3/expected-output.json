@@ -42,6 +42,16 @@
     },
     {
       "producer_repo": "inventory-svc",
+      "producer_key": "http|GET|/warehouses/:param/stock/:param",
+      "consumer_repo": "inventory-svc",
+      "consumer_key": "http|GET|/warehouses/:param/stock/:param",
+      "type_compatible": null,
+      "mismatch_reason": null,
+      "protocol": "http",
+      "tier": "capability"
+    },
+    {
+      "producer_repo": "inventory-svc",
       "producer_key": "pubsub|inventory.stock.adjust",
       "consumer_repo": "orders-api",
       "consumer_key": "pubsub|inventory.stock.adjust",
@@ -124,7 +134,6 @@
   "orphans": [
     { "repo": "catalog-api", "side": "producer", "key": "http|GET|/api/v2/products/:param", "tier": "capability" },
     { "repo": "catalog-api", "side": "producer", "key": "http|DELETE|/api/v2/products/:param", "tier": "capability" },
-    { "repo": "inventory-svc", "side": "producer", "key": "http|GET|/warehouses/:param/stock/:param", "tier": "capability" },
     { "repo": "support-desk", "side": "producer", "key": "http|GET|/tickets/:param", "tier": "capability" },
     { "repo": "support-desk", "side": "producer", "key": "graphql|subscription|ticketUpdated", "tier": "capability" },
     { "repo": "storefront-web", "side": "consumer", "key": "http|GET|/api/v1/products/:param", "tier": "capability" },
@@ -141,12 +150,13 @@
   "summary": {
     "total_repos": 7,
     "producers": 17,
-    "consumers": 13,
-    "matched_edges": 12,
+    "consumers": 14,
+    "matched_edges": 13,
+    "same_service_edges": 1,
     "incompatible_edges": 4,
-    "orphan_producers": 5,
+    "orphan_producers": 4,
     "orphan_consumers": 2,
-    "decoys_must_not_emit": 3,
-    "matched_edges_by_protocol": { "http": 4, "pubsub": 5, "graphql": 2, "socket": 1 }
+    "decoys_must_not_emit": 2,
+    "matched_edges_by_protocol": { "http": 5, "pubsub": 5, "graphql": 2, "socket": 1 }
   }
 }

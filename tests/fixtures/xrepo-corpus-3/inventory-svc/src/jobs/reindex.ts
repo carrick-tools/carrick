@@ -1,6 +1,6 @@
-// Nightly cache warm: hits this service's own HTTP surface over localhost.
-// An intra-repo self-call — not a cross-repo consumer, must not be extracted
-// as a data call.
+// Nightly cache warm: reads every stock level once, so the first requests of
+// the day are answered from memory. Runs inside this service and goes through
+// its own HTTP surface over localhost.
 export async function warmStockCache(warehouseIds: string[], skus: string[]): Promise<void> {
   for (const wid of warehouseIds) {
     for (const sku of skus) {

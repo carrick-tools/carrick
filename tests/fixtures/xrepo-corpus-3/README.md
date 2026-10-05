@@ -43,7 +43,12 @@ Selected via `CARRICK_EVAL_CORPUS=xrepo-corpus-3` through the same two-phase sco
    `gql`-tag consumer with **no call-site generic** (exercises the #298
    file-analyzer hint path).
 6. **New decoy families** — supertest test-client calls, msw mock handlers,
-   an intra-repo HTTP self-call, `amqplib` `assertQueue` topology setup.
+   `amqplib` `assertQueue` topology setup.
+7. **A call to the service's own route** — a job that fetches its own
+   service's endpoint over a loopback origin. It is a consumer of that route:
+   an expected call row marked `own_route`, and the corpus's one edge whose
+   producer and consumer are the same service (carrick#1926). Until that was
+   ruled it was labelled a decoy.
 
 ## Repos
 
@@ -51,7 +56,7 @@ Selected via `CARRICK_EVAL_CORPUS=xrepo-corpus-3` through the same two-phase sco
 |---|---|---|
 | `platform-monorepo/` | npm workspaces: `@meridian/contracts` (zod schemas + shared types) + `catalog-api` (Koa + `@koa/router` + nats) | HTTP producer (v2 products/variants; PATCH; DELETE-204), NATS fan-out publisher `catalog.price.updated`, supertest decoy |
 | `orders-api/` | Fastify + amqplib + bullmq + kafkajs + @aws-sdk/client-sqs | HTTP producer (`POST /orders`, `GET /orders/:orderId/timeline`), RabbitMQ publisher `inventory.stock.adjust`, BullMQ publisher `shipments.dispatch`, Kafka subscriber `orders.status.changed` (cross-broker), SQS publisher (roadmap) |
-| `inventory-svc/` | Express + amqplib + nats + zod@3 | RabbitMQ subscriber `inventory.stock.adjust` (payload type via `z.infer`), NATS subscriber `catalog.price.updated` (fan-out A), HTTP orphan producer, self-call + assertQueue decoys |
+| `inventory-svc/` | Express + amqplib + nats + zod@3 | RabbitMQ subscriber `inventory.stock.adjust` (payload type via `z.infer`), NATS subscriber `catalog.price.updated` (fan-out A), HTTP producer called by its own nightly job (the same-service edge), assertQueue decoy |
 | `fulfillment-worker/` | bullmq + nats + got (no HTTP framework) | BullMQ Worker `shipments.dispatch` (subscriber=producer), NATS publisher `orders.status.changed`, `got` consumer of catalog variants |
 | `storefront-web/` | Next-ish + ky + graphql-tag + socket.io-client + msw + zod@4 | `ky` consumer `POST /orders`, v1 drift consumer, gql query consumer (no generic → #298), socket emitter `support:message`, msw decoy |
 | `ops-console/` | plain node BFF: fetch-wrapper + graphql-request + nats | wrapper consumers (PATCH products, GET timeline) through config-object env bases, gql mutation consumer (with generic), NATS subscriber `catalog.price.updated` (fan-out B) |
@@ -88,6 +93,14 @@ the server; socket **listener** = producer; pub/sub **subscriber** = producer
 | 10 | graphql | support-desk `query ticket` | storefront-web (gql tag, **no generic**) | `graphql\|query\|ticket` | compatible |
 | 11 | graphql | support-desk `mutation escalateTicket` | ops-console (`request<T>`) | `graphql\|mutation\|escalateTicket` | **incompatible** (consumer requires `assignee: string`; producer `EscalationResult` lacks it) |
 | 12 | socket | support-desk (server `socket.on`) | storefront-web (client emit) | `socket\|CLIENT->SERVER\|support:message` | compatible |
+| 13 | http | inventory-svc `GET /warehouses/:warehouseId/stock/:sku` | inventory-svc (`fetch` over loopback, `src/jobs/reindex.ts`) | `http\|GET\|/warehouses/:param/stock/:param` | unlabelled (see below) |
+
+**Edge 13 is the same-service edge**: `inventory-svc` calls its own route, so
+the edge's producer and consumer are one repo, and the call row in
+`inventory-svc/expected.json` is labelled `own_route`. Its `type_compatible` is
+`null`, the one edge here without a verdict label: the type check pairs no
+service with itself yet (carrick#1945), so the edge carries no verdict and is
+skipped on the compat row. The label takes a verdict when that lands.
 
 **Edges 8/9 are the fan-out**: one publisher (catalog-api), two subscriber repos —
 two producers on one key (`pubsub|catalog.price.updated`), so two match edges
@@ -104,10 +117,11 @@ A match between them is a false positive.
 
 Producers: catalog-api `GET /api/v2/products/:id` (drift counterpart) and
 `DELETE /api/v2/products/:id` (204, no body → null anchor, null resolved type);
-inventory-svc `GET /warehouses/:warehouseId/stock/:sku`; support-desk
-`GET /tickets/:id` (**Implicit**: no return annotation, inferred
+support-desk `GET /tickets/:id` (**Implicit**: no return annotation, inferred
 `{ id: string; subject: string; ageDays: number; }`) and
-`graphql subscription ticketUpdated`.
+`graphql subscription ticketUpdated`. inventory-svc
+`GET /warehouses/:warehouseId/stock/:sku` is not one: its own job calls it
+(edge 13).
 Consumers: storefront-web `GET /api/v1/products/:id` (drift);
 orders-api `pubsub|notifications.digest` (**roadmap**, see Tiers).
 
@@ -132,12 +146,7 @@ repo's emissions):
 2. `storefront-web/mocks/handlers.ts` — msw `http.get("/api/v2/promotions/:id")`:
    a **mock route registration**, not a producer. `{kind: "endpoint", GET
    /api/v2/promotions/:id}`.
-3. `inventory-svc/src/jobs/reindex.ts` — `fetch("http://localhost:4002/warehouses/…")`:
-   an **intra-repo self-call**; must not surface as a consumer call (and never as
-   a cross-repo edge). `{kind: "call", GET /warehouses/:warehouseId/stock/:sku}` —
-   this entry shares (method, path) with the repo's legit *endpoint*, so the
-   decoy scorer distinguishes on `kind` (endpoint-set vs call-set).
-4. Documented, not formally scoreable (non-HTTP; same limitation corpus-2 logs):
+3. Documented, not formally scoreable (non-HTTP; same limitation corpus-2 logs):
    `inventory-svc/src/mq/setup.ts` `ch.assertQueue("inventory.stock.adjust")` —
    queue **topology setup**, not subscribe; and the SQS `sqs.send(…)` must not be
    emitted as an HTTP call.
