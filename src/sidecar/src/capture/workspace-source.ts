@@ -382,6 +382,26 @@ function incompleteFrom(
   return because;
 }
 
+/**
+ * Whether a file an anchor names as its module may join the capture. A source
+ * file outside the service is carried into the stub with everything it
+ * reaches, so it is held to the rule a package read by name is: a file of the
+ * checkout whole or not at all, and a source file of anything else never. A
+ * file of the service itself is what it is, and a declaration file is an
+ * installed package's, named by its specifier and pinned.
+ */
+export function carriesWhole(
+  file: string,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost,
+  scope: WorkspaceScope
+): boolean {
+  const real = realPath(file);
+  if (isInside(realPath(scope.service), real)) return true;
+  if (!SOURCE_FILE.test(file) || DECLARATION_FILE.test(file)) return true;
+  return isOwnPath(real, scope) && incompleteFrom(file, options, host, scope) === undefined;
+}
+
 function sourceOf(followed: Followed): string | undefined {
   return followed?.kind === 'source' ? followed.file : undefined;
 }

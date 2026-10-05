@@ -801,6 +801,41 @@ describe('carrick#1910: a package whose source is not all on the checkout is rea
     assertAsBefore(EMITTER, missing('node:events'));
   });
 
+  // The scanner names a type declared in a sibling package by the path of
+  // its file, where the model saw it imported.
+  const byPath = (repo: string, file: string): CaptureAnchorRequest[] => [
+    TALLY_ANCHORS[0],
+    { kind: 'symbol', alias: 'Endpoint_store_Response', symbol_name: 'Store', source_file: path.join(repo, 'packages/records', file), anchor_origin: 'llm-symbol' },
+  ];
+  const HALF_THERE = {
+    'lib/index.ts': "export * from '../generated/schema';\nexport * from './store';\n",
+    'lib/store.ts': STORE,
+  };
+
+  it('an anchor that names a file of the package by its path is held to the same rule', () => {
+    const { base, repo, service } = isolatedWorkspace(HALF_THERE, TALLY);
+    const anchors = byPath(repo, 'lib/index.ts');
+    const before = captureAsBefore(service, base, anchors);
+    const result = capture(repo, service, base, anchors);
+    assert.match(before.aliases[1].capture_failure_reason ?? '', /^source file not in program: /);
+    assert.deepStrictEqual(result.aliases, before.aliases);
+    assert.deepStrictEqual(declarations(result.stub_dir), declarations(before.stub_dir));
+  });
+
+  it('and reads the file where all it reaches is there', () => {
+    // The same package, entered at the one file that asks nothing of the missing module.
+    const { base, repo, service } = isolatedWorkspace(HALF_THERE, TALLY);
+    const result = capture(repo, service, base, byPath(repo, 'lib/store.ts'));
+    assert.deepStrictEqual(summary(result.aliases), [
+      ['Endpoint_tally_Response', 'ok', undefined],
+      ['Endpoint_store_Response', 'ok', undefined],
+    ]);
+    const files = Object.keys(declarations(result.stub_dir));
+    assert.ok(files.some((file) => file.endsWith('records/lib/store.d.ts')), files.join(', '));
+    assert.ok(!files.some((file) => file.endsWith('records/lib/index.d.ts')), files.join(', '));
+    assert.deepStrictEqual(standalone(result.stub_dir, base).members('Endpoint_store_Response'), ['name']);
+  });
+
   it('two packages that read each other, both all there, travel together', () => {
     const { base, repo, service } = isolatedWorkspace(
       {

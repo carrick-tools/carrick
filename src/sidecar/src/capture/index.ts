@@ -54,6 +54,7 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import {
+  carriesWhole,
   resolveModule,
   unbuiltPackageNote,
   workspaceCompilerHost,
@@ -847,7 +848,12 @@ function resolveAnchors(
       if (moduleSources.has(anchor.source_file)) continue;
       if (fs.existsSync(path.join(ctx.repoRoot, anchor.source_file))) continue;
       const file = resolveFromEntry(anchor.source_file);
-      if (file !== undefined) moduleSources.set(anchor.source_file, file);
+      // The scanner names a type in a sibling package by its file's path. Such
+      // a file joins the program as a root, with all it reaches, so it is
+      // held to the rule a package read by name is: whole, or left as it was.
+      if (file !== undefined && carriesWhole(file, options, ts.sys, ctx.workspace)) {
+        moduleSources.set(anchor.source_file, file);
+      }
     }
     const program = ts.createProgram(
       [ctx.entryPath, ...anchorSources, ...new Set(moduleSources.values()), ...(deno?.globals ?? [])],
