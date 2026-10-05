@@ -212,20 +212,64 @@ pub(crate) fn unwidened_alias(alias: &str) -> String {
     format!("{alias}_Unwidened")
 }
 
-/// True when an inference for an alias came back BLIND: tsc resolved the use
-/// site to a bare `any`/`unknown` — no anchor symbol, no array depth, no
-/// shape. This is not "the type is scalar"; it is "the compiler could not see
-/// the type at all", the routine CI shape whenever a payload flowed through an
-/// unresolved third-party import on a bare checkout (#349).
+/// True when an inference for an alias READ NO SHAPE: tsc resolved the use
+/// site to a bare `any`/`unknown` and peeled no array level off it. This is
+/// not "the type is scalar"; it is "the compiler could not see the type at
+/// all", the routine CI shape whenever a payload flowed through an unresolved
+/// third-party import on a bare checkout (#349), and the shape of a body the
+/// source itself reads untyped and casts later (carrick#1967).
 ///
 /// Deliberately narrower than [`contains_disqualifying_top_type`]: a partially
 /// decayed shape (`{ ok: boolean; count: any }`) still witnesses the use
-/// site's array-ness, so it is NOT blindness and must not demote anything.
-/// Only the bare top types mean the inference saw nothing.
-fn inference_was_blind(inf: &crate::services::type_sidecar::InferredType) -> bool {
-    inf.primary_type_symbol.is_none()
-        && inf.array_depth.is_none()
-        && text_is_bare_top_type(&inf.type_string)
+/// site's array-ness, so it is NOT this and must not demote anything. Only the
+/// bare top types mean the inference saw nothing.
+///
+/// A symbol the answer names beside the bare top type is not part of the
+/// question. Whether that symbol witnesses an anchor is asked of the anchor's
+/// own symbol, by [`Sightings::none_of`].
+fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
+    inf.array_depth.is_none() && text_is_bare_top_type(&inf.type_string)
+}
+
+/// What the deterministic inferences saw at each alias, asked of one model
+/// symbol at a time (carrick#1967).
+///
+/// A model symbol is the bare element by schema contract (`Order[]` ->
+/// `Order`), so it is published, as an anchor or as the text a backfill
+/// re-anchors with, only at an array depth a deterministic reader witnessed:
+/// the inference for the same alias naming the same symbol, the body's stated
+/// type, or a depth the caller knows (a schema's list marker).
+struct Sightings<'a> {
+    by_alias: HashMap<&'a str, Vec<&'a crate::services::type_sidecar::InferredType>>,
+}
+
+impl<'a> Sightings<'a> {
+    fn of(inferred: &'a [crate::services::type_sidecar::InferredType]) -> Self {
+        let mut by_alias: HashMap<&str, Vec<&crate::services::type_sidecar::InferredType>> =
+            HashMap::new();
+        for inf in inferred {
+            by_alias.entry(inf.alias.as_str()).or_default().push(inf);
+        }
+        Self { by_alias }
+    }
+
+    /// True when inferences ran for `alias` and none of them saw `symbol`:
+    /// each read a bare top type, and none names the symbol itself. A single
+    /// sighted inference clears it, because the depth join
+    /// (`apply_inferred_array_depth`) is first-anchor-carrying-wins.
+    ///
+    /// The symbol an answer names beside a bare top type is a sighting only
+    /// when it IS the anchor's symbol (an alias declared `any`). Any other
+    /// one is not: where the source reads a body untyped, the answer names
+    /// the transport's response object, which says nothing of the body. An
+    /// alias no inference ran for is not this either; nothing looked.
+    fn none_of(&self, alias: &str, symbol: &str) -> bool {
+        self.by_alias.get(alias).is_some_and(|answers| {
+            answers.iter().all(|inf| {
+                inference_read_no_shape(inf) && inf.primary_type_symbol.as_deref() != Some(symbol)
+            })
+        })
+    }
 }
 
 /// True when a printed type text carries no shape whatever: it IS a top type,
@@ -351,26 +395,6 @@ fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredTy
         })
 }
 
-/// Aliases whose deterministic inference ran and came back blind for EVERY
-/// result it produced. A single sighted inference for the alias clears it: the
-/// depth join (`apply_inferred_array_depth`) is first-anchor-carrying-wins, so
-/// blindness is only meaningful when nothing else saw the use site.
-fn blind_inference_aliases(
-    inferred: &[crate::services::type_sidecar::InferredType],
-) -> HashSet<&str> {
-    let mut blind: HashSet<&str> = HashSet::new();
-    let mut sighted: HashSet<&str> = HashSet::new();
-    for inf in inferred {
-        if inference_was_blind(inf) {
-            blind.insert(inf.alias.as_str());
-        } else {
-            sighted.insert(inf.alias.as_str());
-        }
-    }
-    blind.retain(|alias| !sighted.contains(alias));
-    blind
-}
-
 /// Derive one capture anchor per alias from the collected v1 type requests.
 ///
 /// Precedence mirrors the v1 bundle: an explicit symbol request wins over an
@@ -443,7 +467,7 @@ pub(crate) fn derive_capture_anchors(
             }
         }
     }
-    let blind = blind_inference_aliases(inferred);
+    let sightings = Sightings::of(inferred);
     let decided: HashSet<&str> = inferred
         .iter()
         .filter(|inf| inference_decided_no_contract(inf))
@@ -459,8 +483,10 @@ pub(crate) fn derive_capture_anchors(
         // (`Order[]` -> `Order`), so the use-site's array-ness rides only on
         // `array_depth`, which `apply_inferred_array_depth` copies from the
         // deterministic inference for the same alias. When that inference came
-        // back blind there is no depth to copy — and no way to tell "the type
-        // is scalar" from "nothing was seen". Capturing the bare symbol anyway
+        // back with no shape and no sight of this symbol there is no depth to
+        // copy — and no way to tell "the type is scalar" from "nothing was
+        // seen" (carrick#1967 for the answer that names the transport's
+        // response object beside a bare top type). Capturing the bare symbol anyway
         // publishes a CONFIDENT contract whose array-ness was guessed, which is
         // how a correct `Order[]` producer renders as `Order` and reads
         // incompatible against a correct `Order[]` consumer.
@@ -471,7 +497,7 @@ pub(crate) fn derive_capture_anchors(
         // IsAny gate to unverifiable. A depth the caller already knows (the
         // GraphQL SDL list marker, or a depth the join did land) is evidence
         // in its own right and keeps the anchor.
-        if request.array_depth.is_none() && blind.contains(alias) {
+        if request.array_depth.is_none() && sightings.none_of(alias, &request.symbol_name) {
             debug!(
                 "v2 capture: alias {} has an explicit '{}' anchor but its inference \
                  resolved to a bare top type; skipping the symbol anchor so the \
@@ -1001,12 +1027,31 @@ fn usable_backfill_text(text: &str) -> Option<&str> {
 /// Precedence mirrors that join: the explicit bundle's structural expansion
 /// wins over the inference result for the same alias; first usable text wins
 /// within each source.
+///
+/// The explicit bundle's text is a model symbol's own expansion, so it is
+/// offered only where the symbol anchor is (carrick#1967): an alias at which
+/// nothing witnessed the symbol, and for which the caller knows no depth, gets
+/// no text from it. Its symbol anchor was withheld because its array-ness
+/// would be a guess, and re-anchoring the alias with the same symbol's text
+/// publishes the same guess one step later.
 pub(crate) fn derive_backfill_texts(
     explicit_manifest: &[ManifestEntry],
     inferred: &[crate::services::type_sidecar::InferredType],
+    explicit: &[SymbolRequest],
 ) -> HashMap<String, String> {
+    let sightings = Sightings::of(inferred);
+    let request_of: HashMap<&str, &SymbolRequest> = explicit
+        .iter()
+        .filter_map(|request| Some((request.alias.as_deref()?, request)))
+        .collect();
     let mut texts: HashMap<String, String> = HashMap::new();
     for entry in explicit_manifest {
+        let request = request_of.get(entry.alias.as_str());
+        let symbol = request.map_or(entry.original_name.as_str(), |r| r.symbol_name.as_str());
+        let depth_known = request.is_some_and(|r| r.array_depth.is_some());
+        if !depth_known && sightings.none_of(&entry.alias, symbol) {
+            continue;
+        }
         if let Some(text) = usable_backfill_text(&entry.type_string) {
             texts
                 .entry(entry.alias.clone())
@@ -4094,6 +4139,138 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     /// inference) and rejects everything the scanner cannot stand behind:
     /// any/unknown at any position, and declaration-shaped bundle fallbacks
     /// that are not type expressions.
+    /// carrick#1967: the source reads a body untyped and casts it to an array
+    /// later, `const data: unknown = await response.json()` then
+    /// `data as Order[]`. The model names `Order`; the inference follows the
+    /// call to the body read and answers `unknown`, naming the transport's
+    /// response object as its symbol. That symbol says nothing of the body, so
+    /// nothing witnessed `Order` or how many of them there are, and the symbol
+    /// anchor is withheld exactly as it is for an answer that names no symbol.
+    #[test]
+    fn derive_anchors_drops_symbol_anchor_when_the_body_was_read_untyped() {
+        for top in ["unknown", "any"] {
+            let explicit = vec![order_explicit("Endpoint_orders_Response")];
+            let infer = vec![response_body_infer("Endpoint_orders_Response")];
+            let answers = vec![inferred(
+                "Endpoint_orders_Response",
+                top,
+                Some("Response"),
+                None,
+            )];
+            let anchors = derive_capture_anchors(&explicit, &infer, &[], &answers, &[], "/repo");
+            assert_eq!(anchors.len(), 1, "{top}: got {anchors:?}");
+            assert!(
+                matches!(&anchors[0], CaptureAnchor::Infer { alias, .. } if alias == "Endpoint_orders_Response"),
+                "{top}: an untyped body read must leave the alias to its infer anchor, got {:?}",
+                anchors[0]
+            );
+        }
+    }
+
+    /// The other side of that rule: a sighting keeps the anchor.
+    #[test]
+    fn derive_anchors_keeps_symbol_anchor_where_something_witnessed_it() {
+        let alias = "Endpoint_orders_Response";
+        let kept = |explicit: Vec<SymbolRequest>,
+                    answers: Vec<crate::services::type_sidecar::InferredType>| {
+            let anchors = derive_capture_anchors(
+                &explicit,
+                &[response_body_infer(alias)],
+                &[],
+                &answers,
+                &[],
+                "/repo",
+            );
+            matches!(&anchors[0], CaptureAnchor::Symbol { symbol_name, .. } if symbol_name == "Order")
+        };
+        // The answer names the anchor's own symbol: `type Order = any`.
+        assert!(kept(
+            vec![order_explicit(alias)],
+            vec![inferred(alias, "any", Some("Order"), None)]
+        ));
+        // The caller knows the depth (a schema's list marker).
+        assert!(kept(
+            vec![SymbolRequest {
+                array_depth: Some(1),
+                ..order_explicit(alias)
+            }],
+            vec![inferred(alias, "unknown", Some("Response"), None)]
+        ));
+        // A second answer for the alias saw a shape.
+        assert!(kept(
+            vec![order_explicit(alias)],
+            vec![
+                inferred(alias, "unknown", Some("Response"), None),
+                inferred(alias, "{ id: string; }", None, None),
+            ]
+        ));
+        // No inference ran for the alias: nothing looked, so nothing is blind.
+        assert!(kept(vec![order_explicit(alias)], Vec::new()));
+    }
+
+    /// carrick#1967: a backfill re-anchors a demoted alias with the scanner's
+    /// own text for it, and the explicit bundle's text IS the model symbol's
+    /// expansion. Where the symbol anchor is withheld because nothing
+    /// witnessed the symbol, offering that text publishes the same guess one
+    /// step later: one `Order` where the source reads a list of them.
+    #[test]
+    fn derive_backfill_texts_offers_no_symbol_text_nothing_witnessed() {
+        let entry = |alias: &str| ManifestEntry {
+            alias: alias.to_string(),
+            original_name: "Order".to_string(),
+            source_file: "src/types.ts".to_string(),
+            type_string: "{ id: string; total: number; }".to_string(),
+            is_explicit: true,
+        };
+        let manifest = vec![
+            entry("Untyped"),
+            entry("Blind"),
+            entry("Named"),
+            entry("Listed"),
+            entry("Unasked"),
+        ];
+        let answers = vec![
+            // The body read untyped: the transport's response object beside a bare top type.
+            inferred("Untyped", "unknown", Some("Response"), None),
+            // The answer that was blind before this rule: no symbol at all.
+            inferred("Blind", "any", None, None),
+            inferred("Named", "any", Some("Order"), None),
+            inferred("Listed", "unknown", Some("Response"), None),
+        ];
+        let requests = vec![
+            order_explicit("Untyped"),
+            order_explicit("Blind"),
+            order_explicit("Named"),
+            SymbolRequest {
+                array_depth: Some(1),
+                ..order_explicit("Listed")
+            },
+            order_explicit("Unasked"),
+        ];
+        let texts = derive_backfill_texts(&manifest, &answers, &requests);
+        let mut offered: Vec<&str> = texts.keys().map(String::as_str).collect();
+        offered.sort_unstable();
+        assert_eq!(offered, ["Listed", "Named", "Unasked"]);
+
+        // And nothing is re-anchored for an alias with no text: its infer
+        // anchor demoted, and it stays the honest unknown it was.
+        let anchors = derive_capture_anchors(
+            &[order_explicit("Untyped")],
+            &[response_body_infer("Untyped")],
+            &[],
+            &[inferred("Untyped", "unknown", Some("Response"), None)],
+            &[],
+            "/repo",
+        );
+        let demoted = vec![record(
+            "Untyped",
+            "infer",
+            "decayed_internal",
+            Some("locator resolved a top type"),
+        )];
+        assert!(backfill_anchors(&anchors, &demoted, &texts).is_none());
+    }
+
     #[test]
     fn derive_backfill_texts_precedence_and_filters() {
         let manifest_entry = |alias: &str, text: &str| ManifestEntry {
@@ -4139,7 +4316,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             inferred_type("D", "{ ok: boolean; }"),
         ];
 
-        let texts = derive_backfill_texts(&explicit, &inferred);
+        let texts = derive_backfill_texts(&explicit, &inferred, &[]);
         assert_eq!(
             texts.get("A").map(String::as_str),
             Some("{ id: string; read: boolean; }"),

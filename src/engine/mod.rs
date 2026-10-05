@@ -6364,6 +6364,7 @@ fn run_capture_for_service(
     let backfill_texts = type_compat_v2::derive_backfill_texts(
         &type_resolution.explicit_manifest,
         &type_resolution.inferred_types,
+        &explicit,
     );
     match type_compat_v2::run_capture(
         sidecar,
