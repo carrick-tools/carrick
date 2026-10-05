@@ -485,6 +485,61 @@ describe('carrick#1175: an anchor source that is a module specifier is resolved 
   });
 });
 
+describe('carrick#1175: a service below the scanned root gets the specifier joined onto that root', () => {
+  // The scanner hands on a specifier it found no file for joined onto the
+  // root it scans. The service here sits two directories below that root, so
+  // the path arrives whole, and names nothing on disk.
+  const joined = (repo: string, specifier: string): CaptureAnchorRequest => ({
+    kind: 'symbol',
+    alias: 'Endpoint_joined_Response',
+    symbol_name: specifier === 'cratekit' ? 'Reply' : 'Crate',
+    source_file: path.join(repo, specifier),
+    anchor_origin: 'llm-symbol',
+  });
+
+  it('a package of the checkout is read as the package the specifier names', () => {
+    const { base, repo, service } = writeRepo(REFERENCED);
+    assert.ok(!fs.existsSync(path.join(repo, '@depot/contracts')));
+    const result = capture(repo, service, base, [joined(repo, '@depot/contracts')]);
+    assert.deepStrictEqual(summary(result.aliases), [['Endpoint_joined_Response', 'ok', undefined]], JSON.stringify(result.aliases, null, 1));
+    const stub = standalone(result.stub_dir, base);
+    assert.deepStrictEqual(stub.diagnostics, []);
+    assert.deepStrictEqual(stub.members('Endpoint_joined_Response'), ['id', 'slots']);
+  });
+
+  it('an installed package is named by its bare specifier and pinned', () => {
+    const { base, repo, service } = writeRepo(REFERENCED, {
+      'node_modules/cratekit/package.json': JSON.stringify({ name: 'cratekit', version: '2.3.4', types: 'index.d.ts' }),
+      'node_modules/cratekit/index.d.ts': 'export interface Reply { status: number; body: string }\n',
+    });
+    const result = capture(repo, service, base, [joined(repo, 'cratekit')]);
+    assert.deepStrictEqual(summary(result.aliases), [['Endpoint_joined_Response', 'ok', undefined]], JSON.stringify(result.aliases, null, 1));
+    assert.deepStrictEqual(result.pinned_dependencies, { cratekit: '2.3.4' });
+  });
+
+  it('a package with no source to read says so by its name', () => {
+    const { base, repo, service } = writeRepo({ manifest: { types: 'dist/index.d.ts' }, files: {} });
+    const [record] = capture(repo, service, base, [joined(repo, '@depot/contracts')]).aliases;
+    assert.match(record.capture_failure_reason ?? '', /^source '@depot\/contracts' did not resolve: '@depot\/contracts' is a package of this checkout whose entry is not on disk/);
+  });
+
+  it('a path that names a file is still read as that file', () => {
+    const { base, repo, service } = writeRepo(REFERENCED);
+    const result = capture(repo, service, base, [
+      { ...joined(repo, '@depot/contracts'), source_file: path.join(repo, 'packages/contracts/lib/index.ts') },
+    ]);
+    assert.deepStrictEqual(summary(result.aliases), [['Endpoint_joined_Response', 'ok', undefined]], JSON.stringify(result.aliases, null, 1));
+  });
+
+  it('a path outside the scanned root is not read as a specifier', () => {
+    const { base, repo, service } = writeRepo(REFERENCED);
+    const [record] = capture(repo, service, base, [
+      { ...joined(repo, '@depot/contracts'), source_file: path.join(base, '@depot/contracts') },
+    ]).aliases;
+    assert.match(record.capture_failure_reason ?? '', /^source file not in program: /);
+  });
+});
+
 describe('carrick#1910: the init\'d project reads the package from source too', () => {
   /** What `infer` answers for the return of `summarise`, a type alias of the package. */
   async function inferSummary(layout: Layout): Promise<{ type_string: string; any_provenance?: unknown[] }> {
@@ -737,22 +792,50 @@ describe('carrick#1910: a package whose source is not all on the checkout is rea
     });
   });
 
-  it('a dependency it reads at another version than the service does', () => {
-    // The stub pins one version of a name: the service's.
-    const units = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+  // The service reads `units` at 2.0.0 and the package at 3.1.0.
+  const UNITS_2 = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+  const SERVICE_READS_2 = {
+    files: {
+      [`${UNITS_2}/package.json`]: JSON.stringify({ name: 'units', version: '2.0.0', types: 'index.d.ts' }),
+      [`${UNITS_2}/index.d.ts`]: 'export interface Unit { symbol: string }\n',
+    },
+    links: { 'packages/api/node_modules/units': UNITS_2 },
+  };
+  const atAnotherVersion = (use: string): string =>
+    `its source ${use} 'units', which it reads at 3.1.0, where the service reads it at 2.0.0`;
+
+  // A declaration can leave an import unresolved and write `unknown` where a
+  // type of it is used. These three uses have no such position.
+  it('a dependency at another version than the service reads, exported onward from the package', () => {
     assertAsBefore(
       {
-        'lib/index.ts': "export * from './store';\nexport type Row = { id: string };\n",
-        'lib/store.ts': "import type { Unit } from 'units';\nexport interface Store { name: string; unit: Unit }\n",
+        'lib/index.ts': "export * from './store';\nexport type { Unit } from 'units';\n",
+        'lib/store.ts': STORE,
       },
-      "its source reads 'units' at 3.1.0, where the service reads it at 2.0.0",
+      atAnotherVersion('re-exports'),
+      SERVICE_READS_2
+    );
+  });
+
+  it('or imported and exported again by name', () => {
+    assertAsBefore(
       {
-        files: {
-          [`${units}/package.json`]: JSON.stringify({ name: 'units', version: '2.0.0', types: 'index.d.ts' }),
-          [`${units}/index.d.ts`]: 'export interface Unit { symbol: string }\n',
-        },
-        links: { 'packages/api/node_modules/units': units },
-      }
+        'lib/index.ts': "export * from './store';\n",
+        'lib/store.ts': `import type { Unit } from 'units';\nexport type { Unit };\n${STORE}`,
+      },
+      atAnotherVersion('re-exports'),
+      SERVICE_READS_2
+    );
+  });
+
+  it('or extended by a type of the package', () => {
+    assertAsBefore(
+      {
+        'lib/index.ts': "export * from './store';\n",
+        'lib/store.ts': "import type * as units from 'units';\nexport interface Store extends units.Unit { name: string }\n",
+      },
+      atAnotherVersion('extends a type of'),
+      SERVICE_READS_2
     );
   });
 
@@ -885,6 +968,211 @@ describe('carrick#1620: what a carried package depends on resolves in the stub a
     const store = Object.keys(files).find((file) => file.endsWith('records/lib/store.d.ts'));
     assert.ok(store, Object.keys(files).join(', '));
     assert.match(files[store], /from ['"]units['"]/);
+  });
+});
+
+describe('carrick#1910: the stub states no type from a version of a package other than the one it pins', () => {
+  // The package types one member of `Store` with a dependency, and declares
+  // `Row` with no dependency at all.
+  const RECORDS = {
+    'lib/index.ts': "export * from './store';\nexport * from './rows';\n",
+    'lib/store.ts': "import type { Unit } from 'units';\nexport interface Store { name: string; unit: Unit }\n",
+    'lib/rows.ts': 'export interface Row { id: string; size: number }\n',
+  };
+  const SHELVES = {
+    'lib/shelves.ts': [
+      "import type { Row, Store } from '@depot/records';",
+      'export interface Shelf { store: Store; aisle: number }',
+      'export interface Bin { row: Row; label: string }',
+      "export interface Tag { name: Store['name']; code: string }",
+      'export interface Count { total: number }',
+      '',
+    ].join('\n'),
+  };
+  const symbol = (name: string): CaptureAnchorRequest => ({
+    kind: 'symbol',
+    alias: `Endpoint_${name.toLowerCase()}_Response`,
+    symbol_name: name,
+    source_file: 'lib/shelves.ts',
+    anchor_origin: 'llm-symbol',
+  });
+  const SHELF_ANCHORS = ['Shelf', 'Bin', 'Tag', 'Count'].map(symbol);
+  const unitsAt = (version: string, at: string, members: string): Record<string, string> => ({
+    [`${at}/package.json`]: JSON.stringify({ name: 'units', version, types: 'index.d.ts' }),
+    [`${at}/index.d.ts`]: `export interface Unit { ${members} }\n`,
+  });
+  const LEFT_UNRESOLVED =
+    "this declaration was read with 'units' at 3.1.0, and the stub pins 2.0.0, the version the service reads; " +
+    'its import of that package is left unresolved here';
+
+  /** The member the dependency types abstains, in the one file that read it, and nothing else moves. */
+  function assertLeftUnresolvedInThatFile(repo: string, service: string, base: string): void {
+    const before = captureAsBefore(service, base, SHELF_ANCHORS);
+    const result = capture(repo, service, base, SHELF_ANCHORS);
+    // The service's version is the pin.
+    assert.deepStrictEqual(result.pinned_dependencies, { units: '2.0.0' });
+    assert.deepStrictEqual(result.unpinned_externals, []);
+    const files = declarations(result.stub_dir);
+    const carried = (name: string): string => {
+      const file = Object.keys(files).find((rel) => rel.endsWith(`records/lib/${name}.d.ts`));
+      assert.ok(file, `${name} not in ${Object.keys(files).join(', ')}`);
+      return files[file];
+    };
+    // The package is carried whole; one import is gone from one file.
+    assert.doesNotMatch(carried('store'), /units/);
+    assert.match(carried('store'), /unit: unknown;/);
+    assert.match(carried('rows'), /size: number;/);
+    assert.match(carried('index'), /store/);
+    assert.deepStrictEqual(standalone(result.stub_dir, base).diagnostics, []);
+
+    const byAlias = new Map(result.aliases.map((record) => [record.alias, record]));
+    const shelf = byAlias.get('Endpoint_shelf_Response')!;
+    assert.strictEqual(shelf.self_check, 'decayed_internal', JSON.stringify(shelf));
+    assert.deepStrictEqual(shelf.any_provenance, [
+      { path: 'store.unit', kind: 'unknown', reason: 'unresolved_import', detail: LEFT_UNRESOLVED },
+    ]);
+    // The types beside it stand: one of the same file, one of the same package.
+    for (const alias of ['Endpoint_bin_Response', 'Endpoint_tag_Response', 'Endpoint_count_Response']) {
+      assert.deepStrictEqual(
+        [byAlias.get(alias)!.self_check, byAlias.get(alias)!.self_check_detail],
+        ['ok', undefined],
+        JSON.stringify(byAlias.get(alias))
+      );
+    }
+    const stub = standalone(result.stub_dir, base);
+    assert.deepStrictEqual(stub.memberOf('Endpoint_bin_Response', 'row'), ['id', 'size']);
+    assert.deepStrictEqual(stub.memberOf('Endpoint_shelf_Response', 'store'), ['name', 'unit']);
+    // And no alias that read `ok` with the package unread reads worse with it carried.
+    for (const record of before.aliases) {
+      if (record.self_check === 'ok') assert.strictEqual(byAlias.get(record.alias)!.self_check, 'ok', record.alias);
+    }
+    assert.strictEqual(before.aliases.find((a) => a.alias === 'Endpoint_count_Response')!.self_check, 'ok');
+  }
+
+  it('an isolated install: the import is left unresolved in the file that read the other version', () => {
+    const at2 = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+    const { base, repo, service } = isolatedWorkspace(RECORDS, SHELVES, {
+      files: unitsAt('2.0.0', at2, 'symbol: string'),
+      links: { 'packages/api/node_modules/units': at2 },
+    });
+    assertLeftUnresolvedInThatFile(repo, service, base);
+  });
+
+  it('a hoisted install: the service reads the root\'s copy, the package its own', () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1910-')));
+    bases.push(base);
+    const repo = path.join(base, 'repo');
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ name: 'depot', private: true, workspaces: ['packages/*'] }),
+      ...unitsAt('2.0.0', 'node_modules/units', 'symbol: string'),
+      ...unitsAt('3.1.0', 'packages/records/node_modules/units', 'symbol: string; factor: number'),
+      'packages/records/package.json': JSON.stringify({
+        name: '@depot/records',
+        version: '1.0.0',
+        types: 'dist/index.d.ts',
+        main: 'dist/index.js',
+        dependencies: { units: '3.1.0' },
+      }),
+      'packages/records/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib', outDir: 'dist' }, { include: ['lib'] }),
+      ...Object.fromEntries(Object.entries(RECORDS).map(([rel, text]) => [`packages/records/${rel}`, text])),
+      'packages/api/package.json': JSON.stringify({ name: '@depot/api', version: '1.0.0', dependencies: { '@depot/records': '1.0.0', units: '2.0.0' } }),
+      'packages/api/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib' }, { include: ['lib'] }),
+      ...Object.fromEntries(Object.entries(SHELVES).map(([rel, text]) => [`packages/api/${rel}`, text])),
+    };
+    for (const [rel, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      fs.writeFileSync(path.join(repo, rel), text);
+    }
+    fs.mkdirSync(path.join(repo, 'node_modules/@depot'), { recursive: true });
+    fs.symlinkSync('../../packages/records', path.join(repo, 'node_modules/@depot/records'), 'dir');
+    assertLeftUnresolvedInThatFile(repo, path.join(repo, 'packages/api'), base);
+  });
+
+  it('the same version through another install is the same reading', () => {
+    // The service links its own copy of the version the package reads.
+    const again = 'node_modules/.pnpm/units@3.1.0_peer/node_modules/units';
+    const { base, repo, service } = isolatedWorkspace(RECORDS, SHELVES, {
+      files: unitsAt('3.1.0', again, 'symbol: string; factor: number'),
+      links: { 'packages/api/node_modules/units': again },
+    });
+    const result = capture(repo, service, base, SHELF_ANCHORS);
+    assert.deepStrictEqual(summary(result.aliases), SHELF_ANCHORS.map((a) => [a.alias, 'ok', undefined]), JSON.stringify(result.aliases, null, 1));
+    assert.deepStrictEqual(result.pinned_dependencies, { units: '3.1.0' });
+    const files = declarations(result.stub_dir);
+    assert.match(files[Object.keys(files).find((rel) => rel.endsWith('records/lib/store.d.ts'))!], /from ['"]units['"]/);
+  });
+
+  it('two packages that read one dependency at two versions, and a service that installs neither', () => {
+    // `@depot/rows` reads 2.0.0 and `@depot/records` 3.1.0. The stub pins one
+    // of them, and only the declaration read with that one keeps its import.
+    const at2 = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+    const { base, repo, service } = isolatedWorkspace(
+      { ...RECORDS, 'lib/index.ts': "export * from './store';\nexport * from './rows';\nexport type { Pallet } from '@depot/rows';\n" },
+      {
+        'lib/shelves.ts': [
+          "import type { Pallet, Store } from '@depot/records';",
+          'export interface Shelf { store: Store; aisle: number }',
+          'export interface Dock { pallet: Pallet; bay: number }',
+          '',
+        ].join('\n'),
+      },
+      {
+        files: {
+          ...unitsAt('2.0.0', at2, 'symbol: string'),
+          'packages/rows/package.json': JSON.stringify({ name: '@depot/rows', version: '1.0.0', types: 'dist/index.d.ts', dependencies: { units: '2.0.0' } }),
+          'packages/rows/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib', outDir: 'dist' }, { include: ['lib'] }),
+          'packages/rows/lib/index.ts': "import type { Unit } from 'units';\nexport interface Pallet { weight: Unit; tier: number }\n",
+        },
+        links: { 'packages/records/node_modules/@depot/rows': 'packages/rows', 'packages/rows/node_modules/units': at2 },
+      }
+    );
+    const result = capture(repo, service, base, [symbol('Shelf'), symbol('Dock')]);
+    const pin = result.pinned_dependencies.units;
+    assert.ok(pin === '2.0.0' || pin === '3.1.0', JSON.stringify(result.pinned_dependencies));
+    const files = declarations(result.stub_dir);
+    const text = (suffix: string): string => files[Object.keys(files).find((rel) => rel.endsWith(suffix))!];
+    const [kept, repaired] = pin === '3.1.0' ? ['records/lib/store.d.ts', 'rows/lib/index.d.ts'] : ['rows/lib/index.d.ts', 'records/lib/store.d.ts'];
+    assert.match(text(kept), /from ['"]units['"]/);
+    assert.doesNotMatch(text(repaired), /units/);
+    const [whole, abstains] = pin === '3.1.0' ? ['Endpoint_shelf_Response', 'Endpoint_dock_Response'] : ['Endpoint_dock_Response', 'Endpoint_shelf_Response'];
+    const byAlias = new Map(result.aliases.map((record) => [record.alias, record]));
+    assert.strictEqual(byAlias.get(whole)!.self_check, 'ok', JSON.stringify(byAlias.get(whole)));
+    assert.strictEqual(byAlias.get(abstains)!.self_check, 'decayed_internal', JSON.stringify(byAlias.get(abstains)));
+    assert.strictEqual(byAlias.get(abstains)!.any_provenance?.[0].reason, 'unresolved_import');
+  });
+
+  it('and where the one that lost exports the dependency onward, every type through that file is refused', () => {
+    // Nothing above the service says which version it reads, so nothing could
+    // be decided before the emit. The declaration read with the version the
+    // stub does not pin cannot be repaired, and it is not stated either.
+    const at2 = 'node_modules/.pnpm/units@2.0.0/node_modules/units';
+    const { base, repo, service } = isolatedWorkspace(
+      {
+        'lib/index.ts': "export * from './store';\nexport type { Pallet } from '@depot/rows';\n",
+        'lib/store.ts': "export type { Unit } from 'units';\nexport interface Store { name: string }\n",
+      },
+      {
+        'lib/shelves.ts': "import type { Pallet, Store } from '@depot/records';\nexport interface Shelf { store: Store; pallet: Pallet }\n",
+        'lib/count.ts': 'export interface Count { total: number }\n',
+      },
+      {
+        files: {
+          ...unitsAt('2.0.0', at2, 'symbol: string'),
+          'packages/rows/package.json': JSON.stringify({ name: '@depot/rows', version: '1.0.0', types: 'dist/index.d.ts', dependencies: { units: '2.0.0' } }),
+          'packages/rows/tsconfig.json': tsconfig({ module: 'CommonJS', rootDir: 'lib', outDir: 'dist' }, { include: ['lib'] }),
+          'packages/rows/lib/index.ts': "export type { Unit as PalletUnit } from 'units';\nexport interface Pallet { tier: number }\n",
+        },
+        links: { 'packages/records/node_modules/@depot/rows': 'packages/rows', 'packages/rows/node_modules/units': at2 },
+      }
+    );
+    const result = capture(repo, service, base, [
+      symbol('Shelf'),
+      { ...symbol('Count'), source_file: 'lib/count.ts' },
+    ]);
+    const [shelf, count] = result.aliases;
+    assert.strictEqual(shelf.self_check, 'decayed_internal', JSON.stringify(shelf));
+    assert.deepStrictEqual(shelf.dangling_specifiers, ['units']);
+    assert.deepStrictEqual([count.self_check, count.self_check_detail], ['ok', undefined], JSON.stringify(count));
   });
 });
 

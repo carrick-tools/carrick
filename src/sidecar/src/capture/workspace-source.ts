@@ -31,10 +31,18 @@
  * travel in the stub with their imports as written, so a file that names a
  * module the checkout does not have (a client that is generated, a dependency
  * that was not installed) would make every type that reaches the file
- * unreadable there, including types that ask nothing of the package. The
- * same holds for a dependency the package reads at another version than the
- * service does: the stub pins one version of a name. Such a package is left
- * as the compiler found it, which is what it was before any of this.
+ * unreadable there, including types that ask nothing of the package. Such a
+ * package is left as the compiler found it, which is what it was before any
+ * of this.
+ *
+ * The stub pins one version of a name: the service's, the one its own
+ * declarations were read at. A carried declaration that read a dependency at
+ * another version keeps its place in the stub, and that one import is left
+ * unresolved in that one file (`readsApart`): a member the dependency types
+ * reads `unknown` there, and every other type of the package stands. A file
+ * that exports such a dependency onward, or extends a type of it, has no
+ * position where `unknown` can be written, so a package that reaches one is
+ * left as the compiler found it too.
  *
  * Nothing is guessed. A package no project of which writes the entry stays
  * unresolved, and so does an output two of its projects write from different
@@ -49,6 +57,7 @@ import { isBuiltin } from 'node:module';
 import * as path from 'node:path';
 import { installOf } from './installed-package.js';
 import { checkoutRootOf } from './machinery.js';
+import { useBeyondRepair } from './repair-dangling.js';
 import { realPath } from './service-config.js';
 import { packageNameOf } from './specifiers.js';
 
@@ -73,6 +82,21 @@ export function workspaceScopeOf(serviceRoot: string, scanRoot?: string): Worksp
     root: scanRoot === undefined ? checkoutRootOf(serviceRoot) : path.resolve(scanRoot),
     service: path.resolve(serviceRoot),
   };
+}
+
+/**
+ * The specifier an anchor's source names, where it names no file
+ * (carrick#1175). The scanner hands on a specifier it found no file for
+ * joined onto the scanned root. For a service that is that root the join
+ * comes off again before the anchor arrives; for a service below it the path
+ * arrives whole and names nothing, and its part below the root is the
+ * specifier as the source wrote it.
+ */
+export function sourceSpecifier(source: string, scope: WorkspaceScope): string {
+  if (!path.isAbsolute(source) || fs.existsSync(source)) return source;
+  const below = path.relative(scope.root, source);
+  if (below === '' || below.startsWith('..') || path.isAbsolute(below)) return source;
+  return below.split(path.sep).join('/');
 }
 
 /** The source files a package's TypeScript projects write its outputs from. */
@@ -329,10 +353,10 @@ function readingsFor(options: ts.CompilerOptions, scope: WorkspaceScope): Readin
  * Every source file of the checkout the entry reaches is read, in this
  * package or in another one entered the same way, nearest first. Each module
  * a file names has to resolve under the options the capture's own program
- * resolves with, and a dependency has to be the version the service reads
- * under that name, where the service installs it. A module only an ambient
- * declaration names (a stylesheet, an image) does not resolve here: which
- * declarations the program will hold is not known until it is built.
+ * resolves with. A dependency read at another version than the service's has
+ * to be used only where the stub can write `unknown` for it. A module only an
+ * ambient declaration names (a stylesheet, an image) does not resolve here:
+ * which declarations the program will hold is not known until it is built.
  *
  * `unresolvedSpecifiersReachableFrom` asks a program that exists what it did
  * not resolve; this is asked while a program's modules are being resolved,
@@ -373,8 +397,12 @@ function incompleteFrom(
         seen.add(resolved);
         continue;
       }
-      because = skewedDependency(specifier, file, scope);
-      if (because !== undefined) break;
+      const apart = readApart(resolved, scope);
+      const use = apart && useBeyondRepair(file, text, specifier);
+      if (apart && use) {
+        because = `its source ${use} '${apart.name}', which it reads at ${apart.read}, where the service reads it at ${apart.pinned}`;
+        break;
+      }
     }
   }
   if (because === undefined) for (const file of reached) readings.incomplete.set(file, undefined);
@@ -406,20 +434,91 @@ function sourceOf(followed: Followed): string | undefined {
   return followed?.kind === 'source' ? followed.file : undefined;
 }
 
+/** What an installed package is, where a file of it was found. */
+type Install = NonNullable<ReturnType<typeof installOf>>;
+
+/** Directory of a resolved file -> the installed package that holds it. */
+const installByDirectory = new Map<string, Install | undefined>();
+
+function installHolding(file: string): Install | undefined {
+  const dir = path.dirname(file);
+  if (!installByDirectory.has(dir)) installByDirectory.set(dir, installOf(file));
+  return installByDirectory.get(dir);
+}
+
 /**
- * A dependency one of the checkout's packages reads at another version than
- * the service does, as the clause that says so. The stub pins one version of
- * a name, and the service's is the one its own declarations were read at.
+ * The install the service itself reads a package from: the nearest one above
+ * the service's own manifest. Its version is the one the stub pins.
  */
-function skewedDependency(specifier: string, file: string, scope: WorkspaceScope): string | undefined {
-  if (specifier.startsWith('.') || path.isAbsolute(specifier)) return undefined;
-  const mine = packageInstall(specifier, file);
-  const theirs = packageInstall(specifier, path.join(scope.service, 'package.json'));
-  if (!mine || !theirs || mine.real === theirs.real) return undefined;
-  const versionAt = (install: string): string | undefined => installOf(path.join(install, 'package.json'))?.version;
-  const [read, pinned] = [versionAt(mine.real), versionAt(theirs.real)];
-  if (read === undefined || pinned === undefined || read === pinned) return undefined;
-  return `its source reads '${packageNameOf(specifier)}' at ${read}, where the service reads it at ${pinned}`;
+export function serviceInstallOf(name: string, scope: WorkspaceScope): Install | undefined {
+  const found = packageInstall(name, path.join(scope.service, 'package.json'));
+  return found && installOf(path.join(found.real, 'package.json'));
+}
+
+/**
+ * A dependency a file of the checkout's source resolved at another version
+ * than the service reads it at: its name and the two versions. Undefined
+ * where the service installs none, or the same one.
+ */
+function readApart(
+  resolved: string,
+  scope: WorkspaceScope
+): { name: string; read: string; pinned: string } | undefined {
+  const mine = installHolding(resolved);
+  if (mine?.version === undefined) return undefined;
+  const theirs = serviceInstallOf(mine.name, scope);
+  if (theirs?.version === undefined || theirs.version === mine.version) return undefined;
+  return { name: mine.name, read: mine.version, pinned: theirs.version };
+}
+
+/** One package a carried declaration names, as its source resolved it. */
+export interface CarriedRead {
+  /** The declaration, by its place in the stub's tree. */
+  file: string;
+  /** The specifier as the declaration writes it. */
+  specifier: string;
+  /** The package's name, where it is installed, and its version when that is a published one. */
+  install: Install;
+}
+
+/**
+ * The install each package the carried declarations name is pinned from: the
+ * service's own where it has one, else the first a carried declaration read.
+ */
+export function carriedInstalls(reads: readonly CarriedRead[], scope: WorkspaceScope): Map<string, Install> {
+  const installs = new Map<string, Install>();
+  for (const { install } of reads) {
+    const pinned = installs.get(install.name);
+    if (pinned === undefined) installs.set(install.name, serviceInstallOf(install.name, scope) ?? install);
+    // A service install that states no version leaves the pin to a read that does.
+    else if (pinned.version === undefined && install.version !== undefined) installs.set(install.name, install);
+  }
+  return installs;
+}
+
+/**
+ * The imports the stub leaves unresolved because its pin is another version
+ * than the declaration read: declaration (by its place in the tree) ->
+ * specifier -> the sentence that says so. A type taken from one version of a
+ * package is never stated against another.
+ */
+export function readsApart(
+  reads: readonly CarriedRead[],
+  pinned: Readonly<Record<string, string>>
+): Map<string, Map<string, string>> {
+  const apart = new Map<string, Map<string, string>>();
+  for (const { file, specifier, install } of reads) {
+    const pin = pinned[install.name];
+    if (install.version === undefined || pin === undefined || pin === install.version) continue;
+    let ofFile = apart.get(file);
+    if (!ofFile) apart.set(file, (ofFile = new Map()));
+    ofFile.set(
+      specifier,
+      `this declaration was read with '${install.name}' at ${install.version}, and the stub pins ${pin}, ` +
+        'the version the service reads; its import of that package is left unresolved here'
+    );
+  }
+  return apart;
 }
 
 function extensionOf(file: string): ts.Extension {

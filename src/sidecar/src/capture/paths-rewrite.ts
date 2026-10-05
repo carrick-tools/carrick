@@ -19,6 +19,7 @@ import * as path from 'node:path';
 import { installOf, installedPackageSpecifier } from './installed-package.js';
 import { OUTSIDE_DIR } from './outside-root.js';
 import type { WriteGuard } from './guarded-fs.js';
+import type { CarriedRead } from './workspace-source.js';
 import {
   isRelative,
   matchPathsPattern,
@@ -121,12 +122,13 @@ export interface RewriteResult {
    */
   installs: Record<string, string>;
   /**
-   * The version of each package a declaration emitted from outside the
-   * service names, read from the install its source resolved it in
-   * (carrick#1620). An isolated install links a dependency only into the
-   * package that declares it, so the service's own install may not say.
+   * Each package a declaration emitted from outside the service names, with
+   * the install its source resolved it in (carrick#1620). An isolated install
+   * links a dependency only into the package that declares it, so the
+   * service's own install may not say; and two packages of one checkout can
+   * read one name at two versions, so each declaration's own reading is kept.
    */
-  sourcePins: Record<string, string>;
+  carried: CarriedRead[];
 }
 
 /**
@@ -146,7 +148,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
   const emitted = new Set(args.files);
   const pins: Record<string, string> = {};
   const installs: Record<string, string> = {};
-  const sourcePins: Record<string, string> = {};
+  const carried: CarriedRead[] = [];
   let total = 0;
 
   const installed = (spec: string, importedName?: string): string | undefined => {
@@ -200,14 +202,11 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
       const target = treeFileFor(named, args.entryDir, emitted, args.outside);
       if (target) return relativeSpecifier(file, target);
       // A declaration emitted from outside the service names its packages as
-      // its own source resolves them. Where the service's install does not
-      // hold one, the self-check reads it from the install the source did.
+      // its own source resolves them: which install that was is the caller's
+      // to weigh against what the stub pins.
       if (file.startsWith(`${OUTSIDE_DIR}/`)) {
         const install = installOf(named);
-        if (install) {
-          installs[install.name] ??= install.root;
-          if (install.version !== undefined) sourcePins[install.name] ??= install.version;
-        }
+        if (install) carried.push({ file, specifier: spec, install });
       }
       return undefined;
     });
@@ -216,5 +215,5 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
       total += rewrites + importTypeRewrites;
     }
   }
-  return { rewrites: total, pins, installs, sourcePins };
+  return { rewrites: total, pins, installs, carried };
 }

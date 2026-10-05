@@ -54,8 +54,11 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import {
+  carriedInstalls,
   carriesWhole,
+  readsApart,
   resolveModule,
+  sourceSpecifier,
   unbuiltPackageNote,
   workspaceCompilerHost,
   workspaceScopeOf,
@@ -520,9 +523,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // the directly-referenced externals; transitives resolve at check-install
   // (check-workspace NPMRC: "Direct deps are exact-pinned by the stubs;
   // only transitives resolve").
-  // A package only a carried declaration names is pinned at the version its
-  // source read (carrick#1620), where the service's own install does not say.
-  for (const name of Object.keys(rewritten.sourcePins)) externalSpecs.add(name);
+  // A package a carried declaration names is pinned at the version the
+  // service reads it at, and at the version its source read where the service
+  // installs none (carrick#1620).
+  const carried = carriedInstalls(rewritten.carried, workspace);
+  for (const name of carried.keys()) externalSpecs.add(name);
   const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
@@ -537,13 +542,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       deno?.pinned[name] ??
       rewritten.pins[name] ??
       installed.get(name) ??
-      rewritten.sourcePins[name] ??
+      carried.get(name)?.version ??
       lockVersions.get(name);
     if (version) pinned[name] = version;
     // A runtime name whose declarations come from a rewritten `@types/*`
     // package resolves through that pin.
-    else if (!rewritten.pins[typesPackageOf(name)] && !rewritten.sourcePins[typesPackageOf(name)]) unpinned.push(name);
+    else if (!rewritten.pins[typesPackageOf(name)] && !carried.get(typesPackageOf(name))?.version) unpinned.push(name);
   }
+  // The stub states no type taken from a version of a package other than the
+  // one it pins (carrick#1910): where a carried declaration read another, its
+  // import of that package is left unresolved in that declaration alone. The
+  // self-check reads each such package from the install the pin was read from.
+  const apart = new Map(
+    [...readsApart(rewritten.carried, pinned)].map(([rel, specifiers]) => [path.join(typesDir, rel), specifiers])
+  );
+  const installs = { ...rewritten.installs };
+  for (const [name, install] of carried) installs[name] ??= install.root;
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
   const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
@@ -590,10 +604,10 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     pinned,
     bareCheckout,
     repoRoot: dependencyRoot,
+    readApart: apart,
     compilerHost:
-      deno || Object.keys(rewritten.installs).length > 0
-        ? (options) =>
-            withInstalledPackages(options, rewritten.installs, deno ? deno.host(options) : undefined)
+      deno || Object.keys(installs).length > 0
+        ? (options) => withInstalledPackages(options, installs, deno ? deno.host(options) : undefined)
         : undefined,
   });
   const fidelity = computeFidelity(aliases);
@@ -847,7 +861,7 @@ function resolveAnchors(
       if (anchor.kind !== 'symbol' && anchor.kind !== 'handler_return') continue;
       if (moduleSources.has(anchor.source_file)) continue;
       if (fs.existsSync(path.join(ctx.repoRoot, anchor.source_file))) continue;
-      const file = resolveFromEntry(anchor.source_file);
+      const file = resolveFromEntry(sourceSpecifier(anchor.source_file, ctx.workspace));
       // The scanner names a type in a sibling package by its file's path. Such
       // a file joins the program as a root, with all it reaches, so it is
       // held to the rule a package read by name is: whole, or left as it was.

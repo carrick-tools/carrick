@@ -21,7 +21,7 @@ import {
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
-import { isOwnSource, unbuiltPackageNote, type WorkspaceScope } from './workspace-source.js';
+import { isOwnSource, sourceSpecifier, unbuiltPackageNote, type WorkspaceScope } from './workspace-source.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -250,18 +250,14 @@ export function resolveAnchor(
   if (!sourceFile) {
     // A source that names one of the checkout's own packages says why it did
     // not resolve (carrick#1910); anything else is a file the program lacks.
+    const specifier = args.workspace ? sourceSpecifier(request.source_file, args.workspace) : request.source_file;
     const unbuilt =
       namesModule && args.workspace
-        ? unbuiltPackageNote(
-            request.source_file,
-            path.join(args.entryDir, 'entry.ts'),
-            program.getCompilerOptions(),
-            args.workspace
-          )
+        ? unbuiltPackageNote(specifier, path.join(args.entryDir, 'entry.ts'), program.getCompilerOptions(), args.workspace)
         : undefined;
     return demote(
       unbuilt
-        ? `source '${request.source_file}' did not resolve: ${unbuilt}`
+        ? `source '${specifier}' did not resolve: ${unbuilt}`
         : `source file not in program: ${request.source_file}`
     );
   }
