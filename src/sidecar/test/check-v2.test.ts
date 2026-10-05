@@ -100,6 +100,17 @@ const PAIRS: CheckPairSpec[] = [
   // A stream sent where a stream is read: bytes that assign to bytes, which
   // still state nothing a type can check (carrick#1812).
   mk('streamupload', 'Stream_Expected', 'Stream_Sent', { type_kind: 'request' }),
+  // carrick#1995: a handler answering one body per branch, read by a caller of
+  // one branch whose every field is optional; and the shapes beside it that
+  // stay mismatches.
+  mk('branchunion', 'Branch_Producer', 'Branch_Consumer'),
+  mk('branchunionrequest', 'Branch_Request_Expected', 'Branch_Request_Sent', {
+    type_kind: 'request',
+  }),
+  mk('weakrename', 'Weak_Rename_Producer', 'Branch_Consumer'),
+  mk('branchnoneagree', 'Branch_None_Producer', 'Branch_Consumer'),
+  mk('branchrequired', 'Branch_Producer', 'Branch_Required_Consumer'),
+  mk('branchmissing', 'Branch_Missing_Producer', 'Branch_Consumer'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -134,6 +145,11 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Bytes_Producer = Uint8Array;',
         'export type Stream_Expected = ReadableStream<Uint8Array> | null;',
+        'export type Branch_Producer = { chatId: string; accessToken: string; } | { token: string; } | { ok: true; };',
+        'export type Weak_Rename_Producer = { id: string; };',
+        'export type Branch_None_Producer = { token: string; } | { ok: true; };',
+        'export type Branch_Missing_Producer = { chatId: string; } | { chatId: number; token: string; };',
+        'export type Branch_Request_Expected = { name?: string; title?: string; };',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -164,6 +180,9 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type String_Consumer = string;',
         'export type Upload_Sent = File;',
         'export type Stream_Sent = ReadableStream<Uint8Array>;',
+        'export type Branch_Consumer = { chatId?: string; accessToken?: string; error?: string; };',
+        'export type Branch_Required_Consumer = { chatId: string; accessToken?: string; };',
+        'export type Branch_Request_Sent = { name: string; } | { archived: boolean; };',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -292,6 +311,37 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
       const v = verdicts.get(key)!;
       assert.strictEqual(v.bucket, 'gate_caught_baked_any', key);
       assert.strictEqual(v.gate, 'consumer:any', key);
+    }
+  });
+
+  // carrick#1995. The weak-type check (TS2559) rejects a member that shares
+  // no field with a type whose every field is optional. A route that answers
+  // one body per branch, read by a caller of one branch, is a union the caller
+  // takes in part; which member arrives is not in the types, so the pair is
+  // not compared. It applies in the direction the body travels.
+  it('a union a weak type takes in part is not compared (carrick#1995)', () => {
+    const cases: Array<[string, string, RegExp]> = [
+      ['branchunion', 'producer:union', /union of 3 bodies.*accepts 1 of them.*other 2/],
+      ['branchunionrequest', 'consumer:union', /union of 2 bodies.*accepts 1 of them.*other 1/],
+    ];
+    for (const [key, gate, text] of cases) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'unverifiable', `${key}: ${v.diagnostic}`);
+      assert.strictEqual(v.gate, gate, key);
+      assert.match(v.diagnostic!, text, key);
+      assert.strictEqual(v.resolved, false, key);
+      assert.strictEqual(v.unresolved_side, undefined, `${key}: no side to retype`);
+    }
+  });
+
+  // The shapes beside it keep their mismatch: a single type sharing no field
+  // with a weak type (the misspelling the check exists for), a union no member
+  // of which assigns, a consumer with a required field, and a member that
+  // fails for a reason other than sharing no field.
+  it('keeps every other weak-type and union mismatch (carrick#1995)', () => {
+    for (const key of ['weakrename', 'branchnoneagree', 'branchrequired', 'branchmissing']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'incompatible', `${key}: ${v.diagnostic}`);
     }
   });
 

@@ -114,6 +114,70 @@ function assignabilityOf(
 }
 
 /**
+ * The two types the judge's decisive assignment compared for one plan, read in
+ * the probe program, with the compiler's own assignability relation.
+ * `undefined` when the probe or either alias cannot be read, or the compiler
+ * build exposes no relation: every statement made without them would be a
+ * guess.
+ *
+ * The sent side is whatever that assignment actually sent: the GraphQL
+ * comparand where one exists, then the JSON wire form where serialising
+ * changes the type. Reading `sent` there instead would describe a type the
+ * judge did not compare, which is the one way a reader of this pair could
+ * contradict it.
+ */
+export function comparedTypes(
+  opened: ProbeProgram,
+  plan: ProbePlan
+):
+  | {
+      compared: ts.Type;
+      expected: { type: ts.Type; node: ts.Node };
+      wireApplied: boolean;
+      checker: ts.TypeChecker;
+      isAssignableTo: (source: ts.Type, target: ts.Type) => boolean;
+    }
+  | undefined {
+  const { program, checker, probesDir } = opened;
+  const isAssignableTo = assignabilityOf(checker);
+  if (!isAssignableTo) return undefined;
+  const file = program.getSourceFile(
+    `${probesDir}/probes/${plan.fileName}`.split('\\').join('/')
+  );
+  const source =
+    file ??
+    program.getSourceFiles().find((sf) => sf.fileName.endsWith(`/probes/${plan.fileName}`));
+  if (!source) return undefined;
+  const declared =
+    declaredConstType(source, checker, 'sentComparand') ??
+    declaredConstType(source, checker, 'sent');
+  const expected = declaredConstType(source, checker, 'expected');
+  if (!declared || !expected) return undefined;
+  const wire = declaredConstType(source, checker, 'sentWire');
+  // Whether serialising changes anything observable about the sent type.
+  const wireApplied =
+    wire !== undefined &&
+    !(isAssignableTo(wire.type, declared.type) && isAssignableTo(declared.type, wire.type));
+  // The DECLARED type unless serialising really changed it.
+  //
+  // The probe declares its wire comparand through a conditional alias that
+  // short-circuits back to the declared type whenever that already assigns,
+  // and a conditional the checker has not had to resolve carries no members
+  // to walk. Reading it unconditionally therefore emptied the field report on
+  // exactly the pairs that AGREE — the ones whose only statement is an
+  // optionality gap or the wire note (carrick#1341). Where serialisation did
+  // change the type the wire form is a mapped type with real members, and it
+  // stays the thing compared, because that is what the judge judged.
+  return {
+    compared: wireApplied ? wire.type : declared.type,
+    expected,
+    wireApplied,
+    checker,
+    isAssignableTo,
+  };
+}
+
+/**
  * Field reports for every plan whose probe the program could read, keyed by
  * pair id. A plan with no entry has no report, which is not a claim that its
  * types agree.
@@ -124,56 +188,18 @@ export function pairFieldReports(
 ): Map<string, PairFieldReport> {
   const results = new Map<string, PairFieldReport>();
   if (!opened) return results;
-  const { program, checker, probesDir } = opened;
-  const isAssignableTo = assignabilityOf(checker);
-  if (!isAssignableTo) return results;
-
   for (const plan of plans) {
-    const file = program.getSourceFile(
-      `${probesDir}/probes/${plan.fileName}`.split('\\').join('/')
-    );
-    const source =
-      file ??
-      program
-        .getSourceFiles()
-        .find((sf) => sf.fileName.endsWith(`/probes/${plan.fileName}`));
-    if (!source) continue;
-    // Whatever the judge's decisive assignment actually sent: the GraphQL
-    // comparand where one exists, then the JSON wire form where one exists.
-    // Reading `sent` there instead would describe a type the judge did not
-    // compare, which is the one way this walk could contradict it.
-    const declared =
-      declaredConstType(source, checker, 'sentComparand') ??
-      declaredConstType(source, checker, 'sent');
-    const expected = declaredConstType(source, checker, 'expected');
-    if (!declared || !expected) continue;
-    const wire = declaredConstType(source, checker, 'sentWire');
-    // Whether serialising changes anything observable about the sent type.
-    const wireChanges =
-      wire !== undefined &&
-      !(
-        isAssignableTo(wire.type, declared.type) && isAssignableTo(declared.type, wire.type)
-      );
-    // Walk the DECLARED type unless serialising really changed it.
-    //
-    // The probe declares its wire comparand through a conditional alias that
-    // short-circuits back to the declared type whenever that already assigns,
-    // and a conditional the checker has not had to resolve carries no members
-    // to walk. Reading it unconditionally therefore emptied the report on
-    // exactly the pairs that AGREE — the ones whose only statement is an
-    // optionality gap or the wire note (carrick#1341). Where serialisation
-    // did change the type the wire form is a mapped type with real members,
-    // and it stays the thing compared, because that is what the judge judged.
-    const compared = wireChanges ? wire.type : declared.type;
+    const pair = comparedTypes(opened, plan);
+    if (!pair) continue;
     const report = diffReport(
-      compared,
-      expected.type,
-      checker,
-      isAssignableTo,
-      expected.node,
+      pair.compared,
+      pair.expected.type,
+      pair.checker,
+      pair.isAssignableTo,
+      pair.expected.node,
       plan.spec.protocol === 'graphql' ? GRAPHQL_SERVER_SUPPLIED : NONE_SERVER_SUPPLIED
     );
-    report.wireApplied = wireChanges;
+    report.wireApplied = pair.wireApplied;
     results.set(plan.pairId, report);
   }
   return results;
