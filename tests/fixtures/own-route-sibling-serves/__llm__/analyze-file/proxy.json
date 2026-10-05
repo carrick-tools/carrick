@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/api/*",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

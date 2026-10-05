@@ -69,12 +69,10 @@
 //!   and a peer scanned before subpaths were recorded says it of the root
 //!   alone.
 //! - `no_matching_producer` — the member's span contains no outbound call that
-//!   matched a producer. Three structural causes are worth naming, because
-//!   each is a real shape rather than a bug here. The cross-repo analyzer
-//!   drops same-identity pairs (#397), so an SDK that wraps its OWN service's
-//!   endpoints forms no `CrossRepoMatch` to carry. A vendor client whose
+//!   matched a producer. Two structural causes are worth naming, because
+//!   each is a real shape rather than a bug here. A vendor client whose
 //!   hardcoded host the project does not declare internal is classified
-//!   external at extraction, so it never matches either. And
+//!   external at extraction, so it never matches. And
 //!   `MountGraph::merge_from_repos` dedupes data calls on
 //!   `method:target_url:file_location` without repo identity, so two repos
 //!   whose relative paths, method and target all coincide collapse to one
@@ -805,6 +803,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }];
         data.mount_graph = Some(graph);
         data
@@ -949,6 +948,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }];
         sdk.mount_graph = Some(graph);
 
@@ -1011,6 +1011,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }];
         data.mount_graph = Some(graph);
         data
@@ -1298,8 +1299,8 @@ mod tests {
     }
 
     /// The member resolves, but the SDK's own call inside it matched no
-    /// producer — the shape that fires when the cross-repo analyzer dropped
-    /// the pair (same identity, #397) or classified the call external.
+    /// producer — the shape that fires when the cross-repo analyzer
+    /// classified the call external.
     #[test]
     fn a_member_whose_call_matched_no_producer_has_no_edge() {
         let joined = run(

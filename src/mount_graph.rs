@@ -332,6 +332,24 @@ pub struct DataFetchingCall {
     /// reads it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub library_semantics: Vec<String>,
+    /// A route this service defines matches this call (carrick#1926): the
+    /// same method, the call's canonical path, at least one literal segment
+    /// in common, and a route definition rather than the call's own
+    /// double-extracted twin. Stamped by `build_mount_graph`, which sees one
+    /// service's routes and nothing else.
+    ///
+    /// It is a statement about this service alone, and not about who serves
+    /// the call. The pair is decided later, over every service's routes, by
+    /// maximal literal agreement: when this service's match is a catch-all and
+    /// a sibling defines the concrete route, the sibling is the producer and
+    /// this is still true. A pair whose two ends are one service is marked by
+    /// its two ids being equal, never by this field.
+    ///
+    /// Written only when true, so a blob from a scanner that did not state it
+    /// reads false on every row. Nothing in matching reads it, as with `role`
+    /// and `host`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_route: bool,
 }
 
 /// The complete mount and endpoint graph
@@ -737,6 +755,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -805,6 +824,78 @@ mod tests {
         assert_eq!(
             json["resolution_source"],
             serde_json::json!("imported_member")
+        );
+    }
+
+    /// carrick#1926: the wire spelling of the own-route mark, as the index
+    /// blob carries it in `mount_graph.data_calls[]`. A row a route of its own
+    /// service matches is written with `"own_route":true`, and a row none
+    /// matches carries no such key. A blob written before the mark existed
+    /// has no key on any row, and each of them reads false: the cloud reads
+    /// `own_route === true` and takes an absent key as a call the scan did
+    /// not mark.
+    #[test]
+    fn own_route_is_written_only_when_true_and_reads_false_when_absent() {
+        let call = |path: &str, line: u32, own_route: bool| DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: path.to_string(),
+            canonical_path: path.to_string(),
+            client: "fetch(".to_string(),
+            file_location: format!("src/page.tsx:{line}"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route,
+        };
+        let mut graph = MountGraph::new();
+        graph.data_calls = vec![
+            call("/api/items", 4, true),
+            call("/api/elsewhere", 9, false),
+        ];
+
+        let text = serde_json::to_string(&graph).unwrap();
+        assert!(
+            text.contains(r#""own_route":true"#),
+            "the marked row spells the key and the value this way: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let rows = json["data_calls"].as_array().unwrap();
+        assert_eq!(rows[0]["own_route"], serde_json::json!(true));
+        assert!(
+            rows[1].get("own_route").is_none(),
+            "a row no own route matches carries no key: {}",
+            rows[1]
+        );
+
+        let back: MountGraph = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.data_calls
+                .iter()
+                .map(|c| c.own_route)
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+
+        let older: MountGraph = serde_json::from_str(
+            r#"{"nodes":{},"mounts":[],"endpoints":[],"data_calls":[
+                {"method":"GET","target_url":"/api/items","canonical_path":"/api/items",
+                 "client":"fetch(","file_location":"src/page.tsx:4"},
+                {"method":"GET","target_url":"/api/elsewhere","canonical_path":"/api/elsewhere",
+                 "client":"fetch(","file_location":"src/page.tsx:9"}]}"#,
+        )
+        .expect("a graph written before the mark existed still reads");
+        assert!(
+            older.data_calls.iter().all(|c| !c.own_route),
+            "every row of an older blob reads false"
         );
     }
 
@@ -1530,6 +1621,7 @@ mod tests {
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

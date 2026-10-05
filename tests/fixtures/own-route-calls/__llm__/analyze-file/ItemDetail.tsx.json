@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "/api/items/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/items/${id}`)",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:18",
+      "line_number": 18,
+      "target": "/api/items/${id}",
+      "method": "DELETE",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/items/${id}`, { method: 'DELETE' })",
+      "call_expression_line": 18,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

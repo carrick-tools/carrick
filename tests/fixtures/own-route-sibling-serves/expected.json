@@ -1,0 +1,25 @@
+{
+  "_doc": "Answer key for tests/own_route_calls_test.rs. Both calls are marked `own_route`, because a route of `web` (its catch-all under /api) matches each. The mark says nothing about who serves a call: `matches` is decided over both services' routes by the most literal segments in common.",
+  "endpoints": [
+    { "service": "api", "method": "GET", "path": "/api/orders/:orderId" },
+    { "service": "web", "method": "GET", "path": "/api/*" }
+  ],
+  "calls": [
+    { "file": "web/src/orders.ts", "line": 2, "method": "GET", "path": "/api/orders/:id", "own_route": true },
+    { "file": "web/src/orders.ts", "line": 7, "method": "GET", "path": "/api/status", "own_route": true }
+  ],
+  "matches": [
+    {
+      "producer_repo": "api",
+      "producer_key": "http|GET|/api/orders/:orderId",
+      "consumer_repo": "web",
+      "consumer_key": "http|GET|/api/orders/:id"
+    },
+    {
+      "producer_repo": "web",
+      "producer_key": "http|GET|/api/*",
+      "consumer_repo": "web",
+      "consumer_key": "http|GET|/api/status"
+    }
+  ]
+}

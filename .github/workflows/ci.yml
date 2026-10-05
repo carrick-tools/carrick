@@ -134,6 +134,7 @@ jobs:
           --test object_export_surface_test
           --test object_key_url_wrapper_test
           --test output_contract_test
+          --test own_route_calls_test
           --test pr_on_main_test
           --test prompt_determinism_test
           --test receiver_type_classification_test

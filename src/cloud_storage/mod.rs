@@ -2187,6 +2187,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -2261,6 +2262,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -2391,6 +2393,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);

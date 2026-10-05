@@ -1493,6 +1493,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             &analyzer.call_raw_targets(),
             &analyzer.call_bases(),
             &analyzer.call_unfollowed_members(),
+            &analyzer.call_own_routes(),
         );
         crate::outln!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
@@ -7511,6 +7512,25 @@ fn build_type_manifest_entries(
     }
 
     for call in mount_graph.get_data_calls() {
+        // A call that a route of its own service matches is an index row
+        // (carrick#1926) with no type entries yet (carrick#1944). The type
+        // check builds no pair whose two ends are one service, so an entry
+        // here would be judged against nothing: it would add two manifest
+        // rows a call, an `unknown` capture anchor for each alias no request
+        // reaches, and no verdict. carrick#1945 gives these calls their pairs
+        // and removes this line with the skip in `build_check_pairs`.
+        //
+        // The cost is the call a sibling serves on a more literal route than
+        // the caller's own: its pair has two services and stays unchecked
+        // until then, as it was while the row was deleted.
+        //
+        // The type REQUESTS are not gated and did not change. They are
+        // collected from the per-file rows (`collect_type_requests`), which
+        // the mount graph's passes never edit, so these calls were inferred
+        // and captured while the graph deleted them and still are.
+        if call.own_route {
+            continue;
+        }
         if !normalizer.is_probable_url(&call.target_url) {
             continue;
         }
@@ -10805,6 +10825,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             // join that reads the scan's own absolute paths.
             reaches_request: Some(abs("src/lib/search-client.ts:88")),
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let mut function_definitions = HashMap::new();
@@ -11495,6 +11516,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -11570,6 +11592,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.data_calls = vec![
@@ -11687,6 +11710,59 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 (15, "POST".to_string(), ManifestTypeKind::Response),
                 (21, "PUT".to_string(), ManifestTypeKind::Request),
             ]
+        );
+    }
+
+    /// carrick#1944: a call that a route of its own service matches is an
+    /// index row with no type entries, until the type check pairs a service
+    /// with itself (carrick#1945). An entry with no pair to be judged in is
+    /// two manifest rows and a capture anchor a call, for no verdict. A call
+    /// no own route matches keeps both of its entries. Taking the skip out of
+    /// `build_type_manifest_entries` puts two entries at line 4 and fails
+    /// this.
+    #[test]
+    fn a_call_to_the_service_s_own_route_has_no_type_entries() {
+        let config = Config::default();
+        let call = |path: &str, line: u32, own_route: bool| crate::mount_graph::DataFetchingCall {
+            method: "POST".to_string(),
+            canonical_path: path.to_string(),
+            target_url: path.to_string(),
+            client: "fetch".to_string(),
+            file_location: format!("src/page.ts:{line}"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(line),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: None,
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route,
+        };
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            call("/api/items", 4, true),
+            call("/api/elsewhere", 9, false),
+        ];
+
+        let entries = build_type_manifest_entries(&mount_graph, &config, ".");
+
+        let consumer: Vec<(u32, ManifestTypeKind)> = entries
+            .iter()
+            .filter(|entry| entry.role == ManifestRole::Consumer)
+            .map(|entry| (entry.line_number, entry.type_kind))
+            .collect();
+        assert_eq!(
+            consumer,
+            vec![
+                (9, ManifestTypeKind::Request),
+                (9, ManifestTypeKind::Response),
+            ],
+            "only the call no own route matches is typed"
         );
     }
 
@@ -11821,6 +11897,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -12690,6 +12767,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -12709,6 +12787,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             },
         ];
 
@@ -18370,6 +18449,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }
     }
 
@@ -18431,6 +18511,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

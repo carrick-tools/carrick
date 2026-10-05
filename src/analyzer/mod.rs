@@ -145,9 +145,11 @@ fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
 /// another, with the type-compatibility verdict for that producer endpoint.
 /// Both sides are identified by the `service_name ?? repo_name` id (#368), so
 /// in a monorepo the two sides can be different services of ONE git repo and
-/// still form a real edge. Same-identity pairs (producer_repo ==
-/// consumer_repo) are dropped by every matcher (#397): a service exercising
-/// its own contract is not a cross-service edge.
+/// still form a real edge. An HTTP pair whose two ends are one service
+/// (`producer_repo == consumer_repo`) is an edge like any other
+/// (carrick#1926): a service calling its own route is a consumer of it, and
+/// the equal ids are the pair's only mark. The exact-key matcher still drops
+/// the same-identity pair for GraphQL, socket and pub/sub.
 ///
 /// `type_compatible == None` is deliberate and load-bearing: it means compat
 /// was never evaluated for this edge (e.g. the type sidecar was unavailable, so
@@ -2644,20 +2646,17 @@ impl Analyzer {
                         };
                         match edge.relationship {
                             carrick_match::MatchRelationship::ProducerConsumer => {
-                                // #397: a service calling its own endpoint
-                                // (through an env-var base; localhost
-                                // self-calls are dropped at extraction) is
-                                // real behaviour but not a cross-service
-                                // contract edge. Drop the self-pair on repo
-                                // identity alone, the same structural rule
-                                // `analyze_exact_key_matches` applies. The
-                                // endpoint was already marked matched above,
-                                // so it still surfaces as a verified
-                                // endpoint — only the degenerate self-edge
-                                // is dropped.
-                                if edge.producer_repo != edge.consumer_repo {
-                                    cross_repo_matches.push(edge);
-                                }
+                                // A service calling its own route is a
+                                // consumer of that route (carrick#1926), so
+                                // the edge is kept whatever the two ids are.
+                                // A pair whose two ends are one service is an
+                                // ordinary edge with `producer_repo ==
+                                // consumer_repo`, and that equality is its
+                                // only mark. This reverses the HTTP half of
+                                // #397; `analyze_exact_key_matches` still
+                                // drops the same-identity pair for GraphQL,
+                                // socket and pub/sub.
+                                cross_repo_matches.push(edge);
                             }
                             carrick_match::MatchRelationship::SharedExternalContract => {
                                 // Both sides are call-site encodings of the
@@ -3471,6 +3470,27 @@ impl Analyzer {
                             ),
                             c.consumers_not_resolved.clone()?,
                         ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The consumer calls a route of their own service matches
+    /// (carrick#1926), keyed exactly as [`Self::call_raw_targets`] is, so the
+    /// eval projection can attach the mark the persisted row carries.
+    pub fn call_own_routes(&self) -> HashSet<(String, String)> {
+        self.mount_graph
+            .as_ref()
+            .map(|g| {
+                g.get_data_calls()
+                    .iter()
+                    .filter(|c| c.own_route)
+                    .map(|c| {
+                        (
+                            OperationKey::http(&c.method, c.canonical_path.clone()).canonical(),
+                            c.file_location.clone(),
+                        )
                     })
                     .collect()
             })
@@ -5623,6 +5643,7 @@ mod tests {
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             });
 
             let (findings, _verified, _edges) =
@@ -5696,6 +5717,7 @@ mod tests {
                     role: None,
                     reaches_request: None,
                     library_semantics: Vec::new(),
+                    own_route: false,
                 });
             }
 
@@ -5909,6 +5931,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
         analyzer.mount_graph = Some(mount_graph);
 
@@ -5993,6 +6016,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
         analyzer.mount_graph = Some(mount_graph);
 
@@ -6380,6 +6404,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -6819,6 +6844,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -6935,6 +6961,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
         analyzer
             .calls
@@ -7020,6 +7047,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
         analyzer
             .calls
@@ -7088,6 +7116,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -8541,6 +8570,7 @@ mod tests {
             role: None,
             reaches_request: None,
             library_semantics: Vec::new(),
+            own_route: false,
         }
     }
 
@@ -8831,15 +8861,15 @@ mod tests {
         assert!(findings.is_empty(), "got {findings:?}");
     }
 
-    /// KILL (#397): a service calling its OWN endpoint through an env-var base
-    /// (localhost self-calls are dropped at extraction, so this is the shape
-    /// that reaches the matcher) must not emit a producer==consumer self-pair
-    /// edge — the same structural rule `analyze_exact_key_matches` applies.
-    /// The endpoint itself stays visible: it is verified by the self-call,
-    /// not orphaned. Pins the monorepo shape from the issue, where both
-    /// sides carry the same `service_name ?? repo_name` id (#368).
+    /// KEEP (carrick#1926, reversing the HTTP half of #397): a service
+    /// calling its OWN endpoint is a consumer of it, so the pair is an edge
+    /// whose two ends are one id, and that equality is its only mark. The
+    /// endpoint is verified by the call and not orphaned. Pins the monorepo
+    /// shape, where both sides carry the same `service_name ?? repo_name` id
+    /// (#368). Putting the `producer_repo != consumer_repo` test back in the
+    /// matcher's producer/consumer arm empties `edges` and fails this.
     #[test]
-    fn http_self_pair_emits_no_edge_but_endpoint_stays_visible() {
+    fn http_same_service_pair_is_an_edge_and_verifies_the_endpoint() {
         let config = Config {
             internal_env_vars: ["API_URL".to_string()].into_iter().collect(),
             ..Config::default()
@@ -8869,9 +8899,25 @@ mod tests {
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
 
-        assert!(
-            edges.is_empty(),
-            "a producer==consumer pair is not a cross-repo edge, got {edges:?}"
+        assert_eq!(
+            edges.len(),
+            1,
+            "a service calling its own route is one edge, got {edges:?}"
+        );
+        assert_eq!(edges[0].producer_repo, "web");
+        assert_eq!(
+            edges[0].consumer_repo, edges[0].producer_repo,
+            "the pair's two ends are one service id"
+        );
+        assert_eq!(edges[0].producer_key, "http|GET|/api/self-status");
+        assert_eq!(edges[0].consumer_key, "http|GET|/api/self-status");
+        assert_eq!(
+            edges[0].consumer_location.as_deref(),
+            Some("apps/web/src/status.ts:7")
+        );
+        assert_eq!(
+            edges[0].relationship,
+            carrick_match::MatchRelationship::ProducerConsumer
         );
         assert_eq!(
             verified,
@@ -8880,11 +8926,57 @@ mod tests {
                 "/api/self-status".to_string(),
                 crate::operation::EndpointProvenance::Route
             )],
-            "the endpoint stays visible as a verified endpoint"
+            "the endpoint is verified by its own service's call"
         );
         assert!(
             findings.is_empty(),
             "matched means neither missing nor orphaned, got {findings:?}"
+        );
+    }
+
+    /// Must-not 3 of carrick#1944: a call its own service's catch-all would
+    /// route goes to the sibling that serves it on more literal segments.
+    /// The row still says `own_route`, because that is what one service knows
+    /// about itself, and the edge is the sibling's, because the pair is
+    /// decided over every service's routes by maximal literal agreement.
+    /// Nothing in the matcher reads the mark: narrowing the pool to the
+    /// caller's own routes on it would draw the edge to the catch-all.
+    #[test]
+    fn a_call_a_sibling_serves_on_more_literal_segments_is_the_sibling_s_edge() {
+        let mut analyzer = Analyzer::new(Config::default());
+
+        analyzer
+            .calls
+            .push(http_call("GET", "/api/orders/:id", "web/src/orders.ts:4"));
+
+        let mut mount_graph = MountGraph::new();
+        // The caller's own catch-all, and the sibling's concrete route.
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/api/**", "web"));
+        mount_graph
+            .endpoints
+            .push(resolved_in("GET", "/api/orders/:orderId", "api"));
+        let mut call = data_call_in("GET", "/api/orders/:id", "web/src/orders.ts:4", "web");
+        call.own_route = true;
+        mount_graph.data_calls.push(call);
+
+        let (_findings, _verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        let pairs: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .map(|e| {
+                (
+                    e.producer_repo.as_str(),
+                    e.producer_key.as_str(),
+                    e.consumer_repo.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("api", "http|GET|/api/orders/:orderId", "web")],
+            "the sibling's concrete route is the producer, and no edge goes to the catch-all"
         );
     }
 

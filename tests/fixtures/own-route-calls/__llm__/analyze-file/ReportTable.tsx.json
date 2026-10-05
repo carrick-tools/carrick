@@ -1,0 +1,71 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/api/reports?from=${from}&to=${to}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/reports?from=${from}&to=${to}`)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "/api/reports?${params.toString()}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/reports?${params.toString()}`)",
+      "call_expression_line": 15,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/api/items/${itemId}/history?page=${page}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${base}?page=${page}`)",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:27",
+      "line_number": 27,
+      "target": "/api/reports?${params.toString()}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch('/api/reports?' + params.toString())",
+      "call_expression_line": 27,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:33",
+      "line_number": 33,
+      "target": "/api/reports",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/reports${query}`)",
+      "call_expression_line": 33,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

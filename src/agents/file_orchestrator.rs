@@ -10187,6 +10187,9 @@ impl FileOrchestrator {
                         // The library claims the row was read through
                         // (carrick#1564).
                         library_semantics: data_call.library_semantics.clone(),
+                        // Decided by the seventh pass below, once every
+                        // endpoint path is final (carrick#1926).
+                        own_route: false,
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -10252,42 +10255,49 @@ impl FileOrchestrator {
         // definition), not a route this service defines. Mark it as call-site
         // evidence so the cross-repo matcher reports a pair against it as a
         // shared external contract instead of fabricating a producer role.
-        // Must run BEFORE the self-call suppression below: suppression deletes
-        // the twin data call (the fabricated endpoint matches it), destroying
-        // the evidence.
+        // Must run BEFORE the own-route pass below: a fabricated endpoint
+        // matches its own twin data call, and the pass must not read that as
+        // a route this service defines.
         Self::classify_endpoint_evidence(&mut graph);
 
-        // Seventh pass: suppress self-calls. A data call whose (method, canonical
-        // path) matches one of THIS service's own resolved endpoints is the
-        // service hitting its own HTTP surface (e.g. a cron/reindex job fetching
-        // `http://localhost:PORT/warehouses/:id/stock/:sku`), not a cross-repo
-        // dependency. Emitting it would (a) inject a spurious self producer↔
-        // consumer edge and (b) leak an operation the service already exposes as
-        // a producer. The mount graph is built per service, so a call matching an
-        // endpoint in the SAME graph is necessarily intra-service; a genuine
-        // cross-service-same-repo call lives in a different service's graph and is
-        // untouched. Runs after path resolution so the endpoint `full_path`s are
-        // final, and matches param-aware (`find_matching_endpoints`) so a
+        // Seventh pass: mark the calls this service's own routes match
+        // (carrick#1926). A data call whose (method, canonical path) matches
+        // one of THIS service's resolved endpoints is the service calling its
+        // own HTTP surface: a page fetching the API beside it, a job fetching
+        // `http://localhost:PORT/warehouses/:id/stock/:sku`. It is a consumer
+        // of that route like any other, so the row stays and says so
+        // (`DataFetchingCall::own_route`). The pass deleted such a row until
+        // it was ruled an index row; on a one-service app that removed every
+        // call the scan had read correctly.
+        //
+        // The mount graph is built per service, so this states what one
+        // service can know about itself and no more. Who serves the call is
+        // decided later over every service's routes, and may be a sibling
+        // with a more literal route.
+        //
+        // Runs after path resolution so the endpoint `full_path`s are final,
+        // and matches param-aware (`find_matching_endpoints`) so a
         // canonicalized `/warehouses/:wid/...` still matches a declared
-        // `/warehouses/:warehouseId/...`. This is only reachable once the literal
-        // origin is stripped from the call key (see `consumer_call_path`); a raw
-        // `http://host:port/...` key matches no endpoint and would evade it.
-        let keep_call: Vec<bool> = graph
+        // `/warehouses/:warehouseId/...`. A loopback origin is stripped from
+        // the call key before this (see `consumer_call_path`), which is what
+        // lets a call over the service's own port match; an external origin
+        // stays on the key and matches no route.
+        let own_route: Vec<bool> = graph
             .data_calls
             .iter()
             .map(|call| {
-                // Two guards on what counts as a self-call, composed:
-                // - A zero-agreement routing match (#381) — this service's own
-                //   catch-all fallback (`GET /*`) absorbing the call — is not
-                //   evidence of a self-call: it would suppress every one of
-                //   the service's real outgoing calls. Only a producer that
-                //   shares literal path signal with the call counts.
+                // Two guards on what counts as the service's own route,
+                // composed:
+                // - A zero-agreement routing match (#381), this service's own
+                //   catch-all fallback (`GET /*`) absorbing the call, is no
+                //   evidence: it would mark every one of the service's real
+                //   outgoing calls. Only a route that shares literal path
+                //   signal with the call counts.
                 // - Only route-definition evidence counts (#379): a call whose
                 //   only match is a call-site-evidence endpoint (its own
                 //   double-extracted twin) is a call to an EXTERNAL contract,
-                //   not the service hitting its own surface — keep it so the
-                //   shared-external-contract group can form cross-repo.
-                let is_self_call = graph
+                //   not the service calling its own surface.
+                graph
                     .find_matching_endpoints(&call.canonical_path, &call.method)
                     .iter()
                     .any(|endpoint| {
@@ -10298,25 +10308,18 @@ impl FileOrchestrator {
                             )
                             .unwrap_or(0)
                                 > 0
-                    });
-                if is_self_call {
-                    debug!(
-                        "Suppressing self-call to own endpoint: {} {} ({})",
-                        call.method, call.canonical_path, call.file_location
-                    );
-                }
-                !is_self_call
+                    })
             })
             .collect();
-        // `keep_call` was derived element-for-element from `graph.data_calls`
-        // just above, so the iterator running dry mid-retain can only mean that
-        // invariant was broken — fail loudly rather than silently keeping calls.
-        let mut keep_iter = keep_call.into_iter();
-        graph.data_calls.retain(|_| {
-            keep_iter
-                .next()
-                .expect("keep_call must be exactly as long as graph.data_calls")
-        });
+        for (call, own_route) in graph.data_calls.iter_mut().zip(own_route) {
+            if own_route {
+                debug!(
+                    "Call to a route this service defines: {} {} ({})",
+                    call.method, call.canonical_path, call.file_location
+                );
+            }
+            call.own_route = own_route;
+        }
 
         graph
     }
@@ -10714,7 +10717,8 @@ impl FileOrchestrator {
     /// different line is not caught and keeps route-definition evidence.
     ///
     /// Runs after `resolve_endpoint_paths` (so `full_path` is final) and
-    /// before self-call suppression (which deletes the twin call).
+    /// before the own-route pass, which reads this evidence so that a twin
+    /// call is not marked as a call to the service's own route.
     fn classify_endpoint_evidence(graph: &mut MountGraph) {
         for endpoint in &mut graph.endpoints {
             let twinned = graph.data_calls.iter().any(|call| {
@@ -13282,17 +13286,19 @@ export * from "./aFetch.js";"#,
         assert!(graph.data_calls.is_empty());
     }
 
-    /// A data call to the service's OWN endpoint (same mount graph) is a
-    /// self-call — the service hitting its own HTTP surface — and must be
-    /// dropped so it neither leaks as an indexed consumer op nor forms a
-    /// spurious self producer↔consumer edge. The literal `http://localhost:PORT`
-    /// origin is stripped to a bare param path (`consumer_call_path`), which then
-    /// matches the declared endpoint param-aware (`:wid` ≡ `:warehouseId`). A
-    /// call to a DIFFERENT path survives. Fails before the origin-strip +
-    /// suppression pass: both calls' keys keep the raw `http://host:port/...`
-    /// origin, so nothing matches the endpoint and both survive (len == 2).
+    /// carrick#1926: a data call to the service's OWN endpoint (same mount
+    /// graph) is the service calling its own HTTP surface. It is a consumer
+    /// of that route, so the row is kept and marked `own_route`. The literal
+    /// `http://localhost:PORT` origin is stripped to a bare param path
+    /// (`consumer_call_path`), which then matches the declared endpoint
+    /// param-aware (`:wid` ≡ `:warehouseId`). A call to a path no route of
+    /// the service serves is kept unmarked.
+    ///
+    /// Putting the retain back fails the row count, and taking the stamp out
+    /// fails the mark. Until the row was ruled an index row the pass deleted
+    /// it, and a one-service app lost every call it had read correctly.
     #[test]
-    fn test_build_mount_graph_suppresses_self_calls() {
+    fn test_build_mount_graph_keeps_a_call_to_an_own_route_and_marks_it() {
         let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
 
@@ -13354,12 +13360,12 @@ export * from "./aFetch.js";"#,
                     dispatch: None,
                 }],
                 data_calls: vec![
-                    // Self-call to the service's own endpoint over localhost.
+                    // A call to the service's own endpoint over localhost.
                     mk_call(
                         "span:100-160",
                         "http://localhost:4002/warehouses/${wid}/stock/${sku}",
                     ),
-                    // Genuine outbound call to a different path — survives.
+                    // A call to a path no route of this service serves.
                     mk_call("span:200-260", "http://localhost:9000/catalog/${id}"),
                 ],
                 graphql_operations: vec![],
@@ -13375,27 +13381,120 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
 
-        let call_paths: Vec<&str> = graph
+        let mut rows: Vec<(&str, bool)> = graph
             .data_calls
             .iter()
-            .map(|c| c.canonical_path.as_str())
+            .map(|c| (c.canonical_path.as_str(), c.own_route))
             .collect();
+        rows.sort();
         assert_eq!(
-            graph.data_calls.len(),
-            1,
-            "self-call must be suppressed, surviving calls: {call_paths:?}"
+            rows,
+            vec![
+                ("/catalog/:id", false),
+                ("/warehouses/:wid/stock/:sku", true),
+            ],
+            "both calls are rows, and only the one an own route serves is marked"
         );
-        assert_eq!(graph.data_calls[0].canonical_path, "/catalog/:id");
+    }
+
+    /// The two guards on the mark (carrick#381, and the catch-all shape a
+    /// proxying service has). A route with no literal segment absorbs every
+    /// path, so it is no evidence that a call is the service's own: marking
+    /// on it would mark every outgoing call the service makes. A catch-all
+    /// under a literal prefix shares that prefix with the call, and does
+    /// count, which is what leaves the pair itself to be decided later over
+    /// every service's routes.
+    #[test]
+    fn test_build_mount_graph_marks_no_own_route_on_zero_literal_agreement() {
+        let own_route_of = |route: &str, call: &str| {
+            let orchestrator = FileOrchestrator::new(AgentService::new());
+            let mut file_results = HashMap::new();
+            file_results.insert(
+                "src/app.ts".to_string(),
+                FileAnalysisResult {
+                    graphql_consumer_locates: vec![],
+                    mounts: vec![],
+                    endpoints: vec![EndpointResult {
+                        handler_declaration_line: None,
+                        registration_literal: None,
+                        view_module: false,
+                        candidate_id: "span:1-40".to_string(),
+                        line_number: 5,
+                        owner_node: "app".to_string(),
+                        method: "GET".to_string(),
+                        path: route.to_string(),
+                        handler_name: "proxy".to_string(),
+                        pattern_matched: ".get(".to_string(),
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        response_expression_text: None,
+                        response_expression_line: None,
+                        emission_style: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                        resolution_source: None,
+                        dispatch: None,
+                    }],
+                    data_calls: vec![DataCallResult {
+                        call_kind: None,
+                        candidate_id: "span:100-160".to_string(),
+                        line_number: 9,
+                        target: call.to_string(),
+                        method: Some("GET".to_string()),
+                        pattern_matched: "fetch(".to_string(),
+                        call_expression_span_start: None,
+                        call_expression_span_end: None,
+                        call_expression_text: None,
+                        call_expression_line: None,
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                        loopback_default_url: None,
+                        base: None,
+                        consumers_not_resolved: None,
+                        resolution_source: None,
+                        dispatch: None,
+                        reaches_request: None,
+                        body_literals: Default::default(),
+                        library_semantics: Vec::new(),
+                        at_caller: false,
+                        call_body: None,
+                    }],
+                    graphql_operations: vec![],
+                    pubsub_operations: vec![],
+                    dispatch_tables: Vec::new(),
+                },
+            );
+            let graph = orchestrator.build_mount_graph(
+                &file_results,
+                &UrlNormalizer::default_permissive(),
+                Path::new(""),
+                Path::new(""),
+            );
+            assert_eq!(graph.data_calls.len(), 1, "the call is a row either way");
+            graph.data_calls[0].own_route
+        };
+
+        assert!(
+            !own_route_of("/*", "/catalog/${id}"),
+            "a route with no literal segment is no evidence of an own route"
+        );
+        assert!(
+            own_route_of("/api/*", "/api/catalog/${id}"),
+            "a catch-all under a literal prefix the call shares is an own route"
+        );
     }
 
     /// #379: an "endpoint" whose exact source site (file:line), method, and
     /// path were ALSO extracted as a data call is a double-extracted client
     /// call expression, not a route definition. It must be reclassified to
-    /// call-site evidence, and its twin call must SURVIVE self-call
-    /// suppression (the call targets an external contract, not the service's
-    /// own surface). A genuine route definition in the same file keeps
-    /// route-definition evidence, and a call matching THAT one is still
-    /// suppressed as a self-call.
+    /// call-site evidence, and its twin call must NOT be marked `own_route`
+    /// (the call targets an external contract, not the service's own
+    /// surface). A genuine route definition in the same file keeps
+    /// route-definition evidence, and a call matching THAT one is marked.
     #[test]
     fn test_build_mount_graph_reclassifies_double_extracted_call_as_call_site_evidence() {
         let agent_service = AgentService::new();
@@ -13467,7 +13566,7 @@ export * from "./aFetch.js";"#,
                 ],
                 data_calls: vec![
                     mk_call(14, "POST", "/v2/widgets"),
-                    // Self-call to the genuine route: still suppressed.
+                    // A call to the genuine route: the service's own.
                     mk_call(52, "GET", "/health"),
                 ],
                 graphql_operations: vec![],
@@ -13502,17 +13601,18 @@ export * from "./aFetch.js";"#,
             "a genuine route definition keeps route-definition evidence"
         );
 
-        // The twin call survives (external contract encoding); the genuine
-        // self-call is still suppressed.
-        let surviving: Vec<&str> = graph
+        // Both calls are rows. The twin is an external contract's encoding
+        // and is not the service's own route; the call to the real route is.
+        let mut rows: Vec<(&str, bool)> = graph
             .data_calls
             .iter()
-            .map(|c| c.canonical_path.as_str())
+            .map(|c| (c.canonical_path.as_str(), c.own_route))
             .collect();
+        rows.sort();
         assert_eq!(
-            surviving,
-            vec!["/v2/widgets"],
-            "twin call must survive; self-call to the real route must not"
+            rows,
+            vec![("/health", true), ("/v2/widgets", false)],
+            "a call is never its own twin's consumer; the real route's is marked"
         );
     }
 

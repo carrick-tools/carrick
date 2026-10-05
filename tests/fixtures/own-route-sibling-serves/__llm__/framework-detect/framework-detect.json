@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A synthetic server declared in the fixture; requests are made with the platform fetch."
+}

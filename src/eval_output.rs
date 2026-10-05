@@ -9,7 +9,7 @@
 //! from this projection.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::analyzer::{
@@ -65,6 +65,11 @@ pub struct EvalOp {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// Consumer ops only: a route this call's own service defines matches it
+    /// (carrick#1926), the same value the persisted row carries and written
+    /// the same way, only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_route: bool,
     /// The dispatch case this op is (carrick#831): on a producer the case it
     /// answers, on a call the value it sends for the field its target
     /// dispatches on. `None` for a plain route, which is nearly all of them.
@@ -173,6 +178,7 @@ impl EvalProjection {
             (String, String),
             crate::imported_request_member::UnfollowedMemberSites,
         >,
+        call_own_routes: &HashSet<(String, String)>,
     ) -> Self {
         let manifest_index = ManifestIndex::build(type_manifest);
         // Canonical ordering so the projection is deterministic across runs:
@@ -250,6 +256,7 @@ impl EvalProjection {
                     op.target_url = raw_targets.get(&site).cloned();
                     op.base = call_bases.get(&site).cloned();
                     op.consumers_not_resolved = call_unfollowed_members.get(&site).cloned();
+                    op.own_route = call_own_routes.contains(&site);
                     op
                 })
                 .collect(),
@@ -263,15 +270,13 @@ impl EvalProjection {
     /// no other repo on the key. The projection filters out the ops of that repo
     /// on that key.
     ///
-    /// HTTP ops are excluded — they get repo provenance from the mount graph, not
-    /// from `repo_name`; localhost self-calls are already dropped at extraction,
-    /// and the HTTP matcher drops self-pair EDGES on repo identity (#397) while
-    /// keeping the ops visible as endpoint/call. A non-HTTP op with no repo
-    /// attribution is skipped (self-loop is
-    /// undecidable without both repo ids), on both sides: it neither votes here
-    /// nor gets dropped by the filter.
+    /// HTTP ops are excluded: a service calling its own route is a consumer of
+    /// it (carrick#1926), so the call, the route and the edge between them all
+    /// stay in the projection, the call marked `own_route`. A non-HTTP op with
+    /// no repo attribution is skipped (self-loop is undecidable without both
+    /// repo ids), on both sides: it neither votes here nor gets dropped by the
+    /// filter.
     fn intra_repo_self_loops(result: &ApiAnalysisResult) -> HashMap<String, String> {
-        use std::collections::HashSet;
         let mut producer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
         let mut consumer_repos: HashMap<String, HashSet<&str>> = HashMap::new();
         for (ops, repos) in [
@@ -506,6 +511,7 @@ impl EvalOp {
             // neither.
             base: None,
             consumers_not_resolved: None,
+            own_route: false,
             // Both carried by the details type itself, on both sides: which
             // layer stated the row (carrick#660), and the dispatch case it is
             // (carrick#831).
@@ -802,6 +808,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let endpoint_keys: Vec<&str> = projection
             .endpoints
@@ -870,6 +877,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let surviving: Vec<(&str, &str)> = projection
             .endpoints
@@ -986,6 +994,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1069,6 +1078,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1092,6 +1102,62 @@ mod tests {
         // Empty match/dep arrays still serialize as present empty arrays.
         assert_eq!(json["cross_repo_matches"].as_array().unwrap().len(), 0);
         assert_eq!(json["dependency_conflicts"].as_array().unwrap().len(), 0);
+    }
+
+    /// carrick#1926: the projection carries the own-route mark the persisted
+    /// row carries, joined by the call's key and site, and spells it the same
+    /// way: `"own_route":true` on a call a route of its own service matches,
+    /// and no key on a call none matches. A second call on the same key at
+    /// another site stays unmarked, so the join is by site and not by key.
+    #[test]
+    fn a_call_to_an_own_route_is_marked_on_the_projected_call() {
+        let result = ApiAnalysisResult {
+            endpoints: vec![endpoint("GET", "/api/items", "app/api/items/route.ts:3")],
+            calls: vec![
+                endpoint("GET", "/api/items", "components/list.tsx:12"),
+                endpoint("GET", "/api/items", "components/other.tsx:4"),
+            ],
+            findings: vec![],
+            dependency_conflicts: vec![],
+            verified_endpoints: vec![],
+            sdk_edges: Vec::new(),
+            sdk_unresolved: Vec::new(),
+            detected_graphql_libraries: vec![],
+            graphql_operations_indexed: false,
+            cross_repo_matches: vec![],
+        };
+        let own_routes: HashSet<(String, String)> = [(
+            "http|GET|/api/items".to_string(),
+            "components/list.tsx:12".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let projection = EvalProjection::from_results(
+            &result,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &own_routes,
+        );
+        let text = serde_json::to_string(&projection).unwrap();
+        let json: Value = serde_json::from_str(&text).unwrap();
+        let calls = json["calls"].as_array().unwrap();
+
+        assert_eq!(calls[0]["file"], "components/list.tsx");
+        assert_eq!(calls[0]["own_route"], Value::from(true));
+        assert_eq!(calls[1]["file"], "components/other.tsx");
+        assert!(
+            calls[1].get("own_route").is_none(),
+            "an unmarked call carries no key: {}",
+            calls[1]
+        );
+        assert!(
+            json["endpoints"][0].get("own_route").is_none(),
+            "the mark is a call's, never a route's"
+        );
+        assert_eq!(text.matches(r#""own_route":true"#).count(), 1);
     }
 
     /// #245 Phase 1: a manifest entry keyed by a *socket* OperationKey joins to
@@ -1157,6 +1223,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1249,6 +1316,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1332,6 +1400,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1404,6 +1473,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
@@ -1496,6 +1566,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();

@@ -3821,6 +3821,7 @@ mod tests {
                 role: None,
                 reaches_request: None,
                 library_semantics: Vec::new(),
+                own_route: false,
             }
         }
 

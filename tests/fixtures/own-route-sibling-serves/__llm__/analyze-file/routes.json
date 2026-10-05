@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/api/orders/:orderId",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "reply.json(order)",
+      "response_expression_line": 12,
+      "primary_type_symbol": "Order",
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

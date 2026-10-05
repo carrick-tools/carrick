@@ -1,0 +1,110 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "/api/items/${item.id}",
+      "method": "PUT",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(url, { method, body: JSON.stringify(values) })",
+      "call_expression_line": 7,
+      "payload_expression_text": "JSON.stringify(values)",
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "/api/items",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(url, { method, body: JSON.stringify(values) })",
+      "call_expression_line": 7,
+      "payload_expression_text": "JSON.stringify(values)",
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/api/items",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch('/api/items')",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/api/items/${id}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/items/${id}`)",
+      "call_expression_line": 17,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:18",
+      "line_number": 18,
+      "target": "/api/reports?from=${from}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/reports?from=${from}`)",
+      "call_expression_line": 18,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/api/items/${id}/archive",
+      "method": "DELETE",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/items/${id}/archive`, { method })",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/api/items/${id}/archive",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/api/items/${id}/archive`, { method })",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:22",
+      "line_number": 22,
+      "target": "${process.env.APP_URL}/api/settings",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${process.env.APP_URL}/api/settings`)",
+      "call_expression_line": 22,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
