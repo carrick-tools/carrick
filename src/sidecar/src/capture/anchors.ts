@@ -21,6 +21,7 @@ import {
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
+import { isOwnSource, sourceSpecifier, unbuiltPackageNote, type WorkspaceScope } from './workspace-source.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -109,6 +110,27 @@ export function entryRelativeSpecifier(
   return kind ? from(`${target.slice(0, kind.index)}.${kind[1]}js`) : bare;
 }
 
+/**
+ * The specifier the entry names an anchor's module by. A source that arrived
+ * as a module specifier (carrick#1175) is named by the file it resolved to:
+ * the post-emit rewrite turns that path into the module's place in the tree,
+ * or into its package's bare specifier and a pin.
+ */
+export function anchorModuleSpecifier(
+  args: {
+    repoRoot: string;
+    entryDir: string;
+    moduleSources?: ReadonlyMap<string, string>;
+    resolveFromEntry?: (specifier: string) => string | undefined;
+  },
+  sourceFile: string
+): string {
+  return (
+    args.moduleSources?.get(sourceFile) ??
+    entryRelativeSpecifier(args.entryDir, args.repoRoot, sourceFile, args.resolveFromEntry)
+  );
+}
+
 function moduleExport(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
@@ -146,6 +168,14 @@ export function resolveAnchor(
      * same module by it.
      */
     resolveFromEntry?: (specifier: string) => string | undefined;
+    /**
+     * carrick#1175: the file each symbol or handler anchor's `source_file`
+     * resolves to as a module specifier from the entry, for the sources that
+     * are not a file of the service.
+     */
+    moduleSources?: ReadonlyMap<string, string>;
+    /** The checkout whose packages are read from source (carrick#1910). */
+    workspace?: WorkspaceScope;
   }
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
@@ -212,17 +242,26 @@ export function resolveAnchor(
     };
   }
 
-  const sourceAbs = path.join(args.repoRoot, request.source_file);
+  const namesModule = request.kind === 'symbol' || request.kind === 'handler_return';
+  const sourceAbs =
+    (namesModule ? args.moduleSources?.get(request.source_file) : undefined) ??
+    path.join(args.repoRoot, request.source_file);
   const sourceFile = program.getSourceFile(sourceAbs);
   if (!sourceFile) {
-    return demote(`source file not in program: ${request.source_file}`);
+    // A source that names one of the checkout's own packages says why it did
+    // not resolve (carrick#1910); anything else is a file the program lacks.
+    const specifier = args.workspace ? sourceSpecifier(request.source_file, args.workspace) : request.source_file;
+    const unbuilt =
+      namesModule && args.workspace
+        ? unbuiltPackageNote(specifier, path.join(args.entryDir, 'entry.ts'), program.getCompilerOptions(), args.workspace)
+        : undefined;
+    return demote(
+      unbuilt
+        ? `source '${specifier}' did not resolve: ${unbuilt}`
+        : `source file not in program: ${request.source_file}`
+    );
   }
-  const spec = entryRelativeSpecifier(
-    args.entryDir,
-    args.repoRoot,
-    request.source_file,
-    args.resolveFromEntry
-  );
+  const spec = anchorModuleSpecifier(args, request.source_file);
 
   if (request.kind === 'symbol') {
     const exported = moduleExport(checker, sourceFile, request.symbol_name);
@@ -628,6 +667,7 @@ function qualifyNamesFromSource(
     repoRoot: string;
     entryDir: string;
     resolveFromEntry?: (specifier: string) => string | undefined;
+    workspace?: WorkspaceScope;
   }
 ): string | undefined {
   if (!sourceFileRel) return undefined;
@@ -647,8 +687,19 @@ function qualifyNamesFromSource(
 
   const specOf = (file: ts.SourceFile): string | undefined => {
     const rel = path.relative(args.repoRoot, file.fileName);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+    if (!rel || path.isAbsolute(rel)) return undefined;
     if (rel.split(path.sep).includes('node_modules')) return undefined;
+    if (rel.startsWith('..')) {
+      // Source of another package of the checkout (carrick#1910): the emit
+      // writes its declaration into the stub, and the rewrite turns this
+      // path into its place there. A package the program reads as an
+      // installed library is not emitted, and is named as it was.
+      return args.workspace &&
+        isOwnSource(file.fileName, args.workspace) &&
+        !program.isSourceFileFromExternalLibrary(file)
+        ? file.fileName
+        : undefined;
+    }
     return entryRelativeSpecifier(
       args.entryDir,
       args.repoRoot,

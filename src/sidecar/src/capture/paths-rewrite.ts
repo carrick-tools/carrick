@@ -16,8 +16,10 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { installedPackageSpecifier } from './installed-package.js';
+import { installOf, installedPackageSpecifier } from './installed-package.js';
+import { OUTSIDE_DIR } from './outside-root.js';
 import type { WriteGuard } from './guarded-fs.js';
+import type { CarriedRead } from './workspace-source.js';
 import {
   isRelative,
   matchPathsPattern,
@@ -44,6 +46,13 @@ export interface RewriteArgs {
    * (carrick#1770): absolute source-side path without extension -> tree path.
    */
   outside: Map<string, string>;
+  /**
+   * The file a bare specifier in tree file `file` names, as the emit resolved
+   * it (carrick#1620). A specifier that names a module whose declaration the
+   * tree holds is rewritten to that declaration: a package of the checkout
+   * read from its source is emitted into the tree, and nothing pins it.
+   */
+  moduleFromTree?: (spec: string, file: string) => string | undefined;
 }
 
 export function parsePathsPatterns(
@@ -112,6 +121,14 @@ export interface RewriteResult {
    * resolution only. Absolute paths: never written into the stub.
    */
   installs: Record<string, string>;
+  /**
+   * Each package a declaration emitted from outside the service names, with
+   * the install its source resolved it in (carrick#1620). An isolated install
+   * links a dependency only into the package that declares it, so the
+   * service's own install may not say; and two packages of one checkout can
+   * read one name at two versions, so each declaration's own reading is kept.
+   */
+  carried: CarriedRead[];
 }
 
 /**
@@ -131,6 +148,7 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
   const emitted = new Set(args.files);
   const pins: Record<string, string> = {};
   const installs: Record<string, string> = {};
+  const carried: CarriedRead[] = [];
   let total = 0;
 
   const installed = (spec: string, importedName?: string): string | undefined => {
@@ -178,6 +196,18 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
         // self-check to classify (never guess).
         return undefined;
       }
+      // A module whose declaration the tree holds, named by a bare specifier.
+      const named = args.moduleFromTree?.(spec, file);
+      if (named === undefined) return undefined;
+      const target = treeFileFor(named, args.entryDir, emitted, args.outside);
+      if (target) return relativeSpecifier(file, target);
+      // A declaration emitted from outside the service names its packages as
+      // its own source resolves them: which install that was is the caller's
+      // to weigh against what the stub pins.
+      if (file.startsWith(`${OUTSIDE_DIR}/`)) {
+        const install = installOf(named);
+        if (install) carried.push({ file, specifier: spec, install });
+      }
       return undefined;
     });
     if (rewrites + importTypeRewrites > 0) {
@@ -185,5 +215,5 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
       total += rewrites + importTypeRewrites;
     }
   }
-  return { rewrites: total, pins, installs };
+  return { rewrites: total, pins, installs, carried };
 }

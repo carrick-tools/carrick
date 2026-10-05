@@ -66,9 +66,16 @@ export function findDisqualifyingTopTypes(
   root: ts.Type,
   program: ts.Program,
   checker: ts.TypeChecker,
-  location: ts.Node
+  location: ts.Node,
+  /**
+   * Filled, when given, with the file that declares the member each finding
+   * sits under: finding path -> file. The self-check reads it to tell a
+   * member the stub left unresolved from one its source declares that way
+   * (carrick#1910).
+   */
+  declaredIn?: Map<string, string>
 ): DeepTopType[] {
-  return walkTopTypes(root, program, checker, location, disqualifyingFlag);
+  return walkTopTypes(root, program, checker, location, disqualifyingFlag, declaredIn);
 }
 
 /**
@@ -110,7 +117,8 @@ function walkTopTypes(
   program: ts.Program,
   checker: ts.TypeChecker,
   location: ts.Node,
-  flagOf: (t: ts.Type) => 'any' | 'unknown' | undefined
+  flagOf: (t: ts.Type) => 'any' | 'unknown' | undefined,
+  declaredIn?: Map<string, string>
 ): DeepTopType[] {
   // Cover v1's inline-expander reach with margin so this structural walk is a
   // genuine superset of v1's text-scan disqualifier AT DEPTH: anything v1 could
@@ -139,14 +147,16 @@ function walkTopTypes(
   // One finding per kind and position, under the cap. Two union members that
   // both type `x` reach the same position twice.
   const named = new Set<string>();
-  const note = (kind: 'any' | 'unknown', path: string): void => {
+  const note = (kind: 'any' | 'unknown', path: string, member: ts.Node | undefined): void => {
     const key = `${kind}\u0000${path}`;
     if (named.has(key) || found.length >= MAX_DEEP_FINDINGS) return;
     named.add(key);
     found.push({ kind, path });
+    if (member && declaredIn && !declaredIn.has(path)) declaredIn.set(path, member.getSourceFile().fileName);
   };
 
-  const walk = (t: ts.Type, path: string, depth: number): void => {
+  // `member` is the declaration of the nearest member above `t` on this path.
+  const walk = (t: ts.Type, path: string, depth: number, member?: ts.Node): void => {
     // Genuine cycle handling — NOT fail-open. `t` is already on the walk stack
     // (or was fully explored earlier), so the owning frame completes it;
     // returning "clean" here is sound because a type reaches `seen` ONLY after a
@@ -170,7 +180,7 @@ function walkTopTypes(
       // the check phase pre-gates on, does not move: a repeat always follows
       // the first meeting.
       const kind = depth > 0 ? flagOf(t) : undefined;
-      if (kind) note(kind, path);
+      if (kind) note(kind, path, member);
       return;
     }
     // Budget exhaustion FAILS CLOSED. Returning "clean" here would let an
@@ -205,14 +215,14 @@ function walkTopTypes(
     if (depth > 0) {
       const kind = flagOf(t);
       if (kind) {
-        note(kind, path);
+        note(kind, path, member);
         return;
       }
     }
 
     if (t.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
       for (const part of (t as ts.UnionOrIntersectionType).types) {
-        walk(part, path, depth + 1);
+        walk(part, path, depth + 1, member);
         if (exhausted) return;
       }
       return;
@@ -230,7 +240,7 @@ function walkTopTypes(
     // sound shape. Fall through afterwards so a hybrid callable
     // (`{ (): T; data: any }`) still has its own members walked below.
     for (const sig of [...t.getCallSignatures(), ...t.getConstructSignatures()]) {
-      walk(sig.getReturnType(), `${path}()`, depth + 1);
+      walk(sig.getReturnType(), `${path}()`, depth + 1, member);
       if (exhausted) return;
     }
 
@@ -240,7 +250,7 @@ function walkTopTypes(
         ? checker.getTypeArguments(t as ts.TypeReference)
         : [];
     for (let i = 0; i < args.length; i++) {
-      walk(args[i], `${path}<${i}>`, depth + 1);
+      walk(args[i], `${path}<${i}>`, depth + 1, member);
       if (exhausted) return;
     }
 
@@ -249,7 +259,7 @@ function walkTopTypes(
     // just above under `<0>`: walking it twice would name one element twice.
     for (const info of checker.getIndexInfosOfType(t)) {
       if (args.includes(info.type)) continue;
-      walk(info.type, `${path}[index]`, depth + 1);
+      walk(info.type, `${path}[index]`, depth + 1, info.declaration ?? member);
       if (exhausted) return;
     }
 
@@ -266,7 +276,7 @@ function walkTopTypes(
         continue;
       }
       const propType = checker.getTypeOfSymbolAtLocation(prop, location);
-      walk(propType, memberPath(path, prop, checker), depth + 1);
+      walk(propType, memberPath(path, prop, checker), depth + 1, decl ?? member);
       if (exhausted) return;
     }
   };
@@ -323,6 +333,14 @@ export interface UnresolvedAtAnchor {
    * empty: a name the program never declared leaves the same placeholder.
    */
   specifiers: readonly string[];
+  /**
+   * One sentence for each of those specifiers that names a package of the
+   * scanned checkout whose entry is not on disk and has no source to read in
+   * its place (carrick#1910): the cause a build would remove, where "an
+   * import did not resolve" alone sends a reader to look for a dependency
+   * that was not installed.
+   */
+  notes?: readonly string[];
 }
 
 /** How many specifiers or names a detail lists before it counts the rest. */
@@ -342,7 +360,14 @@ const MAX_NAMED_IN_DETAIL = 3;
  */
 export function provenanceOf(
   finding: DeepTopType,
-  unresolved?: UnresolvedAtAnchor
+  unresolved?: UnresolvedAtAnchor,
+  /**
+   * Why the stub left an import unresolved in the file that declares this
+   * member though it resolved on the checkout (carrick#1910): the sentence
+   * the capture wrote for it. The repair writes `unknown`, so an `any` there
+   * is still the source's own.
+   */
+  leftUnresolved?: string
 ): TypeProvenance {
   if (finding.kind === 'budget_exhausted') {
     return {
@@ -361,8 +386,11 @@ export function provenanceOf(
       path: finding.path,
       kind: finding.kind,
       reason: 'unresolved_import',
-      detail: unresolvedDetail(unresolved.specifiers),
+      detail: unresolvedDetail(unresolved.specifiers, unresolved.notes ?? []),
     };
+  }
+  if (leftUnresolved !== undefined && finding.kind === 'unknown') {
+    return { path: finding.path, kind: finding.kind, reason: 'unresolved_import', detail: leftUnresolved };
   }
   return {
     path: finding.path,
@@ -372,11 +400,12 @@ export function provenanceOf(
   };
 }
 
-function unresolvedDetail(specifiers: readonly string[]): string {
+function unresolvedDetail(specifiers: readonly string[], notes: readonly string[]): string {
   const lead =
     "the type at this position did not resolve on the scanned checkout, so the compiler printed a placeholder 'any' rather than a declared type";
   if (specifiers.length === 0) return lead;
-  return `${lead}; unresolved imports reachable from the anchor: ${quotedList(specifiers)}`;
+  const named = `${lead}; unresolved imports reachable from the anchor: ${quotedList(specifiers)}`;
+  return [named, ...notes.slice(0, MAX_NAMED_IN_DETAIL)].join('; ');
 }
 
 /**

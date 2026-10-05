@@ -154,6 +154,63 @@ function repairFile(file: string, specifiers: Set<string>, tree: WriteGuard): Re
   return { specifiers: [...removedSpecifiers].sort(), names: [...names].sort() };
 }
 
+/**
+ * How a source file uses the module `specifier` names where the repair above
+ * has nothing to write, as the words a reason says it in; undefined when
+ * every use is one the repair can replace (carrick#1910).
+ *
+ * Asked of a file before its declaration is emitted, about a module the stub
+ * would have to leave unresolved in that file. `unknown` stands where a type
+ * is used. It cannot stand for what the file exports from the module, for a
+ * binding of the module the file exports again, or for what a class or an
+ * interface extends: the declaration would keep the import, or lose members
+ * no reader could see were gone. Read from the syntax alone, so a class the
+ * emit would leave out counts too.
+ */
+export function useBeyondRepair(
+  fileName: string,
+  text: string,
+  specifier: string
+): 're-exports' | 'extends a type of' | undefined {
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false);
+  const bound = new Set<string>();
+  for (const statement of source.statements) {
+    if (importSpecifierOf(statement) !== specifier) continue;
+    if (ts.isExportDeclaration(statement)) return 're-exports';
+    if (ts.isImportEqualsDeclaration(statement) && isExported(statement)) return 're-exports';
+    for (const name of boundNames(statement)) bound.add(name);
+  }
+  if (bound.size === 0) return undefined;
+  const binds = (name: ts.Node): boolean => {
+    let current = name;
+    while (ts.isQualifiedName(current) || ts.isPropertyAccessExpression(current)) {
+      current = ts.isQualifiedName(current) ? current.left : current.expression;
+    }
+    return ts.isIdentifier(current) && bound.has(current.text);
+  };
+  const visit = (node: ts.Node): 're-exports' | 'extends a type of' | undefined => {
+    // `export { A }` names a binding of this file; `export { A } from` names the other module's.
+    if (ts.isExportDeclaration(node) && !node.moduleSpecifier && node.exportClause && ts.isNamedExports(node.exportClause)) {
+      return node.exportClause.elements.some((element) => binds(element.propertyName ?? element.name))
+        ? 're-exports'
+        : undefined;
+    }
+    if (ts.isExportAssignment(node) && binds(node.expression)) return 're-exports';
+    if (ts.isHeritageClause(node) && node.types.some((type) => binds(type.expression))) {
+      return 'extends a type of';
+    }
+    return ts.forEachChild(node, visit);
+  };
+  return visit(source);
+}
+
+function isExported(statement: ts.Statement): boolean {
+  return (
+    ts.canHaveModifiers(statement) &&
+    (ts.getModifiers(statement) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+  );
+}
+
 /** The module specifier an import STATEMENT names, if it names one. */
 function importSpecifierOf(statement: ts.Statement): string | undefined {
   let expression: ts.Expression | undefined;

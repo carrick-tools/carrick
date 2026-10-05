@@ -114,6 +114,23 @@ function packageRootOf(file: string): { root: string; manifest: PackageManifest 
   }
 }
 
+/**
+ * The installed package a file belongs to: its name, the directory it is
+ * installed in, and its version when that is a published one.
+ */
+export function installOf(file: string): { name: string; root: string; version?: string } | undefined {
+  let real: string;
+  try {
+    real = fs.realpathSync(file);
+  } catch {
+    return undefined;
+  }
+  const owner = packageRootOf(real);
+  if (!owner) return undefined;
+  const { name, version } = owner.manifest;
+  return isPublishedSemver(version) ? { name, root: owner.root, version } : { name, root: owner.root };
+}
+
 function existingFile(spec: string): string | undefined {
   for (const suffix of DECLARATION_SUFFIXES) {
     const candidate = spec + suffix;

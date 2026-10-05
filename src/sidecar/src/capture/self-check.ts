@@ -65,6 +65,13 @@ export interface SelfCheckArgs {
   /** Producer repo root; its node_modules (if any) backs resolution. */
   repoRoot: string;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
+  /**
+   * carrick#1910: imports the stub must leave unresolved though they resolve
+   * on the checkout, because the declaration that holds them was read with
+   * another version of the package than the stub pins. Absolute tree file ->
+   * specifier -> the sentence that says so.
+   */
+  readApart?: ReadonlyMap<string, ReadonlyMap<string, string>>;
 }
 
 interface FileFailures {
@@ -98,7 +105,15 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
   }
 
   try {
-    const first = runSelfCheck(args, treeFiles);
+    // carrick#1910: an import read with another version than the stub pins is
+    // repaired the same way, before anything is checked: the tree that is
+    // checked is the tree that is published.
+    const tree = args.guard.narrow(typesDir);
+    const apart = repairDanglingImports(
+      new Map([...(args.readApart ?? [])].map(([file, specifiers]) => [file, new Set(specifiers.keys())])),
+      tree
+    );
+    const first = runSelfCheck(args, treeFiles, apart.size > 0 ? apart : undefined);
     // carrick#1397: an emitted declaration that imports a module the checkout
     // does not have makes every alias reaching that file unpublishable, however
     // much of it resolved. Repair the file — drop the import, write `unknown`
@@ -106,9 +121,9 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
     // the verdict: it reads the repaired text, and a name the rewrite did not
     // reach comes back as a `Cannot find name` diagnostic that
     // `repairedNameFailures` folds back into the same dangling specifier.
-    const repaired = repairDanglingImports(first.internalFailuresByFile, args.guard.narrow(typesDir));
+    const repaired = repairDanglingImports(first.internalFailuresByFile, tree);
     if (repaired.size === 0) return first.records;
-    return runSelfCheck(args, treeFiles, repaired).records;
+    return runSelfCheck(args, treeFiles, new Map([...apart, ...repaired])).records;
   } finally {
     // unlinkSync, not rmSync: the link target is a directory and rmSync
     // refuses symlinks-to-directories with EISDIR.
@@ -204,6 +219,15 @@ function runSelfCheck(
       bucket.externalPinned.add(spec);
     } else {
       bucket.internal.add(spec);
+    }
+  }
+  // carrick#1910: an import read with another version than the stub pins that
+  // the repair could not take out of its file is a failure of that file, as
+  // one that did not resolve is. It resolves here, so no diagnostic says so.
+  for (const [file, specifiers] of args.readApart ?? []) {
+    const removed = repaired?.get(file)?.specifiers ?? [];
+    for (const specifier of specifiers.keys()) {
+      if (!removed.includes(specifier)) bucketIn(failuresByFile, path.resolve(file)).internal.add(specifier);
     }
   }
 
@@ -358,6 +382,13 @@ function checkedRecord(
   // publishes is this tree, so the record says where it does not resolve.
   let unresolvedPaths: string[] = [];
   const seeds: string[] = [];
+  // carrick#1910: the file that declares the member each deep finding sits
+  // under, and what the stub left unresolved in that file on purpose.
+  const declaredIn = new Map<string, string>();
+  const leftUnresolvedIn = (file: string | undefined): string | undefined => {
+    const sentences = file === undefined ? undefined : ctx.args.readApart?.get(path.resolve(file));
+    return sentences && [...sentences.values()].join('; ');
+  };
 
   if (ctx.surfaceSource) {
     for (const stmt of ctx.surfaceSource.statements) {
@@ -370,7 +401,8 @@ function checkedRecord(
           type,
           ctx.program,
           ctx.checker,
-          stmt.name
+          stmt.name,
+          declaredIn
         );
         unresolvedPaths = findUnresolvedPlaceholders(type, ctx.program, ctx.checker, stmt.name);
       } else if (isErrorPlaceholder(type)) {
@@ -512,7 +544,7 @@ function checkedRecord(
     ...(unexplainedDeep.length > 0
       ? {
           any_provenance: unexplainedDeep.map((finding) =>
-            provenanceOf(finding, anchor.unresolved)
+            provenanceOf(finding, anchor.unresolved, leftUnresolvedIn(declaredIn.get(finding.path)))
           ),
         }
       : {}),
