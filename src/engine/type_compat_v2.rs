@@ -364,11 +364,18 @@ fn path_names_a_member(path: &str) -> bool {
 /// (carrick#1166), or a request config that sets no body member
 /// (carrick-cloud#1366). `projected_value_only`: every read of the call's result
 /// takes a member out of it, so the site states a part of a payload and not a
-/// payload (carrick#1375).
+/// payload (carrick#1375). `no_response_body`: the route's handler ends the
+/// response without handing it a value (carrick#1913). `handler_body_unread`:
+/// the request named a handler, by its own span or through its registration,
+/// and nothing in the handler is a body the inferrer can state; the locator of
+/// such a request, run again, lands on the function or on the registration
+/// call, and prints the function or the router (carrick#1913).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
+    "no_response_body",
+    "handler_body_unread",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -3257,6 +3264,41 @@ mod tests {
             "a blind inference without a decision keeps its infer anchor, got {:?}",
             anchors[1]
         );
+    }
+
+    /// carrick#1913: a request located at a route's handler is answered
+    /// `unknown` with a reason of its own when the handler sends no body
+    /// (`no_response_body`) or sends one the inferrer cannot state
+    /// (`handler_body_unread`). Both are decisions: the request's locator is
+    /// the handler's span or its registration, and the capture's re-run of it
+    /// prints the function or the router as the route's body.
+    #[test]
+    fn derive_anchors_keeps_an_inferrer_decision_about_a_handler() {
+        for reason in ["no_response_body", "handler_body_unread"] {
+            let mut decided = inferred("Endpoint_handler_Response", "unknown", None, None);
+            decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: "unknown".to_string(),
+                reason: reason.to_string(),
+                detail: None,
+            }];
+            let infer = vec![response_body_infer("Endpoint_handler_Response")];
+
+            let anchors = derive_capture_anchors(&[], &infer, &[], &[decided], &[], "/repo");
+
+            assert_eq!(anchors.len(), 1, "{reason}: {anchors:?}");
+            match &anchors[0] {
+                CaptureAnchor::Literal {
+                    alias, type_text, ..
+                } => {
+                    assert_eq!(alias, "Endpoint_handler_Response");
+                    assert_eq!(type_text, "unknown");
+                }
+                other => {
+                    panic!("{reason}: a decided abstain must stay a literal unknown, got {other:?}")
+                }
+            }
+        }
     }
 
     /// carrick#1841: a consumer call whose result carries a library's own

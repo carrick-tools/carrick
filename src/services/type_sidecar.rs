@@ -56,9 +56,15 @@ pub enum InferKind {
     CallResult,
     /// Get type of a variable declaration
     Variable,
-    /// Find response body (.json()/.send()/ctx.body)
+    /// Find response body (.json()/.send()/ctx.body). An item whose span is a
+    /// function's own declaration asks about the route that function handles:
+    /// what it returns, or what it sends through the transport it was handed
+    /// (carrick#1913). Such an item is always answered, with a type or with a
+    /// decided `unknown`.
     ResponseBody,
-    /// Find request body (req.body/ctx.request.body or call payloads)
+    /// Find request body (req.body/ctx.request.body or call payloads). An item
+    /// whose span is a function's own declaration asks what that handler reads
+    /// as its body (carrick#1913).
     RequestBody,
     /// Function return for the signature hint — NO Promise/wrapper unwrapping
     SignatureReturn,
@@ -425,7 +431,7 @@ pub struct TypeProvenance {
     /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
-    /// `not_recorded`.
+    /// `not_recorded`, `no_response_body`, `handler_body_unread`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]

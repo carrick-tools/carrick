@@ -57,6 +57,7 @@ interface InferResponseShape {
     type_string: string;
     infer_kind: string;
     is_explicit: boolean;
+    any_provenance?: Array<{ path: string; reason: string }>;
   }>;
   errors?: string[];
 }
@@ -167,10 +168,18 @@ describe('Type inferrer gap regressions', () => {
     const inferred = response.inferred_types?.find(
       (t) => t.alias === 'GapRegistrationResponse'
     );
+    // carrick#1913: answered, and with a reason, never left unanswered. An
+    // unanswered request is run again by the capture, and the span of a
+    // registration prints the registration call's own value.
+    assert.ok(inferred, 'a registration-call span is answered so the capture does not ask again');
     assert.strictEqual(
-      inferred,
-      undefined,
-      `expected no inferred type for a registration-call span, got ${inferred?.type_string}`
+      inferred.type_string,
+      'unknown',
+      `expected no type for a registration-call span, got ${inferred.type_string}`
+    );
+    assert.deepStrictEqual(
+      (inferred.any_provenance ?? []).map((entry) => [entry.path, entry.reason]),
+      [['', 'handler_body_unread']]
     );
   });
 

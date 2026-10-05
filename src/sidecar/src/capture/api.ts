@@ -233,7 +233,9 @@ export type TypeProvenanceReason =
   | 'no_success_payload'
   | 'no_request_body'
   | 'projected_value_only'
-  | 'not_recorded';
+  | 'not_recorded'
+  | 'no_response_body'
+  | 'handler_body_unread';
 
 /**
  * One `any`/`unknown` finding inside a captured or inferred type, with its
