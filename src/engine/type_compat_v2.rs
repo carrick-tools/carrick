@@ -480,6 +480,21 @@ pub(crate) fn derive_capture_anchors(
         .filter(|inf| inference_decided_no_contract(inf))
         .map(|inf| inf.alias.as_str())
         .collect();
+    // carrick#1961: an answer whose text holds a top type is not carried as a
+    // literal; the capture reads a node itself, so its record can say which
+    // positions are open and why. Where the inferrer read that answer from
+    // one expression it names it, and that is the node to read: the request's
+    // own locator, for a request located at a handler or a registration, is
+    // the function or the registration call. First such answer per alias.
+    let mut reread_at: HashMap<&str, &crate::services::type_sidecar::RereadAt> = HashMap::new();
+    for inf in inferred {
+        if let Some(at) = inf.reread_at.as_ref()
+            && usable_inferred_text(&inf.type_string).is_none()
+            && !text_is_bare_top_type(&inf.type_string)
+        {
+            reread_at.entry(inf.alias.as_str()).or_insert(at);
+        }
+    }
 
     for request in explicit {
         let Some(alias) = request.alias.as_deref() else {
@@ -569,6 +584,22 @@ pub(crate) fn derive_capture_anchors(
                 source_file: None,
                 printed_names: Vec::new(),
                 raw_text_read: false,
+            });
+            continue;
+        }
+        // The inferrer named the expression its answer was read from
+        // (carrick#1961): the capture reads that node, by its span, in the
+        // file it is in. An infer anchor like any other, never a symbol one.
+        if let Some(at) = reread_at.get(alias) {
+            anchors.push(CaptureAnchor::Infer {
+                alias: alias.to_string(),
+                source_file: repo_relative(&at.file_path, repo_root),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                span_start: Some(at.span_start),
+                span_end: Some(at.span_end),
+                line_number: Some(at.line_number).filter(|l| *l > 0),
+                expression_text: None,
+                param_name: None,
             });
             continue;
         }
@@ -2989,6 +3020,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         }
     }
 
@@ -3301,6 +3333,91 @@ mod tests {
         }
     }
 
+    /// carrick#1961: a handler's body that holds an open member is not carried
+    /// as a literal, and the request that asked for it is located at the
+    /// handler. The capture is sent the expression the inferrer read, in the
+    /// file it is in, and not the handler's span, which prints the function.
+    /// An answer the scanner can carry keeps its literal, and an answer that
+    /// names no expression keeps the request's own locator.
+    #[test]
+    fn derive_anchors_reads_an_open_body_at_the_expression_the_inferrer_read() {
+        let reread = || crate::services::type_sidecar::RereadAt {
+            file_path: "/repo/src/sends.ts".to_string(),
+            span_start: 412,
+            span_end: 430,
+            line_number: 21,
+        };
+        let mut open = inferred(
+            "Endpoint_open_Response",
+            "{ id: string; tags: unknown; }",
+            Some("Tagged"),
+            None,
+        );
+        open.reread_at = Some(reread());
+        // A text the scanner carries is a literal whatever else it names.
+        let mut closed = inferred("Endpoint_closed_Response", "{ id: string; }", None, None);
+        closed.reread_at = Some(reread());
+        let unnamed = inferred(
+            "Endpoint_unnamed_Response",
+            "{ id: string; tags: unknown; }",
+            None,
+            None,
+        );
+        let at_handler = |alias: &str| InferRequestItem {
+            file_path: "/repo/src/handlers.ts".to_string(),
+            line_number: 9,
+            span_start: Some(100),
+            span_end: Some(260),
+            ..response_body_infer(alias)
+        };
+        let infer = vec![
+            at_handler("Endpoint_open_Response"),
+            at_handler("Endpoint_closed_Response"),
+            at_handler("Endpoint_unnamed_Response"),
+        ];
+
+        let anchors =
+            derive_capture_anchors(&[], &infer, &[], &[open, closed, unnamed], &[], "/repo");
+
+        assert_eq!(anchors.len(), 3, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Infer {
+                alias,
+                source_file,
+                span_start,
+                span_end,
+                line_number,
+                expression_text,
+                param_name,
+                ..
+            } => {
+                assert_eq!(alias, "Endpoint_open_Response");
+                assert_eq!(source_file, "src/sends.ts");
+                assert_eq!((*span_start, *span_end), (Some(412), Some(430)));
+                assert_eq!(*line_number, Some(21));
+                assert!(expression_text.is_none() && param_name.is_none());
+            }
+            other => panic!("an open body is read at the expression, got {other:?}"),
+        }
+        assert!(
+            matches!(&anchors[1], CaptureAnchor::Literal { type_text, .. } if type_text == "{ id: string; }"),
+            "a text the scanner carries stays a literal, got {:?}",
+            anchors[1]
+        );
+        match &anchors[2] {
+            CaptureAnchor::Infer {
+                source_file,
+                span_start,
+                span_end,
+                ..
+            } => {
+                assert_eq!(source_file, "src/handlers.ts");
+                assert_eq!((*span_start, *span_end), (Some(100), Some(260)));
+            }
+            other => panic!("with no expression named the request's locator stands, got {other:?}"),
+        }
+    }
+
     /// carrick#1841: a consumer call whose result carries a library's own
     /// response object is answered `unknown` with `machinery_envelope` at the
     /// root. That is a decision: the capture's raw locator re-run would resolve
@@ -3607,6 +3724,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         };
 
         let infer = vec![
@@ -3738,6 +3856,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -4344,6 +4463,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         };
 
         let explicit = vec![

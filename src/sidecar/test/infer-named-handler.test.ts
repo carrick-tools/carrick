@@ -437,7 +437,7 @@ export const mapsWithANamedFunction = async (_req: Req, res: Res) => {
   res.json(widgets.map(toLabel));
 };
 
-interface Tagged {
+export interface Tagged {
   id: string;
   tags: unknown;
 }
@@ -445,6 +445,20 @@ declare function loadTagged(): Promise<Tagged>;
 
 export const sendsAnOpenMember = async (_req: Req, res: Res) => {
   res.json(await loadTagged());
+};
+
+export const sendsOpenMembersOnTwoPaths = async (req: Req, res: Res) => {
+  if (req.params.id === 'first') {
+    res.json(await loadTagged());
+    return;
+  }
+  res.json({ other: await loadTagged() });
+};
+
+declare const untyped: any;
+
+export const sendsAny = async (_req: Req, res: Res) => {
+  res.json(untyped);
 };
 `;
 
@@ -483,6 +497,18 @@ interface Inferred {
   type_string: string;
   is_explicit: boolean;
   any_provenance?: Array<{ path: string; kind: string; reason: string; detail?: string }>;
+  reread_at?: { file_path: string; span_start: number; span_end: number; line_number: number };
+}
+
+interface CaptureShape {
+  success?: boolean;
+  result?: CaptureShape;
+  aliases?: Array<{
+    alias: string;
+    serialization: string;
+    self_check: string;
+    any_provenance?: Array<{ path: string; kind: string; reason: string }>;
+  }>;
 }
 
 interface InferShape {
@@ -1087,14 +1113,84 @@ describe('carrick#1913: a route whose handler is a named function in another fil
       );
     });
 
-    it('answers a body that holds an open member with unknown, not with the function', async () => {
-      // The scanner does not carry a text that holds `unknown`; it runs the
-      // request's locator through the capture, and this locator is a function.
-      assertDecided(
-        await inSends('sendsAnOpenMember = async'),
-        'handler_body_unread',
-        'an unanswered request at a handler prints the handler'
+    it('names the expression a body with an open member was read from, for the capture to read', async () => {
+      // carrick#1961: the scanner does not carry a text that holds `unknown`;
+      // it has the capture read a node. Named here, that node is the body.
+      // Left to the request's own locator it is the handler, and the capture
+      // prints the function.
+      const inferred = await inSends('sendsAnOpenMember = async');
+      assertBody(inferred, '{ id: string; tags: unknown; }', 'the body is read, open member and all');
+      const at = inferred?.reread_at;
+      assert.ok(at, 'the answer names the expression it was read from');
+      assert.strictEqual(at.file_path, fileOf('sends.ts'));
+      assert.strictEqual(
+        SENDS_TS.slice(at.span_start, at.span_end),
+        'await loadTagged()',
+        'the awaited value is the body, not the promise'
       );
+      assert.strictEqual(at.line_number, lineOf(SENDS_TS, 'res.json(await loadTagged());'));
+    });
+
+    it('gives the capture a type with the open member marked as the declaration states it', async () => {
+      const inferred = await inSends('sendsAnOpenMember = async');
+      const at = inferred?.reread_at;
+      assert.ok(at, 'the answer names the expression it was read from');
+      const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1961-stub-'));
+      try {
+        const res = await client.send<CaptureShape>(
+          {
+            action: 'capture_v2',
+            request_id: 'capture-open-member',
+            repo_root: repoDir,
+            service_name: 'named-handler',
+            out_dir: outDir,
+            anchors: [
+              {
+                kind: 'infer',
+                alias: 'Endpoint_open_Response',
+                source_file: path.relative(repoDir, at.file_path),
+                anchor_origin: 'deterministic-infer',
+                span_start: at.span_start,
+                span_end: at.span_end,
+                line_number: at.line_number,
+              },
+            ],
+          },
+          120000
+        );
+        const record = (res.result ?? res).aliases?.find(
+          (entry) => entry.alias === 'Endpoint_open_Response'
+        );
+        assert.ok(record, `the capture answers the alias: ${JSON.stringify(res).slice(0, 400)}`);
+        assert.strictEqual(record.serialization, 'node_builder', JSON.stringify(record));
+        assert.deepStrictEqual(
+          (record.any_provenance ?? []).map((entry) => [entry.path, entry.kind, entry.reason]),
+          [['tags', 'unknown', 'declared']],
+          'the one open member is recorded as the declaration states it'
+        );
+        const surface = fs.readFileSync(path.join(outDir, 'types', 'surface.d.ts'), 'utf8');
+        const line = surface
+          .split('\n')
+          .find((text) => text.includes('Endpoint_open_Response'));
+        assert.ok(line && !line.includes('=>'), `the surface holds the body, not a function: ${line}`);
+        assert.ok(line && !/=\s*(any|unknown);/.test(line), `the surface holds a type: ${line}`);
+      } finally {
+        fs.rmSync(outDir, { recursive: true, force: true });
+      }
+    });
+
+    it('withholds a body with open members joined from two sends', async () => {
+      // No one expression carries a join, and the request's own locator is a
+      // function, so nothing the capture could read in its place is the body.
+      const inferred = await inSends('sendsOpenMembersOnTwoPaths = async');
+      assertDecided(inferred, 'handler_body_unread', 'a join has no single node');
+      assert.strictEqual(inferred?.reread_at, undefined);
+    });
+
+    it('keeps a body that is any outright abstained', async () => {
+      const inferred = await inSends('sendsAny = async');
+      assertDecided(inferred, 'handler_body_unread', 'an untyped value states no contract');
+      assert.strictEqual(inferred?.reread_at, undefined);
     });
   });
 

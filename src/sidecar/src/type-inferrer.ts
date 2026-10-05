@@ -592,6 +592,12 @@ export class TypeInferrer {
    * unwidened reading re-reads from here (carrick#1516).
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
+  /**
+   * The answers read from ONE payload expression, whose own type is the
+   * answer (carrick#1961). An answer joined from several sends, or read off a
+   * function's declared return, has no single node that carries it.
+   */
+  private readonly readFromOneNode = new WeakSet<InferredType>();
   private readonly unwidenedBudgetMs: number;
 
   constructor(options: TypeInferrerOptions) {
@@ -1984,7 +1990,7 @@ export class TypeInferrer {
       resolvedSymbol !== undefined && recoveredAnchor
         ? this.primaryTypeSymbolSource(recoveredAnchor.element)
         : undefined;
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       recovered.typeString,
       recovered.isExplicit,
@@ -1994,6 +2000,8 @@ export class TypeInferrer {
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
       writtenAnchor ? writtenAnchor.source : resolvedSource
     );
+    if (recovered.nodes.length === 1) this.readFromOneNode.add(inferred);
+    return inferred;
   }
 
   /**
@@ -6228,9 +6236,11 @@ export class TypeInferrer {
    *    value the bound handler does not return. The wrapper consumed it, and
    *    what it sent in its place (the value, or an envelope around it) is in
    *    the wrapper;
-   *  - a body that holds `any` or `unknown`. The scanner does not carry such a
-   *    text, and what it does in its place is run this request's locator
-   *    through the capture, which at a handler prints the handler.
+   *  - a body that holds `any` or `unknown` and is not read from one
+   *    expression. The scanner does not carry such a text; it has the capture
+   *    read a node. One expression is named for it (`reread_at`,
+   *    carrick#1961); a join of several, or a declared return, has none, and
+   *    this request's own locator would print the handler.
    */
   private handlerResponse(
     request: InferRequestItem,
@@ -6240,14 +6250,40 @@ export class TypeInferrer {
   ): InferredType {
     const unread = (at: Node, detail: string): InferredType =>
       this.decidedAbstain(request, at, 'handler_body_unread', detail);
-    const published = (read: InferredType): InferredType =>
-      textHoldsTopType(read.type_string)
-        ? unread(
-            handler,
-            "the body the handler states holds a member typed 'any' or 'unknown', and a " +
-              'request located at a handler cannot carry one, so the route publishes no body here'
-          )
-        : read;
+    // carrick#1961: a body that holds `any` or `unknown` is not a text the
+    // scanner carries. Read from one expression, the answer names that
+    // expression and the capture reads it there, which is what records an
+    // open member as the declaration's own. Anything else is withheld: left to
+    // this request's own locator, the capture prints the handler.
+    const published = (read: InferredType): InferredType => {
+      if (!textHoldsTopType(read.type_string)) return read;
+      let node = this.readNodes.get(read.source_location);
+      if (node && this.readFromOneNode.has(read)) {
+        // The answer is the AWAITED value: name the `await`, not what it awaits.
+        for (
+          let parent = node.getParent();
+          parent &&
+          (Node.isAwaitExpression(parent) || Node.isParenthesizedExpression(parent)) &&
+          parent.getExpression() === node;
+          parent = node.getParent()
+        ) {
+          node = parent;
+        }
+        read.reread_at = {
+          file_path: node.getSourceFile().getFilePath(),
+          span_start: node.getStart(),
+          span_end: node.getEnd(),
+          line_number: node.getStartLineNumber(),
+        };
+        return read;
+      }
+      return unread(
+        handler,
+        "the body the handler states holds a member typed 'any' or 'unknown', and it is not " +
+          'read from one expression the capture can read in its place, so the route publishes ' +
+          'no body here'
+      );
+    };
 
     const returned = this.returnedMembers(handler);
     const isTransport = (member: Type): boolean =>

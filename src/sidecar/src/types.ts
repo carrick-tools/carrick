@@ -963,6 +963,23 @@ export interface InferredType {
    * Absent when the body is not a raw-text read.
    */
   raw_text_read?: true;
+  /**
+   * carrick#1961: the node this answer was read from, for an answer whose
+   * text holds `any` or `unknown` and whose node carries that same type. The
+   * scanner does not carry such a text; it has the capture read a node
+   * itself, so that the capture's record says which positions are open and
+   * why. Left to the request's own locator, that node is the handler or the
+   * registration the request was located at, and the capture prints the
+   * function. With this, it reads the body. `file_path` is absolute and the
+   * span is in this sidecar's numbering, as `span_start`/`span_end` are on a
+   * request. Absent on every other answer.
+   */
+  reread_at?: {
+    file_path: string;
+    span_start: number;
+    span_end: number;
+    line_number: number;
+  };
 }
 
 /**
