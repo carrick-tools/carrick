@@ -44,11 +44,12 @@ find_similar({{SCOPE}})
 Call again with `offset: <next_offset>` for as long as the response carries
 `has_more`, and class what every page returned.
 
-Where the project is larger than one pass, the response carries `error` in place
-of clusters and names the two routes under the ceiling: a `service`, or a higher
-`min_lines`. Take the route the response names and run it again. Where
-`truncated` is present the audit is partial, and its `scanned_functions` of `of`
-says by how much.
+Where the project is larger than one pass, the response carries `window`: the
+functions it compared, in path order, each against every function after them.
+Call again with `scan_from: <next_scan_from>` until a response carries no
+`next_scan_from`; the windows together compare every pair once. `path` narrows
+an audit to one directory. Where `truncated` is present the audit is partial,
+and its `scanned_functions` of `of` says by how much.
 
 ## Class every row
 
