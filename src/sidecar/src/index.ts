@@ -68,7 +68,6 @@ let initTimeMs: number | null = null;
 interface ProjectComponents {
   typeBundler: TypeBundler;
   typeInferrer: TypeInferrer;
-  definitionResolver: DefinitionResolver;
   retyper: Retyper;
   claimsVerifier: LibraryClaimsVerifier;
 }
@@ -79,6 +78,14 @@ interface ProjectComponents {
  * the service's files (carrick#1604).
  */
 let components = new Map<string, ProjectComponents>();
+
+/**
+ * Reads a capture stub's own declaration tree and nothing of the init'd
+ * project, so it is not one of the project's components: taking it from them
+ * would build the service's whole program to answer about the stub
+ * (carrick#1927).
+ */
+const definitionResolver = new DefinitionResolver();
 
 /**
  * Get the project-backed components, building the project if this is the
@@ -109,7 +116,6 @@ function projectComponents(key = ''): ProjectComponents {
     built = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       typeInferrer,
-      definitionResolver: new DefinitionResolver({ project }),
       // Locates calls exactly as `infer` does, so it rewrites the node the
       // consumer's published type came from (carrick#1491).
       // The walk is typed against the capture bundle's compiler copy and
@@ -560,7 +566,8 @@ function handleListLibrarySurface(
 
 /**
  * Handle the 'resolve_definitions' action - resolve surface aliases from a
- * v2 capture stub package's declaration tree.
+ * v2 capture stub package's declaration tree. Stateless, as `capture_v2` is:
+ * it needs no init and builds no project but the stub's own.
  */
 function handleResolveDefinitions(
   request: SidecarRequest & { action: 'resolve_definitions' },
@@ -568,10 +575,7 @@ function handleResolveDefinitions(
   try {
     log(`Resolving ${request.aliases.length} type alias(es) from ${request.stub_dir}`);
 
-    const results = projectComponents().definitionResolver.resolveFromStub(
-      request.stub_dir,
-      request.aliases,
-    );
+    const results = definitionResolver.resolveFromStub(request.stub_dir, request.aliases);
 
     return {
       request_id: request.request_id,

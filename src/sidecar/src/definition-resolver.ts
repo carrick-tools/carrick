@@ -26,9 +26,11 @@
  * inference path in `type-inferrer.ts`), which walks the resolved `Type` and
  * rebuilds the inlined text.
  *
- * Each resolve call builds its own throwaway in-memory project over the stub
- * tree, so the warm sidecar's long-lived project never sees stub files and
- * cannot accumulate stale trees across requests.
+ * Each resolve call builds its own throwaway project over the stub tree and
+ * reads nothing else: not the service's project, and not whether the sidecar
+ * was ever initialised. So the request costs what the stub costs, in a process
+ * that has built nothing as in one that has (carrick#1927), and the sidecar's
+ * long-lived project never sees stub files.
  */
 
 import * as path from 'node:path';
@@ -48,12 +50,6 @@ export interface ResolvedDefinition {
 }
 
 export class DefinitionResolver {
-  private readonly project: Project;
-
-  constructor(options: { project: Project }) {
-    this.project = options.project;
-  }
-
   /**
    * Resolve surface aliases from a capture stub package directory
    * (`<stub_dir>/types/surface.d.ts` + its declaration tree).

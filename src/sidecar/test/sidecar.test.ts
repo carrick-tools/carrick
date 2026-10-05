@@ -1593,29 +1593,6 @@ describe('Type Sidecar Integration Tests', () => {
         assert.strictEqual(expanded, '[number, string]');
       });
     });
-
-    it('should fail before init', async () => {
-      const freshClient = new SidecarClient();
-      await freshClient.start();
-
-      try {
-        const response = await freshClient.send<{
-          request_id: string;
-          status: string;
-          errors?: string[];
-        }>({
-          action: 'resolve_definitions',
-          request_id: 'resolve-uninit',
-          stub_dir: stubDirFor('export type Foo = string;'),
-          aliases: ['Foo'],
-        });
-
-        assert.strictEqual(response.status, 'error');
-        assert.ok(response.errors?.some((e) => e.toLowerCase().includes('init')));
-      } finally {
-        await freshClient.stop();
-      }
-    });
   });
 
   describe('error handling', () => {

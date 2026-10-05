@@ -99,11 +99,11 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `resolve_definitions`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
 
-`capture_v2`, `check_v2`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
+`capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
-`capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. When both die, the service is recorded with how each process ended and the stage its last progress frame named. A `resolve_definitions` after it builds the init'd project again in the fresh process.
+`capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. When both die, the service is recorded with how each process ended and the stage its last progress frame named. The `resolve_definitions` that follows a capture is answered by that fresh process, which reads the stub and builds nothing of the service (carrick#1927).
 
 ### Actions
 
@@ -117,14 +117,14 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
-| `resolve_definitions` | yes | As-written and structural form of captured aliases |
+| `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
 | `shutdown` | no | Graceful exit |
 
 #### `init` - Point the sidecar at a project
 
-Resolves which tsconfig (or default patterns) the project will be built from and answers immediately. The ts-morph project itself is built by the first request that reads it — `bundle`, `infer` or `resolve_definitions` — and reused after that. So `init` costs the same on a repo with its dependencies installed as on a bare checkout, and the time a large program takes to build is charged to a request's deadline rather than to readiness (carrick#749).
+Resolves which tsconfig (or default patterns) the project will be built from and answers immediately. The ts-morph project itself is built by the first request that reads it — `infer`, `retype_check`, `bundle` or one of the library checks — and reused after that. So `init` costs the same on a repo with its dependencies installed as on a bare checkout, and the time a large program takes to build is charged to a request's deadline rather than to readiness (carrick#749).
 
 Re-initialising re-scopes the sidecar to another root, and drops the previous project along with everything built over it.
 
@@ -722,7 +722,7 @@ Response:
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 
-Resolves surface aliases from a stub package's declaration tree (`<stub_dir>/types/surface.d.ts`), in a dedicated throwaway project so the warm project never sees stub files. Returns two forms per alias: `definition` as written (named refs preserved) and `expanded` fully structural, with named members inlined. Union members print in a canonical order, so the same tree always yields the same string (carrick#735).
+Resolves surface aliases from a stub package's declaration tree (`<stub_dir>/types/surface.d.ts`), in a dedicated throwaway project so the warm project never sees stub files. Stateless: it needs no `init` and never builds the init'd project, so it costs what the stub costs. Returns two forms per alias: `definition` as written (named refs preserved) and `expanded` fully structural, with named members inlined. Union members print in a canonical order, so the same tree always yields the same string (carrick#735).
 
 An alias that does not resolve is skipped, not failed.
 
@@ -784,6 +784,8 @@ Response:
 
 #### `health` - Readiness
 
+The scanner does not send it; it is kept for probing a sidecar by hand.
+
 ```json
 { "request_id": "10", "action": "health" }
 ```
@@ -814,10 +816,11 @@ Response, written before the process exits:
 │                                                                  │
 │  project-backed (built lazily after init):                       │
 │    TypeBundler · TypeInferrer                                    │
-│    DefinitionResolver                                            │
+│    Retyper · LibraryClaimsVerifier                               │
 │                                                                  │
 │  stateless (own program / own workspace per request):            │
 │    capture/ (capture_v2, check_v2)                               │
+│    DefinitionResolver (the stub's own tree)                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
