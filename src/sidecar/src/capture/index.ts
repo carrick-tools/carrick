@@ -306,13 +306,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
 
   const scratch = WriteGuard.scratch('carrick-capture-v2-');
   const staging = scratch.dir;
-  const emitted = new Map<string, string>();
-  // Input .d.ts files (ambient stubs, augmentation declarations, local
-  // hand-written declarations in the import closure) are never re-emitted by
-  // tsc; they must ship verbatim or the tree's references to them dangle.
-  const declarationSources = new Map<string, string>();
-  const sourceByEmitted = new Map<string, string>();
-  let emitPartial = false;
+  let written: DeclarationEmit;
   try {
     progress('emit', 'emitting declarations');
     guard.writeFile(entryPath, entryLines.join('\n') + '\n');
@@ -330,42 +324,22 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       outDir: staging,
       rootDir: entryDir,
     };
-    const program = ts.createProgram([entryPath, ...augmentationSources], emitOptions, deno?.host(emitOptions));
-    const emitResult = program.emit(
-      undefined,
-      (fileName, text, _bom, _error, sources) => {
-        emitted.set(fileName, text);
-        if (sources?.[0]) sourceByEmitted.set(path.relative(staging, fileName).split(path.sep).join('/'), sources[0].fileName);
-      },
-      undefined,
-      /* emitOnlyDtsFiles */ true
-    );
-    // emitSkipped is PER-PROGRAM even when only one file's declaration emit
-    // failed (e.g. TS4023 from a hand-rolled ambient stub shadowing a real
-    // package): every other file's .d.ts was still written to the callback.
-    // Fail wholesale only when nothing at all emitted; otherwise keep the
-    // emitted subset and demote exactly the aliases it cannot support.
-    if (emitResult.emitSkipped && emitted.size === 0) {
-      return fail(stubDir, packageName, ['declaration emit was skipped']);
-    }
-    emitPartial = emitResult.emitSkipped;
-    for (const d of emitResult.diagnostics) {
-      errors.push(ts.flattenDiagnosticMessageText(d.messageText, '\n'));
-    }
-    for (const sourceFile of program.getSourceFiles()) {
-      if (!sourceFile.isDeclarationFile) continue;
-      const abs = path.resolve(sourceFile.fileName);
-      const rel = path.relative(entryDir, abs).split(path.sep).join('/');
-      if (rel.startsWith('..') || rel.includes('node_modules/')) continue;
-      declarationSources.set(rel, sourceFile.getFullText());
-      sourceByEmitted.set(rel, abs);
-    }
+    written = emitDeclarations({
+      rootNames: [entryPath, ...augmentationSources],
+      options: emitOptions,
+      host: deno?.host(emitOptions),
+      staging,
+      entryDir,
+    });
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   } finally {
     if (fs.existsSync(entryPath)) guard.unlink(entryPath);
     scratch.guard.remove(staging);
   }
+  const { emitted, declarationSources, sourceByEmitted } = written;
+  const emitPartial = written.partial;
+  errors.push(...written.diagnostics);
 
   // ---- Partial-emit recovery ----
   // The corpus-2 notifications-svc shape: one file's declaration emit was
@@ -583,6 +557,87 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     bare_checkout: bareCheckout,
     ts_version: ts.version,
     errors,
+  };
+}
+
+/** What one declaration emit wrote, as text: nothing here is a compiler object. */
+interface DeclarationEmit {
+  /** Staging-absolute emitted file -> its text. */
+  emitted: Map<string, string>;
+  /**
+   * Input .d.ts files (ambient stubs, augmentation declarations, local
+   * hand-written declarations in the import closure), by their path from
+   * `entryDir`. They are never re-emitted by tsc; they must ship verbatim or
+   * the tree's references to them dangle.
+   */
+  declarationSources: Map<string, string>;
+  /** Tree-relative file -> the source file it was emitted or copied from. */
+  sourceByEmitted: Map<string, string>;
+  /** The compiler skipped at least one file's declaration and wrote the rest. */
+  partial: boolean;
+  /** The emit's own diagnostics, as text. */
+  diagnostics: string[];
+}
+
+/**
+ * Phase B: build the program of the final entry and emit its declarations.
+ *
+ * A function of its own so that its program dies with it (carrick#1916). The
+ * program is as large as the service, and nothing after the emit reads it:
+ * what the capture needs is the text returned here. While the emit ran inside
+ * `captureStub`, that one long function's frame went on holding the program
+ * for as long as the capture ran, so the self-check loaded its own program
+ * beside it; on a 2,345-file service that was 1,290 MB of a 2,741 MB peak.
+ *
+ * The caller builds the options and the host. A host is held by its program
+ * and holds none itself, so the caller keeping one keeps no program alive.
+ *
+ * Throws when the emit was skipped and wrote nothing.
+ */
+function emitDeclarations(args: {
+  rootNames: string[];
+  options: ts.CompilerOptions;
+  host: ts.CompilerHost | undefined;
+  /** The directory the emit is written under (`options.outDir`). */
+  staging: string;
+  /** The directory the entry sits in (`options.rootDir`). */
+  entryDir: string;
+}): DeclarationEmit {
+  const emitted = new Map<string, string>();
+  const declarationSources = new Map<string, string>();
+  const sourceByEmitted = new Map<string, string>();
+  const program = ts.createProgram(args.rootNames, args.options, args.host);
+  const emitResult = program.emit(
+    undefined,
+    (fileName, text, _bom, _error, sources) => {
+      emitted.set(fileName, text);
+      if (sources?.[0]) sourceByEmitted.set(path.relative(args.staging, fileName).split(path.sep).join('/'), sources[0].fileName);
+    },
+    undefined,
+    /* emitOnlyDtsFiles */ true
+  );
+  // emitSkipped is PER-PROGRAM even when only one file's declaration emit
+  // failed (e.g. TS4023 from a hand-rolled ambient stub shadowing a real
+  // package): every other file's .d.ts was still written to the callback.
+  // Fail wholesale only when nothing at all emitted; otherwise keep the
+  // emitted subset and demote exactly the aliases it cannot support.
+  if (emitResult.emitSkipped && emitted.size === 0) {
+    throw new Error('declaration emit was skipped');
+  }
+  for (const sourceFile of program.getSourceFiles()) {
+    if (!sourceFile.isDeclarationFile) continue;
+    const abs = path.resolve(sourceFile.fileName);
+    const rel = path.relative(args.entryDir, abs).split(path.sep).join('/');
+    if (rel.startsWith('..') || rel.includes('node_modules/')) continue;
+    declarationSources.set(rel, sourceFile.getFullText());
+    sourceByEmitted.set(rel, abs);
+  }
+  return {
+    emitted,
+    declarationSources,
+    sourceByEmitted,
+    partial: emitResult.emitSkipped,
+    diagnostics: emitResult.diagnostics.map((d) => ts.flattenDiagnosticMessageText(d.messageText, '\n')),
   };
 }
 
