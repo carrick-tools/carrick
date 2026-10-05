@@ -331,6 +331,90 @@ export const writesInALoop = async (_req: Req, res: Res) => {
 
 export const conciseSend = (_req: Req, res: Res) => res.json({ concise: true });
 
+declare function rejectWith(res: Res, code: string): void;
+declare function finishWith(options: { res: Res; widgets: Widget[] }): Promise<void>;
+
+function rejects(res: Res, code: string): void {
+  res.status(400).json({ error: code });
+}
+
+function answersAll(res: Res, widgets: Widget[]): void {
+  res.json({ widgets });
+}
+
+function passesAlong(res: Res): void {
+  rejects(res, 'again');
+}
+
+async function finishes({ res, widgets }: { res: Res; widgets: Widget[] }): Promise<void> {
+  res.status(200).json({ finished: widgets.length });
+}
+
+export const guardsWithAHelper = async (req: Req, res: Res) => {
+  const widgets = await listAll();
+  if (widgets.length === 0) {
+    rejects(res, 'no_widget');
+    return;
+  }
+  res.status(200).json({ found: widgets[0], asked: req.params.id });
+};
+
+export const answersThroughAHelper = async (req: Req, res: Res) => {
+  const widgets = await listAll();
+  if (req.params.id === 'all') {
+    answersAll(res, widgets);
+    return;
+  }
+  res.json({ one: widgets[0] });
+};
+
+export const handsOnTwice = async (_req: Req, res: Res) => {
+  passesAlong(res);
+};
+
+export const onlyRejects = async (_req: Req, res: Res) => {
+  rejects(res, 'never');
+};
+
+export const finishesInAnObject = async (req: Req, res: Res) => {
+  const widgets = await listAll();
+  if (req.params.id === 'none') {
+    res.status(400).json({ error: 'bad id' });
+    return;
+  }
+  await finishes({ res, widgets });
+};
+declare function record(entry: { status: number; bytes: string | undefined }): void;
+declare function later(run: () => void): void;
+
+export const guardsThenSends = async (req: Req, res: Res) => {
+  const widgets = await listAll();
+  if (widgets.length === 0) {
+    rejectWith(res, 'no_widget');
+    return;
+  }
+  res.status(200).json({ found: widgets[0], asked: req.params.id });
+};
+
+export const handsOffInAnObject = async (req: Req, res: Res) => {
+  const widgets = await listAll();
+  if (req.params.id === 'none') {
+    res.status(400).json({ error: 'bad id' });
+    return;
+  }
+  await finishWith({ res, widgets });
+};
+
+export const readsAfterTheSend = async (_req: Req, res: Res) => {
+  res.json({ measured: true });
+  record({ status: res.statusCode, bytes: res.getHeader('content-length') });
+};
+
+export const readsInACallback = async (_req: Req, res: Res) => {
+  later(() => record({ status: res.statusCode, bytes: res.getHeader('content-length') }));
+  res.json({ logged: true });
+};
+
 declare function toLabel(widget: Widget): { label: string };
 
 export const mapsWithANamedFunction = async (_req: Req, res: Res) => {
@@ -798,6 +882,87 @@ describe('carrick#1913: a route whose handler is a named function in another fil
         await inSends('handsOff = async'),
         'handler_body_unread',
         'what that function sends is not in this handler'
+      );
+    });
+
+    it('never drops a path it hands on to a function it cannot read', async () => {
+      // The helper has no body in the program. Guessing that it reports an
+      // error would publish a body that is missing whatever it does send.
+      const inferred = await inSends('guardsThenSends = async');
+      assertDecided(
+        inferred,
+        'handler_body_unread',
+        'the handler sends a body itself, and a helper nobody can read sends on another path'
+      );
+      assert.match((inferred?.any_provenance ?? [])[0]?.detail ?? '', /no body in the program/);
+    });
+
+    it('follows a hand-off into an error helper and leaves that path out', async () => {
+      assertBody(
+        await inSends('guardsWithAHelper = async'),
+        `{ found: ${WIDGET}; asked: string; }`,
+        'the helper states a written 400, so its path is an error path'
+      );
+    });
+
+    it('joins the body a helper sends on the path that hands on to it', async () => {
+      assertBody(
+        await inSends('answersThroughAHelper = async'),
+        `{ widgets: ${WIDGET}[]; } | { one: ${WIDGET}; }`,
+        'the helper sends a success body, and it is part of what the route sends'
+      );
+    });
+
+    it('follows a hand-off one level and no further', async () => {
+      const inferred = await inSends('handsOnTwice = async');
+      assertDecided(
+        inferred,
+        'handler_body_unread',
+        'the helper hands the transport on again'
+      );
+      assert.match((inferred?.any_provenance ?? [])[0]?.detail ?? '', /hands it on again/);
+    });
+
+    it('says only errors when the one helper a handler hands on to only rejects', async () => {
+      assertDecided(
+        await inSends('onlyRejects = async'),
+        'no_success_payload',
+        'the path was read, and it states an error'
+      );
+    });
+
+    it('follows a hand-off made inside an object to the member it arrives as', async () => {
+      assertBody(
+        await inSends('finishesInAnObject = async'),
+        '{ finished: number; }',
+        'the helper takes the object apart in its parameter list'
+      );
+    });
+
+    it('reads a parameter passed inside an object as handed on, and says so', async () => {
+      const inferred = await inSends('handsOffInAnObject = async');
+      assertDecided(
+        inferred,
+        'handler_body_unread',
+        'the only send of its own is an error; the success is in the function it hands on to'
+      );
+      const detail = (inferred?.any_provenance ?? [])[0]?.detail ?? '';
+      assert.match(detail, /another function/, 'the reason is the hand-off, not "only errors"');
+    });
+
+    it('does not take a read of the parameter after the send for another send', async () => {
+      assertBody(
+        await inSends('readsAfterTheSend = async'),
+        '{ measured: boolean; }',
+        'a call whose value is used reads the response, it does not send one'
+      );
+    });
+
+    it('does not abstain over a callback that only reads the parameter', async () => {
+      assertBody(
+        await inSends('readsInACallback = async'),
+        '{ logged: boolean; }',
+        'nothing in the callback sends'
       );
     });
 

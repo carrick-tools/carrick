@@ -60,6 +60,7 @@ import {
   parameterUses,
   statementsBefore,
   type DirectCall,
+  type ParameterUses,
 } from './handler-sends.js';
 import {
   addedDiagnostics,
@@ -243,6 +244,38 @@ const WRAPPER_MAX_DEPTH = 3;
  *    and `why` says what was in the way;
  *  - `none`: it does nothing with a transport parameter.
  */
+/**
+ * How far a path that hands the transport to another function is followed
+ * (carrick#1913): into that function, and no further. A function that hands
+ * the transport on again is not read, and the handler is then unread.
+ */
+const HAND_OFF_DEPTH = 1;
+
+/**
+ * What a call on a transport parameter carries: a `value` (a payload in a
+ * parameter its declaration leaves open), nothing (`empty`: no argument, or
+ * numbers alone, which state a status and send no body), or something the
+ * reading cannot state (`opaque`).
+ */
+type Carried = 'value' | 'empty' | 'opaque';
+
+/** The last send of each path of a function; see `TypeInferrer.lastSends`. */
+interface LastSends {
+  last: Array<{
+    call: CallExpression;
+    carried: Carried;
+    status: ResponseSiteStatus;
+    /** Where the handler reaches it, for the order of a joined body. */
+    order: number;
+  }>;
+  /** A value handed to an open parameter before the last call on the transport. */
+  writtenBefore?: Node;
+  /** True when the function does anything with the transport. */
+  touched: boolean;
+  /** The first thing it does with the transport, to locate an abstain at. */
+  first: Node;
+}
+
 type ParameterSends =
   | { kind: 'body'; recovered: RecoveredPayload }
   | { kind: 'no_body'; at: Node }
@@ -6388,11 +6421,18 @@ export class TypeInferrer {
    * (`res.status(code)`) makes that path abstain: it does not join, and with
    * no other path the handler is unread.
    *
-   * A catch clause answers a failure, so nothing in one joins or blocks. A
-   * parameter handed to another function as the last thing on a path, kept as
-   * a value, assigned a member that is not a number, or used inside a function
-   * the handler declares makes the handler unread: what is sent is decided
-   * somewhere this reading does not go.
+   * A catch clause answers a failure, so nothing in one joins or blocks.
+   *
+   * A path that ends by handing the parameter to another function (as an
+   * argument, or inside an object literal that is one) is read in that
+   * function, one level deep (`lastSends`). Where that function cannot be
+   * read, the handler is unread.
+   *
+   * A parameter kept as a value, assigned a member that is not a number, or
+   * acted on inside a function the handler declares (a send in a callback)
+   * makes the whole handler unread: what is sent is decided somewhere this
+   * reading does not go. A READ of the parameter is none of these: a member
+   * read, or a call whose value is used.
    */
   private parameterSends(handler: FunctionLike, wire: WireFormat): ParameterSends {
     if (!handler.getBody()) return { kind: 'none' };
@@ -6401,9 +6441,96 @@ export class TypeInferrer {
       uses.parameters.filter((parameter) => this.isTransportParameter(parameter))
     );
     if (transport.size === 0) return { kind: 'none' };
+    const facts = this.lastSends(handler, uses, transport, HAND_OFF_DEPTH);
+    if ('unread' in facts) {
+      return { kind: 'unread', at: facts.unread.at, why: facts.unread.why };
+    }
+    if (!facts.touched) return { kind: 'none' };
+    const unread = (at: Node, why: string): ParameterSends => ({ kind: 'unread', why, at });
+
+    const joins = facts.last
+      .filter(
+        (send) =>
+          send.carried === 'value' && (send.status === 'success' || send.status === 'undecided')
+      )
+      // In the order the handler reaches them: a body a helper sends sits
+      // where the handler hands the transport to it.
+      .sort((a, b) => a.order - b.order);
+    if (joins.length > 0) {
+      const recovered = this.recoverPayloadFromResponseExpressions(
+        joins.map((send) => send.call),
+        false,
+        wire
+      );
+      if (recovered) return { kind: 'body', recovered };
+    }
+
+    const unwritten = facts.last.find((send) => send.status === 'variable');
+    if (unwritten) {
+      return unread(
+        unwritten.call,
+        'a send states a status the source does not write as a number, so whether that path ' +
+          'answers with success is not known, and no other path sends a body'
+      );
+    }
+    if (facts.last.length === 0) {
+      return unread(
+        facts.first,
+        'nothing the handler does with the transport it was handed is the last thing it does ' +
+          'on a path, so no call on it reads as the send'
+      );
+    }
+    if (facts.writtenBefore) {
+      return unread(
+        facts.writtenBefore,
+        'the handler hands the transport a value before the last call it makes on it, and this ' +
+          'reading takes only the last call as the send'
+      );
+    }
+    const succeeding = facts.last.filter(
+      (send) => send.status !== 'error' && send.status !== 'redirect'
+    );
+    if (succeeding.length === 0) return { kind: 'no_success', at: facts.last[0].call };
+    const opaque = succeeding.find((send) => send.carried !== 'empty');
+    if (opaque) {
+      return unread(
+        opaque.call,
+        'what the handler sends is not an object a JSON contract describes: a primitive, an ' +
+          'untyped value, or a value handed to a parameter its library types'
+      );
+    }
+    return { kind: 'no_body', at: succeeding[0].call };
+  }
+
+  /**
+   * The last send of every path of `func` through the parameters in
+   * `transport`, with what each carried and the status it states; or why the
+   * function cannot be read.
+   *
+   * A path that ends by handing the transport to another function is followed
+   * into that function, `handOffDepth` levels deep (`HAND_OFF_DEPTH`: one).
+   * The function's own last sends, read by this same rule through the
+   * parameter the transport arrives in, are then that path's: an error helper
+   * (`res.status(400).json(problem)`) leaves the path out as any error send
+   * does, and a helper that sends a body joins it. The handler is unread when
+   * the function cannot be read: it has no body in the program, it has more
+   * than one declaration, the call does not name it, the transport does not
+   * arrive in a parameter of its own, or it hands the transport on again.
+   * A path is never dropped on the guess that the function it was handed to
+   * reports an error: a helper that sends a second success shape would then be
+   * missing from the published body.
+   */
+  private lastSends(
+    func: FunctionLike,
+    uses: ParameterUses,
+    transport: Set<Node>,
+    handOffDepth: number
+  ): LastSends | { unread: { at: Node; why: string; handsOnAgain?: boolean } } {
     const onTransport = <T extends { parameter: Node }>(list: T[]): T[] =>
       list.filter((use) => transport.has(use.parameter));
-    const unread = (at: Node, why: string): ParameterSends => ({ kind: 'unread', why, at });
+    const unread = (at: Node, why: string, handsOnAgain = false) => ({
+      unread: { at, why, handsOnAgain },
+    });
 
     const calls = onTransport(uses.calls);
     const handOffs = onTransport(uses.handOffs);
@@ -6412,8 +6539,8 @@ export class TypeInferrer {
     if (nested) {
       return unread(
         nested.at,
-        'a function the handler declares uses the transport the handler was handed, so what ' +
-          'the route sends is decided where that function runs'
+        'a function the handler declares acts on the transport the handler was handed, so ' +
+          'what the route sends is decided where that function runs'
       );
     }
     const kept = onTransport(uses.kept)[0];
@@ -6424,10 +6551,15 @@ export class TypeInferrer {
           'is not in one place'
       );
     }
-    if (calls.length + handOffs.length + assignments.length === 0) return { kind: 'none' };
+    const facts: LastSends = {
+      last: [],
+      touched: calls.length + handOffs.length + assignments.length > 0,
+      first: calls[0]?.call ?? handOffs[0]?.call ?? func,
+    };
+    if (!facts.touched) return facts;
 
     for (const { assignment } of assignments) {
-      if (inCatchClause(assignment, handler)) continue;
+      if (inCatchClause(assignment, func)) continue;
       if (this.statusNumber(assignment.getRight()) === undefined) {
         return unread(
           assignment,
@@ -6437,100 +6569,148 @@ export class TypeInferrer {
       }
     }
 
+    // A call on the transport whose value is USED reads it
+    // (`res.getHeader('etag')`); one whose value is discarded or returned may
+    // send. A value kept from a call that was handed a payload is the one
+    // case this cannot place.
+    const sending: DirectCall[] = [];
+    for (const use of calls) {
+      if (use.discarded) {
+        sending.push(use);
+      } else if (this.carriedBy(use.call) === 'value') {
+        return unread(
+          use.call,
+          'the handler keeps what a call on the transport returns after handing it a value, ' +
+            'so the send is not the last thing it does with it'
+        );
+      }
+    }
+
     // Everything that acts on a parameter: a send is last only when none of
     // these can follow it.
     const acts: Node[] = [
-      ...calls.map((use) => use.call),
+      ...sending.map((use) => use.call),
       ...uses.handOffs.map((use) => use.call),
       ...uses.invocations.map((use) => use.call),
       ...assignments.map((use) => use.assignment),
     ];
 
-    for (const { call } of handOffs) {
-      if (inCatchClause(call, handler)) continue;
-      const status = this.responseSiteStatus(call);
-      if (status === 'error' || status === 'redirect') continue;
-      if (lastOnItsPath(call, handler, acts)) {
-        return unread(
+    for (const handOff of handOffs) {
+      const { call } = handOff;
+      // A catch clause, and a hand-off with an error status written beside
+      // it, answer a failure and are left out like any error send.
+      if (inCatchClause(call, func)) continue;
+      const beside = this.responseSiteStatus(call);
+      if (beside === 'error' || beside === 'redirect') continue;
+      // Before the last thing done on its path it configures the response.
+      if (!lastOnItsPath(call, func, acts)) continue;
+      const handedOn = (why: string, handsOnAgain = false) =>
+        unread(
           call,
           'the handler hands the transport it was handed to another function as the last ' +
-            'thing it does on a path, so what the route sends there is in that function'
+            `thing it does on a path, and ${why}, so what the route sends there is not read`,
+          handsOnAgain
+        );
+      if (handOffDepth <= 0) return handedOn('this is as far as a hand-off is followed', true);
+      const callee = this.functionHandedTo(handOff);
+      if (typeof callee === 'string') return handedOn(callee);
+      const inside = this.lastSends(
+        callee.func,
+        parameterUses(callee.func),
+        new Set([callee.parameter]),
+        handOffDepth - 1
+      );
+      if ('unread' in inside) {
+        return handedOn(
+          inside.unread.handsOnAgain
+            ? 'that function hands it on again'
+            : 'that function does something with it this reading cannot follow'
         );
       }
+      if (inside.writtenBefore) facts.writtenBefore ??= call;
+      facts.last.push(...inside.last.map((send) => ({ ...send, order: call.getStart() })));
     }
 
-    type Carried = { kind: 'value' } | { kind: 'empty' } | { kind: 'opaque' };
-    const last: Array<{ use: DirectCall; carried: Carried; status: ResponseSiteStatus }> = [];
-    let writtenBefore: Node | undefined;
-    for (const use of calls) {
-      if (!use.discarded) {
-        return unread(
-          use.call,
-          'the handler keeps what a call on the transport returns, so the send is not the ' +
-            'last thing it does with it'
-        );
-      }
+    for (const use of sending) {
       const carried = this.carriedBy(use.call);
-      if (!lastOnItsPath(use.call, handler, acts)) {
+      if (!lastOnItsPath(use.call, func, acts)) {
         // Not last: it configures the response. A value handed to an open
         // parameter before the response ends may still be part of the body.
-        if (carried.kind !== 'empty' && this.firstParameterIsOpen(use.call)) {
-          writtenBefore ??= use.call;
+        if (carried !== 'empty' && this.firstParameterIsOpen(use.call)) {
+          facts.writtenBefore ??= use.call;
         }
         continue;
       }
-      if (inCatchClause(use.call, handler)) continue;
-      last.push({ use, carried, status: this.sendStatus(use, handler, calls, assignments) });
+      if (inCatchClause(use.call, func)) continue;
+      facts.last.push({
+        call: use.call,
+        carried,
+        status: this.sendStatus(use, func, sending, assignments),
+        order: use.call.getStart(),
+      });
     }
+    return facts;
+  }
 
-    const joins = last.filter(
-      (send) =>
-        send.carried.kind === 'value' && (send.status === 'success' || send.status === 'undecided')
-    );
-    if (joins.length > 0) {
-      const recovered = this.recoverPayloadFromResponseExpressions(
-        joins.map((send) => send.use.call),
-        false,
-        wire
-      );
-      if (recovered) return { kind: 'body', recovered };
-    }
+  /**
+   * The function a hand-off hands the transport to, and the parameter of it
+   * the transport arrives in; or, as a sentence fragment, why that cannot be
+   * said. Read through the checker: the call has to name the function (an
+   * identifier, or a member), the name has to resolve to exactly one
+   * declaration, and that declaration has to have a body in the program.
+   */
+  private functionHandedTo(handOff: {
+    call: Node;
+    argument: number;
+    member?: string;
+  }): { func: FunctionLike; parameter: Node } | string {
+    if (!Node.isCallExpression(handOff.call)) return 'it is handed to a constructor';
+    const callee = this.unwrapExpressionNode(handOff.call.getExpression());
+    const name = Node.isIdentifier(callee)
+      ? callee
+      : Node.isPropertyAccessExpression(callee)
+        ? callee.getNameNode()
+        : undefined;
+    if (!name) return 'the call does not name that function';
+    const declarations = name.getDefinitionNodes();
+    if (declarations.length === 0) return 'that function has no declaration in the program';
+    if (declarations.length > 1) return 'that function has more than one declaration';
+    const declaration = declarations[0];
+    const held =
+      Node.isPropertyAssignment(declaration) || Node.isPropertyDeclaration(declaration)
+        ? declaration.getInitializer()
+        : undefined;
+    const func = Node.isMethodDeclaration(declaration)
+      ? declaration
+      : held
+        ? this.asHandlerFunction(held, false)
+        : this.functionFromDeclaration(declaration, false);
+    if (!func || !func.getBody()) return 'that function has no body in the program';
 
-    const unwritten = last.find((send) => send.status === 'variable');
-    if (unwritten) {
-      return unread(
-        unwritten.use.call,
-        'a send states a status the source does not write as a number, so whether that path ' +
-          'answers with success is not known, and no other path sends a body'
-      );
+    const parameter = func.getParameters()[handOff.argument];
+    if (!parameter || parameter.isRestParameter()) {
+      return 'the transport does not arrive in a parameter of its own there';
     }
-    if (last.length === 0) {
-      return unread(
-        calls[0]?.call ?? handOffs[0]?.call ?? handler,
-        'nothing the handler does with the transport it was handed is the last thing it does ' +
-          'on a path, so no call on it reads as the send'
-      );
+    const binding = parameter.getNameNode();
+    if (handOff.member === undefined) {
+      return Node.isIdentifier(binding)
+        ? { func, parameter }
+        : 'the transport does not arrive in a parameter of its own there';
     }
-    if (writtenBefore) {
-      return unread(
-        writtenBefore,
-        'the handler hands the transport a value before the last call it makes on it, and this ' +
-          'reading takes only the last call as the send'
-      );
-    }
-    const succeeding = last.filter(
-      (send) => send.status !== 'error' && send.status !== 'redirect'
-    );
-    if (succeeding.length === 0) return { kind: 'no_success', at: last[0].use.call };
-    const opaque = succeeding.find((send) => send.carried.kind !== 'empty');
-    if (opaque) {
-      return unread(
-        opaque.use.call,
-        'what the handler sends is not an object a JSON contract describes: a primitive, an ' +
-          'untyped value, or a value handed to a parameter its library types'
-      );
-    }
-    return { kind: 'no_body', at: succeeding[0].use.call };
+    // Handed over inside an object literal: it arrives as the member of the
+    // same name, where the parameter list takes the object apart.
+    const element = Node.isObjectBindingPattern(binding)
+      ? binding
+          .getElements()
+          .find(
+            (candidate) =>
+              (candidate.getPropertyNameNode()?.getText() ?? candidate.getName()) ===
+              handOff.member
+          )
+      : undefined;
+    return element && Node.isIdentifier(element.getNameNode())
+      ? { func, parameter: element }
+      : 'the transport does not arrive in a parameter of its own there';
   }
 
   /**
@@ -6555,13 +6735,13 @@ export class TypeInferrer {
    * numbers alone, which state a status and send no body), or something this
    * reading cannot state (`opaque`).
    */
-  private carriedBy(call: CallExpression): { kind: 'value' } | { kind: 'empty' } | { kind: 'opaque' } {
+  private carriedBy(call: CallExpression): Carried {
     const args = call.getArguments().map((arg) => this.peelTransparentExpression(arg));
-    if (args.length === 0) return { kind: 'empty' };
-    if (args.every((arg) => this.statusNumber(arg) !== undefined)) return { kind: 'empty' };
+    if (args.length === 0) return 'empty';
+    if (args.every((arg) => this.statusNumber(arg) !== undefined)) return 'empty';
     // A call handed a function registers it; it does not send it.
     if (args.some((arg) => arg.getType().getCallSignatures().length > 0)) {
-      return { kind: 'opaque' };
+      return 'opaque';
     }
     const first = this.unwrapJsonStringifyArg(args[0]);
     const holdsAFunction =
@@ -6574,8 +6754,8 @@ export class TypeInferrer {
     return !holdsAFunction &&
       this.firstParameterIsOpen(call) &&
       this.nodeCarriesPayloadContract(first, false)
-      ? { kind: 'value' }
-      : { kind: 'opaque' };
+      ? 'value'
+      : 'opaque';
   }
 
   /**

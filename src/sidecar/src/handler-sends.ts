@@ -56,11 +56,21 @@ export interface DirectCall {
   /** The calls before it in the chain, innermost first. */
   earlier: CallExpression[];
   /**
-   * True when the chain's value is discarded or returned. A chain bound to a
-   * name or handed to another call is kept, and what happens to it next is
-   * not on this path.
+   * True when the chain's value is discarded or returned, which is how a send
+   * is written. A chain whose value is used (`res.getHeader('etag')` bound to
+   * a name, or handed on) reads the parameter.
    */
   discarded: boolean;
+}
+
+/** A parameter handed to a call. */
+export interface HandOff {
+  parameter: Node;
+  call: Node;
+  /** Which argument of the call it is, or is held by. */
+  argument: number;
+  /** The member it is the value of, when handed over inside an object literal. */
+  member?: string;
 }
 
 export interface ParameterUses {
@@ -70,11 +80,19 @@ export interface ParameterUses {
   calls: DirectCall[];
   /** Calls OF a parameter: `next(error)`. */
   invocations: Array<{ parameter: Node; call: CallExpression }>;
-  /** Calls a parameter is an argument of: `respond(res, body)`. */
-  handOffs: Array<{ parameter: Node; call: Node }>;
+  /**
+   * Calls a parameter is handed to: as an argument (`respond(res, body)`), or
+   * as a member of an object literal that is one (`finish({ res, body })`).
+   */
+  handOffs: HandOff[];
   /** Assignments to a member of a parameter: `res.statusCode = 404`. */
   assignments: Array<{ parameter: Node; assignment: BinaryExpression }>;
-  /** A parameter used inside a function the handler declares. */
+  /**
+   * A parameter ACTED on inside a function the handler declares: a method
+   * called on it and its value discarded, a hand-off, an assignment, or the
+   * parameter kept. A read there (`res.statusCode`, a call whose value is
+   * used) is not listed: it sends nothing.
+   */
   nested: Array<{ parameter: Node; at: Node }>;
   /** A parameter kept as a value: bound to a name, returned, spread. */
   kept: Array<{ parameter: Node; at: Node }>;
@@ -124,10 +142,11 @@ function memberOn(value: Node): Node | undefined {
 
 /**
  * True when the value of `call` is discarded or returned: it is a statement
- * of its own, a returned expression, a concise body, or a branch of a
- * conditional or of `&&` / `||` / `??` / `,` that is.
+ * of its own, a returned expression, the concise body of `owner` (the
+ * function that holds it), or a branch of a conditional or of `&&` / `||` /
+ * `??` / `,` that is.
  */
-function isDiscarded(call: Node, handler: HandlerFunction): boolean {
+function isDiscarded(call: Node, owner: Node | undefined): boolean {
   let value: Node = call;
   for (;;) {
     const parent = value.getParent();
@@ -158,8 +177,31 @@ function isDiscarded(call: Node, handler: HandlerFunction): boolean {
       return false;
     }
     if (Node.isExpressionStatement(parent) || Node.isReturnStatement(parent)) return true;
-    return parent === handler;
+    return parent === owner;
   }
+}
+
+/**
+ * The call `value` is handed to: the call it is an argument of, or the call
+ * an object literal that holds it as a member's value is an argument of.
+ */
+function handedTo(value: Node): Omit<HandOff, 'parameter'> | undefined {
+  let handed = value;
+  let member: string | undefined;
+  const holder = handed.getParent();
+  if (
+    (Node.isShorthandPropertyAssignment(holder) && holder.getNameNode() === handed) ||
+    (Node.isPropertyAssignment(holder) && holder.getInitializer() === handed)
+  ) {
+    const literal = holder.getParent();
+    if (!literal || !Node.isObjectLiteralExpression(literal)) return undefined;
+    member = holder.getName();
+    handed = wrapped(literal);
+  }
+  const call = handed.getParent();
+  if (!call || (!Node.isCallExpression(call) && !Node.isNewExpression(call))) return undefined;
+  const argument = call.getArguments().indexOf(handed);
+  return argument >= 0 ? { call, argument, member } : undefined;
 }
 
 /** Every use the body of `handler` makes of the parameters it declares. */
@@ -206,10 +248,13 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
     // `typeof res` in a type position reads nothing at run time.
     if (identifier.getFirstAncestorByKind(SyntaxKind.TypeQuery)) continue;
 
-    if (identifier.getFirstAncestor(isHandlerFunction) !== handler) {
+    // A use inside a function the handler declares is listed only when it
+    // acts on the parameter; `own` is false for it.
+    const owner = identifier.getFirstAncestor(isHandlerFunction);
+    const own = owner === handler;
+    const acted = (): void => {
       uses.nested.push({ parameter, at: identifier });
-      continue;
-    }
+    };
 
     const member = memberOn(identifier);
     if (member) {
@@ -223,7 +268,9 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
           earlier.push(call);
           call = nextCall;
         }
-        uses.calls.push({ parameter, call, earlier, discarded: isDiscarded(call, handler) });
+        const discarded = isDiscarded(call, owner);
+        if (own) uses.calls.push({ parameter, call, earlier, discarded });
+        else if (discarded) acted();
         continue;
       }
       const target = wrapped(member);
@@ -233,7 +280,8 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
         assignment.getLeft() === target &&
         isAssignment(assignment)
       ) {
-        uses.assignments.push({ parameter, assignment });
+        if (own) uses.assignments.push({ parameter, assignment });
+        else acted();
       }
       // Any other member use reads the parameter, or calls an object it holds.
       continue;
@@ -242,14 +290,14 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
     const value = wrapped(identifier);
     const parent = value.getParent();
     if (Node.isCallExpression(parent) && parent.getExpression() === value) {
-      uses.invocations.push({ parameter, call: parent });
+      if (own) uses.invocations.push({ parameter, call: parent });
+      else acted();
       continue;
     }
-    if (
-      (Node.isCallExpression(parent) || Node.isNewExpression(parent)) &&
-      parent.getArguments().includes(value)
-    ) {
-      uses.handOffs.push({ parameter, call: parent });
+    const receiver = handedTo(value);
+    if (receiver) {
+      if (own) uses.handOffs.push({ parameter, ...receiver });
+      else acted();
       continue;
     }
     // A test of the parameter reads it without keeping it.
@@ -260,7 +308,8 @@ export function parameterUses(handler: HandlerFunction): ParameterUses {
     ) {
       continue;
     }
-    uses.kept.push({ parameter, at: identifier });
+    if (own) uses.kept.push({ parameter, at: identifier });
+    else acted();
   }
   return uses;
 }
