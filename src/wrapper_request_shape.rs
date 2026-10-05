@@ -212,6 +212,31 @@ pub(crate) fn is_request_options(obj: &ObjectLit) -> bool {
     })
 }
 
+/// The keys a response's init takes (`new Response(body, init)` and every
+/// helper that builds a response the same way): the Fetch standard's
+/// `ResponseInit`. The sidecar reads the same three for a route's response.
+const RESPONSE_INIT_KEYS: &[&str] = &["headers", "status", "statusText"];
+
+/// Whether an object literal could equally be a response's init: every entry
+/// is a plain key a response's init takes, so nothing in it is a key only a
+/// request carries (carrick#1986).
+///
+/// `{ headers }` passes [`is_request_options`] on `headers` alone, and so does
+/// the init of a redirect: `redirect(path, { headers })` builds a response, it
+/// sends nothing. A bag that names `method`, `body`, `data` or any other key
+/// is not one, and neither is one with a spread or a computed key, which may
+/// carry any key.
+pub(crate) fn could_be_response_init(obj: &ObjectLit) -> bool {
+    !obj.props.is_empty()
+        && obj.props.iter().all(|entry| {
+            let PropOrSpread::Prop(prop) = entry else {
+                return false;
+            };
+            matches!(&**prop, Prop::KeyValue(_) | Prop::Shorthand(_))
+                && prop_key_name(entry).is_some_and(|name| RESPONSE_INIT_KEYS.contains(&&*name))
+        })
+}
+
 /// The request-options bag among a call's arguments: the one object literal
 /// that carries a request-options key, whatever position it sits at and
 /// whatever else the call is passed.
@@ -695,6 +720,55 @@ export async function create(payload: unknown) {
         assert_eq!(fold_wrappers([Some(&known), None]), None);
         // No wrapper at all is not "agreed": there is nothing to propagate.
         assert_eq!(fold_wrappers([]), None);
+    }
+
+    fn object(source: &str) -> ObjectLit {
+        use swc_common::{FileName, SourceMap, sync::Lrc};
+        use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+        let map: Lrc<SourceMap> = Default::default();
+        let file = map.new_source_file(Lrc::new(FileName::Anon), format!("({source})"));
+        let lexer = Lexer::new(
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            StringInput::from(&*file),
+            None,
+        );
+        let expr = Parser::new_from(lexer)
+            .parse_expr()
+            .expect("fixture parses");
+        match crate::graphql_document_sites::unwrap_expression(&expr) {
+            Expr::Object(obj) => obj.clone(),
+            other => panic!("not an object literal: {other:?}"),
+        }
+    }
+
+    /// carrick#1986: the bags a response's init could equally be.
+    #[test]
+    fn a_bag_of_response_init_keys_could_be_a_response_init() {
+        for source in [
+            "{ headers }",
+            "{ headers: { 'Set-Cookie': cookie } }",
+            "{ status: 303, headers }",
+            "{ \"headers\": h, statusText: 'See Other' }",
+        ] {
+            assert!(could_be_response_init(&object(source)), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_bag_naming_another_key_is_no_response_init() {
+        for source in [
+            "{}",
+            "{ method: 'GET', headers }",
+            "{ headers, body }",
+            "{ headers, data }",
+            "{ headers, credentials: 'include' }",
+            "{ ...init, headers }",
+            "{ [key]: value, headers }",
+            "{ headers() { return h; } }",
+        ] {
+            assert!(!could_be_response_init(&object(source)), "{source}");
+        }
     }
 
     #[test]

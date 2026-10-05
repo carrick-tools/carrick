@@ -1,0 +1,10 @@
+{
+  "name": "@fixture/web",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@fixture/http-kit": "workspace:*",
+    "a-server-runtime": "^2.0.0",
+    "an-http-client": "^3.0.0"
+  }
+}

@@ -49,6 +49,13 @@
 //!   carrying exactly one request-options bag (`method`/`headers`/`body`/
 //!   `data`). A call the call graph resolves to a function in this service is
 //!   never read as a request: it is composed instead.
+//! - **A response's init is not a request's** (carrick#1986). A bag holding
+//!   only `headers` (and `status`, `statusText`) is what a response is built
+//!   with too: `return redirect(path, { headers })` sends nothing. Read off
+//!   such a bag alone, a call is a request only where the source waits on
+//!   its result (`await`, `.then`) or the callee is a function the
+//!   repository defines; anywhere else it states nothing
+//!   ([`Composer::request_of`]).
 //! - **A `fetch` handed in is `fetch`** (carrick#1562). A parameter whose
 //!   default is the platform's `fetch` (`fetchImpl = fetch`, `{ fetchImpl =
 //!   fetch } = {}`) and that the body never assigns again, and a field the
@@ -173,7 +180,9 @@ use crate::services::type_sidecar::{SemanticsRequestArgs, SemanticsVerbArgs};
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::is_http_method;
 use crate::visitor::SymbolKind;
-use crate::wrapper_request_shape::{is_request_options, verb_from_callee_property};
+use crate::wrapper_request_shape::{
+    could_be_response_init, is_request_options, verb_from_callee_property,
+};
 use library_sites::{ClassThis, FieldWriteIr, LibrarySiteIr};
 
 /// One piece of a URL or a body value.
@@ -355,6 +364,12 @@ struct RequestShape {
     /// The library-semantics claim ids this reading used. Empty for every
     /// other request.
     semantics: BTreeSet<String>,
+    /// The call reads as a request only on an options bag a response's init
+    /// could equally be (`redirect(path, { headers })`, carrick#1986): no
+    /// `fetch`, no verb, no key only a request carries. Such a call is a
+    /// request only where something else the source states says so
+    /// ([`Composer::request_of`]).
+    init_only: bool,
 }
 
 /// A client of a library package, as the source names it (carrick#1564): a
@@ -556,6 +571,9 @@ struct CallIr {
     /// the call graph does not resolve the call to a function of this
     /// service.
     request: Option<RequestShape>,
+    /// The source waits on what the call returns: it is awaited, or handed
+    /// to `.then`, `.catch` or `.finally` (carrick#1986).
+    waited: bool,
     /// A call on a runtime global that sends nothing (`console.log`,
     /// `JSON.stringify`).
     inert: bool,
@@ -3583,6 +3601,7 @@ impl Reader<'_> {
             reader: self,
             scope,
             ir,
+            waited: HashSet::new(),
         };
         node.visit_with(&mut walker);
     }
@@ -4006,6 +4025,7 @@ impl Reader<'_> {
         };
 
         let mut bag: Option<(usize, &ObjValue)> = None;
+        let mut init_only = false;
         for (index, arg) in call.args.iter().enumerate() {
             if let Expr::Object(obj) = &*arg.expr
                 && is_request_options(obj)
@@ -4015,6 +4035,7 @@ impl Reader<'_> {
                 }
                 if let Some(Value::Obj(value)) = args.get(index) {
                     bag = Some((index, value));
+                    init_only = could_be_response_init(obj);
                 }
             }
         }
@@ -4148,6 +4169,8 @@ impl Reader<'_> {
             base: Vec::new(),
             base_scope: None,
             semantics: BTreeSet::new(),
+            // Only the bag says this is a request: not `fetch`, and no verb.
+            init_only: kind == RequestKind::Bag && verb.is_none() && init_only,
         })
     }
 
@@ -4564,10 +4587,42 @@ struct CallWalker<'r, 's, 'i> {
     reader: &'r Reader<'r>,
     scope: &'s Scope<'s>,
     ir: &'i mut FnIr,
+    /// The calls (span start, span end) whose result the source waits on,
+    /// recorded before the call itself is visited ([`CallIr::waited`]).
+    waited: HashSet<(u32, u32)>,
+}
+
+impl CallWalker<'_, '_, '_> {
+    /// Record `expr` as waited on, when it is a call.
+    fn wait_on(&mut self, expr: &Expr) {
+        if let Expr::Call(call) = crate::graphql_document_sites::unwrap_expression(expr) {
+            self.waited.insert((call.span.lo.0, call.span.hi.0));
+        }
+    }
 }
 
 impl Visit for CallWalker<'_, '_, '_> {
+    // `await send(…)`: the source waits on what `send` returns
+    // (carrick#1986). Recorded before the call is visited.
+    fn visit_await_expr(&mut self, awaited: &AwaitExpr) {
+        self.wait_on(&awaited.arg);
+        awaited.visit_children_with(self);
+    }
+
     fn visit_call_expr(&mut self, call: &CallExpr) {
+        // `send(…).then(…)`: a promise's own members wait on it, as `await`
+        // does (carrick#1986). The receiver is visited below, through the
+        // callee.
+        if let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(member) = crate::graphql_document_sites::unwrap_expression(callee)
+            && matches!(
+                member_prop(member).as_deref(),
+                Some("then" | "catch" | "finally")
+            )
+        {
+            self.wait_on(&member.obj);
+        }
+
         // `produce()`: the body invokes a parameter. One that holds the
         // platform's `fetch` unless a caller hands another is a `fetch`
         // (carrick#1562).
@@ -4679,6 +4734,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee,
             args,
             request,
+            waited: self.waited.contains(&(call.span.lo.0, call.span.hi.0)),
             inert,
             invokes_param,
             receiver,
@@ -5573,6 +5629,37 @@ impl Composer<'_> {
         Some(summary)
     }
 
+    /// What a call this pass did not compose sends, as [`shape_of`] reads it,
+    /// less a request read only off an options bag a response's init could
+    /// equally be (carrick#1986).
+    ///
+    /// `redirect(path, { headers })` and `request(path, { headers })` are the
+    /// same call, written the same way: one builds a response and sends
+    /// nothing, the other sends a request. The bag cannot tell them apart, so
+    /// such a call is a request only where something else the source states
+    /// says so:
+    ///
+    /// - the source waits on its result (`await`, `.then`, `.catch`,
+    ///   `.finally`): a request is answered later, a response is built at
+    ///   once and returned or thrown;
+    /// - the call graph resolves the callee to a function the repository
+    ///   defines, outside this service (an own one is composed instead): it
+    ///   is code of this repository, not a package's export, and its options
+    ///   are read as they always were.
+    ///
+    /// Anywhere else nothing is stated, and the call is one this pass cannot
+    /// read: the body is not complete, so no model row is withdrawn on it.
+    fn request_of<'c>(&self, file: &Path, call: &'c CallIr) -> Option<Cow<'c, RequestShape>> {
+        shape_of(call, file, self.semantics, &self.clients).filter(|request| {
+            !request.init_only
+                || call.waited
+                || self
+                    .sites
+                    .target_at(file, call.site.lo, call.site.hi)
+                    .is_some()
+        })
+    }
+
     /// The callee a call resolves to, when it is a function this pass read.
     fn callee(&mut self, file: &Path, call: &CallIr) -> Option<(PathBuf, Summary)> {
         let (target_file, key) = self.sites.target(file, call.site.lo)?.clone();
@@ -5618,7 +5705,7 @@ impl Composer<'_> {
                     }
                 }
                 None => {
-                    if let Some(request) = shape_of(call, file, self.semantics, &self.clients) {
+                    if let Some(request) = self.request_of(file, call) {
                         summary.effects.insert(ir.settle_forward(Effect::from_shape(
                             &request,
                             file,
@@ -5665,9 +5752,7 @@ impl Composer<'_> {
             return false;
         };
         match (returned, self.callee(file, call)) {
-            (BodyReturn::Parsed(_), None) => {
-                shape_of(call, file, self.semantics, &self.clients).is_some()
-            }
+            (BodyReturn::Parsed(_), None) => self.request_of(file, call).is_some(),
             (BodyReturn::Value(_), Some((_, callee))) => callee.passes_body,
             _ => false,
         }
@@ -5822,7 +5907,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
-                if let Some(request) = shape_of(call, file, composer.semantics, &composer.clients) {
+                if let Some(request) = composer.request_of(file, call) {
                     let library = request.kind == RequestKind::Library;
                     if library || (request.kind != RequestKind::Verb && !request.url_inline) {
                         let effect = Effect::from_shape(&request, file, call.site.line);
@@ -6172,6 +6257,7 @@ fn library_shape(
         base,
         base_scope: None,
         semantics: used,
+        init_only: false,
     })
 }
 

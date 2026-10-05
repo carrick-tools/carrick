@@ -1,0 +1,7 @@
+{
+  "name": "response-init-bag",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"]
+}

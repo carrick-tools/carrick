@@ -211,6 +211,7 @@ jobs:
           --test one_row_per_request_test
           --test payload_without_method_test
           --test pubsub_wrapper_type_capture_test
+          --test response_init_bag_test
           --test run_log_isolation_test
           --test scan_leaves_repo_unedited_test
           --test spread_options_verb_test
