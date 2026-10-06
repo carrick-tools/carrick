@@ -38,6 +38,7 @@ import {
   type Symbol as TsSymbol,
   ts,
 } from 'ts-morph';
+import { typeToStringAsDeclared } from './print-type.js';
 import type {
   InferRequestItem,
   InferResult,
@@ -343,8 +344,19 @@ const TYPE_TEXT_FLAGS =
 
 function typeText(type: Type, enclosingNode?: Node): string {
   // Timed as the print (carrick#1985): the type is already computed when it
-  // gets here, so this is what its length costs.
-  const text = timedPhase('print', () => type.getText(enclosingNode, TYPE_TEXT_FLAGS));
+  // gets here, so this is what its length costs. A module the print names is
+  // written as its declaring file, whichever file it is printed from
+  // (carrick#2019).
+  const text = timedPhase('print', () =>
+    enclosingNode
+      ? typeToStringAsDeclared(
+          enclosingNode.getProject().getTypeChecker().compilerObject,
+          type.compilerType,
+          enclosingNode.compilerNode,
+          TYPE_TEXT_FLAGS
+        )
+      : type.getText(undefined, TYPE_TEXT_FLAGS)
+  );
   notePrintedType(type, enclosingNode, text);
   return text;
 }

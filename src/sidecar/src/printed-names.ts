@@ -25,6 +25,7 @@
 
 import { ts, type Node, type Type } from 'ts-morph';
 import type { PrintedName } from './types.js';
+import { typeToTypeNodeAsDeclared } from './print-type.js';
 
 /** One type print: the type, the declaration it was printed for, the text. */
 type Print = { type: ts.Type; enclosing: ts.Node | undefined; text: string };
@@ -91,7 +92,7 @@ export class PrintedTypes {
       visited.set(type, at.add(enclosing));
       let node: ts.TypeNode | undefined;
       try {
-        node = checker.typeToTypeNode(type, enclosing, NODE_FLAGS);
+        node = typeToTypeNodeAsDeclared(checker, type, enclosing, NODE_FLAGS);
       } catch {
         continue;
       }
