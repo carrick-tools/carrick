@@ -401,8 +401,8 @@ fn infer_missing_types(
 ///
 /// `infer` is the sidecar call. A batch it fails on is lost and the next one
 /// is asked, unless the failure says there is no sidecar left
-/// ([`sidecar_still_answers`]): then the batches not yet sent are lost with
-/// it, without being sent.
+/// ([`SidecarError::leaves_no_process`]): then the batches not yet sent are
+/// lost with it, without being sent.
 fn infer_in_batches(
     requests: &[InferRequestItem],
     batch_slots: usize,
@@ -439,7 +439,7 @@ fn infer_in_batches(
         };
         outcome.lost += batch.len();
         outcome.failed_batches += 1;
-        if sidecar_still_answers(&error) {
+        if !error.leaves_no_process() {
             warn!(
                 "Signature inference failed for a batch of {} slot(s): {error}",
                 batch.len()
@@ -456,30 +456,6 @@ fn infer_in_batches(
         outcome.unsent = unsent;
     }
     outcome
-}
-
-/// Whether the sidecar can be asked the next batch after failing this way.
-///
-/// A timed-out operation has already had its sidecar replaced by a fresh one
-/// (carrick#1914), and a frame that could not be written or read says nothing
-/// about the process. The rest say there is no process to ask: sending the
-/// remaining batches would fail each the same way.
-fn sidecar_still_answers(error: &SidecarError) -> bool {
-    match error {
-        SidecarError::Timeout
-        | SidecarError::SerializationError(_)
-        | SidecarError::DeserializationError(_)
-        // Failures of other operations; an inference does not return them.
-        | SidecarError::ResolutionFailed(_)
-        | SidecarError::CaptureFailed(_)
-        | SidecarError::CheckFailed(_) => true,
-        SidecarError::SpawnFailed(_)
-        | SidecarError::InitFailed(_)
-        | SidecarError::NotReady(_)
-        | SidecarError::ProcessDied
-        | SidecarError::IoError(_)
-        | SidecarError::Interrupted(_) => false,
-    }
 }
 
 /// Put one batch's inferred types on the function definitions they belong
@@ -1018,18 +994,12 @@ mod tests {
     #[test]
     fn only_a_sidecar_that_can_still_answer_is_asked_again() {
         // Replaced by a fresh process, or an answer that could not be read.
-        assert!(sidecar_still_answers(&SidecarError::Timeout));
-        assert!(sidecar_still_answers(&SidecarError::DeserializationError(
-            "bad frame".into()
-        )));
+        assert!(!SidecarError::Timeout.leaves_no_process());
+        assert!(!SidecarError::DeserializationError("bad frame".into()).leaves_no_process());
         // No process to ask.
-        assert!(!sidecar_still_answers(&SidecarError::ProcessDied));
-        assert!(!sidecar_still_answers(&SidecarError::IoError(
-            "broken pipe".into()
-        )));
-        assert!(!sidecar_still_answers(&SidecarError::NotReady(
-            "its replacement was not ready".into()
-        )));
+        assert!(SidecarError::ProcessDied.leaves_no_process());
+        assert!(SidecarError::IoError("broken pipe".into()).leaves_no_process());
+        assert!(SidecarError::NotReady("its replacement was not ready".into()).leaves_no_process());
     }
 
     // ---- carrick#1985: the log names the slots a pass's time went to ----

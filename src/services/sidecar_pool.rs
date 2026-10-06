@@ -16,7 +16,8 @@
 //! - [`SidecarPool::scoped`] borrows the caller's own sidecar, already scoped
 //!   to the service, and starts the others beside it.
 //! - [`SidecarPool::run`] answers a list of jobs, each on whichever process
-//!   is free next.
+//!   is free next. A process whose answer says it is gone takes no more; the
+//!   others take the rest, and with none left the rest are not sent.
 //! - [`jobs_by_file`] cuts a list of items into jobs that keep each file's
 //!   items together, in their order.
 //!
@@ -219,19 +220,39 @@ impl<'a> SidecarPool<'a> {
         self.extra.len() + 1
     }
 
-    /// Answer every job: `work` runs each job on whichever process takes it
-    /// next, one job per process at a time, and the answers come back in the
-    /// order of `jobs`. A job's failure is its own answer, so `work` maps
-    /// errors into `R`. With one process this is `jobs.iter().map(...)` on
-    /// `base`, in order.
-    pub fn run<J, R, F>(&self, jobs: &[J], work: F) -> Vec<R>
+    /// Answer every job a process is left to take: `work` runs each job on
+    /// whichever process takes it next, one job per process at a time, and
+    /// the answers come back in the order of `jobs`. A job's failure is its
+    /// own answer, so `work` maps errors into `R`.
+    ///
+    /// `leaves_no_process` says which answers mean the process that gave it
+    /// is gone (for an error, [`SidecarError::leaves_no_process`]; a timeout
+    /// is not one, as its process has already been replaced). That process
+    /// takes no more jobs in this run, and the jobs left go to the others.
+    /// A job no process was left to take is `None`: it failed, unsent.
+    ///
+    /// With one process, the jobs run on `base` in order, and the first
+    /// answer that leaves no process leaves the rest unsent.
+    pub fn run<J, R, D, F>(&self, jobs: &[J], leaves_no_process: D, work: F) -> Vec<Option<R>>
     where
         J: Sync,
         R: Send,
+        D: Fn(&R) -> bool + Sync,
         F: Fn(&TypeSidecar, &J) -> R + Sync,
     {
         if self.extra.is_empty() || jobs.len() <= 1 {
-            return jobs.iter().map(|job| work(self.base, job)).collect();
+            let mut answers: Vec<Option<R>> = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let answer = work(self.base, job);
+                let gone = leaves_no_process(&answer);
+                answers.push(Some(answer));
+                if gone {
+                    retired(self.base);
+                    break;
+                }
+            }
+            answers.resize_with(jobs.len(), || None);
+            return unsent_logged(answers);
         }
         let next = AtomicUsize::new(0);
         let answers: Vec<Mutex<Option<R>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
@@ -240,7 +261,8 @@ impl<'a> SidecarPool<'a> {
             .collect();
         std::thread::scope(|scope| {
             for sidecar in workers {
-                let (next, answers, work) = (&next, &answers, &work);
+                let (next, answers, work, leaves_no_process) =
+                    (&next, &answers, &work, &leaves_no_process);
                 scope.spawn(move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::SeqCst);
@@ -248,20 +270,43 @@ impl<'a> SidecarPool<'a> {
                             break;
                         };
                         let answer = work(sidecar, job);
+                        let gone = leaves_no_process(&answer);
                         *answers[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(answer);
+                        if gone {
+                            retired(sidecar);
+                            break;
+                        }
                     }
                 });
             }
         });
-        answers
-            .into_iter()
-            .map(|slot| {
-                slot.into_inner()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .expect("every job is taken by exactly one process")
-            })
-            .collect()
+        unsent_logged(
+            answers
+                .into_iter()
+                .map(|slot| slot.into_inner().unwrap_or_else(|p| p.into_inner()))
+                .collect(),
+        )
     }
+}
+
+/// The log line for a process [`SidecarPool::run`] hands no more jobs to.
+fn retired(sidecar: &TypeSidecar) {
+    warn!(
+        "A sidecar pool process (pid {}) can no longer answer and takes no more jobs",
+        sidecar.pid()
+    );
+}
+
+/// [`SidecarPool::run`]'s answers, with a log line when some were not sent.
+fn unsent_logged<R>(answers: Vec<Option<R>>) -> Vec<Option<R>> {
+    let unsent = answers.iter().filter(|answer| answer.is_none()).count();
+    if unsent > 0 {
+        warn!(
+            "No sidecar pool process was left for {unsent} of {} job(s); they were not sent",
+            answers.len()
+        );
+    }
+    answers
 }
 
 impl Drop for SidecarPool<'_> {
@@ -380,7 +425,8 @@ mod tests {
     }
 
     /// A stand-in sidecar that answers each retype item with its own pid as
-    /// the reason, after a short wait so that every process gets work.
+    /// the reason, after a short wait so that every process gets work. An
+    /// item whose id starts with `die` ends the process before it answers.
     fn stand_in(dir: &Path) -> std::path::PathBuf {
         let script = dir.join("stand-in-sidecar.cjs");
         std::fs::write(
@@ -393,6 +439,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
   const request_id = request.request_id;
   if (request.action === 'shutdown') { write({ request_id, status: 'success' }); process.exit(0); }
   if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.items.some((item) => item.item_id.startsWith('die'))) process.exit(1);
   const until = Date.now() + 150;
   while (Date.now() < until) {}
   write({
@@ -422,6 +469,28 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
+    /// A ready stand-in process scoped to `root`, the caller's own sidecar.
+    fn base_at(root: &Path) -> TypeSidecar {
+        let base = TypeSidecar::spawn(&stand_in(root)).unwrap();
+        base.start_init(root, None);
+        base.wait_ready(std::time::Duration::from_secs(20)).unwrap();
+        base
+    }
+
+    /// One job's answer from the stand-in: the pid of the process that ran it.
+    fn ask(sidecar: &TypeSidecar, job: &str) -> Result<String, SidecarError> {
+        Ok(sidecar
+            .retype_check(&[item(job)])?
+            .remove(0)
+            .reason
+            .expect("the stand-in names its pid"))
+    }
+
+    /// The predicate a caller hands [`SidecarPool::run`].
+    fn gone(answer: &Result<String, SidecarError>) -> bool {
+        matches!(answer, Err(e) if e.leaves_no_process())
+    }
+
     /// Jobs are answered by every process of the pool, and the answers come
     /// back in the order of the jobs whichever process ran them. The extra
     /// processes are scoped to the same root as the caller's.
@@ -429,21 +498,27 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     fn a_pool_answers_every_job_in_order_across_its_processes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let base = TypeSidecar::spawn(&stand_in(&root)).unwrap();
-        base.start_init(&root, None);
-        base.wait_ready(std::time::Duration::from_secs(20)).unwrap();
+        let base = base_at(&root);
 
         let pool = SidecarPool::scoped(&base, &root, None, 3).unwrap();
         assert_eq!(pool.processes(), 3);
         let jobs: Vec<String> = (0..12).map(|n| format!("job-{n}")).collect();
-        let answers = pool.run(&jobs, |sidecar, job| {
-            assert!(sidecar.is_scoped_to(&root, None));
-            let outcome = sidecar
-                .retype_check(&[item(job)])
-                .expect("the stand-in answers")
-                .remove(0);
-            (outcome.item_id, outcome.reason.unwrap())
-        });
+        let answers = pool.run(
+            &jobs,
+            |_: &(String, String)| false,
+            |sidecar, job| {
+                assert!(sidecar.is_scoped_to(&root, None));
+                let outcome = sidecar
+                    .retype_check(&[item(job)])
+                    .expect("the stand-in answers")
+                    .remove(0);
+                (outcome.item_id, outcome.reason.unwrap())
+            },
+        );
+        let answers: Vec<(String, String)> = answers
+            .into_iter()
+            .map(|answer| answer.expect("every job is sent"))
+            .collect();
         assert_eq!(
             answers.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
             jobs,
@@ -465,14 +540,76 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         // One process: the caller's own, in order.
         let single = SidecarPool::scoped(&base, &root, None, 1).unwrap();
         assert_eq!(single.processes(), 1);
-        let answers = single.run(&jobs, |sidecar, job| {
-            sidecar
-                .retype_check(&[item(job)])
-                .unwrap()
-                .remove(0)
-                .reason
-                .unwrap()
-        });
-        assert!(answers.iter().all(|pid| pid == &answers[0]));
+        let answers = single.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        let own = base.pid().to_string();
+        assert!(
+            answers
+                .iter()
+                .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
+            "{answers:?}"
+        );
+    }
+
+    /// A process that dies takes no job after the one it died on: the jobs
+    /// left go to the processes still answering, and every one is answered.
+    #[test]
+    fn a_dead_process_takes_no_more_jobs_and_the_others_answer_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = base_at(&root);
+        let pool = SidecarPool::scoped(&base, &root, None, 3).unwrap();
+        assert_eq!(pool.processes(), 3);
+
+        let mut jobs: Vec<String> = (0..12).map(|n| format!("job-{n}")).collect();
+        jobs[1] = "die".to_string();
+        let answers = pool.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+
+        assert!(
+            matches!(&answers[1], Some(Err(e)) if e.leaves_no_process()),
+            "the job its process died on is that job's failure: {:?}",
+            answers[1]
+        );
+        for (index, answer) in answers.iter().enumerate().filter(|(index, _)| *index != 1) {
+            assert!(
+                matches!(answer, Some(Ok(_))),
+                "job {index} is answered by a process still running: {answers:?}"
+            );
+        }
+    }
+
+    /// With every process dead, the jobs not yet taken come back unsent.
+    /// Each process takes one job and dies on it, so the first three are
+    /// failures and the rest are never sent. One process alone stops the
+    /// same way.
+    #[test]
+    fn with_every_process_dead_the_jobs_left_come_back_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = base_at(&root);
+        let pool = SidecarPool::scoped(&base, &root, None, 3).unwrap();
+        assert_eq!(pool.processes(), 3);
+
+        let jobs: Vec<String> = (0..12).map(|n| format!("die-{n}")).collect();
+        let answers = pool.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        assert!(
+            answers[..3]
+                .iter()
+                .all(|answer| matches!(answer, Some(Err(e)) if e.leaves_no_process())),
+            "each process died on the one job it took: {answers:?}"
+        );
+        assert!(
+            answers[3..].iter().all(Option::is_none),
+            "no process was left for the rest: {answers:?}"
+        );
+
+        let alone = base_at(&root);
+        let single = SidecarPool::scoped(&alone, &root, None, 1).unwrap();
+        let jobs = ["die".to_string(), "job-1".to_string(), "job-2".to_string()];
+        let answers = single.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        assert!(
+            matches!(&answers[0], Some(Err(e)) if e.leaves_no_process()),
+            "{answers:?}"
+        );
+        assert!(answers[1..].iter().all(Option::is_none), "{answers:?}");
     }
 }
