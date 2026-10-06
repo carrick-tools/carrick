@@ -17,8 +17,9 @@ use crate::services::type_sidecar::{
     TypeSidecar, ready_budget,
 };
 use crate::visitor::FunctionDefinition;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -42,7 +43,9 @@ const RETURN_UNKNOWN: &str = "unknown";
 /// the rest a file at a time instead (carrick#1993). The order does not
 /// change how a signature prints: the sidecar's compiler orders a union's
 /// members, and the properties of an object made from a mapped type, by
-/// their content rather than by which it met first (carrick#2019).
+/// their names rather than by which it met first (carrick#2019), and two of
+/// the same name by where their files sit in the program, which every
+/// process asked holds alike ([`SameProgram`], carrick#2027).
 const BATCH_SLOTS: usize = 500;
 
 /// A slot is named in the log when it took this many milliseconds or more
@@ -368,13 +371,30 @@ fn infer_missing_types(
     // AND the scanner-side request build, and only the split says which grew
     // (carrick#767).
     let round_trips = std::time::Instant::now();
+    let program = match SameProgram::of(sidecar, &requests) {
+        Ok(program) => Some(program),
+        Err(e) => {
+            warn!(
+                "Signature inference stays on one process: the pass's files could not be added \
+                 to its program up front: {e}"
+            );
+            None
+        }
+    };
+    let ask = |process: &TypeSidecar, batch: &[InferRequestItem]| {
+        if let Some(program) = &program {
+            program.hold(process)?;
+        }
+        process.infer_types(batch, None)
+    };
     let outcome = infer_in_batches(
         &requests,
         BATCH_SLOTS,
         &targets,
         function_definitions,
-        |batch| sidecar.infer_types(batch, None),
-        || pool_beside(sidecar),
+        |batch| ask(sidecar, batch),
+        ask,
+        || program.as_ref().and_then(|_| pool_beside(sidecar)),
     );
     let seconds = round_trips.elapsed().as_secs_f64();
 
@@ -393,6 +413,63 @@ fn infer_missing_types(
     }
     if let Some(line) = outcome.timing.summary() {
         debug!("{line}");
+    }
+}
+
+/// The program every process answering the pass holds before it answers
+/// (carrick#2027): the scan's own process's, root file for root file, once
+/// the pass's files have been added to it in path order.
+///
+/// The compiler orders two types of the same name by where their files sit
+/// in the program (`stableTypeOrdering`), and a process adds a file its
+/// tsconfig does not list when it is first asked about it. Added up front in
+/// one order, the pass's files sit in the same place in every process: the
+/// scan's own, with a pool or without, before and after a restart, and every
+/// process of a pool.
+struct SameProgram {
+    /// The root files of the scan's own process's program, in order.
+    roots: Vec<PathBuf>,
+    /// The processes that hold it, by pid: a process that replaced one that
+    /// timed out does not.
+    holding: Mutex<HashSet<u32>>,
+}
+
+impl SameProgram {
+    /// Add the files `requests` ask about to `sidecar`'s program, in path
+    /// order, and take its root files as the program every process holds.
+    fn of(sidecar: &TypeSidecar, requests: &[InferRequestItem]) -> Result<Self, SidecarError> {
+        let mut files: Vec<PathBuf> = requests
+            .iter()
+            .map(|request| PathBuf::from(&request.file_path))
+            .collect();
+        files.sort();
+        files.dedup();
+        let added = sidecar.add_program_files(&files)?;
+        let roots = sidecar.program_files()?;
+        debug!(
+            "Signature inference: {added} of the pass's {} file(s) added to the program up \
+             front; it is built from {} root file(s)",
+            files.len(),
+            roots.len()
+        );
+        Ok(Self {
+            roots,
+            holding: Mutex::new(HashSet::from([sidecar.pid()])),
+        })
+    }
+
+    /// Give `sidecar` this program before it answers, unless it holds it
+    /// already. Files it has loaded keep their place, so the roots go to a
+    /// process before any other request: a pool process before its first
+    /// job, a process that replaced one before its first.
+    fn hold(&self, sidecar: &TypeSidecar) -> Result<(), SidecarError> {
+        let pid = sidecar.pid();
+        if self.holding.lock().unwrap().contains(&pid) {
+            return Ok(());
+        }
+        sidecar.add_program_files(&self.roots)?;
+        self.holding.lock().unwrap().insert(pid);
+        Ok(())
     }
 }
 
@@ -417,6 +494,13 @@ impl Answer {
     /// ([`SidecarError::leaves_no_process`]).
     fn leaves_no_process(&self) -> bool {
         matches!(&self.result, Err(error) if error.leaves_no_process())
+    }
+
+    /// Whether a pool process that gave this answer takes no more jobs: it
+    /// is gone, or it could not be given the program every process holds
+    /// ([`SameProgram`]), so what it would answer could read otherwise.
+    fn ends_a_pool_process(&self) -> bool {
+        self.leaves_no_process() || matches!(&self.result, Err(SidecarError::ProgramFilesFailed(_)))
     }
 
     /// The lines the log holds for batch `number` of `count` when it was
@@ -491,25 +575,29 @@ impl PassOutcome {
 /// others.
 ///
 /// `infer` asks the scan's own process, and the first batch always goes to
-/// it: that request builds the process's program, so only after it does the
-/// process's size say what another process reading the same program takes.
-/// Then `pool_for_the_rest` may start a pool of more than one process for the
-/// rest (carrick#1993). Every process of it takes one whole file's slots at a
-/// time, so a process pays a file's first look once, and the answers are
-/// merged in the order of the jobs. Without a pool, the rest go to the scan's
-/// own process a batch at a time, as they always did.
+/// it: only once its checker has answered over the service's program does
+/// the process's size say what another process answering the same way
+/// takes. Then `pool_for_the_rest` may start a pool of more than one
+/// process for the rest (carrick#1993), each asked with `ask`. Every process
+/// of it takes one whole file's slots at a time, so a process pays a file's
+/// first look once, and the answers are merged in the order of the jobs.
+/// Without a pool, the rest go to the scan's own process a batch at a time,
+/// as they always did.
 ///
 /// A batch that fails is lost and the next one is asked, unless the failure
 /// says its process is gone ([`SidecarError::leaves_no_process`]). On one
 /// process the batches not yet sent are then lost with it, without being
-/// sent. On a pool that process takes no more jobs, the others take the
-/// rest, and only the jobs no process was left to take go unsent.
+/// sent. On a pool that process takes no more jobs, nor does one that could
+/// not be given the pass's program ([`Answer::ends_a_pool_process`]); the
+/// others take the rest, and only the jobs no process was left to take go
+/// unsent.
 fn infer_in_batches<'s>(
     requests: &[InferRequestItem],
     batch_slots: usize,
     targets: &HashMap<String, SigTarget>,
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     mut infer: impl FnMut(&[InferRequestItem]) -> Result<SidecarResponse, SidecarError>,
+    ask: impl Fn(&TypeSidecar, &[InferRequestItem]) -> Result<SidecarResponse, SidecarError> + Sync,
     pool_for_the_rest: impl FnOnce() -> Option<SidecarPool<'s>>,
 ) -> PassOutcome {
     let mut outcome = PassOutcome::default();
@@ -538,9 +626,9 @@ fn infer_in_batches<'s>(
             let definitions: &HashMap<String, FunctionDefinition> = function_definitions;
             pool.run(
                 &jobs,
-                Answer::leaves_no_process,
+                Answer::ends_a_pool_process,
                 |sidecar, (number, job)| {
-                    let answer = Answer::timed(|| sidecar.infer_types(job, None));
+                    let answer = Answer::timed(|| ask(sidecar, job));
                     answer.log(*number, count, targets, definitions);
                     answer
                 },
@@ -596,8 +684,9 @@ fn infer_in_batches<'s>(
 /// the size comes to one, when the scan's own process cannot say its scope or
 /// its size, or when no other process starts.
 ///
-/// Asked after the first batch, which built the scan's own process's program:
-/// its size then is the estimate for another process reading the same one.
+/// Asked after the first batch, which the scan's own process answered over
+/// its program: its size then is the estimate for another process answering
+/// over the same one.
 fn pool_beside(sidecar: &TypeSidecar) -> Option<SidecarPool<'_>> {
     let Some((root, tsconfig)) = sidecar.scope() else {
         debug!("Signature inference stays on one process: the sidecar has no scope to copy");
@@ -1003,6 +1092,15 @@ mod tests {
         d
     }
 
+    /// How a pool process is asked for a batch in these tests: as the pass
+    /// asks one, without a program to give it first.
+    fn ask_a_pool_process(
+        sidecar: &TypeSidecar,
+        batch: &[InferRequestItem],
+    ) -> Result<SidecarResponse, SidecarError> {
+        sidecar.infer_types(batch, None)
+    }
+
     /// A sidecar answer that types every slot of the batch as `typed`.
     fn answer(batch: &[InferRequestItem]) -> SidecarResponse {
         let inferred: Vec<serde_json::Value> = batch
@@ -1056,6 +1154,7 @@ mod tests {
                 sent.push(batch.iter().map(|r| r.alias.clone().unwrap()).collect());
                 Ok(answer(batch))
             },
+            ask_a_pool_process,
             || None,
         );
 
@@ -1111,6 +1210,7 @@ mod tests {
                     Ok(answer(batch))
                 }
             },
+            ask_a_pool_process,
             || None,
         );
 
@@ -1153,6 +1253,7 @@ mod tests {
                     Err(SidecarError::ProcessDied)
                 }
             },
+            ask_a_pool_process,
             || None,
         );
 
@@ -1181,6 +1282,7 @@ mod tests {
             &mut definitions,
             // Only the first slot of each batch comes back.
             |batch| Ok(answer(&batch[..1])),
+            ask_a_pool_process,
             || None,
         );
         assert_eq!(
@@ -1280,6 +1382,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &targets,
             &mut definitions,
             |batch| base.infer_types(batch, None),
+            ask_a_pool_process,
             || SidecarPool::scoped(&base, &root, None, 3).ok(),
         );
 
@@ -1346,6 +1449,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &targets,
             &mut definitions,
             |batch| base.infer_types(batch, None),
+            ask_a_pool_process,
             || SidecarPool::scoped(&base, &root, None, 3).ok(),
         );
 
@@ -1387,6 +1491,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     Ok(answer(batch))
                 }
             },
+            ask_a_pool_process,
             || panic!("no pool is sized from a process that answered nothing"),
         );
         assert_eq!(asked, vec!["/r/a.ts", "/r/b.ts", "/r/c.ts"]);
@@ -1400,6 +1505,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &targets,
             &mut definitions,
             |batch| Ok(answer(batch)),
+            ask_a_pool_process,
             || panic!("no pool is started for nothing"),
         );
         assert_eq!(outcome.inferred, 6);
@@ -1588,6 +1694,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                         )),
                     ))
                 },
+                ask_a_pool_process,
                 || None,
             );
         });
@@ -1666,7 +1773,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 answer(batch)
             })
         };
-        let outcome = infer_in_batches(&requests, 2, &targets, &mut definitions, ask, || None);
+        let outcome = infer_in_batches(
+            &requests,
+            2,
+            &targets,
+            &mut definitions,
+            ask,
+            ask_a_pool_process,
+            || None,
+        );
 
         assert_eq!(
             outcome.inferred, 6,
@@ -1710,6 +1825,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 &targets,
                 &mut definitions,
                 |batch| Ok(answer(batch)),
+                ask_a_pool_process,
                 || None,
             );
             assert_eq!(outcome.timing, PassTiming::default());

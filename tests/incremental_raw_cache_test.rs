@@ -1264,33 +1264,39 @@ fn named_dog(member: &str, returns: &str, function: &str) -> String {
     )
 }
 
-/// Files a process adds to its program in one order. The sidecar's program
-/// does not list `tools/` (no tsconfig, and outside its default source
-/// folders), so a process adds a file there the first time it is asked about
-/// it, with the files it imports. Two interfaces are both named `Dog`, in
-/// `tools/yard/` and `tools/kennel/`. The yard's function is asked first of
-/// all, so the scan's own process adds the yard's module before the
-/// kennel's. Sixty later files under `tools/` import the kennel's module
-/// before the yard's and print a union of the two: the first batch ends
-/// among them, so a pool process starts from a later file and adds the
-/// kennel's first.
+/// Files a process would add to its program in another order. The sidecar's
+/// program does not list `tools/` (no tsconfig, and outside its default
+/// source folders), so a process adds a file there the first time it is
+/// asked about it, with the files it imports. Two interfaces are both named
+/// `Dog`, in `tools/kennel/` and `tools/yard/`, and sixty later files under
+/// `tools/` print a union of the two. Each way of meeting them gives another
+/// order:
+///
+/// - by path, the order the pass adds its files in up front: kennel first;
+/// - by name, the order the scan's own process asks in: kennel first (its
+///   function is asked first of all);
+/// - by import, the order a pool process left to itself would add them in
+///   from its first job, a later file: yard first.
+///
+/// The first batch ends among the later files, so every pool process starts
+/// from one.
 fn files_added_in_another_order() -> Vec<(String, String)> {
     let mut files = vec![
         ("src/pets/shapes.ts".to_string(), PET_SHAPES.to_string()),
         (
-            "tools/yard/dog.ts".to_string(),
-            named_dog("woof", "number", "$0_yard"),
+            "tools/kennel/dog.ts".to_string(),
+            named_dog("bark", "string", "$0_kennel"),
         ),
         (
-            "tools/kennel/dog.ts".to_string(),
-            named_dog("bark", "string", "zzz_kennel"),
+            "tools/yard/dog.ts".to_string(),
+            named_dog("woof", "number", "zzz_yard"),
         ),
     ];
     for file in 0..60 {
         let mut text = String::from(
             "import type { Cat, Dog } from '../src/pets/shapes.js';\n\
-             import type { Dog as KennelDog } from './kennel/dog.js';\n\
-             import type { Dog as YardDog } from './yard/dog.js';\n",
+             import type { Dog as YardDog } from './yard/dog.js';\n\
+             import type { Dog as KennelDog } from './kennel/dog.js';\n",
         );
         for function in 0..3 {
             let name = format!("zz_{file:02}_{function}");
@@ -1431,8 +1437,6 @@ async fn a_pool_writes_what_one_process_writes(
 /// the scan's own process did (`types_met_in_another_order`).
 #[tokio::test]
 #[serial]
-#[ignore = "red until the sidecar prints types in an order of their own (carrick#2019); \
-            `--ignored` shows it fail on TypeScript 5"]
 async fn a_pool_prints_types_its_processes_met_in_another_order_as_one_process_does() {
     a_pool_writes_what_one_process_writes(
         "types met in another order",
@@ -1452,8 +1456,6 @@ async fn a_pool_prints_types_its_processes_met_in_another_order_as_one_process_d
 /// (`files_added_in_another_order`).
 #[tokio::test]
 #[serial]
-#[ignore = "red until every process's program holds the same files in the same order \
-            (carrick#1993); `--ignored` shows it fail on a sidecar with stable type order"]
 async fn a_pool_prints_types_from_files_its_processes_added_in_another_order_as_one_process_does() {
     a_pool_writes_what_one_process_writes(
         "files added in another order",
