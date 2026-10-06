@@ -185,6 +185,14 @@ pub struct ServiceBoundary {
     /// Whether the tree had no `node_modules` when types were captured. Every
     /// type that resolves through a dependency is `any` on a bare checkout.
     pub bare_checkout: bool,
+    /// What the time limits that ran out during this scan cost this service,
+    /// by kind (carrick#2021): the ones that ran out while it was analysed,
+    /// and the ones that ran out in the cross-service check on the checks
+    /// whose verdicts this service stores. `{}` when none ran out. `None` on
+    /// a blob from a scanner that did not count them, and on a run whose
+    /// cross-service check failed before it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limits_run_out: Option<crate::time_limits::TimeLimitsRunOut>,
 }
 
 impl ServiceBoundary {
@@ -248,7 +256,20 @@ impl ServiceBoundary {
                 .capture_stub
                 .as_ref()
                 .is_some_and(|stub| stub.bare_checkout),
+            // Known once the cross-service check has run; see
+            // `fold_time_limits`.
+            time_limits_run_out: None,
         }
+    }
+
+    /// Add what time limits that ran out cost this service: once with what
+    /// its own analysis lost, once with what the cross-service check lost.
+    ///
+    /// Separate from [`Self::collect`] for the same reason as
+    /// [`Self::fold_sdk_unresolved`]: the check runs over every service of
+    /// the run at once, after each service's own analysis.
+    pub fn fold_time_limits(&mut self, cost: &crate::time_limits::TimeLimitsRunOut) {
+        self.time_limits_run_out.get_or_insert_default().merge(cost);
     }
 
     /// Fold in what the cross-repo SDK join could not resolve for this service.
@@ -346,6 +367,9 @@ impl ServiceBoundary {
                 "  types captured on a bare checkout: anything through a dependency is `any`"
                     .to_string(),
             );
+        }
+        if let Some(cost) = &self.time_limits_run_out {
+            out.extend(cost.lines().into_iter().map(|line| format!("  {line}")));
         }
         out
     }
@@ -1215,6 +1239,61 @@ mod tests {
         assert_eq!(
             boundary.awaiting_model().as_deref(),
             Some("8 candidate(s) waiting for `carrick index`")
+        );
+    }
+
+    /// carrick#2021, the index side of the count. A boundary written before
+    /// the count existed carries no block and reads back as not counted; a
+    /// counted boundary carries the block, `{}` when no limit ran out, and
+    /// each kind that did under its own name. The block is folded from the
+    /// service's own analysis and from the check, and printed one line per
+    /// kind that ran out.
+    #[test]
+    fn the_time_limits_that_ran_out_are_written_by_kind_and_absent_is_not_zero() {
+        use crate::time_limits::{TimeLimit, TimeLimitsRunOut};
+
+        let older: ServiceBoundary =
+            serde_json::from_value(serde_json::to_value(ServiceBoundary::default()).unwrap())
+                .unwrap();
+        assert_eq!(older.time_limits_run_out, None, "not counted");
+        assert!(
+            serde_json::to_value(&older)
+                .unwrap()
+                .get("time_limits_run_out")
+                .is_none(),
+            "a boundary that did not count writes nothing"
+        );
+
+        let mut boundary = ServiceBoundary {
+            commit_hash: "0123456".to_string(),
+            ..Default::default()
+        };
+        boundary.fold_time_limits(&TimeLimitsRunOut::default());
+        boundary.fold_time_limits(&TimeLimitsRunOut::default());
+        let counted = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(counted["time_limits_run_out"], serde_json::json!({}));
+        assert_eq!(boundary.lines("web").len(), 1, "nothing ran out, no line");
+
+        let mut analysed = TimeLimitsRunOut::default();
+        analysed.add(TimeLimit::LibraryChecks, 4);
+        let mut checked = TimeLimitsRunOut::default();
+        checked.add(TimeLimit::Retype, 312);
+        boundary.fold_time_limits(&analysed);
+        boundary.fold_time_limits(&checked);
+        let value = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(
+            value["time_limits_run_out"],
+            serde_json::json!({ "retype": 312, "library_checks": 4 })
+        );
+        let read: ServiceBoundary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(read, boundary);
+        let lines = boundary.lines("web");
+        assert!(
+            lines.contains(&"  312 response checks not reached: retype time limit".to_string())
+                && lines.contains(
+                    &"  4 library checks not reached: library check time limit".to_string()
+                ),
+            "{lines:?}"
         );
     }
 }

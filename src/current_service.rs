@@ -28,10 +28,16 @@
 //! for every call that task makes, whatever the loop is analysing meanwhile.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// The service whose analysis is running, or `None` outside the loop.
 static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// How many scopes [`enter`] has open: above zero exactly while a service's
+/// analysis runs, named or not, which [`CURRENT`] cannot say for an unnamed
+/// service.
+static OPEN_SCOPES: AtomicUsize = AtomicUsize::new(0);
 
 fn current_slot() -> MutexGuard<'static, Option<String>> {
     // A panic inside one service's analysis leaves the lock poisoned; the
@@ -84,7 +90,14 @@ pub fn enter(service: Option<&str>) -> ServiceScope {
     let mut slot = current_slot();
     let previous = slot.take();
     *slot = service.map(str::to_string);
+    OPEN_SCOPES.fetch_add(1, Ordering::SeqCst);
     ServiceScope { previous }
+}
+
+/// Whether a service's analysis is running, named or unnamed. `false` in the
+/// cross-repo phase and the upload, which belong to no service.
+pub fn in_scope() -> bool {
+    OPEN_SCOPES.load(Ordering::SeqCst) > 0
 }
 
 /// Holds one service's analysis open. See [`enter`].
@@ -98,6 +111,7 @@ pub struct ServiceScope {
 impl Drop for ServiceScope {
     fn drop(&mut self) {
         *current_slot() = self.previous.take();
+        OPEN_SCOPES.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -123,16 +137,20 @@ mod tests {
     #[test]
     #[serial_test::serial(current_service)]
     fn each_service_is_current_only_for_its_own_analysis() {
+        assert!(!in_scope());
         {
             let _scope = enter(Some("api"));
             assert_eq!(name().as_deref(), Some("api"));
+            assert!(in_scope());
         }
         assert_eq!(name(), None, "the gap between two services names neither");
+        assert!(!in_scope());
         {
             let _scope = enter(Some("web"));
             assert_eq!(name().as_deref(), Some("web"));
         }
         assert_eq!(name(), None, "the cross-repo phase names no service");
+        assert!(!in_scope(), "the cross-repo phase is no service's analysis");
     }
 
     /// A service's detection and guidance are asked while the loop analyses
@@ -169,6 +187,7 @@ mod tests {
     fn an_unnamed_service_reports_no_name() {
         let _scope = enter(None);
         assert_eq!(name(), None);
+        assert!(in_scope(), "its analysis is running all the same");
     }
 
     /// A service whose analysis fails carries its error out through `?`,

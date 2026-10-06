@@ -77,6 +77,7 @@ mod shutdown;
 mod signature_pass;
 mod socket_io;
 mod swc_scanner;
+mod time_limits;
 mod type_manifest;
 mod url_normalizer;
 mod utils;

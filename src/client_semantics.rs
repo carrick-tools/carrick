@@ -758,7 +758,13 @@ pub fn verify(
     }
     let checks = derived.checks();
     let results = match sidecar.verify_client_semantics(from_dir, &checks) {
-        Ok(results) => results,
+        Ok(results) => {
+            crate::scan_health::record_time_limit(
+                crate::time_limits::TimeLimit::LibraryChecks,
+                crate::services::type_sidecar::not_reached_in_time(&results),
+            );
+            results
+        }
         // Nothing for the user to act on: every call keeps the reading it
         // has without the semantics, and the next scan checks again.
         Err(error) => {
@@ -1451,6 +1457,59 @@ mod tests {
         }
         // No checks, no results: nothing to disagree about.
         assert!(answers_every_check(&[], &[]));
+    }
+
+    /// carrick#2021: checks the sidecar's time limit did not reach are
+    /// counted against the service being verified. The stand-in answers
+    /// every check the way the verifier does once its time limit has passed.
+    #[test]
+    #[serial_test::serial(current_service)]
+    fn checks_the_time_limit_did_not_reach_are_counted_against_the_service() {
+        const SERVICE: &str = "semantics-2021";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("out-of-time-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  write({
+    request_id,
+    status: 'success',
+    semantics: request.checks.map((check) => ({
+      claim_id: check.claim_id, receiver: check.receiver, verdict: 'unchecked', reason: 'budget',
+    })),
+  });
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = crate::services::type_sidecar::TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let entries = sample_entries();
+        let asked = derive_claims(&entries).checks().len();
+        assert!(asked > 0, "the sample asks something");
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+
+        let semantics = {
+            let _scope = crate::current_service::enter(Some(SERVICE));
+            verify(&sidecar, &root, &entries)
+        };
+        assert!(semantics.is_empty(), "nothing was verified");
+        assert_eq!(
+            crate::scan_health::time_limits_for(Some(SERVICE)).library_checks,
+            asked
+        );
+        crate::scan_health::forget_service_losses(Some(SERVICE));
     }
 
     #[test]

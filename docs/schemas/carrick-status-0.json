@@ -242,7 +242,17 @@
             "candidates_awaiting_model": { "type": "integer", "minimum": 0 },
             "unemitted_literal_candidates": { "type": "integer", "minimum": 0 },
             "unemitted_literal_sites": { "type": "array", "items": { "type": "string" } },
-            "type_extraction_status": { "type": "string" }
+            "type_extraction_status": { "type": "string" },
+            "time_limits_run_out": {
+              "type": "object",
+              "description": "What the time limits that ran out during the scan cost this service, by kind. Empty when none ran out; absent on an index written before the count existed.",
+              "properties": {
+                "retype": { "type": "integer", "minimum": 0 },
+                "library_checks": { "type": "integer", "minimum": 0 },
+                "sidecar_deadline": { "type": "integer", "minimum": 0 }
+              },
+              "additionalProperties": true
+            }
           },
           "additionalProperties": true
         },

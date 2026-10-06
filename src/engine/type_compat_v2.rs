@@ -6866,4 +6866,129 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             outcomes[0].diagnostic
         );
     }
+
+    /// carrick#2021: a retype the time limit cut short is counted, in the
+    /// scan summary and in the consumer's boundary on the index, and a retype
+    /// that finished counts nothing.
+    ///
+    /// Three consumer calls of `web` go to a stand-in sidecar that answers the
+    /// way the real one does when its time limit passes before it reaches an
+    /// item (`retype.ts`); the control stand-in judges every item. The check
+    /// runs as a scan runs it, its outcomes are folded into the boundary as
+    /// the engine folds them, and the summary is the run's total.
+    #[test]
+    fn a_retype_the_time_limit_cut_short_is_counted_in_the_summary_and_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let stand_in = |name: &str, answer: &str| -> TypeSidecar {
+            let script = root.join(name);
+            std::fs::write(
+                &script,
+                format!(
+                    r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  write({{
+    request_id,
+    status: 'success',
+    outcomes: request.items.map((item) => ({{ item_id: item.item_id, diagnostics: [], {answer} }})),
+  }});
+}});
+"#
+                ),
+            )
+            .unwrap();
+            let sidecar = TypeSidecar::spawn(&script).unwrap();
+            sidecar.start_init(&root, None);
+            sidecar
+                .wait_ready(std::time::Duration::from_secs(20))
+                .expect("the stand-in answers init");
+            sidecar
+        };
+
+        let key = OperationKey::http("GET", "/orders");
+        let mut producer = entry(
+            key.clone(),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            "Orders",
+            "src/routes.ts",
+            3,
+            ManifestTypeState::Explicit,
+        );
+        producer.expanded_definition = Some("{ id: string; }".to_string());
+        let calls: Vec<TypeManifestEntry> = [8, 9, 10]
+            .into_iter()
+            .map(|line| {
+                entry(
+                    key.clone(),
+                    ManifestRole::Consumer,
+                    ManifestTypeKind::Response,
+                    &format!("Call{line}"),
+                    "src/client.ts",
+                    line,
+                    ManifestTypeState::Unknown,
+                )
+            })
+            .collect();
+        let local = LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: root.clone(),
+                tsconfig: None,
+                calls: calls
+                    .iter()
+                    .map(|call| {
+                        (
+                            call.type_alias.clone(),
+                            CallLocator {
+                                file_path: root.join("src/client.ts").display().to_string(),
+                                line_number: call.line_number,
+                                span_start: None,
+                                span_end: None,
+                                expression_text: None,
+                                expression_line: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        )]);
+        // The consumer has no surface of its own, so every pair is its to
+        // settle and only the retype can.
+        let all_repo_data = [
+            repo("api", None, vec![producer], Some(fake_artifact())),
+            repo("web", None, calls, None),
+        ];
+        let scanned = |sidecar: &TypeSidecar| {
+            let outcomes = run_check(sidecar, &all_repo_data, &local);
+            let mut boundaries = vec![(
+                "web".to_string(),
+                crate::boundary::ServiceBoundary::default(),
+            )];
+            let summary = crate::time_limits::fold_check_outcomes(&mut boundaries, &outcomes);
+            let index = serde_json::to_value(&boundaries[0].1).unwrap();
+            (summary.lines(), index["time_limits_run_out"].clone())
+        };
+
+        let cut_short = stand_in(
+            "cut-short.cjs",
+            "outcome: 'abstain', reason: 'the retype check ran out of its 600000ms budget'",
+        );
+        assert_eq!(
+            scanned(&cut_short),
+            (
+                vec!["3 response checks not reached: retype time limit".to_string()],
+                serde_json::json!({ "retype": 3 })
+            )
+        );
+
+        let finished = stand_in("finished.cjs", "outcome: 'agrees'");
+        assert_eq!(scanned(&finished), (Vec::new(), serde_json::json!({})));
+    }
 }

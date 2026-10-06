@@ -1377,18 +1377,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // Each local service's boundary (carrick#705), taken for the same reason:
     // the blobs are about to move into the analyzer, and the SDK half of the
-    // boundary is only known once the join below has run. Keyed by the same
-    // `service_name ?? repo_name` id every other cross-repo surface uses.
-    let mut boundaries: Vec<(String, crate::boundary::ServiceBoundary)> = current_services_data
-        .iter()
-        .filter_map(|data| {
-            let id = data
-                .service_name
-                .clone()
-                .unwrap_or_else(|| data.repo_name.clone());
-            data.boundary.clone().map(|boundary| (id, boundary))
-        })
-        .collect();
+    // boundary is only known once the join below has run.
+    let mut boundaries = local_boundaries(&current_services_data);
 
     // Handlers that switch on a request field with no `operations` block yet
     // (carrick#831), taken here for the same reason as the two above: the
@@ -1471,6 +1461,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     results.sdk_unresolved = sdk_join.unresolved();
     for (id, boundary) in &mut boundaries {
         boundary.fold_sdk_unresolved(&sdk_join.unresolved_for(id));
+    }
+
+    // Every time limit that ran out, in the scan's analysis and in the check
+    // above, stated by kind with what it cost (carrick#2021). Not a loss the
+    // run fails on: the work it cut off says why on each row it left.
+    let time_limits =
+        crate::time_limits::fold_check_outcomes(&mut boundaries, analyzer.pair_outcomes());
+    for line in time_limits.lines() {
+        warn!("{line}");
+        logging::annotate(logging::Annotation::Warning, &line);
     }
 
     // An SDK-mediated break is a contract risk like any other, so it joins the
@@ -1980,6 +1980,31 @@ fn upload_payloads_for<T: CloudStorage>(
                 dirty,
                 unchanged.as_ref(),
             )
+        })
+        .collect()
+}
+
+/// Each local service's boundary, keyed by the `service_name ?? repo_name`
+/// id every other cross-repo surface uses, carrying what the time limits that
+/// ran out during the service's own analysis cost it (carrick#2021). The
+/// cross-service check's are folded in once it has run
+/// ([`crate::time_limits::fold_check_outcomes`]).
+fn local_boundaries(
+    current_services_data: &[CloudRepoData],
+) -> Vec<(String, crate::boundary::ServiceBoundary)> {
+    current_services_data
+        .iter()
+        .filter_map(|data| {
+            let id = data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| data.repo_name.clone());
+            data.boundary.clone().map(|mut boundary| {
+                boundary.fold_time_limits(&crate::scan_health::time_limits_for(
+                    data.service_name.as_deref(),
+                ));
+                (id, boundary)
+            })
         })
         .collect()
 }
@@ -3973,7 +3998,13 @@ fn read_library_rows(
     crate::library_claims::read(sites, claims, |checks| {
         sidecar
             .verify_library_claims(from_dir, checks)
-            .map(|answer| answer.verdicts)
+            .map(|answer| {
+                crate::scan_health::record_time_limit(
+                    crate::time_limits::TimeLimit::LibraryChecks,
+                    crate::services::type_sidecar::not_reached_in_time(&answer.verdicts),
+                );
+                answer.verdicts
+            })
             .map_err(|error| error.to_string())
     })
 }
@@ -19276,6 +19307,87 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             read_library_rows(&sites, &claims, None, dir.path())
                 .rows
                 .is_empty()
+        );
+    }
+
+    /// carrick#2021: library-claim checks the sidecar's time limit did not
+    /// reach are counted against the service whose analysis asked them, and
+    /// its boundary carries the count when the run takes the boundaries for
+    /// the index. The stand-in answers every check the way the verifier does
+    /// once its time limit has passed.
+    #[test]
+    #[serial_test::serial(current_service)]
+    fn library_checks_the_time_limit_did_not_reach_reach_the_boundary() {
+        const SERVICE: &str = "library-2021";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let script = root.join("out-of-time-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  write({
+    request_id,
+    status: 'success',
+    verdicts: request.checks.map((check) => ({
+      claim_id: check.claim_id, receiver: check.receiver, verdict: 'unchecked', reason: 'budget',
+    })),
+  });
+});
+"#,
+        )
+        .expect("write stand-in");
+        let sidecar = TypeSidecar::spawn(&script).expect("spawn stand-in");
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        let asked = crate::library_claims::checks(&sites, &claims).len();
+        assert!(asked > 0, "the site asks something");
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+
+        let rows = {
+            let _scope = crate::current_service::enter(Some(SERVICE));
+            read_library_rows(&sites, &claims, Some(&sidecar), &root)
+        };
+        assert!(
+            rows.rows.is_empty(),
+            "nothing was verified, nothing is stated"
+        );
+
+        let mut data = service_data("monorepo", Some(SERVICE));
+        data.boundary = Some(crate::boundary::ServiceBoundary::default());
+        let boundaries = local_boundaries(&[data]);
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].0, SERVICE);
+        assert_eq!(
+            boundaries[0].1.time_limits_run_out,
+            Some(crate::time_limits::TimeLimitsRunOut {
+                library_checks: asked,
+                ..Default::default()
+            })
         );
     }
 

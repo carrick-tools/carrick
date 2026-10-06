@@ -109,6 +109,11 @@ struct Registry {
     /// a count a reader needs to know the rows were dropped on purpose. A
     /// service analysed twice in one run keeps its last count.
     in_process_pubsub: BTreeMap<Scope, usize>,
+    /// What the time limits that ran out while each service was analysed
+    /// cost it, by kind (carrick#2021). The cross-service check's are read
+    /// off its outcomes instead ([`crate::time_limits::from_check_outcomes`]),
+    /// because no service is being analysed while it runs.
+    time_limits: BTreeMap<Scope, crate::time_limits::TimeLimitsRunOut>,
 }
 
 /// Which service a loss belongs to: its `service_name`, or `None` for a repo
@@ -233,6 +238,29 @@ impl Registry {
         self.lost.retain(|l| l.scope != *scope);
         self.attempted = self.attempted.saturating_sub(before - self.lost.len());
         self.intents_failed.retain(|(s, _, _)| s != scope);
+        self.time_limits.remove(scope);
+    }
+
+    /// Records that `limit` ran out while `scope` was analysed, at a cost of
+    /// `cost` items.
+    fn record_time_limit(
+        &mut self,
+        scope: &Scope,
+        limit: crate::time_limits::TimeLimit,
+        cost: usize,
+    ) {
+        if cost == 0 {
+            return;
+        }
+        self.time_limits
+            .entry(scope.clone())
+            .or_default()
+            .add(limit, cost);
+    }
+
+    /// What the time limits that ran out cost `scope` while it was analysed.
+    fn time_limits_for(&self, scope: &Scope) -> crate::time_limits::TimeLimitsRunOut {
+        self.time_limits.get(scope).copied().unwrap_or_default()
     }
 
     fn unanalysed_files_for(&self, scope: &Scope) -> Vec<crate::cloud_storage::UnanalysedFile> {
@@ -594,6 +622,34 @@ pub fn forget_service_losses(service: Option<&str>) {
         .lock()
         .expect("scan health lock")
         .forget_service_losses(&service.map(str::to_string));
+}
+
+/// Records that `limit` ran out at a cost of `cost` items, against the
+/// service whose analysis is running ([`crate::current_service`],
+/// carrick#2021).
+///
+/// Nothing is recorded when no service's analysis is running: the
+/// cross-service check belongs to no one service, and its time limits are
+/// read off its outcomes instead
+/// ([`crate::time_limits::from_check_outcomes`]). Nothing is recorded for a
+/// cost of 0 either.
+pub fn record_time_limit(limit: crate::time_limits::TimeLimit, cost: usize) {
+    if !crate::current_service::in_scope() {
+        return;
+    }
+    let scope = crate::current_service::name();
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_time_limit(&scope, limit, cost);
+}
+
+/// What the time limits that ran out cost `service` while it was analysed.
+pub fn time_limits_for(service: Option<&str>) -> crate::time_limits::TimeLimitsRunOut {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .time_limits_for(&service.map(str::to_string))
 }
 
 /// Whether [`ALLOW_PARTIAL_ENV`] is set for this run.
@@ -1226,6 +1282,43 @@ mod tests {
         assert!(
             sentence.split_whitespace().count() <= 20,
             "a line a person reads, not a paragraph: {sentence}"
+        );
+    }
+
+    /// carrick#2021: a time limit that runs out is counted against the
+    /// service being analysed, by kind, and a service analysed again counts
+    /// afresh rather than twice. A cost of nothing records nothing, so a
+    /// service no limit cut short has no count at all.
+    #[test]
+    fn a_time_limit_is_counted_against_the_service_being_analysed() {
+        use crate::time_limits::{TimeLimit, TimeLimitsRunOut};
+        let api = Some("api".to_string());
+        let web = Some("web".to_string());
+        let mut run = run();
+
+        run.record_time_limit(&api, TimeLimit::LibraryChecks, 3);
+        run.record_time_limit(&api, TimeLimit::SidecarDeadline, 50);
+        run.record_time_limit(&api, TimeLimit::LibraryChecks, 2);
+        run.record_time_limit(&web, TimeLimit::LibraryChecks, 0);
+
+        assert_eq!(
+            run.time_limits_for(&api),
+            TimeLimitsRunOut {
+                library_checks: 5,
+                sidecar_deadline: 50,
+                ..TimeLimitsRunOut::default()
+            }
+        );
+        assert!(run.time_limits_for(&web).is_empty());
+
+        run.forget_service_losses(&api);
+        run.record_time_limit(&api, TimeLimit::LibraryChecks, 1);
+        assert_eq!(
+            run.time_limits_for(&api),
+            TimeLimitsRunOut {
+                library_checks: 1,
+                ..TimeLimitsRunOut::default()
+            }
         );
     }
 }

@@ -289,7 +289,8 @@ pub fn split_line(split: &Split) -> String {
     )
 }
 
-fn plural(count: usize, noun: &str) -> String {
+/// `1 check`, `2 checks`: the count and its noun, plural unless it is one.
+pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         return format!("{count} {noun}");
     }

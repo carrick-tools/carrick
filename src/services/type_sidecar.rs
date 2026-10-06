@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -698,6 +699,22 @@ pub struct SemanticsResult {
     pub reason: Option<String>,
 }
 
+/// The reason a semantics or library-claim check comes back `unchecked`
+/// with when the request's time limit ran out before the sidecar reached it.
+const NOT_REACHED_IN_TIME: &str = "budget";
+
+/// How many of `results` the sidecar did not reach before the request's time
+/// limit ran out (carrick#2021).
+pub fn not_reached_in_time(results: &[SemanticsResult]) -> usize {
+    results
+        .iter()
+        .filter(|result| {
+            result.verdict == SemanticsVerdict::Unchecked
+                && result.reason.as_deref() == Some(NOT_REACHED_IN_TIME)
+        })
+        .count()
+}
+
 /// How one package of a `verify_client_semantics` request resolved, for logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticsModule {
@@ -1040,6 +1057,24 @@ enum SidecarRequest {
     },
     #[serde(rename = "shutdown")]
     Shutdown { request_id: String },
+}
+
+impl SidecarRequest {
+    /// How many things the request asks about: what is lost with it when the
+    /// sidecar never answers it (carrick#2021).
+    fn item_count(&self) -> usize {
+        match self {
+            SidecarRequest::Init { .. } | SidecarRequest::Shutdown { .. } => 0,
+            SidecarRequest::Bundle { symbols, .. } => symbols.len(),
+            SidecarRequest::Infer { requests, .. } => requests.len(),
+            SidecarRequest::CaptureV2 { anchors, .. } => anchors.len(),
+            SidecarRequest::CheckV2 { pairs, .. } => pairs.len(),
+            SidecarRequest::ResolveDefinitions { aliases, .. } => aliases.len(),
+            SidecarRequest::RetypeCheck { items, .. } => items.len(),
+            SidecarRequest::VerifyClientSemantics { checks, .. } => checks.len(),
+            SidecarRequest::VerifyLibraryClaims { checks, .. } => checks.len(),
+        }
+    }
 }
 
 // ============================================================================
@@ -1410,7 +1445,10 @@ const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
 ///
 /// When it passes, the sidecar is killed and a fresh one is started in its
 /// place: see [`TypeSidecar::restart`].
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
+///
+/// A request it cuts off is counted, with the items it carried, as a time
+/// limit that ran out ([`crate::time_limits`], carrick#2021).
+pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// How often a progress frame is written to the log while an operation runs.
 /// The sidecar reports far more often than this; the log needs enough to tell
@@ -1796,6 +1834,9 @@ pub struct TypeSidecar {
     /// The last progress frame of the wait in hand, or of the one that last
     /// ended: see [`Self::last_progress`].
     last_progress: Mutex<Option<OperationProgress>>,
+    /// How many items the request last sent carries: what a timeout costs
+    /// ([`Self::restarting_on_timeout`]).
+    in_flight_items: AtomicUsize,
 }
 
 impl TypeSidecar {
@@ -1835,6 +1876,7 @@ impl TypeSidecar {
             scan_root: Mutex::new(None),
             operation_timeout: OPERATION_TIMEOUT,
             last_progress: Mutex::new(None),
+            in_flight_items: AtomicUsize::new(0),
         })
     }
 
@@ -2194,8 +2236,18 @@ impl TypeSidecar {
     /// is free to be replaced. The timeout is what the caller is told either
     /// way: a restart that failed has left its reason in the state, where the
     /// next operation reads it.
+    ///
+    /// A timeout while a service is analysed is counted against it, with the
+    /// items the request carried (carrick#2021). One in the cross-service
+    /// check is counted from the check's outcomes instead, which say which
+    /// consumer each lost pair belongs to
+    /// ([`crate::time_limits::from_check_outcomes`]).
     fn restarting_on_timeout<T>(&self, answer: Result<T, SidecarError>) -> Result<T, SidecarError> {
         if matches!(answer, Err(SidecarError::Timeout)) {
+            crate::scan_health::record_time_limit(
+                crate::time_limits::TimeLimit::SidecarDeadline,
+                self.in_flight_items.load(Ordering::Relaxed),
+            );
             let _ = self.restart(&format!(
                 "an operation gave no answer or progress within {:?}",
                 self.operation_timeout
@@ -2744,6 +2796,8 @@ impl TypeSidecar {
     fn send_request(&self, request: &SidecarRequest) -> Result<(), SidecarError> {
         let json = serde_json::to_string(request)
             .map_err(|e| SidecarError::SerializationError(e.to_string()))?;
+        self.in_flight_items
+            .store(request.item_count(), Ordering::Relaxed);
 
         let mut stdin = self.stdin.lock().unwrap();
         writeln!(stdin, "{}", json).map_err(|e| SidecarError::IoError(e.to_string()))?;
@@ -4195,6 +4249,15 @@ mod tests {
         assert_eq!(semantics[1].reason.as_deref(), Some("member_missing"));
         assert_eq!(semantics[2].verdict, SemanticsVerdict::Unchecked);
         assert_eq!(semantics[2].reason.as_deref(), Some("budget"));
+        // carrick#2021: the one the time limit did not reach is counted, and
+        // the reason counted is the one the verifier writes.
+        assert_eq!(not_reached_in_time(&semantics), 1);
+        assert!(
+            include_str!("../sidecar/src/library-claims.ts")
+                .contains(&format!("unchecked('{NOT_REACHED_IN_TIME}')")),
+            "the verifier no longer answers a check it had no time for with reason \
+             `{NOT_REACHED_IN_TIME}`"
+        );
         let modules = response.semantics_modules.unwrap();
         assert_eq!(modules[0].installed_version.as_deref(), Some("1.2.3"));
         assert_eq!(modules[1].resolved_file, None);
@@ -5411,5 +5474,84 @@ mod tests {
             1,
             "Alias should appear exactly once in bundled DTS"
         );
+    }
+
+    /// carrick#2021: a request the sidecar never answers is counted against
+    /// the service being analysed, with every item it carried, and one sent
+    /// while no service is being analysed (the cross-service check) is not
+    /// counted here, because the check counts its own from its outcomes.
+    ///
+    /// The stand-in answers `init` and nothing else. The count is a range,
+    /// not one number: another test's sidecar timing out while this scope is
+    /// open is counted against it too, one capture anchor at a time.
+    #[test]
+    #[serial_test::serial(current_service)]
+    fn a_request_the_sidecar_never_answers_is_counted_with_its_items() {
+        const SERVICE: &str = "deadline-2021";
+        const ITEMS: usize = 1000;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("silent-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') fs.writeSync(1, JSON.stringify({ request_id: request.request_id, status: 'ready' }) + '\n');
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script)
+            .unwrap()
+            .with_operation_timeout(Duration::from_millis(300));
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let items: Vec<InferRequestItem> = (0..ITEMS as u32)
+            .map(|line| InferRequestItem {
+                file_path: "src/a.ts".to_string(),
+                line_number: line + 1,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::Expression,
+                alias: Some(format!("A{line}")),
+                param_name: None,
+            })
+            .collect();
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+
+        {
+            let _scope = crate::current_service::enter(Some(SERVICE));
+            assert!(matches!(
+                sidecar.infer_types(&items, None),
+                Err(SidecarError::Timeout)
+            ));
+        }
+        let counted = crate::scan_health::time_limits_for(Some(SERVICE)).sidecar_deadline;
+        assert!(
+            (ITEMS..ITEMS + 10).contains(&counted),
+            "the lost request's {ITEMS} items are counted against {SERVICE}: {counted}"
+        );
+
+        let unnamed = crate::scan_health::time_limits_for(None);
+        assert!(matches!(
+            sidecar.infer_types(&items, None),
+            Err(SidecarError::Timeout)
+        ));
+        assert_eq!(
+            (
+                crate::scan_health::time_limits_for(Some(SERVICE)).sidecar_deadline,
+                crate::scan_health::time_limits_for(None),
+            ),
+            (counted, unnamed),
+            "no service was being analysed, named or not"
+        );
+        crate::scan_health::forget_service_losses(Some(SERVICE));
     }
 }
