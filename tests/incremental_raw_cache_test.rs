@@ -1213,22 +1213,34 @@ async fn two_scans_of_one_tree_with_types_upload_the_same_bytes() {
     }
 }
 
-/// The types the pool test's tree has its signatures print: a union of two
-/// interfaces, and the keys an object made from a mapped type lists.
+/// The pool test's trees print a union of two interfaces and the keys of an
+/// object made from a mapped type over literal keys.
 const PET_SHAPES: &str = "export interface Dog {\n  bark(): string;\n}\n\n\
     export interface Cat {\n  meow(): string;\n}\n";
 
-/// The functions the signature pass asks first, by name (`$` sorts before
-/// every letter): each meets its types in one order.
+/// Asked first of the first tree's functions, by name (`$` sorts before every
+/// letter): meets `'alpha'` before `'zeta'` and `Dog` before `Cat`.
 const PETS_MET_FIRST: &str = "import type { Cat, Dog } from './shapes.js';\n\n\
     export function $alphaFirst(o: Record<'alpha' | 'zeta', number>) {\n  return { ...o };\n}\n\n\
     export function $dogFirst(d: Dog, c: Cat, flip: boolean) {\n  return flip ? d : c;\n}\n";
 
-/// A tree of more than one batch of signature slots: `PETS_MET_FIRST`, then
-/// forty files of sixteen functions that each meet the same types in the
-/// other order. The pass asks its first batch in name order, so every file a
-/// pool is left with starts in the order the first batch did not.
-fn pet_tree() -> Vec<(String, String)> {
+/// Two functions that meet the pets' types the other way round from
+/// `PETS_MET_FIRST`, named `{name}_keys` and `{name}_pet`.
+fn pets_met_later(name: &str) -> String {
+    format!(
+        "\nexport function {name}_keys(o: Record<'zeta' | 'alpha', number>) {{\n  \
+         return {{ ...o }};\n}}\n\
+         \nexport function {name}_pet(c: Cat, d: Dog, flip: boolean) {{\n  \
+         return flip ? c : d;\n}}\n"
+    )
+}
+
+/// Types a checker meets in one order. Every file is in the sidecar's program
+/// from the start. `PETS_MET_FIRST` is asked first, and forty files of
+/// sixteen slots meet the same types the other way round. The first batch
+/// ends among those, so a pool process starts from a later file, in the
+/// order the scan's own process did not.
+fn types_met_in_another_order() -> Vec<(String, String)> {
     let mut files = vec![
         ("src/pets/shapes.ts".to_string(), PET_SHAPES.to_string()),
         ("src/pets/first.ts".to_string(), PETS_MET_FIRST.to_string()),
@@ -1236,14 +1248,59 @@ fn pet_tree() -> Vec<(String, String)> {
     for file in 0..40 {
         let mut text = String::from("import type { Cat, Dog } from './shapes.js';\n");
         for function in 0..8 {
-            text.push_str(&format!(
-                "\nexport function zz_{file:02}_{function:02}_keys(o: Record<'zeta' | 'alpha', number>) {{\n  \
-                 return {{ ...o }};\n}}\n\
-                 \nexport function zz_{file:02}_{function:02}_pet(c: Cat, d: Dog, flip: boolean) {{\n  \
-                 return flip ? c : d;\n}}\n"
-            ));
+            text.push_str(&pets_met_later(&format!("zz_{file:02}_{function}")));
         }
         files.push((format!("src/pets/later_{file:02}.ts"), text));
+    }
+    files
+}
+
+/// One of two interfaces named `Dog`, in a module of its own, with a
+/// function the pass asks about.
+fn named_dog(member: &str, returns: &str, function: &str) -> String {
+    format!(
+        "export interface Dog {{\n  {member}(): {returns};\n}}\n\n\
+         export function {function}(d: Dog) {{\n  return d.{member}();\n}}\n"
+    )
+}
+
+/// Files a process adds to its program in one order. The sidecar's program
+/// does not list `tools/` (no tsconfig, and outside its default source
+/// folders), so a process adds a file there the first time it is asked about
+/// it, with the files it imports. Two interfaces are both named `Dog`, in
+/// `tools/yard/` and `tools/kennel/`. The yard's function is asked first of
+/// all, so the scan's own process adds the yard's module before the
+/// kennel's. Sixty later files under `tools/` import the kennel's module
+/// before the yard's and print a union of the two: the first batch ends
+/// among them, so a pool process starts from a later file and adds the
+/// kennel's first.
+fn files_added_in_another_order() -> Vec<(String, String)> {
+    let mut files = vec![
+        ("src/pets/shapes.ts".to_string(), PET_SHAPES.to_string()),
+        (
+            "tools/yard/dog.ts".to_string(),
+            named_dog("woof", "number", "$0_yard"),
+        ),
+        (
+            "tools/kennel/dog.ts".to_string(),
+            named_dog("bark", "string", "zzz_kennel"),
+        ),
+    ];
+    for file in 0..60 {
+        let mut text = String::from(
+            "import type { Cat, Dog } from '../src/pets/shapes.js';\n\
+             import type { Dog as KennelDog } from './kennel/dog.js';\n\
+             import type { Dog as YardDog } from './yard/dog.js';\n",
+        );
+        for function in 0..3 {
+            let name = format!("zz_{file:02}_{function}");
+            text.push_str(&pets_met_later(&name));
+            text.push_str(&format!(
+                "\nexport function {name}_pick(k: KennelDog, y: YardDog, flip: boolean) {{\n  \
+                 return flip ? k : y;\n}}\n"
+            ));
+        }
+        files.push((format!("tools/later_{file:02}.ts"), text));
     }
     files
 }
@@ -1291,25 +1348,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
 }
 
 /// carrick#1993: a pool of sidecar processes writes the index one process
-/// writes.
+/// writes, over `tree` added to the `llm-mocked-api` fixture.
 ///
 /// The signature pass asks the slots after its first batch on a pool, a file
-/// at a time. Each process builds its own program and checker, so a type it
-/// prints must not depend on which files that process met first: a union's
-/// members, and the properties of an object made from a mapped type over
-/// literal keys, are printed in an order of their own (carrick#2019). The
-/// tree meets those types in one order in the functions the first batch asks
-/// and in the other in every file after it, so each process the pool adds
-/// starts from the order the scan's own process did not.
-///
-/// One scan forced to one process and one to three: the blobs, the function
-/// index among them, must be the same bytes.
-#[tokio::test]
-#[serial]
-#[ignore = "red until the sidecar prints types in an order of their own (carrick#2019); \
-            `--ignored` shows it fail on TypeScript 5"]
-async fn a_pool_of_sidecar_processes_writes_the_index_one_process_writes() {
-    let tree = pet_tree();
+/// at a time. Each process builds its own program and checker, so what it
+/// prints must not depend on the order that process met anything in. One
+/// scan forced to one process and one to three: the blobs, the function
+/// index among them, must be the same bytes. `teeth` names functions whose
+/// inferred return must name both members it lists, or the comparison
+/// compares nothing.
+async fn a_pool_writes_what_one_process_writes(
+    label: &str,
+    tree: Vec<(String, String)>,
+    teeth: &[(&str, [&str; 2])],
+) {
     let extra: Vec<(&str, &str)> = tree
         .iter()
         .map(|(path, text)| (path.as_str(), text.as_str()))
@@ -1343,37 +1395,74 @@ async fn a_pool_of_sidecar_processes_writes_the_index_one_process_writes() {
         .collect();
     assert!(
         log.contains("Signature inference: 3 processes answer the slots after the first batch"),
-        "the second scan must ask on three processes, or it compares nothing: {pool_lines:?}"
+        "{label}: the second scan must ask on three processes, or it compares nothing: \
+         {pool_lines:?}"
     );
 
     let functions = &latest_upload(&one).function_definitions;
-    let printed: Vec<(&str, [&str; 2], String)> = [
-        ("$alphaFirst", ["alpha", "zeta"]),
-        ("$dogFirst", ["Cat", "Dog"]),
-        ("zz_39_07_keys", ["alpha", "zeta"]),
-        ("zz_39_07_pet", ["Cat", "Dog"]),
-    ]
-    .into_iter()
-    .map(|(name, members)| {
-        let signature = functions
-            .get(name)
-            .and_then(|def| def.signature.clone())
-            .unwrap_or_default();
-        (name, members, signature)
-    })
-    .collect();
+    let printed: Vec<(&str, [&str; 2], String)> = teeth
+        .iter()
+        .map(|(name, members)| {
+            let signature = functions
+                .get(*name)
+                .and_then(|def| def.signature.clone())
+                .unwrap_or_default();
+            (*name, *members, signature)
+        })
+        .collect();
     assert!(
         printed.iter().all(|(_, members, signature)| {
             let returned = signature.rsplit(" => ").next().unwrap_or_default();
             members.iter().all(|member| returned.contains(member))
         }),
-        "each inferred return must name both members, or the test compares nothing: {printed:#?}"
+        "{label}: each inferred return must name both members, or the test compares nothing: \
+         {printed:#?}"
     );
 
     assert_same_bytes(
-        "llm-mocked-api with the pet tree",
+        label,
         "a scan on three sidecar processes and a scan on one",
         &uploaded_text(&one),
         &uploaded_text(&pooled),
     );
+}
+
+/// The checker's history: types a pool process meets in another order than
+/// the scan's own process did (`types_met_in_another_order`).
+#[tokio::test]
+#[serial]
+#[ignore = "red until the sidecar prints types in an order of their own (carrick#2019); \
+            `--ignored` shows it fail on TypeScript 5"]
+async fn a_pool_prints_types_its_processes_met_in_another_order_as_one_process_does() {
+    a_pool_writes_what_one_process_writes(
+        "types met in another order",
+        types_met_in_another_order(),
+        &[
+            ("$alphaFirst", ["alpha", "zeta"]),
+            ("$dogFirst", ["Cat", "Dog"]),
+            ("zz_39_7_keys", ["alpha", "zeta"]),
+            ("zz_39_7_pet", ["Cat", "Dog"]),
+        ],
+    )
+    .await;
+}
+
+/// The program's file order: files a pool process adds to its program in
+/// another order than the scan's own process did
+/// (`files_added_in_another_order`).
+#[tokio::test]
+#[serial]
+#[ignore = "red until every process's program holds the same files in the same order \
+            (carrick#1993); `--ignored` shows it fail on a sidecar with stable type order"]
+async fn a_pool_prints_types_from_files_its_processes_added_in_another_order_as_one_process_does() {
+    a_pool_writes_what_one_process_writes(
+        "files added in another order",
+        files_added_in_another_order(),
+        &[
+            ("zz_59_2_keys", ["alpha", "zeta"]),
+            ("zz_59_2_pet", ["Cat", "Dog"]),
+            ("zz_59_2_pick", ["KennelDog", "YardDog"]),
+        ],
+    )
+    .await;
 }
