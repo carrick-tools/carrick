@@ -14,7 +14,8 @@
 //!
 //! - [`pool_size`] decides how many processes a pool may run.
 //! - [`SidecarPool::scoped`] borrows the caller's own sidecar, already scoped
-//!   to the service, and starts the others beside it.
+//!   to the service, and starts the others beside it, each given the files
+//!   of the caller's program so that every process holds the same program.
 //! - [`SidecarPool::run`] answers a list of jobs, each on whichever process
 //!   is free next. A process whose answer says it is gone takes no more; the
 //!   others take the rest, and with none left the rest are not sent.
@@ -178,10 +179,21 @@ impl<'a> SidecarPool<'a> {
     /// A pool of up to `processes` processes for the service at `root`:
     /// `base`, scoped to it unless it already is, and up to `processes - 1`
     /// more started from the same sidecar script with `base`'s scope copied
-    /// exactly (root, tsconfig and scan root) and its operation deadline. A process
-    /// that does not start or does not become ready is left out and logged;
-    /// the pool always holds `base`. An error only when `base` cannot be
-    /// scoped, as a caller with no pool would have met it.
+    /// exactly (root, tsconfig and scan root) and its operation deadline.
+    ///
+    /// Each process started is also given `base`'s program before any other
+    /// request: the files `base`'s program was built from, in order
+    /// ([`TypeSidecar::program_files`], carrick#2027), so that it builds the
+    /// same program. Without them a process builds from its tsconfig alone
+    /// and adds a file when it is first asked about it, so two processes can
+    /// hold their files in different orders, and the compiler orders two
+    /// types of the same name by that order. The processes build at once.
+    ///
+    /// A process that does not start, does not become ready, or cannot take
+    /// `base`'s files is left out and logged; when `base`'s files cannot be
+    /// read, none is started. The pool always holds `base`. An error only
+    /// when `base` cannot be scoped, as a caller with no pool would have met
+    /// it.
     pub fn scoped(
         base: &'a TypeSidecar,
         root: &Path,
@@ -192,20 +204,69 @@ impl<'a> SidecarPool<'a> {
             base.start_init(root, tsconfig);
             base.wait_ready(ready_budget())?;
         }
-        let mut extra = Vec::new();
-        for _ in 1..processes.max(1) {
+        if processes <= 1 {
+            return Ok(Self {
+                base,
+                extra: Vec::new(),
+            });
+        }
+        let files = match base.program_files() {
+            Ok(files) => files,
+            Err(e) => {
+                warn!(
+                    "No pool process for {} was started: the files of the program the others would copy could not be read: {e}",
+                    root.display()
+                );
+                return Ok(Self {
+                    base,
+                    extra: Vec::new(),
+                });
+            }
+        };
+        let mut started = Vec::new();
+        for _ in 1..processes {
             match base.spawn_scoped_like(root, tsconfig) {
-                Ok(sidecar) => extra.push(sidecar),
+                Ok(sidecar) => started.push(sidecar),
                 Err(e) => {
                     warn!("A pool process for {} did not start: {e}", root.display());
                     break;
                 }
             }
         }
+        let copied: Vec<Result<usize, SidecarError>> = std::thread::scope(|scope| {
+            let copying: Vec<_> = started
+                .iter()
+                .map(|sidecar| scope.spawn(|| sidecar.add_program_files(&files)))
+                .collect();
+            copying
+                .into_iter()
+                .map(|copy| {
+                    copy.join().unwrap_or_else(|_| {
+                        Err(SidecarError::ProgramFilesFailed(
+                            "the copy panicked".to_string(),
+                        ))
+                    })
+                })
+                .collect()
+        });
+        let mut extra = Vec::new();
+        for (sidecar, copy) in started.into_iter().zip(copied) {
+            match copy {
+                Ok(_) => extra.push(sidecar),
+                Err(e) => {
+                    warn!(
+                        "A pool process for {} could not build the program the others hold, and is left out: {e}",
+                        root.display()
+                    );
+                    let _ = sidecar.shutdown();
+                }
+            }
+        }
         debug!(
-            "Sidecar pool for {}: {} process(es)",
+            "Sidecar pool for {}: {} process(es), each built from {} file(s)",
             root.display(),
-            extra.len() + 1
+            extra.len() + 1,
+            files.len()
         );
         Ok(Self { base, extra })
     }
@@ -359,6 +420,13 @@ pub(crate) mod test_support {
     /// whose id starts with `die` ends the process before it answers, and
     /// one holding an item whose id starts with `fail` is answered with an
     /// error frame.
+    ///
+    /// It keeps a program's file list as the sidecar does (carrick#2027):
+    /// `list_program_files` answers it, `add_program_files` appends the files
+    /// it does not hold (and refuses a list naming a file with `refuse` in
+    /// its path), and a retype item's file joins it when the item is asked
+    /// about. Every retype answer carries the list as it stood, joined with
+    /// commas, as the message of its one diagnostic.
     pub(crate) fn stand_in(dir: &Path) -> PathBuf {
         let script = dir.join("stand-in-sidecar.cjs");
         std::fs::write(
@@ -366,16 +434,28 @@ pub(crate) mod test_support {
             r#"
 const fs = require('fs');
 const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+const files = [];
+const load = (file) => { if (!files.includes(file)) files.push(file); };
 require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
   const request = JSON.parse(line);
   const request_id = request.request_id;
   if (request.action === 'shutdown') { write({ request_id, status: 'success' }); process.exit(0); }
   if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.action === 'list_program_files') return write({ request_id, status: 'success', files });
+  if (request.action === 'add_program_files') {
+    if (request.files.some((file) => file.includes('refuse'))) {
+      return write({ request_id, status: 'error', errors: ['the stand-in refuses these files'] });
+    }
+    const held = files.length;
+    request.files.forEach(load);
+    return write({ request_id, status: 'success', added: files.length - held });
+  }
   if (request.items.some((item) => item.item_id.startsWith('die'))) process.exit(1);
   if (request.items.some((item) => item.item_id.startsWith('fail'))) {
     return write({ request_id, status: 'error', errors: ['the stand-in fails this request'] });
   }
   write({ request_id, status: 'progress', phase: 'retype', message: `0 of ${request.items.length}` });
+  request.items.forEach((item) => load(item.file_path));
   const until = Date.now() + 150;
   while (Date.now() < until) {}
   write({
@@ -384,7 +464,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     outcomes: request.items.map((item) => ({
       item_id: item.item_id,
       outcome: Number(item.item_id.slice(-1)) % 2 === 0 ? 'agrees' : 'abstain',
-      diagnostics: [],
+      diagnostics: [{ line: 1, code: 0, message: files.join(',') }],
       reason: String(process.pid),
     })),
   });
@@ -570,6 +650,74 @@ mod tests {
                 .iter()
                 .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
             "{answers:?}"
+        );
+    }
+
+    /// carrick#2027: every process a pool starts holds the caller's program
+    /// before its first job: the files the caller's program was built from,
+    /// in their order. The caller was asked about two files in an order no
+    /// sort would give, and every job, whichever process took it, is judged
+    /// in a program holding those two in that order. A process that cannot
+    /// take the caller's files is left out of the pool.
+    #[test]
+    fn every_process_of_a_pool_holds_the_callers_program_before_its_first_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = base_at(&root);
+        base.retype_check(&[
+            retype_item("/repo/src/late.ts", "x-0"),
+            retype_item("/repo/src/early.ts", "x-2"),
+        ])
+        .unwrap();
+        assert_eq!(
+            base.program_files().unwrap(),
+            [
+                std::path::PathBuf::from("/repo/src/late.ts"),
+                std::path::PathBuf::from("/repo/src/early.ts")
+            ]
+        );
+
+        let pool = SidecarPool::scoped(&base, &root, None, 3).unwrap();
+        assert_eq!(pool.processes(), 3);
+        let jobs: Vec<String> = (0..12).map(|n| format!("job-{n}")).collect();
+        let answers = pool.run(
+            &jobs,
+            |_: &(String, String)| false,
+            |sidecar, job| {
+                let mut outcome = sidecar
+                    .retype_check(&[retype_item("/repo/src/late.ts", job)])
+                    .expect("the stand-in answers")
+                    .remove(0);
+                (
+                    outcome.reason.unwrap(),
+                    outcome.diagnostics.remove(0).message,
+                )
+            },
+        );
+        let answers: Vec<(String, String)> = answers.into_iter().map(Option::unwrap).collect();
+        let pids: std::collections::BTreeSet<&String> =
+            answers.iter().map(|(pid, _)| pid).collect();
+        assert_eq!(
+            pids.len(),
+            3,
+            "every process answered some job: {answers:?}"
+        );
+        assert!(
+            answers
+                .iter()
+                .all(|(_, program)| program == "/repo/src/late.ts,/repo/src/early.ts"),
+            "{answers:?}"
+        );
+
+        let refused = base_at(&root);
+        refused
+            .retype_check(&[retype_item("/repo/src/refuse.ts", "x-0")])
+            .unwrap();
+        let pool = SidecarPool::scoped(&refused, &root, None, 3).unwrap();
+        assert_eq!(
+            pool.processes(),
+            1,
+            "a process without the program is left out"
         );
     }
 

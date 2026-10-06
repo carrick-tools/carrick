@@ -2016,12 +2016,14 @@ fn retype_consumer_calls(
 /// of them. One file a request also lets a pool share the work evenly, and a
 /// failure costs only that file's calls.
 ///
-/// The first request goes to `sidecar`, scoped to the service: it builds the
-/// service's program, whose size then decides how many processes the rest
-/// may use (`size`). The rest are answered by a pool of that many processes,
-/// `sidecar` among them, each request on whichever is free next. A pool of
+/// Every file the calls are in first joins `sidecar`'s program, sorted, so
+/// that no request adds one. The first request goes to `sidecar`, scoped to
+/// the service: it builds the service's program, whose size then decides how
+/// many processes the rest may use (`size`). The rest are answered by a pool
+/// of that many processes, `sidecar` among them, each started from
+/// `sidecar`'s program and each request on whichever is free next. A pool of
 /// one is `sidecar` alone, taking them in order. Every item is judged by the
-/// same code whichever process takes it.
+/// same code in the same program whichever process takes it.
 ///
 /// A request that fails abstains its own items with the reason and costs no
 /// other request's answers. A process that is gone takes no more requests;
@@ -2077,15 +2079,47 @@ fn retype_service(
             .map(|answer| (answer.item_id.clone(), answer))
             .collect();
     }
+    // Every file the calls are in joins the program before the first
+    // request, in one order (carrick#2027). Asked file by file, a process
+    // loads a file its tsconfig does not list when it reaches it, so the
+    // program a call is judged in would depend on which calls came first and
+    // on which process took them; the compiler orders two types of the same
+    // name by the program's file order. A pool's processes start from this
+    // program ([`SidecarPool::scoped`]).
+    let mut files: Vec<PathBuf> = items
+        .iter()
+        .map(|item| PathBuf::from(&item.file_path))
+        .collect();
+    files.sort();
+    files.dedup();
+    let alone = match sidecar.add_program_files(&files) {
+        Ok(_) => false,
+        Err(e) if e.leaves_no_process() => {
+            warn!("Retyping {service}'s consumer calls did not start: {e}");
+            let reason = format!("the retype check did not run: {e}");
+            return jobs
+                .iter()
+                .flat_map(|job| abstained(job, &reason))
+                .map(|answer| (answer.item_id.clone(), answer))
+                .collect();
+        }
+        Err(e) => {
+            warn!(
+                "Retyping {service}'s consumer calls on the scan's own process alone: the files of the calls could not join its program first: {e}"
+            );
+            true
+        }
+    };
     let first_answer = ask(sidecar, first);
     let first_gone = gone(&first_answer);
     let mut answers: Vec<Option<Result<Vec<RetypeOutcome>, SidecarError>>> =
         Vec::with_capacity(jobs.len());
     answers.push(Some(first_answer));
     let mut ran_on = 1;
-    if first_gone || rest.is_empty() || spent() {
+    if first_gone || rest.is_empty() || spent() || alone {
         // A process that is gone takes no more, as in a pool. With the time
-        // spent nothing more is sent, so no process is started for it.
+        // spent nothing more is sent, so no process is started for it. A
+        // program that could not take the calls' files first is not copied.
         answers.extend(
             rest.iter()
                 .map(|job| (!first_gone).then(|| ask(sidecar, job))),
@@ -2910,6 +2944,50 @@ mod tests {
             assert!(died(&answers[id]), "{id}: {answers:?}");
         }
         assert!(unsent(&answers["x-6"]), "{answers:?}");
+    }
+
+    /// carrick#1996, carrick#2027: every call is judged in one program that
+    /// holds the file of every call, sorted, whichever process takes it and
+    /// however many there are. The files join the scan process's program
+    /// before the first request, and a pool's processes start from that
+    /// program. Asked file by file, a process would load each file when it
+    /// reached it, in the order of the calls.
+    #[test]
+    fn every_call_is_judged_in_one_program_holding_every_file_asked_about() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let file = |name: &str| root.join(name).display().to_string();
+        let names = ["src/d.ts", "src/b.ts", "src/a.ts", "src/c.ts", "src/e.ts"];
+        let items: Vec<RetypeItem> = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| retype_item(&file(name), &format!("x-{n}")))
+            .collect();
+        let mut sorted: Vec<String> = names.iter().map(|name| file(name)).collect();
+        sorted.sort();
+        let program = sorted.join(",");
+
+        for n in [1, 3] {
+            let answers = retype_service(
+                &sidecar,
+                "web",
+                &consumer,
+                &items,
+                std::time::Duration::from_secs(600),
+                processes(n),
+            );
+            assert_eq!(answers.len(), 5);
+            for answer in answers.values() {
+                assert_eq!(
+                    answer.diagnostics[0].message, program,
+                    "{n} process(es): {} was judged in another program",
+                    answer.item_id
+                );
+            }
+        }
     }
 
     /// carrick#1516: the producer's unwidened reading rides the retype item
@@ -7107,6 +7185,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
   const request_id = request.request_id;
   if (request.action === 'shutdown') process.exit(0);
   if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  if (request.action === 'list_program_files') return write({{ request_id, status: 'success', files: [] }});
+  if (request.action === 'add_program_files') return write({{ request_id, status: 'success', added: request.files.length }});
   write({{
     request_id,
     status: 'success',
