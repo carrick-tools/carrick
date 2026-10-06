@@ -5719,7 +5719,7 @@ export class TypeInferrer {
    */
   private declaringPackageOf(type: Type): string | undefined {
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
-    const declaration = symbol?.getDeclarations()?.[0];
+    const declaration = this.attributedDeclaration(symbol?.getDeclarations() ?? []);
     if (!declaration) {
       return undefined;
     }
@@ -5741,6 +5741,30 @@ export class TypeInferrer {
       return rest.length > 1 ? `${rest[0]}/${rest[1]}` : undefined;
     }
     return rest[0];
+  }
+
+  /**
+   * The declaration a symbol is attributed to (carrick#2031). One declaration
+   * is itself. Where several files merge one symbol (a global interface the
+   * compiler's library declares and a typings package augments), their order
+   * is the order the checker merged them in, and on TypeScript 6 that changes
+   * once the program is rebuilt, so the first one is not an answer. The
+   * compiler's default library wins where it declares the symbol; otherwise,
+   * and among the library's own files, the declaring file whose path sorts
+   * first, then the earliest declaration in it.
+   */
+  private attributedDeclaration(declarations: Node[]): Node | undefined {
+    if (declarations.length <= 1) return declarations[0];
+    const program = this.project.getProgram().compilerObject;
+    const fromLibrary = declarations.filter((declaration) =>
+      program.isSourceFileDefaultLibrary(declaration.getSourceFile().compilerNode)
+    );
+    const candidates = fromLibrary.length > 0 ? fromLibrary : declarations;
+    return [...candidates].sort((a, b) => {
+      const pathA = a.getSourceFile().getFilePath();
+      const pathB = b.getSourceFile().getFilePath();
+      return pathA < pathB ? -1 : pathA > pathB ? 1 : a.getStart() - b.getStart();
+    })[0];
   }
 
   /**
