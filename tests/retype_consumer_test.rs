@@ -31,12 +31,18 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// Scan `root` with the fixture's cassettes; returns the projection and the
-/// scanner's combined log.
+/// Scan `root` with the cassettes in its `__llm__`; returns the projection
+/// and the scanner's combined log.
 fn scan(root: &Path) -> (serde_json::Value, String) {
+    scan_with(root, &[])
+}
+
+/// [`scan`] with `env` set for the scanner.
+fn scan_with(root: &Path, env: &[(&str, &str)]) -> (serde_json::Value, String) {
     let cache = tempfile::tempdir().expect("temp cache dir");
-    let cassettes = fixture_dir().join("__llm__");
+    let cassettes = root.join("__llm__");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.envs(env.iter().copied());
     cmd.arg(root)
         .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -165,4 +171,73 @@ fn a_read_of_a_field_the_producer_returns_is_not_flagged() {
             "the reads at line {line} are now a fact:\n{log}"
         );
     }
+}
+
+/// carrick#1996: the retype check sends one request per consumer file, the
+/// first to the scan's own sidecar and the rest to a pool of processes. Here
+/// `web` calls the route from four files of three calls each. A scan forced
+/// to three processes publishes every match exactly as a scan forced to one
+/// does, and its log says three ran.
+#[test]
+fn a_pool_of_three_processes_judges_every_call_as_one_process_does() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("retype-http-client");
+    copy_tree(&fixture_dir(), &root);
+    let calls = std::fs::read_to_string(root.join("web/src/checkout.ts")).expect("read calls");
+    let answer = std::fs::read_to_string(root.join("__llm__/analyze-file/checkout.json"))
+        .expect("read the cassette");
+    for stem in ["basket", "orders", "refunds"] {
+        std::fs::write(root.join(format!("web/src/{stem}.ts")), &calls).expect("write calls");
+        std::fs::write(
+            root.join(format!("__llm__/analyze-file/{stem}.json")),
+            &answer,
+        )
+        .expect("write the cassette");
+    }
+
+    let sorted = |projection: &serde_json::Value| {
+        let mut rows: Vec<String> = checkout_matches(projection)
+            .into_iter()
+            .map(|m| m.to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    let (one, one_log) = scan_with(&root, &[("CARRICK_SIDECAR_POOL", "1")]);
+    let (three, three_log) = scan_with(&root, &[("CARRICK_SIDECAR_POOL", "3")]);
+
+    let rows = sorted(&one);
+    assert_eq!(rows.len(), 12, "every call matches the route: {rows:#?}");
+    let flagged = rows
+        .iter()
+        .filter(|row| row.contains("Property 'x' does not exist"))
+        .count();
+    assert_eq!(flagged, 8, "both reads of each file are flagged: {rows:#?}");
+    assert_eq!(
+        sorted(&three),
+        rows,
+        "three processes publish what one does"
+    );
+
+    let pool_line = |log: &str| {
+        log.lines()
+            .find(|line| line.contains("Retyping web's consumer calls: 12 call(s) in 4 file(s)"))
+            .map(str::to_string)
+    };
+    assert!(
+        pool_line(&three_log)
+            .is_some_and(|line| line.contains("; 3 process(es) for the 3 after the first")),
+        "three processes took the files after the first: {:?}",
+        pool_line(&three_log)
+    );
+    assert!(
+        pool_line(&one_log)
+            .is_some_and(|line| line.contains("; 1 process(es) for the 3 after the first")),
+        "one process took them all: {:?}",
+        pool_line(&one_log)
+    );
 }

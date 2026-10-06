@@ -1951,20 +1951,21 @@ fn retype_items<'a>(
     by_service
 }
 
-/// How many consumer calls one retype request carries (carrick#1945).
-///
-/// A service's calls used to go in one request, so one failure (an error
-/// frame, a timeout, a sidecar that died) cost every answer of the service.
-/// A one-service app that calls its own API puts hundreds of untyped calls in
-/// that request. In batches, a failure costs its own batch.
-const RETYPE_BATCH: usize = 50;
-
-/// The time one service's retype may spend across its batches: the budget
+/// The time one service's retype may spend across its requests: the budget
 /// the sidecar gives one request (`RETYPE_BUDGET_MS` in its `index.ts`),
 /// which bounded a service's retype while its calls went in one request. A
-/// batch is not sent once it is spent; its items abstain with the sentence
+/// request is not sent once it is spent; its items abstain with the sentence
 /// the sidecar uses for an item its budget did not reach.
 const RETYPE_SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What a retype process is taken to need when its own size cannot be read:
+/// a service's program and the checkers the retype builds over it.
+const RETYPE_PROCESS_FLOOR_MB: u64 = 1024;
+
+/// Why a call abstains when its request was never sent: the process it would
+/// have gone to stopped answering, and no other process was left to take it.
+const RETYPE_UNSENT: &str =
+    "the retype check did not run: no sidecar process was left to send the call to";
 
 /// Judge every HTTP response pair whose CONSUMER left the verdict unresolved
 /// by retyping the consumer's call with the producer's response type and
@@ -1985,13 +1986,19 @@ fn retype_consumer_calls(
 ) {
     let by_service = retype_items(pairs, consumer_blamed, local_consumers);
     for (service, items) in by_service {
-        let answers = retype_in_batches(
+        let answers = retype_service(
             sidecar,
             service,
             &local_consumers[service],
             &items,
-            RETYPE_BATCH,
             RETYPE_SERVICE_BUDGET,
+            |base| {
+                crate::services::sidecar_pool::pool_size(
+                    crate::services::sidecar_pool::resident_mb(base)
+                        .unwrap_or(RETYPE_PROCESS_FLOOR_MB)
+                        .max(RETYPE_PROCESS_FLOOR_MB),
+                )
+            },
         );
         for outcome in outcomes.iter_mut() {
             if let Some(answer) = answers.get(&outcome.pair_key) {
@@ -2001,61 +2008,148 @@ fn retype_consumer_calls(
     }
 }
 
-/// Retype one service's items `batch` at a time, all of them within `budget`.
+/// Retype one service's items, one request per file, all of them within
+/// `budget` (carrick#1945, carrick#1996).
 ///
-/// A batch that fails abstains its own items with the reason and costs no
-/// other batch's answers: the batches that finished keep theirs, and the
-/// batches after it are still sent. Each batch scopes the sidecar to the
-/// service first, which is a no-op while it is scoped and re-initialises a
-/// sidecar that was restarted after a failure.
-fn retype_in_batches(
+/// A request holds one file's calls, never part of a file: the process that
+/// takes it reads that file's diagnostics before any rewrite once, for all
+/// of them. One file a request also lets a pool share the work evenly, and a
+/// failure costs only that file's calls.
+///
+/// The first request goes to `sidecar`, scoped to the service: it builds the
+/// service's program, whose size then decides how many processes the rest
+/// may use (`size`). The rest are answered by a pool of that many processes,
+/// `sidecar` among them, each request on whichever is free next. A pool of
+/// one is `sidecar` alone, taking them in order. Every item is judged by the
+/// same code whichever process takes it.
+///
+/// A request that fails abstains its own items with the reason and costs no
+/// other request's answers. A process that is gone takes no more requests;
+/// a request no process was left to take is not sent, and its items abstain
+/// with [`RETYPE_UNSENT`]. Once `budget` is spent no further request is
+/// sent, and its items abstain in the words the sidecar uses for its own
+/// budget.
+fn retype_service(
     sidecar: &TypeSidecar,
     service: &str,
     consumer: &LocalConsumer,
     items: &[RetypeItem],
-    batch: usize,
     budget: std::time::Duration,
+    size: impl Fn(&TypeSidecar) -> crate::services::sidecar_pool::PoolSize,
 ) -> HashMap<String, RetypeOutcome> {
+    use crate::services::sidecar_pool::{SidecarPool, jobs_by_file};
+    use crate::services::type_sidecar::SidecarError;
+
     let started = std::time::Instant::now();
-    let batches = items.len().div_ceil(batch.max(1));
-    let mut answers: HashMap<String, RetypeOutcome> = HashMap::new();
-    for (index, chunk) in items.chunks(batch.max(1)).enumerate() {
-        let result = if started.elapsed() >= budget {
-            Err(format!(
-                "the retype check ran out of its {}ms budget",
-                budget.as_millis()
-            ))
-        } else {
-            scope_to(sidecar, consumer)
-                .and_then(|()| sidecar.retype_check(chunk))
-                .map_err(|e| {
-                    warn!(
-                        "Retyping {service}'s consumer calls failed on batch {} of {batches}: {e}",
-                        index + 1
+    let jobs = jobs_by_file(items, |item| item.file_path.as_str(), 1);
+    let spent = || started.elapsed() >= budget;
+    let ask = |process: &TypeSidecar,
+               job: &Vec<RetypeItem>|
+     -> Result<Vec<RetypeOutcome>, SidecarError> {
+        if spent() {
+            return Ok(abstained(
+                job,
+                &format!(
+                    "the retype check ran out of its {}ms budget",
+                    budget.as_millis()
+                ),
+            ));
+        }
+        process.retype_check(job).inspect_err(|e| {
+            warn!(
+                "Retyping {service}'s consumer calls failed for {} call(s) in {}: {e}",
+                job.len(),
+                job.first().map_or("", |item| item.file_path.as_str())
+            );
+        })
+    };
+    let gone = |answer: &Result<Vec<RetypeOutcome>, SidecarError>| matches!(answer, Err(e) if e.leaves_no_process());
+
+    let Some((first, rest)) = jobs.split_first() else {
+        return HashMap::new();
+    };
+    if let Err(e) = scope_to(sidecar, consumer) {
+        warn!("Retyping {service}'s consumer calls did not start: {e}");
+        let reason = format!("the retype check did not run: {e}");
+        return jobs
+            .iter()
+            .flat_map(|job| abstained(job, &reason))
+            .map(|answer| (answer.item_id.clone(), answer))
+            .collect();
+    }
+    let first_answer = ask(sidecar, first);
+    let first_gone = gone(&first_answer);
+    let mut answers: Vec<Option<Result<Vec<RetypeOutcome>, SidecarError>>> =
+        Vec::with_capacity(jobs.len());
+    answers.push(Some(first_answer));
+    let mut ran_on = 1;
+    if first_gone || rest.is_empty() || spent() {
+        // A process that is gone takes no more, as in a pool. With the time
+        // spent nothing more is sent, so no process is started for it.
+        answers.extend(
+            rest.iter()
+                .map(|job| (!first_gone).then(|| ask(sidecar, job))),
+        );
+    } else {
+        let wanted = size(sidecar);
+        let processes = wanted.processes.min(rest.len()).max(1);
+        info!(
+            "Retyping {service}'s consumer calls: {} call(s) in {} file(s); {processes} process(es) for the {} after the first ({})",
+            items.len(),
+            jobs.len(),
+            rest.len(),
+            wanted.why
+        );
+        match SidecarPool::scoped(
+            sidecar,
+            &consumer.root,
+            consumer.tsconfig.as_deref(),
+            processes,
+        ) {
+            Ok(pool) => {
+                if pool.processes() < processes {
+                    info!(
+                        "Retyping {service}'s consumer calls in {} process(es): the others did not start",
+                        pool.processes()
                     );
-                    format!("the retype check did not run: {e}")
-                })
-        };
-        match result {
-            Ok(outcomes) => answers.extend(
-                outcomes
-                    .into_iter()
-                    .map(|answer| (answer.item_id.clone(), answer)),
-            ),
-            Err(reason) => answers.extend(chunk.iter().map(|item| {
-                (
-                    item.item_id.clone(),
-                    RetypeOutcome {
-                        item_id: item.item_id.clone(),
-                        outcome: RetypeVerdict::Abstain,
-                        diagnostics: Vec::new(),
-                        reason: Some(reason.clone()),
-                    },
-                )
-            })),
+                }
+                ran_on = pool.processes();
+                answers.extend(pool.run(rest, gone, ask));
+            }
+            Err(e) => {
+                warn!("Retyping {service}'s consumer calls stopped: {e}");
+                answers.extend(rest.iter().map(|_| Some(Err(e.clone()))));
+            }
         }
     }
-    answers
+    info!(
+        "Retyped {service}'s consumer calls: {} call(s) in {} file(s) took {:.1}s on {ran_on} process(es)",
+        items.len(),
+        jobs.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    jobs.iter()
+        .zip(answers)
+        .flat_map(|(job, answer)| match answer {
+            Some(Ok(outcomes)) => outcomes,
+            Some(Err(e)) => abstained(job, &format!("the retype check did not run: {e}")),
+            None => abstained(job, RETYPE_UNSENT),
+        })
+        .map(|answer| (answer.item_id.clone(), answer))
+        .collect()
+}
+
+/// Every item of `job` abstaining for `reason`.
+fn abstained(job: &[RetypeItem], reason: &str) -> Vec<RetypeOutcome> {
+    job.iter()
+        .map(|item| RetypeOutcome {
+            item_id: item.item_id.clone(),
+            outcome: RetypeVerdict::Abstain,
+            diagnostics: Vec::new(),
+            reason: Some(reason.to_string()),
+        })
+        .collect()
 }
 
 /// Point the sidecar's project at the consumer service, unless it already is.
@@ -2587,106 +2681,101 @@ mod tests {
         assert!(retype_items(&request, &blamed_request, &local).is_empty());
     }
 
-    /// carrick#1945: a service's retype goes in batches, and a batch that
-    /// fails costs only its own items. The stand-in answers every item of a
-    /// request `agrees`, except that it fails the second request it is sent.
-    /// The batch before it keeps its answers, the batch after it is still
-    /// sent, and the failed batch's items abstain and say why.
-    ///
-    /// Sending every item in one request again fails this: all five come
-    /// back from the one failed request. A spent budget sends nothing and
-    /// abstains every item in the words the sidecar uses for its own budget.
-    #[test]
-    fn a_retype_batch_that_fails_costs_only_its_own_items() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let script = root.join("stand-in-sidecar.cjs");
-        std::fs::write(
-            &script,
-            r#"
-const fs = require('fs');
-const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
-let retypes = 0;
-require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
-  const request = JSON.parse(line);
-  const request_id = request.request_id;
-  if (request.action === 'shutdown') process.exit(0);
-  if (request.action === 'init') return write({ request_id, status: 'ready' });
-  retypes += 1;
-  if (retypes === 2) return write({ request_id, status: 'error', errors: ['the second batch broke'] });
-  write({ request_id, status: 'progress', phase: 'retype', message: `1 of ${request.items.length}` });
-  write({
-    request_id,
-    status: 'success',
-    outcomes: request.items.map((item) => ({ item_id: item.item_id, outcome: 'agrees', diagnostics: [] })),
-  });
-});
-"#,
-        )
-        .unwrap();
-        let sidecar = TypeSidecar::spawn(&script).unwrap();
-        sidecar.start_init(&root, None);
-        sidecar
-            .wait_ready(std::time::Duration::from_secs(20))
-            .expect("the stand-in answers init");
-        let consumer = LocalConsumer {
-            root: root.clone(),
+    /// A pool size of `n` processes, for [`retype_service`].
+    fn processes(n: usize) -> impl Fn(&TypeSidecar) -> crate::services::sidecar_pool::PoolSize {
+        move |_| crate::services::sidecar_pool::PoolSize {
+            processes: n,
+            why: format!("{n} process(es) for the test"),
+        }
+    }
+
+    /// A pool size that must not be asked for: no pool is started.
+    fn no_pool(_: &TypeSidecar) -> crate::services::sidecar_pool::PoolSize {
+        panic!("no pool is started here")
+    }
+
+    /// The consumer service at `root`, for [`retype_service`].
+    fn consumer_at(root: &std::path::Path) -> LocalConsumer {
+        LocalConsumer {
+            root: root.to_path_buf(),
             tsconfig: None,
             calls: HashMap::new(),
-        };
-        let items: Vec<RetypeItem> = ["a", "b", "c", "d", "e"]
-            .into_iter()
-            .map(|id| RetypeItem {
-                item_id: id.to_string(),
-                file_path: root.join("src/client.ts").display().to_string(),
-                line_number: 1,
-                span_start: None,
-                span_end: None,
-                expression_text: None,
-                expression_line: None,
-                producer_type: "{ id: string; }".to_string(),
-                producer_unwidened_type: None,
-                wire: true,
-            })
-            .collect();
+        }
+    }
 
-        let answers = retype_in_batches(
+    /// Each answer's outcome and reason, by item id.
+    fn read_answers(
+        answers: &HashMap<String, RetypeOutcome>,
+    ) -> BTreeMap<String, (RetypeVerdict, Option<String>)> {
+        answers
+            .iter()
+            .map(|(id, answer)| (id.clone(), (answer.outcome, answer.reason.clone())))
+            .collect()
+    }
+
+    /// carrick#1945, carrick#1996: a service's retype goes one file a
+    /// request, and a request that fails costs only its own items. The
+    /// stand-in fails the request that holds `fail-1`. The other files keep
+    /// their answers, whether one process or three take them, and the
+    /// failed file's two calls abstain and say why. A file is never split:
+    /// `x-4` shares the failed request with `fail-1`.
+    ///
+    /// Sending every item in one request again fails this: all five come
+    /// back from the one failed request. A spent budget sends nothing,
+    /// starts no pool, and abstains every item in the words the sidecar
+    /// uses for its own budget.
+    #[test]
+    fn a_retype_request_that_fails_costs_only_its_own_items() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let file = |name: &str| root.join(name).display().to_string();
+        let items = [
+            ("src/a.ts", "x-0"),
+            ("src/c.ts", "fail-1"),
+            ("src/a.ts", "x-2"),
+            ("src/c.ts", "x-4"),
+            ("src/e.ts", "x-6"),
+        ]
+        .map(|(name, id)| retype_item(&file(name), id));
+
+        for n in [1, 3] {
+            let answers = read_answers(&retype_service(
+                &sidecar,
+                "web",
+                &consumer,
+                &items,
+                std::time::Duration::from_secs(600),
+                processes(n),
+            ));
+            assert_eq!(answers.len(), 5, "{n} process(es): {answers:?}");
+            for id in ["x-0", "x-2", "x-6"] {
+                assert_eq!(answers[id].0, RetypeVerdict::Agrees, "{n}: {id}");
+            }
+            for id in ["fail-1", "x-4"] {
+                assert_eq!(
+                    answers[id],
+                    (
+                        RetypeVerdict::Abstain,
+                        Some(
+                            "the retype check did not run: v2 check failed: the stand-in fails this request"
+                                .to_string()
+                        )
+                    ),
+                    "{n}: {id}"
+                );
+            }
+        }
+
+        let spent = retype_service(
             &sidecar,
             "web",
             &consumer,
             &items,
-            2,
-            std::time::Duration::from_secs(600),
-        );
-        let read = |id: &str| {
-            let answer = &answers[id];
-            (answer.outcome, answer.reason.clone())
-        };
-        assert_eq!(answers.len(), 5);
-        for id in ["a", "b", "e"] {
-            assert_eq!(read(id), (RetypeVerdict::Agrees, None), "{id}");
-        }
-        for id in ["c", "d"] {
-            assert_eq!(
-                read(id),
-                (
-                    RetypeVerdict::Abstain,
-                    Some(
-                        "the retype check did not run: v2 check failed: the second batch broke"
-                            .to_string()
-                    )
-                ),
-                "{id}"
-            );
-        }
-
-        let spent = retype_in_batches(
-            &sidecar,
-            "web",
-            &consumer,
-            &items,
-            2,
             std::time::Duration::ZERO,
+            no_pool,
         );
         assert_eq!(spent.len(), 5);
         for answer in spent.values() {
@@ -2696,6 +2785,131 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("the retype check ran out of its 0ms budget")
             );
         }
+    }
+
+    /// carrick#1996: the requests after the first are answered by a pool of
+    /// processes, and every item gets the answer one process gives it. The
+    /// stand-in judges an item by its id alone and names the process that
+    /// answered, so the test can see that three did, the scan's own among
+    /// them.
+    #[test]
+    fn a_pool_of_processes_gives_every_item_the_answer_one_process_gives() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let items: Vec<RetypeItem> = (0..9)
+            .map(|n| {
+                retype_item(
+                    &root.join(format!("src/f{n}.ts")).display().to_string(),
+                    &format!("item-{n}"),
+                )
+            })
+            .collect();
+        let judge = |n: usize| {
+            read_answers(&retype_service(
+                &sidecar,
+                "web",
+                &consumer,
+                &items,
+                std::time::Duration::from_secs(600),
+                processes(n),
+            ))
+        };
+        let verdicts = |answers: &BTreeMap<String, (RetypeVerdict, Option<String>)>| {
+            answers
+                .iter()
+                .map(|(id, (verdict, _))| (id.clone(), *verdict))
+                .collect::<Vec<_>>()
+        };
+        let answered_by = |answers: &BTreeMap<String, (RetypeVerdict, Option<String>)>| {
+            answers
+                .values()
+                .filter_map(|(_, pid)| pid.clone())
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+
+        let one = judge(1);
+        let pooled = judge(3);
+        assert_eq!(one.len(), 9);
+        assert_eq!(verdicts(&pooled), verdicts(&one));
+        assert_eq!(
+            answered_by(&one),
+            [sidecar.pid().to_string()].into(),
+            "one process: the scan's own answers every request"
+        );
+        let pids = answered_by(&pooled);
+        assert_eq!(pids.len(), 3, "three processes answered: {pooled:?}");
+        assert!(pids.contains(&sidecar.pid().to_string()));
+    }
+
+    /// carrick#1996: a process that is gone takes no more requests, and a
+    /// request no process was left to take is not sent: its calls abstain
+    /// and say so. When the scan's own process dies on the first request,
+    /// no pool is started for the rest. When every process of a pool dies,
+    /// the requests nobody took are the unsent ones.
+    #[test]
+    fn a_request_no_process_was_left_to_take_abstains_unsent() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let consumer = consumer_at(&root);
+        let file = |name: &str| root.join(name).display().to_string();
+        let died = |answer: &RetypeOutcome| {
+            answer.outcome == RetypeVerdict::Abstain
+                && answer.reason.as_deref().is_some_and(|reason| {
+                    reason.starts_with("the retype check did not run: ") && reason != RETYPE_UNSENT
+                })
+        };
+        let unsent = |answer: &RetypeOutcome| {
+            answer.outcome == RetypeVerdict::Abstain
+                && answer.reason.as_deref() == Some(RETYPE_UNSENT)
+        };
+
+        let first_dies = [
+            ("src/a.ts", "die-0"),
+            ("src/b.ts", "x-2"),
+            ("src/c.ts", "x-4"),
+        ]
+        .map(|(name, id)| retype_item(&file(name), id));
+        let answers = retype_service(
+            &base_at(&root),
+            "web",
+            &consumer,
+            &first_dies,
+            std::time::Duration::from_secs(600),
+            no_pool,
+        );
+        assert!(died(&answers["die-0"]), "{answers:?}");
+        assert!(
+            unsent(&answers["x-2"]) && unsent(&answers["x-4"]),
+            "{answers:?}"
+        );
+
+        // The first request is answered; the pool's three processes each
+        // take one of the next three and die on it; nobody takes the last.
+        let all_die = [
+            ("src/a.ts", "x-0"),
+            ("src/b.ts", "die-1"),
+            ("src/c.ts", "die-3"),
+            ("src/d.ts", "die-5"),
+            ("src/e.ts", "x-6"),
+        ]
+        .map(|(name, id)| retype_item(&file(name), id));
+        let answers = retype_service(
+            &base_at(&root),
+            "web",
+            &consumer,
+            &all_die,
+            std::time::Duration::from_secs(600),
+            processes(3),
+        );
+        assert_eq!(answers["x-0"].outcome, RetypeVerdict::Agrees, "{answers:?}");
+        for id in ["die-1", "die-3", "die-5"] {
+            assert!(died(&answers[id]), "{id}: {answers:?}");
+        }
+        assert!(unsent(&answers["x-6"]), "{answers:?}");
     }
 
     /// carrick#1516: the producer's unwidened reading rides the retype item

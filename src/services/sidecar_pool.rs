@@ -20,11 +20,6 @@
 //!   others take the rest, and with none left the rest are not sent.
 //! - [`jobs_by_file`] cuts a list of items into jobs that keep each file's
 //!   items together, in their order.
-//!
-//! Its two users land after it: the retype check (carrick#1996) and the
-//! signature pass (carrick#1993). The `dead_code` allowance below is for the
-//! binary until then, and goes with the first of them.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -349,9 +344,90 @@ pub fn jobs_by_file<T: Clone>(
     jobs
 }
 
+/// A stand-in sidecar for the tests of the pool and of its callers.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    use crate::services::type_sidecar::{RetypeItem, TypeSidecar};
+
+    /// A stand-in sidecar that answers each retype item after a short wait,
+    /// so that every process of a pool gets work. An item whose id ends in
+    /// an even digit agrees and any other abstains, so an answer depends on
+    /// the item alone; every answer names the pid of the process that gave
+    /// it as its reason, after a progress frame. A request holding an item
+    /// whose id starts with `die` ends the process before it answers, and
+    /// one holding an item whose id starts with `fail` is answered with an
+    /// error frame.
+    pub(crate) fn stand_in(dir: &Path) -> PathBuf {
+        let script = dir.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') { write({ request_id, status: 'success' }); process.exit(0); }
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.items.some((item) => item.item_id.startsWith('die'))) process.exit(1);
+  if (request.items.some((item) => item.item_id.startsWith('fail'))) {
+    return write({ request_id, status: 'error', errors: ['the stand-in fails this request'] });
+  }
+  write({ request_id, status: 'progress', phase: 'retype', message: `0 of ${request.items.length}` });
+  const until = Date.now() + 150;
+  while (Date.now() < until) {}
+  write({
+    request_id,
+    status: 'success',
+    outcomes: request.items.map((item) => ({
+      item_id: item.item_id,
+      outcome: Number(item.item_id.slice(-1)) % 2 === 0 ? 'agrees' : 'abstain',
+      diagnostics: [],
+      reason: String(process.pid),
+    })),
+  });
+});
+"#,
+        )
+        .unwrap();
+        script
+    }
+
+    /// One retype item for `id`, a call in `file`.
+    pub(crate) fn retype_item(file: &str, id: &str) -> RetypeItem {
+        RetypeItem {
+            item_id: id.to_string(),
+            file_path: file.to_string(),
+            line_number: 1,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            producer_type: "{ id: string; }".to_string(),
+            producer_unwidened_type: None,
+            wire: true,
+        }
+    }
+
+    /// A ready stand-in process scoped to `root`, the caller's own sidecar.
+    pub(crate) fn base_at(root: &Path) -> TypeSidecar {
+        let base = TypeSidecar::spawn(&stand_in(root)).unwrap();
+        base.start_init(root, None);
+        base.wait_ready(std::time::Duration::from_secs(20)).unwrap();
+        base
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{base_at, retype_item};
     use super::*;
+
+    fn item(id: &str) -> crate::services::type_sidecar::RetypeItem {
+        retype_item("/repo/src/a.ts", id)
+    }
 
     #[test]
     fn the_pool_is_sized_by_free_memory_cores_and_the_cap() {
@@ -422,59 +498,6 @@ mod tests {
             ]
         );
         assert!(jobs_by_file::<(&str, i32)>(&[], |(file, _)| file, 3).is_empty());
-    }
-
-    /// A stand-in sidecar that answers each retype item with its own pid as
-    /// the reason, after a short wait so that every process gets work. An
-    /// item whose id starts with `die` ends the process before it answers.
-    fn stand_in(dir: &Path) -> std::path::PathBuf {
-        let script = dir.join("stand-in-sidecar.cjs");
-        std::fs::write(
-            &script,
-            r#"
-const fs = require('fs');
-const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
-require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
-  const request = JSON.parse(line);
-  const request_id = request.request_id;
-  if (request.action === 'shutdown') { write({ request_id, status: 'success' }); process.exit(0); }
-  if (request.action === 'init') return write({ request_id, status: 'ready' });
-  if (request.items.some((item) => item.item_id.startsWith('die'))) process.exit(1);
-  const until = Date.now() + 150;
-  while (Date.now() < until) {}
-  write({
-    request_id,
-    status: 'success',
-    outcomes: request.items.map((item) => ({ item_id: item.item_id, outcome: 'abstain', diagnostics: [], reason: String(process.pid) })),
-  });
-});
-"#,
-        )
-        .unwrap();
-        script
-    }
-
-    fn item(id: &str) -> crate::services::type_sidecar::RetypeItem {
-        crate::services::type_sidecar::RetypeItem {
-            item_id: id.to_string(),
-            file_path: "/repo/src/a.ts".to_string(),
-            line_number: 1,
-            span_start: None,
-            span_end: None,
-            expression_text: None,
-            expression_line: None,
-            producer_type: "{ id: string; }".to_string(),
-            producer_unwidened_type: None,
-            wire: true,
-        }
-    }
-
-    /// A ready stand-in process scoped to `root`, the caller's own sidecar.
-    fn base_at(root: &Path) -> TypeSidecar {
-        let base = TypeSidecar::spawn(&stand_in(root)).unwrap();
-        base.start_init(root, None);
-        base.wait_ready(std::time::Duration::from_secs(20)).unwrap();
-        base
     }
 
     /// One job's answer from the stand-in: the pid of the process that ran it.
