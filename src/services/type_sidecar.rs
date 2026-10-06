@@ -1055,6 +1055,13 @@ enum SidecarRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_ms: Option<u64>,
     },
+    #[serde(rename = "list_program_files")]
+    ListProgramFiles { request_id: String },
+    #[serde(rename = "add_program_files")]
+    AddProgramFiles {
+        request_id: String,
+        files: Vec<String>,
+    },
     #[serde(rename = "shutdown")]
     Shutdown { request_id: String },
 }
@@ -1298,6 +1305,13 @@ pub struct SidecarResponse {
     /// Wall time of a verify_library_claims request, program build included
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// The root files the program was built from, in order (for
+    /// list_program_files)
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+    /// How many files were added (for add_program_files)
+    #[serde(default)]
+    pub added: Option<usize>,
     /// Error messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
@@ -2286,6 +2300,8 @@ impl TypeSidecar {
                 verdicts: None,
                 modules: None,
                 duration_ms: None,
+                files: None,
+                added: None,
                 errors: None,
             });
         }
@@ -2331,6 +2347,8 @@ impl TypeSidecar {
                 verdicts: None,
                 modules: None,
                 duration_ms: None,
+                files: None,
+                added: None,
                 errors: None,
             });
         }
@@ -2381,6 +2399,63 @@ impl TypeSidecar {
         }
 
         Ok(response.definitions.unwrap_or_default())
+    }
+
+    /// The root files the init'd project's program was built from, in order
+    /// (carrick#2027). The roots decide the program's file order, and with
+    /// `stableTypeOrdering` the compiler orders two types of the same name by
+    /// that order. A process adds a file its tsconfig does not list when it
+    /// is first asked about it, so two processes asked in different orders
+    /// can hold their files in different orders. A process whose program no
+    /// request has built lists nothing, and is not made to build it.
+    pub fn program_files(&self) -> Result<Vec<PathBuf>, SidecarError> {
+        self.ensure_ready()?;
+        let request = SidecarRequest::ListProgramFiles {
+            request_id: self.next_request_id(),
+        };
+        self.send_request(&request)?;
+        let response = self.operation_response()?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::ProgramFilesFailed(errors.join("; ")));
+        }
+        let files = response.files.ok_or_else(|| {
+            SidecarError::DeserializationError(
+                "list_program_files answered without its files".to_string(),
+            )
+        })?;
+        Ok(files.into_iter().map(PathBuf::from).collect())
+    }
+
+    /// Add `files` the init'd project has not loaded, in the given order,
+    /// with one rebuild of the program (carrick#2027). A file already loaded
+    /// keeps its place, so a process given another's [`Self::program_files`]
+    /// before any other request builds the same program. A file a referenced
+    /// project owns is skipped, as is one that cannot be read. Returns how
+    /// many files were added.
+    pub fn add_program_files(&self, files: &[PathBuf]) -> Result<usize, SidecarError> {
+        self.ensure_ready()?;
+        if files.is_empty() {
+            return Ok(0);
+        }
+        let request = SidecarRequest::AddProgramFiles {
+            request_id: self.next_request_id(),
+            files: files
+                .iter()
+                .map(|file| file.to_string_lossy().into_owned())
+                .collect(),
+        };
+        self.send_request(&request)?;
+        let response = self.operation_response()?;
+        if response.status != "success" {
+            let errors = response.errors.unwrap_or_default();
+            return Err(SidecarError::ProgramFilesFailed(errors.join("; ")));
+        }
+        response.added.ok_or_else(|| {
+            SidecarError::DeserializationError(
+                "add_program_files answered without a count".to_string(),
+            )
+        })
     }
 
     /// Whether the last `init` scoped the sidecar to exactly this root and
@@ -3292,6 +3367,8 @@ pub enum SidecarError {
     CaptureFailed(String),
     /// v2 check failed
     CheckFailed(String),
+    /// The sidecar could not list or add its program's files
+    ProgramFilesFailed(String),
     /// This process was signalled while the wait was on (carrick#1387).
     Interrupted(crate::shutdown::Interrupted),
 }
@@ -3340,7 +3417,8 @@ impl SidecarError {
             | SidecarError::DeserializationError(_)
             | SidecarError::ResolutionFailed(_)
             | SidecarError::CaptureFailed(_)
-            | SidecarError::CheckFailed(_) => false,
+            | SidecarError::CheckFailed(_)
+            | SidecarError::ProgramFilesFailed(_) => false,
             SidecarError::SpawnFailed(_)
             | SidecarError::InitFailed(_)
             | SidecarError::NotReady(_)
@@ -3365,6 +3443,7 @@ impl std::fmt::Display for SidecarError {
             SidecarError::ResolutionFailed(e) => write!(f, "Definition resolution failed: {}", e),
             SidecarError::CaptureFailed(e) => write!(f, "v2 capture failed: {}", e),
             SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
+            SidecarError::ProgramFilesFailed(e) => write!(f, "Program files request failed: {}", e),
             SidecarError::Interrupted(e) => write!(f, "{e}"),
         }
     }
@@ -3939,6 +4018,11 @@ mod tests {
                     }),
                 ],
                 budget_ms: Some(500),
+            },
+            SidecarRequest::ListProgramFiles { request_id: id() },
+            SidecarRequest::AddProgramFiles {
+                request_id: id(),
+                files: vec!["/repo/apps/web/tools/seed.ts".into()],
             },
             SidecarRequest::Shutdown { request_id: id() },
         ]

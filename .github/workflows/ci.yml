@@ -80,8 +80,8 @@ jobs:
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test, span_locator_units_test,
       # retype_consumer_test, client_semantics_test,
-      # library_claims_sidecar_test and library_store_test need the sidecar
-      # built above. eval_xrepo
+      # library_claims_sidecar_test, library_store_test and
+      # sidecar_program_files_test need the sidecar built above. eval_xrepo
       # is the cross-repo scorer math only:
       # default `cargo test` skips its #[ignore]d live scorer + mock smoke (both
       # spawn the binary / cost money); the live scorer runs via eval-xrepo.yml
@@ -146,6 +146,7 @@ jobs:
           --test service_derivation_test
           --test shadowed_binding_test
           --test sidecar_integration_test
+          --test sidecar_program_files_test
           --test socket_class_field_test
           --test socket_extraction_test
           --test socket_generic_test

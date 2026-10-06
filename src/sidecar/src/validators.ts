@@ -281,6 +281,15 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
   action: z.literal('shutdown'),
 });
 
+export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('list_program_files'),
+});
+
+export const AddProgramFilesRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('add_program_files'),
+  files: z.array(z.string().min(1, 'File path cannot be empty')),
+});
+
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
   stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
@@ -499,6 +508,8 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ListLibrarySurfaceRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
+  ListProgramFilesRequestSchema,
+  AddProgramFilesRequestSchema,
 ]);
 
 // ============================================================================

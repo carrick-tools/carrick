@@ -112,7 +112,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims` and `list_library_surface` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files` and `add_program_files` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -130,6 +130,8 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `verify_client_semantics` | yes | Check claims about an HTTP client library against its type declarations |
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
+| `list_program_files` | yes | The files the program was built from, in order |
+| `add_program_files` | yes | Add files to the program in a given order |
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
@@ -796,6 +798,56 @@ Response:
 - `longest_printed` is the request that printed the longest type, and is absent when none printed one.
 
 A batch that names fewer requests than it timed left out none slower than the last one it names.
+
+#### `list_program_files` and `add_program_files` - One program, one file order
+
+With `stableTypeOrdering`, the compiler orders two types of the same name by where their declarations sit in the program's file list, so a union of two interfaces named `Dog` from two modules prints in the order the program holds the modules. A process asked about a file its tsconfig does not list adds the file to its program, in the order the requests arrive. Two processes asked the same questions in different orders can therefore print the same type differently. These two actions give every process the same program (carrick#2027).
+
+`list_program_files` returns the files the init'd project's program was built from (its root files), as absolute paths, in order. ts-morph builds each program from every file the project has loaded, so the list also holds the compiler's library files (under ts-morph's in-memory `/node_modules/typescript/lib`) and dependencies that earlier builds reached. The list is the roots, not the program's file list. A second copy of a package that the compiler folded into the first while resolving imports becomes a file of its own when it is named as a root, so replaying the full file list builds a larger program. A process whose project no request has built lists nothing.
+
+```json
+{ "request_id": "12", "action": "list_program_files" }
+```
+
+Response:
+```json
+{
+  "request_id": "12",
+  "status": "success",
+  "files": [
+    "/repo/src/index.ts",
+    "/node_modules/typescript/lib/lib.es2022.d.ts",
+    "/repo/node_modules/@types/node/index.d.ts",
+    "/repo/tools/yard/dog.ts",
+    "/repo/tools/kennel/dog.ts"
+  ]
+}
+```
+
+`add_program_files` adds each file the project has not loaded, in the order given, and builds the program once. A file already loaded keeps its place, so the order of an earlier request is never changed. A path may be absolute or relative to the init'd root. A file that cannot be read is skipped and not counted. `added` counts the files added.
+
+```json
+{
+  "request_id": "13",
+  "action": "add_program_files",
+  "files": [
+    "/repo/src/index.ts",
+    "/node_modules/typescript/lib/lib.es2022.d.ts",
+    "/repo/node_modules/@types/node/index.d.ts",
+    "/repo/tools/yard/dog.ts",
+    "/repo/tools/kennel/dog.ts"
+  ]
+}
+```
+
+Response:
+```json
+{ "request_id": "13", "status": "success", "added": 2 }
+```
+
+To give a second process the first one's program, send the first one's `list_program_files` answer to the second one's `add_program_files` before the second one answers any other request. Both processes then build from the same roots in the same order, so they hold the same files in the same order. A process that has already added files keeps them where they are.
+
+Both actions read the default project, the one that types every file no referenced project owns. A file a referenced project owns (carrick#1604) is in that project's program from its tsconfig, so `add_program_files` skips it, and no request adds files to that program.
 
 #### `resolve_definitions` - Read aliases out of a capture stub
 

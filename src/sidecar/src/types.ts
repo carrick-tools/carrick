@@ -258,6 +258,24 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
+ * List the root files the init'd project's program was built from, in order
+ * (carrick#2027).
+ */
+export interface ListProgramFilesRequest extends BaseRequest {
+  action: 'list_program_files';
+}
+
+/**
+ * Add files to the programs that type them, in the given order
+ * (carrick#2027).
+ */
+export interface AddProgramFilesRequest extends BaseRequest {
+  action: 'add_program_files';
+  /** Absolute paths, or relative to the init'd root. */
+  files: string[];
+}
+
+/**
  * Request to resolve type definitions from a v2 capture stub package.
  * Returns both the original declaration and the compiler-expanded form for
  * each surface alias (design doc: `resolve_per_endpoint_definitions` is
@@ -530,7 +548,9 @@ export type SidecarRequest =
   | InferRequest
   | ResolveDefinitionsRequest
   | HealthRequest
-  | ShutdownRequest;
+  | ShutdownRequest
+  | ListProgramFilesRequest
+  | AddProgramFilesRequest;
 
 /**
  * Request for a specific symbol to be bundled
@@ -733,6 +753,24 @@ export interface ShutdownResponse extends BaseResponse {
 }
 
 /**
+ * Response for list_program_files action
+ */
+export interface ListProgramFilesResponse extends BaseResponse {
+  /** The program's root files, as absolute paths, in order. */
+  files?: string[];
+  errors?: string[];
+}
+
+/**
+ * Response for add_program_files action
+ */
+export interface AddProgramFilesResponse extends BaseResponse {
+  /** How many of the given files were added. */
+  added?: number;
+  errors?: string[];
+}
+
+/**
  * Error response
  */
 export interface ErrorResponse extends BaseResponse {
@@ -901,6 +939,8 @@ export type SidecarResponse =
   | ResolveDefinitionsResponse
   | HealthResponse
   | ShutdownResponse
+  | ListProgramFilesResponse
+  | AddProgramFilesResponse
   | ErrorResponse;
 
 /**

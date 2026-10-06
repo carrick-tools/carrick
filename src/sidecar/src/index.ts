@@ -34,6 +34,7 @@ import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck } from './library-claims.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
+import { addProgramFiles, listProgramFiles } from './program-files.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -51,6 +52,8 @@ import type {
   ListLibrarySurfaceResponse,
   HealthResponse,
   ShutdownResponse,
+  ListProgramFilesResponse,
+  AddProgramFilesResponse,
   ErrorResponse,
 } from './types.js';
 
@@ -88,6 +91,14 @@ let components = new Map<string, ProjectComponents>();
  */
 const definitionResolver = new DefinitionResolver();
 
+/** The init'd project loader, or the error every project-backed action gives without one. */
+function initializedLoader(): ProjectLoader {
+  if (!projectLoader?.isInitialized()) {
+    throw new Error('Sidecar not initialized. Call init first.');
+  }
+  return projectLoader;
+}
+
 /**
  * Get the project-backed components, building the project if this is the
  * first request that needs it.
@@ -95,15 +106,12 @@ const definitionResolver = new DefinitionResolver();
  * @throws if init has not run, or if the project cannot be built
  */
 function projectComponents(key = ''): ProjectComponents {
-  if (!projectLoader?.isInitialized()) {
-    throw new Error('Sidecar not initialized. Call init first.');
-  }
+  // Bound here rather than read from the module slot inside the components:
+  // a re-init drops `components` and points the slot at another service, and
+  // nothing built over this project may follow it there.
+  const loader = initializedLoader();
   let built = components.get(key);
   if (!built) {
-    // Bound here rather than read from the module slot inside the components:
-    // a re-init drops `components` and points the slot at another service, and
-    // nothing built over this project may follow it there.
-    const loader = projectLoader;
     const project = loader.getProjectFor(key);
     const repoRoot = loader.getRepoRoot();
     // The module graph, where the project resolved through one, is the only
@@ -613,6 +621,64 @@ function handleResolveDefinitions(
 }
 
 /**
+ * Handle the 'list_program_files' action - the root files the default
+ * project's program was built from, in order (carrick#2027). It is the only
+ * program a request grows: a file a referenced project owns is in that
+ * project's program from its tsconfig, so a program built for an owning
+ * project (carrick#1604) holds the same files in every process. A process
+ * that has not built the default project lists nothing, and does not build
+ * it to answer.
+ */
+function handleListProgramFiles(
+  request: SidecarRequest & { action: 'list_program_files' }
+): ListProgramFilesResponse {
+  try {
+    const project = initializedLoader().builtProject();
+    const files = project ? listProgramFiles(project) : [];
+    log(`Listing ${files.length} program file(s)`);
+    return { request_id: request.request_id, status: 'success', files };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Listing program files failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
+ * Handle the 'add_program_files' action - add the given files to the default
+ * project's program in the given order, rebuilding it at most once
+ * (carrick#2027). A file a referenced project owns is skipped, as an `infer`
+ * on it would never add it to this program: its owner's program already holds
+ * it.
+ */
+function handleAddProgramFiles(
+  request: SidecarRequest & { action: 'add_program_files' }
+): AddProgramFilesResponse {
+  try {
+    const loader = initializedLoader();
+    const startTime = performance.now();
+    const files = request.files
+      .map((file) => path.resolve(loader.getRepoRoot(), file))
+      .filter((file) => loader.projectKeyFor(file) === '');
+    const added =
+      files.length === 0
+        ? 0
+        : addProgramFiles(loader.getProject(), files, (file, reason) =>
+            logError(`Not added to the program: ${file}: ${reason}`)
+          );
+    log(
+      `Added ${added} of ${request.files.length} file(s) to the program in ` +
+        `${Math.round(performance.now() - startTime)}ms`
+    );
+    return { request_id: request.request_id, status: 'success', added };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Adding program files failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'health' action - report initialization status
  */
 function handleHealth(request: SidecarRequest & { action: 'health' }): HealthResponse {
@@ -670,6 +736,10 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleVerifyLibraryClaims(request);
     case 'list_library_surface':
       return handleListLibrarySurface(request);
+    case 'list_program_files':
+      return handleListProgramFiles(request);
+    case 'add_program_files':
+      return handleAddProgramFiles(request);
     case 'health':
       return handleHealth(request);
     case 'shutdown':

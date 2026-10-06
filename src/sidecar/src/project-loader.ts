@@ -448,6 +448,14 @@ export class ProjectLoader {
   }
 
   /**
+   * The default project when a request has built it, and `undefined` before
+   * that, without building it (carrick#2027).
+   */
+  builtProject(): Project | undefined {
+    return this.project ?? undefined;
+  }
+
+  /**
    * The registry package a resolved file belongs to, when the module graph
    * names one (carrick#1260). `undefined` for a project that did not resolve
    * through Deno, and for a file the workspace itself owns.
