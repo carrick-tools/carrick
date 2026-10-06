@@ -920,6 +920,18 @@ impl Visit for CalleeCollector<'_> {
         lit.visit_children_with(self);
     }
 
+    /// A JSX attribute's string value (`<Icon name="alert-circle" />`) is a
+    /// literal the parser stores in the attribute as a bare string, outside
+    /// any `Lit`, so `visit_lit` never sees it.
+    fn visit_jsx_attr_value(&mut self, value: &JSXAttrValue) {
+        if let JSXAttrValue::Str(text) = value
+            && let Some(token) = string_literal_token(&text.value.to_string_lossy())
+        {
+            self.literals.push(token);
+        }
+        value.visit_children_with(self);
+    }
+
     /// Template literals carry paths, URLs and header names as often as plain
     /// string literals do, and their static chunks are literals by any other
     /// name. The interpolations are ordinary expressions and are picked up by
@@ -2394,8 +2406,14 @@ mod tests {
     };
 
     fn parse_ts(source: &str) -> (Lrc<SourceMap>, Module) {
+        parse_as(source, "input.ts")
+    }
+
+    /// Parse `source` through the production entry point, as a file named
+    /// `file_name`: the extension picks the syntax (`.tsx` reads JSX).
+    fn parse_as(source: &str, file_name: &str) -> (Lrc<SourceMap>, Module) {
         let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let file_path = tmp_dir.path().join("input.ts");
+        let file_path = tmp_dir.path().join(file_name);
         std::fs::write(&file_path, source).expect("write file");
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
@@ -2404,8 +2422,12 @@ mod tests {
     }
 
     fn extract(source: &str) -> HashMap<String, FunctionDefinition> {
-        let (cm, module) = parse_ts(source);
-        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("test.ts"), cm);
+        extract_as(source, "test.ts")
+    }
+
+    fn extract_as(source: &str, file_name: &str) -> HashMap<String, FunctionDefinition> {
+        let (cm, module) = parse_as(source, file_name);
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from(file_name), cm);
         module.visit_with(&mut extractor);
         extractor.finalize_exports();
         extractor.function_definitions
@@ -3469,6 +3491,37 @@ second`): void {}
                 "{rejected:?} should not be a token: {tokens:?}"
             );
         }
+    }
+
+    /// A JSX attribute's string value is a literal like any other: the
+    /// `"alert-circle"` in `<Icon name="alert-circle" />` is what a question
+    /// about that component names. The parser puts it in the attribute as a
+    /// bare string node, outside any `Lit`, so it needs its own arm. Order is
+    /// part of the contract (the cap keeps the first tokens), so the values
+    /// must sit where the source writes them, between the literals around them.
+    #[test]
+    fn jsx_attribute_string_values_are_collected_in_source_order() {
+        let defs = extract_as(
+            "export function Banner(props) {\n\
+             \x20 const tone = \"before\";\n\
+             \x20 return <Box align=\"center\" gap={8}><Icon name=\"alert-circle\" />{\"after\"}</Box>;\n\
+             }\n",
+            "banner.tsx",
+        );
+        let tokens = &defs.get("Banner").expect("definition").tokens;
+        let position = |token: &str| {
+            tokens
+                .iter()
+                .position(|t| t == token)
+                .unwrap_or_else(|| panic!("{token} missing: {tokens:?}"))
+        };
+        assert!(
+            position("before") < position("center")
+                && position("center") < position("8")
+                && position("8") < position("alert-circle")
+                && position("alert-circle") < position("after"),
+            "literals out of source order: {tokens:?}"
+        );
     }
 
     #[test]
