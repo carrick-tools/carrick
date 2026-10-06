@@ -164,11 +164,12 @@ describe('list_program_files and add_program_files (carrick#2027)', () => {
       `the union names both interfaces, or the test compares nothing: ${firstPick}`
     );
 
-    // A process that meets the kennel's module first holds another order:
-    // the list can tell the two apart.
+    // A process that meets the kennel's module first holds another order,
+    // and prints the union the other way round.
     const unaligned = await processFor(root);
-    await ask(unaligned, root, [KENNEL, YARD, PICK]);
+    const [, , unalignedPick] = await ask(unaligned, root, [KENNEL, YARD, PICK]);
     assert.notDeepStrictEqual(await list(unaligned), firstFiles);
+    assert.notStrictEqual(unalignedPick, firstPick, 'the file order decides the union order');
 
     // Given the first process's list before anything else, a process holds
     // its order, and keeps it while it is asked in the other order.

@@ -1071,7 +1071,10 @@ impl SidecarRequest {
     /// sidecar never answers it (carrick#2021).
     fn item_count(&self) -> usize {
         match self {
-            SidecarRequest::Init { .. } | SidecarRequest::Shutdown { .. } => 0,
+            SidecarRequest::Init { .. }
+            | SidecarRequest::ListProgramFiles { .. }
+            | SidecarRequest::Shutdown { .. } => 0,
+            SidecarRequest::AddProgramFiles { files, .. } => files.len(),
             SidecarRequest::Bundle { symbols, .. } => symbols.len(),
             SidecarRequest::Infer { requests, .. } => requests.len(),
             SidecarRequest::CaptureV2 { anchors, .. } => anchors.len(),
