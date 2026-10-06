@@ -404,10 +404,14 @@ pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
 /// `stopped` receives every separate checkout and untracked dot folder the
 /// walk stopped at ([`git_boundary`]), as walked, so the caller can say what
 /// was left out.
+///
+/// `exclusion` is the service's `exclude` (carrick#1990): what it matches is
+/// never entered either, and is put in `stopped` to be counted.
 fn source_entries<'a>(
     root: &'a Path,
     ignore_patterns: &'a [&'a str],
     left_out: &'a [PathBuf],
+    exclusion: &'a Exclusion,
     stopped: &'a mut Stopped,
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
@@ -421,6 +425,10 @@ fn source_entries<'a>(
                     .strip_prefix(root)
                     .is_ok_and(|relative| left_out.iter().any(|dir| relative == dir))
             {
+                return false;
+            }
+            if entry.depth() > 0 && exclusion.excludes(entry.path(), entry.file_type().is_dir()) {
+                stopped.excluded.push(entry.path().to_path_buf());
                 return false;
             }
             match git_boundary(entry) {
@@ -447,6 +455,90 @@ struct Stopped {
     /// Dot folders git tracks nothing under
     /// ([`GitBoundary::UntrackedDotFolder`]).
     dot_folders: Vec<PathBuf>,
+    /// Files and folders the service's `exclude` matches ([`Exclusion`]).
+    excluded: Vec<PathBuf>,
+}
+
+/// What a service's carrick.json `exclude` leaves out (carrick#1990): paths
+/// matching its patterns, read in gitignore syntax relative to the service's
+/// directory.
+///
+/// An excluded file is not walked, so it is not analysed or typed and states
+/// no row. A file that is not excluded and imports one still resolves the
+/// import through the compiler, as it does for any file outside the walk.
+/// Nothing is excluded by default or by a name written here.
+#[derive(Default)]
+pub struct Exclusion {
+    root: PathBuf,
+    matcher: Option<ignore::gitignore::Gitignore>,
+    patterns: usize,
+}
+
+impl std::fmt::Debug for Exclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exclusion")
+            .field("root", &self.root)
+            .field("patterns", &self.patterns)
+            .finish()
+    }
+}
+
+impl Exclusion {
+    /// The matcher for `patterns` rooted at `root`, or the reason one of
+    /// them is not a pattern.
+    fn build(root: &Path, patterns: &[String]) -> Result<Exclusion, String> {
+        if patterns.is_empty() {
+            return Ok(Exclusion::default());
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        for pattern in patterns {
+            builder
+                .add_line(None, pattern)
+                .map_err(|error| format!("`{pattern}` is not a pattern: {error}"))?;
+        }
+        let matcher = builder.build().map_err(|error| error.to_string())?;
+        Ok(Exclusion {
+            root: root.to_path_buf(),
+            matcher: Some(matcher),
+            patterns: patterns.len(),
+        })
+    }
+
+    /// Whether every pattern reads as one, for the config to refuse what
+    /// would otherwise exclude nothing.
+    pub fn check(patterns: &[String]) -> Result<(), String> {
+        Self::build(Path::new(""), patterns).map(|_| ())
+    }
+
+    /// The service's `exclude`, rooted at its directory. A config that
+    /// passed [`Self::check`] always builds; one that did not excludes
+    /// nothing.
+    pub fn of_service(repo_root: &Path, service: &crate::config::Config) -> Exclusion {
+        Self::build(&service_root(repo_root, service), &service.exclude).unwrap_or_default()
+    }
+
+    /// How many patterns the service states.
+    pub fn patterns(&self) -> usize {
+        self.patterns
+    }
+
+    /// Whether `path` is excluded: it, or a folder it sits in, matches. A
+    /// path outside the service's directory, and the directory itself, never
+    /// is.
+    pub fn excludes(&self, path: &Path, is_dir: bool) -> bool {
+        let Some(matcher) = &self.matcher else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() {
+            return false;
+        }
+        matcher
+            .matched_path_or_any_parents(relative, is_dir)
+            .is_ignore()
+    }
 }
 
 /// What one walk read, and the directories it stopped at.
@@ -466,18 +558,30 @@ struct Walked {
 /// last on that host. A service's manifest is the one at its root and nowhere
 /// else — see [`find_service_files`].
 pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
-    let walked = find_files_leaving_out(dir, ignore_patterns, &[]);
+    let walked = find_files_leaving_out(dir, ignore_patterns, &[], &Exclusion::default());
     (walked.files, walked.config_file)
 }
 
-/// [`find_files`], never entering the `left_out` directories below `dir`.
-fn find_files_leaving_out(dir: &str, ignore_patterns: &[&str], left_out: &[PathBuf]) -> Walked {
+/// [`find_files`], never entering the `left_out` directories below `dir` or
+/// what `exclusion` matches.
+fn find_files_leaving_out(
+    dir: &str,
+    ignore_patterns: &[&str],
+    left_out: &[PathBuf],
+    exclusion: &Exclusion,
+) -> Walked {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
     let mut stopped = Stopped::default();
     let root_path = Path::new(dir);
 
-    for entry in source_entries(root_path, ignore_patterns, left_out, &mut stopped) {
+    for entry in source_entries(
+        root_path,
+        ignore_patterns,
+        left_out,
+        exclusion,
+        &mut stopped,
+    ) {
         let path = entry.path();
 
         if !path.is_file() {
@@ -499,6 +603,28 @@ fn find_files_leaving_out(dir: &str, ignore_patterns: &[&str], left_out: &[PathB
         config_file,
         stopped,
     }
+}
+
+/// How many source files the walk rooted at `root` would have read under the
+/// `excluded` paths it did not enter (carrick#1990).
+fn count_excluded(excluded: &[PathBuf], root: &Path, ignore_patterns: &[&str]) -> usize {
+    excluded
+        .iter()
+        .map(|path| {
+            if !path.is_dir() {
+                return usize::from(is_scanned_source(path, root));
+            }
+            source_entries(
+                path,
+                ignore_patterns,
+                &[],
+                &Exclusion::default(),
+                &mut Stopped::default(),
+            )
+            .filter(|entry| entry.path().is_file() && is_scanned_source(entry.path(), root))
+            .count()
+        })
+        .sum()
 }
 
 /// Where a service's own tree starts: its `directory` under the repo root, or
@@ -576,6 +702,16 @@ pub struct ServiceWalk {
     /// The dot folders git tracks nothing under that the walk did not enter
     /// (carrick#1607), listed as `checkouts_left_out` is.
     pub dot_folders_left_out: Vec<PathBuf>,
+    /// What the service's `exclude` left out (carrick#1990).
+    pub excluded: ExcludedFiles,
+}
+
+/// How many `exclude` patterns a service states, and how many source files
+/// they left out of its walk (carrick#1990).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExcludedFiles {
+    pub patterns: usize,
+    pub files: usize,
 }
 
 /// [`find_service_files`], with the directories the walk stopped at.
@@ -600,20 +736,41 @@ pub fn walk_service(
 
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.
+    let exclusion = Exclusion::of_service(root, service);
     let Walked {
         mut files,
         config_file: _,
         mut stopped,
-    } = find_files_leaving_out(&service_root.to_string_lossy(), ignore_patterns, &left_out);
+    } = find_files_leaving_out(
+        &service_root.to_string_lossy(),
+        ignore_patterns,
+        &left_out,
+        &exclusion,
+    );
+    let mut excluded_files = count_excluded(&stopped.excluded, &service_root, ignore_patterns);
 
     let manifest = find_service_manifest(root, service);
 
     for inc in &service.include {
         let inc_path = root.join(inc);
-        let included = find_files_leaving_out(&inc_path.to_string_lossy(), ignore_patterns, &[]);
+        let included = find_files_leaving_out(
+            &inc_path.to_string_lossy(),
+            ignore_patterns,
+            &[],
+            &exclusion,
+        );
         files.extend(included.files);
         stopped.checkouts.extend(included.stopped.checkouts);
         stopped.dot_folders.extend(included.stopped.dot_folders);
+        // Only what the directory walk did not already count.
+        let new: Vec<PathBuf> = included
+            .stopped
+            .excluded
+            .into_iter()
+            .filter(|path| !stopped.excluded.iter().any(|seen| path.starts_with(seen)))
+            .collect();
+        excluded_files += count_excluded(&new, &inc_path, ignore_patterns);
+        stopped.excluded.extend(new);
     }
 
     // An `include` root may overlap the service directory; keep the first
@@ -642,6 +799,10 @@ pub fn walk_service(
         manifest,
         checkouts_left_out: left_out_named_nothing(stopped.checkouts),
         dot_folders_left_out: left_out_named_nothing(stopped.dot_folders),
+        excluded: ExcludedFiles {
+            patterns: exclusion.patterns(),
+            files: excluded_files,
+        },
     }
 }
 
@@ -829,9 +990,15 @@ mod tests {
         installed_workspace(root, 12, 2);
 
         let mut stopped = Stopped::default();
-        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[], &mut stopped)
-            .map(|entry| entry.path().to_path_buf())
-            .collect();
+        let visited: Vec<PathBuf> = source_entries(
+            root,
+            ARTIFACT_IGNORES,
+            &[],
+            &Exclusion::default(),
+            &mut stopped,
+        )
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
 
         assert!(
             !visited
@@ -1635,6 +1802,76 @@ mod tests {
             [".tooling/release.ts", "src/orders.ts"]
         );
         assert!(dot_folders_left_out_by(root, &included).is_empty());
+    }
+
+    /// carrick#1990: `exclude` reads as a `.gitignore` does, relative to the
+    /// service's directory, and the walk says how many source files it left
+    /// out.
+    #[test]
+    fn exclude_patterns_leave_paths_out_of_a_service_walk() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "web/src/orders.ts");
+        touch(root, "web/src/orders.scratch.ts");
+        touch(root, "web/scripts/backfill.ts");
+        touch(root, "web/scripts/nested/report.ts");
+        touch(root, "web/src/scripts/kept.ts");
+        touch(root, "web/legacy/old.ts");
+        touch(root, "web/legacy/keep.ts");
+        touch(root, "shared/util.ts");
+        let service = crate::config::Config {
+            directory: Some("web".to_string()),
+            include: vec!["shared".to_string()],
+            exclude: vec![
+                "/scripts/".to_string(),
+                "*.scratch.ts".to_string(),
+                "legacy/*".to_string(),
+                "!legacy/keep.ts".to_string(),
+                "util.ts".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            read_by(root, &service),
+            [
+                "shared/util.ts",
+                "web/legacy/keep.ts",
+                "web/src/orders.ts",
+                "web/src/scripts/kept.ts"
+            ],
+            "anchored, glob, negated; a path outside the directory is never matched"
+        );
+        let walk = walk_service(root.to_str().unwrap(), &service, ARTIFACT_IGNORES);
+        assert_eq!(
+            walk.excluded,
+            ExcludedFiles {
+                patterns: 5,
+                files: 4
+            }
+        );
+    }
+
+    /// No pattern leaves nothing out and counts nothing, so a repository
+    /// without `exclude` walks as it always did.
+    #[test]
+    fn a_service_with_no_exclude_walks_as_before() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "scripts/backfill.ts");
+        let services = resolved(&[(".", "")]);
+        assert_eq!(read_by(root, &services[0]), ["scripts/backfill.ts"]);
+        assert_eq!(
+            walk_service(root.to_str().unwrap(), &services[0], ARTIFACT_IGNORES).excluded,
+            ExcludedFiles::default()
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_no_pattern_is_refused() {
+        assert!(Exclusion::check(&["scripts/".to_string()]).is_ok());
+        // A trailing escape escapes nothing.
+        let refused = Exclusion::check(&["src/\\".to_string()]).unwrap_err();
+        assert!(refused.contains("`src/\\`"), "{refused}");
     }
 
     /// Naming a checkout is how it is read: as a service's own `directory`,

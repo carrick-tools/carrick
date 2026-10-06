@@ -3846,6 +3846,12 @@ fn scan_protocol_extractions(
     let declared =
         crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
+    // A schema file the service excludes serves nothing (carrick#1990),
+    // unless the service also names it in `graphqlSchemas`.
+    let exclusion = crate::file_finder::Exclusion::of_service(Path::new(repo_path), service);
+    graphql.producers.retain(|op| {
+        declared.files.contains(&op.file_path) || !exclusion.excludes(&op.file_path, false)
+    });
     merge_graphql_resolver_locations(&mut graphql, file_results);
     // Aliases resolve here as they do for the HTTP-twin drop: a page imports
     // its generated documents through the repo's path aliases as often as
@@ -5842,7 +5848,12 @@ fn attach_external_call_candidates(
 ) {
     let repo_root = std::path::Path::new(repo_path);
     let started = Instant::now();
-    let sdk_rows = workspace.rows_for_service(files, repo_root);
+    // A file the service excludes states no row (carrick#1990), and the
+    // workspace pass reaches it through an import of a file that is not
+    // excluded.
+    let exclusion = crate::file_finder::Exclusion::of_service(repo_root, config);
+    let mut sdk_rows = workspace.rows_for_service(files, repo_root);
+    sdk_rows.retain(|row| !exclusion.excludes(&repo_root.join(&row.file), false));
     debug!(
         "External call candidates: workspace pass in {:.1}s",
         started.elapsed().as_secs_f64()
@@ -6632,6 +6643,17 @@ fn left_out_line(left_out: &str) -> String {
     format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
 }
 
+/// What a scan prints when the service states `exclude` patterns
+/// (carrick#1990): how many, and how many source files they left out, so a
+/// file missing from the index is never a silent decision. Printed for a
+/// pattern that matched nothing too: that is how a mistyped one shows.
+fn excluded_line(excluded: crate::file_finder::ExcludedFiles) -> String {
+    format!(
+        "Left out {} file(s) matching the {} exclude pattern(s) in carrick.json.",
+        excluded.files, excluded.patterns
+    )
+}
+
 /// `repo_path` as every path of a scan is read from: canonical, so two runs
 /// that name one tree two ways normalise their paths alike.
 fn canonical_repo_path(repo_path: &str) -> String {
@@ -6726,7 +6748,12 @@ fn discover_files_and_symbols(
         };
         // A folder of checkouts holds source and none of it is this walk's:
         // the error names them, so the fix is not searched for in the config.
-        let advice = if left_out.is_empty() {
+        let advice = if walk.excluded.files > 0 {
+            format!(
+                "{} Narrow \"exclude\" in carrick.json.",
+                excluded_line(walk.excluded)
+            )
+        } else if left_out.is_empty() {
             "Check the scan path and the directory/include entries in carrick.json.".to_string()
         } else {
             format!(
@@ -6741,6 +6768,9 @@ fn discover_files_and_symbols(
     }
     for left_out in &left_out {
         info!("{}", left_out_line(left_out));
+    }
+    if walk.excluded.patterns > 0 {
+        info!("{}", excluded_line(walk.excluded));
     }
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);

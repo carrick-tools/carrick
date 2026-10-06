@@ -1,0 +1,3 @@
+{
+  "exclude": ["scripts/", "app/api/legacy/", "**/*.scratch.ts"]
+}

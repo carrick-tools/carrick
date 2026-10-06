@@ -30,6 +30,17 @@ pub struct Config {
     /// Relative to the `carrick.json` location.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Paths this service's scan leaves out (carrick#1990): patterns in
+    /// gitignore syntax, relative to the service's `directory`. A file one
+    /// matches is not walked, analysed or typed, and states no row. The
+    /// scan prints how many files they left out, and the blob's
+    /// `config_json` carries the patterns, so a reader can tell an excluded
+    /// file from a missing row ([`crate::file_finder::Exclusion`]).
+    ///
+    /// Skipped when empty so a config without one serializes byte-identically
+    /// into the blob's `config_json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
     /// Printed GraphQL SDL files that define the operations this service
     /// SERVES (carrick#1099), relative to the `carrick.json` location; glob
     /// patterns are allowed. The declaration for a code-first schema, whose
@@ -295,6 +306,21 @@ impl Config {
             } else {
                 root.services
             };
+
+            // A pattern the matcher cannot read would leave out nothing, and
+            // a reader would take the files it meant as excluded.
+            for service in &file_services {
+                if let Err(reason) = crate::file_finder::Exclusion::check(&service.exclude) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: `exclude` of service '{}': {reason}",
+                            path.display(),
+                            service.service_name.as_deref().unwrap_or("(root)")
+                        ),
+                    ));
+                }
+            }
 
             let mut inherited: HashSet<String> = HashSet::new();
             for service in file_services.iter_mut() {
@@ -844,6 +870,39 @@ mod tests {
         assert!(message.contains("lambdas/_shard"), "{message}");
         assert!(message.contains("include"), "{message}");
         assert!(message.contains("carrick.json"), "{message}");
+    }
+
+    /// carrick#1990: a flat config and a service entry both take `exclude`,
+    /// and a line that is no pattern fails the scan rather than excluding
+    /// nothing.
+    #[test]
+    fn exclude_is_read_from_both_shapes_and_a_bad_pattern_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("flat.json");
+        std::fs::write(&flat, r#"{ "exclude": ["scripts/"] }"#).unwrap();
+        let services = Config::load_services(vec![flat]).unwrap();
+        assert_eq!(services[0].exclude, ["scripts/"]);
+
+        let nested = dir.path().join("nested.json");
+        std::fs::write(
+            &nested,
+            r#"{ "services": [{ "name": "web", "directory": "web", "exclude": ["scratch/"] }] }"#,
+        )
+        .unwrap();
+        let services = Config::load_services(vec![nested]).unwrap();
+        assert_eq!(services[0].exclude, ["scratch/"]);
+
+        let bad = dir.path().join("carrick.json");
+        std::fs::write(
+            &bad,
+            r#"{ "services": [{ "name": "web", "directory": "web", "exclude": ["src/\\"] }] }"#,
+        )
+        .unwrap();
+        let err = Config::load_services(vec![bad]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("`src/\\`"), "{message}");
+        assert!(message.contains("web"), "{message}");
     }
 
     /// carrick#831: an `operations` block reaches the service it names, route
