@@ -112,8 +112,9 @@ export function typeToStringAsDeclared(
       ts.NodeBuilderFlags.IgnoreErrors |
       (noTruncation ? ts.NodeBuilderFlags.NoTruncation : 0)
   );
-  // `typeToString` asserts a node; with IgnoreErrors the builder always gives one.
-  if (node === undefined) return checker.typeToString(type, enclosing, flags);
+  // `typeToString` asserts a node here too (`Debug.fail`). Falling back to it
+  // would print the other specifier form, so fail the same way it does.
+  if (node === undefined) throw new Error('the node builder gave no type node to print');
   const unresolved = (type as { intrinsicName?: string }).intrinsicName === 'unresolved';
   const writer = (ts as unknown as InternalTs).createTextWriter('');
   (unresolved ? PRINTER_WITH_COMMENTS : PRINTER).writeNode(
