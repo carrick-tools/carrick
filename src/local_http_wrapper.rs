@@ -320,7 +320,7 @@ impl Reader<'_> {
     ) -> Option<Vec<Piece>> {
         match unwrap(expr) {
             Expr::Lit(Lit::Str(literal)) => Some(vec![Piece::Text {
-                text: literal.value.to_string(),
+                text: literal.value.to_string_lossy().into_owned(),
                 literal: !literal.value.is_empty(),
             }]),
             Expr::Ident(ident) => {
@@ -567,7 +567,7 @@ impl Reader<'_> {
 fn prop_name_is(key: &PropName, name: &str) -> bool {
     match key {
         PropName::Ident(ident) => ident.sym.as_ref() == name,
-        PropName::Str(literal) => literal.value.as_ref() == name,
+        PropName::Str(literal) => literal.value == name,
         _ => false,
     }
 }
@@ -919,7 +919,7 @@ fn callee_property(call: &CallExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,

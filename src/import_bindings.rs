@@ -649,9 +649,10 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
                         .unwrap_or_else(|| upstream.clone());
                     match &named.src {
                         Some(src) => {
-                            exports
-                                .type_forwarded
-                                .insert(exported, (src.value.to_string(), upstream));
+                            exports.type_forwarded.insert(
+                                exported,
+                                (src.value.to_string_lossy().into_owned(), upstream),
+                            );
                         }
                         None => {
                             exports.type_local.insert(exported);
@@ -664,7 +665,7 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
                 match &named.src {
                     // `export { a as b } from "./m"`, `export { default as X } from "./m"`
                     Some(src) => {
-                        let specifier = src.value.to_string();
+                        let specifier = src.value.to_string_lossy().into_owned();
                         for spec in &named.specifiers {
                             match spec {
                                 ExportSpecifier::Named(spec) if !spec.is_type_only => {
@@ -715,7 +716,9 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
                 }
             }
             ModuleDecl::ExportAll(export) if !export.type_only => {
-                exports.stars.push(export.src.value.to_string());
+                exports
+                    .stars
+                    .push(export.src.value.to_string_lossy().into_owned());
             }
             _ => {}
         }
@@ -727,7 +730,7 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
 fn export_name_string(name: &ModuleExportName) -> String {
     match name {
         ModuleExportName::Ident(ident) => ident.sym.to_string(),
-        ModuleExportName::Str(s) => s.value.to_string(),
+        ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
     }
 }
 

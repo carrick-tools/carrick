@@ -2290,7 +2290,7 @@ impl Analyzer {
                 // Extract request body fields from the handler function
                 let req_json = match &func_def.node_type {
                     FunctionNodeType::ArrowFunction(arrow) => {
-                        if let swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block) = &*arrow.body {
+                        if let swc_ecma_ast::ArrowFunctionBody::FunctionBody(block) = &*arrow.body {
                             self.extract_req_body_fields(block)
                         } else {
                             None

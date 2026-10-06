@@ -298,7 +298,7 @@ impl BusCollector<'_> {
         let Expr::Lit(Lit::Str(event)) = &*first.expr else {
             return;
         };
-        let event = event.value.to_string();
+        let event = event.value.to_string_lossy().into_owned();
         if is_reserved(&event) {
             return;
         }

@@ -364,7 +364,7 @@ pub(crate) fn read_call_sites(file: &Path) -> Option<FileCalls> {
             .iter()
             .filter_map(|item| match item {
                 ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    Some(import.src.value.to_string())
+                    Some(import.src.value.to_string_lossy().into_owned())
                 }
                 _ => None,
             })

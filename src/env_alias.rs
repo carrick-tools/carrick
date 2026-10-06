@@ -301,7 +301,7 @@ fn object_env_props(obj: &ObjectLit, known_aliases: &EnvAliasMap) -> Vec<(String
             Prop::KeyValue(kv) => {
                 let name = match &kv.key {
                     PropName::Ident(ident) => ident.sym.to_string(),
-                    PropName::Str(s) => s.value.to_string(),
+                    PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                     _ => continue,
                 };
                 let env_name = env_read_name(&kv.value).or_else(|| {
@@ -443,7 +443,7 @@ fn module_exports(module: &Module) -> Vec<ModuleExport<'_>> {
                     };
                     let exported = match &named_spec.exported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string_lossy().into_owned(),
                         None => orig.sym.to_string(),
                     };
                     exports.push(ModuleExport::Binding {
@@ -577,7 +577,7 @@ fn env_member_name(member: &MemberExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -835,7 +835,7 @@ fn base_literal(expr: &Expr) -> Option<String> {
 /// URL that interpolates something is not a literal statement of a path.
 fn string_literal(expr: &Expr) -> Option<String> {
     match unwrap_transparent(expr) {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -962,7 +962,7 @@ impl Visit for EnvSchemaExtractor {
             };
             let name = match &kv.key {
                 PropName::Ident(ident) => ident.sym.to_string(),
-                PropName::Str(s) => s.value.to_string(),
+                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                 _ => continue,
             };
             if !is_env_var_name(&name) {

@@ -325,7 +325,7 @@ fn sibling_call_name(call: &CallExpr) -> Option<String> {
         Expr::Member(member) if matches!(&*member.obj, Expr::This(_)) => match &member.prop {
             MemberProp::Ident(ident) => Some(ident.sym.to_string()),
             MemberProp::Computed(computed) => match &*computed.expr {
-                Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+                Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
                 _ => None,
             },
             MemberProp::PrivateName(_) => None,
@@ -344,7 +344,7 @@ fn callee_property(call: &CallExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -354,7 +354,7 @@ fn callee_property(call: &CallExpr) -> Option<String> {
 fn prop_name_text(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(literal) => Some(literal.value.to_string()),
+        PropName::Str(literal) => Some(literal.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

@@ -22,7 +22,7 @@ pub trait CoreExtractor {
     fn extract_fields_from_arrow(&self, arrow: &ArrowExpr) -> Json {
         match &*arrow.body {
             // For arrow functions with block bodies: (req, res) => { ... }
-            BlockStmtOrExpr::BlockStmt(block) => {
+            ArrowFunctionBody::FunctionBody(block) => {
                 for stmt in &block.stmts {
                     if let Stmt::Expr(expr_stmt) = stmt
                         && let Some(json) = self.extract_json_fields_from_call(expr_stmt)
@@ -40,7 +40,7 @@ pub trait CoreExtractor {
                 }
             }
             // For arrow functions with expression bodies: (req, res) => res.json(...)
-            BlockStmtOrExpr::Expr(expr) => {
+            ArrowFunctionBody::Expr(expr) => {
                 if let Some(json) = self.extract_json_fields_from_return(expr) {
                     return json;
                 }
@@ -170,7 +170,7 @@ pub trait CoreExtractor {
         match expr {
             // Handle literals
             Expr::Lit(lit) => match lit {
-                Lit::Str(str_lit) => Json::String(str_lit.value.to_string()),
+                Lit::Str(str_lit) => Json::String(str_lit.value.to_string_lossy().into_owned()),
                 Lit::Num(num) => Json::Number(num.value),
                 Lit::Bool(b) => Json::Boolean(b.value),
                 Lit::Null(_) => Json::Null,
@@ -198,7 +198,7 @@ pub trait CoreExtractor {
                         // Extract key
                         let key = match &kv.key {
                             PropName::Ident(ident) => ident.sym.to_string(),
-                            PropName::Str(str) => str.value.to_string(),
+                            PropName::Str(str) => str.value.to_string_lossy().into_owned(),
                             _ => continue, // Skip computed keys
                         };
 
@@ -217,7 +217,7 @@ pub trait CoreExtractor {
         }
     }
 
-    fn extract_req_body_fields(&self, function_body: &BlockStmt) -> Option<Json> {
+    fn extract_req_body_fields(&self, function_body: &FunctionBody) -> Option<Json> {
         // Examine each statement in the function body
         for stmt in &function_body.stmts {
             // Look for variable declarations that extract from req.body

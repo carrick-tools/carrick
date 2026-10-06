@@ -189,7 +189,7 @@ fn named_imports(module: &Module) -> HashMap<String, String> {
                 ImportSpecifier::Named(named) if !named.is_type_only => {
                     let imported = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string_lossy().into_owned(),
                         None => named.local.sym.to_string(),
                     };
                     imports.insert(named.local.sym.to_string(), imported);

@@ -1074,7 +1074,7 @@ impl PubsubTopicWitnessCollector {
 
 impl Visit for PubsubTopicWitnessCollector {
     fn visit_str(&mut self, s: &Str) {
-        self.literals.insert(s.value.to_string());
+        self.literals.insert(s.value.to_string_lossy().into_owned());
     }
 
     fn visit_tpl(&mut self, tpl: &Tpl) {
@@ -1083,7 +1083,7 @@ impl Visit for PubsubTopicWitnessCollector {
         let cooked: Option<Vec<String>> = tpl
             .quasis
             .iter()
-            .map(|q| q.cooked.as_ref().map(|c| c.to_string()))
+            .map(|q| q.cooked.as_ref().map(|c| c.to_string_lossy().into_owned()))
             .collect();
         // A quasi with no cooked value contains an invalid escape; such a
         // template is not a usable witness.
@@ -1139,7 +1139,7 @@ fn flatten_concat_parts(expr: &Expr, parts: &mut Vec<Option<String>>) {
             flatten_concat_parts(&bin.right, parts);
         }
         Expr::Paren(paren) => flatten_concat_parts(&paren.expr, parts),
-        Expr::Lit(Lit::Str(s)) => parts.push(Some(s.value.to_string())),
+        Expr::Lit(Lit::Str(s)) => parts.push(Some(s.value.to_string_lossy().into_owned())),
         _ => parts.push(None),
     }
 }
@@ -5522,7 +5522,7 @@ impl FileOrchestrator {
                     if export.type_only {
                         continue;
                     }
-                    sources.push(export.src.value.to_string());
+                    sources.push(export.src.value.to_string_lossy().into_owned());
                 }
                 ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
                     let Some(src) = &export.src else {
@@ -5539,7 +5539,7 @@ impl FileOrchestrator {
                     if !has_value_specifier {
                         continue;
                     }
-                    sources.push(src.value.to_string());
+                    sources.push(src.value.to_string_lossy().into_owned());
                 }
                 _ => {}
             }

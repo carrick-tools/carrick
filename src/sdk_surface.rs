@@ -118,10 +118,10 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    Accessibility, ArrowExpr, BindingIdent, BlockStmt, BlockStmtOrExpr, CallExpr, Callee, Class,
-    ClassMember, Decl, DefaultDecl, Expr, Function, ImportSpecifier, MethodKind, Module,
-    ModuleDecl, ModuleExportName, ModuleItem, ObjectLit, ParamOrTsParamProp, Pat, Prop, PropName,
-    PropOrSpread, Stmt, TsEntityName, TsParamPropParam, TsType, TsTypeAnn,
+    Accessibility, ArrowExpr, ArrowFunctionBody, BindingIdent, CallExpr, Callee, Class,
+    ClassMember, Decl, DefaultDecl, Expr, Function, FunctionBody, ImportSpecifier, MethodKind,
+    Module, ModuleDecl, ModuleExportName, ModuleItem, ObjectLit, ParamOrTsParamProp, Pat, Prop,
+    PropName, PropOrSpread, Stmt, TsEntityName, TsParamPropParam, TsType, TsTypeAnn,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
@@ -1445,12 +1445,12 @@ fn this_field_name(expr: &Expr) -> Option<String> {
 /// top-level `return` in its block.
 fn arrow_returned_expr(arrow: &ArrowExpr) -> Option<&Expr> {
     match &*arrow.body {
-        BlockStmtOrExpr::Expr(expr) => Some(expr),
-        BlockStmtOrExpr::BlockStmt(block) => block_returned_expr(block),
+        ArrowFunctionBody::Expr(expr) => Some(expr),
+        ArrowFunctionBody::FunctionBody(block) => block_returned_expr(block),
     }
 }
 
-fn block_returned_expr(block: &BlockStmt) -> Option<&Expr> {
+fn block_returned_expr(block: &FunctionBody) -> Option<&Expr> {
     block.stmts.iter().rev().find_map(|stmt| match stmt {
         Stmt::Return(statement) => statement.arg.as_deref(),
         _ => None,
@@ -1460,7 +1460,10 @@ fn block_returned_expr(block: &BlockStmt) -> Option<&Expr> {
 fn member_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(name) if !name.value.contains('.') => Some(name.value.to_string()),
+        PropName::Str(name) => {
+            let name = name.value.to_string_lossy();
+            (!name.contains('.')).then(|| name.into_owned())
+        }
         _ => None,
     }
 }
@@ -1517,7 +1520,7 @@ fn import_source(module: &Module, root: &str, qualifier: Option<&str>) -> Option
         if import.type_only {
             continue;
         }
-        let specifier = import.src.value.to_string();
+        let specifier = import.src.value.to_string_lossy().into_owned();
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             continue;
         }
@@ -1531,7 +1534,9 @@ fn import_source(module: &Module, root: &str, qualifier: Option<&str>) -> Option
                         .as_ref()
                         .map(|name| match name {
                             ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                            ModuleExportName::Str(text) => text.value.to_string(),
+                            ModuleExportName::Str(text) => {
+                                text.value.to_string_lossy().into_owned()
+                            }
                         })
                         .unwrap_or_else(|| named.local.sym.to_string());
                     return Some((specifier, exported));

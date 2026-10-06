@@ -1452,8 +1452,8 @@ impl Builder {
             Expr::Arrow(arrow) => Some(Builder {
                 params: arrow.params.iter().map(pat_key).collect(),
                 returned: Box::new(match &*arrow.body {
-                    BlockStmtOrExpr::Expr(expr) => (**expr).clone(),
-                    BlockStmtOrExpr::BlockStmt(block) => only_return(&block.stmts)?.clone(),
+                    ArrowFunctionBody::Expr(expr) => (**expr).clone(),
+                    ArrowFunctionBody::FunctionBody(block) => only_return(&block.stmts)?.clone(),
                 }),
             }),
             Expr::Fn(function) => Self::of_function(&function.function),
@@ -2151,7 +2151,7 @@ impl Visit for BindingUses {
     /// `() => client`: an arrow whose expression body is a binding returns
     /// it, as `return client` does.
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        let BlockStmtOrExpr::Expr(body) = &*arrow.body else {
+        let ArrowFunctionBody::Expr(body) = &*arrow.body else {
             arrow.visit_children_with(self);
             return;
         };
@@ -2288,7 +2288,7 @@ fn called_member(prop: &MemberProp) -> Option<String> {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(key)) => Some(key.value.to_string()),
+            Expr::Lit(Lit::Str(key)) => Some(key.value.to_string_lossy().into_owned()),
             _ => None,
         },
     }
@@ -2630,7 +2630,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) if !import.type_only => {
-                let specifier = import.src.value.to_string();
+                let specifier = import.src.value.to_string_lossy().into_owned();
                 for import_specifier in &import.specifiers {
                     match import_specifier {
                         ImportSpecifier::Default(default) => {
@@ -2645,7 +2645,9 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                         ImportSpecifier::Named(named) if !named.is_type_only => {
                             let export = match &named.imported {
                                 Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                                Some(ModuleExportName::Str(name)) => name.value.to_string(),
+                                Some(ModuleExportName::Str(name)) => {
+                                    name.value.to_string_lossy().into_owned()
+                                }
                                 None => named.local.sym.to_string(),
                             };
                             add(
@@ -2673,7 +2675,7 @@ fn import_bindings(module: &Module) -> (HashMap<String, ImportBinding>, HashSet<
                 if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref {
                     add(
                         decl.id.sym.to_string(),
-                        external.expr.value.to_string(),
+                        external.expr.value.to_string_lossy().into_owned(),
                         DEFAULT_EXPORT.to_string(),
                         false,
                         false,
@@ -2800,11 +2802,11 @@ pub(crate) fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> 
                         }
                     });
                 if kept {
-                    found.insert(import.src.value.to_string());
+                    found.insert(import.src.value.to_string_lossy().into_owned());
                 }
             }
             ModuleDecl::ExportAll(export) if !export.type_only => {
-                found.insert(export.src.value.to_string());
+                found.insert(export.src.value.to_string_lossy().into_owned());
             }
             ModuleDecl::ExportNamed(export) if !export.type_only => {
                 if let Some(src) = &export.src
@@ -2813,14 +2815,14 @@ pub(crate) fn value_specifiers(module: &Module, used: impl Fn(&str) -> bool) -> 
                             !matches!(specifier, ExportSpecifier::Named(named) if named.is_type_only)
                         }))
                 {
-                    found.insert(src.value.to_string());
+                    found.insert(src.value.to_string_lossy().into_owned());
                 }
             }
             ModuleDecl::TsImportEquals(decl) if !decl.is_type_only => {
                 if let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref
                     && used(decl.id.sym.as_ref())
                 {
-                    found.insert(external.expr.value.to_string());
+                    found.insert(external.expr.value.to_string_lossy().into_owned());
                 }
             }
             _ => {}
@@ -2905,12 +2907,12 @@ fn jsx_names(module: &Module) -> HashSet<String> {
 /// A string literal, or a template with no hole in it.
 fn literal_specifier(expr: &Expr) -> Option<String> {
     match crate::graphql_document_sites::unwrap_expression(expr) {
-        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {
             quasi
                 .cooked
                 .as_ref()
-                .map(|cooked| cooked.to_string())
+                .map(|cooked| cooked.to_string_lossy().into_owned())
                 .unwrap_or_else(|| quasi.raw.to_string())
         }),
         _ => None,
@@ -3539,10 +3541,10 @@ impl Reader<'_> {
             ..FnIr::default()
         };
         match &*arrow.body {
-            BlockStmtOrExpr::BlockStmt(block) => self.body(&block.stmts, &mut scope, &mut ir),
+            ArrowFunctionBody::FunctionBody(block) => self.body(&block.stmts, &mut scope, &mut ir),
             // The expression body is what the arrow returns, where it starts
             // ([`BindingUses::visit_arrow_expr`] keys it the same way).
-            BlockStmtOrExpr::Expr(expr) => {
+            ArrowFunctionBody::Expr(expr) => {
                 let returned = self.returned_instances(expr, &scope);
                 ir.returns.push((expr.span().lo.0, returned));
                 ir.body_returns.push(body_return(expr, &scope.bodies));
@@ -3687,7 +3689,9 @@ impl Reader<'_> {
     /// The value of an expression, as far as the source states it.
     fn eval(&self, expr: &Expr, scope: &Scope<'_>) -> Value {
         match expr {
-            Expr::Lit(Lit::Str(s)) => Value::Str(vec![Piece::Lit(s.value.to_string())]),
+            Expr::Lit(Lit::Str(s)) => {
+                Value::Str(vec![Piece::Lit(s.value.to_string_lossy().into_owned())])
+            }
             Expr::Lit(Lit::Num(n)) => Value::Str(vec![Piece::Lit(n.value.to_string())]),
             Expr::Tpl(tpl) => Value::Str(self.template(tpl, scope)),
             Expr::Bin(bin) if bin.op == BinaryOp::Add => {
@@ -3824,7 +3828,7 @@ impl Reader<'_> {
             let text = quasi
                 .cooked
                 .as_ref()
-                .map(|cooked| cooked.to_string())
+                .map(|cooked| cooked.to_string_lossy().into_owned())
                 .unwrap_or_else(|| quasi.raw.to_string());
             parts.push(vec![Piece::Lit(text)]);
             if let Some(expr) = tpl.exprs.get(index) {
@@ -4627,8 +4631,8 @@ fn arrow_builds_query(arrow: &ArrowExpr) -> bool {
     !arrow.is_async
         && !arrow.is_generator
         && match &*arrow.body {
-            BlockStmtOrExpr::Expr(returned) => is_query_text(returned),
-            BlockStmtOrExpr::BlockStmt(block) => returns_only_queries(&block.stmts),
+            ArrowFunctionBody::Expr(returned) => is_query_text(returned),
+            ArrowFunctionBody::FunctionBody(block) => returns_only_queries(&block.stmts),
         }
 }
 
@@ -4675,7 +4679,7 @@ fn is_query_text(expr: &Expr) -> bool {
 /// string leads nothing, so what follows it would.
 fn starts_with_query(expr: &Expr) -> bool {
     match crate::graphql_document_sites::unwrap_expression(expr) {
-        Expr::Lit(Lit::Str(text)) => text.value.to_string().starts_with('?'),
+        Expr::Lit(Lit::Str(text)) => text.value.to_string_lossy().into_owned().starts_with('?'),
         Expr::Tpl(tpl) => tpl
             .quasis
             .first()
@@ -4881,8 +4885,8 @@ impl Visit for CallWalker<'_, '_, '_> {
                     continue;
                 };
                 let value = match &attr.value {
-                    Some(JSXAttrValue::Lit(Lit::Str(text))) => {
-                        Value::Str(vec![Piece::Lit(text.value.to_string())])
+                    Some(JSXAttrValue::Str(text)) => {
+                        Value::Str(vec![Piece::Lit(text.value.to_string_lossy().into_owned())])
                     }
                     Some(JSXAttrValue::JSXExprContainer(JSXExprContainer {
                         expr: JSXExpr::Expr(expr),
@@ -5173,7 +5177,7 @@ fn this_assignment(stmt: &Stmt) -> Option<(String, &Expr)> {
 fn prop_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(s) => Some(s.value.to_string()),
+        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

@@ -1,7 +1,0 @@
-# RUSTSEC-2026-0009: time 0.3.44 DoS via parsing attacker-controlled
-# date strings. We only use `time` transitively via tracing-appender
-# for internal timestamp formatting, so the vector does not apply.
-# Fix requires time >=0.3.47, which forces serde >=1.0.228 and breaks
-# swc_common 12. Revisit when the swc stack is bumped.
-[advisories]
-ignore = ["RUSTSEC-2026-0009"]

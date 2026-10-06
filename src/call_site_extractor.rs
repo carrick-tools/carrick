@@ -389,7 +389,7 @@ impl CallSiteExtractor {
             Expr::TsAs(ts_as) => self.expr_to_string(&ts_as.expr),
             Expr::TsNonNull(non_null) => self.expr_to_string(&non_null.expr),
             Expr::TsTypeAssertion(type_assertion) => self.expr_to_string(&type_assertion.expr),
-            Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+            Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
             Expr::Lit(Lit::Num(n)) => n.value.to_string(),
             Expr::Lit(Lit::Bool(b)) => b.value.to_string(),
             _ => "...".to_string(),
@@ -522,7 +522,7 @@ impl CallSiteExtractor {
 
     fn extract_string_value(&self, expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
             Expr::Tpl(tpl) => Some(self.extract_template_literal(tpl)),
             Expr::Ident(ident) => {
                 let var_name = ident.sym.to_string();
@@ -543,7 +543,7 @@ impl CallSiteExtractor {
 
             let key_name = match &kv.key {
                 PropName::Ident(ident) => Some(ident.sym.as_ref()),
-                PropName::Str(s) => Some(s.value.as_ref()),
+                PropName::Str(s) => s.value.as_str(),
                 _ => None,
             };
             if key_name != Some("method") {
@@ -551,7 +551,7 @@ impl CallSiteExtractor {
             }
 
             match &*kv.value {
-                Expr::Lit(Lit::Str(s)) => return Some(s.value.to_string().to_uppercase()),
+                Expr::Lit(Lit::Str(s)) => return Some(s.value.to_string_lossy().to_uppercase()),
                 Expr::Ident(ident) => {
                     let var_name = ident.sym.to_string();
                     if let Some(value) = self.argument_values.get(&var_name) {
@@ -584,7 +584,7 @@ impl CallSiteExtractor {
                     MemberProp::Ident(ident) => ident.sym.to_string(),
                     MemberProp::PrivateName(name) => name.name.to_string(),
                     MemberProp::Computed(computed) => match &*computed.expr {
-                        Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+                        Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                         Expr::Ident(ident) => ident.sym.to_string(),
                         _ => self.expr_to_string(&computed.expr),
                     },
@@ -676,7 +676,7 @@ impl CallSiteExtractor {
 
             let key_name = match &kv.key {
                 PropName::Ident(ident) => Some(ident.sym.as_ref()),
-                PropName::Str(s) => Some(s.value.as_ref()),
+                PropName::Str(s) => s.value.as_str(),
                 _ => None,
             };
 
@@ -863,8 +863,8 @@ impl CallSiteExtractor {
         match expr {
             Expr::Lit(Lit::Str(str_lit)) => CallArgument {
                 arg_type: ArgumentType::StringLiteral,
-                value: Some(str_lit.value.to_string()),
-                resolved_value: Some(str_lit.value.to_string()),
+                value: Some(str_lit.value.to_string_lossy().into_owned()),
+                resolved_value: Some(str_lit.value.to_string_lossy().into_owned()),
                 handler_param_types: None,
             },
             Expr::Ident(ident) => {
@@ -945,8 +945,10 @@ impl Visit for CallSiteExtractor {
                 if let Some(init) = &decl.init {
                     match &**init {
                         Expr::Lit(Lit::Str(str_lit)) => {
-                            self.argument_values
-                                .insert(var_name.clone(), str_lit.value.to_string());
+                            self.argument_values.insert(
+                                var_name.clone(),
+                                str_lit.value.to_string_lossy().into_owned(),
+                            );
                         }
                         Expr::Tpl(tpl) => {
                             self.argument_values
@@ -995,7 +997,9 @@ impl Visit for CallSiteExtractor {
                     let definition = match &**init {
                         Expr::Call(_) | Expr::New(_) => self.expr_to_string(init),
                         Expr::Ident(ident) => format!("= {}", ident.sym),
-                        Expr::Lit(Lit::Str(str_lit)) => format!("= \"{}\"", str_lit.value),
+                        Expr::Lit(Lit::Str(str_lit)) => {
+                            format!("= \"{}\"", str_lit.value.to_string_lossy())
+                        }
                         Expr::Tpl(tpl) => format!("= `{}`", self.extract_template_literal(tpl)),
                         _ => "variable_assignment".to_string(),
                     };
@@ -1017,7 +1021,7 @@ impl Visit for CallSiteExtractor {
                         MemberProp::Ident(prop_ident) => prop_ident.sym.to_string(),
                         MemberProp::PrivateName(name) => name.name.to_string(),
                         MemberProp::Computed(computed) => match &*computed.expr {
-                            Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+                            Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                             Expr::Ident(ident) => ident.sym.to_string(),
                             _ => self.expr_to_string(&computed.expr),
                         },

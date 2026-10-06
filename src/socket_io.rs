@@ -793,7 +793,8 @@ struct RootCollector<'a> {
 
 impl Visit for RootCollector<'_> {
     fn visit_import_decl(&mut self, node: &ImportDecl) {
-        let source = node.src.value.as_ref();
+        let specifier_text = node.src.value.to_string_lossy();
+        let source: &str = &specifier_text;
         // Record every named import's local name → module specifier so a
         // socket payload typed as an imported symbol (`import type { Payment }
         // from "./types"`) can be anchored. Default/namespace imports are
@@ -811,7 +812,7 @@ impl Visit for RootCollector<'_> {
                     .as_ref()
                     .map(|name| match name {
                         ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                        ModuleExportName::Str(s) => s.value.to_string(),
+                        ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                     })
                     .unwrap_or_else(|| named.local.sym.to_string());
                 self.roots
@@ -854,7 +855,7 @@ impl Visit for RootCollector<'_> {
                         .as_ref()
                         .map(|name| match name {
                             ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                            ModuleExportName::Str(s) => s.value.to_string(),
+                            ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                         })
                         .unwrap_or_else(|| named.local.sym.to_string());
                     match (source, imported.as_str()) {
@@ -1014,7 +1015,7 @@ impl Visit for RootCollector<'_> {
             && let Some(receiver) = member_root(member)
             && self.roots.server_sockets.contains(&receiver)
             && let Some(first) = node.args.first()
-            && matches!(&*first.expr, Expr::Lit(Lit::Str(event)) if matches!(event.value.as_ref(), "connection" | "connect"))
+            && matches!(&*first.expr, Expr::Lit(Lit::Str(event)) if matches!(event.value.as_str(), Some("connection" | "connect")))
             && let Some(handler) = node.args.get(1)
         {
             let param = match &*handler.expr {
@@ -1177,14 +1178,14 @@ fn envelope_event_name(expr: &Expr) -> Option<String> {
         };
         let key = match &key_value.key {
             PropName::Ident(ident) => ident.sym.to_string(),
-            PropName::Str(name) => name.value.to_string(),
+            PropName::Str(name) => name.value.to_string_lossy().into_owned(),
             _ => return None,
         };
         if !ENVELOPE_EVENT_KEYS.contains(&key.as_str()) {
             return None;
         }
         match &*key_value.value {
-            Expr::Lit(Lit::Str(value)) => Some(value.value.to_string()),
+            Expr::Lit(Lit::Str(value)) => Some(value.value.to_string_lossy().into_owned()),
             _ => None,
         }
     })
@@ -1251,7 +1252,7 @@ fn is_envelope_discriminator(expr: &Expr, bindings: &HashSet<String>) -> bool {
 /// The string a literal expression carries, if it is one.
 fn string_literal(expr: &Expr) -> Option<String> {
     match unwrap_expr(expr) {
-        Expr::Lit(Lit::Str(value)) => Some(value.value.to_string()),
+        Expr::Lit(Lit::Str(value)) => Some(value.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -1261,7 +1262,7 @@ fn string_literal(expr: &Expr) -> Option<String> {
 fn prop_name_literal(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(name) => Some(name.value.to_string()),
+        PropName::Str(name) => Some(name.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -1603,7 +1604,10 @@ impl OpCollector<'_> {
             && UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
             && let Some(first) = args.first()
             && let Expr::Lit(Lit::Str(event)) = &*first.expr
-            && TRANSPORT_RECEIVE_EVENTS.contains(&event.value.as_ref())
+            && event
+                .value
+                .as_str()
+                .is_some_and(|name| TRANSPORT_RECEIVE_EVENTS.contains(&name))
         {
             if let Some(handler) = Self::handler_argument(args)
                 && let Some(direction) = self.roots.direction_for(&root_name, true)
@@ -1624,7 +1628,7 @@ impl OpCollector<'_> {
         if (is_listener || is_emitter)
             && let Some(first) = args.first()
             && let Expr::Lit(Lit::Str(event)) = &*first.expr
-            && !reserved(event.value.as_ref())
+            && !reserved(&event.value.to_string_lossy())
             && let Some(direction) = self.roots.direction_for(&root_name, is_listener)
         {
             let payload_symbol = if is_listener {
@@ -1644,7 +1648,7 @@ impl OpCollector<'_> {
                 None => (None, None),
             };
             let op = SocketOp {
-                key: OperationKey::socket(event.value.to_string(), direction),
+                key: OperationKey::socket(event.value.to_string_lossy().into_owned(), direction),
                 file_path: self.file_path.to_path_buf(),
                 line,
                 payload_type_symbol,

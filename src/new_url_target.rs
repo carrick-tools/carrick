@@ -202,7 +202,7 @@ impl<'a> UrlBindings<'a> {
     /// path parameter.
     fn argument_text(&self, expr: &Expr) -> Option<String> {
         match unwrap_transparent(expr) {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             Expr::Tpl(tpl) => {
                 let snippet = self.source_map.span_to_snippet(tpl.span).ok()?;
                 let trimmed = snippet.trim();

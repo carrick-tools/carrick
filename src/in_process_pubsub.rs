@@ -354,13 +354,14 @@ struct ArgumentText {
 
 impl Visit for ArgumentText {
     fn visit_str(&mut self, value: &Str) {
-        self.literals.insert(value.value.to_string());
+        self.literals
+            .insert(value.value.to_string_lossy().into_owned());
     }
     fn visit_tpl(&mut self, tpl: &Tpl) {
         if tpl.exprs.is_empty()
             && let Some(cooked) = tpl.quasis.first().and_then(|quasi| quasi.cooked.as_ref())
         {
-            self.literals.insert(cooked.to_string());
+            self.literals.insert(cooked.to_string_lossy().into_owned());
         }
         tpl.visit_children_with(self);
     }
@@ -799,7 +800,7 @@ fn import_table(module: &Module) -> HashMap<String, ImportedSymbol> {
 
 /// The function a definition names, found in its module.
 struct Located<'m> {
-    body: FunctionBody<'m>,
+    body: CallableBody<'m>,
     class: Option<&'m Class>,
     class_name: Option<String>,
     params: HashSet<String>,
@@ -807,16 +808,16 @@ struct Located<'m> {
 }
 
 #[derive(Clone, Copy)]
-enum FunctionBody<'m> {
-    Block(&'m BlockStmt),
+enum CallableBody<'m> {
+    Block(&'m FunctionBody),
     Expr(&'m Expr),
 }
 
-impl FunctionBody<'_> {
+impl CallableBody<'_> {
     fn visit(self, visitor: &mut impl Visit) {
         match self {
-            FunctionBody::Block(block) => block.visit_with(visitor),
-            FunctionBody::Expr(expr) => expr.visit_with(visitor),
+            CallableBody::Block(block) => block.visit_with(visitor),
+            CallableBody::Expr(expr) => expr.visit_with(visitor),
         }
     }
 }
@@ -911,15 +912,15 @@ impl<'m> Callable<'m> {
     }
 
     fn located(self) -> Option<Located<'m>> {
-        let (body, params): (FunctionBody<'m>, Vec<&Pat>) = match self {
+        let (body, params): (CallableBody<'m>, Vec<&Pat>) = match self {
             Callable::Function(function) => (
-                FunctionBody::Block(function.body.as_ref()?),
+                CallableBody::Block(function.body.as_ref()?),
                 function.params.iter().map(|p| &p.pat).collect(),
             ),
             Callable::Arrow(arrow) => (
                 match &*arrow.body {
-                    BlockStmtOrExpr::BlockStmt(block) => FunctionBody::Block(block),
-                    BlockStmtOrExpr::Expr(expr) => FunctionBody::Expr(expr),
+                    ArrowFunctionBody::FunctionBody(block) => CallableBody::Block(block),
+                    ArrowFunctionBody::Expr(expr) => CallableBody::Expr(expr),
                 },
                 arrow.params.iter().collect(),
             ),
@@ -975,7 +976,7 @@ fn module_classes(module: &Module) -> Vec<(String, &Class)> {
 fn prop_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(s) => Some(s.value.to_string()),
+        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -1206,7 +1207,7 @@ fn member_prop_name(prop: &MemberProp) -> Option<String> {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::PrivateName(private) => Some(format!("#{}", private.name)),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
             _ => None,
         },
     }

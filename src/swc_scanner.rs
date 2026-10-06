@@ -831,7 +831,7 @@ impl SwcScanner {
                             // Prefer the exported alias if present (`as handler`).
                             let name = match n.exported.as_ref().unwrap_or(&n.orig) {
                                 ModuleExportName::Ident(id) => id.sym.to_string(),
-                                ModuleExportName::Str(s) => s.value.to_string(),
+                                ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                             };
                             // The guard lives on the *local* binding the
                             // specifier renames, not on the exported alias.
@@ -840,7 +840,8 @@ impl SwcScanner {
                                     (guards_of(id.sym.as_ref()), declared_of(id.sym.as_ref()))
                                 }
                                 ModuleExportName::Str(s) => {
-                                    (guards_of(s.value.as_ref()), declared_of(s.value.as_ref()))
+                                    let name = s.value.to_string_lossy();
+                                    (guards_of(&name), declared_of(&name))
                                 }
                             };
                             push(name, n.span(), guards, declared);
@@ -1115,7 +1116,7 @@ fn call_declared_methods(init: &Expr) -> Vec<String> {
             };
             let key = match &kv.key {
                 PropName::Ident(id) => id.sym.to_string(),
-                PropName::Str(s) => s.value.to_string(),
+                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                 _ => continue,
             };
             if key != "method" {
@@ -1143,7 +1144,7 @@ fn method_literals(expr: &Expr) -> Vec<String> {
         let Expr::Lit(Lit::Str(s)) = expr else {
             return None;
         };
-        let value = s.value.to_string();
+        let value = s.value.to_string_lossy().into_owned();
         is_http_method(&value).then(|| value.trim().to_uppercase())
     };
     match expr {
@@ -1276,7 +1277,7 @@ fn method_preserving_call(expr: &Expr) -> Option<&Expr> {
 /// The HTTP-method literal an expression denotes, uppercased.
 fn method_literal(expr: &Expr) -> Option<String> {
     let text = match unwrap_expr(expr) {
-        Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+        Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
         // A no-substitution template literal is the same literal.
         Expr::Tpl(t) if t.exprs.is_empty() && t.quasis.len() == 1 => t.quasis[0].raw.to_string(),
         _ => return None,
@@ -1430,7 +1431,7 @@ fn collect_import_locals(module: &Module) -> HashMap<String, String> {
         if decl.type_only {
             continue;
         }
-        let specifier = decl.src.value.to_string();
+        let specifier = decl.src.value.to_string_lossy().into_owned();
         for spec in &decl.specifiers {
             let local = match spec {
                 ImportSpecifier::Default(s) => s.local.sym.to_string(),
@@ -1618,7 +1619,7 @@ fn controller_method(
     }
     let name = match &method.key {
         PropName::Ident(id) => id.sym.to_string(),
-        PropName::Str(s) => s.value.to_string(),
+        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
         _ => return None,
     };
     let http_method = declared_http_method(&method.function.decorators).or_else(|| {
@@ -1659,7 +1660,7 @@ fn declared_http_method(decorators: &[Decorator]) -> Option<String> {
         let Expr::Lit(Lit::Str(literal)) = &*arg.expr else {
             return None;
         };
-        let value = literal.value.to_string();
+        let value = literal.value.to_string_lossy().into_owned();
         crate::type_manifest::is_http_method(&value).then(|| value.trim().to_uppercase())
     })
 }
@@ -1705,7 +1706,7 @@ fn quasi_text(quasi: &TplElement) -> String {
     quasi
         .cooked
         .as_ref()
-        .map(|cooked| cooked.to_string())
+        .map(|cooked| cooked.to_string_lossy().into_owned())
         .unwrap_or_else(|| quasi.raw.to_string())
 }
 
@@ -1778,7 +1779,7 @@ fn decorator_string_argument(args: &[ExprOrSpread]) -> Option<String> {
     match args {
         [] => Some(String::new()),
         [arg] if arg.spread.is_none() => match &*arg.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             _ => None,
         },
         _ => None,
@@ -1843,7 +1844,7 @@ impl DecoratorRouteVisitor {
             }
             let name = match &method.key {
                 PropName::Ident(id) => id.sym.to_string(),
-                PropName::Str(s) => s.value.to_string(),
+                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                 _ => continue,
             };
             for decorator in &method.function.decorators {
@@ -1950,7 +1951,9 @@ impl DecoratorRouteVisitor {
                     return None;
                 }
                 match &*arg.expr {
-                    Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+                    Expr::Lit(Lit::Str(literal)) => {
+                        Some(literal.value.to_string_lossy().into_owned())
+                    }
                     _ => None,
                 }
             })
@@ -2042,7 +2045,7 @@ impl Visit for ControllerRouteVisitor {
         let Expr::Lit(Lit::Str(path)) = &*first.expr else {
             return;
         };
-        let path = path.value.to_string();
+        let path = path.value.to_string_lossy().into_owned();
         if !is_producer_route_path(&path) {
             return;
         }
@@ -2421,7 +2424,7 @@ impl CandidateVisitor {
                 || s.starts_with("//")
         };
         match &*arg.expr {
-            Expr::Lit(Lit::Str(s)) => starts_with_scheme(s.value.as_ref()),
+            Expr::Lit(Lit::Str(s)) => starts_with_scheme(&s.value.to_string_lossy()),
             Expr::Tpl(tpl) => tpl
                 .quasis
                 .first()
@@ -2462,13 +2465,13 @@ impl CandidateVisitor {
     /// `None` and the site stays on the LLM path.
     fn resolve_topic_string(&self, expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
             Expr::Ident(ident) => self.const_string_values.get(ident.sym.as_ref()).cloned(),
             Expr::Tpl(tpl) => {
                 let mut resolved = String::new();
                 for (i, quasi) in tpl.quasis.iter().enumerate() {
                     match &quasi.cooked {
-                        Some(cooked) => resolved.push_str(cooked),
+                        Some(cooked) => resolved.push_str(&cooked.to_string_lossy()),
                         // A quasi with no cooked value contains an invalid
                         // escape — not a resolvable literal.
                         None => return None,
@@ -2535,7 +2538,7 @@ impl CandidateVisitor {
                 Prop::KeyValue(kv) => {
                     let name = match &kv.key {
                         PropName::Ident(id) => id.sym.to_string(),
-                        PropName::Str(s) => s.value.to_string(),
+                        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                         _ => continue,
                     };
                     match name.as_str() {
@@ -2637,7 +2640,9 @@ impl CandidateVisitor {
                 let mut path = String::new();
                 for part in rest {
                     match unwrap_expr(part) {
-                        Expr::Lit(Lit::Str(literal)) => path.push_str(&literal.value),
+                        Expr::Lit(Lit::Str(literal)) => {
+                            path.push_str(&literal.value.to_string_lossy())
+                        }
                         other => path.push_str(&self.interpolation_text(other)?),
                     }
                 }
@@ -2922,7 +2927,7 @@ impl CandidateVisitor {
             }
             let key = match &kv.key {
                 PropName::Ident(id) => id.sym.to_string(),
-                PropName::Str(s) => s.value.to_string(),
+                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                 _ => continue,
             };
             if key == "handler" {
@@ -2931,7 +2936,7 @@ impl CandidateVisitor {
             if key == "url"
                 && let Expr::Lit(Lit::Str(value)) = &*kv.value
             {
-                url = Some(value.value.to_string());
+                url = Some(value.value.to_string_lossy().into_owned());
             }
         }
 
@@ -2970,17 +2975,17 @@ impl CandidateVisitor {
             };
             let key = match &kv.key {
                 PropName::Ident(id) => id.sym.to_string(),
-                PropName::Str(s) => s.value.to_string(),
+                PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                 _ => continue,
             };
             let Expr::Lit(Lit::Str(value)) = &*kv.value else {
                 continue;
             };
             match key.as_str() {
-                "method" => method = Some(value.value.to_string()),
+                "method" => method = Some(value.value.to_string_lossy().into_owned()),
                 // `url` wins over `path` when a config carries both.
-                "url" => url = Some(value.value.to_string()),
-                "path" if url.is_none() => url = Some(value.value.to_string()),
+                "url" => url = Some(value.value.to_string_lossy().into_owned()),
+                "path" if url.is_none() => url = Some(value.value.to_string_lossy().into_owned()),
                 _ => {}
             }
         }
@@ -3009,7 +3014,7 @@ impl CandidateVisitor {
         let key_name = |key: &PropName| -> Option<String> {
             match key {
                 PropName::Ident(id) => Some(id.sym.to_string()),
-                PropName::Str(s) => Some(s.value.to_string()),
+                PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
                 _ => None,
             }
         };
@@ -3038,13 +3043,13 @@ impl CandidateVisitor {
                     // expr) still satisfies the shape guard but yields no
                     // deterministic emission — only the recall-boost candidate.
                     if let Expr::Lit(Lit::Str(s)) = &*kv.value {
-                        method = Some(s.value.to_string());
+                        method = Some(s.value.to_string_lossy().into_owned());
                     }
                 }
                 "path" => {
                     has_path = true;
                     if let Expr::Lit(Lit::Str(s)) = &*kv.value {
-                        path = Some(s.value.to_string());
+                        path = Some(s.value.to_string_lossy().into_owned());
                     }
                 }
                 "handler" => {
@@ -3079,7 +3084,7 @@ impl CandidateVisitor {
         match &member.prop {
             MemberProp::Ident(id) => Some(id.sym.to_string()),
             MemberProp::Computed(c) => match &*c.expr {
-                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
                 _ => None,
             },
             MemberProp::PrivateName(_) => None,
@@ -3181,7 +3186,7 @@ impl Visit for CandidateVisitor {
     fn visit_class_method(&mut self, node: &ClassMethod) {
         if let Some(name) = match &node.key {
             PropName::Ident(id) => Some(id.sym.to_string()),
-            PropName::Str(s) => Some(s.value.to_string()),
+            PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
             _ => None,
         } {
             self.function_stack.push(name);
@@ -3195,7 +3200,7 @@ impl Visit for CandidateVisitor {
     fn visit_method_prop(&mut self, node: &MethodProp) {
         if let Some(name) = match &node.key {
             PropName::Ident(id) => Some(id.sym.to_string()),
-            PropName::Str(s) => Some(s.value.to_string()),
+            PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
             _ => None,
         } {
             self.function_stack.push(name);
@@ -3466,7 +3471,7 @@ impl Visit for CandidateVisitor {
                 MemberProp::Ident(ident) => Some(ident.sym.to_string()),
                 MemberProp::Computed(computed) => {
                     if let Expr::Lit(Lit::Str(s)) = &*computed.expr {
-                        Some(s.value.to_string())
+                        Some(s.value.to_string_lossy().into_owned())
                     } else {
                         None
                     }
@@ -3525,7 +3530,7 @@ impl Visit for CandidateVisitor {
                     let name = match &member.prop {
                         MemberProp::Ident(id) => Some(id.sym.to_string()),
                         MemberProp::Computed(c) => match &*c.expr {
-                            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
                             _ => None,
                         },
                         MemberProp::PrivateName(_) => None,
@@ -3546,7 +3551,7 @@ impl Visit for CandidateVisitor {
                 let is_message_listener = prop_name == "addEventListener"
                     && matches!(
                         call.args.first().map(|a| &*a.expr),
-                        Some(Expr::Lit(Lit::Str(s))) if s.value.as_ref() == "message"
+                        Some(Expr::Lit(Lit::Str(s))) if s.value == "message"
                     );
                 if is_post_message || is_message_listener {
                     let obj_name = receiver
@@ -3586,7 +3591,7 @@ impl Visit for CandidateVisitor {
             let method = match &member.prop {
                 MemberProp::Ident(id) => Some(id.sym.to_string()),
                 MemberProp::Computed(c) => match &*c.expr {
-                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
                     _ => None,
                 },
                 MemberProp::PrivateName(_) => None,
@@ -3717,7 +3722,7 @@ pub(crate) fn collect_import_sources(module: &Module) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                Some(import.src.value.to_string())
+                Some(import.src.value.to_string_lossy().into_owned())
             }
             _ => None,
         })
@@ -3778,7 +3783,10 @@ pub(crate) fn collect_const_string_values(module: &Module) -> HashMap<String, St
             if let Some(init) = &decl.init
                 && let Expr::Lit(Lit::Str(value)) = &**init
             {
-                bindings.insert(ident.id.sym.to_string(), value.value.to_string());
+                bindings.insert(
+                    ident.id.sym.to_string(),
+                    value.value.to_string_lossy().into_owned(),
+                );
             }
         }
     }
@@ -3809,7 +3817,7 @@ fn package_import_locals(module: &Module, packages: &[String]) -> HashSet<String
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
         };
-        if !is_listed(import.src.value.as_ref()) {
+        if !is_listed(&import.src.value.to_string_lossy()) {
             continue;
         }
         for spec in &import.specifiers {

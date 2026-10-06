@@ -1549,7 +1549,7 @@ impl FactCollector<'_> {
                         continue;
                     }
                     if let Some(Target::Internal(target)) =
-                        self.resolver.resolve(export.src.value.as_ref())
+                        self.resolver.resolve(&export.src.value.to_string_lossy())
                     {
                         self.facts.edges.insert(target);
                         self.facts.star_exports.insert(target);
@@ -1599,7 +1599,7 @@ impl FactCollector<'_> {
     }
 
     fn collect_import(&mut self, import: &ImportDecl) {
-        let Some(target) = self.resolver.resolve(import.src.value.as_ref()) else {
+        let Some(target) = self.resolver.resolve(&import.src.value.to_string_lossy()) else {
             return;
         };
         // `import type { X } from './x'` ships nothing, so it is not a
@@ -1614,7 +1614,9 @@ impl FactCollector<'_> {
                 ImportSpecifier::Named(named) => {
                     let imported = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(name)) => name.value.to_string(),
+                        Some(ModuleExportName::Str(name)) => {
+                            name.value.to_string_lossy().into_owned()
+                        }
                         None => named.local.sym.to_string(),
                     };
                     (&named.local, Some(imported))
@@ -1684,7 +1686,7 @@ impl FactCollector<'_> {
         let target = export
             .src
             .as_ref()
-            .and_then(|src| self.resolver.resolve(src.value.as_ref()));
+            .and_then(|src| self.resolver.resolve(&src.value.to_string_lossy()));
         if let Some(Target::Internal(file)) = &target {
             self.facts.edges.insert(*file);
         }
@@ -1697,7 +1699,9 @@ impl FactCollector<'_> {
                     };
                     let exported = match &named.exported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(name)) => name.value.to_string(),
+                        Some(ModuleExportName::Str(name)) => {
+                            name.value.to_string_lossy().into_owned()
+                        }
                         None => local.sym.to_string(),
                     };
                     match &target {
@@ -1850,7 +1854,7 @@ impl FactCollector<'_> {
             return None;
         }
         let specifier = call.args.first().and_then(|arg| match &*arg.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             _ => None,
         })?;
         let target = self.resolver.resolve(&specifier)?;
@@ -1982,8 +1986,8 @@ impl FactCollector<'_> {
     fn arrow_shape(&mut self, arrow: &ArrowExpr) -> ReturnShape {
         let mut shape = ReturnShape::default();
         match &*arrow.body {
-            BlockStmtOrExpr::BlockStmt(body) => self.collect_returns(Some(body), &mut shape),
-            BlockStmtOrExpr::Expr(expr) => self.collect_return_value(expr, &mut shape),
+            ArrowFunctionBody::FunctionBody(body) => self.collect_returns(Some(body), &mut shape),
+            ArrowFunctionBody::Expr(expr) => self.collect_return_value(expr, &mut shape),
         }
         shape
     }
@@ -1994,7 +1998,7 @@ impl FactCollector<'_> {
         self.push_function(local, shape, annotation);
     }
 
-    fn body_shape(&mut self, body: Option<&BlockStmt>) -> ReturnShape {
+    fn body_shape(&mut self, body: Option<&FunctionBody>) -> ReturnShape {
         let mut shape = ReturnShape::default();
         self.collect_returns(body, &mut shape);
         shape
@@ -2011,7 +2015,7 @@ impl FactCollector<'_> {
         });
     }
 
-    fn collect_returns(&mut self, body: Option<&BlockStmt>, shape: &mut ReturnShape) {
+    fn collect_returns(&mut self, body: Option<&FunctionBody>, shape: &mut ReturnShape) {
         let Some(body) = body else {
             return;
         };
@@ -2423,7 +2427,7 @@ fn leftmost_type_ident(name: &TsEntityName) -> &Ident {
 fn property_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(name) => Some(name.value.to_string()),
+        PropName::Str(name) => Some(name.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

@@ -135,7 +135,7 @@ impl ReceiverOriginCollector {
                 ImportSpecifier::Default(default) => default.local.sym.to_string(),
                 ImportSpecifier::Namespace(ns) => ns.local.sym.to_string(),
             };
-            self.record(local, Some(import.src.value.to_string()));
+            self.record(local, Some(import.src.value.to_string_lossy().into_owned()));
         }
     }
 

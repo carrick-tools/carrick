@@ -100,13 +100,14 @@ impl ModuleReader {
             .iter()
             .filter_map(|item| match item {
                 ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    Some(import.src.value.to_string())
+                    Some(import.src.value.to_string_lossy().into_owned())
                 }
-                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
-                    export.src.as_ref().map(|src| src.value.to_string())
-                }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => export
+                    .src
+                    .as_ref()
+                    .map(|src| src.value.to_string_lossy().into_owned()),
                 ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
-                    Some(export.src.value.to_string())
+                    Some(export.src.value.to_string_lossy().into_owned())
                 }
                 _ => None,
             })

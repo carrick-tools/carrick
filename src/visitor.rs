@@ -397,7 +397,7 @@ impl Visit for LexicalReceivers {
                         declared: false,
                         local_member: None,
                         origin: (!import.type_only && !type_only)
-                            .then(|| import.src.value.to_string()),
+                            .then(|| import.src.value.to_string_lossy().into_owned()),
                     },
                     ..Default::default()
                 },
@@ -418,7 +418,7 @@ impl Visit for LexicalReceivers {
                     imported_name: Some(decl.id.sym.to_string()),
                     declared: false,
                     local_member: None,
-                    origin: Some(external.expr.value.to_string()),
+                    origin: Some(external.expr.value.to_string_lossy().into_owned()),
                 },
                 ..Default::default()
             },
@@ -591,7 +591,7 @@ fn string_literal_token(raw: &str) -> Option<String> {
 /// `1_500` index as written rather than as a reconstruction of their value.
 fn literal_token(lit: &Lit) -> Option<String> {
     match lit {
-        Lit::Str(s) => string_literal_token(&s.value),
+        Lit::Str(s) => string_literal_token(&s.value.to_string_lossy()),
         Lit::Num(n) => Some(match &n.raw {
             Some(raw) => raw.to_string(),
             None if n.value.fract() == 0.0 && n.value.abs() < 1e15 => {
@@ -658,7 +658,9 @@ fn collect_pat_tokens(pat: &Pat, out: &mut Vec<String>) {
                         match &kv.key {
                             PropName::Ident(ident) => out.push(ident.sym.to_string()),
                             PropName::Str(s) => {
-                                if let Some(token) = string_literal_token(&s.value) {
+                                if let Some(token) =
+                                    string_literal_token(&s.value.to_string_lossy())
+                                {
                                     out.push(token);
                                 }
                             }
@@ -925,10 +927,10 @@ impl Visit for CalleeCollector<'_> {
     fn visit_tpl(&mut self, tpl: &Tpl) {
         for quasi in &tpl.quasis {
             let raw = match &quasi.cooked {
-                Some(cooked) => cooked.as_str(),
-                None => quasi.raw.as_str(),
+                Some(cooked) => cooked.to_string_lossy(),
+                None => quasi.raw.as_str().into(),
             };
-            if let Some(token) = string_literal_token(raw) {
+            if let Some(token) = string_literal_token(&raw) {
                 self.literals.push(token);
             }
         }
@@ -995,7 +997,7 @@ impl Default for ImportSymbolExtractor {
 
 impl Visit for ImportSymbolExtractor {
     fn visit_import_decl(&mut self, import: &ImportDecl) {
-        let source = import.src.value.to_string();
+        let source = import.src.value.to_string_lossy().into_owned();
 
         for specifier in &import.specifiers {
             match specifier {
@@ -1003,7 +1005,9 @@ impl Visit for ImportSymbolExtractor {
                     let local_name = named.local.sym.to_string();
                     let imported_name = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(str)) => str.value.to_string(),
+                        Some(ModuleExportName::Str(str)) => {
+                            str.value.to_string_lossy().into_owned()
+                        }
                         None => local_name.clone(),
                     };
                     self.imported_symbols.insert(
@@ -1465,7 +1469,7 @@ impl FunctionDefinitionExtractor {
                 ObjectPatProp::Assign(a) => a.key.sym.to_string(),
                 ObjectPatProp::KeyValue(kv) => match &kv.key {
                     PropName::Ident(i) => i.sym.to_string(),
-                    PropName::Str(s) => s.value.to_string(),
+                    PropName::Str(s) => s.value.to_string_lossy().into_owned(),
                     _ => "_".to_string(),
                 },
                 ObjectPatProp::Rest(rest) => match &*rest.arg {
@@ -1559,7 +1563,10 @@ impl FunctionDefinitionExtractor {
     fn prop_name_to_string(key: &PropName) -> Option<String> {
         match key {
             PropName::Ident(ident) => Some(ident.sym.to_string()),
-            PropName::Str(s) if !s.value.contains('.') => Some(s.value.to_string()),
+            PropName::Str(s) => {
+                let name = s.value.to_string_lossy();
+                (!name.contains('.')).then(|| name.into_owned())
+            }
             _ => None,
         }
     }
@@ -1943,7 +1950,7 @@ impl Visit for FunctionDefinitionExtractor {
                 if let ExportSpecifier::Named(named) = spec {
                     let name = match &named.orig {
                         ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                        ModuleExportName::Str(s) => s.value.to_string(),
+                        ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                     };
                     self.exported_names.insert(name);
                 }
@@ -2326,7 +2333,7 @@ fn extract_call_context(call: &CallExpr) -> Option<(String, Option<String>)> {
 
     // Get the first string argument if present
     let first_str = call.args.first().and_then(|arg| match &*arg.expr {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) => {
             // Template literal — extract the first quasi
             tpl.quasis.first().map(|q| q.raw.to_string())

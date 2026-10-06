@@ -661,13 +661,13 @@ pub(crate) fn import_table(module: &Module) -> HashMap<String, Import> {
         else {
             continue;
         };
-        let specifier = src.value.to_string();
+        let specifier = src.value.to_string_lossy().into_owned();
         for spec in specifiers {
             let (local, imported) = match spec {
                 ImportSpecifier::Named(named) => {
                     let imported = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string_lossy().into_owned(),
                         None => named.local.sym.to_string(),
                     };
                     (named.local.sym.to_string(), imported)
@@ -1055,7 +1055,7 @@ fn property_key(member: &TsTypeElement) -> Option<(String, &TsPropertySignature)
     }
     let key = match &*property.key {
         Expr::Ident(ident) => ident.sym.to_string(),
-        Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+        Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
         _ => return None,
     };
     Some((key, property))
@@ -1070,7 +1070,7 @@ fn expression_operations(expr: &Expr) -> Vec<DocumentOperation> {
         Expr::Call(call) if call.args.len() == 1 && call.args[0].spread.is_none() => {
             match unwrap_expression(&call.args[0].expr) {
                 Expr::Tpl(tpl) => text_operations(&template_text(tpl)),
-                Expr::Lit(Lit::Str(s)) => text_operations(s.value.as_ref()),
+                Expr::Lit(Lit::Str(s)) => text_operations(&s.value.to_string_lossy()),
                 _ => Vec::new(),
             }
         }
@@ -1098,7 +1098,7 @@ fn property<'e>(object: &'e ObjectLit, key: &str) -> Option<&'e Expr> {
 
 fn string_property<'e>(object: &'e ObjectLit, key: &str) -> Option<&'e str> {
     match property(object, key)? {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.as_ref()),
+        Expr::Lit(Lit::Str(s)) => s.value.as_str(),
         _ => None,
     }
 }
@@ -1275,7 +1275,9 @@ pub fn is_document_expression(expr: &Expr) -> bool {
         Expr::Call(call) if call.args.len() == 1 && call.args[0].spread.is_none() => {
             match unwrap_expression(&call.args[0].expr) {
                 Expr::Tpl(tpl) => is_executable_document(&template_text(tpl)),
-                Expr::Lit(swc_ecma_ast::Lit::Str(s)) => is_executable_document(s.value.as_ref()),
+                Expr::Lit(swc_ecma_ast::Lit::Str(s)) => {
+                    is_executable_document(&s.value.to_string_lossy())
+                }
                 _ => false,
             }
         }
@@ -1304,7 +1306,7 @@ fn template_text(tpl: &swc_ecma_ast::Tpl) -> String {
             quasi
                 .cooked
                 .as_ref()
-                .map(|cooked| cooked.to_string())
+                .map(|cooked| cooked.to_string_lossy().into_owned())
                 .unwrap_or_else(|| quasi.raw.to_string())
         })
         .collect::<Vec<_>>()

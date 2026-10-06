@@ -2960,12 +2960,14 @@ pub(super) fn literal_text(expr: &Expr, scope: &Scope<'_>) -> Option<String> {
 /// argument is text, or nothing is read.
 pub(super) fn text_pieces(expr: &Expr, scope: &Scope<'_>) -> Option<Vec<TextPiece>> {
     match unwrap_expression(expr) {
-        Expr::Lit(Lit::Str(text)) => Some(vec![TextPiece::Lit(text.value.to_string())]),
+        Expr::Lit(Lit::Str(text)) => Some(vec![TextPiece::Lit(
+            text.value.to_string_lossy().into_owned(),
+        )]),
         Expr::Tpl(tpl) => {
             let mut out = Vec::new();
             for (index, quasi) in tpl.quasis.iter().enumerate() {
                 let text = match &quasi.cooked {
-                    Some(cooked) => cooked.to_string(),
+                    Some(cooked) => cooked.to_string_lossy().into_owned(),
                     None => quasi.raw.to_string(),
                 };
                 push_pieces(&mut out, vec![TextPiece::Lit(text)]);

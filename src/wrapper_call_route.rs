@@ -532,13 +532,13 @@ impl Literals {
 
 impl Visit for Literals {
     fn visit_str(&mut self, node: &Str) {
-        self.add(&node.value);
+        self.add(&node.value.to_string_lossy());
     }
 
     fn visit_tpl(&mut self, node: &Tpl) {
         for quasi in &node.quasis {
             match &quasi.cooked {
-                Some(cooked) => self.add(cooked),
+                Some(cooked) => self.add(&cooked.to_string_lossy()),
                 None => self.add(&quasi.raw),
             }
         }

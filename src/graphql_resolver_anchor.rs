@@ -340,7 +340,7 @@ pub fn named_resolver(file_path: &Path, content: &str, name: &str) -> Option<Nam
                                     ident.sym.to_string()
                                 }
                                 Some(swc_ecma_ast::ModuleExportName::Str(text)) => {
-                                    text.value.to_string()
+                                    text.value.to_string_lossy().into_owned()
                                 }
                                 None => named.local.sym.to_string(),
                             };
@@ -353,7 +353,10 @@ pub fn named_resolver(file_path: &Path, content: &str, name: &str) -> Option<Nam
                         // type-only name binds no value at all.
                         _ => continue,
                     };
-                    imports.insert(local, (import.src.value.to_string(), imported));
+                    imports.insert(
+                        local,
+                        (import.src.value.to_string_lossy().into_owned(), imported),
+                    );
                 }
                 continue;
             }
@@ -405,7 +408,7 @@ pub fn named_resolver(file_path: &Path, content: &str, name: &str) -> Option<Nam
 fn prop_name(name: &PropName) -> Option<String> {
     match name {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(string) => Some(string.value.to_string()),
+        PropName::Str(string) => Some(string.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

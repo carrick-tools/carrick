@@ -50,12 +50,11 @@ serde = "1.0.219"
 serde_json = { version = "1.0.140", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
-swc_common = { version = "12.0.1", features = ["tty-emitter"] }
-swc_ecma_ast = "12.0.0"
-swc_ecma_codegen = "14.0.0"
-swc_ecma_parser = "15.0.0"
-swc_ecma_transforms_base = "16.0.0"
-swc_ecma_visit = "12.0.0"
+swc_common = { version = "26.0.0", features = ["tty-emitter"] }
+swc_ecma_ast = "29.0.2"
+swc_ecma_parser = "46.0.0"
+swc_ecma_transforms_base = "50.0.0"
+swc_ecma_visit = "29.0.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-appender = "0.2"

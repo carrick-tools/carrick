@@ -112,7 +112,7 @@ pub fn require_bindings(module: &Module) -> RequireBindings {
                     ImportedSymbol {
                         imported_name: local_name.clone(),
                         local_name,
-                        source: external.expr.value.to_string(),
+                        source: external.expr.value.to_string_lossy().into_owned(),
                         kind: SymbolKind::Namespace,
                     },
                 );
@@ -242,7 +242,7 @@ fn is_require_callee(callee: &Callee) -> bool {
 fn pattern_key(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(literal) => Some(literal.value.to_string()),
+        PropName::Str(literal) => Some(literal.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -271,7 +271,7 @@ fn literal_specifier(call: &CallExpr) -> Option<String> {
         return None;
     }
     match argument.expr.as_ref() {
-        Expr::Lit(Lit::Str(specifier)) => Some(specifier.value.to_string()),
+        Expr::Lit(Lit::Str(specifier)) => Some(specifier.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

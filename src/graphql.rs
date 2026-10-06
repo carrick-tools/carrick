@@ -1559,7 +1559,7 @@ fn tagged_tpl_text(node: &TaggedTpl) -> String {
             quasi
                 .cooked
                 .as_ref()
-                .map(|c| c.to_string())
+                .map(|c| c.to_string_lossy().into_owned())
                 .unwrap_or_else(|| quasi.raw.to_string())
         })
         .collect::<Vec<_>>()
@@ -1755,7 +1755,7 @@ impl Visit for TaggedTplVisitor<'_> {
     fn visit_import_decl(&mut self, node: &ImportDecl) {
         // Record every named import's local name → module specifier (copy of the
         // socket pattern) so an imported result type can carry its source.
-        let source = node.src.value.as_ref();
+        let source = node.src.value.to_string_lossy();
         for specifier in &node.specifiers {
             if let ImportSpecifier::Named(named) = specifier {
                 self.type_imports
@@ -1837,7 +1837,7 @@ fn resolve_request_type_arg(type_arg: &TsType, field: &str) -> Option<String> {
             }
             let prop_name = match &*prop.key {
                 Expr::Ident(ident) => ident.sym.to_string(),
-                Expr::Lit(swc_ecma_ast::Lit::Str(s)) => s.value.to_string(),
+                Expr::Lit(swc_ecma_ast::Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
                 _ => return None,
             };
             let inner = prop.type_ann.as_ref()?;

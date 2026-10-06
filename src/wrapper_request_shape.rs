@@ -84,7 +84,7 @@ pub(crate) fn verb_from_callee_property(prop: Option<&str>) -> Option<String> {
 /// literal (an identifier, a member expression, an interpolated template).
 pub(crate) fn literal_string(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
             Some(tpl.quasis[0].raw.to_string())
         }
@@ -110,7 +110,7 @@ fn prop_key_name(prop: &PropOrSpread) -> Option<String> {
     };
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(s) => Some(s.value.to_string()),
+        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }

@@ -890,7 +890,7 @@ fn argument_text(expr: &Expr, source_map: &Lrc<SourceMap>) -> Option<String> {
         Expr::Paren(paren) => argument_text(&paren.expr, source_map),
         Expr::TsAs(as_expr) => argument_text(&as_expr.expr, source_map),
         Expr::TsNonNull(non_null) => argument_text(&non_null.expr, source_map),
-        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
         Expr::Tpl(_) => {
             let snippet = source_map.span_to_snippet(expr.span()).ok()?;
             let trimmed = snippet.trim();
@@ -1017,7 +1017,7 @@ fn callee_property(call: &CallExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(ident) => Some(ident.sym.to_string()),
         MemberProp::Computed(computed) => match &*computed.expr {
-            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -1028,7 +1028,7 @@ fn callee_property(call: &CallExpr) -> Option<String> {
 fn prop_name_text(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
-        PropName::Str(s) => Some(s.value.to_string()),
+        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
 }
