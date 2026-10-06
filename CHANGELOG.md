@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.3.108](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.107...carrick-v0.3.108) (2026-10-06)
+
+
+### Features
+
+* **scanner:** a call to a route of its own service is type-checked against that route ([#1945](https://github.com/carrick-tools/carrick/issues/1945)) ([#1999](https://github.com/carrick-tools/carrick/issues/1999)) ([ffc8c28](https://github.com/carrick-tools/carrick/commit/ffc8c28a0bddc7db1cc4cfe4c78c1850d21f3392))
+* **scanner:** carrick.json takes `exclude`, path patterns a service's scan leaves out ([#1990](https://github.com/carrick-tools/carrick/issues/1990)) ([#2017](https://github.com/carrick-tools/carrick/issues/2017)) ([dbe6b3f](https://github.com/carrick-tools/carrick/commit/dbe6b3f86b689eada568d0dbd629209a4e155e6c))
+* **sidecar:** signature inference logs the slowest slots of each batch ([#1985](https://github.com/carrick-tools/carrick/issues/1985)) ([#1991](https://github.com/carrick-tools/carrick/issues/1991)) ([5aa008d](https://github.com/carrick-tools/carrick/commit/5aa008d6a9df8102d9c63a784d0eaea1953ede2c))
+
+
+### Bug Fixes
+
+* **scanner:** a call to the service's own route is kept as a call row marked own_route, with its edge ([#1944](https://github.com/carrick-tools/carrick/issues/1944)) ([#1984](https://github.com/carrick-tools/carrick/issues/1984)) ([7496780](https://github.com/carrick-tools/carrick/commit/7496780ad5490ac7ec05130d3d0146a22cfe73c0))
+* **scanner:** a dot folder git tracks nothing in is left out of every walk, and the scan names it ([#1607](https://github.com/carrick-tools/carrick/issues/1607)) ([#2016](https://github.com/carrick-tools/carrick/issues/2016)) ([c3937c4](https://github.com/carrick-tools/carrick/commit/c3937c464f34547de80c4d8a6c0f8f95b20f233a))
+* **scanner:** a model symbol is published only at an array depth something witnessed, as the anchor and as the backfill ([#1967](https://github.com/carrick-tools/carrick/issues/1967)) ([#1970](https://github.com/carrick-tools/carrick/issues/1970)) ([08bdff1](https://github.com/carrick-tools/carrick/commit/08bdff1d063f5e2b83390eaf137fd959216b0a68))
+* **scanner:** a route that answers nothing holds a scan for its refusal budget and one probe, whatever the number of files ([#1909](https://github.com/carrick-tools/carrick/issues/1909)) ([#1957](https://github.com/carrick-tools/carrick/issues/1957)) ([49a6a6b](https://github.com/carrick-tools/carrick/commit/49a6a6b597623c2b69c63b1d1430e575e6415ec3))
+* **scanner:** a URL handed in through a hook's options or a component's props is stated where the caller fills it in ([#1949](https://github.com/carrick-tools/carrick/issues/1949)) ([#2001](https://github.com/carrick-tools/carrick/issues/2001)) ([50e4e5b](https://github.com/carrick-tools/carrick/commit/50e4e5bf70b9266891492127eac307f06cc5c968))
+* **scanner:** a wrapper whose URL is a key of an object parameter states its request at its callers, and a built query ends the path ([#1950](https://github.com/carrick-tools/carrick/issues/1950)) ([#1954](https://github.com/carrick-tools/carrick/issues/1954)) ([ba2d954](https://github.com/carrick-tools/carrick/commit/ba2d954dab4aaa1c8b3a445c48f3509147d6c617))
+* **scanner:** a write names no more owed files than the cloud takes, and states the total beside them ([#1955](https://github.com/carrick-tools/carrick/issues/1955)) ([#1959](https://github.com/carrick-tools/carrick/issues/1959)) ([387697d](https://github.com/carrick-tools/carrick/commit/387697de14bc087c92b28e854214e0b41b66babd))
+* **scanner:** an options bag a response's init could equally be states a request only where the source says one is sent ([#1986](https://github.com/carrick-tools/carrick/issues/1986)) ([#1994](https://github.com/carrick-tools/carrick/issues/1994)) ([f4d5190](https://github.com/carrick-tools/carrick/commit/f4d519037985b8bfd5cd8c9b8315251a52b319df))
+* **scanner:** each service's detection and guidance are asked for as the scan starts, not when the scan reaches the service ([#1895](https://github.com/carrick-tools/carrick/issues/1895)) ([#1947](https://github.com/carrick-tools/carrick/issues/1947)) ([724d59f](https://github.com/carrick-tools/carrick/commit/724d59fcb23c019d5faeb7720fe0bb7fea341f4b))
+* **sidecar:** a capture anchor keeps the parameter name its request carries ([#1980](https://github.com/carrick-tools/carrick/issues/1980)) ([#1983](https://github.com/carrick-tools/carrick/issues/1983)) ([39c9e3c](https://github.com/carrick-tools/carrick/commit/39c9e3cb161e4c9a7defdb59eaf09aefcd1da5e1))
+* **sidecar:** a capture reports each stage it reaches, and one that dies twice says at which stage and how ([#1916](https://github.com/carrick-tools/carrick/issues/1916)) ([#1951](https://github.com/carrick-tools/carrick/issues/1951)) ([168384c](https://github.com/carrick-tools/carrick/commit/168384c8234399ea3f1b1e4df87fdadf962c1ddc))
+* **sidecar:** a capture's emit program is released before the self-check loads its own ([#1916](https://github.com/carrick-tools/carrick/issues/1916)) ([#1976](https://github.com/carrick-tools/carrick/issues/1976)) ([da97eed](https://github.com/carrick-tools/carrick/commit/da97eedab96034a918c9639bdf11dc61eb96c6de))
+* **sidecar:** a file route publishes no redirect location or request stream as its contract, and its request is asked at the handler's line ([#807](https://github.com/carrick-tools/carrick/issues/807)) ([#1952](https://github.com/carrick-tools/carrick/issues/1952)) ([efc9487](https://github.com/carrick-tools/carrick/commit/efc9487d9d852a7fe9a4d7a8cee0072d5ee671fa))
+* **sidecar:** a union a weak type takes in part is not compared ([#1995](https://github.com/carrick-tools/carrick/issues/1995)) ([#2000](https://github.com/carrick-tools/carrick/issues/2000)) ([8f8ecdc](https://github.com/carrick-tools/carrick/commit/8f8ecdc10d834d9c6f0424591763d1c19b991ccb))
+* **sidecar:** resolve_definitions reads the capture stub without building the service's project ([#1927](https://github.com/carrick-tools/carrick/issues/1927)) ([#1964](https://github.com/carrick-tools/carrick/issues/1964)) ([8627643](https://github.com/carrick-tools/carrick/commit/862764344e203285b0f84e49333bfe146bcfb553))
+
+
+### Documentation
+
+* **skills:** carrick-reuse reads an audit larger than one pass as windows, not a refusal (cloud[#1770](https://github.com/carrick-tools/carrick/issues/1770)) ([#2002](https://github.com/carrick-tools/carrick/issues/2002)) ([ce5131d](https://github.com/carrick-tools/carrick/commit/ce5131d6f885babc795189487a1f1a1111982f92))
+
 ## [0.3.107](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.106...carrick-v0.3.107) (2026-10-04)
 
 
