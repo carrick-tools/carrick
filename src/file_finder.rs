@@ -1,5 +1,7 @@
 use crate::operation::EndpointProvenance;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use walkdir::WalkDir;
 
 const TEST_DIR_NAMES: &[&str] = &[
@@ -261,6 +263,83 @@ pub fn is_separate_checkout(dir: &Path) -> bool {
         .any(|declared| declared == relative)
 }
 
+/// What a checkout's git tracks, as far as a walk asks it: every tracked path
+/// and every directory that holds one, relative to the checkout's top.
+#[derive(Debug, Default)]
+struct Tracked {
+    /// Tracked paths: files, symlinks and submodules.
+    paths: HashSet<PathBuf>,
+    /// Every directory a tracked path sits in, below the top.
+    dirs: HashSet<PathBuf>,
+}
+
+impl Tracked {
+    fn from_paths(paths: Vec<String>) -> Tracked {
+        let mut tracked = Tracked::default();
+        for path in paths {
+            let path = PathBuf::from(path);
+            for dir in path.ancestors().skip(1) {
+                if dir.as_os_str().is_empty() || !tracked.dirs.insert(dir.to_path_buf()) {
+                    break;
+                }
+            }
+            tracked.paths.insert(path);
+        }
+        tracked
+    }
+
+    /// Whether git tracks anything at `relative`: a file under it, the path
+    /// itself, or a tracked symlink the path is reached through.
+    fn tracks_under(&self, relative: &Path) -> bool {
+        self.dirs.contains(relative)
+            || relative
+                .ancestors()
+                .any(|path| !path.as_os_str().is_empty() && self.paths.contains(path))
+    }
+}
+
+/// What git tracks in the checkout at `top`, asked once per checkout per
+/// process. `None` when git cannot answer (no git, or no repository there).
+fn tracked_in(top: &Path) -> Option<Arc<Tracked>> {
+    static TRACKED: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<Tracked>>>>> = OnceLock::new();
+    let cache = TRACKED.get_or_init(Default::default);
+    if let Some(known) = cache.lock().ok()?.get(top) {
+        return known.clone();
+    }
+    let answer = crate::git_state::tracked_paths(top, &[])
+        .ok()
+        .map(|paths| Arc::new(Tracked::from_paths(paths)));
+    cache.lock().ok()?.insert(top.to_path_buf(), answer.clone());
+    answer
+}
+
+/// Whether `dir` is a dot folder git tracks nothing under (carrick#1607): a
+/// tool's cache, a virtual environment, a build's output, kept beside the
+/// source and never committed.
+///
+/// The name alone decides nothing: a framework can define a dot folder as an
+/// application's own source (a server-only module folder, say). That folder
+/// is committed, so git tracking a file under it is what keeps it read. With
+/// no checkout above `dir`, or a git that cannot answer, nothing says the
+/// folder is not the repository's, and it is read.
+pub fn is_untracked_dot_folder(dir: &Path) -> bool {
+    if !dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+    {
+        return false;
+    }
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(top) = dir.ancestors().skip(1).find(|above| is_git_checkout(above)) else {
+        return false;
+    };
+    let Ok(relative) = dir.strip_prefix(top) else {
+        return false;
+    };
+    tracked_in(top).is_some_and(|tracked| !tracked.tracks_under(relative))
+}
+
 /// Why a walk stops at a directory below its root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitBoundary {
@@ -268,6 +347,8 @@ pub enum GitBoundary {
     Records,
     /// A checkout of its own ([`is_separate_checkout`]).
     SeparateCheckout,
+    /// A dot folder git tracks nothing under ([`is_untracked_dot_folder`]).
+    UntrackedDotFolder,
 }
 
 /// Whether a walk stops at `entry`, and why (carrick#1902).
@@ -281,9 +362,8 @@ pub enum GitBoundary {
 /// an `include` root that names a checkout reads it whole. Naming it is how a
 /// checkout this rule leaves out is brought back.
 ///
-/// Dot folders are not a boundary. A framework can define one as part of an
-/// application's source (a server-only module folder, say), and nothing about
-/// the name tells that from a tool's cache.
+/// A dot folder is a boundary only where git tracks nothing under it
+/// (carrick#1607). A committed one is read as any folder is.
 pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return None;
@@ -291,7 +371,10 @@ pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
     if entry.file_name() == ".git" {
         return Some(GitBoundary::Records);
     }
-    is_separate_checkout(entry.path()).then_some(GitBoundary::SeparateCheckout)
+    if is_separate_checkout(entry.path()) {
+        return Some(GitBoundary::SeparateCheckout);
+    }
+    is_untracked_dot_folder(entry.path()).then_some(GitBoundary::UntrackedDotFolder)
 }
 
 /// The entries of a source walk below `dir`: everything the scan may read,
@@ -318,13 +401,14 @@ pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
 /// never enters: the services nested in the one being walked (carrick#553).
 /// Pruned for the reason above, and so a nested service's tree is read once.
 ///
-/// `checkouts` receives every separate checkout the walk stopped at
-/// ([`git_boundary`]), as walked, so the caller can say what was left out.
+/// `stopped` receives every separate checkout and untracked dot folder the
+/// walk stopped at ([`git_boundary`]), as walked, so the caller can say what
+/// was left out.
 fn source_entries<'a>(
     root: &'a Path,
     ignore_patterns: &'a [&'a str],
     left_out: &'a [PathBuf],
-    checkouts: &'a mut Vec<PathBuf>,
+    stopped: &'a mut Stopped,
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .sort_by_file_name()
@@ -343,7 +427,11 @@ fn source_entries<'a>(
                 None => true,
                 Some(GitBoundary::Records) => false,
                 Some(GitBoundary::SeparateCheckout) => {
-                    checkouts.push(entry.path().to_path_buf());
+                    stopped.checkouts.push(entry.path().to_path_buf());
+                    false
+                }
+                Some(GitBoundary::UntrackedDotFolder) => {
+                    stopped.dot_folders.push(entry.path().to_path_buf());
                     false
                 }
             }
@@ -351,11 +439,21 @@ fn source_entries<'a>(
         .filter_map(|e| e.ok())
 }
 
-/// What one walk read, and the separate checkouts it stopped at.
+/// The directories a walk stopped at that a reader is told about.
+#[derive(Debug, Default)]
+struct Stopped {
+    /// Separate checkouts ([`GitBoundary::SeparateCheckout`]).
+    checkouts: Vec<PathBuf>,
+    /// Dot folders git tracks nothing under
+    /// ([`GitBoundary::UntrackedDotFolder`]).
+    dot_folders: Vec<PathBuf>,
+}
+
+/// What one walk read, and the directories it stopped at.
 struct Walked {
     files: Vec<PathBuf>,
     config_file: Option<PathBuf>,
-    checkouts: Vec<PathBuf>,
+    stopped: Stopped,
 }
 
 /// Find all JavaScript and TypeScript files in a directory
@@ -376,10 +474,10 @@ pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<
 fn find_files_leaving_out(dir: &str, ignore_patterns: &[&str], left_out: &[PathBuf]) -> Walked {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
-    let mut checkouts = Vec::new();
+    let mut stopped = Stopped::default();
     let root_path = Path::new(dir);
 
-    for entry in source_entries(root_path, ignore_patterns, left_out, &mut checkouts) {
+    for entry in source_entries(root_path, ignore_patterns, left_out, &mut stopped) {
         let path = entry.path();
 
         if !path.is_file() {
@@ -399,7 +497,7 @@ fn find_files_leaving_out(dir: &str, ignore_patterns: &[&str], left_out: &[PathB
     Walked {
         files: js_ts_files,
         config_file,
-        checkouts,
+        stopped,
     }
 }
 
@@ -475,9 +573,12 @@ pub struct ServiceWalk {
     /// the config names (an `include` root, a nested service) is not listed:
     /// what was named inside it is read by the walk rooted there.
     pub checkouts_left_out: Vec<PathBuf>,
+    /// The dot folders git tracks nothing under that the walk did not enter
+    /// (carrick#1607), listed as `checkouts_left_out` is.
+    pub dot_folders_left_out: Vec<PathBuf>,
 }
 
-/// [`find_service_files`], with the checkouts the walk stopped at.
+/// [`find_service_files`], with the directories the walk stopped at.
 pub fn walk_service(
     repo_path: &str,
     service: &crate::config::Config,
@@ -502,7 +603,7 @@ pub fn walk_service(
     let Walked {
         mut files,
         config_file: _,
-        mut checkouts,
+        mut stopped,
     } = find_files_leaving_out(&service_root.to_string_lossy(), ignore_patterns, &left_out);
 
     let manifest = find_service_manifest(root, service);
@@ -511,7 +612,8 @@ pub fn walk_service(
         let inc_path = root.join(inc);
         let included = find_files_leaving_out(&inc_path.to_string_lossy(), ignore_patterns, &[]);
         files.extend(included.files);
-        checkouts.extend(included.checkouts);
+        stopped.checkouts.extend(included.stopped.checkouts);
+        stopped.dot_folders.extend(included.stopped.dot_folders);
     }
 
     // An `include` root may overlap the service directory; keep the first
@@ -519,7 +621,7 @@ pub fn walk_service(
     let mut seen = std::collections::HashSet::new();
     files.retain(|p| seen.insert(p.clone()));
 
-    // A checkout that holds a root the config names was stopped at by the
+    // A directory that holds a root the config names was stopped at by the
     // directory walk and is read, as far as it was named, by the walk rooted
     // inside it: this service's `include` root, or the nested service's own.
     let named: Vec<PathBuf> = service
@@ -528,14 +630,18 @@ pub fn walk_service(
         .chain(&service.nested_directories)
         .map(|directory| root.join(directory))
         .collect();
-    checkouts.retain(|checkout| !named.iter().any(|named| named.starts_with(checkout)));
-    checkouts.sort();
-    checkouts.dedup();
+    let left_out_named_nothing = |mut dirs: Vec<PathBuf>| {
+        dirs.retain(|dir| !named.iter().any(|named| named.starts_with(dir)));
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    };
 
     ServiceWalk {
         files,
         manifest,
-        checkouts_left_out: checkouts,
+        checkouts_left_out: left_out_named_nothing(stopped.checkouts),
+        dot_folders_left_out: left_out_named_nothing(stopped.dot_folders),
     }
 }
 
@@ -722,8 +828,8 @@ mod tests {
         let root = tmp.path();
         installed_workspace(root, 12, 2);
 
-        let mut checkouts = Vec::new();
-        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[], &mut checkouts)
+        let mut stopped = Stopped::default();
+        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES, &[], &mut stopped)
             .map(|entry| entry.path().to_path_buf())
             .collect();
 
@@ -1403,9 +1509,10 @@ mod tests {
         assert!(left_out_by(root, &services[0]).is_empty());
     }
 
-    /// A dot folder that is no checkout is read as any folder is. A framework
-    /// can define one as an application's server-only modules, and a blanket
-    /// skip would take the request code out of the index with it.
+    /// Where git cannot say what the repository tracks (here, a `.git` that
+    /// holds no repository), a dot folder is read as any folder is. A
+    /// framework can define one as an application's server-only modules, and
+    /// a skip by name would take the request code out of the index with it.
     #[test]
     fn a_dot_folder_that_is_no_checkout_is_still_read() {
         let tmp = tempdir().expect("temp dir");
@@ -1425,6 +1532,109 @@ mod tests {
             ]
         );
         assert!(left_out_by(root, &services[0]).is_empty());
+    }
+
+    /// Run git in `root` clear of the git environment and configuration the
+    /// test process inherited (a pre-commit hook exports `GIT_DIR`).
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The dot folders a service's walk says it left out, relative to the repo.
+    fn dot_folders_left_out_by(root: &Path, service: &crate::config::Config) -> Vec<String> {
+        walk_service(root.to_str().unwrap(), service, ARTIFACT_IGNORES)
+            .dot_folders_left_out
+            .iter()
+            .map(|dir| {
+                dir.strip_prefix(root)
+                    .expect("a folder left out is under the repo")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// carrick#1607. A dot folder git tracks nothing in is a tool's: a
+    /// virtual environment, a framework's build output. It is left out of the
+    /// walk and named. A dot folder git tracks a file in is the repository's
+    /// own source and is read, whatever its name.
+    #[test]
+    fn a_dot_folder_git_tracks_nothing_in_is_left_out() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "app/routes/orders.tsx");
+        touch(root, "app/.server/session.ts");
+        touch(root, ".venv-docx/lib/site-packages/widget/index.js");
+        touch(root, "app/.react-router/types/+types/orders.ts");
+        touch(root, ".config/eslint.config.ts");
+        touch(root, ".config/generated/schema.ts");
+        git(root, &["init", "-q"]);
+        git(
+            root,
+            &[
+                "add",
+                "app/routes",
+                "app/.server",
+                ".config/eslint.config.ts",
+            ],
+        );
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            [
+                ".config/eslint.config.ts",
+                ".config/generated/schema.ts",
+                "app/.server/session.ts",
+                "app/routes/orders.tsx"
+            ]
+        );
+        assert_eq!(
+            dot_folders_left_out_by(root, &services[0]),
+            [".venv-docx", "app/.react-router"]
+        );
+        assert!(left_out_by(root, &services[0]).is_empty());
+    }
+
+    /// A walk's root is never a boundary: a dot folder named as a service's
+    /// directory, or as an `include` root, is read whole.
+    #[test]
+    fn an_untracked_dot_folder_the_config_names_is_read() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, ".tooling/release.ts");
+        git(root, &["init", "-q"]);
+        git(root, &["add", "src"]);
+
+        let tooling = resolved(&[(".tooling", "")]);
+        assert_eq!(read_by(root, &tooling[0]), [".tooling/release.ts"]);
+
+        let included = crate::config::Config {
+            directory: Some("src".to_string()),
+            include: vec![".tooling".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            read_by(root, &included),
+            [".tooling/release.ts", "src/orders.ts"]
+        );
+        assert!(dot_folders_left_out_by(root, &included).is_empty());
     }
 
     /// Naming a checkout is how it is read: as a service's own `directory`,

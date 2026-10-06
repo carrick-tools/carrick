@@ -273,9 +273,51 @@ fn a_root_service_is_scanned_once_beside_a_worktree_copy_of_itself() {
         "the copy is not among the files the walk found:\n{}",
         scan.output
     );
+    // The worktree sits in a dot folder git tracks nothing in, and the walk
+    // stops there first (carrick#1607).
     assert!(
         scan.output.contains(
-            "Left out 1 folder(s) with their own .git: .agent/worktrees/task. Name one under \
+            "Left out 1 dot folder(s) git tracks nothing in: .agent. Name one under \
+             \"include\" in carrick.json to scan it."
+        ),
+        "the scan says what it left out and how to bring it back:\n{}",
+        scan.output
+    );
+}
+
+/// carrick#1607: a generated client in a dot folder git tracks nothing in,
+/// full of request-shaped text, is never read, so nothing of it reaches the
+/// analyzer or the index. A dot folder the repository commits is read.
+#[test]
+fn a_dot_folder_git_tracks_nothing_in_is_not_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/.server/session.ts",
+        "export function readSession() { return 1; }\n",
+    );
+    committed_repository(root);
+    write(
+        root,
+        ".generated/client/index.ts",
+        "export async function loadOrders() { return fetch(\"/api/orders\"); }\n\
+         export async function saveOrder(body: string) {\n\
+           return fetch(\"/api/orders\", { method: \"POST\", body });\n\
+         }\n",
+    );
+
+    let scan = scan(root);
+
+    assert_eq!(scan.of("storefront"), ["listOrders", "readSession"]);
+    assert!(
+        scan.output.contains("Discovered 2 file(s) under "),
+        "the generated client is not among the files the walk found:\n{}",
+        scan.output
+    );
+    assert!(
+        scan.output.contains(
+            "Left out 1 dot folder(s) git tracks nothing in: .generated. Name one under \
              \"include\" in carrick.json to scan it."
         ),
         "the scan says what it left out and how to bring it back:\n{}",
