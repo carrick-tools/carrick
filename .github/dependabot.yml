@@ -1,0 +1,23 @@
+# Monthly version updates for the SWC crates only, in one grouped PR
+# (carrick#70). SWC ships a breaking major every few weeks and its crates must
+# move together. A bump ships only when the golden replays come out equal or
+# better.
+#
+# `allow` also limits Dependabot's cargo security PRs to these crates. An
+# advisory in any other crate still fails the `cargo audit` job in ci.yml.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    allow:
+      - dependency-name: "swc_*"
+    groups:
+      swc:
+        patterns:
+          - "swc_*"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "area:scanner"
