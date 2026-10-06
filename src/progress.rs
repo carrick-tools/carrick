@@ -172,7 +172,8 @@ pub fn tick(phase: Phase, done: usize, total: usize) {
 const PENDING_MARKER: &str = "@carrick-pending ";
 
 /// State, for the parent, which services this scan left pending and what
-/// re-running does (the engine's summary line, verbatim).
+/// re-running does (the engine's summary line, verbatim), or a time limit
+/// that ran out and what it cost (carrick#2021).
 ///
 /// The indexer swallows a scan's output and shows it only when the scan
 /// fails, and a scan that lands six services and defers a seventh does not
@@ -385,7 +386,8 @@ pub struct Summary {
     pub services: Vec<ServiceSummary>,
     pub elapsed_secs: f64,
     /// The sentences this build owes the reader beyond its counts: where a
-    /// dispatched repo is being analysed, what a pending scan still owes.
+    /// dispatched repo is being analysed, what a pending scan still owes,
+    /// what a time limit that ran out cost.
     /// Empty on the ordinary run, whose next step is the renderer's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<String>,

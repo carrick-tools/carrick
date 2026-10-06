@@ -1468,9 +1468,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // run fails on: the work it cut off says why on each row it left.
     let time_limits =
         crate::time_limits::fold_check_outcomes(&mut boundaries, analyzer.pair_outcomes());
+    // Crossed to the indexer as well, which shows a scan's own output only
+    // when it fails, so a laptop index states the cut-off in its summary.
     for line in time_limits.lines() {
         warn!("{line}");
         logging::annotate(logging::Annotation::Warning, &line);
+        crate::progress::report_pending(&line);
     }
 
     // An SDK-mediated break is a contract risk like any other, so it joins the
