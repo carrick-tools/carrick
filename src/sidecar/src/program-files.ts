@@ -62,8 +62,8 @@ export function addProgramFiles(
     }
   }
   // ts-morph drops its program on each add and builds the next one when it is
-  // read, so reading it once here is the one rebuild the adds cost, paid by
-  // this request rather than by the next one.
+  // read, so reading it once here is the one rebuild the adds need, done in
+  // this request rather than in the next one.
   if (added > 0) project.getProgram().compilerObject;
   return added;
 }
