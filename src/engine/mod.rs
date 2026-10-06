@@ -10431,6 +10431,76 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#2028. The boundary changes the strings that hold a machine path
+    /// and nothing else. Here the one machine path sits in a string no
+    /// function row holds, and every row still goes up as the kind it was
+    /// parsed as: the boundary rebuilds the payload from its own wire format,
+    /// and that rebuild once read every kind back as `Placeholder`.
+    #[tokio::test]
+    async fn the_upload_boundary_changes_only_the_strings_it_scrubs() {
+        let root = "/home/user/work/acme-app";
+        let home = "/home/user";
+        let source = tempfile::tempdir().expect("tempdir");
+        let file = source.path().join("orders.ts");
+        std::fs::write(
+            &file,
+            "export function declared(id: string): string { return id; }\n\
+             export const arrow = (id: string): string => id;\n\
+             export const expressed = function (id: string): string { return id; };\n\
+             const booted = declared(\"boot\");\n",
+        )
+        .expect("write source");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), None);
+        let module = parse_file(&file, &cm, &handler).expect("the source parses");
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("src/orders.ts"), cm);
+        module.visit_with(&mut extractor);
+        extractor.finalize_exports();
+
+        let mut leaking = service_data("acme-app", Some("orders"));
+        leaking.function_definitions = extractor.function_definitions;
+        leaking.package_json = Some(format!(
+            "{{\"name\":\"orders\",\"main\":\"{root}/dist/index.js\"}}"
+        ));
+        let payloads = vec![leaking];
+        let storage = ScriptedStorage::new(vec![Ok(UploadOutcome::default())], vec![]);
+
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &payloads,
+            false,
+            true,
+            &upload_boundary::UploadBoundary::new(root, Some(home)),
+        )
+        .await;
+
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        let bodies = storage.uploaded_bodies();
+        assert_eq!(bodies.len(), 1);
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).expect("body is JSON");
+        let kinds: std::collections::BTreeMap<&str, &str> = sent["function_definitions"]
+            .as_object()
+            .expect("function rows")
+            .iter()
+            .map(|(key, row)| (key.as_str(), row["node_type"].as_str().unwrap_or("<none>")))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::BTreeMap::from([
+                ("<module>", "Placeholder"),
+                ("arrow", "ArrowFunction"),
+                ("declared", "FunctionDeclaration"),
+                ("expressed", "FunctionExpression"),
+            ])
+        );
+        assert!(!bodies[0].contains(root), "{}", bodies[0]);
+        // Everything else is the payload as scanned, field for field.
+        let mut expected = serde_json::to_value(&payloads[0]).expect("payload serializes");
+        expected["package_json"] =
+            serde_json::Value::from("{\"name\":\"orders\",\"main\":\"<checkout>/dist/index.js\"}");
+        assert_eq!(sent, expected);
+    }
+
     fn two_services() -> Vec<CloudRepoData> {
         vec![
             service_data("api-server", Some("orders")),

@@ -82,15 +82,42 @@ pub enum Json {
 /// file it came from.
 pub const MODULE_SCOPE_KEY: &str = "<module>";
 
+/// The kind of function a row describes: the one fact about its AST node that
+/// a payload carries. Written as the variant's name (`node_type` on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FunctionKind {
+    ArrowFunction,
+    FunctionDeclaration,
+    FunctionExpression,
+}
+
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub enum FunctionNodeType {
     ArrowFunction(Box<ArrowExpr>),
     FunctionDeclaration(Box<FnDecl>),
     FunctionExpression(Box<FnExpr>),
-    // Used for deserialization when AST data is not available
+    /// A row read back from a payload, which states the function's kind and
+    /// never its node. It is written back out as the same kind, so a payload
+    /// that passes through its own wire format (the upload boundary's scrub, a
+    /// peer's downloaded blob) says what it said before (carrick#2028).
+    FromPayload(FunctionKind),
+    /// A row with no function node: a file's module scope, or a row built
+    /// without a parse.
     #[default]
     Placeholder,
+}
+
+impl FunctionNodeType {
+    /// The kind this row states; `None` for a row with no function node.
+    pub fn kind(&self) -> Option<FunctionKind> {
+        match self {
+            Self::ArrowFunction(_) => Some(FunctionKind::ArrowFunction),
+            Self::FunctionDeclaration(_) => Some(FunctionKind::FunctionDeclaration),
+            Self::FunctionExpression(_) => Some(FunctionKind::FunctionExpression),
+            Self::FromPayload(kind) => Some(*kind),
+            Self::Placeholder => None,
+        }
+    }
 }
 
 impl Spanned for FunctionNodeType {
@@ -99,42 +126,40 @@ impl Spanned for FunctionNodeType {
             Self::ArrowFunction(arrow) => arrow.span,
             Self::FunctionDeclaration(function) => function.function.span,
             Self::FunctionExpression(function) => function.function.span,
-            Self::Placeholder => swc_common::DUMMY_SP,
+            Self::FromPayload(_) | Self::Placeholder => swc_common::DUMMY_SP,
         }
     }
 }
+
+/// The name a row with no function node is written as.
+const NO_FUNCTION_NODE: &str = "Placeholder";
 
 impl serde::Serialize for FunctionNodeType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        match self {
-            FunctionNodeType::ArrowFunction(_) => serializer.serialize_str("ArrowFunction"),
-            FunctionNodeType::FunctionDeclaration(_) => {
-                serializer.serialize_str("FunctionDeclaration")
-            }
-            FunctionNodeType::FunctionExpression(_) => {
-                serializer.serialize_str("FunctionExpression")
-            }
-            FunctionNodeType::Placeholder => serializer.serialize_str("Placeholder"),
+        match self.kind() {
+            Some(kind) => kind.serialize(serializer),
+            None => serializer.serialize_str(NO_FUNCTION_NODE),
         }
     }
 }
 
 impl<'de> serde::Deserialize<'de> for FunctionNodeType {
+    /// Every name [`Serialize`](serde::Serialize) writes reads back as itself.
+    /// A name this build does not know (a later scanner's peer blob) reads as
+    /// a row with no function node rather than failing the blob it arrives
+    /// in; this build never writes one, so its own payloads round-trip.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "ArrowFunction" => Ok(FunctionNodeType::Placeholder),
-            "FunctionDeclaration" => Ok(FunctionNodeType::Placeholder),
-            "FunctionExpression" => Ok(FunctionNodeType::Placeholder),
-            "Placeholder" => Ok(FunctionNodeType::Placeholder),
-            _ => Ok(FunctionNodeType::Placeholder),
-        }
+        use serde::de::IntoDeserializer;
+        let name = String::deserialize(deserializer)?;
+        let kind: Result<FunctionKind, serde::de::value::Error> =
+            FunctionKind::deserialize(name.as_str().into_deserializer());
+        Ok(kind.map_or(Self::Placeholder, Self::FromPayload))
     }
 }
 

@@ -1083,6 +1083,53 @@ async fn two_scans_of_one_tree_upload_the_same_bytes() {
     }
 }
 
+/// carrick#2028: a blob read back from its own bytes writes the same bytes.
+///
+/// The upload boundary rebuilds a payload from its wire format whenever it
+/// rewrites a machine path, and a peer's blob is read the same way, so every
+/// field the scanner writes has to read back as itself. One that did not
+/// (each function row's kind read back as `Placeholder`) changed what the
+/// index stored for a whole service whenever one unrelated string in it held
+/// a machine path. Run over the same three trees as the test above, so a field
+/// added to any type a scan fills is held to it.
+#[tokio::test]
+#[serial]
+async fn a_blob_read_back_from_its_bytes_writes_the_same_bytes() {
+    for fixture in [
+        "llm-mocked-api",
+        "in-process-publish",
+        "graphql-walked-vendor-schema",
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, cassette) = committed_copy_of(fixture, tmp.path(), &[]);
+        mock_env(&cassette);
+
+        let storage = StubStorage::default();
+        scan(&storage, &repo_path).await;
+        let written = uploaded_text(&storage);
+        assert!(
+            written
+                .values()
+                .any(|text| text.contains("\"node_type\":\"FunctionDeclaration\"")),
+            "{fixture}: the scan must upload a parsed function row"
+        );
+        let read_back: std::collections::BTreeMap<String, String> = written
+            .iter()
+            .map(|(service, text)| {
+                let blob: CloudRepoData = serde_json::from_str(text).expect("the blob reads back");
+                let text = serde_json::to_string(&blob).expect("the blob serializes");
+                (service.clone(), text)
+            })
+            .collect();
+        assert_same_bytes(
+            fixture,
+            "a blob and the blob read back from it",
+            &written,
+            &read_back,
+        );
+    }
+}
+
 /// The real type sidecar, built from `src/sidecar` and initialised on `repo`.
 /// A fresh one for each scan, as every scan starts its own.
 fn real_sidecar(repo: &Path) -> carrick::services::type_sidecar::TypeSidecar {

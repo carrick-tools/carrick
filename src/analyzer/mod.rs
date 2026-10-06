@@ -2285,8 +2285,8 @@ impl Analyzer {
                     FunctionNodeType::FunctionExpression(expr) => {
                         self.extract_fields_from_function_expr(expr)
                     }
-                    FunctionNodeType::Placeholder => {
-                        // In CI mode, AST is not available, skip field extraction
+                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => {
+                        // No AST in hand, so no fields to read off it
                         Json::Null
                     }
                 };
@@ -2314,8 +2314,8 @@ impl Analyzer {
                             None
                         }
                     }
-                    FunctionNodeType::Placeholder => {
-                        // In CI mode, AST is not available, skip request body extraction
+                    FunctionNodeType::FromPayload(_) | FunctionNodeType::Placeholder => {
+                        // No AST in hand, so no request body to read off it
                         None
                     }
                 };
