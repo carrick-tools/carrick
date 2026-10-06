@@ -1212,3 +1212,168 @@ async fn two_scans_of_one_tree_with_types_upload_the_same_bytes() {
         );
     }
 }
+
+/// The types the pool test's tree has its signatures print: a union of two
+/// interfaces, and the keys an object made from a mapped type lists.
+const PET_SHAPES: &str = "export interface Dog {\n  bark(): string;\n}\n\n\
+    export interface Cat {\n  meow(): string;\n}\n";
+
+/// The functions the signature pass asks first, by name (`$` sorts before
+/// every letter): each meets its types in one order.
+const PETS_MET_FIRST: &str = "import type { Cat, Dog } from './shapes.js';\n\n\
+    export function $alphaFirst(o: Record<'alpha' | 'zeta', number>) {\n  return { ...o };\n}\n\n\
+    export function $dogFirst(d: Dog, c: Cat, flip: boolean) {\n  return flip ? d : c;\n}\n";
+
+/// A tree of more than one batch of signature slots: `PETS_MET_FIRST`, then
+/// forty files of sixteen functions that each meet the same types in the
+/// other order. The pass asks its first batch in name order, so every file a
+/// pool is left with starts in the order the first batch did not.
+fn pet_tree() -> Vec<(String, String)> {
+    let mut files = vec![
+        ("src/pets/shapes.ts".to_string(), PET_SHAPES.to_string()),
+        ("src/pets/first.ts".to_string(), PETS_MET_FIRST.to_string()),
+    ];
+    for file in 0..40 {
+        let mut text = String::from("import type { Cat, Dog } from './shapes.js';\n");
+        for function in 0..8 {
+            text.push_str(&format!(
+                "\nexport function zz_{file:02}_{function:02}_keys(o: Record<'zeta' | 'alpha', number>) {{\n  \
+                 return {{ ...o }};\n}}\n\
+                 \nexport function zz_{file:02}_{function:02}_pet(c: Cat, d: Dog, flip: boolean) {{\n  \
+                 return flip ? c : d;\n}}\n"
+            ));
+        }
+        files.push((format!("src/pets/later_{file:02}.ts"), text));
+    }
+    files
+}
+
+/// `CARRICK_SIDECAR_POOL` set for as long as this lives, and unset after,
+/// a failed assertion included.
+struct PoolSize;
+
+impl PoolSize {
+    fn set(processes: &str) -> Self {
+        // SAFETY: every test in this binary is `#[serial]`.
+        unsafe { std::env::set_var(carrick::services::sidecar_pool::POOL_ENV, processes) };
+        PoolSize
+    }
+}
+
+impl Drop for PoolSize {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(carrick::services::sidecar_pool::POOL_ENV) };
+    }
+}
+
+/// A writer the test reads back: what the scan logged.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+    type Writer = Logged;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// carrick#1993: a pool of sidecar processes writes the index one process
+/// writes.
+///
+/// The signature pass asks the slots after its first batch on a pool, a file
+/// at a time. Each process builds its own program and checker, so a type it
+/// prints must not depend on which files that process met first: a union's
+/// members, and the properties of an object made from a mapped type over
+/// literal keys, are printed in an order of their own (carrick#2019). The
+/// tree meets those types in one order in the functions the first batch asks
+/// and in the other in every file after it, so each process the pool adds
+/// starts from the order the scan's own process did not.
+///
+/// One scan forced to one process and one to three: the blobs, the function
+/// index among them, must be the same bytes.
+#[tokio::test]
+#[serial]
+#[ignore = "red until the sidecar prints types in an order of their own (carrick#2019); \
+            `--ignored` shows it fail on TypeScript 5"]
+async fn a_pool_of_sidecar_processes_writes_the_index_one_process_writes() {
+    let tree = pet_tree();
+    let extra: Vec<(&str, &str)> = tree
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_copy_of("llm-mocked-api", tmp.path(), &extra);
+    mock_env(&cassette);
+
+    let one = StubStorage::default();
+    {
+        let _size = PoolSize::set("1");
+        scan_with_types(&one, &repo_path).await;
+    }
+    let pooled = StubStorage::default();
+    let logged = Logged::default();
+    {
+        let _size = PoolSize::set("3");
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        scan_with_types(&pooled, &repo_path).await;
+    }
+
+    let log = String::from_utf8_lossy(&logged.0.lock().unwrap()).into_owned();
+    let pool_lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("Signature inference pool") || line.contains("stays on one"))
+        .collect();
+    assert!(
+        log.contains("Signature inference: 3 processes answer the slots after the first batch"),
+        "the second scan must ask on three processes, or it compares nothing: {pool_lines:?}"
+    );
+
+    let functions = &latest_upload(&one).function_definitions;
+    let printed: Vec<(&str, [&str; 2], String)> = [
+        ("$alphaFirst", ["alpha", "zeta"]),
+        ("$dogFirst", ["Cat", "Dog"]),
+        ("zz_39_07_keys", ["alpha", "zeta"]),
+        ("zz_39_07_pet", ["Cat", "Dog"]),
+    ]
+    .into_iter()
+    .map(|(name, members)| {
+        let signature = functions
+            .get(name)
+            .and_then(|def| def.signature.clone())
+            .unwrap_or_default();
+        (name, members, signature)
+    })
+    .collect();
+    assert!(
+        printed.iter().all(|(_, members, signature)| {
+            let returned = signature.rsplit(" => ").next().unwrap_or_default();
+            members.iter().all(|member| returned.contains(member))
+        }),
+        "each inferred return must name both members, or the test compares nothing: {printed:#?}"
+    );
+
+    assert_same_bytes(
+        "llm-mocked-api with the pet tree",
+        "a scan on three sidecar processes and a scan on one",
+        &uploaded_text(&one),
+        &uploaded_text(&pooled),
+    );
+}

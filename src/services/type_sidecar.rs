@@ -2481,6 +2481,13 @@ impl TypeSidecar {
             })
     }
 
+    /// The root and tsconfig the last `init` scoped the sidecar to, or `None`
+    /// before the first: what a pool copies to start processes that read the
+    /// same project as this one (carrick#1993).
+    pub fn scope(&self) -> Option<(PathBuf, Option<String>)> {
+        self.scope.lock().unwrap().clone()
+    }
+
     /// Retype consumer calls with the producer's response type and report what
     /// the consumer file's own type-check says (carrick#1491). Reads the
     /// init'd project: the caller scopes the sidecar to the consumer service
