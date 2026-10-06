@@ -307,8 +307,11 @@ export class Retyper {
         call.getProject().getTypeChecker().compilerObject,
         call.getType().compilerType,
         call.compilerNode,
-        undefined,
-        call.getProject().getCompilerOptions().noErrorTruncation
+        // ts-morph's own default for Type.getText, which this print used.
+        ts.TypeFormatFlags.UseTypeOfFunction |
+          ts.TypeFormatFlags.NoTruncation |
+          ts.TypeFormatFlags.UseFullyQualifiedType |
+          ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
       )}', so it cannot be retyped`
     );
   }
