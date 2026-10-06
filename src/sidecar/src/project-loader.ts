@@ -10,11 +10,17 @@
  * - Pinned dependency snapshots for deterministic builds
  */
 
-import { Project, type CompilerOptions } from 'ts-morph';
+import { Project, getCompilerOptionsFromTsConfig, type CompilerOptions } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
-import { DenoProject, findDenoConfig, findServiceTsconfig, serviceConfigPath } from './capture/index.js';
+import {
+  DenoProject,
+  findDenoConfig,
+  findServiceTsconfig,
+  serviceConfigPath,
+  sidecarCompilerOptions,
+} from './capture/index.js';
 import { moduleFormatResolutionHost } from './module-format.js';
 import { ExternalImports, registerExternalImports } from './origin.js';
 
@@ -222,7 +228,7 @@ export class ProjectLoader {
         this.log('Project will load with tsconfig snapshot');
         this.buildProject = () => {
           const project = new Project({
-            compilerOptions: this.snapshotToCompilerOptions(snapshot),
+            compilerOptions: sidecarCompilerOptions(this.snapshotToCompilerOptions(snapshot)),
             skipAddingFilesFromTsConfig: true,
           });
           this.addDefaultSourceFiles(project);
@@ -243,7 +249,7 @@ export class ProjectLoader {
             // rebuilds that drop them (carrick#1731).
             const imports = new ExternalImports();
             const project = new Project({
-              compilerOptions: deno.parsed.options as CompilerOptions,
+              compilerOptions: sidecarCompilerOptions(deno.parsed.options as CompilerOptions),
               skipAddingFilesFromTsConfig: true,
               resolutionHost: imports.recording((host, getOptions) => ({
                 resolveModuleNames: (names, from) => names.map(name =>
@@ -266,7 +272,7 @@ export class ProjectLoader {
           this.log('No tsconfig.json found, using default compiler options');
           this.buildProject = () => {
             const project = new Project({
-              compilerOptions: DEFAULT_COMPILER_OPTIONS,
+              compilerOptions: sidecarCompilerOptions(DEFAULT_COMPILER_OPTIONS),
               skipAddingFilesFromTsConfig: true,
             });
             // Add source files from common locations
@@ -369,6 +375,8 @@ export class ProjectLoader {
     const imports = new ExternalImports();
     const project = new Project({
       tsConfigFilePath: configPath,
+      // Over the tsconfig's own options: ts-morph lays these on top.
+      compilerOptions: sidecarCompilerOptions(getCompilerOptionsFromTsConfig(configPath).options),
       skipAddingFilesFromTsConfig: false,
       // Each import resolves in its file's own module format (carrick#1619),
       // and every external-library answer is kept past the program rebuilds

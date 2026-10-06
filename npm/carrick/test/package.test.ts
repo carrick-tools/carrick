@@ -169,11 +169,14 @@ test("the node floor is the sidecar's floor", () => {
 
 test("the sidecar's dependencies are declared here, since nothing installs inside it", () => {
   const sidecar = readJson(path.join(repoRoot, "src", "sidecar", "package.json"));
-  for (const name of Object.keys(sidecar["dependencies"] ?? {})) {
+  for (const [name, version] of Object.entries(sidecar["dependencies"] ?? {})) {
     assert.ok(
       name in (pkg["dependencies"] ?? {}),
       `${name} is a sidecar dependency and is not declared by npm/carrick/package.json`,
     );
+    // The same range: the sidecar pins `typescript` to the version `ts-morph`
+    // bundles, so a looser range here would install a second compiler.
+    assert.equal(pkg["dependencies"][name], version, `${name} is pinned differently from the sidecar's own package.json`);
   }
 });
 

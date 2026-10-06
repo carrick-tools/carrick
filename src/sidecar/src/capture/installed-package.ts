@@ -25,6 +25,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { sidecarCompilerOptions } from './compiler-options.js';
 import { isPublishedSemver } from './lockfile.js';
 
 export interface InstalledPackageSpecifier {
@@ -47,14 +48,14 @@ interface PackageManifest {
 
 const DECLARATION_SUFFIXES = ['', '.d.ts', '.d.mts', '.d.cts', '.ts', '.mts', '.cts', '/index.d.ts'];
 
-const RESOLUTION_OPTIONS: ts.CompilerOptions = {
+const RESOLUTION_OPTIONS: ts.CompilerOptions = sidecarCompilerOptions({
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
   target: ts.ScriptTarget.ESNext,
   noEmit: true,
   skipLibCheck: true,
   types: [],
-};
+});
 
 /** DefinitelyTyped packages are imported by the runtime name (TS6137). */
 function publicNameOf(name: string): string {

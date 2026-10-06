@@ -18,6 +18,14 @@ The TypeSidecar is a warm-standby Node.js process that gives the Carrick analysi
 - **Inference**: resolve the type at a file/line locator, unwrapping framework machinery by the caller's rules (`infer`)
 - **Definition resolution**: the as-written and fully-inlined structural form of a captured alias (`resolve_definitions`)
 
+### The compiler and the options every program carries
+
+The sidecar runs TypeScript 6.0.2: the version `ts-morph` 28 bundles, and the version of its own `typescript` dependency, pinned to match. Every program it builds (ts-morph projects, `ts.createProgram`, and the `tsconfig.json` the check hands to `tsc`) goes through `sidecarCompilerOptions` in `src/capture/compiler-options.ts`, which adds:
+
+- `stableTypeOrdering`: a union's members and the properties of a mapped type print in one order whatever the process checked before, so the same request gives the same text in any process (carrick#2019).
+- TypeScript 5's value for each option whose default TypeScript 6 changed (`strict`, `types`, `target`, `module`, `moduleResolution`, the interop options, `resolveJsonModule`, `noUncheckedSideEffectImports`, `libReplacement`), where the project's options leave it unset. A value the project sets is kept.
+- `ignoreDeprecations: "6.0"`, so an option TypeScript 6 deprecates (`baseUrl`, `moduleResolution: "node"`, `target: "es5"`) still loads without an error.
+
 ## Building
 
 ```bash
@@ -899,6 +907,7 @@ Response, written before the process exits:
 | `src/types.ts` | Request/response interfaces |
 | `src/validators.ts` | Zod schemas; the authority on request shape |
 | `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |
+| `src/capture/compiler-options.ts` | The options every program the sidecar builds carries; the rest of the sidecar reaches it through `capture/index.js` |
 | `src/bundler.ts` | Legacy symbol bundling |
 | `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
 | `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |

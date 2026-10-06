@@ -91,11 +91,13 @@ describe('capture bundle seam (pinned decision 11a)', () => {
       const base = path.basename(file);
       for (const spec of importsOf(file)) {
         if (!spec.includes('capture/')) continue;
-        if (base === 'index.ts' || base === 'project-loader.ts') {
+        if (base === 'index.ts' || base === 'project-loader.ts' || base === 'definition-resolver.ts') {
+          // Shared Deno resolution, and the options every program carries
+          // (`sidecarCompilerOptions`, carrick#2019).
           assert.strictEqual(
             spec,
             './capture/index.js',
-            `${base} must use only the capture entry point (shared Deno resolution), saw '${spec}'`
+            `${base} must use only the capture entry point, saw '${spec}'`
           );
         } else if (base === 'types.ts') {
           assert.strictEqual(

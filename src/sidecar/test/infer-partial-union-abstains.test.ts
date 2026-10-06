@@ -246,7 +246,9 @@ describe('carrick#166 part B: a partial union never answers with its survivors',
   it('still prints every branch of a union that dropped none', async () => {
     const inferred = await inferReturn('Endpoint_Full_Response', FULL_LINE);
     assert.ok(inferred);
-    assert.strictEqual(collapse(inferred.type_string), 'OkBody | ErrBody');
+    // Named members print by name under stableTypeOrdering (carrick#2019),
+    // not in the order the checker met them.
+    assert.strictEqual(collapse(inferred.type_string), 'ErrBody | OkBody');
     assert.strictEqual(inferred.any_provenance, undefined);
   });
 

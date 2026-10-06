@@ -33,6 +33,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { sidecarCompilerOptions } from './compiler-options.js';
 import type { CaptureAliasRecord, CaptureAnchorRequest, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
 import {
@@ -132,7 +133,7 @@ function runSelfCheck(
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const options: ts.CompilerOptions = {
+  const options: ts.CompilerOptions = sidecarCompilerOptions({
     noEmit: true,
     strict: true,
     // MUST be false: the whole stub tree is .d.ts (see module header).
@@ -140,7 +141,7 @@ function runSelfCheck(
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     types: [],
-  };
+  });
   const program = ts.createProgram(treeFiles, options, args.compilerHost?.(options));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);

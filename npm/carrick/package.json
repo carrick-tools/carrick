@@ -53,8 +53,8 @@
     "@clack/prompts": "1.8.1",
     "picocolors": "1.1.1",
     "pnpm": "10.34.5",
-    "ts-morph": "^25.0.1",
-    "typescript": "^5.8.0",
+    "ts-morph": "28.0.0",
+    "typescript": "6.0.2",
     "zod": "^3.23.0"
   },
   "optionalDependencies": {
@@ -65,8 +65,7 @@
     "@carrick-tools/cli-win32-x64": "0.3.108"
   },
   "devDependencies": {
-    "@types/node": "^24.13.3",
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3"
   },
   "publishConfig": {
     "access": "public",

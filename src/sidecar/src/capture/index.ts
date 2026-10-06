@@ -53,9 +53,11 @@ import { emitsAlike, ProjectGraph, type ServiceProject } from './project-referen
 import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
+import { sidecarCompilerOptions } from './compiler-options.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
+export { sidecarCompilerOptions } from './compiler-options.js';
 export { serviceConfigPath } from './project-references.js';
 export { findServiceTsconfig } from './service-config.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
@@ -310,7 +312,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   try {
     progress('emit', 'emitting declarations');
     guard.writeFile(entryPath, entryLines.join('\n') + '\n');
-    const emitOptions: ts.CompilerOptions = {
+    const emitOptions: ts.CompilerOptions = sidecarCompilerOptions({
       ...parsed.options,
       // The load-bearing trio: emit declarations without checking, so
       // type-error-laden and bare (no node_modules) checkouts still emit.
@@ -323,7 +325,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       incremental: false,
       outDir: staging,
       rootDir: entryDir,
-    };
+    });
     written = emitDeclarations({
       rootNames: [entryPath, ...augmentationSources],
       options: emitOptions,
@@ -606,7 +608,7 @@ function emitDeclarations(args: {
   const emitted = new Map<string, string>();
   const declarationSources = new Map<string, string>();
   const sourceByEmitted = new Map<string, string>();
-  const program = ts.createProgram(args.rootNames, args.options, args.host);
+  const program = ts.createProgram(args.rootNames, sidecarCompilerOptions(args.options), args.host);
   const emitResult = program.emit(
     undefined,
     (fileName, text, _bom, _error, sources) => {
@@ -824,10 +826,10 @@ function resolveAnchors(
           .flatMap((a) => (a.source_file ? [path.join(ctx.repoRoot, a.source_file)] : []))
       ),
     ].filter((f) => fs.existsSync(f));
-    const options = {
+    const options = sidecarCompilerOptions({
       ...parsed.options,
       noEmit: true,
-    };
+    });
     const program = ts.createProgram([ctx.entryPath, ...anchorSources, ...(deno?.globals ?? [])], options, deno?.host(options));
     // The checker binds every file of the program when it is first asked for,
     // which the first anchor would otherwise do: asked for here, so that the

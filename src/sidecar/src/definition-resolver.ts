@@ -36,6 +36,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Project, Node, type SourceFile, type Type } from 'ts-morph';
+import { sidecarCompilerOptions } from './capture/index.js';
 import {
   expandTypeStructural,
   type ExpandOrigin,
@@ -71,13 +72,13 @@ export class DefinitionResolver {
 
     try {
       const stubProject = new Project({
-        compilerOptions: {
+        compilerOptions: sidecarCompilerOptions({
           target: 99, // ESNext
           module: 99, // ESNext
           moduleResolution: 100, // Bundler
           strict: true,
           skipLibCheck: true,
-        },
+        }),
         skipAddingFilesFromTsConfig: true,
       });
       for (const filePath of walkDtsFiles(typesDir)) {

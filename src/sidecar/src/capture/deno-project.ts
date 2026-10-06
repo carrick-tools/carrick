@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { sidecarCompilerOptions } from './compiler-options.js';
 import { rewriteSpecifiers } from './specifiers.js';
 import { WriteGuard } from './guarded-fs.js';
 
@@ -460,11 +461,11 @@ export class DenoProject {
 /** Runtime declarations belong to their producer, not the checker's globals. */
 function isolateRuntime(guard: WriteGuard, typesDir: string, files: string[], runtimeRel: string): void {
   const runtimePath = path.join(typesDir, runtimeRel);
-  const program = ts.createProgram(files.map(file => path.join(typesDir, file)), {
+  const program = ts.createProgram(files.map(file => path.join(typesDir, file)), sidecarCompilerOptions({
     strict: true, skipLibCheck: true, target: ts.ScriptTarget.ESNext,
     module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
     types: [],
-  });
+  }));
   const checker = program.getTypeChecker();
   const runtime = program.getSourceFile(runtimePath)!;
   const retained = new Set<ts.Statement>();

@@ -266,8 +266,11 @@ const NPMRC = [
 // TS2717 collisions so the poison rule can convert them to honest
 // unverifiables). noUnusedLocals/Parameters:false keep TS6133/6196 off the
 // gate/assignment lines. moduleResolution bundler accepts both node16
-// `.js`-suffixed and extensionless specifiers in one program.
-const CHECKER_TSCONFIG =
+// `.js`-suffixed and extensionless specifiers in one program. The rest is
+// what `sidecarCompilerOptions` sets on every other program (carrick#2019):
+// `tsc` reads this file itself, so each value is written out, and a test
+// holds the file to what that function would make of it.
+export const CHECKER_TSCONFIG =
   JSON.stringify(
     {
       compilerOptions: {
@@ -283,6 +286,14 @@ const CHECKER_TSCONFIG =
         types: [],
         noEmit: true,
         forceConsistentCasingInFileNames: true,
+        esModuleInterop: false,
+        allowSyntheticDefaultImports: true,
+        resolveJsonModule: true,
+        alwaysStrict: true,
+        noUncheckedSideEffectImports: false,
+        libReplacement: true,
+        stableTypeOrdering: true,
+        ignoreDeprecations: '6.0',
       },
       include: ['probes/**/*.ts'],
     },

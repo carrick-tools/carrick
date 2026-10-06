@@ -19,6 +19,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { sidecarCompilerOptions } from './compiler-options.js';
 import type { TypeProvenance } from './api.js';
 import { findDisqualifyingTopTypes, provenanceOf } from './deep-walk.js';
 import type { ProbePlan } from './check-probe.js';
@@ -55,7 +56,7 @@ export function openProbeProgram(
       .map((plan) => path.join(probesDir, 'probes', plan.fileName))
       .filter((f) => fs.existsSync(f));
     if (fileNames.length === 0) return undefined;
-    const program = ts.createProgram(fileNames, { ...parsed.options, noEmit: true });
+    const program = ts.createProgram(fileNames, sidecarCompilerOptions({ ...parsed.options, noEmit: true }));
     return { program, checker: program.getTypeChecker(), probesDir };
   } catch {
     return undefined;

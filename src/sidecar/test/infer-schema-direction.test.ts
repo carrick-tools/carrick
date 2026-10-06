@@ -207,9 +207,11 @@ describe('schema direction: requests read the input, responses the output', () =
       `nested object must mix output and input members in: ${type}`
     );
     assert.match(type, /ids\s*:\s*number\[\]/, `coerced array element must read as the output in: ${type}`);
+    // A mapped type's properties print in its keys' content order under
+    // stableTypeOrdering (carrick#2019), not the order the schema wrote them.
     assert.match(
       type,
-      /lines\s*:\s*\{\s*qty\s*:\s*number\s*;\s*note\s*\?\s*:\s*string\s*;\s*\}\[\]/,
+      /lines\s*:\s*\{\s*note\s*\?\s*:\s*string\s*;\s*qty\s*:\s*number\s*;\s*\}\[\]/,
       `array of objects must mix output and input members in: ${type}`
     );
     assert.match(type, /label\s*\?\s*:\s*string\s*;/, `defaulted top-level key must stay optional in: ${type}`);
