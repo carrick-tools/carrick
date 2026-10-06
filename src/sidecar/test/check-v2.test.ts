@@ -145,10 +145,10 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Bytes_Producer = Uint8Array;',
         'export type Stream_Expected = ReadableStream<Uint8Array> | null;',
-        'export type Branch_Producer = { chatId: string; accessToken: string; } | { token: string; } | { ok: true; };',
+        'export type Branch_Producer = { first: string; second: string; } | { third: string; } | { ok: true; };',
         'export type Weak_Rename_Producer = { id: string; };',
-        'export type Branch_None_Producer = { token: string; } | { ok: true; };',
-        'export type Branch_Missing_Producer = { chatId: string; } | { chatId: number; token: string; };',
+        'export type Branch_None_Producer = { third: string; } | { ok: true; };',
+        'export type Branch_Missing_Producer = { first: string; } | { first: number; third: string; };',
         'export type Branch_Request_Expected = { name?: string; title?: string; };',
       ].join('\n') + '\n'
     );
@@ -180,8 +180,8 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type String_Consumer = string;',
         'export type Upload_Sent = File;',
         'export type Stream_Sent = ReadableStream<Uint8Array>;',
-        'export type Branch_Consumer = { chatId?: string; accessToken?: string; error?: string; };',
-        'export type Branch_Required_Consumer = { chatId: string; accessToken?: string; };',
+        'export type Branch_Consumer = { first?: string; second?: string; error?: string; };',
+        'export type Branch_Required_Consumer = { first: string; second?: string; };',
         'export type Branch_Request_Sent = { name: string; } | { archived: boolean; };',
       ].join('\n') + '\n'
     );
