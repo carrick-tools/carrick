@@ -7,8 +7,14 @@
 //! `unverifiable`, a library check that ran out drops a claim. Until this
 //! module nothing added those reasons up, so a cut-off was invisible unless
 //! somebody read the log. Each limit is counted by kind, in the unit of what
-//! it cost, stated in the scan summary and in each service's boundary, and
-//! written to the index with the boundary.
+//! it cost, and written to the index with the boundary and to the run log.
+//! The retype and library-check counts are also stated in the scan summary
+//! and in each service's boundary.
+//!
+//! The sidecar deadline is counted and never stated (the 2026-10-07 ruling): a
+//! reader can do nothing about a type checker that stopped answering, and the
+//! line reads as Carrick being flaky. Its count goes to the index field and
+//! the run log only, for the health record.
 //!
 //! Each count reads the reason the limit already leaves on what it cut off:
 //!
@@ -61,7 +67,8 @@ pub struct TimeLimitsRunOut {
     /// Items carried by sidecar requests that went the whole operation
     /// deadline without an answer or a sign of life: type readings, captured
     /// types, response checks, library checks. A timed-out request is not
-    /// asked again, so none of them was answered.
+    /// asked again, so none of them was answered. On the index and in the run
+    /// log only: [`TimeLimitsRunOut::lines`] states no line for it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub sidecar_deadline: usize,
 }
@@ -92,32 +99,48 @@ impl TimeLimitsRunOut {
         *self == Self::default()
     }
 
-    /// One line per limit that ran out, naming what it skipped and why, and
-    /// nothing for a limit that did not. The scan summary prints the run's
-    /// total; each service's boundary prints its own.
+    /// One line per stated limit that ran out, naming what it skipped and
+    /// why, and nothing for a limit that did not. The scan summary prints the
+    /// run's total; each service's boundary prints its own. The sidecar
+    /// deadline has no line (see the module header).
     pub fn lines(&self) -> Vec<String> {
-        let deadline_minutes = crate::services::type_sidecar::OPERATION_TIMEOUT.as_secs() / 60;
         [
             (
                 self.retype,
                 "response check",
-                "not reached: retype time limit".to_string(),
+                "not reached: retype time limit",
             ),
             (
                 self.library_checks,
                 "library check",
-                "not reached: library check time limit".to_string(),
-            ),
-            (
-                self.sidecar_deadline,
-                "type lookup",
-                format!("not answered: the type checker was silent for {deadline_minutes} minutes"),
+                "not reached: library check time limit",
             ),
         ]
         .into_iter()
         .filter(|(count, _, _)| *count > 0)
         .map(|(count, noun, why)| format!("{} {why}", crate::scan_timing::plural(count, noun)))
         .collect()
+    }
+}
+
+/// Record the run's total: every kind on the run log, in the index's
+/// spelling, and the stated ones as warnings, CI annotations and the
+/// indexer's pending line. Nothing when no limit ran out.
+pub fn report(total: &TimeLimitsRunOut) {
+    if total.is_empty() {
+        return;
+    }
+    // Debug, so the run log keeps it and the terminal does not show it.
+    tracing::debug!(
+        "time limits run out: {}",
+        serde_json::to_string(total).unwrap_or_default()
+    );
+    // Crossed to the indexer as well, which shows a scan's own output only
+    // when it fails, so a laptop index states the cut-off in its summary.
+    for line in total.lines() {
+        tracing::warn!("{line}");
+        crate::logging::annotate(crate::logging::Annotation::Warning, &line);
+        crate::progress::report_pending(&line);
     }
 }
 
@@ -284,11 +307,16 @@ mod tests {
         );
     }
 
-    /// One line per limit that ran out, in the scan summary and in the
-    /// boundary alike, and nothing when none did.
+    /// One line per stated limit that ran out, in the scan summary and in
+    /// the boundary alike, and nothing when none did. The sidecar deadline is
+    /// never a line, alone or beside the others.
     #[test]
-    fn each_limit_that_ran_out_is_one_line_naming_what_it_skipped() {
+    fn each_stated_limit_that_ran_out_is_one_line_naming_what_it_skipped() {
         assert!(TimeLimitsRunOut::default().lines().is_empty());
+
+        let mut deadline_only = TimeLimitsRunOut::default();
+        deadline_only.add(TimeLimit::SidecarDeadline, 50);
+        assert_eq!(deadline_only.lines(), Vec::<String>::new());
 
         let mut cost = TimeLimitsRunOut::default();
         cost.add(TimeLimit::Retype, 312);
@@ -299,7 +327,6 @@ mod tests {
             vec![
                 "312 response checks not reached: retype time limit",
                 "1 library check not reached: library check time limit",
-                "50 type lookups not answered: the type checker was silent for 15 minutes",
             ]
         );
     }

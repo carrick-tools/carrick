@@ -249,7 +249,11 @@
               "properties": {
                 "retype": { "type": "integer", "minimum": 0 },
                 "library_checks": { "type": "integer", "minimum": 0 },
-                "sidecar_deadline": { "type": "integer", "minimum": 0 }
+                "sidecar_deadline": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Type lookups the type checker never answered. Counted here and in the run log; no line in boundary_lines states it."
+                }
               },
               "additionalProperties": true
             }

@@ -1464,17 +1464,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
 
     // Every time limit that ran out, in the scan's analysis and in the check
-    // above, stated by kind with what it cost (carrick#2021). Not a loss the
+    // above, counted by kind with what it cost (carrick#2021). Not a loss the
     // run fails on: the work it cut off says why on each row it left.
     let time_limits =
         crate::time_limits::fold_check_outcomes(&mut boundaries, analyzer.pair_outcomes());
-    // Crossed to the indexer as well, which shows a scan's own output only
-    // when it fails, so a laptop index states the cut-off in its summary.
-    for line in time_limits.lines() {
-        warn!("{line}");
-        logging::annotate(logging::Annotation::Warning, &line);
-        crate::progress::report_pending(&line);
-    }
+    crate::time_limits::report(&time_limits);
 
     // An SDK-mediated break is a contract risk like any other, so it joins the
     // findings rather than living only in its own section (#525). The PR result
@@ -19461,6 +19455,103 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 library_checks: asked,
                 ..Default::default()
             })
+        );
+    }
+
+    /// carrick#2021, ruled 2026-10-07: a scan in which the sidecar goes
+    /// silent for its whole operation deadline writes what it lost to the
+    /// index and to the run log, and states it on no surface a reader sees:
+    /// not the summary's warnings, annotations or pending line, not the
+    /// boundary the scan prints, not the one `status` and `check` print.
+    ///
+    /// The stand-in answers `init` and nothing else, under a short deadline.
+    /// The count is a range: another test's sidecar timing out while this
+    /// scope is open is counted against it too.
+    #[test]
+    #[serial_test::serial(current_service)]
+    fn a_sidecar_deadline_is_written_to_the_index_and_run_log_and_stated_nowhere() {
+        use crate::services::type_sidecar::{InferKind, InferRequestItem, SidecarError};
+        const SERVICE: &str = "silent-2021";
+        const ITEMS: usize = 40;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("silent-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') fs.writeSync(1, JSON.stringify({ request_id: request.request_id, status: 'ready' }) + '\n');
+});
+"#,
+        )
+        .expect("write stand-in");
+        let sidecar = TypeSidecar::spawn(&script)
+            .expect("spawn stand-in")
+            .with_operation_timeout(Duration::from_millis(300));
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let items: Vec<InferRequestItem> = (1..=ITEMS as u32)
+            .map(|line| InferRequestItem {
+                file_path: "src/a.ts".to_string(),
+                line_number: line,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::Expression,
+                alias: Some(format!("A{line}")),
+                param_name: None,
+            })
+            .collect();
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        {
+            let _scope = crate::current_service::enter(Some(SERVICE));
+            assert!(matches!(
+                sidecar.infer_types(&items, None),
+                Err(SidecarError::Timeout)
+            ));
+        }
+
+        let mut data = service_data("monorepo", Some(SERVICE));
+        data.boundary = Some(crate::boundary::ServiceBoundary::default());
+        let mut boundaries = local_boundaries(&[data]);
+        crate::scan_health::forget_service_losses(Some(SERVICE));
+        let total = crate::time_limits::fold_check_outcomes(&mut boundaries, &[]);
+        let boundary = &boundaries[0].1;
+
+        // The index.
+        let written =
+            serde_json::to_value(boundary).unwrap()["time_limits_run_out"]["sidecar_deadline"]
+                .as_u64()
+                .unwrap_or(0) as usize;
+        assert!(
+            (ITEMS..ITEMS + 10).contains(&written),
+            "the index carries the lost request's {ITEMS} items: {written}"
+        );
+
+        // The boundary the scan, `status` and `check` print: the same lines as
+        // a boundary on which no limit ran out.
+        let mut nothing_ran_out = boundary.clone();
+        nothing_ran_out.time_limits_run_out = Some(Default::default());
+        assert_eq!(boundary.lines(SERVICE), nothing_ran_out.lines(SERVICE));
+        assert_eq!(
+            crate::local_mode::query::boundary_lines(SERVICE, "note", Some(boundary)),
+            crate::local_mode::query::boundary_lines(SERVICE, "note", Some(&nothing_ran_out)),
+        );
+
+        // The summary: no line for the warnings, annotations and pending line,
+        // nothing on the terminal, and the count in the run log.
+        assert_eq!(total.lines(), Vec::<String>::new());
+        let (terminal, file) = crate::logging::written_by(|| crate::time_limits::report(&total));
+        assert_eq!(terminal, "", "the terminal states nothing");
+        assert!(
+            file.contains(&format!("\"sidecar_deadline\":{written}")),
+            "the run log carries the count: {file}"
         );
     }
 

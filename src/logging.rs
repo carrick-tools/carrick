@@ -218,6 +218,31 @@ fn terminal_filter(verbose: bool) -> String {
     }
 }
 
+/// What `pass` writes to the terminal at its default level and to the log
+/// file, through the two filters [`init`] builds: `(terminal, file)`. For a
+/// test of what a reader sees against what the run log keeps.
+#[cfg(test)]
+pub(crate) fn written_by(pass: impl FnOnce()) -> (String, String) {
+    let terminal = tests::Shared::default();
+    let file = tests::Shared::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(terminal.clone())
+                .with_ansi(false)
+                .with_filter(EnvFilter::new(terminal_filter(false))),
+        )
+        .with(
+            fmt::layer()
+                .with_writer(file.clone())
+                .with_ansi(false)
+                .with_target(true)
+                .with_filter(EnvFilter::new(FILE_FILTER)),
+        );
+    tracing::subscriber::with_default(subscriber, pass);
+    (terminal.text(), file.text())
+}
+
 /// What a line may carry off the machine, and how it is rewritten until it
 /// carries nothing else (carrick#1063, carrick#1098).
 ///
@@ -1460,10 +1485,10 @@ mod tests {
 
     /// A writer the test can read back.
     #[derive(Clone, Default)]
-    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl Shared {
-        fn text(&self) -> String {
+        pub(super) fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
     }
