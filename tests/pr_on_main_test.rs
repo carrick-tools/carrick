@@ -5,7 +5,8 @@
 //! producer (`GET /api/v1/widgets/:widgetId`) and a client consumer whose
 //! verb or response type is edited to make a finding. Every row is
 //! deterministic, `CARRICK_MOCK_ALL` keeps the run offline, and the storage is
-//! in memory. The type cases run the real sidecar.
+//! in memory, handing each copy back from its bytes. The type cases run the
+//! real sidecar.
 
 use async_trait::async_trait;
 use carrick::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
@@ -55,10 +56,23 @@ impl CloudStorage for Store {
                 && stored.commit_hash == data.commit_hash
         }))
     }
+    // Every copy is read back from its bytes, as a CI run reads the cloud's
+    // download: a field the blob reader does not keep reaches the PR run as
+    // it would on a runner (carrick#2037).
     async fn download_all_repo_data(
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
-        Ok((self.repos.lock().unwrap().clone(), HashMap::new()))
+        let repos = self
+            .repos
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|stored| {
+                let bytes = serde_json::to_string(stored).expect("a stored copy serializes");
+                serde_json::from_str(&bytes).expect("a stored copy reads back")
+            })
+            .collect();
+        Ok((repos, HashMap::new()))
     }
     async fn upload_type_file(
         &self,
@@ -112,11 +126,20 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// `root` with no link in it. macOS reaches its temp dir through one (`/var`
+/// is `/private/var`), and a scan run through a link uploads its package
+/// paths with the root still on them for the upload boundary to rewrite
+/// (carrick#2060), which a runner's checkout does not. The skip tests need
+/// the payload a runner uploads.
+fn unlinked(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap()
+}
+
 fn fixture_repo(root: &Path, name: &str) -> PathBuf {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/local-mode-workspace")
         .join(name);
-    let repo = root.join(name);
+    let repo = unlinked(root).join(name);
     copy_dir(&src, &repo);
     git(&repo, &["init", "-q"]);
     commit(&repo, "init");
@@ -186,8 +209,9 @@ async fn scan(store: &Store, repo: &Path) {
     scan_with(store, repo, false).await;
 }
 
-/// Scan `repo` as PR #7 and return every finding it posted.
-async fn pr_scan_with(store: &Store, repo: &Path, typed: bool) -> Vec<serde_json::Value> {
+/// Scan `repo` as PR #7 and return the whole result it posted, which is what
+/// the cloud renders the PR comment and check from.
+async fn pr_payload_with(store: &Store, repo: &Path, typed: bool) -> serde_json::Value {
     // SAFETY: the tests in this binary run one at a time (SERIAL).
     unsafe {
         std::env::set_var("GITHUB_REF", "refs/pull/7/merge");
@@ -204,14 +228,25 @@ async fn pr_scan_with(store: &Store, repo: &Path, typed: bool) -> Vec<serde_json
         .unwrap()
         .pop()
         .expect("a PR run posts its result");
-    serde_json::to_value(&payload).unwrap()["findings"]
-        .as_array()
-        .unwrap()
-        .clone()
+    serde_json::to_value(&payload).unwrap()
+}
+
+/// The findings of a posted PR result.
+fn findings_of(payload: &serde_json::Value) -> Vec<serde_json::Value> {
+    payload["findings"].as_array().unwrap().clone()
+}
+
+/// Scan `repo` as PR #7 and return every finding it posted.
+async fn pr_scan_with(store: &Store, repo: &Path, typed: bool) -> Vec<serde_json::Value> {
+    findings_of(&pr_payload_with(store, repo, typed).await)
 }
 
 async fn pr_scan(store: &Store, repo: &Path) -> Vec<serde_json::Value> {
     pr_scan_with(store, repo, false).await
+}
+
+async fn pr_payload(store: &Store, repo: &Path) -> serde_json::Value {
+    pr_payload_with(store, repo, false).await
 }
 
 fn wrong_verb(findings: &[serde_json::Value]) -> serde_json::Value {
@@ -375,8 +410,8 @@ async fn a_failing_main_side_posts_the_findings_of_a_run_without_a_baseline() {
     unsafe { std::env::remove_var("CARRICK_MAIN_SIDE_TIMEOUT_SECS") };
 }
 
-/// Two runs that main's side never needs to make: a PR with no mismatch to
-/// mark, and a PR that leaves every scanned service as main has it.
+/// A PR with no mismatch to mark: main's side never needs to run. (A PR that
+/// leaves every scanned service as main has it is the next two tests'.)
 #[tokio::test]
 async fn main_side_is_skipped_when_it_has_nothing_to_add() {
     let _serial = SERIAL.lock().await;
@@ -384,8 +419,8 @@ async fn main_side_is_skipped_when_it_has_nothing_to_add() {
     let store = Store::default();
     scan(&store, &producer).await;
 
-    // Nothing to mark: main and the PR both call with the right verb, and
-    // the PR changes the call's line so the surfaces differ.
+    // Main and the PR both call with the right verb, and the PR changes the
+    // call's line so the surfaces differ.
     scan(&store, &consumer).await;
     set_consumer_verb(&consumer, "GET", 2);
     commit(&consumer, "pr: pad");
@@ -396,18 +431,137 @@ async fn main_side_is_skipped_when_it_has_nothing_to_add() {
         findings.iter().all(|f| f.get("on_main").is_none()),
         "{findings:#?}"
     );
+}
 
-    // Same surface: main already calls with the wrong verb and the PR only
-    // touches a file nothing scans. Every finding is main's.
+/// Give one function in main's stored copy of `repo` (of `service`, in a
+/// multi-service repo) the kind `kind`, and return its name. The function is
+/// one whose stored kind is a real one other than `kind`. `Placeholder` is
+/// what a release before carrick#2036 stored for every function of a service
+/// whose payload the upload boundary rewrote.
+fn set_one_function_kind(store: &Store, repo: &str, service: Option<&str>, kind: &str) -> String {
+    let mut changed = None;
+    rewrite_main_copy(store, repo, |stored| {
+        if stored.service_name.as_deref() != service {
+            return;
+        }
+        let mut value = serde_json::to_value(&*stored).unwrap();
+        let definitions = value["function_definitions"].as_object_mut().unwrap();
+        let name = definitions
+            .iter()
+            .filter(|(_, definition)| {
+                definition["node_type"] != kind && definition["node_type"] != "Placeholder"
+            })
+            .map(|(name, _)| name.clone())
+            .min()
+            .unwrap_or_else(|| panic!("main's copy has a function that is not {kind}"));
+        definitions[&name]["node_type"] = serde_json::json!(kind);
+        *stored = serde_json::from_value(value).unwrap();
+        changed = Some(name);
+    });
+    changed.unwrap_or_else(|| panic!("main has a copy of {service:?}"))
+}
+
+/// Main's stored copies went up as scanned: the upload boundary found no
+/// machine path to rewrite. Its rewrite reads the payload back through the
+/// same reader as the download, so a copy it rewrote would match this run's
+/// rewritten one even with a reader that loses fields, and the skip would
+/// fire without proving the read.
+fn assert_not_rewritten(store: &Store) {
+    let stored = serde_json::to_string(&*store.repos.lock().unwrap()).unwrap();
+    for placeholder in ["<checkout>", "<home>"] {
+        assert!(
+            !stored.contains(placeholder),
+            "main's copy went through the upload boundary's rewrite ({placeholder})"
+        );
+    }
+}
+
+/// The two PR results, compared as the bytes the cloud receives, so a
+/// failure prints the line where they part.
+fn assert_same_result(compared: &serde_json::Value, skipped: &serde_json::Value, why: &str) {
+    assert_eq!(
+        serde_json::to_string_pretty(compared).unwrap(),
+        serde_json::to_string_pretty(skipped).unwrap(),
+        "{why}: the full comparison posted another result than the skip"
+    );
+}
+
+/// carrick#2037. A PR that leaves every scanned service as main has it skips
+/// main's side of the comparison, and posts what the full comparison posts.
+///
+/// Main's copy reaches the run through its bytes, as a CI run downloads it.
+/// Before carrick#2036 that read turned every function's kind into
+/// `Placeholder`, so the copy never matched the run's own scan and the skip
+/// never ran. The full comparison is the same PR against the same copy with
+/// one function's kind changed: the surface compares kinds and no finding
+/// reads them, so main's side runs and must reach the skip's result.
+#[tokio::test]
+async fn a_pr_that_leaves_main_as_it_is_posts_what_the_full_comparison_posts() {
+    let _serial = SERIAL.lock().await;
+    let (_tmp, producer, consumer) = setup();
+    let store = Store::default();
+    scan(&store, &producer).await;
+
+    // Main already calls with the wrong verb, and the PR touches only a file
+    // nothing scans.
     set_consumer_verb(&consumer, "PUT", 0);
     commit(&consumer, "main: put");
     scan(&store, &consumer).await;
     std::fs::write(consumer.join("NOTES.txt"), "unscanned\n").unwrap();
     commit(&consumer, "pr: notes");
+    let main_copy = store.repos.lock().unwrap().clone();
+    assert_not_rewritten(&store);
+
     let runs = main_side_runs();
-    let finding = wrong_verb(&pr_scan(&store, &consumer).await);
-    assert_eq!(main_side_runs(), runs, "same surface, nothing run");
+    let skipped = pr_payload(&store, &consumer).await;
+    assert_eq!(main_side_runs(), runs, "same surface, main's side skipped");
+    // A finding with a pairing, so it is the skip, and not a comparison with
+    // nothing to mark, that kept main's side from running.
+    let finding = wrong_verb(&findings_of(&skipped));
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+
+    for kind in ["ArrowFunction", "Placeholder"] {
+        *store.repos.lock().unwrap() = main_copy.clone();
+        let changed = set_one_function_kind(&store, "inventory-svc", None, kind);
+        let why = format!("{changed} is {kind} in main's copy");
+        let runs = main_side_runs();
+        let compared = pr_payload(&store, &consumer).await;
+        assert_eq!(main_side_runs(), runs + 1, "{why}: main's side ran");
+        assert_same_result(&compared, &skipped, &why);
+    }
+}
+
+/// carrick#2037 on the two-service repo whose breaks only the retype check
+/// finds (carrick#1491). Main's side cannot retype, so the full comparison
+/// reads those breaks from main's stored verdicts; the skip must reach the
+/// same answer without them.
+#[tokio::test]
+async fn a_two_service_pr_that_leaves_main_as_it_is_posts_what_the_full_comparison_posts() {
+    let _serial = SERIAL.lock().await;
+    let (tmp, _, _) = setup();
+    let (repo, cassettes) = retype_repo(tmp.path());
+    let _cassettes = Cassettes::from(&cassettes);
+
+    let store = Store::default();
+    scan_with(&store, &repo, true).await;
+    assert_not_rewritten(&store);
+    std::fs::write(repo.join("NOTES.txt"), "unscanned\n").unwrap();
+    commit(&repo, "pr: notes");
+
+    let runs = main_side_runs();
+    let skipped = pr_payload_with(&store, &repo, true).await;
+    assert_eq!(main_side_runs(), runs, "same surface, main's side skipped");
+    for line in [6, 11] {
+        let finding = call_at(&findings_of(&skipped), line);
+        assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
+    }
+
+    let changed = set_one_function_kind(&store, "retype-http-client", Some("web"), "ArrowFunction");
+    let why = format!("{changed} is ArrowFunction in main's copy of web");
+    let runs = main_side_runs();
+    let compared = pr_payload_with(&store, &repo, true).await;
+    assert_eq!(main_side_runs(), runs + 1, "{why}: main's side ran");
+    assert_same_result(&compared, &skipped, &why);
 }
 
 /// A type mismatch is judged on main's side from main's stored type surface,
@@ -451,7 +605,7 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
 fn retype_repo(root: &Path) -> (PathBuf, PathBuf) {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/retype-http-client");
-    let repo = root.join("retype-http-client");
+    let repo = unlinked(root).join("retype-http-client");
     copy_dir(&fixture, &repo);
     git(&repo, &["init", "-q"]);
     commit(&repo, "init");
@@ -695,7 +849,7 @@ export async function isUp(client: HealthClient): Promise<boolean> {
 
 /// Change main's stored copy of `repo` in place, as another scanner would
 /// have written it.
-fn rewrite_main_copy(store: &Store, repo: &str, rewrite: impl Fn(&mut CloudRepoData)) {
+fn rewrite_main_copy(store: &Store, repo: &str, mut rewrite: impl FnMut(&mut CloudRepoData)) {
     let mut repos = store.repos.lock().unwrap();
     let mut rewritten = 0;
     for stored in repos.iter_mut().filter(|stored| stored.repo_name == repo) {
