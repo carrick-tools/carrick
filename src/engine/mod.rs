@@ -16660,6 +16660,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -16696,6 +16697,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -16732,6 +16734,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         }
     }
 

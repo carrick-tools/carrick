@@ -210,6 +210,7 @@ jobs:
           --test keep_awake_test
           --test llm_cassette_hard_gate_test
           --test method_per_site_test
+          --test named_handler_response_test
           --test one_row_per_request_test
           --test payload_without_method_test
           --test props_and_hook_options_test

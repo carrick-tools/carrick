@@ -65,6 +65,7 @@ pub mod receiver_origin;
 pub mod receiver_type;
 pub mod request_summary;
 pub mod retry_budget;
+pub mod route_handler_anchor;
 pub mod scan_health;
 pub mod scan_spend;
 pub mod scan_stage;

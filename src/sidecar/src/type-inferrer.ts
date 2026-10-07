@@ -58,6 +58,14 @@ import { reachedOnlyOnFailure } from './failure-path.js';
 import { functionAtLine } from './function-line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
+  inCatchClause,
+  lastOnItsPath,
+  parameterUses,
+  statementsBefore,
+  type DirectCall,
+  type ParameterUses,
+} from './handler-sends.js';
+import {
   addedDiagnostics,
   applyInsertions,
   fileDiagnostics,
@@ -222,6 +230,63 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
 const RESPONSE_HELPER_MAX_DEPTH = 4;
 
 /**
+ * How many calls a handler's binding may be wrapped in before the function
+ * they wrap is given up on (carrick#1912): `withAuth(guarded(async () => …))`
+ * is two.
+ */
+const WRAPPER_MAX_DEPTH = 3;
+
+/**
+ * What a handler that returns nothing answers with through the transport it
+ * was handed (carrick#1913); see `TypeInferrer.parameterSends`.
+ *
+ *  - `body`: the join of the values its last sends were given;
+ *  - `no_body`: every one of its last sends was given no value;
+ *  - `no_success`: every one of them states an error or redirect status;
+ *  - `unread`: it sends, or may send, something this reading cannot state,
+ *    and `why` says what was in the way;
+ *  - `none`: it does nothing with a transport parameter.
+ */
+/**
+ * How far a path that hands the transport to another function is followed
+ * (carrick#1913): into that function, and no further. A function that hands
+ * the transport on again is not read, and the handler is then unread.
+ */
+const HAND_OFF_DEPTH = 1;
+
+/**
+ * What a call on a transport parameter carries: a `value` (a payload in a
+ * parameter its declaration leaves open), nothing (`empty`: no argument, or
+ * numbers alone, which state a status and send no body), or something the
+ * reading cannot state (`opaque`).
+ */
+type Carried = 'value' | 'empty' | 'opaque';
+
+/** The last send of each path of a function; see `TypeInferrer.lastSends`. */
+interface LastSends {
+  last: Array<{
+    call: CallExpression;
+    carried: Carried;
+    status: ResponseSiteStatus;
+    /** Where the handler reaches it, for the order of a joined body. */
+    order: number;
+  }>;
+  /** A value handed to an open parameter before the last call on the transport. */
+  writtenBefore?: Node;
+  /** True when the function does anything with the transport. */
+  touched: boolean;
+  /** The first thing it does with the transport, to locate an abstain at. */
+  first: Node;
+}
+
+type ParameterSends =
+  | { kind: 'body'; recovered: RecoveredPayload }
+  | { kind: 'no_body'; at: Node }
+  | { kind: 'no_success'; at: Node }
+  | { kind: 'unread'; why: string; at: Node }
+  | { kind: 'none' };
+
+/**
  * Members an options object uses to state an HTTP status. A >= 400 status marks
  * the branch an error path, whose shape is not the endpoint's contract.
  */
@@ -359,6 +424,17 @@ function typeText(type: Type, enclosingNode?: Node): string {
   );
   notePrintedType(type, enclosingNode, text);
   return text;
+}
+
+/**
+ * True when printed type text uses `any` or `unknown` as a type anywhere in
+ * it: the scanner's `contains_disqualifying_top_type`, which decides whether
+ * an inferred text is carried or the request's locator is run again through
+ * the capture. String literal contents and member names are not types.
+ */
+function textHoldsTopType(text: string): boolean {
+  const scrubbed = text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '$1$1');
+  return /(?<![\w$])(?:any|unknown)(?![\w$])(?!\??:)/.test(scrubbed);
 }
 
 /**
@@ -532,6 +608,12 @@ export class TypeInferrer {
    * unwidened reading re-reads from here (carrick#1516).
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
+  /**
+   * The answers read from ONE payload expression, whose own type is the
+   * answer (carrick#1961). An answer joined from several sends, or read off a
+   * function's declared return, has no single node that carries it.
+   */
+  private readonly readFromOneNode = new WeakSet<InferredType>();
   private readonly unwidenedBudgetMs: number;
   /**
    * The files a request has named to this inferrer, as the requests named
@@ -970,6 +1052,31 @@ export class TypeInferrer {
 
     const func = this.resolveContainingFunction(sourceFile, request);
 
+    // carrick#1913: a line-only request at a registration that names its
+    // handler. The function is declared somewhere else, so the line holds
+    // none, and a function the line search does find is a neighbour declared
+    // just above the registration. Unanswered, the capture ran the line again
+    // and published the registration call's own value, the router. The
+    // handler the registration names is the one to read.
+    //
+    // Only for a handler declared OUTSIDE the registration. One written inline
+    // further down than the line search reaches (a factory call that takes an
+    // options object first) is unanswered as before (carrick#1975): reading
+    // those rows moved four verdicts on a benchmark to incompatible that two
+    // other open defects made false (carrick#1933, carrick#1862).
+    const lineOnly = request.span_start === undefined && !request.expression_text;
+    const within = (inner: Node, outer: Node): boolean =>
+      outer.getStart() <= inner.getStart() && inner.getEnd() <= outer.getEnd();
+    if (lineOnly && registration && !(func && within(func, registration))) {
+      const named = this.resolveRegisteredHandler(registration);
+      if (named && !within(named, registration)) {
+        this.log(
+          `Line ${request.line_number} registers a handler declared elsewhere; reading that handler`
+        );
+        return this.registeredHandlerResponse(request, registration, named, extractionConfig, false);
+      }
+    }
+
     if (!func) {
       this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
       return null;
@@ -1304,6 +1411,24 @@ export class TypeInferrer {
   ): InferredType | null {
     const node = this.resolveTargetNode(sourceFile, request);
 
+    // carrick#1913: the request is located AT the route's handler, by the span
+    // of its own declaration in its own file. That is what a scan sends for a
+    // row whose registration names a handler declared somewhere else: the
+    // registration file holds nothing to locate. The function is read as the
+    // route's handler and the request is always answered, because the span of
+    // a function, run again by the capture, prints the function.
+    if (node && request.span_start !== undefined) {
+      const locatedHandler = this.handlerDeclaredAt(node);
+      if (locatedHandler) {
+        return this.handlerResponse(
+          request,
+          locatedHandler,
+          extractionConfig,
+          this.wrapperBindingOf(locatedHandler)
+        );
+      }
+    }
+
     if (!node) {
       // Line-only anchor (no span, no expression text) — the shape the scanner
       // sends for a named-handler route registration whose handler is declared
@@ -1322,8 +1447,19 @@ export class TypeInferrer {
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
         );
-        return this.buildFunctionReturnInferredType(
+        // A text that located nothing is still a locator the capture can run
+        // again, so that request keeps the answer it always had.
+        if (request.expression_text) {
+          return this.buildFunctionReturnInferredType(
+            request,
+            atLine.handler,
+            extractionConfig,
+            true
+          );
+        }
+        return this.registeredHandlerResponse(
           request,
+          atLine.registration,
           atLine.handler,
           extractionConfig,
           true
@@ -1349,6 +1485,21 @@ export class TypeInferrer {
           extractionConfig,
           true
         );
+      }
+      // carrick#1913: the line alone, and a function opens on exactly that
+      // line. That is a request located at a handler by its line, and it is
+      // read as one: the fallback below would publish `void` for a handler
+      // that sends through a parameter.
+      if (!request.expression_text) {
+        const opened = this.findFunctionByLine(sourceFile, request.line_number);
+        if (opened && opened.getStartLineNumber() === request.line_number) {
+          return this.handlerResponse(
+            request,
+            opened,
+            extractionConfig,
+            this.wrapperBindingOf(opened)
+          );
+        }
       }
       // No locator, or locator didn't resolve — likely a payload-less handler
       // (redirect, 204, streaming). Infer the containing function's return type.
@@ -1391,6 +1542,32 @@ export class TypeInferrer {
       );
       if (returned !== undefined) {
         return returned;
+      }
+    }
+
+    // carrick#1913: the span is the handler's own NAME where the registration
+    // is handed it (`showWidget` in `router.get(path, requireKey,
+    // showWidget)`). The name says which function, so that one is read, not
+    // the registration's own pick; and the request is answered, because the
+    // span of a name, run again by the capture, prints the function it names.
+    if (request.span_start !== undefined && Node.isIdentifier(node)) {
+      const registration = node.getParent();
+      const named =
+        Node.isCallExpression(registration) && registration.getArguments().includes(node)
+          ? this.asHandlerFunction(node)
+          : undefined;
+      if (named && Node.isCallExpression(registration)) {
+        const declared = this.declaredResponseInferredType(request, registration);
+        if (declared) {
+          return declared;
+        }
+        return this.registeredHandlerResponse(
+          request,
+          registration,
+          named,
+          extractionConfig,
+          false
+        );
       }
     }
 
@@ -1486,9 +1663,25 @@ export class TypeInferrer {
       // argument is the route path, not a payload. The span locator falls
       // back to exactly this shape when no payload expression was reported,
       // so drilling here would put the path literal's type in the manifest.
-      const registersCallback = args.some(
+      const registersInline = args.some(
         (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
       );
+      // carrick#1913: a registration handed its handler by NAME is a
+      // registration as much as one handed a function literal. Tested on
+      // literals alone, `router.get('/widgets', listWidgets)` fell through to
+      // the drill below and published the path. Read so only for a request
+      // located by SPAN: that span is the row's own registration call, which
+      // the scanner sends when nothing was located inside the handler. A call
+      // a model located by its text is a payload it read
+      // (`rows.map(toView)`), and keeps the reading below. Under a span, any
+      // argument that is a function, by declaration or by type, makes the
+      // call one that hands a function over, and its first argument is then
+      // never a body.
+      const registersCallback =
+        registersInline ||
+        (request.span_start !== undefined &&
+          (this.handlerFromRegistrationCall(node) !== undefined ||
+            args.some((arg) => arg.getType().getCallSignatures().length > 0)));
       if (registersCallback) {
         // A registration that DECLARES its response contract in a schema needs
         // no indirection: the declaration is the contract the framework
@@ -1499,24 +1692,33 @@ export class TypeInferrer {
           return declared;
         }
         // The locator lands on a route registration whose handler carries the
-        // response contract in its RETURN type — one indirection away. Follow
-        // the handler and infer its return instead of dropping the payload.
+        // response contract — one indirection away. Follow the handler and
+        // read it. The request is answered either way: run again by the
+        // capture, the span of a registration prints the registration call's
+        // own value.
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
           this.log(
             `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; following handler return`
           );
-          return this.buildFunctionReturnInferredType(
+          return this.registeredHandlerResponse(
             request,
+            node,
             handler,
             extractionConfig,
-            true
+            registersInline
           );
         }
         this.log(
           `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; no payload to infer`
         );
-        return null;
+        return this.decidedAbstain(
+          request,
+          node,
+          'handler_body_unread',
+          'the registration is handed a function that could not be followed to a declaration ' +
+            'with a body, so nothing states what the route sends'
+        );
       }
       // A call whose result is a value the repo shapes is not a send: it is
       // the payload (carrick#1732), and drilling would publish its input.
@@ -1533,6 +1735,26 @@ export class TypeInferrer {
       payloadNode,
       extractionConfig
     );
+
+    // carrick#1913: the locator landed on a function (a handler's name, a
+    // method reference) and no rule read a payload out of it. Nothing crosses
+    // the wire as a function, so printing it states a contract no response
+    // has; the request side has refused the same since carrick#964. Answered,
+    // not dropped: run again by the capture, the same locator prints the same
+    // function.
+    if (!unwrapResult.wasUnwrapped && this.isCallableType(payloadType)) {
+      this.log(
+        `Response locator at ${request.file_path}:${request.line_number} resolved a callable ` +
+          `(${typeString}); a function is not a body`
+      );
+      return this.decidedAbstain(
+        request,
+        payloadNode,
+        'handler_body_unread',
+        'the located expression is a function, not a value a response carries, so nothing ' +
+          'states what the route sends'
+      );
+    }
 
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
@@ -1816,7 +2038,7 @@ export class TypeInferrer {
       resolvedSymbol !== undefined && recoveredAnchor
         ? this.primaryTypeSymbolSource(recoveredAnchor.element)
         : undefined;
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       recovered.typeString,
       recovered.isExplicit,
@@ -1826,6 +2048,8 @@ export class TypeInferrer {
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
       writtenAnchor ? writtenAnchor.source : resolvedSource
     );
+    if (recovered.nodes.length === 1) this.readFromOneNode.add(inferred);
+    return inferred;
   }
 
   /**
@@ -2685,6 +2909,16 @@ export class TypeInferrer {
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
     let located = this.resolveTargetNode(sourceFile, request);
+
+    // carrick#1913: the request is located AT the route's handler, by the span
+    // of its own declaration. What it reads as its body is what a caller
+    // sends; the function itself is never the answer.
+    if (located && request.span_start !== undefined) {
+      const locatedHandler = this.handlerDeclaredAt(located);
+      if (locatedHandler) {
+        return this.handlerRequest(request, locatedHandler);
+      }
+    }
 
     if (!located) {
       // Line-only anchor: the scanner points a request infer at the route
@@ -4470,6 +4704,31 @@ export class TypeInferrer {
   }
 
   /**
+   * True when a type the repo declares EXTENDS framework machinery: one of
+   * its base types, at any depth, is machinery by `typeIsFrameworkMachinery`
+   * (carrick#1913). The members that make it transport are the library's, and
+   * the repo's name on the subtype does not make the value a payload. A union
+   * is asked of each member. An intersection is not asked here: its parts are
+   * already read one by one by `typeIsOrContainsMachinery`.
+   */
+  private typeDerivesFromMachinery(type: Type): boolean {
+    if (type.isUnion()) {
+      return type.getUnionTypes().some((member) => this.typeDerivesFromMachinery(member));
+    }
+    if (!this.hasMachineryIndicatorThreshold(type)) return false;
+    const seen = new Set<Type>();
+    const pending = [...type.getBaseTypes()];
+    while (pending.length > 0) {
+      const base = pending.pop()!;
+      if (seen.has(base)) continue;
+      seen.add(base);
+      if (this.typeIsFrameworkMachinery(base)) return true;
+      pending.push(...base.getBaseTypes());
+    }
+    return false;
+  }
+
+  /**
    * True once the type carries at least `MACHINERY_INDICATOR_THRESHOLD` DISTINCT
    * `MACHINERY_MEMBER_INDICATORS` (own + apparent). Deduplicates by name (own and
    * apparent property lists overlap) and early-returns the moment the threshold
@@ -5225,6 +5484,11 @@ export class TypeInferrer {
     }
     if (type.getCallSignatures().length > 0) return false;
     if (this.typeIsOrContainsResponseMachinery(type)) return false;
+    // carrick#1913: `interface RequestWithContext extends Request` is the
+    // platform's request with a member of the repo's own. Its symbol is the
+    // repo's, so the origin gate above lets it through, and
+    // `engine.handle(request)` published the request as the response.
+    if (this.typeDerivesFromMachinery(type)) return false;
     return this.typeIsObjectShaped(type, 0, asSent);
   }
 
@@ -5910,6 +6174,893 @@ export class TypeInferrer {
   }
 
   // ===========================================================================
+  // A function read as a route's handler (carrick#1913)
+  // ===========================================================================
+
+  /**
+   * The handler a span names when the span is the handler's own declaration:
+   * the function itself, the binding (or the statement of one binding) whose
+   * initializer is the function or a call that wraps it, or a default export
+   * of the function.
+   *
+   * Deliberately narrow. A call is not read here even when it is bound to a
+   * name, because a registration can be bound too (`const route =
+   * app.get(...)`) and keeps the reading it always had. An identifier is not
+   * read here either: what a name used inside an expression names is the
+   * expression's business.
+   */
+  private handlerDeclaredAt(located: Node): FunctionLike | undefined {
+    let node = located;
+    if (Node.isVariableStatement(node) || Node.isVariableDeclarationList(node)) {
+      const declarations = node.getDeclarations();
+      if (declarations.length !== 1) return undefined;
+      node = declarations[0];
+    } else if (Node.isExportAssignment(node)) {
+      // `export default async (req, res) => { … }`
+      node = this.unwrapExpressionNode(node.getExpression());
+    }
+    if (
+      Node.isFunctionDeclaration(node) ||
+      Node.isArrowFunction(node) ||
+      Node.isFunctionExpression(node) ||
+      Node.isMethodDeclaration(node)
+    ) {
+      return node;
+    }
+    return Node.isVariableDeclaration(node) ? this.functionFromDeclaration(node) : undefined;
+  }
+
+  /**
+   * An `unknown` the inferrer DECIDED on, with the reason at the root. The
+   * scanner lists these reasons as decided (`DECIDED_ABSTAIN_REASONS`), so the
+   * capture does not run the request's locator again; at a handler or a
+   * registration that re-run prints the function or the router.
+   */
+  private decidedAbstain(
+    request: InferRequestItem,
+    at: Node,
+    reason: TypeProvenance['reason'],
+    detail: string
+  ): InferredType {
+    const abstain = this.createInferredType(request, 'unknown', false, this.getNodeLocation(at));
+    abstain.any_provenance = [{ path: '', kind: 'unknown', reason, detail }];
+    return abstain;
+  }
+
+  /**
+   * The response of the handler a registration names, for a request located
+   * at the registration.
+   *
+   * Where the scan already read this handler's return (`readItsReturn`: the
+   * registration is handed the function as a literal, or the request is the
+   * line alone) and the handler is the one that reading picked, the first
+   * function the registration is handed, that reading stands: no answer a
+   * released scanner gets today changes. Everything it left unanswered is read
+   * as a handler (`handlerResponse`), and so is a handler it never reached: one
+   * behind a named middleware, or one bound to a wrapper call.
+   */
+  private registeredHandlerResponse(
+    request: InferRequestItem,
+    registration: Node,
+    handler: FunctionLike,
+    extractionConfig: ExtractionConfig | undefined,
+    readItsReturn: boolean
+  ): InferredType {
+    if (readItsReturn && handler === this.firstPlainHandlerOf(registration)) {
+      const returned = this.buildFunctionReturnInferredType(
+        request,
+        handler,
+        extractionConfig,
+        true
+      );
+      if (returned) return returned;
+    }
+    // A function the registration is handed directly is the handler as
+    // written. One reached through a name may be bound to a wrapper.
+    const handedDirectly =
+      Node.isCallExpression(registration) &&
+      registration.getArguments().some((arg) => this.unwrapExpressionNode(arg) === handler);
+    return this.handlerResponse(
+      request,
+      handler,
+      extractionConfig,
+      handedDirectly ? undefined : this.wrapperBindingOf(handler)
+    );
+  }
+
+  /**
+   * The handler the scan read at a registration before carrick#1913: the first
+   * argument that is a function literal or a name bound to one. `undefined`
+   * for a handler only the newer reading reaches.
+   */
+  private firstPlainHandlerOf(registration: Node): FunctionLike | undefined {
+    if (Node.isObjectLiteralExpression(registration)) {
+      const handler = this.handlerFromObjectLiteral(registration);
+      return handler && !this.wrapperBindingOf(handler) ? handler : undefined;
+    }
+    if (!Node.isCallExpression(registration)) return undefined;
+    for (const arg of registration.getArguments()) {
+      const handler = this.asHandlerFunction(arg, false);
+      if (handler) return handler;
+    }
+    return undefined;
+  }
+
+  /**
+   * What a function answers a request with, read as the route's handler
+   * (carrick#1913). Always an answer: a type, or an `unknown` with the reason
+   * at its root.
+   *
+   * What it RETURNS is read first. A handler that returns a value returns the
+   * body, as `function_return` has always read it. A handler that returns
+   * nothing (`void` is no answer and never the body) or returns transport
+   * answers through the transport it was handed, and `parameterSends` reads
+   * that; with no send on a parameter, a returned transport is read for the
+   * body it was built from, as before.
+   *
+   * It abstains rather than choose when the evidence points two ways:
+   *
+   *  - a value on one path and a send through a parameter on another. Which of
+   *    them is the response depends on whether the caller of the handler sends
+   *    what it returns, and the handler's own source does not say;
+   *  - a value on one path and transport on another;
+   *  - a handler bound to a wrapper call (`wrapper`) whose function returns a
+   *    value the bound handler does not return. The wrapper consumed it, and
+   *    what it sent in its place (the value, or an envelope around it) is in
+   *    the wrapper;
+   *  - a body that holds `any` or `unknown` and is not read from one
+   *    expression. The scanner does not carry such a text; it has the capture
+   *    read a node. One expression is named for it (`reread_at`,
+   *    carrick#1961); a join of several, or a declared return, has none, and
+   *    this request's own locator would print the handler.
+   */
+  private handlerResponse(
+    request: InferRequestItem,
+    handler: FunctionLike,
+    extractionConfig?: ExtractionConfig,
+    wrapper?: CallExpression
+  ): InferredType {
+    const unread = (at: Node, detail: string): InferredType =>
+      this.decidedAbstain(request, at, 'handler_body_unread', detail);
+    // carrick#1961: a body that holds `any` or `unknown` is not a text the
+    // scanner carries. Read from one expression, the answer names that
+    // expression and the capture reads it there, which is what records an
+    // open member as the declaration's own. Anything else is withheld: left to
+    // this request's own locator, the capture prints the handler.
+    const published = (read: InferredType): InferredType => {
+      if (!textHoldsTopType(read.type_string)) return read;
+      let node = this.readNodes.get(read.source_location);
+      if (node && this.readFromOneNode.has(read)) {
+        // The answer is the AWAITED value: name the `await`, not what it awaits.
+        for (
+          let parent = node.getParent();
+          parent &&
+          (Node.isAwaitExpression(parent) || Node.isParenthesizedExpression(parent)) &&
+          parent.getExpression() === node;
+          parent = node.getParent()
+        ) {
+          node = parent;
+        }
+        read.reread_at = {
+          file_path: node.getSourceFile().getFilePath(),
+          span_start: node.getStart(),
+          span_end: node.getEnd(),
+          line_number: node.getStartLineNumber(),
+        };
+        return read;
+      }
+      return unread(
+        handler,
+        "the body the handler states holds a member typed 'any' or 'unknown', and it is not " +
+          'read from one expression the capture can read in its place, so the route publishes ' +
+          'no body here'
+      );
+    };
+
+    const returned = this.returnedMembers(handler);
+    const isTransport = (member: Type): boolean =>
+      this.typeIsOrContainsResponseMachinery(member) || this.typeDerivesFromMachinery(member);
+    const returnsTransport = returned.some(isTransport);
+    const returnsValue = returned.some(
+      (member) =>
+        !member.isVoid() && !member.isUndefined() && !member.isNever() && !isTransport(member)
+    );
+    const sends = this.parameterSends(handler, this.wireFormatFor(request));
+
+    if (returned.some((member) => this.isCallableType(member))) {
+      return unread(
+        handler,
+        'the function returns a function, so it builds a handler and is not one, and nothing ' +
+          'in it states what a route sends'
+      );
+    }
+    if (returnsValue) {
+      if (returnsTransport) {
+        return unread(
+          handler,
+          'the handler returns a value on one path and transport on another, and nothing in it ' +
+            'states which of the two the route answers with'
+        );
+      }
+      if (sends.kind === 'body') {
+        return unread(
+          handler,
+          'the handler returns a value on one path and sends another through a parameter, and ' +
+            'nothing in it states which of the two the route answers with'
+        );
+      }
+      if (wrapper && !this.wrapperReturnsWhatItWraps(wrapper, handler)) {
+        return unread(
+          wrapper,
+          'the handler is bound to a call that does not return what the function it wraps ' +
+            'returns, so what the route sends is decided inside that call'
+        );
+      }
+      const read = this.buildFunctionReturnInferredType(request, handler, extractionConfig, true);
+      return read
+        ? published(read)
+        : unread(handler, 'what the handler returns carries no body this reading can state');
+    }
+
+    switch (sends.kind) {
+      case 'body':
+        return published(this.inferredFromRecoveredPayload(request, sends.recovered));
+      case 'no_body':
+        return this.decidedAbstain(
+          request,
+          sends.at,
+          'no_response_body',
+          'the handler ends the response without handing it a value on every path that does not ' +
+            'state an error or a redirect, so the route sends no body'
+        );
+      case 'no_success':
+        return this.decidedAbstain(
+          request,
+          sends.at,
+          'no_success_payload',
+          "every response this route's handler sends states an error or redirect status, " +
+            'so it publishes no success body'
+        );
+      case 'unread':
+        return unread(sends.at, sends.why);
+      case 'none': {
+        const read = this.buildFunctionReturnInferredType(request, handler, extractionConfig, true);
+        if (read) return published(read);
+        return unread(
+          handler,
+          returnsTransport
+            ? 'the handler returns transport and no body could be read out of what it was built from'
+            : 'the handler returns nothing and calls nothing on a parameter that is transport ' +
+                'a library declares, so nothing in it states what the route sends'
+        );
+      }
+    }
+  }
+
+  /**
+   * The types a function's return resolves to once awaited, a union as its
+   * members: `Promise<Reply | undefined>` is `Reply` and `undefined`.
+   */
+  private returnedMembers(handler: FunctionLike): Type[] {
+    const members = (type: Type, depth: number): Type[] => {
+      const awaited = this.unwrapAsyncIterableType(this.unwrapPromiseType(type));
+      // `boolean` is a union of two literals and a value like any other.
+      return awaited.isUnion() && !awaited.isBoolean() && depth < 3
+        ? awaited.getUnionTypes().flatMap((member) => members(member, depth + 1))
+        : [awaited];
+    };
+    return members(handler.getReturnType(), 0);
+  }
+
+  /**
+   * The call a binding wraps `func` in, when a name is bound to one:
+   * `guarded(...)` for the function in `const handler = guarded(async (req,
+   * res) => …)`, the outermost of several. `undefined` for a function no
+   * binding wraps.
+   */
+  private wrapperBindingOf(func: FunctionLike): CallExpression | undefined {
+    let value: Node = func;
+    let outermost: CallExpression | undefined;
+    for (;;) {
+      const holder = this.receivingCallOf(value, () => true);
+      if (!holder || !Node.isCallExpression(holder)) break;
+      outermost = holder;
+      value = holder;
+    }
+    if (!outermost) return undefined;
+    let bound: Node = outermost;
+    for (
+      let parent = bound.getParent();
+      parent && this.unwrapExpressionNode(parent) !== parent;
+      parent = bound.getParent()
+    ) {
+      bound = parent;
+    }
+    const binding = bound.getParent();
+    return Node.isVariableDeclaration(binding) && binding.getInitializer() === bound
+      ? outermost
+      : undefined;
+  }
+
+  /**
+   * True when the handler a wrapper call produces returns what the function
+   * it wraps returns: every signature of the call's result has that function's
+   * awaited return type. `withAuth(handler)` does; a wrapper that takes a
+   * function returning a value and produces one returning nothing has
+   * consumed the value.
+   */
+  private wrapperReturnsWhatItWraps(wrapper: CallExpression, wrapped: FunctionLike): boolean {
+    const signatures = wrapper.getType().getCallSignatures();
+    if (signatures.length === 0) return false;
+    const inner = this.unwrapPromiseType(wrapped.getReturnType());
+    const innerText = inner.getText(undefined, TYPE_TEXT_FLAGS);
+    return signatures.every((signature) => {
+      const outer = this.unwrapPromiseType(signature.getReturnType());
+      return (
+        outer.compilerType === inner.compilerType ||
+        outer.getText(undefined, TYPE_TEXT_FLAGS) === innerText
+      );
+    });
+  }
+
+  /**
+   * What a handler that returns nothing answers with through the transport it
+   * was handed (carrick#1913): `res.status(201).json(created)`.
+   *
+   * Read from types and structure, with no method name consulted. A SEND is:
+   *
+   *  - a method called directly on one of the handler's parameters, or at the
+   *    end of a chain of calls on it. A call on an object the parameter holds
+   *    (`res.locals.audit.record(entry)`) is not one, and neither is a call OF
+   *    a parameter (`next(error)`);
+   *  - where that parameter's type is transport the repo does not declare,
+   *    and transport something can be sent through
+   *    (`isTransportParameter`): the test a returned response already gets,
+   *    and one method of it that takes a body;
+   *  - made in the handler's own body, not in a function it declares;
+   *  - the last thing the handler does with its parameters on that path
+   *    (`lastOnItsPath`). A header object set before the body is not last.
+   *
+   * A send carries a BODY when its first argument reads as a payload
+   * (`nodeCarriesPayloadContract`) and the method's own declaration leaves
+   * that parameter open: `any`, `unknown` or a type parameter
+   * (`firstParameterIsOpen`). A parameter the library types (an error to
+   * destroy the connection with, a header map) is not a body slot.
+   *
+   * Each send is then read for the status the source WRITES: a number handed
+   * to an earlier call of its chain, an argument beside the body, or the
+   * statement before it on the path setting one on the same parameter. Only a
+   * path that states no status, or a success one, joins. An error or a
+   * redirect is left out. A status the source does not write as a number
+   * (`res.status(code)`) makes that path abstain: it does not join, and with
+   * no other path the handler is unread.
+   *
+   * A catch clause answers a failure, so nothing in one joins or blocks.
+   *
+   * A path that ends by handing the parameter to another function (as an
+   * argument, or inside an object literal that is one) is read in that
+   * function, one level deep (`lastSends`). Where that function cannot be
+   * read, the handler is unread.
+   *
+   * A parameter kept as a value, assigned a member that is not a number, or
+   * acted on inside a function the handler declares (a send in a callback)
+   * makes the whole handler unread: what is sent is decided somewhere this
+   * reading does not go. A READ of the parameter is none of these: a member
+   * read, or a call whose value is used.
+   */
+  private parameterSends(handler: FunctionLike, wire: WireFormat): ParameterSends {
+    if (!handler.getBody()) return { kind: 'none' };
+    const uses = parameterUses(handler);
+    const transport = new Set(
+      uses.parameters.filter((parameter) => this.isTransportParameter(parameter))
+    );
+    if (transport.size === 0) return { kind: 'none' };
+    const facts = this.lastSends(handler, uses, transport, HAND_OFF_DEPTH);
+    if ('unread' in facts) {
+      return { kind: 'unread', at: facts.unread.at, why: facts.unread.why };
+    }
+    if (!facts.touched) return { kind: 'none' };
+    const unread = (at: Node, why: string): ParameterSends => ({ kind: 'unread', why, at });
+
+    const joins = facts.last
+      .filter(
+        (send) =>
+          send.carried === 'value' && (send.status === 'success' || send.status === 'undecided')
+      )
+      // In the order the handler reaches them: a body a helper sends sits
+      // where the handler hands the transport to it.
+      .sort((a, b) => a.order - b.order);
+    if (joins.length > 0) {
+      const recovered = this.recoverPayloadFromResponseExpressions(
+        joins.map((send) => send.call),
+        false,
+        wire
+      );
+      if (recovered) return { kind: 'body', recovered };
+    }
+
+    const unwritten = facts.last.find((send) => send.status === 'variable');
+    if (unwritten) {
+      return unread(
+        unwritten.call,
+        'a send states a status the source does not write as a number, so whether that path ' +
+          'answers with success is not known, and no other path sends a body'
+      );
+    }
+    if (facts.last.length === 0) {
+      return unread(
+        facts.first,
+        'nothing the handler does with the transport it was handed is the last thing it does ' +
+          'on a path, so no call on it reads as the send'
+      );
+    }
+    if (facts.writtenBefore) {
+      return unread(
+        facts.writtenBefore,
+        'the handler hands the transport a value before the last call it makes on it, and this ' +
+          'reading takes only the last call as the send'
+      );
+    }
+    const succeeding = facts.last.filter(
+      (send) => send.status !== 'error' && send.status !== 'redirect'
+    );
+    if (succeeding.length === 0) return { kind: 'no_success', at: facts.last[0].call };
+    const opaque = succeeding.find((send) => send.carried !== 'empty');
+    if (opaque) {
+      return unread(
+        opaque.call,
+        'what the handler sends is not an object a JSON contract describes: a primitive, an ' +
+          'untyped value, or a value handed to a parameter its library types'
+      );
+    }
+    return { kind: 'no_body', at: succeeding[0].call };
+  }
+
+  /**
+   * The last send of every path of `func` through the parameters in
+   * `transport`, with what each carried and the status it states; or why the
+   * function cannot be read.
+   *
+   * A path that ends by handing the transport to another function is followed
+   * into that function, `handOffDepth` levels deep (`HAND_OFF_DEPTH`: one).
+   * The function's own last sends, read by this same rule through the
+   * parameter the transport arrives in, are then that path's: an error helper
+   * (`res.status(400).json(problem)`) leaves the path out as any error send
+   * does, and a helper that sends a body joins it. The handler is unread when
+   * the function cannot be read: it has no body in the program, it has more
+   * than one declaration, the call does not name it, the transport does not
+   * arrive in a parameter of its own, or it hands the transport on again.
+   * A path is never dropped on the guess that the function it was handed to
+   * reports an error: a helper that sends a second success shape would then be
+   * missing from the published body.
+   */
+  private lastSends(
+    func: FunctionLike,
+    uses: ParameterUses,
+    transport: Set<Node>,
+    handOffDepth: number
+  ): LastSends | { unread: { at: Node; why: string; handsOnAgain?: boolean } } {
+    const onTransport = <T extends { parameter: Node }>(list: T[]): T[] =>
+      list.filter((use) => transport.has(use.parameter));
+    const unread = (at: Node, why: string, handsOnAgain = false) => ({
+      unread: { at, why, handsOnAgain },
+    });
+
+    const calls = onTransport(uses.calls);
+    const handOffs = onTransport(uses.handOffs);
+    const assignments = onTransport(uses.assignments);
+    const nested = onTransport(uses.nested)[0];
+    if (nested) {
+      return unread(
+        nested.at,
+        'a function the handler declares acts on the transport the handler was handed, so ' +
+          'what the route sends is decided where that function runs'
+      );
+    }
+    const kept = onTransport(uses.kept)[0];
+    if (kept) {
+      return unread(
+        kept.at,
+        'the handler keeps the transport it was handed as a value, so what is sent through it ' +
+          'is not in one place'
+      );
+    }
+    const facts: LastSends = {
+      last: [],
+      touched: calls.length + handOffs.length + assignments.length > 0,
+      first: calls[0]?.call ?? handOffs[0]?.call ?? func,
+    };
+    if (!facts.touched) return facts;
+
+    for (const { assignment } of assignments) {
+      if (inCatchClause(assignment, func)) continue;
+      if (this.statusNumber(assignment.getRight()) === undefined) {
+        return unread(
+          assignment,
+          'the handler sets a member of the transport it was handed by assignment, which this ' +
+            'reading does not follow to a body'
+        );
+      }
+    }
+
+    // A call on the transport whose value is USED reads it
+    // (`res.getHeader('etag')`); one whose value is discarded or returned may
+    // send. A value kept from a call that was handed a payload is the one
+    // case this cannot place.
+    const sending: DirectCall[] = [];
+    for (const use of calls) {
+      if (use.discarded) {
+        sending.push(use);
+      } else if (this.carriedBy(use.call) === 'value') {
+        return unread(
+          use.call,
+          'the handler keeps what a call on the transport returns after handing it a value, ' +
+            'so the send is not the last thing it does with it'
+        );
+      }
+    }
+
+    // Everything that acts on a parameter: a send is last only when none of
+    // these can follow it.
+    const acts: Node[] = [
+      ...sending.map((use) => use.call),
+      ...uses.handOffs.map((use) => use.call),
+      ...uses.invocations.map((use) => use.call),
+      ...assignments.map((use) => use.assignment),
+    ];
+
+    for (const handOff of handOffs) {
+      const { call } = handOff;
+      // A catch clause, and a hand-off with an error status written beside
+      // it, answer a failure and are left out like any error send.
+      if (inCatchClause(call, func)) continue;
+      const beside = this.responseSiteStatus(call);
+      if (beside === 'error' || beside === 'redirect') continue;
+      // Before the last thing done on its path it configures the response.
+      if (!lastOnItsPath(call, func, acts)) continue;
+      const handedOn = (why: string, handsOnAgain = false) =>
+        unread(
+          call,
+          'the handler hands the transport it was handed to another function as the last ' +
+            `thing it does on a path, and ${why}, so what the route sends there is not read`,
+          handsOnAgain
+        );
+      if (handOffDepth <= 0) return handedOn('this is as far as a hand-off is followed', true);
+      const callee = this.functionHandedTo(handOff);
+      if (typeof callee === 'string') return handedOn(callee);
+      const inside = this.lastSends(
+        callee.func,
+        parameterUses(callee.func),
+        new Set([callee.parameter]),
+        handOffDepth - 1
+      );
+      if ('unread' in inside) {
+        return handedOn(
+          inside.unread.handsOnAgain
+            ? 'that function hands it on again'
+            : 'that function does something with it this reading cannot follow'
+        );
+      }
+      if (inside.writtenBefore) facts.writtenBefore ??= call;
+      facts.last.push(...inside.last.map((send) => ({ ...send, order: call.getStart() })));
+    }
+
+    for (const use of sending) {
+      const carried = this.carriedBy(use.call);
+      if (!lastOnItsPath(use.call, func, acts)) {
+        // Not last: it configures the response. A value handed to an open
+        // parameter before the response ends may still be part of the body.
+        if (carried !== 'empty' && this.firstParameterIsOpen(use.call)) {
+          facts.writtenBefore ??= use.call;
+        }
+        continue;
+      }
+      if (inCatchClause(use.call, func)) continue;
+      facts.last.push({
+        call: use.call,
+        carried,
+        status: this.sendStatus(use, func, sending, assignments),
+        order: use.call.getStart(),
+      });
+    }
+    return facts;
+  }
+
+  /**
+   * The function a hand-off hands the transport to, and the parameter of it
+   * the transport arrives in; or, as a sentence fragment, why that cannot be
+   * said. Read through the checker: the call has to name the function (an
+   * identifier, or a member), the name has to resolve to exactly one
+   * declaration, and that declaration has to have a body in the program.
+   */
+  private functionHandedTo(handOff: {
+    call: Node;
+    argument: number;
+    member?: string;
+  }): { func: FunctionLike; parameter: Node } | string {
+    if (!Node.isCallExpression(handOff.call)) return 'it is handed to a constructor';
+    const callee = this.unwrapExpressionNode(handOff.call.getExpression());
+    const name = Node.isIdentifier(callee)
+      ? callee
+      : Node.isPropertyAccessExpression(callee)
+        ? callee.getNameNode()
+        : undefined;
+    if (!name) return 'the call does not name that function';
+    const declarations = name.getDefinitionNodes();
+    if (declarations.length === 0) return 'that function has no declaration in the program';
+    if (declarations.length > 1) return 'that function has more than one declaration';
+    const declaration = declarations[0];
+    const held =
+      Node.isPropertyAssignment(declaration) || Node.isPropertyDeclaration(declaration)
+        ? declaration.getInitializer()
+        : undefined;
+    const func = Node.isMethodDeclaration(declaration)
+      ? declaration
+      : held
+        ? this.asHandlerFunction(held, false)
+        : this.functionFromDeclaration(declaration, false);
+    if (!func || !func.getBody()) return 'that function has no body in the program';
+
+    const parameter = func.getParameters()[handOff.argument];
+    if (!parameter || parameter.isRestParameter()) {
+      return 'the transport does not arrive in a parameter of its own there';
+    }
+    const binding = parameter.getNameNode();
+    if (handOff.member === undefined) {
+      return Node.isIdentifier(binding)
+        ? { func, parameter }
+        : 'the transport does not arrive in a parameter of its own there';
+    }
+    // Handed over inside an object literal: it arrives as the member of the
+    // same name, where the parameter list takes the object apart.
+    const element = Node.isObjectBindingPattern(binding)
+      ? binding
+          .getElements()
+          .find(
+            (candidate) =>
+              (candidate.getPropertyNameNode()?.getText() ?? candidate.getName()) ===
+              handOff.member
+          )
+      : undefined;
+    return element && Node.isIdentifier(element.getNameNode())
+      ? { func, parameter: element }
+      : 'the transport does not arrive in a parameter of its own there';
+  }
+
+  /**
+   * True when a parameter (or the element of a destructured one) is transport
+   * a library or the platform declares, or a type of the repo's that extends
+   * it, and a body can be handed to it (`takesABody`): what a handler is
+   * HANDED to answer through. A response-like type the repo declares from
+   * nothing is the repo's own object and is not read.
+   */
+  private isTransportParameter(parameter: Node): boolean {
+    let type: Type;
+    try {
+      type = parameter.getType().getNonNullableType();
+    } catch {
+      return false;
+    }
+    return (
+      (this.typeIsFrameworkMachinery(type) || this.typeDerivesFromMachinery(type)) &&
+      this.takesABody(type, parameter)
+    );
+  }
+
+  /**
+   * True when something can be SENT through a transport type: one of its
+   * methods leaves its first parameter open, as a body slot is declared
+   * (`declaresAnOpenFirstParameter`). The platform request is transport and
+   * has no such method (every one of them takes nothing), so a handler that is
+   * handed a request and returns its response is not read as sending through
+   * the request, whatever it does with it on the way.
+   */
+  private takesABody(type: Type, at: Node): boolean {
+    for (const member of type.getProperties()) {
+      for (const declaration of member.getDeclarations()) {
+        if (Node.isMethodSignature(declaration) || Node.isMethodDeclaration(declaration)) {
+          if (this.declaresAnOpenFirstParameter(declaration)) return true;
+          continue;
+        }
+        if (!Node.isPropertySignature(declaration) && !Node.isPropertyDeclaration(declaration)) {
+          continue;
+        }
+        // A member whose TYPE is a function: `json: Send<Body, this>`.
+        try {
+          const opens = member
+            .getTypeAtLocation(at)
+            .getCallSignatures()
+            .some((signature) => this.declaresAnOpenFirstParameter(signature.getDeclaration()));
+          if (opens) return true;
+        } catch {
+          // A signature with no declaration states nothing about its parameters.
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * What a call on a transport parameter carries: a `value` (a payload in a
+   * parameter its declaration leaves open), nothing (`empty`: no argument, or
+   * numbers alone, which state a status and send no body), or something this
+   * reading cannot state (`opaque`).
+   */
+  private carriedBy(call: CallExpression): Carried {
+    const args = call.getArguments().map((arg) => this.peelTransparentExpression(arg));
+    if (args.length === 0) return 'empty';
+    if (args.every((arg) => this.statusNumber(arg) !== undefined)) return 'empty';
+    // A call handed a function registers it; it does not send it.
+    if (args.some((arg) => arg.getType().getCallSignatures().length > 0)) {
+      return 'opaque';
+    }
+    const first = this.unwrapJsonStringifyArg(args[0]);
+    const holdsAFunction =
+      Node.isObjectLiteralExpression(first) &&
+      first.getProperties().some((property) => {
+        if (Node.isMethodDeclaration(property)) return true;
+        const value = Node.isPropertyAssignment(property) ? property.getInitializer() : undefined;
+        return value !== undefined && value.getType().getCallSignatures().length > 0;
+      });
+    return !holdsAFunction &&
+      this.firstParameterIsOpen(call) &&
+      this.nodeCarriesPayloadContract(first, false)
+      ? 'value'
+      : 'opaque';
+  }
+
+  /**
+   * True when the signature a call resolves to leaves its first parameter
+   * open: declared `any` or `unknown`, or with a type that names a type
+   * parameter, and not a rest parameter. That is how a library declares a
+   * body slot, because it cannot know the body: `json(body?: ResBody)`. A
+   * parameter it gives a type of its own (`destroy(error?: Error)`,
+   * `headers(values: HeaderMap)`) takes that type and nothing else, which is
+   * `memberIsFixedByItsLibrary` asked of a parameter.
+   */
+  private firstParameterIsOpen(call: CallExpression): boolean {
+    try {
+      return this.declaresAnOpenFirstParameter(
+        this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration()
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** `firstParameterIsOpen` asked of a signature's own declaration. */
+  private declaresAnOpenFirstParameter(declaration: Node | undefined): boolean {
+    const parameter =
+      declaration && 'getParameters' in declaration
+        ? (declaration as unknown as { getParameters(): ParameterDeclaration[] }).getParameters()[0]
+        : undefined;
+    if (!parameter || parameter.isRestParameter()) return false;
+    const typeNode = parameter.getTypeNode();
+    // No annotation is an implicit `any`.
+    if (!typeNode) return true;
+    const kind = typeNode.getKind();
+    if (kind === SyntaxKind.AnyKeyword || kind === SyntaxKind.UnknownKeyword) return true;
+    return this.namesATypeParameter(typeNode);
+  }
+
+  /**
+   * The HTTP status a NUMBER states: `statedStatusCodes` asked only of a
+   * value that is a number. The codes of a literal in the HTTP range, or of a
+   * value the checker resolves to literals (a constant, an enum member);
+   * `'variable'` for a number the source does not fix; and `undefined` for
+   * anything that is not a number, or a literal outside the range. An object
+   * with a `status` member is not read here: an argument of a call in a
+   * chain states a status by being one.
+   */
+  private statusNumber(node: Node): number[] | 'variable' | undefined {
+    const value = this.peelTransparentExpression(node);
+    const type = value.getType();
+    const members = type.isUnion() ? type.getUnionTypes() : [type];
+    if (!members.every((member) => member.isNumber() || member.isNumberLiteral())) {
+      return undefined;
+    }
+    // A literal outside the HTTP range (a timeout, a count) states no status.
+    return (
+      this.statedStatusCodes(value) ??
+      (members.some((member) => member.isNumber()) ? 'variable' : undefined)
+    );
+  }
+
+  /**
+   * What a send through a parameter states about its status, read in order:
+   * what `responseSiteStatus` reads off the call itself (an argument beside
+   * the body, the result's type), then a number handed to an earlier call of
+   * its chain (`res.status(404).json(...)`), then the nearest statement before
+   * it on its path that states one on the same parameter: a call on it handed
+   * numbers alone, or a member of it assigned a number.
+   */
+  private sendStatus(
+    send: DirectCall,
+    handler: FunctionLike,
+    calls: DirectCall[],
+    assignments: Array<{ parameter: Node; assignment: BinaryExpression }>
+  ): ResponseSiteStatus {
+    const own = this.responseSiteStatus(send.call);
+    if (own !== 'undecided') return own;
+
+    const classify = (
+      stated: Array<number[] | 'variable' | undefined>
+    ): ResponseSiteStatus | undefined => {
+      const codes = stated.flatMap((entry) => (Array.isArray(entry) ? entry : []));
+      if (codes.length > 0) {
+        const kind = classifyStatusCodes(codes);
+        return kind === 'mixed' ? 'variable' : kind;
+      }
+      return stated.includes('variable') ? 'variable' : undefined;
+    };
+    const numbersOf = (call: CallExpression) =>
+      call.getArguments().map((arg) => this.statusNumber(arg));
+
+    const inChain = classify([send.call, ...send.earlier].flatMap(numbersOf));
+    if (inChain) return inChain;
+
+    for (const statement of statementsBefore(send.call, handler)) {
+      if (!Node.isExpressionStatement(statement)) continue;
+      const expression = this.peelTransparentExpression(statement.getExpression());
+      const call = calls.find(
+        (use) => use.call === expression && use.parameter === send.parameter
+      );
+      if (call) {
+        const stated = classify([call.call, ...call.earlier].flatMap(numbersOf));
+        if (stated) return stated;
+        continue;
+      }
+      const assigned = assignments.find(
+        (use) => use.assignment === expression && use.parameter === send.parameter
+      );
+      if (assigned) {
+        const stated = classify([this.statusNumber(assigned.assignment.getRight())]);
+        if (stated) return stated;
+      }
+    }
+    return 'undecided';
+  }
+
+  /**
+   * The request body of a function read as the route's handler, for a request
+   * located at the handler (carrick#1913): what its parameters declare, then
+   * what the source states at the read of the platform request it was handed.
+   * A handler that states neither is answered `unknown` with its reason: the
+   * span of a function, run again by the capture, prints the function.
+   */
+  private handlerRequest(request: InferRequestItem, handler: FunctionLike): InferredType {
+    const unread = (detail: string): InferredType =>
+      this.decidedAbstain(request, handler, 'handler_body_unread', detail);
+    const published = (read: InferredType): InferredType =>
+      textHoldsTopType(read.type_string)
+        ? unread(
+            "the body the handler declares holds a member typed 'any' or 'unknown', and a " +
+              'request located at a handler cannot carry one, so the route publishes no body here'
+          )
+        : read;
+    const annotated = this.requestBodyFromHandlerParams(handler);
+    if (annotated) {
+      return published(
+        this.declaredRequestInferredType(
+          request,
+          { text: annotated },
+          this.getNodeLocation(handler)
+        )
+      );
+    }
+    const read = this.platformBodyReadIn(handler);
+    const stated = read ? this.requestStatedAtBodyRead(request, read) : null;
+    if (stated) return published(stated);
+    return this.decidedAbstain(
+      request,
+      handler,
+      'handler_body_unread',
+      'no parameter of the handler declares the body it reads, and no read of the request ' +
+        'it was handed states one'
+    );
+  }
+
+  // ===========================================================================
   // Route-Registration Handler Resolution
   // ===========================================================================
 
@@ -6035,17 +7186,23 @@ export class TypeInferrer {
   }
 
   /**
-   * The handler function referenced by a route-registration call: the first
+   * The handler function referenced by a route-registration call: the LAST
    * argument that is an inline function, or an identifier bound to a function
-   * (typically the 2nd+ arg — the path literal is not function-valued, so it is
-   * skipped naturally). No callee-name check: a call whose argument resolves to
-   * a function is structurally a registration regardless of the framework.
+   * (the path literal is not function-valued, so it is skipped naturally). No
+   * callee-name check: a call whose argument resolves to a function is
+   * structurally a registration regardless of the framework.
+   *
+   * The last, because the functions a registration is handed run in the order
+   * they are written and the one that answers runs after the ones that guard
+   * it (carrick#1913). Taking the first read `requireKey` as the handler of
+   * `router.get(path, requireKey, showWidget)`, and a guard returns nothing.
    */
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
-    for (const arg of call.getArguments()) {
-      const handler = this.asHandlerFunction(arg);
+    const args = call.getArguments();
+    for (let index = args.length - 1; index >= 0; index--) {
+      const handler = this.asHandlerFunction(args[index]);
       if (handler) {
         return handler;
       }
@@ -6088,7 +7245,7 @@ export class TypeInferrer {
    * declaration is — or initializes to — a function. Anything else (a path
    * literal, an object, a non-function binding) yields undefined.
    */
-  private asHandlerFunction(node: Node): FunctionLike | undefined {
+  private asHandlerFunction(node: Node, followWrappers = true): FunctionLike | undefined {
     const expr = this.unwrapExpressionNode(node);
 
     if (Node.isArrowFunction(expr) || Node.isFunctionExpression(expr)) {
@@ -6097,7 +7254,7 @@ export class TypeInferrer {
 
     if (Node.isIdentifier(expr)) {
       for (const def of expr.getDefinitionNodes()) {
-        const func = this.functionFromDeclaration(def);
+        const func = this.functionFromDeclaration(def, followWrappers);
         if (func) {
           return func;
         }
@@ -6113,8 +7270,13 @@ export class TypeInferrer {
    * declaration / binding whose initializer is an inline function yields that
    * function (`const h = async () => { … }`). Import/re-export shims are walked
    * by ts-morph's `getDefinitionNodes`, so no manual import chasing is needed.
+   *
+   * carrick#1912: a binding whose initializer is a CALL that wraps the
+   * function (`const h = guarded<Body>(async (req, res) => { … })`) yields the
+   * function the call wraps (`functionWrappedBy`), unless `followWrappers` is
+   * off.
    */
-  private functionFromDeclaration(decl: Node): FunctionLike | undefined {
+  private functionFromDeclaration(decl: Node, followWrappers = true): FunctionLike | undefined {
     if (Node.isFunctionDeclaration(decl)) {
       return decl;
     }
@@ -6141,10 +7303,42 @@ export class TypeInferrer {
         if (Node.isArrowFunction(inner) || Node.isFunctionExpression(inner)) {
           return inner;
         }
+        if (followWrappers && Node.isCallExpression(inner)) {
+          return this.functionWrappedBy(inner, 0);
+        }
       }
     }
 
     return undefined;
+  }
+
+  /**
+   * The function a call wraps, for a handler bound to that call
+   * (carrick#1912): its one argument that is a function literal, a name bound
+   * to one, or another such call, a few calls deep.
+   *
+   * Two conditions keep this to wrappers. The call's own value has to be a
+   * function, because the binding is used as a handler: `rows.map((row) => …)`
+   * is handed a function and yields a list. And exactly one argument may be a
+   * function: with two there is no saying which of them is wrapped.
+   */
+  private functionWrappedBy(call: CallExpression, depth: number): FunctionLike | undefined {
+    if (depth >= WRAPPER_MAX_DEPTH) return undefined;
+    if (!this.isCallableType(call.getType())) return undefined;
+    const wrapped: FunctionLike[] = [];
+    for (const arg of call.getArguments()) {
+      const value = this.unwrapExpressionNode(arg);
+      const func =
+        Node.isArrowFunction(value) || Node.isFunctionExpression(value)
+          ? value
+          : Node.isCallExpression(value)
+            ? this.functionWrappedBy(value, depth + 1)
+            : Node.isIdentifier(value)
+              ? this.asHandlerFunction(value, false)
+              : undefined;
+      if (func) wrapped.push(func);
+    }
+    return wrapped.length === 1 ? wrapped[0] : undefined;
   }
 
   /**
@@ -6881,11 +8075,16 @@ export class TypeInferrer {
             ? declaration.getReturnTypeNode()
             : undefined;
       if (!typeNode) return false;
-      const names = [typeNode, ...typeNode.getDescendants()].filter(Node.isIdentifier);
-      return !names.some((name) =>
-        (name.getSymbol()?.getDeclarations() ?? []).some(Node.isTypeParameterDeclaration)
-      );
+      return !this.namesATypeParameter(typeNode);
     });
+  }
+
+  /** True when a written type names a type parameter anywhere in it. */
+  private namesATypeParameter(typeNode: Node): boolean {
+    const names = [typeNode, ...typeNode.getDescendants()].filter(Node.isIdentifier);
+    return names.some((name) =>
+      (name.getSymbol()?.getDeclarations() ?? []).some(Node.isTypeParameterDeclaration)
+    );
   }
 
   /**

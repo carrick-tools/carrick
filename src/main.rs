@@ -65,6 +65,7 @@ mod receiver_origin;
 mod receiver_type;
 mod request_summary;
 mod retry_budget;
+mod route_handler_anchor;
 mod scan_health;
 mod scan_spend;
 mod scan_stage;

@@ -1,0 +1,7 @@
+{
+  "name": "named-handler-response",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: routes registered with a handler passed by name and declared in another file (carrick#1913)",
+  "main": "src/routes.ts"
+}

@@ -57,9 +57,15 @@ pub enum InferKind {
     CallResult,
     /// Get type of a variable declaration
     Variable,
-    /// Find response body (.json()/.send()/ctx.body)
+    /// Find response body (.json()/.send()/ctx.body). An item whose span is a
+    /// function's own declaration asks about the route that function handles:
+    /// what it returns, or what it sends through the transport it was handed
+    /// (carrick#1913). Such an item is always answered, with a type or with a
+    /// decided `unknown`.
     ResponseBody,
-    /// Find request body (req.body/ctx.request.body or call payloads)
+    /// Find request body (req.body/ctx.request.body or call payloads). An item
+    /// whose span is a function's own declaration asks what that handler reads
+    /// as its body (carrick#1913).
     RequestBody,
     /// Function return for the signature hint — NO Promise/wrapper unwrapping
     SignatureReturn,
@@ -426,7 +432,7 @@ pub struct TypeProvenance {
     /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
-    /// `not_recorded`.
+    /// `not_recorded`, `no_response_body`, `handler_body_unread`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1212,6 +1218,24 @@ pub struct InferredType {
     /// the check phase reads the pair unverifiable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw_text_read: bool,
+    /// carrick#1961: the node the answer was read from, when its text holds
+    /// `any` or `unknown` and that node carries the same type. Such a text is
+    /// not carried as a literal, and `derive_capture_anchors` sends the
+    /// capture this node in place of the request's own locator, which for a
+    /// request located at a handler or a registration is the function or the
+    /// registration call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_at: Option<RereadAt>,
+}
+
+/// Where the capture reads an answer the scanner cannot carry as text
+/// (carrick#1961): an absolute file and a span in the sidecar's numbering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RereadAt {
+    pub file_path: String,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub line_number: u32,
 }
 
 /// The declaration a bare name in an inference's printed text meant
@@ -4886,6 +4910,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            reread_at: None,
         }
     }
 

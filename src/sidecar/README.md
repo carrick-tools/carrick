@@ -694,6 +694,49 @@ Each item locates one expression. The fields are `file_path`, `line_number` and 
 
 `extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
 
+**A request located at a handler** (carrick#1913). A route whose registration names a handler declared in another file has nothing to locate in the registration file, so the scanner asks at the handler: a `response_body` item whose `file_path` is the handler's own file and whose span is the handler's own declaration. The span is the function, or the binding whose initializer is the function or a call that wraps it (`renameWidget = guarded<NewWidget>(async (req, res) => { … })`), or the statement that declares that one binding. `line_number` is the declaration's first line. A `request_body` item with the same locator asks what the handler reads as its body. No other field is added and no `infer_kind` is new: an `infer_kind` a sidecar does not know fails the whole batch. This request is only sent by a scanner that ships with a sidecar that reads it.
+
+```json
+{
+  "request_id": "5",
+  "action": "infer",
+  "requests": [
+    {
+      "file_path": "src/handlers/widgets.ts",
+      "line_number": 13,
+      "infer_kind": "response_body",
+      "alias": "Endpoint_3c1f_Response",
+      "span_start": 412,
+      "span_end": 530
+    }
+  ]
+}
+```
+
+The function is read as the route's handler, and the item is always answered, with a type or with `unknown` and a reason at the root of `any_provenance`:
+
+| The handler | Answer |
+|---|---|
+| returns a value | the awaited return, as `function_return` reads it |
+| returns a send (`return res.json(body)`) | the body the send was given |
+| returns nothing and sends through a parameter (`res.status(201).json(created)`) | the join of the bodies its sends were given; `void` is never the answer |
+| ends the response without a value (`res.status(204).end()`) | `unknown`, reason `no_response_body` |
+| sends only error or redirect statuses | `unknown`, reason `no_success_payload` |
+| sends a body that holds `any` or `unknown`, from one expression | the body's text, with `reread_at` naming that expression |
+| anything else | `unknown`, reason `handler_body_unread`, with a sentence saying what was in the way |
+
+A send through a parameter is read from types and structure, never from a method's name: a method called directly on a parameter of the handler (or at the end of a chain of calls on it), where the parameter's type is transport a library or the platform declares (or a type of the repo's that extends one) and transport a body can be handed to (a request has no method that takes one, so nothing is read as sent through a request), the method's own declaration leaves its first parameter open (`any`, `unknown` or a type parameter), the first argument reads as a payload, and the call is the last thing the handler does with its parameters on that path. A path joins when it states no status or a success one. The status is the number the source writes: a literal, or a constant the checker resolves to one, handed to an earlier call of the chain, written beside the body, or set on the same parameter by the statement before. An error or redirect path is left out. A path whose status is not a written number (`res.status(code)`) does not join, and with no other path the handler is unread. A catch clause answers a failure and is not read. A read of the parameter (a member read, or a call whose value is used) is not a send and does not count as a later use.
+
+A path that ends by handing the parameter to another function, as an argument or inside an object literal that is one, is followed into that function, one level: its last sends through the parameter the transport arrives in are read by the same rule, so an error helper leaves the path out and a helper that sends a body joins it. The path is never dropped on the guess that the function reports an error. The handler is unread when that function has no body in the program, has more than one declaration, is not named by the call, does not take the transport in a parameter of its own, or hands it on again.
+
+The handler is also unread (`handler_body_unread`) when the send is inside a function it declares, when it sets the body by assignment, when it returns a value on one path and sends through a parameter on another, and when it is bound to a wrapper call that does not return what the wrapped function returns.
+
+A body that holds `any` or `unknown` (an open member, say) is answered with its text and with `reread_at`: the file and span of the one expression it was read from (carrick#1961). The scanner does not carry such a text as a literal; it has the capture read a node, so the capture's record can say which positions are open and why. `reread_at` is that node. Without it the capture would read the request's own locator, which here is the handler, and print the function. A body with an open member that was joined from several sends, or read off a declared return, has no one expression and is unread.
+
+The same handler is read, and the item is answered the same way, from two other locators: the line the handler opens on with no span, and the span of the handler's own name where a registration is handed it (`createWidget` in `router.post('/widgets', requireKey, createWidget)`), which is followed through imports, re-exports and a wrapper binding. The span of a bare call is not one of them: a call is read as a registration.
+
+A request located at a registration reads the same handler: `response_body` by the registration's line or call span, and `function_return` by its line when the handler is declared outside the registration. The handler is the last argument of the registration that is a function, so a named middleware in front of it is not read in its place, and a handler bound to a wrapper call is followed to the function the call wraps. A response schema the registration declares still comes first. Where the registration is handed its handler as a function literal and that handler's return already answered the request, that answer stands.
+
 A `response_body` or `function_return` answer can also carry `unwidened_type_string`: the same inference read again with every literal on the handler's path kept at its literal type (`scope: "all" | "specific"` where `type_string` says `scope: string`). It is absent when the two are the same, and when keeping the literals added a diagnostic on the path. The reading of one batch stops after 120 seconds and keeps the answers it has.
 
 ```json
