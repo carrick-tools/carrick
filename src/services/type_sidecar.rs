@@ -3557,6 +3557,36 @@ fn answered_in_order(
 mod tests {
     use super::*;
 
+    /// carrick#2054: the sidecar reports `response_modes` on a response
+    /// joined from several bodies, and nothing on this side reads it yet. An
+    /// inference that carries it must come through as the same value, so no
+    /// stored artifact changes until the reader of the field lands.
+    #[test]
+    fn an_inference_with_response_modes_reads_as_one_without_them() {
+        let without = serde_json::json!({
+            "alias": "Route",
+            "type_string": "{ x: number; } | { y: string; }",
+            "is_explicit": false,
+            "source_location": { "file_path": "/repo/src/route.ts", "start_line": 3, "end_line": 3 },
+            "infer_kind": "response_body",
+        });
+        let mut with = without.clone();
+        with["response_modes"] = serde_json::json!({
+            "reads": [{ "location": "query", "field": "mode" }],
+            "cases": [
+                { "value": "a", "type_string": "{ x: number; }" },
+                { "value": null, "type_string": "{ y: string; }" },
+            ],
+        });
+
+        let read_without: InferredType = serde_json::from_value(without).unwrap();
+        let read_with: InferredType = serde_json::from_value(with).unwrap();
+        assert_eq!(
+            serde_json::to_value(&read_with).unwrap(),
+            serde_json::to_value(&read_without).unwrap()
+        );
+    }
+
     /// The cap tracks the machine, with a floor and a ceiling. Without one,
     /// V8's own default (~4 GB) killed the sidecar on a ~2.9k-file program
     /// (carrick#535); without the other, a small runner would be handed a

@@ -28,7 +28,7 @@
  * gets through, and the json read that follows is the payload.
  */
 
-import { Node, SyntaxKind } from 'ts-morph';
+import { Node, SyntaxKind, type CaseOrDefaultClause, type SwitchStatement } from 'ts-morph';
 
 /** A set of HTTP statuses, as the predicate that admits them. */
 export type Statuses = (status: number) => boolean;
@@ -101,7 +101,8 @@ export function reachedOnlyOnFailure(
  * an `if` or a conditional expression it sits in, or an earlier `if` in an
  * enclosing block one of whose branches cannot complete, which leaves the
  * rest of the block to the other side. A test that does not read the
- * response's `ok` or `status` is not listed.
+ * response's `ok` or `status` is not listed. A `switch` is not read here:
+ * `retype.ts` finds one by its own climb.
  */
 export function testsOnPath(
   node: Node,
@@ -109,10 +110,42 @@ export function testsOnPath(
   isResponse: (node: Node) => boolean
 ): SideTaken[] {
   const sides: SideTaken[] = [];
-  const take = (test: StatusTest, whenTrue: boolean) => {
-    if (test === UNRELATED) return;
-    sides.push({ admits: whenTrue ? test.whenTrue : test.whenFalse, inexact: test.inexact });
-  };
+  for (const step of stepsOnPath(node, boundary)) {
+    if (step.kind !== 'branch') continue;
+    const test = readTest(step.condition, isResponse);
+    if (test === UNRELATED) continue;
+    sides.push({ admits: step.whenTrue ? test.whenTrue : test.whenFalse, inexact: test.inexact });
+  }
+  return sides;
+}
+
+/**
+ * One test on the path to a node, as the side the node is on. `test` is the
+ * statement or expression that tests, so two nodes under the same test share
+ * it.
+ *
+ *  - `branch`: an `if` or a conditional expression, and whether the node is
+ *    on its true side: the branch the node sits in or, for an earlier `if` in
+ *    an enclosing block one of whose branches cannot complete, the side that
+ *    did not leave.
+ *  - `clause`: the node sits in this clause of a `switch`.
+ *  - `after-switch`: the node follows a `switch` in an enclosing block.
+ */
+export type PathStep =
+  | { kind: 'branch'; test: Node; condition: Node; whenTrue: boolean }
+  | { kind: 'clause'; test: SwitchStatement; clause: CaseOrDefaultClause }
+  | { kind: 'after-switch'; test: SwitchStatement };
+
+/**
+ * Every test on the path from `node` up to `boundary` (the whole file when it
+ * is `undefined`), whatever it reads, innermost first. `testsOnPath` reads
+ * the branches as statuses; `response-modes.ts` reads branches and switches
+ * as values of a request field (carrick#2054).
+ */
+export function stepsOnPath(node: Node, boundary: Node | undefined): PathStep[] {
+  const steps: PathStep[] = [];
+  const branch = (test: Node, condition: Node, whenTrue: boolean) =>
+    steps.push({ kind: 'branch', test, condition, whenTrue });
 
   for (
     let child: Node = node, parent = node.getParent();
@@ -121,15 +154,20 @@ export function testsOnPath(
   ) {
     if (Node.isIfStatement(parent)) {
       if (child === parent.getThenStatement()) {
-        take(readTest(parent.getExpression(), isResponse), true);
+        branch(parent, parent.getExpression(), true);
       } else if (child === parent.getElseStatement()) {
-        take(readTest(parent.getExpression(), isResponse), false);
+        branch(parent, parent.getExpression(), false);
       }
     } else if (Node.isConditionalExpression(parent)) {
       if (child === parent.getWhenTrue()) {
-        take(readTest(parent.getCondition(), isResponse), true);
+        branch(parent, parent.getCondition(), true);
       } else if (child === parent.getWhenFalse()) {
-        take(readTest(parent.getCondition(), isResponse), false);
+        branch(parent, parent.getCondition(), false);
+      }
+    } else if (Node.isCaseClause(parent) || Node.isDefaultClause(parent)) {
+      const statement = parent.getParent()?.getParent();
+      if (statement && Node.isSwitchStatement(statement)) {
+        steps.push({ kind: 'clause', test: statement, clause: parent });
       }
     }
 
@@ -141,19 +179,23 @@ export function testsOnPath(
     ) {
       for (const statement of parent.getStatements()) {
         if (statement === child) break;
+        if (Node.isSwitchStatement(statement)) {
+          steps.push({ kind: 'after-switch', test: statement });
+          continue;
+        }
         if (!Node.isIfStatement(statement)) continue;
         const otherwise = statement.getElseStatement();
         const thenLeaves = cannotComplete(statement.getThenStatement());
         const elseLeaves = otherwise !== undefined && cannotComplete(otherwise);
         if (thenLeaves && !elseLeaves) {
-          take(readTest(statement.getExpression(), isResponse), false);
+          branch(statement, statement.getExpression(), false);
         } else if (elseLeaves && !thenLeaves) {
-          take(readTest(statement.getExpression(), isResponse), true);
+          branch(statement, statement.getExpression(), true);
         }
       }
     }
   }
-  return sides;
+  return steps;
 }
 
 /** The statuses `condition` lets through when it is true and when it is false. */
@@ -282,7 +324,7 @@ export function readsResponseStatus(node: Node, isResponse: (node: Node) => bool
  * `switch` or a `try` is read as one that can complete, which only ever
  * leaves a read on the path it was on.
  */
-function cannotComplete(statement: Node): boolean {
+export function cannotComplete(statement: Node): boolean {
   if (
     Node.isReturnStatement(statement) ||
     Node.isThrowStatement(statement) ||

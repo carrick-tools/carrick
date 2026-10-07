@@ -3,6 +3,8 @@
  * These types define the JSON messages exchanged between Rust and the Node.js sidecar
  */
 
+import type { ResponseModes } from './response-modes.js';
+
 // ============================================================================
 // Inference Kind Enum
 // ============================================================================
@@ -1073,6 +1075,15 @@ export interface InferredType {
    * Absent when the body is not a raw-text read.
    */
   raw_text_read?: true;
+  /**
+   * carrick#2054, a response joined from two or more success bodies: the
+   * request fields whose values pick among them (`reads`), and, for one
+   * query parameter or body field whose every test the reading follows, the
+   * union each stated value receives (`cases`). `type_string` is unchanged.
+   * Absent when no request read separates the bodies, or when every value
+   * receives the same union.
+   */
+  response_modes?: ResponseModes;
 }
 
 /**

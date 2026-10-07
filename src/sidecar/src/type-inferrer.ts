@@ -55,6 +55,7 @@ import { validateInferRequestItem } from './validators.js';
 import { notePrintedType, PrintedTypes } from './printed-names.js';
 import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
+import { readResponseModes, type JoinedBody, type ResponseModes } from './response-modes.js';
 import { functionAtLine } from './function-line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
@@ -246,6 +247,22 @@ interface RecoveredPayload {
   nodes: Node[];
   anchorType?: Type;
   statedTypeNode?: Node;
+  /** carrick#2054: see `InferredType.response_modes`. */
+  responseModes?: ResponseModes;
+}
+
+/**
+ * The items whose whitespace-collapsed texts differ, first of each kept, in
+ * order: how a joined union drops a member it already has.
+ */
+function distinctByText<T>(items: T[], text: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = text(item).replace(/\s+/g, ' ').trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** `value` when it is an integer in the HTTP status range, else `undefined`. */
@@ -1816,7 +1833,7 @@ export class TypeInferrer {
       resolvedSymbol !== undefined && recoveredAnchor
         ? this.primaryTypeSymbolSource(recoveredAnchor.element)
         : undefined;
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       recovered.typeString,
       recovered.isExplicit,
@@ -1826,6 +1843,8 @@ export class TypeInferrer {
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
       writtenAnchor ? writtenAnchor.source : resolvedSource
     );
+    if (recovered.responseModes) inferred.response_modes = recovered.responseModes;
+    return inferred;
   }
 
   /**
@@ -4976,17 +4995,14 @@ export class TypeInferrer {
     const withMembers = candidates.filter((c) => !isEmptyObject(c.typeString));
     const kept = withMembers.length > 0 ? withMembers : candidates;
 
-    // Dedupe on the whitespace-collapsed text, preserving source order.
-    const seen = new Set<string>();
-    const distinct = kept.filter((c) => {
-      const key = c.typeString.replace(/\s+/g, ' ').trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
+    const distinct = distinctByText(kept, (c) => c.typeString);
     const typeString = distinct.map((c) => c.typeString).join(' | ');
     return {
+      // carrick#2054: which request field picks each member of the union.
+      responseModes:
+        distinct.length >= 2
+          ? this.responseModesOf(kept.map((c) => ({ node: c.node, type_string: c.typeString })))
+          : undefined,
       typeString,
       // Every payload node that fed the union, deduped ones included: a
       // caller asks whether the expression it located is one of them.
@@ -5000,6 +5016,24 @@ export class TypeInferrer {
       statedTypeNode:
         distinct.length === 1 ? distinct[0].statedTypeNode : undefined,
     };
+  }
+
+  /**
+   * The request field each member of a joined union answers
+   * (`response-modes.ts`). Case texts are joined by the published union's
+   * rule. A reading that fails is no reading: it must never cost the union.
+   */
+  private responseModesOf(bodies: JoinedBody[]): ResponseModes | undefined {
+    try {
+      return readResponseModes(
+        bodies,
+        (texts) => distinctByText(texts, (text) => text).join(' | '),
+        (symbol) => this.symbolIsLibOrExternalOrigin(symbol)
+      );
+    } catch (error) {
+      this.log(`Response modes not read: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
   }
 
   /**

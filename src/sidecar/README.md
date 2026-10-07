@@ -698,6 +698,8 @@ Each item locates one expression. The fields are `file_path`, `line_number` and 
 
 A `response_body` or `function_return` answer can also carry `unwidened_type_string`: the same inference read again with every literal on the handler's path kept at its literal type (`scope: "all" | "specific"` where `type_string` says `scope: string`). It is absent when the two are the same, and when keeping the literals added a diagnostic on the path. The reading of one batch stops after 120 seconds and keeps the answers it has.
 
+An answer whose `type_string` joins two or more success bodies can also carry `response_modes` (carrick#2054): which request fields the handler's branches test to choose among those bodies. `reads` lists each field as `{ location, field }`, where `location` is `query` (a `.get(...)` on the platform `URLSearchParams`), `body` (a top-level property of an awaited platform or library `json()`), or `unplaced` (a header, a path parameter, a framework accessor, or anything else). Only tests that separate two of the joined bodies count; an error-only guard does not. For one placed field whose every test compares it with a string literal (`===`, `==`, `!==`, `!=`, `!`, or `switch` labels), `cases` gives the union each value receives, `{ value, type_string }`, sorted by value, with `value: null` last for any value no other case names. A body sent under no test of the field is in every case. `response_modes` is absent when no request read separates the bodies, or when every value receives the same union; `type_string` does not change.
+
 ```json
 {
   "request_id": "4",
