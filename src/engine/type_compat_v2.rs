@@ -1756,12 +1756,6 @@ pub(crate) const SAME_SERVICE_MISMATCH_NOT_REPORTED: &str =
 /// The gate a held-back same-service mismatch is stamped with.
 const SAME_SERVICE_GATE: &str = "same_service";
 
-/// What the check found on a held-back pair, worded once for the stored note
-/// and the run log's line (carrick#2053).
-fn held_back_finding(found: &str) -> String {
-    format!("what the check found: {found}")
-}
-
 /// Publish every same-service pair the check found incompatible as
 /// unverifiable, saying why ([`SAME_SERVICE_MISMATCH_NOT_REPORTED`]).
 ///
@@ -1773,13 +1767,13 @@ fn held_back_finding(found: &str) -> String {
 /// not a fact a pull request should fail on. A same-service `compatible`, an
 /// unverifiable half and every pair of two services are unchanged.
 ///
-/// What the check found is kept (carrick#2053): its text stays as the
-/// outcome's `diagnostic` (a retype mismatch's text already names the
-/// consumer's lines) and rides as a note, because a direction's `reason`
-/// exists only on `incompatible` and would read as the mismatch this holds
-/// back. The notes the check already made stay too: the comparison happened.
-/// The consumer's lines are cleared as such, since a finding projects them as
-/// the places of a mismatch.
+/// What the check found stays as the outcome's `diagnostic` (carrick#2053; a
+/// retype mismatch's text already names the consumer's lines), and the run
+/// log prints it after the sentence. Nothing a reader of the index sees
+/// changes: the stored half is unverifiable with the sentence as its reason,
+/// no `reason` and no notes, because a note reaches agents and a held-back
+/// mismatch is not for them. The consumer's lines are cleared as such, since
+/// a finding projects them as the places of a mismatch.
 ///
 /// Done here, on the outcomes, because every reader starts from them: the
 /// stored verdict rows, the edges' `type_compatible`, and the findings a pull
@@ -1794,11 +1788,9 @@ fn hold_back_same_service_mismatches(outcomes: &mut [PairCheckOutcome]) {
         outcome.bucket = VerdictBucket::Unverifiable;
         outcome.gate = Some(SAME_SERVICE_GATE.to_string());
         outcome.diagnostic = outcome.diagnostic.take().filter(|found| !found.is_empty());
-        if let Some(found) = outcome.diagnostic.as_deref() {
-            outcome.notes.push(held_back_finding(found));
-        }
         outcome.resolved = false;
         outcome.unresolved_reason = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.notes.clear();
         outcome.consumer_reads.clear();
     }
 }
@@ -2405,7 +2397,7 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
     let found = match outcome.diagnostic.as_deref() {
         Some(found) if outcome.gate.as_deref() == Some(SAME_SERVICE_GATE) => {
             let one_line = found.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!("; {}", held_back_finding(&one_line))
+            format!("; what the check found: {one_line}")
         }
         _ => String::new(),
     };
@@ -2432,8 +2424,7 @@ fn outcome_for(
     // Empty for every outcome this module SYNTHESISES — a pre-verdicted pair,
     // a pair the check returned nothing for, a run that did not happen —
     // since none of those compared anything to observe. Only a real
-    // `CheckVerdict.notes` is non-empty here; the retype and the hold-back
-    // add their own after the check.
+    // `CheckVerdict.notes` is ever non-empty here.
     notes: Vec<String>,
 ) -> PairCheckOutcome {
     PairCheckOutcome {
@@ -5276,18 +5267,11 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
         assert!(!held.resolved);
-        // What the check found stays: its text on the outcome, and as a note
-        // beside the check's own notes. The consumer lines cannot ride a
-        // mismatch, so they are cleared (their places are in the text).
+        // What the check found stays on the outcome (carrick#2053), for the
+        // run log. Its notes and the consumer lines do not ride a held-back
+        // half, as before.
         assert_eq!(held.diagnostic.as_deref(), Some("the check's text"));
-        assert_eq!(
-            held.notes,
-            vec![
-                "a note".to_string(),
-                "what the check found: the check's text".to_string()
-            ]
-        );
-        assert!(held.consumer_reads.is_empty());
+        assert!(held.notes.is_empty() && held.consumer_reads.is_empty());
         assert_eq!(
             format!("{:?}", &after[1..]),
             format!("{:?}", &before[1..]),
@@ -5323,13 +5307,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             response.unresolved_reason.as_deref(),
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
-        assert_eq!(
-            response.notes,
-            vec![
-                "a note".to_string(),
-                "what the check found: the check's text".to_string()
-            ],
-            "the stored half carries what the check found"
+        assert!(
+            response.notes.is_empty(),
+            "a note reaches agents; the finding is for the run log"
         );
         let mut edges = vec![edge];
         crate::analyzer::apply_pair_outcomes(&after[..1], &mut edges);
@@ -5387,41 +5367,42 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
     }
 
     /// carrick#2053: a same-service mismatch the check found is held back,
-    /// and what it found stays on the half. The mismatch is a note, never
-    /// the half's `reason` (a reason is read as a mismatch), and the held-back
-    /// sentence is still why the half is unverifiable.
+    /// and what it found stays on the outcome for the run log. What a reader
+    /// of the index sees is exactly what it was: the half is unverifiable
+    /// with the sentence as its reason, and carries no `reason` (a reason is
+    /// read as a mismatch) and no note (a note reaches agents).
     #[test]
-    fn a_held_back_mismatch_keeps_what_the_check_found_as_a_note() {
+    fn a_held_back_mismatch_keeps_what_the_check_found_off_the_stored_half() {
         let mut outcomes = vec![same_service_outcome(
             VerdictBucket::Incompatible,
             Some("Property 'y' is missing in type '{ x: string; }'."),
-            Vec::new(),
+            vec!["a note the check made".to_string()],
         )];
         hold_back_same_service_mismatches(&mut outcomes);
 
-        let stored = stored_response_half(&outcomes[0]);
-        assert_eq!(stored.verdict, crate::operation::TypeVerdict::Unverifiable);
-        assert_eq!(stored.reason, None, "a finding is never a reason");
-        assert!(!stored.resolved);
         assert_eq!(
-            stored.unresolved_reason.as_deref(),
-            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+            outcomes[0].diagnostic.as_deref(),
+            Some("Property 'y' is missing in type '{ x: string; }'.")
         );
         assert_eq!(
-            stored.notes,
-            vec![
-                "what the check found: Property 'y' is missing in type '{ x: string; }'."
-                    .to_string()
-            ]
+            stored_response_half(&outcomes[0]),
+            crate::cloud_storage::DirectionVerdict {
+                verdict: crate::operation::TypeVerdict::Unverifiable,
+                reason: None,
+                resolved: false,
+                unresolved_reason: Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string()),
+                notes: Vec::new(),
+                producer_wider: false,
+            }
         );
     }
 
     /// carrick#2053: a mismatch the retype found names the consumer's own
-    /// reads, and those lines survive the hold-back inside the note. The
+    /// reads, and those lines stay in the outcome's text for the run log. The
     /// consumer lines are cleared as such, since a non-empty list is read as
     /// the places of a finding, which a held-back half is not.
     #[test]
-    fn a_held_back_retype_mismatch_keeps_the_consumer_lines_in_its_note() {
+    fn a_held_back_retype_mismatch_keeps_the_consumer_lines_in_its_text() {
         let mut outcome = same_service_outcome(VerdictBucket::Unverifiable, None, Vec::new());
         outcome.unresolved_reason = Some("the consumer type is 'unknown'".to_string());
         let item_id = outcome.pair_key.clone();
@@ -5455,25 +5436,25 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(held.bucket, VerdictBucket::Unverifiable);
         assert!(held.consumer_reads.is_empty());
         assert_eq!(
-            held.notes,
-            vec![
-                RETYPE_NOTE.to_string(),
-                "what the check found: the consumer uses what the producer's response does not \
-                 provide: src/client.ts:9: Property 'x' does not exist on type '{ y: number; }'.; \
+            held.diagnostic.as_deref(),
+            Some(
+                "the consumer uses what the producer's response does not provide: \
+                 src/client.ts:9: Property 'x' does not exist on type '{ y: number; }'.; \
                  src/client.ts:14: Property 'z' does not exist on type '{ y: number; }'."
-                    .to_string(),
-            ]
+            )
         );
+        // The retype's note is cleared with the rest, as before.
+        assert!(held.notes.is_empty());
         let stored = stored_response_half(held);
         assert_eq!(stored.verdict, crate::operation::TypeVerdict::Unverifiable);
         assert_eq!(stored.reason, None);
-        assert_eq!(stored.notes.len(), 2);
+        assert!(stored.notes.is_empty());
     }
 
     /// carrick#2053: a mismatch that came back with no text has nothing to
-    /// carry, so it adds no note rather than an empty one.
+    /// keep, so the outcome carries none rather than an empty string.
     #[test]
-    fn a_held_back_mismatch_with_no_text_adds_no_note() {
+    fn a_held_back_mismatch_with_no_text_keeps_no_text() {
         for diagnostic in [None, Some("")] {
             let mut outcomes = vec![same_service_outcome(
                 VerdictBucket::Incompatible,
@@ -5482,7 +5463,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )];
             hold_back_same_service_mismatches(&mut outcomes);
             assert_eq!(outcomes[0].bucket, VerdictBucket::Unverifiable);
-            assert!(outcomes[0].notes.is_empty(), "{diagnostic:?}");
+            assert_eq!(outcomes[0].diagnostic, None, "{diagnostic:?}");
         }
     }
 
@@ -5506,7 +5487,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             )
         );
 
-        // A compiler's chain is one line in the log and verbatim in the note.
+        // A compiler's chain is one line in the log and verbatim on the outcome.
         let chain = "Type 'A' is not assignable to type 'B'.\n  Types of property 'id' are \
                      incompatible.\n    Type 'string' is not assignable to type 'number'.";
         let mut chained = vec![same_service_outcome(
@@ -5524,10 +5505,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ),
             "{line}"
         );
-        assert_eq!(
-            chained[0].notes,
-            vec![format!("what the check found: {chain}")]
-        );
+        assert_eq!(chained[0].diagnostic.as_deref(), Some(chain));
 
         let mut nothing_found = vec![same_service_outcome(
             VerdictBucket::Incompatible,
@@ -6170,34 +6148,31 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "{outcomes:#?}"
         );
         // The mismatch the check found is published as not reported, and
-        // says so; what it found rides the half as a note (carrick#2053),
-        // never as a reason.
+        // says so; what it found stays on the outcome for the run log
+        // (carrick#2053) and on neither the half's reason nor its notes.
         let held = &outcomes[2];
         assert_eq!(held.gate.as_deref(), Some("same_service"));
         assert_eq!(
             held.unresolved_reason.as_deref(),
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
-        assert!(!held.resolved && held.consumer_reads.is_empty());
-        let found: Vec<&String> = held
-            .notes
-            .iter()
-            .filter(|note| note.starts_with("what the check found: "))
-            .collect();
-        assert_eq!(found.len(), 1, "{held:#?}");
+        assert!(!held.resolved && held.notes.is_empty() && held.consumer_reads.is_empty());
+        let found = held.diagnostic.as_deref().unwrap_or_default();
         assert!(
-            found[0].contains("'id'") && found[0].contains("string") && found[0].contains("number"),
-            "the note names the field the check found: {held:#?}"
+            found.contains("'id'") && found.contains("string") && found.contains("number"),
+            "the outcome names the field the check found: {held:#?}"
         );
-        assert_eq!(
-            held.diagnostic.as_deref(),
-            found[0].strip_prefix("what the check found: ")
+        let line = unresolved_pair_line(held).expect("a held-back pair is logged");
+        assert!(
+            line.contains(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+                && line.contains("; what the check found: ")
+                && line.contains("'id'")
+                && !line.contains('\n'),
+            "{line}"
         );
-        assert_eq!(
-            stored_response_half(held).reason,
-            None,
-            "a finding is never the stored half's reason"
-        );
+        let stored = stored_response_half(held);
+        assert_eq!(stored.reason, None, "a finding is never the stored reason");
+        assert!(stored.notes.is_empty(), "{stored:#?}");
         let any = &outcomes[0];
         assert!(!any.resolved);
         assert!(

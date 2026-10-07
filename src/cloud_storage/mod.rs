@@ -214,9 +214,7 @@ pub struct DirectionVerdict {
     /// Statements about this direction's comparison that are neither the
     /// verdict nor an unresolution (carrick#1341): an optionality gap that is
     /// legal and still a drift, and the note that the comparison was made
-    /// against the serialised form. A same-service mismatch the scan holds back
-    /// as `unverifiable` carries what the check found here (carrick#2053), since
-    /// `reason` is for a mismatch the scan reports.
+    /// against the serialised form.
     ///
     /// This field exists because `reason` cannot hold either of them. `reason`
     /// is present iff the verdict is `incompatible`, and both statements are
