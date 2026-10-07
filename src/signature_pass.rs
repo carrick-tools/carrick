@@ -1302,7 +1302,8 @@ mod tests {
     /// A stand-in sidecar that types every slot it is asked as `pid <its
     /// pid>`, after a short wait so that every process of a pool gets work.
     /// A request with a slot in a file whose name holds `die` ends the
-    /// process before it answers.
+    /// process before it answers. Its program holds the files it is given,
+    /// in order, which is what a pool copies between processes.
     fn stand_in(dir: &Path) -> std::path::PathBuf {
         let script = dir.join("stand-in-sidecar.cjs");
         std::fs::write(
@@ -1310,11 +1311,18 @@ mod tests {
             r#"
 const fs = require('fs');
 const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+const files = [];
 require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
   const request = JSON.parse(line);
   const request_id = request.request_id;
   if (request.action === 'shutdown') { write({ request_id, status: 'success' }); process.exit(0); }
   if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.action === 'list_program_files') return write({ request_id, status: 'success', files });
+  if (request.action === 'add_program_files') {
+    const added = request.files.filter((file) => !files.includes(file));
+    files.push(...added);
+    return write({ request_id, status: 'success', added: added.length });
+  }
   if (request.requests.some((item) => item.file_path.includes('die'))) process.exit(1);
   const until = Date.now() + 100;
   while (Date.now() < until) {}
