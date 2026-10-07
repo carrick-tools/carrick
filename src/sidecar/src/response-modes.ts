@@ -1,11 +1,11 @@
 /**
- * Which request field picks each member of a response union (carrick#2054).
+ * Which incoming-message field picks each member of a response union (carrick#2054).
  *
  * A handler that sends `{ x }` when `?mode=a` and `{ y }` otherwise publishes
  * `{ x } | { y }`. A call that states `mode=a` receives only `{ x }`, and a
  * call that states nothing may receive either. The union alone cannot say
  * which, so this reads it from the handler: for each success body the union
- * joined, the tests on its path that compare a value read from the request
+ * joined, the tests on its path that compare a value read from the incoming message
  * with a string literal.
  *
  * The reading, in order:
@@ -14,14 +14,14 @@
  *    each side of it, or, for an earlier `if` that cannot complete, one in
  *    its branch and one after it. A validation guard whose branch only sends
  *    an error separates nothing the join kept, and is ignored.
- *  - A counted test is a request read when a value it tests is read from a
- *    parameter of a function enclosing the send (`requestRead`). A test that
- *    reads nothing from the request (server state, a local count) is ignored,
+ *  - A counted test is a message read when a value it tests is read from a
+ *    parameter of a function enclosing the send (`messageRead`). A test that
+ *    reads nothing from the incoming message (server state, a local count) is ignored,
  *    so a body under it is under no test of the field and stays in every case.
  *  - `===`, `==`, `!==` and `!=` against a string literal, with `!` flipping
  *    the test, and `switch` labels, are read as values. Any other test of a
- *    request read leaves its field read with its values unread.
- *  - `reads` lists every request read among the counted tests. `cases` is
+ *    message read leaves its field read with its values unread.
+ *  - `reads` lists every message read among the counted tests. `cases` is
  *    read only for one placed field whose tests were all read: one case per
  *    literal compared, plus "any other value" (`value: null`) when a body
  *    admits one, each the union of the bodies it admits.
@@ -33,10 +33,14 @@
 import { Node, SyntaxKind, VariableDeclarationKind, type Symbol as TsSymbol } from 'ts-morph';
 import { cannotComplete, stepsOnPath, type PathStep } from './failure-path.js';
 
-/** Where a request field is read from. */
-export type ResponseModeLocation = 'query' | 'body' | 'unplaced';
+/**
+ * Where in the incoming message a field is read from. Only the HTTP sources
+ * are read so far; another protocol (a socket message, a pub/sub payload)
+ * adds its own source here.
+ */
+export type MessageSource = 'query' | 'body' | 'unplaced';
 
-/** One request field a response union depends on. */
+/** One incoming-message field a response union depends on. */
 export interface ResponseModeRead {
   /**
    * `query`: read with `.get(...)` on the default lib's `URLSearchParams`.
@@ -45,7 +49,7 @@ export interface ResponseModeRead {
    * anything else (a header, a path parameter, the method, a framework's own
    * accessor, a `json()` the repo declares).
    */
-  location: ResponseModeLocation;
+  location: MessageSource;
   field: string;
 }
 
@@ -57,7 +61,7 @@ export interface ResponseModeCase {
 }
 
 export interface ResponseModes {
-  /** Every request field the union depends on, sorted by location, then field. */
+  /** Every message field the union depends on, sorted by location, then field. */
   reads: ResponseModeRead[];
   /**
    * Present only when `reads` is one placed field and every test of it was
@@ -75,12 +79,12 @@ export interface JoinedBody {
 /** What one body admits of a field's values. */
 type Admits = { only: Set<string> } | { except: Set<string> };
 
-/** A request read, with the node that reads it. */
+/** A message read, with the node that reads it. */
 interface Read extends ResponseModeRead {
   node: Node;
 }
 
-/** What a counted test reads of the request. */
+/** What a counted test reads of the incoming message. */
 type TestReading =
   | { kind: 'values'; read: Read; admits: (side: string) => Admits; literals: string[] }
   | { kind: 'unread'; reads: Read[] };
@@ -88,7 +92,7 @@ type TestReading =
 const MAX_CHAIN = 32;
 
 /**
- * The modes of the union joined from `bodies`, or `undefined` when no request
+ * The modes of the union joined from `bodies`, or `undefined` when no message
  * read separates them. `join` builds a union text from member texts with the
  * rules the published union is built with. `isLibOrExternal` says whether a
  * symbol is declared by a TypeScript lib or an installed library.
@@ -220,7 +224,7 @@ function admitsValue(admits: Admits, value: string): boolean {
   return 'only' in admits ? admits.only.has(value) : !admits.except.has(value);
 }
 
-/** What `step`'s test reads of the request, `undefined` when nothing. */
+/** What `step`'s test reads of the incoming message, `undefined` when nothing. */
 function readStep(
   step: PathStep,
   isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
@@ -228,7 +232,7 @@ function readStep(
   if (step.kind === 'branch') return readCondition(step.condition, isLibOrExternal);
 
   const subject = step.test.getExpression();
-  const read = requestRead(subject, isLibOrExternal);
+  const read = messageRead(subject, isLibOrExternal);
   if (!read) {
     const inside = readsIn(subject, isLibOrExternal);
     return inside.length > 0 ? { kind: 'unread', reads: inside } : undefined;
@@ -272,7 +276,7 @@ function readStep(
   };
 }
 
-/** What an `if` or conditional condition reads of the request. */
+/** What an `if` or conditional condition reads of the incoming message. */
 function readCondition(
   condition: Node,
   isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
@@ -307,7 +311,7 @@ function readCondition(
       const leftLiteral = stringLiteral(left);
       const value = rightLiteral ?? leftLiteral;
       const operand = rightLiteral !== undefined ? left : right;
-      const read = value !== undefined ? requestRead(operand, isLibOrExternal) : undefined;
+      const read = value !== undefined ? messageRead(operand, isLibOrExternal) : undefined;
       if (read && value !== undefined) {
         // True side admits the value when the test is an equality.
         const trueAdmitsValue = equal !== flipped;
@@ -339,7 +343,7 @@ function stringLiteral(node: Node | undefined): string | undefined {
   return undefined;
 }
 
-/** Every request read inside `node`, outermost reads only. */
+/** Every message read inside `node`, outermost reads only. */
 function readsIn(
   node: Node,
   isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
@@ -347,13 +351,13 @@ function readsIn(
   const found: Read[] = [];
   for (const candidate of [node, ...node.getDescendants()]) {
     if (found.some((read) => read.node.containsRange(candidate.getPos(), candidate.getEnd()))) continue;
-    const read = requestRead(candidate, isLibOrExternal);
+    const read = messageRead(candidate, isLibOrExternal);
     if (read) found.push(read);
   }
   return found;
 }
 
-/** One link of a chain read from a request parameter, from the parameter out. */
+/** One link of a chain read from an incoming-message parameter, from the parameter out. */
 type Link =
   | { kind: 'property'; name: string }
   | { kind: 'call'; name: string; args: string[]; call: Node; receiver: Node }
@@ -361,15 +365,15 @@ type Link =
   | { kind: 'url' };
 
 /**
- * The request field `node` reads, `undefined` when it is not a read of the
- * request: a chain that starts, by symbol, at a parameter of a function
+ * The incoming-message field `node` reads, `undefined` when it is not a read of the
+ * incoming message: a chain that starts, by symbol, at a parameter of a function
  * enclosing `node`, through `const` bindings, `await`, parentheses, `as`,
  * `!`, property access, element access with a string literal, a method call
  * whose arguments are all string literals, and `new URL(...)` of the global
- * `URL`. A `let`, a binding default, or a call that takes the request as an
+ * `URL`. A `let`, a binding default, or a call that takes the message as an
  * argument ends the chain, and it is not a read.
  */
-function requestRead(
+function messageRead(
   node: Node,
   isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
 ): Read | undefined {
@@ -444,7 +448,7 @@ function chainOf(node: Node, roots: Set<Node>, depth: number): Link[] | undefine
   return undefined;
 }
 
-/** The chain a declaration binds: a request parameter, or a `const` read of one. */
+/** The chain a declaration binds: an incoming-message parameter, or a `const` read of one. */
 function bindingChain(declaration: Node, roots: Set<Node>, depth: number): Link[] | undefined {
   if (depth > MAX_CHAIN) return undefined;
   if (Node.isParameterDeclaration(declaration)) {
@@ -498,7 +502,7 @@ function fieldOf(links: Link[]): string | undefined {
 function locationOf(
   links: Link[],
   isLibOrExternal: (symbol: TsSymbol | undefined) => boolean
-): ResponseModeLocation {
+): MessageSource {
   const last = links[links.length - 1];
   if (
     last.kind === 'call' &&
