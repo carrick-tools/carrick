@@ -1951,12 +1951,49 @@ fn retype_items<'a>(
     by_service
 }
 
-/// The time one service's retype may spend across its requests: the budget
-/// the sidecar gives one request (`RETYPE_BUDGET_MS` in its `index.ts`),
-/// which bounded a service's retype while its calls went in one request. A
-/// request is not sent once it is spent; its items abstain with the sentence
-/// the sidecar uses for an item its budget did not reach.
-const RETYPE_SERVICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+/// The longest the retype check may run in one scan, across every service
+/// (carrick#2021). No service has a limit of its own: its requests keep
+/// going while they keep finishing, and the sidecar's 900 s with no sign of
+/// life (`OPERATION_TIMEOUT`) stays the guard against a process that hangs.
+///
+/// Sized to the owner's target for a large monorepo's first index, 30 to 45
+/// minutes in all (ruling, 2026-10-04). The rest of a large first index takes
+/// about 30 of them: the one-service stand-in's (1,375 files) took 35 minutes
+/// in all, of which its retype took about 3 on one process. That leaves 15
+/// for the retype. On a pool of three processes the stand-in's retype judged
+/// a call in 0.52 s, so 15 minutes judges about 1,700 calls, and about 800
+/// on one process (carrick#1996).
+const RETYPE_SCAN_CEILING: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The scan's one retype ceiling ([`RETYPE_SCAN_CEILING`]), started when the
+/// scan's retype starts and shared by every service after it.
+struct RetypeCeiling {
+    ends: std::time::Instant,
+    length: std::time::Duration,
+}
+
+impl RetypeCeiling {
+    fn starting_now(length: std::time::Duration) -> Self {
+        Self {
+            ends: std::time::Instant::now() + length,
+            length,
+        }
+    }
+
+    fn passed(&self) -> bool {
+        std::time::Instant::now() >= self.ends
+    }
+
+    /// Why a call the ceiling cut off abstains. It opens as the sidecar's
+    /// own budget sentence does, so the scan counts both as the retype time
+    /// limit (`time_limits.rs`), and says the limit was the scan's.
+    fn reason(&self) -> String {
+        format!(
+            "the retype check ran out of its {}ms budget for the whole scan",
+            self.length.as_millis()
+        )
+    }
+}
 
 /// What a retype process is taken to need when its own size cannot be read:
 /// a service's program and the checkers the retype builds over it.
@@ -1985,13 +2022,14 @@ fn retype_consumer_calls(
     outcomes: &mut [PairCheckOutcome],
 ) {
     let by_service = retype_items(pairs, consumer_blamed, local_consumers);
+    let ceiling = RetypeCeiling::starting_now(RETYPE_SCAN_CEILING);
     for (service, items) in by_service {
         let answers = retype_service(
             sidecar,
             service,
             &local_consumers[service],
             &items,
-            RETYPE_SERVICE_BUDGET,
+            &ceiling,
             |base| {
                 crate::services::sidecar_pool::pool_size(
                     crate::services::sidecar_pool::resident_mb(base)
@@ -2008,8 +2046,8 @@ fn retype_consumer_calls(
     }
 }
 
-/// Retype one service's items, one request per file, all of them within
-/// `budget` (carrick#1945, carrick#1996).
+/// Retype one service's items, one request per file, until the scan's
+/// retype `ceiling` passes (carrick#1945, carrick#1996, carrick#2021).
 ///
 /// A request holds one file's calls, never part of a file: the process that
 /// takes it reads that file's diagnostics before any rewrite once, for all
@@ -2028,15 +2066,15 @@ fn retype_consumer_calls(
 /// A request that fails abstains its own items with the reason and costs no
 /// other request's answers. A process that is gone takes no more requests;
 /// a request no process was left to take is not sent, and its items abstain
-/// with [`RETYPE_UNSENT`]. Once `budget` is spent no further request is
-/// sent, and its items abstain in the words the sidecar uses for its own
-/// budget.
+/// with [`RETYPE_UNSENT`]. Once `ceiling` has passed no further request is
+/// sent, and its items abstain with the ceiling's reason; a request already
+/// sent finishes.
 fn retype_service(
     sidecar: &TypeSidecar,
     service: &str,
     consumer: &LocalConsumer,
     items: &[RetypeItem],
-    budget: std::time::Duration,
+    ceiling: &RetypeCeiling,
     size: impl Fn(&TypeSidecar) -> crate::services::sidecar_pool::PoolSize,
 ) -> HashMap<String, RetypeOutcome> {
     use crate::services::sidecar_pool::{SidecarPool, jobs_by_file};
@@ -2044,18 +2082,12 @@ fn retype_service(
 
     let started = std::time::Instant::now();
     let jobs = jobs_by_file(items, |item| item.file_path.as_str(), 1);
-    let spent = || started.elapsed() >= budget;
+    let spent = || ceiling.passed();
     let ask = |process: &TypeSidecar,
                job: &Vec<RetypeItem>|
      -> Result<Vec<RetypeOutcome>, SidecarError> {
         if spent() {
-            return Ok(abstained(
-                job,
-                &format!(
-                    "the retype check ran out of its {}ms budget",
-                    budget.as_millis()
-                ),
-            ));
+            return Ok(abstained(job, &ceiling.reason()));
         }
         process.retype_check(job).inspect_err(|e| {
             warn!(
@@ -2070,6 +2102,16 @@ fn retype_service(
     let Some((first, rest)) = jobs.split_first() else {
         return HashMap::new();
     };
+    if spent() {
+        // Nothing will be sent, so the service's program is not loaded or
+        // built for it.
+        let reason = ceiling.reason();
+        return jobs
+            .iter()
+            .flat_map(|job| abstained(job, &reason))
+            .map(|answer| (answer.item_id.clone(), answer))
+            .collect();
+    }
     if let Err(e) = scope_to(sidecar, consumer) {
         warn!("Retyping {service}'s consumer calls did not start: {e}");
         let reason = format!("the retype check did not run: {e}");
@@ -2194,8 +2236,33 @@ fn scope_to(
     if sidecar.is_scoped_to(&consumer.root, consumer.tsconfig.as_deref()) {
         return Ok(());
     }
+    scope_within(
+        sidecar,
+        consumer,
+        crate::services::type_sidecar::ready_budget(),
+    )
+}
+
+/// [`scope_to`], waiting at most `budget` for the sidecar to be ready.
+fn scope_within(
+    sidecar: &TypeSidecar,
+    consumer: &LocalConsumer,
+    budget: std::time::Duration,
+) -> Result<(), crate::services::type_sidecar::SidecarError> {
     sidecar.start_init(&consumer.root, consumer.tsconfig.as_deref());
-    sidecar.wait_ready(crate::services::type_sidecar::ready_budget())
+    sidecar.wait_ready(budget).map_err(|e| match e {
+        // `wait_ready` reports a sidecar that was not ready in time as a
+        // timeout, whose words are the operation deadline's (900 s with no
+        // sign of life), and the scan counts that sentence as the deadline
+        // (carrick#2021). This is the readiness budget, so it says so.
+        crate::services::type_sidecar::SidecarError::Timeout => {
+            crate::services::type_sidecar::SidecarError::NotReady(format!(
+                "it was not ready within the {}s readiness budget",
+                budget.as_secs()
+            ))
+        }
+        other => other,
+    })
 }
 
 /// Write one retype answer onto its pair's outcome. An outcome check_v2
@@ -2781,7 +2848,7 @@ mod tests {
                 "web",
                 &consumer,
                 &items,
-                std::time::Duration::from_secs(600),
+                &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
                 processes(n),
             ));
             assert_eq!(answers.len(), 5, "{n} process(es): {answers:?}");
@@ -2808,7 +2875,7 @@ mod tests {
             "web",
             &consumer,
             &items,
-            std::time::Duration::ZERO,
+            &RetypeCeiling::starting_now(std::time::Duration::ZERO),
             no_pool,
         );
         assert_eq!(spent.len(), 5);
@@ -2816,7 +2883,7 @@ mod tests {
             assert_eq!(answer.outcome, RetypeVerdict::Abstain);
             assert_eq!(
                 answer.reason.as_deref(),
-                Some("the retype check ran out of its 0ms budget")
+                Some("the retype check ran out of its 0ms budget for the whole scan")
             );
         }
     }
@@ -2847,7 +2914,7 @@ mod tests {
                 "web",
                 &consumer,
                 &items,
-                std::time::Duration::from_secs(600),
+                &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
                 processes(n),
             ))
         };
@@ -2912,7 +2979,7 @@ mod tests {
             "web",
             &consumer,
             &first_dies,
-            std::time::Duration::from_secs(600),
+            &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
             no_pool,
         );
         assert!(died(&answers["die-0"]), "{answers:?}");
@@ -2936,7 +3003,7 @@ mod tests {
             "web",
             &consumer,
             &all_die,
-            std::time::Duration::from_secs(600),
+            &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
             processes(3),
         );
         assert_eq!(answers["x-0"].outcome, RetypeVerdict::Agrees, "{answers:?}");
@@ -2976,7 +3043,7 @@ mod tests {
                 "web",
                 &consumer,
                 &items,
-                std::time::Duration::from_secs(600),
+                &RetypeCeiling::starting_now(std::time::Duration::from_secs(600)),
                 processes(n),
             );
             assert_eq!(answers.len(), 5);
@@ -2988,6 +3055,175 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A pair outcome of `consumer`'s, unresolved, carrying `answer` as the
+    /// retype writes it, for what the scan counts against its time limits.
+    fn retyped_outcome(consumer: &str, answer: &RetypeOutcome) -> PairCheckOutcome {
+        let mut outcome = PairCheckOutcome {
+            pair_key: answer.item_id.clone(),
+            pseudo_method: "GET".to_string(),
+            identity: "/orders".to_string(),
+            consumer_file: "src/client.ts".to_string(),
+            consumer_line: 1,
+            type_kind: ManifestTypeKind::Response,
+            bucket: VerdictBucket::Unverifiable,
+            gate: None,
+            diagnostic: None,
+            producer_alias: "Res".to_string(),
+            consumer_alias: "Call".to_string(),
+            producer_service: "api".to_string(),
+            consumer_service: consumer.to_string(),
+            resolved: false,
+            unresolved_reason: None,
+            notes: Vec::new(),
+            consumer_reads: Vec::new(),
+        };
+        apply_retype(&mut outcome, answer);
+        outcome
+    }
+
+    /// carrick#2021: the retype has one ceiling for the whole scan, and no
+    /// limit of its own for a service. A service's requests keep going while
+    /// they keep finishing: thirty files, one request each, are all judged.
+    /// The ceiling is shared: once one service has spent it, the next
+    /// service sends nothing and is not even loaded, and every call it cut
+    /// off abstains with the ceiling's reason and is counted as the retype
+    /// time limit.
+    ///
+    /// The stand-in spends at least 150 ms on a request, so thirty requests
+    /// spend at least 4.5 s and a 1.5 s ceiling passes inside the first
+    /// service whatever the machine's load.
+    #[test]
+    fn the_retype_has_one_ceiling_for_the_whole_scan_and_none_for_a_service() {
+        use crate::services::sidecar_pool::test_support::{base_at, retype_item};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sidecar = base_at(&root);
+        let consumer = consumer_at(&root);
+        let calls = |prefix: &str| -> Vec<RetypeItem> {
+            (0..30)
+                .map(|n| {
+                    retype_item(
+                        &root
+                            .join(format!("src/{prefix}{n}.ts"))
+                            .display()
+                            .to_string(),
+                        &format!("{prefix}-{n}0"),
+                    )
+                })
+                .collect()
+        };
+        let judged = |answers: &HashMap<String, RetypeOutcome>| {
+            answers
+                .values()
+                .filter(|answer| answer.outcome == RetypeVerdict::Agrees)
+                .count()
+        };
+
+        let unhurried = RetypeCeiling::starting_now(std::time::Duration::from_secs(600));
+        let whole = retype_service(
+            &sidecar,
+            "web",
+            &consumer,
+            &calls("a"),
+            &unhurried,
+            processes(1),
+        );
+        assert_eq!(
+            judged(&whole),
+            30,
+            "every call of a service that keeps finishing is judged"
+        );
+
+        let ceiling = RetypeCeiling::starting_now(std::time::Duration::from_millis(1500));
+        let first = retype_service(
+            &sidecar,
+            "web",
+            &consumer,
+            &calls("b"),
+            &ceiling,
+            processes(1),
+        );
+        let admin = consumer_at(&root.join("admin"));
+        let after = retype_service(
+            &sidecar,
+            "admin",
+            &admin,
+            &calls("c"),
+            &ceiling,
+            processes(1),
+        );
+        assert!(
+            sidecar.is_scoped_to(&root, None),
+            "a service the ceiling cut off entirely is not loaded"
+        );
+        assert!(
+            (1..30).contains(&judged(&first)),
+            "the ceiling passed inside the first service: {} judged",
+            judged(&first)
+        );
+        assert_eq!(
+            judged(&after),
+            0,
+            "the next service found the ceiling spent"
+        );
+        let cut_off = "the retype check ran out of its 1500ms budget for the whole scan";
+        for answer in first.values().chain(after.values()) {
+            assert!(
+                answer.outcome == RetypeVerdict::Agrees
+                    || answer.reason.as_deref() == Some(cut_off),
+                "{answer:?}"
+            );
+        }
+
+        let outcomes: Vec<PairCheckOutcome> = first
+            .values()
+            .map(|answer| retyped_outcome("web", answer))
+            .chain(
+                after
+                    .values()
+                    .map(|answer| retyped_outcome("admin", answer)),
+            )
+            .collect();
+        let counted = crate::time_limits::from_check_outcomes(&outcomes);
+        assert_eq!(counted["web"].retype, 30 - judged(&first));
+        assert_eq!(counted["admin"].retype, 30);
+    }
+
+    /// carrick#2021: a consumer's sidecar that is not ready within the
+    /// readiness budget is said to be not ready, not silent for the
+    /// operation deadline, and the scan does not count it as that deadline.
+    #[test]
+    fn a_sidecar_not_ready_in_time_is_not_counted_as_the_operation_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("silent-sidecar.cjs");
+        std::fs::write(
+            &script,
+            "require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', () => {});\n",
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        let error = scope_within(
+            &sidecar,
+            &consumer_at(&root),
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("the stand-in never answers init");
+        let reason = format!("the retype check did not run: {error}");
+        assert_eq!(
+            reason,
+            "the retype check did not run: Sidecar not ready: it was not ready within the 1s readiness budget"
+        );
+        let answer = RetypeOutcome {
+            item_id: "web/Call".to_string(),
+            outcome: RetypeVerdict::Abstain,
+            diagnostics: Vec::new(),
+            reason: Some(reason),
+        };
+        let counted = crate::time_limits::from_check_outcomes(&[retyped_outcome("web", &answer)]);
+        assert!(counted.is_empty(), "{counted:?}");
     }
 
     /// carrick#1516: the producer's unwidened reading rides the retype item

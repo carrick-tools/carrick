@@ -14,7 +14,7 @@
 //!
 //! | Limit | Where it is set | The reason it leaves | Counted where |
 //! |---|---|---|---|
-//! | Retype | the scanner's retype limit in `engine/type_compat_v2.rs`, `RETYPE_BUDGET_MS` in the sidecar's `index.ts` | an abstain saying "the retype check ran out of its N ms budget", on the pair's unresolved reason | [`from_check_outcomes`] |
+//! | Retype | the scan's one retype ceiling, `RETYPE_SCAN_CEILING` in `engine/type_compat_v2.rs`, and a request's `RETYPE_BUDGET_MS` in the sidecar's `index.ts` | an abstain saying "the retype check ran out of its N ms budget" (the ceiling's adds "for the whole scan"), on the pair's unresolved reason | [`from_check_outcomes`] |
 //! | Library checks | `SEMANTICS_BUDGET_MS` in the sidecar's `index.ts` | a verdict `unchecked` with reason `budget` | the two places a service's library checks are answered |
 //! | Sidecar deadline | `OPERATION_TIMEOUT` in `services/type_sidecar.rs` | the operation fails with a timeout and the process is replaced | the sidecar client while a service is analysed; [`from_check_outcomes`] in the cross-service check |
 //!
@@ -122,8 +122,8 @@ impl TimeLimitsRunOut {
 }
 
 /// The words both retype limits use for an item they did not reach: the
-/// scanner's for a batch it did not send (`retype_in_batches`), and the
-/// sidecar's for an item inside a batch it did not get to (`retype.ts`).
+/// scan's ceiling for a request it did not send (`retype_service`), and the
+/// sidecar's for an item inside a request it did not get to (`retype.ts`).
 /// Each continues with the limit in milliseconds and `ms budget`.
 const RETYPE_RAN_OUT: &str = "the retype check ran out of its ";
 
