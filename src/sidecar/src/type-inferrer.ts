@@ -57,6 +57,7 @@ import { externalImportsOf, isExternalOrigin } from './origin.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { readResponseModes, type JoinedBody, type ResponseModes } from './response-modes.js';
 import { functionAtLine } from './function-line-index.js';
+import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import {
   addedDiagnostics,
@@ -1390,7 +1391,7 @@ export class TypeInferrer {
             Node.isArrowFunction(ancestor) ||
             Node.isFunctionExpression(ancestor) ||
             Node.isMethodDeclaration(ancestor)) &&
-          ancestor.getStartLineNumber() === request.line_number
+          startLineOf(ancestor) === request.line_number
       );
     const declaredHandler = insideFunctionOnLine
       ? this.handlerDeclaredAtLine(sourceFile, request.line_number)
@@ -1627,7 +1628,7 @@ export class TypeInferrer {
     line: number
   ): FunctionLike | undefined {
     const declared = this.findFunctionByLine(sourceFile, line);
-    if (!declared || declared.getStartLineNumber() !== line) return undefined;
+    if (!declared || startLineOf(declared) !== line) return undefined;
 
     if (Node.isFunctionDeclaration(declared)) {
       return Node.isSourceFile(declared.getParent()) && declared.isExported()
@@ -5979,7 +5980,7 @@ export class TypeInferrer {
       if (
         (Node.isCallExpression(node) ||
           Node.isObjectLiteralExpression(node)) &&
-        node.getStartLineNumber() === line
+        startLineOf(node) === line
       ) {
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
@@ -7777,7 +7778,7 @@ export class TypeInferrer {
     const candidates = (
       lineNumber
         ? nodes.filter((node) => {
-            const nodeLine = node.getStartLineNumber();
+            const nodeLine = startLineOf(node);
             return nodeLine >= lineNumber - searchRadius && nodeLine <= lineNumber + searchRadius;
           })
         : nodes
@@ -7851,8 +7852,8 @@ export class TypeInferrer {
 
       // Tie-break by proximity to target line
       if (targetLine !== undefined) {
-        const bestDist = Math.abs(best.getStartLineNumber() - targetLine);
-        const currentDist = Math.abs(current.getStartLineNumber() - targetLine);
+        const bestDist = Math.abs(startLineOf(best) - targetLine);
+        const currentDist = Math.abs(startLineOf(current) - targetLine);
         return currentDist < bestDist ? current : best;
       }
 
@@ -8102,8 +8103,8 @@ export class TypeInferrer {
   // ===========================================================================
 
   private getNodeLocation(node: Node): SourceLocation {
-    const startLinePos = node.getStartLineNumber();
-    const endLinePos = node.getEndLineNumber();
+    const startLinePos = startLineOf(node);
+    const endLinePos = endLineOf(node);
 
     const location = {
       file_path: node.getSourceFile().getFilePath(),
