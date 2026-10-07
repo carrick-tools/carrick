@@ -8,7 +8,8 @@ is invented.
 handler reads `op` off the JSON body and answers `confirm`, `cancel` and
 `refund` from three branches. `components/OrderActions.tsx` sends each of the
 three, with `op` written as a literal in the body, and loads the order with a
-`GET`.
+`GET`. A fourth `POST`, `replay`, sends a command it was handed, so the scan
+cannot read which case it sends.
 
 The model answers in `__llm__/` state one `POST` row per case, as a handler
 that switches on a request field is read (carrick#831). Each case echoes a
@@ -23,6 +24,7 @@ row the file layout already states:
 
 The scan must keep one `POST` row per case, each stated by the file layout,
 and no `POST` row without a case beside them. Each call then links to the
-case it sends. Before carrick#2048 the first case to reach the join replaced
-the layout's row and the others were discarded, so two of the three calls
-matched no route.
+case it sends. `replay` keeps one edge to the route with its case unknown: the
+route exists, so it is not a missing endpoint. Before carrick#2048 the first
+case to reach the join replaced the layout's row and the others were
+discarded, so two of the three calls that state a case matched no route.

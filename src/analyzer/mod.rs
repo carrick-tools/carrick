@@ -2579,13 +2579,13 @@ impl Analyzer {
                     // been, and against a dispatching one it is the reason the
                     // pair cannot be drawn.
                     let call_dispatch = crate::dispatch::Dispatch::key_of(call.dispatch.as_ref());
-                    // Whether every producer this call routed to refused it on
-                    // its dispatch case, and the last verdict that said so. A
-                    // call the router would deliver but no case answers is
-                    // UNMATCHED, not silently dropped: the producers exist, so
-                    // the code below would otherwise record nothing at all.
-                    let mut dispatch_rejection: Option<carrick_match::MatchVerdict> = None;
-                    let mut any_producer_matched = false;
+                    // Each producer's answer about this call: a case it names
+                    // (or a route that dispatches on nothing), a dispatching
+                    // route whose case the call does not state, or a case the
+                    // call names another value of.
+                    let mut matched = Vec::new();
+                    let mut case_unknown = Vec::new();
+                    let mut case_mismatched = 0u32;
                     for endpoint in matching_endpoints {
                         // #381: a pairing with zero literal agreement — a
                         // wildcard-only producer (`GET /*`) absorbing an
@@ -2611,34 +2611,79 @@ impl Analyzer {
                             crate::dispatch::Dispatch::key_of(endpoint.dispatch.as_ref()),
                             call_dispatch.clone(),
                         );
-                        if matches!(
-                            verdict,
+                        match verdict {
+                            carrick_match::MatchVerdict::Matched => matched.push(endpoint),
                             carrick_match::MatchVerdict::DispatchValueUnknown
-                                | carrick_match::MatchVerdict::DispatchValueMismatch
-                        ) {
-                            debug!(
-                                "Dispatch case declined {} {} for {}: {:?}",
-                                endpoint.method, endpoint.full_path, call_site, verdict
-                            );
-                            dispatch_rejection.get_or_insert(verdict);
-                            continue;
+                            | carrick_match::MatchVerdict::DispatchValueMismatch => {
+                                debug!(
+                                    "Dispatch case declined {} {} for {}: {:?}",
+                                    endpoint.method, endpoint.full_path, call_site, verdict
+                                );
+                                if verdict == carrick_match::MatchVerdict::DispatchValueUnknown {
+                                    case_unknown.push(endpoint);
+                                } else {
+                                    case_mismatched += 1;
+                                }
+                            }
+                            _ => {}
                         }
-                        if verdict != carrick_match::MatchVerdict::Matched {
-                            continue;
-                        }
-                        any_producer_matched = true;
-                        // The dispatch case is part of the operation's
-                        // identity, so it is part of this key: without it the
-                        // nine operations behind one route are one verified
-                        // endpoint, and eight of them read as consumed
-                        // because a ninth was.
-                        let key = format!(
+                    }
+                    // The dispatch case is part of an operation's identity,
+                    // so it is part of the consumed key: without it the nine
+                    // operations behind one route are one verified endpoint,
+                    // and eight of them read as consumed because a ninth was.
+                    let consumed_key = |endpoint: &crate::mount_graph::ResolvedEndpoint| {
+                        format!(
                             "{}:{}{}",
                             endpoint.method,
                             endpoint.full_path,
                             crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
-                        );
-                        matched_endpoints.insert(key);
+                        )
+                    };
+                    // What the call is to those producers as a whole
+                    // (carrick#2048), decided where the cloud can read the
+                    // same rule.
+                    let drawn = match carrick_match::dispatch_outcome(
+                        matched.len() as u32,
+                        case_unknown.len() as u32,
+                        case_mismatched,
+                    ) {
+                        carrick_match::DispatchOutcome::Matched => {
+                            for endpoint in &matched {
+                                matched_endpoints.insert(consumed_key(endpoint));
+                            }
+                            matched
+                        }
+                        // The call reaches a route that dispatches, and states
+                        // no value its cases can be told apart by. The route
+                        // exists, so this is never a missing endpoint: the
+                        // call keeps an edge to the route, with its case
+                        // unknown. An edge's key is the route's and holds no
+                        // case, so the cases' edges for this call are one edge
+                        // after `sort_dedup_cross_repo_matches`. Any case may
+                        // be the one it sends, so none of them is reported as
+                        // having no consumer.
+                        carrick_match::DispatchOutcome::RouteCaseUnknown => {
+                            for endpoint in &case_unknown {
+                                matched_endpoints.insert(consumed_key(endpoint));
+                            }
+                            case_unknown
+                        }
+                        // The call states a value no case of the route
+                        // answers (carrick#831). Record it UNMATCHED for the
+                        // same reason #537 records a path-less call: the
+                        // alternative is a call that matched nothing and is
+                        // reported nowhere.
+                        carrick_match::DispatchOutcome::NoCaseAnswers => {
+                            missing
+                                .entry((method.to_string(), miss_path))
+                                .or_default()
+                                .insert(call_site.clone());
+                            Vec::new()
+                        }
+                        carrick_match::DispatchOutcome::NotMatched => Vec::new(),
+                    };
+                    for endpoint in drawn {
                         let Some(edge) = Self::build_cross_repo_match(
                             call,
                             method,
@@ -2691,21 +2736,6 @@ impl Analyzer {
                                 }
                             }
                         }
-                    }
-                    // Every producer the router would have delivered this
-                    // call to declined it on its dispatch case (carrick#831).
-                    // The route exists and the call reaches it, but no
-                    // operation behind it answers what the call sends — or,
-                    // for `dispatch_value_unknown`, the call says nothing the
-                    // cases can be told apart by. Record it UNMATCHED for the
-                    // same reason #537 records a path-less call: the
-                    // alternative is a call that matched nothing and is
-                    // reported nowhere.
-                    if !any_producer_matched && dispatch_rejection.is_some() {
-                        missing
-                            .entry((method.to_string(), miss_path))
-                            .or_default()
-                            .insert(call_site);
                     }
                 }
                 Some(_) => {
@@ -6567,20 +6597,26 @@ mod tests {
         );
     }
 
-    /// carrick#831: a call that states no value for the field a producer
-    /// switches on stays UNMATCHED — the route is there, but which of its
-    /// operations the call means is unknown, and picking one would fabricate
-    /// the contract the discriminator exists to keep apart.
-    #[test]
-    fn a_call_with_no_dispatch_value_does_not_match_a_dispatching_producer() {
+    /// One call to a route with two dispatch cases, `search-by-intent` and
+    /// `list-external-calls`, from another service; `sends` is the value the
+    /// call states for the field, if any. The data-call row is the repo tag the
+    /// cross-service merge gives a call, which an edge needs.
+    fn scan_one_call_to_a_dispatching_route(sends: Option<&str>) -> MatcherOutput {
         use crate::dispatch::{Dispatch, DispatchLocation};
-        use crate::mount_graph::ResolvedEndpoint;
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        const ROUTE: &str = "/types/check-or-upload";
+        let case = |value: &str| Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: value.to_string(),
+        };
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
             view_module: false,
             owner: None,
-            key: OperationKey::http("POST", "/types/check-or-upload"),
+            key: OperationKey::http("POST", ROUTE),
             params: vec![],
             request_body: None,
             response_body: None,
@@ -6592,7 +6628,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
-            dispatch: None,
+            dispatch: sends.map(case),
             schema_binding: None,
             handler_span: None,
             name_scope: None,
@@ -6600,30 +6636,82 @@ mod tests {
         });
 
         let mut mount_graph = MountGraph::new();
-        mount_graph.endpoints.push(ResolvedEndpoint {
-            view_module: false,
+        for (value, line) in [("search-by-intent", 400), ("list-external-calls", 412)] {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
+                method: "POST".to_string(),
+                path: ROUTE.to_string(),
+                full_path: ROUTE.to_string(),
+                handler: Some(format!("handle-{value}")),
+                owner: "app".to_string(),
+                file_location: format!("index.ts:{line}"),
+                middleware_chain: vec![],
+                repo_name: Some("cloud".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: None,
+                dispatch: Some(case(value)),
+                handler_span: None,
+            });
+        }
+        mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
-            path: "/types/check-or-upload".to_string(),
-            full_path: "/types/check-or-upload".to_string(),
-            handler: Some("handleSearchByIntent".to_string()),
-            owner: "app".to_string(),
-            file_location: "index.ts:400".to_string(),
-            middleware_chain: vec![],
-            repo_name: Some("cloud".to_string()),
+            target_url: ROUTE.to_string(),
+            canonical_path: ROUTE.to_string(),
+            client: "fetch".to_string(),
+            file_location: "api-client.ts:115".to_string(),
+            call_kind: None,
+            repo_name: Some("mcp".to_string()),
             service_name: None,
-            provenance: Default::default(),
-            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
             resolution_source: None,
-            dispatch: Some(Dispatch {
-                location: DispatchLocation::Body,
-                field: "action".to_string(),
-                value: "search-by-intent".to_string(),
-            }),
-            handler_span: None,
+            dispatch: sends.map(case),
+            role: None,
+            reaches_request: None,
+            library_semantics: Vec::new(),
+            own_route: false,
         });
 
-        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        analyzer.analyze_matches_with_mount_graph(&mount_graph)
+    }
 
+    /// carrick#2048: a call that states no value for the field a route
+    /// switches on reaches the route all the same, and only its case is
+    /// unknown. It keeps ONE edge to the route, not one per case, and is never
+    /// a missing endpoint. Any case may be the one it sends, so none is
+    /// reported as having no consumer.
+    #[test]
+    fn a_call_with_no_dispatch_value_keeps_one_edge_to_its_route() {
+        let (findings, verified, edges) = scan_one_call_to_a_dispatching_route(None);
+
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| (edge.producer_key.as_str(), edge.consumer_repo.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("http|POST|/types/check-or-upload", "mcp")],
+            "one edge to the route: {edges:?}"
+        );
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::MissingEndpoint { .. } | Finding::OrphanedEndpoint { .. }
+            )),
+            "the route exists and either case may be consumed: {findings:?}"
+        );
+        assert_eq!(verified.len(), 2, "{verified:?}");
+    }
+
+    /// carrick#831: a call that names a value no case of the route answers is
+    /// a clean negative: no edge, reported unmatched rather than dropped. A
+    /// call naming one case links to that case alone.
+    #[test]
+    fn a_call_naming_a_value_no_case_answers_stays_unmatched() {
+        let (findings, verified, edges) = scan_one_call_to_a_dispatching_route(Some("upload-logs"));
         assert!(edges.is_empty(), "no edge may be drawn: {edges:?}");
         assert!(verified.is_empty(), "and nothing is verified");
         assert!(
@@ -6631,6 +6719,17 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
             "the call is reported unmatched rather than dropped: {findings:?}"
+        );
+
+        let (findings, verified, edges) =
+            scan_one_call_to_a_dispatching_route(Some("search-by-intent"));
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(verified.len(), 1, "{verified:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, Finding::OrphanedEndpoint { .. })),
+            "the case nothing names stays unconsumed: {findings:?}"
         );
     }
 

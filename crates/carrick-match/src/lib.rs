@@ -249,7 +249,9 @@ pub enum MatchVerdict {
     /// states no value for the field it switches on (carrick#831). The paths
     /// route, but the route is not the whole operation identity here: without
     /// the call's own value, the pair is a guess between the producer's
-    /// siblings, so no edge may be drawn.
+    /// siblings, so no edge may be drawn to this case. The call still reaches
+    /// the route: [`dispatch_outcome`] keeps it one edge to the route, with the
+    /// case unknown (carrick#2048).
     DispatchValueUnknown,
     /// The producer is one case of a body-dispatching handler and the call
     /// states a DIFFERENT value for that field. This is a clean negative, not
@@ -359,6 +361,50 @@ pub fn match_verdict_with_dispatch(
             DispatchVerdict::ValueMismatch => MatchVerdict::DispatchValueMismatch,
         },
         rejected => rejected,
+    }
+}
+
+/// What one call is to the producers its path routes it to, once each of
+/// them has answered [`match_verdict_with_dispatch`] (carrick#2048).
+///
+/// The per-pair verdict says whether a call is one CASE of a dispatching
+/// route. This answers the question a surface asks about the call as a whole:
+/// whether it has an edge, to what, and whether it is missing a producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DispatchOutcome {
+    /// At least one producer answered `Matched`: an edge to each of them. A
+    /// dispatching sibling that answered `DispatchValueUnknown` is not one.
+    Matched,
+    /// None matched, and at least one producer is a dispatching route whose
+    /// case the call does not state. The route exists and the call reaches
+    /// it; only the case is unknown. One edge to the route, with the case
+    /// unknown, and never a missing endpoint.
+    RouteCaseUnknown,
+    /// None matched, and every dispatching producer answered
+    /// `DispatchValueMismatch`: the call states a value no case answers. The
+    /// call is unmatched.
+    NoCaseAnswers,
+    /// None matched, and the dispatch question declined nothing: the path
+    /// verdicts did.
+    NotMatched,
+}
+
+/// [`DispatchOutcome`] from the counts of one call's per-producer verdicts:
+/// `Matched`, `DispatchValueUnknown` and `DispatchValueMismatch`. Counts, not
+/// a list, so the wasm surface takes three numbers.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn dispatch_outcome(matched: u32, case_unknown: u32, case_mismatched: u32) -> DispatchOutcome {
+    if matched > 0 {
+        DispatchOutcome::Matched
+    } else if case_unknown > 0 {
+        DispatchOutcome::RouteCaseUnknown
+    } else if case_mismatched > 0 {
+        DispatchOutcome::NoCaseAnswers
+    } else {
+        DispatchOutcome::NotMatched
     }
 }
 
@@ -690,6 +736,20 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// carrick#2048: a call that reaches a dispatching route without stating
+    /// its case keeps an edge to the route; only a value no case answers, or
+    /// a path no producer routes, leaves it without one.
+    #[test]
+    fn a_call_whose_case_is_unknown_keeps_its_route() {
+        assert_eq!(dispatch_outcome(1, 3, 0), DispatchOutcome::Matched);
+        assert_eq!(dispatch_outcome(0, 3, 0), DispatchOutcome::RouteCaseUnknown);
+        // A case on another field, which the call states nothing about, is
+        // still a case the call may reach.
+        assert_eq!(dispatch_outcome(0, 1, 2), DispatchOutcome::RouteCaseUnknown);
+        assert_eq!(dispatch_outcome(0, 0, 3), DispatchOutcome::NoCaseAnswers);
+        assert_eq!(dispatch_outcome(0, 0, 0), DispatchOutcome::NotMatched);
     }
 
     #[test]

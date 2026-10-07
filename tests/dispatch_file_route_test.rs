@@ -118,10 +118,12 @@ fn a_file_route_that_dispatches_on_its_body_keeps_every_case() {
     }
 }
 
-/// Each call sends one case, and each links to the row for it: one edge per
-/// call. A pair is drawn only where the call's value is the case's
-/// (`carrick_match::dispatch_verdict`), and the route has no row without a
-/// case, so a `POST` edge per call is each call reaching its own case.
+/// Each call links to the route once: one edge per call. A call that states
+/// its case reaches that case alone (`carrick_match::dispatch_verdict`), and
+/// the route has no row without a case. The `replay` call sends a body the
+/// scan cannot read the case from: it keeps one edge to the route with its
+/// case unknown (`carrick_match::dispatch_outcome`), never one per case and
+/// never none.
 #[test]
 fn each_call_links_to_the_case_it_sends() {
     let calls = rows("calls");
@@ -129,11 +131,12 @@ fn each_call_links_to_the_case_it_sends() {
         calls,
         BTreeSet::from([
             row("GET", ROUTE, None),
+            row("POST", ROUTE, None),
             row("POST", ROUTE, Some("cancel")),
             row("POST", ROUTE, Some("confirm")),
             row("POST", ROUTE, Some("refund")),
         ]),
-        "each call states the case it sends"
+        "each call states the case it sends, and `replay` states none"
     );
 
     let edges = scan()["cross_repo_matches"]
@@ -148,8 +151,8 @@ fn each_call_links_to_the_case_it_sends() {
             .iter()
             .filter(|key| **key == "http|POST|/api/orders/:orderId")
             .count(),
-        3,
-        "each POST call links to a case: {edges:#?}"
+        4,
+        "each POST call links to the route once: {edges:#?}"
     );
-    assert_eq!(edges.len(), 4, "one edge per call: {edges:#?}");
+    assert_eq!(edges.len(), 5, "one edge per call: {edges:#?}");
 }

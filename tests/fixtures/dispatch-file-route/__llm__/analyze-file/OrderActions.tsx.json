@@ -56,6 +56,19 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:31",
+      "line_number": 31,
+      "target": "/api/orders/${orderId}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 31,
+      "payload_expression_text": "command",
+      "payload_expression_line": 33,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }
