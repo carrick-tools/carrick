@@ -3,6 +3,9 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import * as crypto from 'node:crypto';
+import * as http from 'node:http';
+import * as zlib from 'node:zlib';
 import type { Project } from 'ts-morph';
 import type { ExpandOrigin } from '../src/type-structural-expander.js';
 import * as fs from 'node:fs';
@@ -43,6 +46,131 @@ export function stubDirFor(dts: string): string {
  */
 export function expandOriginOf(project: Project, repoRoot = '/'): ExpandOrigin {
   return { program: project.getProgram().compilerObject, repoRoot };
+}
+
+function tarHeader(name: string, size: number): Buffer {
+  const h = Buffer.alloc(512);
+  h.write(name, 0, 100, 'utf8');
+  h.write('0000644\0', 100);
+  h.write('0000000\0', 108);
+  h.write('0000000\0', 116);
+  h.write(`${size.toString(8).padStart(11, '0')}\0`, 124);
+  h.write('00000000000\0', 136);
+  h.write('        ', 148);
+  h.write('0', 156);
+  h.write('ustar\0', 257);
+  h.write('00', 263);
+  let sum = 0;
+  for (const byte of h) sum += byte;
+  h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+  return h;
+}
+
+function tarBlock(data: Buffer): Buffer {
+  return Buffer.concat([data, Buffer.alloc((512 - (data.length % 512)) % 512)]);
+}
+
+/** A gzipped ustar tarball laid out as npm publishes one: every path under `package/`. */
+export function tgz(files: Record<string, string>): Buffer {
+  const parts: Buffer[] = [];
+  for (const [rel, content] of Object.entries(files)) {
+    const body = Buffer.from(content);
+    parts.push(tarHeader(`package/${rel}`, body.length), tarBlock(body));
+  }
+  parts.push(Buffer.alloc(1024));
+  return zlib.gzipSync(Buffer.concat(parts));
+}
+
+export function integrityOf(bytes: Buffer): string {
+  return `sha512-${crypto.createHash('sha512').update(bytes).digest('base64')}`;
+}
+
+export interface RegistryPackage {
+  name: string;
+  version: string;
+  /** Merged into the published package.json beside name and version. */
+  manifest?: Record<string, unknown>;
+  files?: Record<string, string>;
+  /** Listed in the packument, but its tarball answers 404. */
+  unfetchable?: boolean;
+}
+
+export interface LocalRegistry {
+  /** Base URL with a trailing slash, for `npm_config_registry`. */
+  url: string;
+  /** Tarball paths requested, in order. */
+  tarballs: string[];
+  close(): Promise<void>;
+}
+
+/**
+ * An npm registry on 127.0.0.1 serving packuments and tarballs for the given
+ * packages, so an installer runs offline against a fixed set of versions.
+ */
+export async function localRegistry(packages: RegistryPackage[]): Promise<LocalRegistry> {
+  const packuments = new Map<string, { name: string; 'dist-tags': Record<string, string>; versions: Record<string, unknown> }>();
+  const tarballs = new Map<string, Buffer | null>();
+  const requested: string[] = [];
+  const server = http.createServer((req, res) => {
+    const urlPath = (req.url ?? '/').split('?')[0];
+    if (tarballs.has(urlPath)) {
+      requested.push(urlPath);
+      const bytes = tarballs.get(urlPath);
+      if (!bytes) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.end(bytes);
+      return;
+    }
+    const doc = packuments.get(decodeURIComponent(urlPath.slice(1)));
+    res.writeHead(doc ? 200 : 404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(doc ?? {}));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  const base = `http://127.0.0.1:${port}`;
+  for (const pkg of packages) {
+    const manifest = { name: pkg.name, version: pkg.version, ...(pkg.manifest ?? {}) };
+    const bytes = tgz({ 'package.json': JSON.stringify(manifest), ...(pkg.files ?? {}) });
+    const tarballPath = `/${pkg.name}/-/${pkg.name.split('/').pop()}-${pkg.version}.tgz`;
+    tarballs.set(tarballPath, pkg.unfetchable ? null : bytes);
+    const doc = packuments.get(pkg.name) ?? { name: pkg.name, 'dist-tags': {}, versions: {} };
+    doc.versions[pkg.version] = {
+      ...manifest,
+      dist: { tarball: `${base}${tarballPath}`, integrity: integrityOf(bytes) },
+    };
+    doc['dist-tags'].latest = pkg.version;
+    packuments.set(pkg.name, doc);
+  }
+  return {
+    url: `${base}/`,
+    tarballs: requested,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/**
+ * Point every installer this process spawns at `registry`, with a store and
+ * cache under `scratch`, so the developer's own store is never read. Returns
+ * the restore.
+ */
+export function useRegistry(registry: LocalRegistry, scratch: string): () => void {
+  const values: Record<string, string> = {
+    npm_config_registry: registry.url,
+    npm_config_store_dir: path.join(scratch, 'store'),
+    npm_config_cache_dir: path.join(scratch, 'cache'),
+  };
+  const previous = Object.fromEntries(Object.keys(values).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, values);
+  return () => {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  };
 }
 
 /**

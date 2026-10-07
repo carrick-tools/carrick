@@ -21,7 +21,11 @@ import {
 } from '../src/capture/check-probe.js';
 import { classifyPair, parseTscOutput } from '../src/capture/check-classify.js';
 import { scrubPaths, rewriteAliases } from '../src/capture/check-scrub.js';
-import { assembleWorkspace, computeDedupeOverrides } from '../src/capture/check-workspace.js';
+import {
+  assembleWorkspace,
+  computeDedupeOverrides,
+  computeResolutionOverrides,
+} from '../src/capture/check-workspace.js';
 import type { CheckPairSpec } from '../src/capture/api.js';
 import type { RawDiagnostic } from '../src/capture/check-classify.js';
 
@@ -690,5 +694,94 @@ describe('semver dedupe overrides', () => {
       { dependencies: { pkg: '0.0.5' } },
     ]);
     assert.deepStrictEqual(overrides, {});
+  });
+});
+
+describe('recorded resolution edges become parent-scoped overrides (#2091)', () => {
+  function stub(root: string, name: string, dependencies: Record<string, string>, edges?: unknown): string {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: `@carrick/${name}`, version: '0.0.0-carrick', private: true, dependencies })
+    );
+    if (edges !== undefined) {
+      fs.writeFileSync(path.join(dir, 'carrick-resolution.json'), JSON.stringify({ edges }));
+    }
+    return dir;
+  }
+
+  function rootManifest(stubs: { name: string; dir: string }[], root: string): string {
+    const ws = assembleWorkspace({
+      stubs: stubs.map((s) => ({ service_name: s.name, stub_dir: s.dir })),
+      workspaceRoot: root,
+    });
+    return fs.readFileSync(path.join(ws.workspaceDir, 'package.json'), 'utf8');
+  }
+
+  it('writes each edge as <parent>@<version>><child>, beside the dedupe overrides', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-edges-'));
+    const a = stub(root, 'a', { lib: '6.8.0' }, { 'lib@6.8.0': { dep: '1.2.0' } });
+    const b = stub(root, 'b', { lib: '6.10.1' });
+    const manifest = JSON.parse(rootManifest([{ name: 'a', dir: a }, { name: 'b', dir: b }], root));
+    assert.deepStrictEqual(manifest.pnpm.overrides, {
+      'lib@6.8.0': '6.10.1',
+      'lib@6.8.0>dep': '1.2.0',
+    });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("an edge's version passes through the dedupe table", () => {
+    const overrides = computeResolutionOverrides(
+      [{ 'parent@1.0.0': { child: '2.1.0' } }, { 'other@3.0.0': { child: '2.4.0' } }],
+      { 'child@2.1.0': '2.4.0' }
+    );
+    assert.deepStrictEqual(overrides, {
+      'other@3.0.0>child': '2.4.0',
+      'parent@1.0.0>child': '2.4.0',
+    });
+  });
+
+  it('two stubs that the dedupe does not reconcile leave the edge out', () => {
+    const overrides = computeResolutionOverrides(
+      [
+        { 'parent@1.0.0': { child: '1.0.0', agreed: '4.0.0' } },
+        { 'parent@1.0.0': { child: '2.0.0', agreed: '4.0.0' } },
+      ],
+      {}
+    );
+    assert.deepStrictEqual(overrides, { 'parent@1.0.0>agreed': '4.0.0' });
+  });
+
+  it('two stubs the dedupe reconciles keep the edge', () => {
+    const overrides = computeResolutionOverrides(
+      [{ 'parent@1.0.0': { child: '1.0.0' } }, { 'parent@1.0.0': { child: '1.3.0' } }],
+      { 'child@1.0.0': '1.3.0' }
+    );
+    assert.deepStrictEqual(overrides, { 'parent@1.0.0>child': '1.3.0' });
+  });
+
+  it('a stub without the file writes the root manifest it wrote before', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-edges-'));
+    const a = stub(root, 'a', { lib: '6.8.0' });
+    const b = stub(root, 'b', { lib: '6.10.1' });
+    const expected =
+      JSON.stringify(
+        {
+          name: 'carrick-check-workspace',
+          version: '0.0.0',
+          private: true,
+          pnpm: { overrides: { 'lib@6.8.0': '6.10.1' } },
+        },
+        null,
+        2
+      ) + '\n';
+    assert.strictEqual(rootManifest([{ name: 'a', dir: a }, { name: 'b', dir: b }], root), expected);
+    const bare = stub(root, 'c', {});
+    assert.strictEqual(
+      rootManifest([{ name: 'c', dir: bare }], root),
+      JSON.stringify({ name: 'carrick-check-workspace', version: '0.0.0', private: true }, null, 2) + '\n'
+    );
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

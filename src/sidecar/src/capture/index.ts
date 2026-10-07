@@ -44,6 +44,7 @@ import type {
 import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
+import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
@@ -456,9 +457,8 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // repos whose lockfiles we do not parse (yarn classic v1, binary
   // bun.lockb). The parsed lockfile (npm, pnpm, yarn-berry, text bun.lock)
   // remains the bare-checkout fallback. Both paths pin only
-  // the directly-referenced externals; transitives resolve at check-install
-  // (check-workspace NPMRC: "Direct deps are exact-pinned by the stubs;
-  // only transitives resolve").
+  // the directly-referenced externals; what those depend on is recorded
+  // from the installed tree below (RESOLUTION_FILE).
   const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
@@ -476,6 +476,27 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     // package resolves through that pin.
     else if (!rewritten.pins[typesPackageOf(name)]) unpinned.push(name);
   }
+
+  // ---- Record how the installed tree resolved what the pins depend on ----
+  // The check pins each recorded edge, so it installs what the repo
+  // installed rather than the newest version in range (carrick#2091).
+  const resolution = deno
+    ? { edges: {}, unrecorded: 0 }
+    : installedResolutionEdges(repoRoot, pinned);
+  const edgeCount = Object.values(resolution.edges).reduce(
+    (n, children) => n + Object.keys(children).length,
+    0
+  );
+  if (edgeCount > 0) {
+    stubGuard.writeFile(
+      path.join(stubDir, RESOLUTION_FILE),
+      JSON.stringify({ edges: resolution.edges }, null, 2) + '\n'
+    );
+  }
+  console.error(
+    `[sidecar] capture ${packageName}: ${edgeCount} dependency edge(s) recorded from the installed tree, ` +
+      `${resolution.unrecorded} left to the registry`
+  );
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
   const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));

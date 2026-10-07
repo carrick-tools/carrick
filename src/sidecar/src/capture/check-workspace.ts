@@ -18,6 +18,7 @@ import * as path from 'node:path';
 import type { CheckStubInput } from './api.js';
 import type { ProbePlan } from './check-probe.js';
 import { WriteGuard } from './guarded-fs.js';
+import { RESOLUTION_FILE, type ResolutionEdges } from './resolution-edges.js';
 
 const PROBES_PACKAGE = 'carrick-probes';
 
@@ -125,6 +126,56 @@ export function computeDedupeOverrides(
   );
 }
 
+/** A stub's recorded edges; a stub stored without the file records none. */
+function readStubResolution(stubDir: string): ResolutionEdges {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(stubDir, RESOLUTION_FILE), 'utf8'));
+  } catch {
+    return {};
+  }
+  const edges = (parsed as { edges?: unknown } | null)?.edges;
+  if (!edges || typeof edges !== 'object') return {};
+  const out: ResolutionEdges = {};
+  for (const [parent, children] of Object.entries(edges as Record<string, unknown>)) {
+    if (!children || typeof children !== 'object') continue;
+    for (const [child, version] of Object.entries(children as Record<string, unknown>)) {
+      if (typeof version === 'string') (out[parent] ??= {})[child] = version;
+    }
+  }
+  return out;
+}
+
+/**
+ * pnpm parent-scoped overrides (`<parent>@<version>><child>`) that install
+ * each edge the stubs recorded at the version the scanned repo installed
+ * (carrick#2091). A parent-scoped override wins over a generic one, so an
+ * edge's version first passes through the dedupe table: one physical copy per
+ * compat group still holds. An edge two stubs record at versions the dedupe
+ * does not reconcile is left to the resolver.
+ */
+export function computeResolutionOverrides(
+  edgeSets: ResolutionEdges[],
+  dedupe: Record<string, string>
+): Record<string, string> {
+  const versionsOf = new Map<string, Set<string>>();
+  for (const edges of edgeSets) {
+    for (const [parent, children] of Object.entries(edges)) {
+      for (const [child, version] of Object.entries(children)) {
+        const key = `${parent}>${child}`;
+        if (!versionsOf.has(key)) versionsOf.set(key, new Set());
+        versionsOf.get(key)!.add(dedupe[`${child}@${version}`] ?? version);
+      }
+    }
+  }
+  const overrides: Record<string, string> = {};
+  for (const key of [...versionsOf.keys()].sort()) {
+    const versions = versionsOf.get(key)!;
+    if (versions.size === 1) overrides[key] = [...versions][0];
+  }
+  return overrides;
+}
+
 function readStubPackageName(stubDir: string): string {
   const pkgPath = path.join(stubDir, 'package.json');
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as {
@@ -168,6 +219,7 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
 
   const assembled: AssembledStub[] = [];
   const dependencySets: { dependencies: Record<string, string> }[] = [];
+  const edgeSets: ResolutionEdges[] = [];
   const svcToPkg = new Map<string, string>();
   const dirToPkg = new Map<string, string>();
   const dirToSvc = new Map<string, string>();
@@ -179,13 +231,23 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
     guard.copyTree(stub.stub_dir, dest, (src) => !src.split(path.sep).includes('node_modules'));
     assembled.push({ serviceName: stub.service_name, packageDir, packageName });
     dependencySets.push({ dependencies: readStubDependencies(stub.stub_dir) });
+    edgeSets.push(readStubResolution(stub.stub_dir));
     svcToPkg.set(stub.service_name, packageName);
     dirToPkg.set(packageDir, packageName);
     dirToSvc.set(packageDir, stub.service_name);
   }
 
-  // Root manifest carries the semver-dedupe overrides.
-  const overrides = computeDedupeOverrides(dependencySets);
+  // Root manifest carries the semver-dedupe overrides and the recorded edges.
+  const dedupe = computeDedupeOverrides(dependencySets);
+  const merged: Record<string, string> = {
+    ...dedupe,
+    ...computeResolutionOverrides(edgeSets, dedupe),
+  };
+  const overrides = Object.fromEntries(
+    Object.keys(merged)
+      .sort()
+      .map((k) => [k, merged[k]])
+  );
   guard.writeFile(
     path.join(workspaceDir, 'package.json'),
     JSON.stringify(
@@ -251,12 +313,13 @@ const NPMRC = [
   'strict-peer-dependencies=false',
   // Determinism: install exactly the pinned closure, no implicit peer pull-in.
   'auto-install-peers=false',
-  // Determinism: the scratch workspace has no committed lockfile, so the
-  // transitive closure would otherwise be a pure function of live registry
-  // state. prefer-offline resolves from the local store/metadata cache
+  // Determinism: the scratch workspace has no committed lockfile. Direct deps
+  // are exact-pinned by the stubs, and every transitive edge a stub recorded
+  // from the scanned repo's installed tree is pinned by a parent-scoped
+  // override in the root manifest. Only unrecorded edges resolve, and for
+  // those prefer-offline resolves from the local store/metadata cache
   // whenever possible (byte-stable across runs on a host), and the explicit
   // resolution-mode pins pnpm's resolver behavior across pnpm versions.
-  // Direct deps are exact-pinned by the stubs; only transitives resolve.
   'prefer-offline=true',
   'resolution-mode=highest',
   '',
