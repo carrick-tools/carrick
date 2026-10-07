@@ -87,6 +87,8 @@ JSON over stdio:
 
 Every request carries `request_id` and `action`. Every response echoes `request_id` and carries `status`.
 
+The process exits when stdin closes, and when the process that started it is gone: it compares its parent with the one it started with once a second, so it ends even when another process still holds its stdin open (carrick#2029). A handler that is running finishes first.
+
 ### One request at a time, and progress frames
 
 The sidecar handles requests in order, one at a time. `bundle`, `infer`, `capture_v2` and the other compiler actions are synchronous: the handler blocks the event loop until it returns, so a request sent meanwhile waits in the pipe, and nothing can cancel the one that is running. A client that stops waiting for an answer must kill the process and start another; a request sent to the old one would queue behind work nobody reads.

@@ -48,10 +48,18 @@ fn node_available() -> bool {
 
 /// Write a stand-in sidecar script and return its path. The directory is
 /// returned alongside so the caller keeps it alive for the process's lifetime.
+///
+/// Every stand-in reads stdin, which keeps it running, and ends when stdin
+/// does, as the real sidecar does. One that outlived this test process would
+/// run on until the machine restarts (carrick#2029).
 fn stand_in(body: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
     let script = dir.path().join("stand-in-sidecar.js");
-    std::fs::write(&script, body).expect("write stand-in sidecar");
+    std::fs::write(
+        &script,
+        format!("{body}process.stdin.on('end', () => process.exit(0));\n"),
+    )
+    .expect("write stand-in sidecar");
     (dir, script)
 }
 
@@ -107,7 +115,7 @@ fn a_silent_sidecar_times_out_at_the_stated_budget() {
     }
 
     // Reads stdin so the pipe stays open, writes nothing, ever.
-    let (dir, script) = stand_in("process.stdin.resume();\nsetInterval(() => {}, 1000);\n");
+    let (dir, script) = stand_in("process.stdin.resume();\n");
     let (_sidecar, result, elapsed) = wait_ready_off_thread(&script, dir.path(), BUDGET);
 
     assert!(
@@ -139,8 +147,7 @@ fn a_blank_line_does_not_extend_the_budget() {
 
     let (dir, script) = stand_in(
         "process.stdin.resume();\n\
-         setTimeout(() => process.stdout.write('\\n'), 500);\n\
-         setInterval(() => {}, 1000);\n",
+         setTimeout(() => process.stdout.write('\\n'), 500);\n",
     );
     let (_sidecar, result, elapsed) = wait_ready_off_thread(&script, dir.path(), BUDGET);
 
@@ -172,8 +179,7 @@ fn a_sidecar_that_misses_its_budget_is_killed() {
         "process.stdin.resume();\n\
          setTimeout(() => {\n\
          process.stdout.write(JSON.stringify({ request_id: 'init', status: 'ready' }) + '\\n');\n\
-         }, 6000);\n\
-         setInterval(() => {}, 1000);\n",
+         }, 6000);\n",
     );
     let (sidecar, result, _) = wait_ready_off_thread(&script, dir.path(), BUDGET);
     assert!(
@@ -206,8 +212,7 @@ fn a_prompt_sidecar_returns_immediately() {
     let (dir, script) = stand_in(
         "process.stdin.on('data', () => {\n\
          process.stdout.write(JSON.stringify({ request_id: 'init', status: 'ready' }) + '\\n');\n\
-         });\n\
-         setInterval(() => {}, 1000);\n",
+         });\n",
     );
     let (_sidecar, result, elapsed) = wait_ready_off_thread(&script, dir.path(), BUDGET);
 

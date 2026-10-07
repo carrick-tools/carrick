@@ -100,6 +100,27 @@ impl Bench {
             .collect()
     }
 
+    /// Where the waiting scan's stand-in sidecar writes its pid.
+    fn sidecar_record(&self) -> PathBuf {
+        self.path().join("sidecar-pids")
+    }
+
+    /// Wait for the waiting scan's stand-in sidecar to start, and answer its pid.
+    fn first_sidecar(&self) -> i32 {
+        let start = Instant::now();
+        loop {
+            let pids = std::fs::read_to_string(self.sidecar_record()).unwrap_or_default();
+            if let Some(pid) = pids.lines().find_map(|line| line.trim().parse().ok()) {
+                return pid;
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "the scan never started its sidecar"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for the first hold to be asked for, and answer it.
     fn first_hold(&self) -> (i32, String) {
         let start = Instant::now();
@@ -162,7 +183,12 @@ impl Bench {
         std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
         std::fs::write(
             sidecar.join("index.js"),
-            "process.stdin.resume();\nsetInterval(() => {}, 60000);\n",
+            format!(
+                "require('fs').appendFileSync({record:?}, process.pid + '\\n');\n\
+                 process.stdin.on('end', () => process.exit(0));\n\
+                 process.stdin.resume();\n",
+                record = self.sidecar_record().to_string_lossy()
+            ),
         )
         .expect("write the sidecar that never answers");
         let mut command = self.scan(&repo_root().join("examples/express-single"));
@@ -195,12 +221,16 @@ fn alive(pid: i32) -> bool {
 
 /// The helper goes, or the test fails saying how long it stayed.
 fn assert_released(helper: i32, after: &str) {
+    assert_gone(helper, "the hold outlived the scan: its helper", after);
+}
+
+/// `pid` goes, or the test fails naming `what` stayed and for how long.
+fn assert_gone(pid: i32, what: &str, after: &str) {
     let start = Instant::now();
-    while alive(helper) {
+    while alive(pid) {
         assert!(
             start.elapsed() < DEADLINE,
-            "the hold outlived the scan: its helper (pid {helper}) was still running {:.0}s after \
-             {after}",
+            "{what} (pid {pid}) was still running {:.0}s after {after}",
             start.elapsed().as_secs_f64()
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -218,12 +248,15 @@ fn send(child: &Child, signal: libc::c_int) {
 }
 
 /// Start a scan that is waiting, see that it holds, end it with `signal`, and
-/// see that the hold went with it.
+/// see that the hold and the sidecar went with it. The sidecar ends when its
+/// stdin does, as the real one does; one that outlived its scan here was left
+/// on the machine for good (carrick#2029).
 fn a_scan_ended_by(signal: libc::c_int, name: &str) -> std::process::ExitStatus {
     let bench = Bench::new();
     let mut child = bench.waiting_scan(600).spawn().expect("start a scan");
     let scan = child.id();
 
+    let sidecar = bench.first_sidecar();
     let (helper, arguments) = bench.first_hold();
     assert_eq!(
         arguments,
@@ -239,6 +272,11 @@ fn a_scan_ended_by(signal: libc::c_int, name: &str) -> std::process::ExitStatus 
     send(&child, signal);
     let status = child.wait().expect("collect the scan");
     assert_released(helper, &format!("the scan was ended by {name}"));
+    assert_gone(
+        sidecar,
+        "the scan's sidecar",
+        &format!("the scan was ended by {name}"),
+    );
     assert_eq!(bench.holds().len(), 1, "one hold for one scan");
     status
 }

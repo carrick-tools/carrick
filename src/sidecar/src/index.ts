@@ -852,6 +852,32 @@ function processLine(line: string): void {
   writeResponse(response);
 }
 
+/** How often the sidecar looks for the process that started it. */
+const PARENT_CHECK_MS = 1000;
+
+/**
+ * Exit once the process that started this one is gone (carrick#2029).
+ *
+ * Its death closes stdin, which ends this process, unless another process
+ * still holds the write end. Then the only sign is that this process has a
+ * new parent: whatever adopts it (init, or a subreaper on Linux) has a pid of
+ * its own. So the parent at startup is kept and compared, never 1. A process
+ * already adopted at startup has no parent to watch, and stdin alone decides.
+ *
+ * The timer is unref'd: it never keeps an otherwise finished process alive.
+ * A handler that blocks the event loop holds it off until it returns.
+ */
+function exitWhenParentIsGone(): void {
+  const startedBy = process.ppid;
+  if (startedBy <= 1) return;
+  setInterval(() => {
+    if (process.ppid !== startedBy) {
+      log(`parent ${startedBy} is gone, exiting`);
+      process.exit(0);
+    }
+  }, PARENT_CHECK_MS).unref();
+}
+
 /**
  * Start the message loop
  */
@@ -870,6 +896,8 @@ function main(): void {
     log('stdin closed, exiting');
     process.exit(0);
   });
+
+  exitWhenParentIsGone();
 
   // Handle process signals
   process.on('SIGINT', () => {

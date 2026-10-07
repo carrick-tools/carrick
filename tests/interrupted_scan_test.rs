@@ -119,7 +119,7 @@ fn a_signal_during_the_wait_on_the_sidecar_ends_the_run() {
     // answers nothing.
     std::fs::write(
         sidecar.join("index.js"),
-        "process.stdin.resume();\nsetInterval(() => {}, 60000);\n",
+        "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();\n",
     )
     .expect("write the sidecar that never answers");
 
@@ -203,8 +203,8 @@ process.stdin.on("data", (chunk) => {{
     }}
   }}
 }});
+process.stdin.on("end", () => process.exit(0));
 process.stdin.resume();
-setInterval(() => {{}}, 60000);
 "#,
             asked = asked.to_string_lossy()
         ),
@@ -305,7 +305,7 @@ fn a_signal_to_a_build_reaches_the_scan_it_is_waiting_on() {
     std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
     std::fs::write(
         sidecar.join("index.js"),
-        "process.stdin.resume();\nsetInterval(() => {}, 60000);\n",
+        "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();\n",
     )
     .expect("write the sidecar that never answers");
 
