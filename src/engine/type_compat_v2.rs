@@ -1753,6 +1753,15 @@ pub(crate) fn run_check(
 pub(crate) const SAME_SERVICE_MISMATCH_NOT_REPORTED: &str =
     "a mismatch between a call and a route of its own service, which Carrick does not report yet";
 
+/// The gate a held-back same-service mismatch is stamped with.
+const SAME_SERVICE_GATE: &str = "same_service";
+
+/// What the check found on a held-back pair, worded once for the stored note
+/// and the run log's line (carrick#2053).
+fn held_back_finding(found: &str) -> String {
+    format!("what the check found: {found}")
+}
+
 /// Publish every same-service pair the check found incompatible as
 /// unverifiable, saying why ([`SAME_SERVICE_MISMATCH_NOT_REPORTED`]).
 ///
@@ -1763,6 +1772,14 @@ pub(crate) const SAME_SERVICE_MISMATCH_NOT_REPORTED: &str =
 /// call that breaks. Until those causes are fixed a same-service mismatch is
 /// not a fact a pull request should fail on. A same-service `compatible`, an
 /// unverifiable half and every pair of two services are unchanged.
+///
+/// What the check found is kept (carrick#2053): its text stays as the
+/// outcome's `diagnostic` (a retype mismatch's text already names the
+/// consumer's lines) and rides as a note, because a direction's `reason`
+/// exists only on `incompatible` and would read as the mismatch this holds
+/// back. The notes the check already made stay too: the comparison happened.
+/// The consumer's lines are cleared as such, since a finding projects them as
+/// the places of a mismatch.
 ///
 /// Done here, on the outcomes, because every reader starts from them: the
 /// stored verdict rows, the edges' `type_compatible`, and the findings a pull
@@ -1775,11 +1792,13 @@ fn hold_back_same_service_mismatches(outcomes: &mut [PairCheckOutcome]) {
             continue;
         }
         outcome.bucket = VerdictBucket::Unverifiable;
-        outcome.gate = Some("same_service".to_string());
-        outcome.diagnostic = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
+        outcome.gate = Some(SAME_SERVICE_GATE.to_string());
+        outcome.diagnostic = outcome.diagnostic.take().filter(|found| !found.is_empty());
+        if let Some(found) = outcome.diagnostic.as_deref() {
+            outcome.notes.push(held_back_finding(found));
+        }
         outcome.resolved = false;
         outcome.unresolved_reason = Some(SAME_SERVICE_MISMATCH_NOT_REPORTED.to_string());
-        outcome.notes.clear();
         outcome.consumer_reads.clear();
     }
 }
@@ -2374,8 +2393,24 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
         ManifestTypeKind::Request => "request",
         ManifestTypeKind::Response => "response",
     };
+    let reason = outcome
+        .unresolved_reason
+        .as_deref()
+        .or(outcome.diagnostic.as_deref())
+        .unwrap_or("no reason recorded");
+    // A held-back mismatch says what the check found after why it is not
+    // reported (carrick#2053); no other unverified pair's diagnostic is added.
+    // On one line, as every pair's line is: a compiler's chain of "is not
+    // assignable" lines would otherwise leave the rest of it out of a grep.
+    let found = match outcome.diagnostic.as_deref() {
+        Some(found) if outcome.gate.as_deref() == Some(SAME_SERVICE_GATE) => {
+            let one_line = found.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("; {}", held_back_finding(&one_line))
+        }
+        _ => String::new(),
+    };
     Some(format!(
-        "Types not verified: {} {} {} ({}:{} in {} against {}): {}",
+        "Types not verified: {} {} {} ({}:{} in {} against {}): {reason}{found}",
         outcome.pseudo_method,
         outcome.identity,
         kind,
@@ -2383,11 +2418,6 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
         outcome.consumer_line,
         outcome.consumer_service,
         outcome.producer_service,
-        outcome
-            .unresolved_reason
-            .as_deref()
-            .or(outcome.diagnostic.as_deref())
-            .unwrap_or("no reason recorded")
     ))
 }
 
@@ -2402,7 +2432,8 @@ fn outcome_for(
     // Empty for every outcome this module SYNTHESISES — a pre-verdicted pair,
     // a pair the check returned nothing for, a run that did not happen —
     // since none of those compared anything to observe. Only a real
-    // `CheckVerdict.notes` is ever non-empty here.
+    // `CheckVerdict.notes` is non-empty here; the retype and the hold-back
+    // add their own after the check.
     notes: Vec<String>,
 ) -> PairCheckOutcome {
     PairCheckOutcome {
@@ -5241,15 +5272,22 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(held.bucket, VerdictBucket::Unverifiable);
         assert_eq!(held.gate.as_deref(), Some("same_service"));
         assert_eq!(
-            held.diagnostic.as_deref(),
-            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
-        );
-        assert_eq!(
             held.unresolved_reason.as_deref(),
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
         assert!(!held.resolved);
-        assert!(held.notes.is_empty() && held.consumer_reads.is_empty());
+        // What the check found stays: its text on the outcome, and as a note
+        // beside the check's own notes. The consumer lines cannot ride a
+        // mismatch, so they are cleared (their places are in the text).
+        assert_eq!(held.diagnostic.as_deref(), Some("the check's text"));
+        assert_eq!(
+            held.notes,
+            vec![
+                "a note".to_string(),
+                "what the check found: the check's text".to_string()
+            ]
+        );
+        assert!(held.consumer_reads.is_empty());
         assert_eq!(
             format!("{:?}", &after[1..]),
             format!("{:?}", &before[1..]),
@@ -5285,10 +5323,242 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             response.unresolved_reason.as_deref(),
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
+        assert_eq!(
+            response.notes,
+            vec![
+                "a note".to_string(),
+                "what the check found: the check's text".to_string()
+            ],
+            "the stored half carries what the check found"
+        );
         let mut edges = vec![edge];
         crate::analyzer::apply_pair_outcomes(&after[..1], &mut edges);
         assert_eq!(edges[0].type_compatible, None);
         assert_eq!(edges[0].mismatch_reason, None);
+    }
+
+    /// A same-service outcome built from the retype helper's pair, which
+    /// pairs two services: the producer is moved onto the consumer's service.
+    fn same_service_outcome(
+        bucket: VerdictBucket,
+        diagnostic: Option<&str>,
+        notes: Vec<String>,
+    ) -> PairCheckOutcome {
+        let pair = retype_pair(ManifestTypeKind::Response, Some("{ y: number; }"));
+        let mut outcome = outcome_for(
+            &pair,
+            bucket,
+            None,
+            diagnostic.map(str::to_string),
+            bucket != VerdictBucket::Unverifiable,
+            None,
+            notes,
+        );
+        outcome.producer_service = outcome.consumer_service.clone();
+        outcome
+    }
+
+    /// The half the blob stores for one outcome, as the stored row reads it.
+    fn stored_response_half(outcome: &PairCheckOutcome) -> crate::cloud_storage::DirectionVerdict {
+        let directions =
+            crate::analyzer::PairDirections::from_outcomes(std::slice::from_ref(outcome));
+        let key = format!("http|{}|{}", outcome.pseudo_method, outcome.identity);
+        let edge = crate::analyzer::CrossRepoMatch {
+            producer_repo: outcome.producer_service.clone(),
+            producer_key: key.clone(),
+            consumer_repo: outcome.consumer_service.clone(),
+            consumer_key: key,
+            consumer_location: Some(format!(
+                "{}:{}",
+                outcome.consumer_file, outcome.consumer_line
+            )),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+        };
+        let half = directions
+            .for_edge(&edge)
+            .response
+            .expect("the half is stored");
+        crate::cloud_storage::direction_verdict(&half)
+    }
+
+    /// carrick#2053: a same-service mismatch the check found is held back,
+    /// and what it found stays on the half. The mismatch is a note, never
+    /// the half's `reason` (a reason is read as a mismatch), and the held-back
+    /// sentence is still why the half is unverifiable.
+    #[test]
+    fn a_held_back_mismatch_keeps_what_the_check_found_as_a_note() {
+        let mut outcomes = vec![same_service_outcome(
+            VerdictBucket::Incompatible,
+            Some("Property 'y' is missing in type '{ x: string; }'."),
+            Vec::new(),
+        )];
+        hold_back_same_service_mismatches(&mut outcomes);
+
+        let stored = stored_response_half(&outcomes[0]);
+        assert_eq!(stored.verdict, crate::operation::TypeVerdict::Unverifiable);
+        assert_eq!(stored.reason, None, "a finding is never a reason");
+        assert!(!stored.resolved);
+        assert_eq!(
+            stored.unresolved_reason.as_deref(),
+            Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
+        );
+        assert_eq!(
+            stored.notes,
+            vec![
+                "what the check found: Property 'y' is missing in type '{ x: string; }'."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// carrick#2053: a mismatch the retype found names the consumer's own
+    /// reads, and those lines survive the hold-back inside the note. The
+    /// consumer lines are cleared as such, since a non-empty list is read as
+    /// the places of a finding, which a held-back half is not.
+    #[test]
+    fn a_held_back_retype_mismatch_keeps_the_consumer_lines_in_its_note() {
+        let mut outcome = same_service_outcome(VerdictBucket::Unverifiable, None, Vec::new());
+        outcome.unresolved_reason = Some("the consumer type is 'unknown'".to_string());
+        let item_id = outcome.pair_key.clone();
+        apply_retype(
+            &mut outcome,
+            &RetypeOutcome {
+                item_id,
+                outcome: RetypeVerdict::Mismatch,
+                diagnostics: vec![
+                    crate::services::type_sidecar::RetypeDiagnostic {
+                        line: 9,
+                        code: 2339,
+                        message: "Property 'x' does not exist on type '{ y: number; }'."
+                            .to_string(),
+                    },
+                    crate::services::type_sidecar::RetypeDiagnostic {
+                        line: 14,
+                        code: 2339,
+                        message: "Property 'z' does not exist on type '{ y: number; }'."
+                            .to_string(),
+                    },
+                ],
+                reason: None,
+            },
+        );
+        assert_eq!(outcome.consumer_reads, vec![9, 14]);
+        let mut outcomes = vec![outcome];
+        hold_back_same_service_mismatches(&mut outcomes);
+
+        let held = &outcomes[0];
+        assert_eq!(held.bucket, VerdictBucket::Unverifiable);
+        assert!(held.consumer_reads.is_empty());
+        assert_eq!(
+            held.notes,
+            vec![
+                RETYPE_NOTE.to_string(),
+                "what the check found: the consumer uses what the producer's response does not \
+                 provide: src/client.ts:9: Property 'x' does not exist on type '{ y: number; }'.; \
+                 src/client.ts:14: Property 'z' does not exist on type '{ y: number; }'."
+                    .to_string(),
+            ]
+        );
+        let stored = stored_response_half(held);
+        assert_eq!(stored.verdict, crate::operation::TypeVerdict::Unverifiable);
+        assert_eq!(stored.reason, None);
+        assert_eq!(stored.notes.len(), 2);
+    }
+
+    /// carrick#2053: a mismatch that came back with no text has nothing to
+    /// carry, so it adds no note rather than an empty one.
+    #[test]
+    fn a_held_back_mismatch_with_no_text_adds_no_note() {
+        for diagnostic in [None, Some("")] {
+            let mut outcomes = vec![same_service_outcome(
+                VerdictBucket::Incompatible,
+                diagnostic,
+                Vec::new(),
+            )];
+            hold_back_same_service_mismatches(&mut outcomes);
+            assert_eq!(outcomes[0].bucket, VerdictBucket::Unverifiable);
+            assert!(outcomes[0].notes.is_empty(), "{diagnostic:?}");
+        }
+    }
+
+    /// carrick#2053: the CI log's line for a held-back pair says why it is
+    /// held back, then what the check found. Another unverified pair's line is
+    /// its reason alone, whatever its diagnostic holds.
+    #[test]
+    fn a_held_back_pair_is_logged_with_the_sentence_then_what_the_check_found() {
+        let mut held = vec![same_service_outcome(
+            VerdictBucket::Incompatible,
+            Some("Property 'y' is missing"),
+            Vec::new(),
+        )];
+        hold_back_same_service_mismatches(&mut held);
+        assert_eq!(
+            unresolved_pair_line(&held[0]).as_deref(),
+            Some(
+                "Types not verified: POST /p response (src/client.ts:8 in web against web): \
+                 a mismatch between a call and a route of its own service, which Carrick does \
+                 not report yet; what the check found: Property 'y' is missing"
+            )
+        );
+
+        // A compiler's chain is one line in the log and verbatim in the note.
+        let chain = "Type 'A' is not assignable to type 'B'.\n  Types of property 'id' are \
+                     incompatible.\n    Type 'string' is not assignable to type 'number'.";
+        let mut chained = vec![same_service_outcome(
+            VerdictBucket::Incompatible,
+            Some(chain),
+            Vec::new(),
+        )];
+        hold_back_same_service_mismatches(&mut chained);
+        let line = unresolved_pair_line(&chained[0]).expect("a line");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.ends_with(
+                "; what the check found: Type 'A' is not assignable to type 'B'. Types of \
+                 property 'id' are incompatible. Type 'string' is not assignable to type 'number'."
+            ),
+            "{line}"
+        );
+        assert_eq!(
+            chained[0].notes,
+            vec![format!("what the check found: {chain}")]
+        );
+
+        let mut nothing_found = vec![same_service_outcome(
+            VerdictBucket::Incompatible,
+            None,
+            Vec::new(),
+        )];
+        hold_back_same_service_mismatches(&mut nothing_found);
+        assert_eq!(
+            unresolved_pair_line(&nothing_found[0]).as_deref(),
+            Some(
+                "Types not verified: POST /p response (src/client.ts:8 in web against web): \
+                 a mismatch between a call and a route of its own service, which Carrick does \
+                 not report yet"
+            )
+        );
+
+        let mut other = same_service_outcome(
+            VerdictBucket::GateCaughtBakedAny,
+            Some("the check's text"),
+            vec!["a note".to_string()],
+        );
+        other.gate = Some("capture:consumer:any".to_string());
+        other.resolved = false;
+        other.unresolved_reason = Some("the consumer type carries 'any' at '<1>'".to_string());
+        assert_eq!(
+            unresolved_pair_line(&other).as_deref(),
+            Some(
+                "Types not verified: POST /p response (src/client.ts:8 in web against web): \
+                 the consumer type carries 'any' at '<1>'"
+            )
+        );
     }
 
     /// carrick#2004: a route that states a literal where the call has a
@@ -5900,14 +6170,34 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "{outcomes:#?}"
         );
         // The mismatch the check found is published as not reported, and
-        // says so; nothing of the mismatch rides the half.
+        // says so; what it found rides the half as a note (carrick#2053),
+        // never as a reason.
         let held = &outcomes[2];
         assert_eq!(held.gate.as_deref(), Some("same_service"));
         assert_eq!(
             held.unresolved_reason.as_deref(),
             Some(SAME_SERVICE_MISMATCH_NOT_REPORTED)
         );
-        assert!(!held.resolved && held.notes.is_empty() && held.consumer_reads.is_empty());
+        assert!(!held.resolved && held.consumer_reads.is_empty());
+        let found: Vec<&String> = held
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("what the check found: "))
+            .collect();
+        assert_eq!(found.len(), 1, "{held:#?}");
+        assert!(
+            found[0].contains("'id'") && found[0].contains("string") && found[0].contains("number"),
+            "the note names the field the check found: {held:#?}"
+        );
+        assert_eq!(
+            held.diagnostic.as_deref(),
+            found[0].strip_prefix("what the check found: ")
+        );
+        assert_eq!(
+            stored_response_half(held).reason,
+            None,
+            "a finding is never the stored half's reason"
+        );
         let any = &outcomes[0];
         assert!(!any.resolved);
         assert!(

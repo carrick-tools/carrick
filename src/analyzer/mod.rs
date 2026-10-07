@@ -1583,7 +1583,6 @@ pub struct PairCheckOutcome {
     pub type_kind: crate::cloud_storage::ManifestTypeKind,
     pub bucket: crate::services::type_sidecar::VerdictBucket,
     /// For gate buckets: which side and which gate fired.
-    #[allow(dead_code)]
     pub gate: Option<String>,
     /// Scrubbed compiler diagnostic or synthesized reason.
     pub diagnostic: Option<String>,
@@ -1607,7 +1606,9 @@ pub struct PairCheckOutcome {
     pub unresolved_reason: Option<String>,
     /// Observations the check made about this comparison that are neither the
     /// verdict nor an unresolution (carrick#1341), carried verbatim from the
-    /// sidecar's `CheckVerdict.notes`. Empty when there is nothing to add.
+    /// sidecar's `CheckVerdict.notes`, plus what the retype and the same-service
+    /// hold-back add (carrick#2053: the finding a held-back mismatch keeps, which
+    /// cannot ride `reason`). Empty when there is nothing to add.
     pub notes: Vec<String>,
     /// The lines of `consumer_file` where the consumer reads what the
     /// producer's response does not provide, as the retype check found them
