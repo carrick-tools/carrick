@@ -48,6 +48,9 @@ export function expandOriginOf(project: Project, repoRoot = '/'): ExpandOrigin {
   return { program: project.getProgram().compilerObject, repoRoot };
 }
 
+// tgz, integrityOf and localRegistry mirror the library store's test support
+// in the companion cloud repo (lambdas/library-claims/test_support.js), served
+// over HTTP here because the installer is a separate process.
 function tarHeader(name: string, size: number): Buffer {
   const h = Buffer.alloc(512);
   h.write(name, 0, 100, 'utf8');
