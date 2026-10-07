@@ -1843,7 +1843,8 @@ export class TypeInferrer {
    *
    * Returns `undefined` when this does not apply, which leaves the caller's
    * own reading of the located expression untouched:
-   *  - the row's line is not a route registration;
+   *  - the row's line is neither a route registration nor a line inside the
+   *    handler the located send sits in;
    *  - the located expression is neither a send nor the argument of one;
    *  - that send is not one the handler returns;
    *  - it is a success send and the only one that survives, so the join would
@@ -1861,9 +1862,21 @@ export class TypeInferrer {
     located: Node,
     extractionConfig?: ExtractionConfig
   ): InferredType | null | undefined {
-    if (!this.registrationAtLine(sourceFile, request.line_number)) return undefined;
     const func = this.findContainingFunctionForNode(located);
     if (!func) return undefined;
+    // The row's line is a registration, or a line inside the handler the
+    // located send sits in (carrick#2005: a file-based route's row names the
+    // send's own line, and a send's line is no registration). A row whose
+    // line is outside that function says nothing about it.
+    if (
+      !this.registrationAtLine(sourceFile, request.line_number) &&
+      !(
+        func.getStartLineNumber() <= request.line_number &&
+        request.line_number <= func.getEndLineNumber()
+      )
+    ) {
+      return undefined;
+    }
 
     const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
@@ -1883,10 +1896,10 @@ export class TypeInferrer {
 
     const dropped = (status: ResponseSiteStatus): boolean =>
       status === 'error' || status === 'redirect';
-    const siteStatus = this.responseSiteStatus(site);
+    const siteStatus = this.responseSiteStatus(site, true);
     const survivors: Node[] = [];
     for (const branch of branches) {
-      const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch);
+      const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch, true);
       if (status === 'variable') {
         this.log(
           `Response status at ${request.file_path}:${this.getNodeLocation(branch).start_line} ` +
@@ -5337,7 +5350,7 @@ export class TypeInferrer {
    * A status in the FIRST argument is a field of the body and is never read.
    * No method or framework name is consulted anywhere.
    */
-  private responseSiteStatus(expression: Node): ResponseSiteStatus {
+  private responseSiteStatus(expression: Node, readChain = false): ResponseSiteStatus {
     const call = this.peelTransparentExpression(expression);
     if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
       return 'undecided';
@@ -5359,12 +5372,49 @@ export class TypeInferrer {
     }
     if (variable) return 'variable';
 
+    // carrick#2005: a status an earlier call of the same chain states
+    // (`reply.status(401).json(body)`). Read only where the caller asks for
+    // it; the return walk does not read it yet (carrick#1962).
+    if (readChain) {
+      const chained = this.chainStatus(call);
+      if (chained) return chained;
+    }
+
     const typed = this.sendResultStatusCodes(call);
     if (typed) {
       const kind = classifyStatusCodes(typed);
       if (kind !== 'mixed') return kind;
     }
     return 'undecided';
+  }
+
+  /**
+   * The status an earlier call of a send's own chain states: the receiver
+   * calls `call` is invoked on (`a.status(401).json(body)` has `a.status(401)`),
+   * innermost last. Each receiver call's first argument is read by the rule
+   * an argument past a body is, so a numeric literal or a literal-typed value
+   * counts and a plain `number` is `variable`. `undefined` when no receiver
+   * call states a status. No method name is consulted: a receiver call that
+   * is handed no status-shaped value says nothing.
+   */
+  private chainStatus(call: Node): ResponseSiteStatus | undefined {
+    if (!Node.isCallExpression(call)) return undefined;
+    let callee = call.getExpression();
+    while (Node.isPropertyAccessExpression(callee)) {
+      const receiver = this.peelTransparentExpression(callee.getExpression());
+      if (!Node.isCallExpression(receiver)) return undefined;
+      const first = receiver.getArguments()[0];
+      if (first) {
+        const read = this.statedStatusCodes(this.peelTransparentExpression(first));
+        if (read === 'variable') return 'variable';
+        if (read) {
+          const kind = classifyStatusCodes(read);
+          return kind === 'mixed' ? 'variable' : kind;
+        }
+      }
+      callee = receiver.getExpression();
+    }
+    return undefined;
   }
 
   /**
