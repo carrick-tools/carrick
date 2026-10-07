@@ -7996,24 +7996,47 @@ impl FileOrchestrator {
         result.dispatch_tables = dispatch_tables;
 
         // --- the producer side -------------------------------------------
-        //
+
+        /// What the model's rows did to one deterministic row.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Taken {
+            /// Nothing replaced it, so it reaches the index as it was emitted.
+            Open,
+            /// One model row restated the route and replaces it.
+            Joined,
+            /// The model stated the route as the cases of a handler that
+            /// dispatches on a request field. Each case replaces it, so it
+            /// stays open to the next one (carrick#2048).
+            Cases,
+        }
+
         // An endpoint whose `candidate_id` names no site this file could have
         // registered a route at has no anchor of its own. Where a deterministic
         // row already states that route, the model's reading of it is folded
         // onto that row; where nothing states it, there is no evidence the
         // registration exists and the row is dropped (carrick#1395).
         let mut dropped: Vec<String> = Vec::new();
-        // Deterministic rows a model row with no site of its own has already
-        // been folded onto, by the row's `candidate_id`. Keyed on the id rather
-        // than the index because the twin fold below REMOVES rows from the
-        // deterministic region, which shifts every index after it.
-        let mut reconciled: HashSet<String> = HashSet::new();
         // The rows the emit phase produced, which are the only ones a model
         // row can be the twin OF: every row this loop pushes is appended after
         // them, and a second model row for one route must not fold into the
         // first one's joined row (that would drop a row rather than label it).
-        let mut deterministic_rows = result.endpoints.len();
-        for mut endpoint in endpoints {
+        // Nothing is removed from this region until the loop ends, so an index
+        // into it names one row for the whole loop.
+        let deterministic_rows = result.endpoints.len();
+        // Deterministic rows a model row with no site of its own has already
+        // been folded onto.
+        let mut reconciled = vec![false; deterministic_rows];
+        // What the model's rows did to each deterministic row, read by every
+        // twin search below and applied once the loop ends.
+        let mut taken = vec![Taken::Open; deterministic_rows];
+        // The cases of a body-dispatching handler come first (carrick#2048). A
+        // row with no case that restates a route the model also states as
+        // cases is then dropped whichever order the model answered in, rather
+        // than taking the route before its cases reach it.
+        let (cases, plain): (Vec<EndpointResult>, Vec<EndpointResult>) = endpoints
+            .into_iter()
+            .partition(|endpoint| endpoint.dispatch.is_some());
+        for mut endpoint in cases.into_iter().chain(plain) {
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
             // call that states a route path, or — for a route whose
@@ -8035,12 +8058,49 @@ impl FileOrchestrator {
                     // deterministic layer cannot state. Fold the anchors onto
                     // it rather than dropping them, and never emit a second
                     // row for one route.
+                    //
+                    // A row that states a dispatch case is not a reading of
+                    // that route but one of its operations (carrick#831).
+                    // Folding it would drop the case and leave the route
+                    // answering every call whatever it sends, so it becomes a
+                    // case of the route instead, and the route stays open to
+                    // the handler's other cases (carrick#2048).
+                    let is_case = endpoint.dispatch.is_some();
                     if let Some(index) = Self::route_stated_deterministically(
                         &result.endpoints[..deterministic_rows],
                         &endpoint,
                         route_module_claimed,
-                        &reconciled,
+                        |index| taken[index] != Taken::Joined && (is_case || !reconciled[index]),
                     ) {
+                        if Self::is_case_of(&endpoint, &result.endpoints[index]) {
+                            let row = Self::case_of_route(&result.endpoints[index], &endpoint);
+                            debug!(
+                                "Keeping the model's case {} of {} {} in {} as a case of the row {:?} \
+                                 states for it: the id it echoed ('{}') names no site this route \
+                                 could be registered at",
+                                row.dispatch.as_ref().map(|d| d.key()).unwrap_or_default(),
+                                row.method,
+                                row.path,
+                                file_path,
+                                row.resolution_source,
+                                endpoint.candidate_id
+                            );
+                            taken[index] = Taken::Cases;
+                            if !Self::restates_a_kept_row(
+                                &result.endpoints[deterministic_rows..],
+                                &row,
+                                file_path,
+                            ) {
+                                stats.model_rows_reconciled += 1;
+                                result.endpoints.push(row);
+                            }
+                            continue;
+                        }
+                        if taken[index] == Taken::Cases {
+                            Self::log_route_stated_as_cases(&endpoint, file_path);
+                            continue;
+                        }
+                        reconciled[index] = true;
                         let twin = &mut result.endpoints[index];
                         debug!(
                             "Folding the model's reading of {} {} in {} onto the row {:?} states for it: \
@@ -8051,7 +8111,6 @@ impl FileOrchestrator {
                             twin.resolution_source,
                             endpoint.candidate_id
                         );
-                        reconciled.insert(twin.candidate_id.clone());
                         Self::carry_type_anchors(twin, &endpoint);
                         stats.model_rows_reconciled += 1;
                         continue;
@@ -8112,16 +8171,11 @@ impl FileOrchestrator {
             // Only against the rows THIS loop has pushed: a model row that
             // agrees with a deterministic row must fold onto it and keep its
             // source, which is the twin search below.
-            let key = Self::model_row_key(&endpoint);
-            if result.endpoints[deterministic_rows..]
-                .iter()
-                .any(|kept| Self::model_row_key(kept) == key)
-            {
-                warn!(
-                    "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
-                     emitted for this file: dropped",
-                    endpoint.method, endpoint.path, file_path
-                );
+            if Self::restates_a_kept_row(
+                &result.endpoints[deterministic_rows..],
+                &endpoint,
+                file_path,
+            ) {
                 continue;
             }
             // A structural route the deterministic layer already stated. The
@@ -8149,12 +8203,17 @@ impl FileOrchestrator {
             // twice: once as the structural row with no handler and no type
             // anchor, once as the model's (carrick#1288). The literal is the
             // common ground, and it is already canonical.
+            //
+            // A row a model row has already replaced is not offered again. A
+            // row the model states as cases is: every case replaces it.
             let canonical = Self::canonicalize_route_path(&endpoint.path);
             let literal = endpoint.registration_literal.clone();
             let agreeing = result.endpoints[..deterministic_rows]
                 .iter()
-                .position(|existing| {
-                    if existing.resolution_source == Some(ResolutionSource::Model)
+                .enumerate()
+                .position(|(index, existing)| {
+                    if taken[index] == Taken::Joined
+                        || existing.resolution_source == Some(ResolutionSource::Model)
                         || !existing.method.eq_ignore_ascii_case(&endpoint.method)
                     {
                         return false;
@@ -8199,20 +8258,26 @@ impl FileOrchestrator {
                 );
                 result.endpoints[..deterministic_rows]
                     .iter()
-                    .position(|existing| {
+                    .enumerate()
+                    .position(|(index, existing)| {
                         let (Some(outer_start), Some(outer_end)) = (
                             existing.call_expression_span_start,
                             existing.call_expression_span_end,
                         ) else {
                             return false;
                         };
-                        existing.resolution_source == Some(ResolutionSource::DecoratorRoute)
+                        taken[index] != Taken::Joined
+                            && existing.resolution_source == Some(ResolutionSource::DecoratorRoute)
                             && outer_start <= start
                             && end <= outer_end
                             && (outer_start, outer_end) != (start, end)
                     })
             });
             match twin {
+                Some(index) if endpoint.dispatch.is_none() && taken[index] == Taken::Cases => {
+                    Self::log_route_stated_as_cases(&endpoint, file_path);
+                    continue;
+                }
                 Some(index) => {
                     let stated_by = result.endpoints[index].resolution_source;
                     if stated_by.is_some() {
@@ -8251,8 +8316,14 @@ impl FileOrchestrator {
                     // its own, so nothing else can arrive this way.
                     let twin = result.endpoints[index].clone();
                     Self::carry_type_anchors(&mut endpoint, &twin);
-                    result.endpoints.remove(index);
-                    deterministic_rows -= 1;
+                    // A case of a body-dispatching handler replaces the route,
+                    // and so does each of its other cases, so the route stays
+                    // open to them until the loop ends (carrick#2048).
+                    taken[index] = if Self::is_case_of(&endpoint, &twin) {
+                        Taken::Cases
+                    } else {
+                        Taken::Joined
+                    };
                     stats.model_rows_joined += 1;
                 }
                 None if route_module_claimed => {
@@ -8275,6 +8346,18 @@ impl FileOrchestrator {
             }
             result.endpoints.push(endpoint);
         }
+        // Every deterministic row a model row replaced goes now: a joined
+        // route has its joined row, and a route stated as cases has a row per
+        // case, so keeping it would leave a row that answers every call
+        // whatever it sends beside the cases that each answer one
+        // (`dispatch::apply_declared_operations` replaces a plain row with
+        // its declared operations for the same reason).
+        let mut index = 0;
+        result.endpoints.retain(|_| {
+            let kept = index >= deterministic_rows || taken[index] == Taken::Open;
+            index += 1;
+            kept
+        });
         if !dropped.is_empty() {
             warn!(
                 "[FileOrchestrator] {} endpoint(s) in {} dropped — {}: {}",
@@ -8724,22 +8807,27 @@ impl FileOrchestrator {
     /// module two unrelated routes can share a method, so the path is the only
     /// thing that says these two rows are one route.
     ///
-    /// A row already folded onto is not offered again: a second model row for
-    /// one route is a restatement, not a second source of anchors.
+    /// Only a row `offered` accepts by its index is a candidate: the caller
+    /// withholds a row a model row has already replaced, and, for a row with
+    /// no dispatch case, one already folded onto, since a second model row
+    /// for one route is a restatement, not a second source of anchors.
     fn route_stated_deterministically(
         deterministic: &[EndpointResult],
         endpoint: &EndpointResult,
         route_module_claimed: bool,
-        reconciled: &HashSet<String>,
+        offered: impl Fn(usize) -> bool,
     ) -> Option<usize> {
         let canonical = Self::canonicalize_route_path(&endpoint.path);
-        let mut matches = deterministic.iter().enumerate().filter(|(_, existing)| {
-            existing.resolution_source != Some(ResolutionSource::Model)
-                && existing.method.eq_ignore_ascii_case(&endpoint.method)
-                && !reconciled.contains(&existing.candidate_id)
-                && (route_module_claimed
-                    || Self::canonicalize_route_path(&existing.path) == canonical)
-        });
+        let mut matches = deterministic
+            .iter()
+            .enumerate()
+            .filter(|(index, existing)| {
+                offered(*index)
+                    && existing.resolution_source != Some(ResolutionSource::Model)
+                    && existing.method.eq_ignore_ascii_case(&endpoint.method)
+                    && (route_module_claimed
+                        || Self::canonicalize_route_path(&existing.path) == canonical)
+            });
         let (index, _) = matches.next()?;
         // Two rows this row could equally be: nothing says which, so it stays
         // the model's own reading rather than being folded onto a guess.
@@ -8757,9 +8845,8 @@ impl FileOrchestrator {
     /// identity — [`Self::model_row_key`] separates two rows by it, and the
     /// index keys an operation on it — so writing one onto a route that was
     /// stated without it would narrow the route to a single case and take
-    /// every other case's consumers off it. A handler that dispatches on its
-    /// body states one row per case and only the first would ever be folded;
-    /// the route stays the general one it was derived as.
+    /// every other case's consumers off it. A case is never folded: each one
+    /// becomes a row of its own ([`Self::case_of_route`]).
     fn carry_type_anchors(into: &mut EndpointResult, from: &EndpointResult) {
         if into.payload_expression_text.is_none() {
             into.payload_expression_text = from.payload_expression_text.clone();
@@ -8776,6 +8863,69 @@ impl FileOrchestrator {
             into.primary_type_symbol = from.primary_type_symbol.clone();
             into.type_import_source = from.type_import_source.clone();
         }
+    }
+
+    /// Whether `row` is one case of `route`: the model states a dispatch case
+    /// for it, and the deterministic row states the route without one
+    /// (carrick#2048). A handler that switches on a request field serves one
+    /// operation per value behind one method and path (carrick#831), so each
+    /// case is a row of its own and none of them is the route restated.
+    fn is_case_of(row: &EndpointResult, route: &EndpointResult) -> bool {
+        row.dispatch.is_some() && route.dispatch.is_none()
+    }
+
+    /// One case of a route a deterministic row states, read by a model row
+    /// that names no site of its own (carrick#2048).
+    ///
+    /// The route's identity is kept whole, exactly as a fold keeps it: its
+    /// method, path, line, span, handler and source. The case adds its
+    /// dispatch and its own type anchors, since each case reads its own body
+    /// and answers its own response; the route's anchors fill only what the
+    /// case leaves unstated.
+    fn case_of_route(route: &EndpointResult, case: &EndpointResult) -> EndpointResult {
+        let mut anchors = case.clone();
+        Self::carry_type_anchors(&mut anchors, route);
+        EndpointResult {
+            dispatch: case.dispatch.clone(),
+            payload_expression_text: anchors.payload_expression_text,
+            payload_expression_line: anchors.payload_expression_line,
+            response_expression_text: anchors.response_expression_text,
+            response_expression_line: anchors.response_expression_line,
+            emission_style: anchors.emission_style,
+            primary_type_symbol: anchors.primary_type_symbol,
+            type_import_source: anchors.type_import_source,
+            ..route.clone()
+        }
+    }
+
+    /// Whether `endpoint` restates a row the join has already kept for this
+    /// file, by [`Self::model_row_key`]. Logged when it does.
+    fn restates_a_kept_row(
+        kept: &[EndpointResult],
+        endpoint: &EndpointResult,
+        file_path: &str,
+    ) -> bool {
+        let key = Self::model_row_key(endpoint);
+        let restates = kept.iter().any(|row| Self::model_row_key(row) == key);
+        if restates {
+            warn!(
+                "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
+                 emitted for this file: dropped",
+                endpoint.method, endpoint.path, file_path
+            );
+        }
+        restates
+    }
+
+    /// A model row with no dispatch case, for a route the model also states
+    /// as the cases of a dispatching handler: the cases are the route's rows,
+    /// and this one restates it.
+    fn log_route_stated_as_cases(endpoint: &EndpointResult, file_path: &str) {
+        debug!(
+            "Dropping the model's {} {} in {}: the model states this route as the cases of a \
+             dispatching handler, and a row with no case restates it",
+            endpoint.method, endpoint.path, file_path
+        );
     }
 
     /// Why a reported operation failed the candidate join, phrased so the two
@@ -21908,45 +22058,280 @@ export async function POST(request: Request): Promise<Response> {
         assert_eq!(stats.model_rows_reconciled, 1);
     }
 
-    /// A handler that dispatches on its body states one row per case, and none
-    /// of them joins. A dispatch case is IDENTITY, not an anchor: writing one
-    /// onto the derived route would narrow it to that case and take every
-    /// other case's consumers off it.
-    #[test]
-    fn a_dispatch_case_never_narrows_the_route_it_is_folded_onto() {
-        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
-        let case = |value: &str| {
-            let mut row = model_route_row("endpoint:route.ts:POST", "POST", 3);
-            row.dispatch = Some(crate::dispatch::Dispatch {
-                location: crate::dispatch::DispatchLocation::Body,
-                field: "action".to_string(),
-                value: value.to_string(),
-            });
-            row
-        };
+    // --- carrick#2048: every case of a dispatching handler is a row ----------
 
-        let (result, stats) = emit_and_join_with(
+    /// A handler that switches on a body field: three cases behind one
+    /// exported `PATCH`, each answered from its own branch, and a `GET` beside
+    /// it that dispatches on nothing.
+    const DISPATCH_ROUTE_SOURCE: &str = r#"import type { Approved, Rejected, Archived } from "./types";
+
+export async function PATCH(request: Request): Promise<Response> {
+  const body = await request.json();
+  switch (body.action) {
+    case "approve":
+      return Response.json({ approved: true } satisfies Approved);
+    case "reject":
+      return Response.json({ rejected: true } satisfies Rejected);
+    case "archive":
+      return Response.json({ archived: true } satisfies Archived);
+  }
+  return Response.json({ error: "unknown action" }, { status: 400 });
+}
+
+export async function GET(): Promise<Response> {
+  return Response.json({ ok: true });
+}
+"#;
+
+    /// The cases the handler answers: the value, the type its branch answers
+    /// with, and the line of that branch's send.
+    const DISPATCH_CASES: [(&str, &str, i32); 3] = [
+        ("approve", "Approved", 7),
+        ("reject", "Rejected", 9),
+        ("archive", "Archived", 11),
+    ];
+
+    /// Which id the model echoed for each case, which decides the path a row
+    /// takes through the join (carrick#1395, carrick#1448).
+    #[derive(Clone, Copy, Debug)]
+    enum CaseIds {
+        /// An id the Candidate Context never offered.
+        Unlisted,
+        /// The body read inside the handler: a listed call the handler makes,
+        /// so not a site the route could be registered at.
+        BodyRead,
+        /// The send of the case's own branch, at the line the model answered.
+        OwnSend,
+    }
+
+    fn dispatch_case_row(
+        candidates: &HashMap<String, CandidateTarget>,
+        ids: CaseIds,
+        (value, answers, send_line): (&str, &str, i32),
+    ) -> EndpointResult {
+        let candidate_id = match ids {
+            CaseIds::Unlisted => format!("endpoint:route.ts:PATCH:{value}"),
+            CaseIds::BodyRead => candidates
+                .values()
+                .find(|c| {
+                    c.callee_property.as_deref() == Some("json") && c.callee_object != "Response"
+                })
+                .expect("the body read is a candidate")
+                .candidate_id
+                .clone(),
+            CaseIds::OwnSend => candidates
+                .values()
+                .find(|c| c.callee_object == "Response" && c.line_number as i32 == send_line)
+                .expect("each branch's send is a candidate")
+                .candidate_id
+                .clone(),
+        };
+        let line = match ids {
+            CaseIds::OwnSend => send_line,
+            CaseIds::Unlisted | CaseIds::BodyRead => 3,
+        };
+        let mut row = model_route_row(&candidate_id, "PATCH", line);
+        row.response_expression_text = Some(format!("{value} result"));
+        row.response_expression_line = Some(send_line);
+        row.primary_type_symbol = Some(answers.to_string());
+        row.dispatch = Some(crate::dispatch::Dispatch {
+            location: crate::dispatch::DispatchLocation::Body,
+            field: "action".to_string(),
+            value: value.to_string(),
+        });
+        row
+    }
+
+    fn join_dispatch_cases(
+        model_rows: Vec<EndpointResult>,
+        candidates: &HashMap<String, CandidateTarget>,
+        route_endpoints: &[EndpointResult],
+        claimed: bool,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_with(
             FileAnalysisResult {
-                endpoints: vec![case("create"), case("archive")],
+                endpoints: model_rows,
                 ..Default::default()
             },
-            &candidates,
+            candidates,
             &HashMap::new(),
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            &route_endpoints,
+            route_endpoints,
             "app/things/route.ts",
             claimed,
-        );
+        )
+    }
 
-        assert_eq!(result.endpoints.len(), 1, "one route, one row");
-        let row = &result.endpoints[0];
+    /// The `PATCH` rows of a join, by the case each answers.
+    fn patch_rows_by_case(
+        result: &FileAnalysisResult,
+    ) -> BTreeMap<Option<String>, &EndpointResult> {
+        let rows: Vec<&EndpointResult> = result
+            .endpoints
+            .iter()
+            .filter(|row| row.method == "PATCH")
+            .collect();
+        let by_case: BTreeMap<Option<String>, &EndpointResult> = rows
+            .iter()
+            .map(|row| (row.dispatch.as_ref().map(|d| d.value.clone()), *row))
+            .collect();
+        assert_eq!(by_case.len(), rows.len(), "one row per case: {rows:#?}");
+        by_case
+    }
+
+    /// The route the convention derived for `PATCH` is replaced by one row per
+    /// case the handler answers, whichever id the model echoed and whether or
+    /// not the convention claims the module's whole route set. Each case keeps
+    /// the route's provenance, carries its own type anchors, and no case is
+    /// discarded or left as the model's own reading. A case the model states
+    /// twice is one row.
+    #[test]
+    fn every_dispatch_case_of_a_stated_route_is_a_row_of_its_own() {
+        let (route_endpoints, candidates, claims) = file_route_fixture(DISPATCH_ROUTE_SOURCE);
+        assert!(claims, "the layout claims an app route module");
+        assert_eq!(route_endpoints.len(), 2, "PATCH and GET");
+        let route = route_endpoints
+            .iter()
+            .find(|row| row.method == "PATCH")
+            .expect("the PATCH route");
+
+        for ids in [CaseIds::Unlisted, CaseIds::BodyRead, CaseIds::OwnSend] {
+            for claimed in [true, false] {
+                let label = format!("{ids:?}, claimed {claimed}");
+                let mut model_rows: Vec<EndpointResult> = DISPATCH_CASES
+                    .into_iter()
+                    .map(|case| dispatch_case_row(&candidates, ids, case))
+                    .collect();
+                model_rows.push(dispatch_case_row(&candidates, ids, DISPATCH_CASES[0]));
+
+                let (result, stats) =
+                    join_dispatch_cases(model_rows, &candidates, &route_endpoints, claimed);
+
+                let by_case = patch_rows_by_case(&result);
+                assert_eq!(
+                    by_case.keys().cloned().collect::<Vec<_>>(),
+                    vec![
+                        Some("approve".to_string()),
+                        Some("archive".to_string()),
+                        Some("reject".to_string()),
+                    ],
+                    "{label}: every case, and no general row beside them"
+                );
+                for (value, answers, send_line) in DISPATCH_CASES {
+                    let row = by_case[&Some(value.to_string())];
+                    assert_eq!(
+                        row.resolution_source,
+                        Some(ResolutionSource::FileBasedRoute),
+                        "{label}: {value} is a case of the route the layout states"
+                    );
+                    assert_eq!(row.path, "/things", "{label}: {value}");
+                    assert_eq!(
+                        row.primary_type_symbol.as_deref(),
+                        Some(answers),
+                        "{label}: {value}"
+                    );
+                    assert_eq!(
+                        row.response_expression_line,
+                        Some(send_line),
+                        "{label}: {value}"
+                    );
+                    let (line, span) = match ids {
+                        CaseIds::OwnSend => {
+                            let send = candidates
+                                .values()
+                                .find(|c| {
+                                    c.callee_object == "Response"
+                                        && c.line_number as i32 == send_line
+                                })
+                                .expect("the send");
+                            (send_line, Some(send.span_start))
+                        }
+                        CaseIds::Unlisted | CaseIds::BodyRead => {
+                            (route.line_number, route.call_expression_span_start)
+                        }
+                    };
+                    assert_eq!(row.line_number, line, "{label}: {value}");
+                    assert_eq!(row.call_expression_span_start, span, "{label}: {value}");
+                }
+
+                let get: Vec<&EndpointResult> = result
+                    .endpoints
+                    .iter()
+                    .filter(|row| row.method == "GET")
+                    .collect();
+                assert_eq!(get.len(), 1, "{label}: the GET route is untouched");
+                assert_eq!(get[0].dispatch, None, "{label}");
+                assert_eq!(
+                    get[0].resolution_source,
+                    Some(ResolutionSource::FileBasedRoute)
+                );
+
+                assert_eq!(
+                    stats.model_endpoints_discarded_in_claimed_modules, 0,
+                    "{label}"
+                );
+                assert_eq!(stats.model_only_rows, 0, "{label}");
+                assert_eq!(
+                    stats.model_rows_reconciled + stats.model_rows_joined,
+                    3,
+                    "{label}: each case joins the route once"
+                );
+            }
+        }
+    }
+
+    /// A row with no case for a route the model also states as cases is the
+    /// route restated: the cases are its rows, whichever the model answered
+    /// first.
+    #[test]
+    fn a_general_row_beside_the_cases_of_its_route_adds_nothing() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(DISPATCH_ROUTE_SOURCE);
+        for ids in [CaseIds::Unlisted, CaseIds::BodyRead, CaseIds::OwnSend] {
+            let cases: Vec<EndpointResult> = DISPATCH_CASES
+                .into_iter()
+                .map(|case| dispatch_case_row(&candidates, ids, case))
+                .collect();
+            let mut general = cases[0].clone();
+            general.dispatch = None;
+            general.primary_type_symbol = None;
+            for general_first in [true, false] {
+                let label = format!("{ids:?}, general row first {general_first}");
+                let mut model_rows = cases.clone();
+                if general_first {
+                    model_rows.insert(0, general.clone());
+                } else {
+                    model_rows.push(general.clone());
+                }
+
+                let (result, _) =
+                    join_dispatch_cases(model_rows, &candidates, &route_endpoints, claimed);
+
+                let by_case = patch_rows_by_case(&result);
+                assert_eq!(by_case.len(), 3, "{label}: {by_case:#?}");
+                assert!(!by_case.contains_key(&None), "{label}: no general row");
+            }
+        }
+    }
+
+    /// A plain row still folds onto the route it reads, as before: the route
+    /// stays one row with no case.
+    #[test]
+    fn a_route_the_model_states_without_a_case_stays_one_row() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(DISPATCH_ROUTE_SOURCE);
+        let mut plain = dispatch_case_row(&candidates, CaseIds::Unlisted, DISPATCH_CASES[0]);
+        plain.dispatch = None;
+
+        let (result, stats) =
+            join_dispatch_cases(vec![plain], &candidates, &route_endpoints, claimed);
+
+        let by_case = patch_rows_by_case(&result);
+        assert_eq!(by_case.keys().cloned().collect::<Vec<_>>(), vec![None]);
         assert_eq!(
-            row.dispatch, None,
-            "the route is still the general one the layout states"
+            by_case[&None].primary_type_symbol.as_deref(),
+            Some("Approved")
         );
-        assert_eq!(row.primary_type_symbol.as_deref(), Some("Thing"));
         assert_eq!(stats.model_rows_reconciled, 1);
     }
 

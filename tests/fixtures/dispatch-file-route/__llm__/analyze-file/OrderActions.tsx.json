@@ -1,0 +1,61 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/api/orders/${orderId}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 5,
+      "payload_expression_text": "{ op: 'confirm' }",
+      "payload_expression_line": 7,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "confirm" }
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/api/orders/${orderId}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 12,
+      "payload_expression_text": "{ op: 'cancel', reason }",
+      "payload_expression_line": 14,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "cancel" }
+    },
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "/api/orders/${orderId}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 19,
+      "payload_expression_text": "{ op: 'refund', amount }",
+      "payload_expression_line": 21,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "refund" }
+    },
+    {
+      "candidate_id": "@line:26",
+      "line_number": 26,
+      "target": "/api/orders/${orderId}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 26,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

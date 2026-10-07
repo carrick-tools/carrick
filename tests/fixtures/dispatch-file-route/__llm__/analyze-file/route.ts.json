@@ -1,0 +1,78 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "owner_node": "",
+      "method": "GET",
+      "path": "/api/orders/[orderId]",
+      "handler_name": "GET",
+      "pattern_matched": "export async function GET",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ orderId }",
+      "response_expression_line": 10,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:15",
+      "line_number": 13,
+      "owner_node": "",
+      "method": "POST",
+      "path": "/api/orders/[orderId]",
+      "handler_name": "POST",
+      "pattern_matched": "export async function POST",
+      "payload_expression_text": "command",
+      "payload_expression_line": 15,
+      "response_expression_text": "{ orderId, status: 'confirmed' }",
+      "response_expression_line": 17,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "confirm" }
+    },
+    {
+      "candidate_id": "@line:20",
+      "line_number": 20,
+      "owner_node": "",
+      "method": "POST",
+      "path": "/api/orders/[orderId]",
+      "handler_name": "POST",
+      "pattern_matched": "export async function POST",
+      "payload_expression_text": "command",
+      "payload_expression_line": 15,
+      "response_expression_text": "{ orderId, status: 'cancelled', reason: command.reason }",
+      "response_expression_line": 20,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "cancel" }
+    },
+    {
+      "candidate_id": "endpoint:route.ts:POST:refund",
+      "line_number": 13,
+      "owner_node": "",
+      "method": "POST",
+      "path": "/api/orders/[orderId]",
+      "handler_name": "POST",
+      "pattern_matched": "export async function POST",
+      "payload_expression_text": "command",
+      "payload_expression_line": 15,
+      "response_expression_text": "{ orderId, refunded: command.amount }",
+      "response_expression_line": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": { "location": "body", "field": "op", "value": "refund" }
+    }
+  ],
+  "data_calls": [],
+  "dispatch_tables": [
+    {
+      "location": "body",
+      "field": "op",
+      "values": ["confirm", "cancel", "refund"],
+      "handler_name": "POST",
+      "line_number": 16
+    }
+  ]
+}
