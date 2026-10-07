@@ -1320,6 +1320,80 @@ struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
     entry: &'a TypeManifestEntry,
+    /// The dispatch case of every row this entry stands for (carrick#831):
+    /// on a producer, each case the route answers at this site (several cases
+    /// with no site of their own share the route's, and so its alias); on a
+    /// consumer, the case each call at this site sends. `[None]` is a plain
+    /// route, or a call that states no case, which is nearly every entry.
+    cases: Vec<Option<&'a crate::dispatch::Dispatch>>,
+}
+
+/// The sentence a call to a route that dispatches on a request field reads
+/// when the call states no case (carrick#2059). The analyzer keeps its edge
+/// to the route with the case unknown (`carrick_match::dispatch_outcome`), so
+/// the half is stored, and nothing was compared.
+fn case_unknown_reason(fields: &[&str]) -> String {
+    let fields = fields
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "Not compared: this route returns a different response depending on {fields} in the request, and Carrick cannot tell which one this call receives."
+    )
+}
+
+/// Each HTTP row's dispatch case, by the site and operation a manifest entry
+/// names. Joined on `(file, line, method, path)`, the identity
+/// [`build_type_manifest_entries`](crate::engine) builds the entry from.
+type CasesBySite<'a> =
+    HashMap<(String, u32, String, String), Vec<Option<&'a crate::dispatch::Dispatch>>>;
+
+fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_> {
+    let mut by_site: CasesBySite = HashMap::new();
+    for row in rows {
+        let Some((method, path)) = row.key.as_http() else {
+            continue;
+        };
+        let (file, line) =
+            crate::type_manifest::parse_file_location(&row.file_path.to_string_lossy());
+        by_site
+            .entry((
+                file,
+                line,
+                crate::type_manifest::normalize_manifest_method(method),
+                path.to_string(),
+            ))
+            .or_default()
+            .push(row.dispatch.as_ref());
+    }
+    by_site
+}
+
+/// What one candidate producer entry answers a consumer entry about the
+/// dispatch case, folded over the cases on each side
+/// (`carrick_match::dispatch_verdict`): any pair of cases that matches, or a
+/// producer that does not dispatch, is a match; else any case the call leaves
+/// unknown is unknown; else the call states a value no case here answers.
+fn entry_dispatch_verdict(
+    producer: &ServiceEntry,
+    consumer: &ServiceEntry,
+) -> carrick_match::DispatchVerdict {
+    use carrick_match::DispatchVerdict;
+    let key = |case: &Option<&crate::dispatch::Dispatch>| crate::dispatch::Dispatch::key_of(*case);
+    let mut verdict = DispatchVerdict::ValueMismatch;
+    for producer_case in &producer.cases {
+        for consumer_case in &consumer.cases {
+            match carrick_match::dispatch_verdict(key(producer_case), key(consumer_case)) {
+                DispatchVerdict::Matched | DispatchVerdict::NotDispatching => {
+                    return DispatchVerdict::Matched;
+                }
+                DispatchVerdict::ValueUnknown => verdict = DispatchVerdict::ValueUnknown,
+                DispatchVerdict::ValueMismatch => {}
+            }
+        }
+    }
+    verdict
 }
 
 /// Build check pairs from every participating repo's manifest.
@@ -1335,6 +1409,12 @@ struct ServiceEntry<'a> {
 ///   keeps that edge (carrick#1944). Its routes are ranked with every
 ///   sibling's by the one specificity score, so a sibling's literal route
 ///   wins over the caller's own parameterized one, and the other way round.
+///   Among those, a route that dispatches on a request field is decided case
+///   by case as the analyzer's matcher decides it
+///   (`carrick_match::dispatch_outcome`, carrick#2059): a call is paired with
+///   the case it sends, a call that sends a value no case answers is not
+///   paired, and a call that states no case gets one half per kind, stored
+///   unverifiable without a probe.
 /// - socket/graphql/pubsub: exact operation-key match + type_kind, between
 ///   two services only. The exact-key matcher drops a same-service edge for
 ///   these protocols (#397/#410), so a pair here would be judged and stored
@@ -1365,15 +1445,31 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         let Some(entries) = repo.type_manifest.as_ref() else {
             continue;
         };
+        let endpoint_cases = cases_by_site(&repo.endpoints);
+        let call_cases = cases_by_site(&repo.calls);
         for entry in entries {
-            let target = match entry.role {
-                ManifestRole::Producer => &mut producers,
-                ManifestRole::Consumer => &mut consumers,
+            let (target, rows) = match entry.role {
+                ManifestRole::Producer => (&mut producers, &endpoint_cases),
+                ManifestRole::Consumer => (&mut consumers, &call_cases),
             };
+            let cases = entry
+                .key
+                .as_http()
+                .and_then(|(method, path)| {
+                    rows.get(&(
+                        entry.file_path.clone(),
+                        entry.line_number,
+                        method.to_string(),
+                        path.to_string(),
+                    ))
+                })
+                .cloned()
+                .unwrap_or_else(|| vec![None]);
             target.push(ServiceEntry {
                 service_id,
                 has_surface,
                 entry,
+                cases,
             });
         }
     }
@@ -1446,13 +1542,59 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         // HTTP specificity: keep only the best-scoring producer(s), mirroring
         // routing semantics (a literal route wins over :param).
         let best = candidates.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        // Then the dispatch case, as the analyzer's matcher decides it after
+        // the same specificity filter (carrick#2059): the check pairs a call
+        // with exactly the producers its edge reaches, so a half it judges is
+        // a half the index stores.
+        let mut matched: Vec<&ServiceEntry> = Vec::new();
+        let mut case_unknown: Vec<&ServiceEntry> = Vec::new();
+        let mut case_mismatched = 0u32;
         for (producer, score) in candidates {
             if score != best {
                 continue;
             }
-            if let Some(pair) = build_pair(producer, consumer) {
-                pairs.push(pair);
+            match entry_dispatch_verdict(producer, consumer) {
+                carrick_match::DispatchVerdict::ValueUnknown => case_unknown.push(producer),
+                carrick_match::DispatchVerdict::ValueMismatch => case_mismatched += 1,
+                _ => matched.push(producer),
             }
+        }
+        match carrick_match::dispatch_outcome(
+            matched.len() as u32,
+            case_unknown.len() as u32,
+            case_mismatched,
+        ) {
+            carrick_match::DispatchOutcome::Matched => {
+                pairs.extend(
+                    matched
+                        .into_iter()
+                        .filter_map(|producer| build_pair(producer, consumer)),
+                );
+            }
+            // The call keeps one edge to the route with its case unknown, so
+            // it gets one half per kind, stored unverifiable without a probe:
+            // which case's type to compare against is the thing not known.
+            carrick_match::DispatchOutcome::RouteCaseUnknown => {
+                case_unknown.sort_by(|a, b| {
+                    (a.service_id, &a.entry.type_alias).cmp(&(b.service_id, &b.entry.type_alias))
+                });
+                let mut fields: Vec<&str> = case_unknown
+                    .iter()
+                    .flat_map(|producer| producer.cases.iter().flatten())
+                    .map(|case| case.field.as_str())
+                    .collect();
+                fields.sort_unstable();
+                fields.dedup();
+                if let Some(mut pair) = build_pair(case_unknown[0], consumer) {
+                    pair.pre_verdict =
+                        Some((VerdictBucket::Unverifiable, case_unknown_reason(&fields)));
+                    pair.pre_verdict_side = None;
+                    pairs.push(pair);
+                }
+            }
+            // A value no case answers, as the matcher: no edge, so no pair.
+            carrick_match::DispatchOutcome::NoCaseAnswers
+            | carrick_match::DispatchOutcome::NotMatched => {}
         }
     }
 
@@ -5687,53 +5829,140 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
-    /// Pinned while carrick#2048 lands, for carrick#2059 to flip: a route that
-    /// switches on a body field has a producer entry per case, and a manifest
-    /// entry states no case, so the check pairs a call with every case at its
-    /// method and path. The edge matcher pairs it with the case it sends only
-    /// (`carrick_match::dispatch_verdict`), so another case's verdict can be
-    /// judged for the call's edge. #2059 makes the check pair what the matcher
-    /// pairs.
-    #[test]
-    fn a_call_to_a_dispatching_route_is_paired_with_every_case_today() {
-        let route = OperationKey::http("POST", "/api/orders/:orderId");
-        let case = |alias: &str, line: u32| {
+    /// One HTTP row at `site` (`file:line`), as the index states an endpoint
+    /// or a call, answering or sending `op = value` when given.
+    fn dispatch_row(
+        method: &str,
+        path: &str,
+        site: &str,
+        value: Option<&str>,
+    ) -> crate::analyzer::ApiEndpointDetails {
+        crate::analyzer::ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, path),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(site),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: value.map(|value| crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "op".to_string(),
+                value: value.to_string(),
+            }),
+            schema_binding: None,
+            handler_span: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+        }
+    }
+
+    /// The pairs the check builds for one service whose `POST` route answers
+    /// a different body for each value of `op` (carrick#2059). The case
+    /// `confirm` has a site of its own; `cancel` and `refund` share the
+    /// route's site, so one producer entry stands for both. Its calls send
+    /// `confirm`, `refund`, a value no case answers (`archive`), and nothing.
+    /// A plain `GET` beside it is called with a body that happens to carry
+    /// `op` too.
+    fn pairs_for_a_dispatching_route() -> Vec<BuiltPair> {
+        const ROUTE: &str = "/api/orders/:orderId";
+        const HANDLER: &str = "app/api/orders/[orderId]/route.ts";
+        const CLIENT: &str = "components/OrderActions.tsx";
+        let manifest_entry = |method: &str, role, alias: &str, file: &str, line| {
             entry(
-                route.clone(),
-                ManifestRole::Producer,
+                OperationKey::http(method, ROUTE),
+                role,
                 ManifestTypeKind::Response,
                 alias,
-                "app/api/orders/[orderId]/route.ts",
+                file,
                 line,
                 ManifestTypeState::Explicit,
             )
         };
-        let call = entry(
-            route.clone(),
-            ManifestRole::Consumer,
-            ManifestTypeKind::Response,
-            "C_confirm",
-            "components/OrderActions.tsx",
-            5,
-            ManifestTypeState::Explicit,
-        );
-        let mut paired: Vec<(String, String)> = build_check_pairs(&[repo(
+        let site = |file: &str, line: u32| format!("{file}:{line}");
+        let mut app = repo(
             "app",
             None,
-            vec![case("P_confirm", 17), case("P_cancel", 20), call],
+            vec![
+                manifest_entry("POST", ManifestRole::Producer, "P_confirm", HANDLER, 17),
+                manifest_entry("POST", ManifestRole::Producer, "P_route", HANDLER, 9),
+                manifest_entry("GET", ManifestRole::Producer, "P_get", HANDLER, 4),
+                manifest_entry("POST", ManifestRole::Consumer, "C_confirm", CLIENT, 5),
+                manifest_entry("POST", ManifestRole::Consumer, "C_refund", CLIENT, 6),
+                manifest_entry("POST", ManifestRole::Consumer, "C_archive", CLIENT, 7),
+                manifest_entry("POST", ManifestRole::Consumer, "C_none", CLIENT, 8),
+                manifest_entry("GET", ManifestRole::Consumer, "C_get", CLIENT, 9),
+            ],
             Some(fake_artifact()),
-        )])
-        .into_iter()
-        .map(|pair| (pair.consumer_alias, pair.producer_alias))
-        .collect();
+        );
+        app.endpoints = vec![
+            dispatch_row("POST", ROUTE, &site(HANDLER, 17), Some("confirm")),
+            dispatch_row("POST", ROUTE, &site(HANDLER, 9), Some("cancel")),
+            dispatch_row("POST", ROUTE, &site(HANDLER, 9), Some("refund")),
+            dispatch_row("GET", ROUTE, &site(HANDLER, 4), None),
+        ];
+        app.calls = vec![
+            dispatch_row("POST", ROUTE, &site(CLIENT, 5), Some("confirm")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 6), Some("refund")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 7), Some("archive")),
+            dispatch_row("POST", ROUTE, &site(CLIENT, 8), None),
+            dispatch_row("GET", ROUTE, &site(CLIENT, 9), Some("confirm")),
+        ];
+        build_check_pairs(&[app])
+    }
+
+    /// The check pairs a call to a dispatching route with what the analyzer's
+    /// matcher pairs it with (`carrick_match::dispatch_outcome`), so every
+    /// half it judges is a half the index stores (carrick#2059): the case the
+    /// call sends, found through a producer entry that stands for two cases;
+    /// nothing for a value no case answers; and a route that does not
+    /// dispatch, whatever the call's body carries.
+    #[test]
+    fn a_call_to_a_dispatching_route_is_paired_as_the_matcher_pairs_it() {
+        let mut paired: Vec<(String, String)> = pairs_for_a_dispatching_route()
+            .into_iter()
+            .filter(|pair| pair.pre_verdict.is_none())
+            .map(|pair| (pair.consumer_alias, pair.producer_alias))
+            .collect();
         paired.sort();
         assert_eq!(
             paired,
             vec![
-                ("C_confirm".to_string(), "P_cancel".to_string()),
                 ("C_confirm".to_string(), "P_confirm".to_string()),
+                ("C_get".to_string(), "P_get".to_string()),
+                ("C_refund".to_string(), "P_route".to_string()),
             ]
         );
+    }
+
+    /// A call that states no case keeps its edge to the route with the case
+    /// unknown, so it has one half per kind, not one per case. Nothing is
+    /// probed: the half is stored unverifiable and says why, and it is never
+    /// sent to the retype check, which would judge it against one case's type.
+    #[test]
+    fn a_call_that_states_no_case_has_one_unverifiable_half_and_no_probe() {
+        let unknown: Vec<BuiltPair> = pairs_for_a_dispatching_route()
+            .into_iter()
+            .filter(|pair| pair.consumer_alias == "C_none")
+            .collect();
+        assert_eq!(unknown.len(), 1, "one half for the route, not one per case");
+        assert_eq!(
+            unknown[0].pre_verdict,
+            Some((
+                VerdictBucket::Unverifiable,
+                "Not compared: this route returns a different response depending on `op` in \
+                 the request, and Carrick cannot tell which one this call receives."
+                    .to_string()
+            ))
+        );
+        assert_eq!(unknown[0].pre_verdict_side, None);
     }
 
     /// Only HTTP pairs a service with itself. The exact-key matcher drops a
