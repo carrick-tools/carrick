@@ -156,17 +156,55 @@ fn vm_stat_available_mb(text: &str) -> Option<u64> {
     Some(total * page / (1024 * 1024))
 }
 
-/// Resident memory of `sidecar`'s process in MB, from `ps`: an estimate of
-/// what another process scoped to the same service takes once it has built
-/// the program, for [`pool_size`]. `None` when it cannot be read. Read after
-/// the process has built its program, or it says nothing about the program.
+/// Resident memory of `sidecar`'s process in MB: an estimate of what another
+/// process scoped to the same service takes once it has built the program,
+/// for [`pool_size`]. `None` when it cannot be read. Read after the process
+/// has built its program, or it says nothing about the program.
+///
+/// Asked of the kernel, not of `ps`: `ps` is setuid on macOS, so a sandbox
+/// that refuses setuid binaries refuses it, and a slim container may not
+/// have it. Without the size no pool starts.
 pub fn resident_mb(sidecar: &TypeSidecar) -> Option<u64> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &sidecar.pid().to_string()])
-        .output()
+    resident_bytes(sidecar.pid()).map(|bytes| bytes / (1024 * 1024))
+}
+
+/// The resident size of process `pid` in bytes, from `proc_pidinfo`.
+#[cfg(target_os = "macos")]
+fn resident_bytes(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: a zeroed `proc_taskinfo` is a valid value of that plain C struct.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `proc_pidinfo` writes at most `size` bytes, the size of `info`.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pti_resident_size)
+}
+
+/// The resident size of process `pid` in bytes, from `/proc/<pid>/status`.
+#[cfg(target_os = "linux")]
+fn resident_bytes(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kb: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
         .ok()?;
-    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(kb / 1024)
+    Some(kb * 1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn resident_bytes(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// The caller's sidecar and the processes started beside it, each scoped to
@@ -571,6 +609,15 @@ mod tests {
         assert_eq!(size(Some(64_000), 1000, 8, Some(1)), 1);
         let why = size_for(Some(10_240), 3000, 8, None).why;
         assert!(why.starts_with("3 process(es)"), "{why}");
+    }
+
+    /// The size comes from the kernel, so it reads where `ps` cannot run.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_process_s_resident_size_is_read_from_the_kernel() {
+        let bytes = resident_bytes(std::process::id()).expect("this process's size reads");
+        assert!(bytes > 1024 * 1024, "{bytes} bytes");
+        assert_eq!(resident_bytes(u32::MAX), None, "no such process");
     }
 
     #[test]
