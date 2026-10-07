@@ -12,11 +12,12 @@ import {
   serviceLine,
   shortHash,
   typedMismatchClause,
+  unclassifiedLines,
 } from "../src/render.ts";
 import type { CheckItem } from "../src/contract.ts";
 import { fixture, statusFixture } from "./helpers.ts";
 
-test("the hook context puts locations first and the boundary last", () => {
+test("the hook context puts locations first and the file's unclassified line last", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json"));
   assert.ok(context);
   const lines = context.split("\n");
@@ -25,10 +26,52 @@ test("the hook context puts locations first and the boundary last", () => {
   assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3/);
   assert.match(lines[2] ?? "", /^- src\/routes\/users\.ts:61:9/);
   assert.match(lines[3] ?? "", /^- src\/routes\/users\.ts:12:3/);
-  const boundaryAt = lines.findIndex((line) => line.startsWith("Boundary:"));
+  const unclassifiedAt = lines.findIndex((line) => line.includes("not classified locally"));
   const lastItemAt = lines.reduce((at, line, index) => (line.startsWith("- ") ? index : at), -1);
-  assert.ok(boundaryAt > lastItemAt, "the boundary follows every location line");
-  assert.equal(lines.at(-1)?.startsWith("  "), true, "the boundary is the last thing rendered");
+  assert.ok(unclassifiedAt > lastItemAt, "the file's line follows every location line");
+  assert.equal(unclassifiedAt, lines.length - 1);
+});
+
+test("an edit never carries the service-wide boundary", () => {
+  for (const name of ["check-mismatch.json", "check-pre-rendered-boundary.json"]) {
+    const context = renderPostToolUse(fixture(name)) ?? "";
+    assert.equal(context.includes("Boundary:"), false, name);
+    assert.equal(context.includes("candidate(s) in this service need a model"), false, name);
+    assert.equal(context.includes("sent to the analyzer"), false, name);
+    assert.equal(context.includes("candidates not classified locally"), false, name);
+  }
+});
+
+test("the edit's one boundary line names only this file's unclassified lines", () => {
+  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
+  // The fixture's boundary also lists src/proxy.ts:22, which is another file's.
+  assert.match(
+    context,
+    /\n1 call site in this file not classified locally \(line 80\): their route or type is unchecked here\.$/,
+  );
+  assert.equal(context.includes("proxy.ts"), false);
+  assert.equal(context.includes("22"), false);
+});
+
+test("unclassifiedLines reads every site list, once per line, sorted", () => {
+  const result = fixture("check-mismatch.json");
+  result.boundary = {
+    unemitted_literal_sites: ["src/routes/users.ts:9", "src/other.ts:3", "src/routes/users.ts:80"],
+    calls_without_expected_type: { total: 2, reasons: ["src/routes/users.ts:80", "src/routes/users.ts:5"] },
+    unknown_call_paths: { total: 1, reasons: ["src/routes/users.ts:not-a-line"] },
+  };
+  assert.deepEqual(unclassifiedLines(result), [5, 9, 80]);
+  assert.equal(
+    (renderPostToolUse(result) ?? "").split("\n").at(-1),
+    "3 call sites in this file not classified locally (line 5, 9, 80): their route or type is unchecked here.",
+  );
+});
+
+test("a file with items and no unclassified sites ends on its items", () => {
+  const result = fixture("check-mismatch.json");
+  result.boundary = { calls_without_expected_type: { total: 1, reasons: ["src/elsewhere.ts:1"] } };
+  const context = renderPostToolUse(result) ?? "";
+  assert.equal(context.includes("not classified locally"), false);
 });
 
 test("every route or call gets exactly one line", () => {
@@ -140,13 +183,18 @@ test("a re-check that missed its budget says how old the answer is", () => {
   assert.match(context, /did not finish inside its budget.*2026-09-13T22:26:26Z/);
 });
 
-test("a file with no indexed rows still carries the boundary", () => {
-  // The local index holds no bare receiver and no fetch call, so an empty
-  // answer without the boundary would read as "nothing crosses a service here".
-  const context = renderPostToolUse(fixture("check-clean.json")) ?? "";
-  assert.match(context, /^Carrick checked src\/util\/format\.ts/);
-  assert.equal(context.split("\n").some((line) => line.startsWith("- ")), false);
-  assert.match(context, /^Boundary: A local index holds what the deterministic passes state/m);
+test("a file with no rows and no unclassified sites of its own is silent", () => {
+  // Its service has unclassified candidates, none of them in this file.
+  assert.equal(renderPostToolUse(fixture("check-clean.json")), null);
+});
+
+test("a file with no rows but unclassified sites says so in one line", () => {
+  const result = fixture("check-clean.json");
+  result.boundary = { unemitted_literal_sites: ["src/util/format.ts:7"] };
+  assert.equal(
+    renderPostToolUse(result),
+    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).\n1 call site in this file not classified locally (line 7): their route or type is unchecked here.",
+  );
 });
 
 test("nothing to say prints nothing", () => {
@@ -191,35 +239,18 @@ test("the boundary keeps the CLI's wording", () => {
   );
 });
 
-test("the CLI's own boundary lines are printed as they arrive", () => {
+test("the CLI's own boundary lines are what boundaryFor returns", () => {
   const result = fixture("check-pre-rendered-boundary.json");
-  const context = renderPostToolUse(result) ?? "";
-  const lines = context.split("\n");
-  const sent = result.boundary_lines ?? [];
-  assert.deepEqual(lines.slice(-sent.length), sent);
-  assert.equal(
-    lines.some((line) => line.startsWith("Boundary: ")),
-    false,
-    "a label glued to the front would no longer be the CLI's bytes",
-  );
-  assert.equal(
-    context.includes("file(s) sent to the analyzer"),
-    false,
-    "the counts are not rendered a second time",
-  );
   assert.deepEqual(boundaryFor(result), result.boundary_lines);
 });
 
-test("without the CLI's lines the note leads the counts, and the block is labelled", () => {
+test("without the CLI's lines the note leads the counts", () => {
   const result = fixture("check-mismatch.json");
   assert.equal(result.boundary_lines, undefined);
   assert.deepEqual(boundaryFor(result), [
     result.boundary_note,
     ...boundaryLines(result.boundary, result.service),
   ]);
-  const context = renderPostToolUse(result) ?? "";
-  assert.match(context, /\nBoundary: A local index holds what the deterministic passes state/);
-  assert.match(context, /\nuser-service at 6a1b2c3: 128 file\(s\) sent to the analyzer/);
 });
 
 test("the session line ends with each service's boundary lines, verbatim", () => {

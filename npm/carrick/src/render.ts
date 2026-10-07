@@ -115,11 +115,6 @@ export function boundaryFor(result: CheckResult): string[] {
   return counts;
 }
 
-/** True when the lines came from the CLI rather than from the port above. */
-export function boundaryIsPreRendered(result: CheckResult): boolean {
-  return Boolean(result.boundary_lines?.length);
-}
-
 function counterpartText(counterparts: Counterpart[]): string {
   const shown = counterparts.slice(0, MAX_COUNTERPARTS);
   const rendered = shown
@@ -286,23 +281,6 @@ function deletedLine(result: CheckResult): string | null {
   return `This file is gone from disk and the index still holds ${(result.items ?? []).length} row(s) for it, with ${consumers} counterpart(s) still on the other side.`;
 }
 
-/**
- * Append the boundary to a rendered message.
- *
- * The port's first line is labelled, because on its own it reads as a bare
- * count. The CLI's own lines are appended untouched: a label glued to the front
- * of them would no longer be the bytes the CLI printed.
- */
-function pushBoundary(lines: string[], result: CheckResult, boundary: string[]): void {
-  if (!boundary.length) return;
-  if (boundaryIsPreRendered(result)) {
-    for (const line of boundary) lines.push(line);
-    return;
-  }
-  lines.push(`Boundary: ${boundary[0]}`);
-  for (const line of boundary.slice(1)) lines.push(line);
-}
-
 function staleLine(result: CheckResult): string | null {
   if (!result.stale) return null;
   const changed = result.changed_since_index;
@@ -323,23 +301,58 @@ function staleLine(result: CheckResult): string | null {
   return `This file has changed since the index, so these verdicts describe the indexed version.${suffix}${budget}`;
 }
 
+/** Lines of the edited file the unclassified sentence names before it counts the rest. */
+const MAX_UNCLASSIFIED_LINES = 5;
+
 /**
- * The PostToolUse context, or `null` when the index has nothing to say at all.
+ * Lines in the checked file that the local index holds as unclassified: calls
+ * with no expected type, calls to a path nothing resolved, and literal
+ * candidates no row came out of. Each source lists `file:line` sites for the
+ * whole service, so this keeps the ones in `result.file` and nothing else.
+ */
+export function unclassifiedLines(result: CheckResult): number[] {
+  const file = result.file;
+  const boundary = result.boundary;
+  if (!file || !boundary) return [];
+  const sites = [
+    ...(boundary.unemitted_literal_sites ?? []),
+    ...(boundary.calls_without_expected_type?.reasons ?? []),
+    ...(boundary.unknown_call_paths?.reasons ?? []),
+  ];
+  const lines = new Set<number>();
+  for (const site of sites) {
+    const colon = site.lastIndexOf(":");
+    if (colon < 0 || site.slice(0, colon) !== file) continue;
+    const line = Number(site.slice(colon + 1));
+    if (Number.isInteger(line) && line > 0) lines.add(line);
+  }
+  return [...lines].sort((a, b) => a - b);
+}
+
+function unclassifiedLine(result: CheckResult): string | null {
+  const lines = unclassifiedLines(result);
+  if (!lines.length) return null;
+  const rest = lines.length - MAX_UNCLASSIFIED_LINES;
+  const shown = lines.slice(0, MAX_UNCLASSIFIED_LINES).join(", ");
+  const named = rest > 0 ? `${shown}, +${rest} more` : shown;
+  const noun = lines.length === 1 ? "call site" : "call sites";
+  return `${lines.length} ${noun} in this file not classified locally (line ${named}): their route or type is unchecked here.`;
+}
+
+/**
+ * The PostToolUse context, or `null` when the index has nothing to say about
+ * this file.
  *
- * A file with no indexed route or call still gets the boundary, because that is
- * the difference between "nothing crosses a service here" and "nothing here was
- * classified". Only an error payload and a payload with neither items nor a
- * boundary are silent.
+ * The service-wide boundary is not here: it is the same text on every edit,
+ * which is what an agent learns to skip, so `renderSessionStart` prints it once.
+ * An edit gets one line, and only when this file holds call sites the local
+ * index did not classify, so an empty answer is not read as "nothing here".
  */
 export function renderPostToolUse(result: CheckResult, displayFile?: string): string | null {
   if (result.error) return null;
   const items = reportableItems(result);
-  const boundary = boundaryFor(result);
-  // The boundary is never dropped: the local index holds no bare-receiver route
-  // and no `fetch` call, because both need a model, so an empty answer without
-  // the boundary beside it reads as "there is nothing here" when it means
-  // "nothing here was classified".
-  if (items.length === 0 && boundary.length === 0) return null;
+  const unclassified = unclassifiedLine(result);
+  if (items.length === 0 && !unclassified) return null;
 
   // `result.file` is relative to the repo that owns it, so the caller's own
   // workspace-relative path is the one a reader can open; it wins when given.
@@ -357,7 +370,7 @@ export function renderPostToolUse(result: CheckResult, displayFile?: string): st
   if (deleted) lines.push(deleted);
   const stale = staleLine(result);
   if (stale) lines.push(stale);
-  pushBoundary(lines, result, boundary);
+  if (unclassified) lines.push(unclassified);
   return lines.join("\n");
 }
 

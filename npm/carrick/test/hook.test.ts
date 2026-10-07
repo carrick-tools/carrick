@@ -47,7 +47,7 @@ test("MultiEdit payloads name their file the other way round", async (t) => {
   assert.match(run.stdout, /additionalContext/);
 });
 
-test("a file with no indexed rows still gets the boundary", async (t) => {
+test("a file with no indexed rows gets no service-wide boundary", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
@@ -56,10 +56,7 @@ test("a file with no indexed rows still gets the boundary", async (t) => {
     env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-clean.json") }),
   });
   assert.equal(clean.code, 0);
-  const context = (
-    JSON.parse(clean.stdout) as { hookSpecificOutput: { additionalContext: string } }
-  ).hookSpecificOutput.additionalContext;
-  assert.match(context, /A local index holds what the deterministic passes state/);
+  assert.equal(clean.stdout, "");
 });
 
 test("the hook is silent when there is nothing to say", async (t) => {

@@ -25,7 +25,7 @@ for (const item of decoded.items) {
 for (const target of toDiagnostics(decoded, root, file, { exists: () => true }).keys()) {
   assert.equal(target, file, 'a hosted counterpart became a local diagnostic target');
 }
-assert.ok(renderPostToolUse(decoded).includes(check.boundary_lines[0]));
+assert.ok(!renderPostToolUse(decoded).includes(check.boundary_lines[0]), 'an edit carries the service-wide boundary');
 const decodedStatus = parseStatusResult(JSON.stringify(status));
 assert.ok(decodedStatus);
 assert.equal(decodedStatus.services.length, status.services.length);
@@ -40,7 +40,7 @@ try {
   const env = fakeEnv({ CARRICK_FAKE_FIXTURE: checkFile, CARRICK_FAKE_REBASE: '0', CARRICK_CHANNEL: 'hooks', CARRICK_TOKEN: 'synthetic-unused' });
   const edited = await runHook('post-edit.ts', { payload: editPayload({ root, file }), env, cwd: root });
   assert.equal(edited.code, 0, edited.stderr);
-  assert.ok(JSON.parse(edited.stdout).hookSpecificOutput.additionalContext.includes(check.boundary_lines[0]));
+  assert.ok(JSON.parse(edited.stdout).hookSpecificOutput.additionalContext.includes(check.items[0].path));
   const session = await runHook('session-start.ts', { env: { ...env, CARRICK_FAKE_FIXTURE: statusFile }, cwd: root });
   assert.equal(session.code, 0, session.stderr);
   assert.ok(session.stdout.includes(status.services[0].boundary_lines[0]));
