@@ -5687,6 +5687,55 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// Pinned while carrick#2048 lands, for carrick#2059 to flip: a route that
+    /// switches on a body field has a producer entry per case, and a manifest
+    /// entry states no case, so the check pairs a call with every case at its
+    /// method and path. The edge matcher pairs it with the case it sends only
+    /// (`carrick_match::dispatch_verdict`), so another case's verdict can be
+    /// judged for the call's edge. #2059 makes the check pair what the matcher
+    /// pairs.
+    #[test]
+    fn a_call_to_a_dispatching_route_is_paired_with_every_case_today() {
+        let route = OperationKey::http("POST", "/api/orders/:orderId");
+        let case = |alias: &str, line: u32| {
+            entry(
+                route.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                alias,
+                "app/api/orders/[orderId]/route.ts",
+                line,
+                ManifestTypeState::Explicit,
+            )
+        };
+        let call = entry(
+            route.clone(),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "C_confirm",
+            "components/OrderActions.tsx",
+            5,
+            ManifestTypeState::Explicit,
+        );
+        let mut paired: Vec<(String, String)> = build_check_pairs(&[repo(
+            "app",
+            None,
+            vec![case("P_confirm", 17), case("P_cancel", 20), call],
+            Some(fake_artifact()),
+        )])
+        .into_iter()
+        .map(|pair| (pair.consumer_alias, pair.producer_alias))
+        .collect();
+        paired.sort();
+        assert_eq!(
+            paired,
+            vec![
+                ("C_confirm".to_string(), "P_cancel".to_string()),
+                ("C_confirm".to_string(), "P_confirm".to_string()),
+            ]
+        );
+    }
+
     /// Only HTTP pairs a service with itself. The exact-key matcher drops a
     /// same-service edge for GraphQL, socket and pub/sub (#397/#410), so a
     /// pair of those would be judged against no edge (carrick#1945).

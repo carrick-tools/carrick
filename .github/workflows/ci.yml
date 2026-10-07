@@ -182,6 +182,7 @@ jobs:
           --test commonjs_require_callers_test
           --test dependency_analysis_test
           --test derive_matches_scan_test
+          --test dispatch_file_route_test
           --test dispatch_resume_test
           --test env_var_template_call_segment_test
           --test eval_xrepo
