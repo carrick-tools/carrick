@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.109](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.108...carrick-v0.3.109) (2026-10-07)
+
+
+### Features
+
+* **scanner:** count every time limit that runs out, by kind and cost ([#2021](https://github.com/carrick-tools/carrick/issues/2021) part 1) ([#2034](https://github.com/carrick-tools/carrick/issues/2034)) ([956dbac](https://github.com/carrick-tools/carrick/commit/956dbacc6130dde47b86dace7df72944a2012850))
+* **scanner:** the retype check has one ceiling for the whole scan and none per service ([#2021](https://github.com/carrick-tools/carrick/issues/2021)) ([#2038](https://github.com/carrick-tools/carrick/issues/2038)) ([2e4b4f8](https://github.com/carrick-tools/carrick/commit/2e4b4f84b4668db20c64c6c5d74ff8e9b6348935))
+* **scanner:** the retype check sends one request per consumer file and answers the rest on a pool of sidecar processes ([#1996](https://github.com/carrick-tools/carrick/issues/1996)) ([#2030](https://github.com/carrick-tools/carrick/issues/2030)) ([849c603](https://github.com/carrick-tools/carrick/commit/849c60313c5adccea7478343daa7a2ae8d76a3a1))
+* **sidecar:** a pool of sidecar processes scoped to one service answers a pass's requests at once ([#1996](https://github.com/carrick-tools/carrick/issues/1996)) ([#2014](https://github.com/carrick-tools/carrick/issues/2014)) ([cf8ef3c](https://github.com/carrick-tools/carrick/commit/cf8ef3ce8382ad596fd04b89a6c5de3b687a6a0a))
+* **sidecar:** a process lists the files its program was built from, and another builds the same program from them ([#2027](https://github.com/carrick-tools/carrick/issues/2027)) ([#2033](https://github.com/carrick-tools/carrick/issues/2033)) ([8a968dd](https://github.com/carrick-tools/carrick/commit/8a968ddd0b5d277d42d759c3f09e10eeedcc7eb2))
+* **sidecar:** TypeScript 6 with stableTypeOrdering on every program it builds ([#2019](https://github.com/carrick-tools/carrick/issues/2019)) ([#2023](https://github.com/carrick-tools/carrick/issues/2023)) ([c6292a4](https://github.com/carrick-tools/carrick/commit/c6292a4b4e360b25107e5acd20c3cbd49c3a3382))
+
+
+### Bug Fixes
+
+* **scanner:** a function row read back from a payload keeps its kind ([#2028](https://github.com/carrick-tools/carrick/issues/2028)) ([#2036](https://github.com/carrick-tools/carrick/issues/2036)) ([473c2a8](https://github.com/carrick-tools/carrick/commit/473c2a8fa648ec75a5f736330a87e421b1020600))
+* **scanner:** a pool reads its process's size from the kernel, not from `ps` ([#1996](https://github.com/carrick-tools/carrick/issues/1996)) ([#2039](https://github.com/carrick-tools/carrick/issues/2039)) ([a14229b](https://github.com/carrick-tools/carrick/commit/a14229b21dc9781c2648f751779bece1f04a4352))
+* **scanner:** the sidecar deadline is counted, never stated ([#2021](https://github.com/carrick-tools/carrick/issues/2021)) ([#2052](https://github.com/carrick-tools/carrick/issues/2052)) ([9d91e92](https://github.com/carrick-tools/carrick/commit/9d91e92bbb8f34c15bfcd05327492002847f4132))
+* **sidecar:** a sidecar exits when the process that started it is gone, and test stand-ins exit when stdin ends ([#2029](https://github.com/carrick-tools/carrick/issues/2029)) ([#2063](https://github.com/carrick-tools/carrick/issues/2063)) ([126e450](https://github.com/carrick-tools/carrick/commit/126e450856922401b7efd51260869249c318e644))
+
 ## [0.3.108](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.107...carrick-v0.3.108) (2026-10-06)
 
 
