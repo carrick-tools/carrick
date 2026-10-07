@@ -47,28 +47,26 @@ test("MultiEdit payloads name their file the other way round", async (t) => {
   assert.match(run.stdout, /additionalContext/);
 });
 
-test("a file with no indexed rows gets no service-wide boundary", async (t) => {
+test("a file with no indexed rows prints the header and no service-wide boundary", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
 
-  const clean = await runHook("post-edit.ts", {
-    payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-clean.json") }),
-  });
-  assert.equal(clean.code, 0);
-  assert.equal(clean.stdout, "");
+  for (const name of ["check-clean.json", "check-silent.json"]) {
+    const run = await runHook("post-edit.ts", {
+      payload: editPayload(workspace),
+      env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath(name) }),
+    });
+    assert.equal(run.code, 0, name);
+    const context = (
+      JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }
+    ).hookSpecificOutput.additionalContext;
+    assert.match(context, /^Carrick checked .+ against the workspace index \(user-service, indexed at 6a1b2c3\)\.$/, name);
+  }
 });
 
-test("the hook is silent when there is nothing to say", async (t) => {
+test("the hook is silent when the index cannot answer", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
-
-  const silent = await runHook("post-edit.ts", {
-    payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
-  });
-  assert.equal(silent.stdout, "");
-  assert.equal(silent.code, 0);
 
   const notIndexed = await runHook("post-edit.ts", {
     payload: editPayload(workspace),

@@ -1,5 +1,5 @@
 ### check-clean.json :: renderPostToolUse
-(silent)
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
 
 ### check-counterpart.json :: renderPostToolUse
 Carrick checked user-service/src/routes/users.ts against the workspace index (order-service, indexed at 6a1b2c3).
@@ -24,10 +24,11 @@ Carrick checked user-service/src/routes/users.ts against the workspace index (us
 - user-service/src/routes/users.ts:80:5 call GET /api/audit/:id [fact, imported_member] no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`. Producers: audit-service src/routes/audit.ts:9
 - user-service/src/routes/users.ts:95:7 call POST https://api.example-payments.test/v1/charges [fact, imported_member] no type verdict: matched to a shared external contract, and nothing pairs with it to compare. Same contract in: billing-service src/charges.ts:31
 This file has changed since the index, so these verdicts describe the indexed version. 3 file(s) in the workspace have changed since 6a1b2c3.
-1 call site in this file not classified locally (line 80): their route or type is unchecked here.
+1 call site in this file not classified locally (line 80): its route or type is unchecked here.
 
 ### check-new-functions.json :: renderPostToolUse
-(silent)
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+These verdicts were re-computed from your working tree in 812 ms. 1 file(s) in the workspace have changed since 6a1b2c3.
 
 ### check-not-indexed.json :: renderPostToolUse
 (silent)
@@ -40,10 +41,10 @@ Carrick checked user-service/src/routes/users.ts against the workspace index (us
 - user-service/src/routes/users.ts:80:5 call GET /api/audit/:id [fact, imported_member] no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`. Producers: audit-service src/routes/audit.ts:9
 - user-service/src/routes/users.ts:95:7 call POST https://api.example-payments.test/v1/charges [fact, imported_member] no type verdict: matched to a shared external contract, and nothing pairs with it to compare. Same contract in: billing-service src/charges.ts:31
 This file has changed since the index, so these verdicts describe the indexed version. 3 file(s) in the workspace have changed since 6a1b2c3.
-1 call site in this file not classified locally (line 80): their route or type is unchecked here.
+1 call site in this file not classified locally (line 80): its route or type is unchecked here.
 
 ### check-silent.json :: renderPostToolUse
-(silent)
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
 
 ### check-types.json :: renderPostToolUse
 Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).

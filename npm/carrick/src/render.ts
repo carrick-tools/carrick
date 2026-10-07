@@ -336,23 +336,23 @@ function unclassifiedLine(result: CheckResult): string | null {
   const shown = lines.slice(0, MAX_UNCLASSIFIED_LINES).join(", ");
   const named = rest > 0 ? `${shown}, +${rest} more` : shown;
   const noun = lines.length === 1 ? "call site" : "call sites";
-  return `${lines.length} ${noun} in this file not classified locally (line ${named}): their route or type is unchecked here.`;
+  return `${lines.length} ${noun} in this file not classified locally (line ${named}): ${lines.length === 1 ? "its route or type is" : "their routes or types are"} unchecked here.`;
 }
 
 /**
- * The PostToolUse context, or `null` when the index has nothing to say about
- * this file.
+ * The PostToolUse context, or `null` for an error payload.
  *
- * The service-wide boundary is not here: it is the same text on every edit,
- * which is what an agent learns to skip, so `renderSessionStart` prints it once.
- * An edit gets one line, and only when this file holds call sites the local
- * index did not classify, so an empty answer is not read as "nothing here".
+ * The header is printed on every checked file, even one with nothing to report:
+ * it is the only sign the hook ran, and silence reads the same as a hook that is
+ * not installed. The service-wide boundary is not here: it is the same text on
+ * every edit, which is what an agent learns to skip, so `renderSessionStart`
+ * prints it once. An edit adds one line, only when this file holds call sites
+ * the local index did not classify.
  */
 export function renderPostToolUse(result: CheckResult, displayFile?: string): string | null {
   if (result.error) return null;
   const items = reportableItems(result);
   const unclassified = unclassifiedLine(result);
-  if (items.length === 0 && !unclassified) return null;
 
   // `result.file` is relative to the repo that owns it, so the caller's own
   // workspace-relative path is the one a reader can open; it wins when given.

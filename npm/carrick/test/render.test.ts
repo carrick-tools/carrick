@@ -47,7 +47,7 @@ test("the edit's one boundary line names only this file's unclassified lines", (
   // The fixture's boundary also lists src/proxy.ts:22, which is another file's.
   assert.match(
     context,
-    /\n1 call site in this file not classified locally \(line 80\): their route or type is unchecked here\.$/,
+    /\n1 call site in this file not classified locally \(line 80\): its route or type is unchecked here\.$/,
   );
   assert.equal(context.includes("proxy.ts"), false);
   assert.equal(context.includes("22"), false);
@@ -63,7 +63,7 @@ test("unclassifiedLines reads every site list, once per line, sorted", () => {
   assert.deepEqual(unclassifiedLines(result), [5, 9, 80]);
   assert.equal(
     (renderPostToolUse(result) ?? "").split("\n").at(-1),
-    "3 call sites in this file not classified locally (line 5, 9, 80): their route or type is unchecked here.",
+    "3 call sites in this file not classified locally (line 5, 9, 80): their routes or types are unchecked here.",
   );
 });
 
@@ -183,22 +183,27 @@ test("a re-check that missed its budget says how old the answer is", () => {
   assert.match(context, /did not finish inside its budget.*2026-09-13T22:26:26Z/);
 });
 
-test("a file with no rows and no unclassified sites of its own is silent", () => {
-  // Its service has unclassified candidates, none of them in this file.
-  assert.equal(renderPostToolUse(fixture("check-clean.json")), null);
-});
-
 test("a file with no rows but unclassified sites says so in one line", () => {
   const result = fixture("check-clean.json");
   result.boundary = { unemitted_literal_sites: ["src/util/format.ts:7"] };
   assert.equal(
     renderPostToolUse(result),
-    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).\n1 call site in this file not classified locally (line 7): their route or type is unchecked here.",
+    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).\n1 call site in this file not classified locally (line 7): its route or type is unchecked here.",
   );
 });
 
-test("nothing to say prints nothing", () => {
-  assert.equal(renderPostToolUse(fixture("check-silent.json")), null);
+test("a file with nothing to report still prints the header, and only the header", () => {
+  assert.equal(
+    renderPostToolUse(fixture("check-silent.json")),
+    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).",
+  );
+  assert.equal(
+    renderPostToolUse(fixture("check-clean.json")),
+    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).",
+  );
+});
+
+test("an error payload prints nothing", () => {
   assert.equal(renderPostToolUse(fixture("check-not-indexed.json")), null);
 });
 
