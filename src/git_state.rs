@@ -277,6 +277,28 @@ pub fn tracked_paths(repo_path: &Path, pathspecs: &[&str]) -> Result<Vec<String>
     Ok(nul_paths(run_git(&repo_path, &args)?))
 }
 
+/// What git ignores in the checkout at `repo_path` and does not track
+/// (carrick#1902), relative to it: a file, or a folder written with a
+/// trailing `/` when nothing under it is tracked or kept.
+///
+/// The repository's `.gitignore` files and this machine's own excludes
+/// (`.git/info/exclude`, `core.excludesFile`) both count. A tracked file that
+/// matches an ignore pattern is not listed. `Err` means git could not answer,
+/// as for [`unchanged_since`].
+pub fn ignored_paths(repo_path: &Path) -> Result<Vec<String>, String> {
+    Ok(nul_paths(run_git(
+        &repo_path.to_string_lossy(),
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )?))
+}
+
 /// Run git in `repo_path` with the inherited git environment cleared (see
 /// [`inspect`]), returning stdout, or stderr as the error.
 fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {

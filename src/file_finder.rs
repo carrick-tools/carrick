@@ -1,4 +1,5 @@
 use crate::operation::EndpointProvenance;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -313,6 +314,42 @@ fn tracked_in(top: &Path) -> Option<Arc<Tracked>> {
     answer
 }
 
+/// What git ignores and does not track in the checkout at `top`
+/// ([`crate::git_state::ignored_paths`], carrick#1902), relative to `top`,
+/// asked once per checkout per process. A folder git lists whole is held
+/// without its trailing `/`. `None` when git cannot answer.
+fn ignored_in(top: &Path) -> Option<Arc<HashSet<PathBuf>>> {
+    type Ignored = Option<Arc<HashSet<PathBuf>>>;
+    static IGNORED: OnceLock<Mutex<HashMap<PathBuf, Ignored>>> = OnceLock::new();
+    let cache = IGNORED.get_or_init(Default::default);
+    if let Some(known) = cache.lock().ok()?.get(top) {
+        return known.clone();
+    }
+    let answer = crate::git_state::ignored_paths(top).ok().map(|paths| {
+        Arc::new(
+            paths
+                .iter()
+                .map(|path| PathBuf::from(path.trim_end_matches('/')))
+                .collect(),
+        )
+    });
+    cache.lock().ok()?.insert(top.to_path_buf(), answer.clone());
+    answer
+}
+
+/// The checkout `path` sits in, and `path` relative to its top: the nearest
+/// directory above `path` that holds `.git`. Absolute, and not canonical, as
+/// [`is_separate_checkout`] reads it.
+fn in_checkout(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let top = path
+        .ancestors()
+        .skip(1)
+        .find(|above| is_git_checkout(above))?;
+    let relative = path.strip_prefix(top).ok()?.to_path_buf();
+    Some((top.to_path_buf(), relative))
+}
+
 /// Whether `dir` is a dot folder git tracks nothing under (carrick#1607): a
 /// tool's cache, a virtual environment, a build's output, kept beside the
 /// source and never committed.
@@ -330,14 +367,26 @@ pub fn is_untracked_dot_folder(dir: &Path) -> bool {
     {
         return false;
     }
-    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let Some(top) = dir.ancestors().skip(1).find(|above| is_git_checkout(above)) else {
+    let Some((top, relative)) = in_checkout(dir) else {
         return false;
     };
-    let Ok(relative) = dir.strip_prefix(top) else {
+    tracked_in(&top).is_some_and(|tracked| !tracked.tracks_under(&relative))
+}
+
+/// Whether git ignores `path` and tracks nothing at it (carrick#1902): the
+/// file, or a folder git lists whole.
+///
+/// Git lists an ignored folder once and nothing below it, so a walk rooted
+/// in one (a service `directory`, an `include` root or a scan path the
+/// config names) meets nothing here and reads it whole. A file git lists on
+/// its own, beside tracked files in a folder an ignore pattern matches, is
+/// brought back by naming that file. With no checkout above `path`, or a
+/// git that cannot answer, nothing is ignored.
+fn is_git_ignored(path: &Path) -> bool {
+    let Some((top, relative)) = in_checkout(path) else {
         return false;
     };
-    tracked_in(top).is_some_and(|tracked| !tracked.tracks_under(relative))
+    ignored_in(&top).is_some_and(|ignored| ignored.contains(&relative))
 }
 
 /// Why a walk stops at a directory below its root.
@@ -349,6 +398,11 @@ pub enum GitBoundary {
     SeparateCheckout,
     /// A dot folder git tracks nothing under ([`is_untracked_dot_folder`]).
     UntrackedDotFolder,
+    /// A file or folder git ignores and tracks nothing at
+    /// ([`is_git_ignored`]). The source walk enters one to read what the
+    /// service's own code imports from it ([`walk_service`]); every other
+    /// walk stops there.
+    Ignored,
 }
 
 /// Whether a walk stops at `entry`, and why (carrick#1902).
@@ -364,17 +418,48 @@ pub enum GitBoundary {
 ///
 /// A dot folder is a boundary only where git tracks nothing under it
 /// (carrick#1607). A committed one is read as any folder is.
+///
+/// A file or folder git ignores is a boundary ([`is_git_ignored`]): a stray
+/// copy of the repository in a backup folder is not its source.
 pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
-    if entry.depth() == 0 || !entry.file_type().is_dir() {
+    if entry.depth() == 0 {
         return None;
     }
-    if entry.file_name() == ".git" {
-        return Some(GitBoundary::Records);
+    boundary_at(entry.path(), entry.file_type().is_dir())
+}
+
+/// [`git_boundary`] for `path`, a directory or not, below a walk's root.
+fn boundary_at(path: &Path, is_dir: bool) -> Option<GitBoundary> {
+    if is_dir {
+        if path.file_name().is_some_and(|name| name == ".git") {
+            return Some(GitBoundary::Records);
+        }
+        if is_separate_checkout(path) {
+            return Some(GitBoundary::SeparateCheckout);
+        }
+        if is_untracked_dot_folder(path) {
+            return Some(GitBoundary::UntrackedDotFolder);
+        }
     }
-    if is_separate_checkout(entry.path()) {
-        return Some(GitBoundary::SeparateCheckout);
-    }
-    is_untracked_dot_folder(entry.path()).then_some(GitBoundary::UntrackedDotFolder)
+    is_git_ignored(path).then_some(GitBoundary::Ignored)
+}
+
+/// Whether a walk rooted at `root` would stop before it reached `path`
+/// ([`git_boundary`]): at `path` itself, or at a folder between the two.
+/// For a path a walk did not find, such as a glob's match: a
+/// `graphqlSchemas` entry names what comes before its first wildcard, and
+/// what lies below that is read as a walk of it would read it.
+pub fn left_out_below(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut at = root.to_path_buf();
+    let parts: Vec<_> = relative.components().collect();
+    parts.iter().enumerate().any(|(index, part)| {
+        at.push(part);
+        let is_dir = index + 1 < parts.len() || at.is_dir();
+        boundary_at(&at, is_dir).is_some()
+    })
 }
 
 /// The entries of a source walk below `dir`: everything the scan may read,
@@ -403,7 +488,7 @@ pub fn git_boundary(entry: &walkdir::DirEntry) -> Option<GitBoundary> {
 ///
 /// `stopped` receives every separate checkout and untracked dot folder the
 /// walk stopped at ([`git_boundary`]), as walked, so the caller can say what
-/// was left out.
+/// was left out, and every path git ignores, which the walk enters.
 ///
 /// `exclusion` is the service's `exclude` (carrick#1990): what it matches is
 /// never entered either, and is put in `stopped` to be counted.
@@ -412,7 +497,7 @@ fn source_entries<'a>(
     ignore_patterns: &'a [&'a str],
     left_out: &'a [PathBuf],
     exclusion: &'a Exclusion,
-    stopped: &'a mut Stopped,
+    stopped: &'a RefCell<Stopped>,
 ) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .sort_by_file_name()
@@ -428,9 +513,13 @@ fn source_entries<'a>(
                 return false;
             }
             if entry.depth() > 0 && exclusion.excludes(entry.path(), entry.file_type().is_dir()) {
-                stopped.excluded.push(entry.path().to_path_buf());
+                stopped
+                    .borrow_mut()
+                    .excluded
+                    .push(entry.path().to_path_buf());
                 return false;
             }
+            let mut stopped = stopped.borrow_mut();
             match git_boundary(entry) {
                 None => true,
                 Some(GitBoundary::Records) => false,
@@ -441,6 +530,12 @@ fn source_entries<'a>(
                 Some(GitBoundary::UntrackedDotFolder) => {
                     stopped.dot_folders.push(entry.path().to_path_buf());
                     false
+                }
+                // Entered: what the service's own code imports from it is
+                // read ([`keep_what_is_imported`]).
+                Some(GitBoundary::Ignored) => {
+                    stopped.ignored.push(entry.path().to_path_buf());
+                    true
                 }
             }
         })
@@ -455,6 +550,10 @@ struct Stopped {
     /// Dot folders git tracks nothing under
     /// ([`GitBoundary::UntrackedDotFolder`]).
     dot_folders: Vec<PathBuf>,
+    /// Files and folders git ignores ([`GitBoundary::Ignored`]). The walk
+    /// enters these, and what it finds under one is read only when the
+    /// service's own code imports it.
+    ignored: Vec<PathBuf>,
     /// Files and folders the service's `exclude` matches ([`Exclusion`]).
     excluded: Vec<PathBuf>,
 }
@@ -543,9 +642,76 @@ impl Exclusion {
 
 /// What one walk read, and the directories it stopped at.
 struct Walked {
-    files: Vec<PathBuf>,
+    files: Vec<Found>,
     config_file: Option<PathBuf>,
     stopped: Stopped,
+}
+
+/// A source file a walk found, and whether it sits at or under a path git
+/// ignores ([`GitBoundary::Ignored`]).
+#[derive(Debug, Clone)]
+struct Found {
+    path: PathBuf,
+    ignored: bool,
+}
+
+/// The source files a walk reads from what it `found`, in walk order, and
+/// the ignored ones it leaves out (carrick#1902).
+///
+/// A file git ignores is read when the files read import it, directly or
+/// through another ignored file they import: a client or a set of types a
+/// build step generates and the committed code uses. A copy of the
+/// repository in a folder git ignores, a backup or a stray worktree, is
+/// imported by nothing and stays out. `modules` resolves a specifier the way
+/// the call graph does ([`WorkspaceIndex::resolve_module_path`]), and is
+/// built only when something ignored was found.
+///
+/// Specifiers are read from the source as written: `import`, `export ...
+/// from`, `import x = require()`, and `require` or `import()` with a literal
+/// ([`crate::parser::ModuleReader::loaded_specifiers`]). A specifier the
+/// source computes names no file, and what only it would load stays out.
+fn keep_what_is_imported(
+    found: Vec<Found>,
+    modules: impl FnOnce() -> crate::workspace_resolver::WorkspaceIndex,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if !found.iter().any(|file| file.ignored) {
+        return (
+            found.into_iter().map(|file| file.path).collect(),
+            Vec::new(),
+        );
+    }
+    let modules = modules();
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut read: Vec<bool> = found.iter().map(|file| !file.ignored).collect();
+    let mut waiting: HashMap<PathBuf, usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.ignored)
+        .map(|(index, file)| (canonical(&file.path), index))
+        .collect();
+    let mut queue: Vec<usize> = (0..found.len()).filter(|&index| read[index]).collect();
+    let mut reader = crate::parser::ModuleReader::quiet();
+    while let Some(index) = queue.pop() {
+        if waiting.is_empty() {
+            break;
+        }
+        let importer = &found[index].path;
+        for specifier in reader.loaded_specifiers(importer) {
+            let Some(target) = modules.resolve_module_path(importer, &specifier) else {
+                continue;
+            };
+            if let Some(imported) = waiting.remove(&canonical(&target)) {
+                read[imported] = true;
+                queue.push(imported);
+            }
+        }
+    }
+    let (kept, left_out): (Vec<_>, Vec<_>) =
+        found.into_iter().zip(read).partition(|(_, read)| *read);
+    (
+        kept.into_iter().map(|(file, _)| file.path).collect(),
+        left_out.into_iter().map(|(file, _)| file.path).collect(),
+    )
 }
 
 /// Find all JavaScript and TypeScript files in a directory
@@ -557,13 +723,19 @@ struct Walked {
 /// filesystem readdir order, so "the" manifest it found was whichever came
 /// last on that host. A service's manifest is the one at its root and nowhere
 /// else — see [`find_service_files`].
+///
+/// A file git ignores is read only when a file read imports it
+/// ([`keep_what_is_imported`]), resolved with the configs nearest each file.
 pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
     let walked = find_files_leaving_out(dir, ignore_patterns, &[], &Exclusion::default());
-    (walked.files, walked.config_file)
+    let (files, _) = keep_what_is_imported(walked.files, || {
+        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(dir), None)
+    });
+    (files, walked.config_file)
 }
 
-/// [`find_files`], never entering the `left_out` directories below `dir` or
-/// what `exclusion` matches.
+/// [`find_files`] before an ignored file is kept or left out, never entering
+/// the `left_out` directories below `dir` or what `exclusion` matches.
 fn find_files_leaving_out(
     dir: &str,
     ignore_patterns: &[&str],
@@ -572,36 +744,43 @@ fn find_files_leaving_out(
 ) -> Walked {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
-    let mut stopped = Stopped::default();
+    let stopped = RefCell::new(Stopped::default());
     let root_path = Path::new(dir);
 
-    for entry in source_entries(
-        root_path,
-        ignore_patterns,
-        left_out,
-        exclusion,
-        &mut stopped,
-    ) {
+    for entry in source_entries(root_path, ignore_patterns, left_out, exclusion, &stopped) {
         let path = entry.path();
 
         if !path.is_file() {
             continue;
         }
 
+        // The walk stopped at every ignored path above this one before it
+        // reached it, so the list already holds them.
+        let ignored = stopped
+            .borrow()
+            .ignored
+            .iter()
+            .any(|ignored| path.starts_with(ignored));
+
         if path.file_name().is_some_and(|name| name == "carrick.json") {
-            config_file = Some(path.to_path_buf());
+            if !ignored {
+                config_file = Some(path.to_path_buf());
+            }
             continue;
         }
 
         if is_scanned_source(path, root_path) {
-            js_ts_files.push(path.to_path_buf());
+            js_ts_files.push(Found {
+                path: path.to_path_buf(),
+                ignored,
+            });
         }
     }
 
     Walked {
         files: js_ts_files,
         config_file,
-        stopped,
+        stopped: stopped.into_inner(),
     }
 }
 
@@ -619,7 +798,7 @@ fn count_excluded(excluded: &[PathBuf], root: &Path, ignore_patterns: &[&str]) -
                 ignore_patterns,
                 &[],
                 &Exclusion::default(),
-                &mut Stopped::default(),
+                &RefCell::default(),
             )
             .filter(|entry| entry.path().is_file() && is_scanned_source(entry.path(), root))
             .count()
@@ -678,6 +857,11 @@ pub fn find_service_manifest(repo_path: &Path, service: &crate::config::Config) 
 ///
 /// **A checkout of its own inside the service is not entered**
 /// ([`git_boundary`], carrick#1902). [`walk_service`] also says which ones.
+///
+/// **A file git ignores is read only when the service's own code imports
+/// it** ([`keep_what_is_imported`], carrick#1902), resolved with the
+/// `tsconfig` the service names. A generated client the committed code uses
+/// is read; a backup copy of the repository is not.
 pub fn find_service_files(
     repo_path: &str,
     service: &crate::config::Config,
@@ -702,8 +886,49 @@ pub struct ServiceWalk {
     /// The dot folders git tracks nothing under that the walk did not enter
     /// (carrick#1607), listed as `checkouts_left_out` is.
     pub dot_folders_left_out: Vec<PathBuf>,
+    /// The paths git ignores that the walk left source files out of
+    /// (carrick#1902), listed as `checkouts_left_out` is
+    /// ([`ignored_left_out`]).
+    pub ignored_left_out: Vec<PathBuf>,
     /// What the service's `exclude` left out (carrick#1990).
     pub excluded: ExcludedFiles,
+}
+
+/// The ignored paths a reader is told were left out, from the paths the walk
+/// found ignored (`stopped`, sorted), the files it read and the ignored
+/// source files it left out (carrick#1902).
+///
+/// A path that holds no source file is not named: an ignored `.env` or log
+/// folder was never source. One the walk read nothing under is named whole.
+/// Where the service's code imports some of what one holds, the files left
+/// out under it are named instead, so the folder is never named as left out
+/// when part of it was read.
+fn ignored_left_out(stopped: Vec<PathBuf>, read: &[PathBuf], left_out: &[PathBuf]) -> Vec<PathBuf> {
+    let outermost: Vec<&PathBuf> = stopped
+        .iter()
+        .filter(|path| {
+            !stopped
+                .iter()
+                .any(|above| above != *path && path.starts_with(above))
+        })
+        .collect();
+    let mut named = Vec::new();
+    for path in outermost {
+        let under: Vec<&PathBuf> = left_out
+            .iter()
+            .filter(|file| file.starts_with(path))
+            .collect();
+        if under.is_empty() {
+            continue;
+        }
+        if read.iter().any(|file| file.starts_with(path)) {
+            named.extend(under.into_iter().cloned());
+        } else {
+            named.push(path.clone());
+        }
+    }
+    named.sort();
+    named
 }
 
 /// How many `exclude` patterns a service states, and how many source files
@@ -762,6 +987,7 @@ pub fn walk_service(
         files.extend(included.files);
         stopped.checkouts.extend(included.stopped.checkouts);
         stopped.dot_folders.extend(included.stopped.dot_folders);
+        stopped.ignored.extend(included.stopped.ignored);
         // Only what the directory walk did not already count.
         let new: Vec<PathBuf> = included
             .stopped
@@ -774,9 +1000,28 @@ pub fn walk_service(
     }
 
     // An `include` root may overlap the service directory; keep the first
-    // occurrence of each file so a file is never parsed twice.
-    let mut seen = std::collections::HashSet::new();
-    files.retain(|p| seen.insert(p.clone()));
+    // occurrence of each file so a file is never parsed twice. A file one
+    // walk found under an ignored folder and another read as named (an
+    // `include` root git ignores) is named.
+    let named_here: HashSet<PathBuf> = files
+        .iter()
+        .filter(|file| !file.ignored)
+        .map(|file| file.path.clone())
+        .collect();
+    let mut seen = HashSet::new();
+    files.retain(|file| seen.insert(file.path.clone()));
+    for file in &mut files {
+        file.ignored &= !named_here.contains(&file.path);
+    }
+    let (files, ignored_files) = keep_what_is_imported(files, || {
+        let service_tsconfig = service.alias_tsconfig();
+        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
+            root,
+            service_tsconfig
+                .as_ref()
+                .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
+        )
+    });
 
     // A directory that holds a root the config names was stopped at by the
     // directory walk and is read, as far as it was named, by the walk rooted
@@ -793,12 +1038,18 @@ pub fn walk_service(
         dirs.dedup();
         dirs
     };
+    let ignored_left_out = ignored_left_out(
+        left_out_named_nothing(stopped.ignored),
+        &files,
+        &ignored_files,
+    );
 
     ServiceWalk {
         files,
         manifest,
         checkouts_left_out: left_out_named_nothing(stopped.checkouts),
         dot_folders_left_out: left_out_named_nothing(stopped.dot_folders),
+        ignored_left_out,
         excluded: ExcludedFiles {
             patterns: exclusion.patterns(),
             files: excluded_files,
@@ -989,16 +1240,11 @@ mod tests {
         let root = tmp.path();
         installed_workspace(root, 12, 2);
 
-        let mut stopped = Stopped::default();
-        let visited: Vec<PathBuf> = source_entries(
-            root,
-            ARTIFACT_IGNORES,
-            &[],
-            &Exclusion::default(),
-            &mut stopped,
-        )
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
+        let stopped = RefCell::default();
+        let visited: Vec<PathBuf> =
+            source_entries(root, ARTIFACT_IGNORES, &[], &Exclusion::default(), &stopped)
+                .map(|entry| entry.path().to_path_buf())
+                .collect();
 
         assert!(
             !visited
@@ -1802,6 +2048,145 @@ mod tests {
             [".tooling/release.ts", "src/orders.ts"]
         );
         assert!(dot_folders_left_out_by(root, &included).is_empty());
+    }
+
+    /// The paths git ignores that a service's walk names as left out,
+    /// relative to the repo.
+    fn ignored_left_out_by(root: &Path, service: &crate::config::Config) -> Vec<String> {
+        walk_service(root.to_str().unwrap(), service, ARTIFACT_IGNORES)
+            .ignored_left_out
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .expect("a path left out is under the repo")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// carrick#1902. A folder and a file git ignores are left out and named.
+    /// A file the repository tracks under an ignore pattern is the
+    /// repository's, and is read.
+    #[test]
+    fn what_git_ignores_is_left_out_unless_it_is_tracked() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, "src/env.local.ts");
+        touch(root, "backup/src/orders.ts");
+        touch(root, "generated/kept.ts");
+        touch(root, "generated/stray.ts");
+        fs::write(root.join(".gitignore"), "backup/\n*.local.ts\ngenerated/\n")
+            .expect(".gitignore");
+        git(root, &["init", "-q"]);
+        git(root, &["add", "-A"]);
+        git(root, &["add", "-f", "generated/kept.ts"]);
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            ["generated/kept.ts", "src/orders.ts"]
+        );
+        assert_eq!(
+            ignored_left_out_by(root, &services[0]),
+            ["backup", "generated/stray.ts", "src/env.local.ts"]
+        );
+    }
+
+    /// carrick#1902, ruling (b): an ignored file the service's own code
+    /// imports is read, and so is what it imports in turn, by `import`,
+    /// `export * from` or a literal `require`. What nothing imports stays
+    /// out, and where part of a folder was read the rest is named file by
+    /// file.
+    #[test]
+    fn an_ignored_file_the_service_imports_is_read() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::create_dir_all(root.join("generated")).expect("generated");
+        fs::write(
+            root.join("src/orders.ts"),
+            "import { Order } from '../generated/client';\n\
+             const rates = require('../generated/rates.js');\n",
+        )
+        .expect("orders");
+        fs::write(
+            root.join("generated/client.ts"),
+            "export * from './models';\n",
+        )
+        .expect("client");
+        touch(root, "generated/models.ts");
+        touch(root, "generated/rates.ts");
+        touch(root, "generated/browser.ts");
+        fs::write(root.join(".gitignore"), "generated/\n").expect(".gitignore");
+        git(root, &["init", "-q"]);
+        git(root, &["add", "-A"]);
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            [
+                "generated/client.ts",
+                "generated/models.ts",
+                "generated/rates.ts",
+                "src/orders.ts"
+            ]
+        );
+        assert_eq!(
+            ignored_left_out_by(root, &services[0]),
+            ["generated/browser.ts"]
+        );
+    }
+
+    /// A root the config names is read whole where git ignores it: as a
+    /// service's directory, and as an `include` root.
+    #[test]
+    fn an_ignored_folder_the_config_names_is_read_whole() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        touch(root, "src/orders.ts");
+        touch(root, "codegen/api.ts");
+        touch(root, "codegen/models/order.ts");
+        fs::write(root.join(".gitignore"), "codegen/\n").expect(".gitignore");
+        git(root, &["init", "-q"]);
+        git(root, &["add", "-A"]);
+
+        let codegen = resolved(&[("codegen", "")]);
+        assert_eq!(
+            read_by(root, &codegen[0]),
+            ["codegen/api.ts", "codegen/models/order.ts"]
+        );
+
+        let included = crate::config::Config {
+            directory: Some(".".to_string()),
+            include: vec!["codegen".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            read_by(root, &included),
+            ["codegen/api.ts", "codegen/models/order.ts", "src/orders.ts"]
+        );
+        assert!(ignored_left_out_by(root, &included).is_empty());
+    }
+
+    /// Where git cannot say what it ignores (here, a `.git` that holds no
+    /// repository), nothing counts as ignored and the tree is read as it was.
+    #[test]
+    fn without_an_answer_from_git_nothing_is_ignored() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        git_dir(root, ".");
+        fs::write(root.join(".gitignore"), "backup/\n").expect(".gitignore");
+        touch(root, "src/orders.ts");
+        touch(root, "backup/src/orders.ts");
+
+        let services = resolved(&[(".", "")]);
+        assert_eq!(
+            read_by(root, &services[0]),
+            ["backup/src/orders.ts", "src/orders.ts"]
+        );
+        assert!(ignored_left_out_by(root, &services[0]).is_empty());
     }
 
     /// carrick#1990: `exclude` reads as a `.gitignore` does, relative to the

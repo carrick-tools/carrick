@@ -85,34 +85,98 @@ impl Default for ModuleReader {
 }
 
 impl ModuleReader {
+    /// A reader that prints nothing about a file that does not parse: for a
+    /// read made ahead of the pass that reports it (the source walk,
+    /// carrick#1902).
+    pub fn quiet() -> Self {
+        Self {
+            source_map: Default::default(),
+            handler: Handler::with_emitter_writer(Box::new(std::io::sink()), None),
+        }
+    }
+
+    /// Every module specifier `file` loads a module by, type-only or not
+    /// (carrick#1902): what [`Self::import_specifiers`] reads, plus
+    /// `import x = require()` and `require` or `import()` with a literal
+    /// specifier anywhere in the file. A specifier the source computes names
+    /// no module and is not here.
+    pub fn loaded_specifiers(&mut self, file: &Path) -> Vec<String> {
+        use swc_ecma_ast::{CallExpr, Callee, Expr, ModuleDecl, ModuleItem, TsModuleRef};
+        use swc_ecma_visit::{Visit, VisitWith};
+        struct Loads(Vec<String>);
+        impl Visit for Loads {
+            fn visit_call_expr(&mut self, call: &CallExpr) {
+                let loads = match &call.callee {
+                    Callee::Import(_) => true,
+                    Callee::Expr(callee) => {
+                        matches!(&**callee, Expr::Ident(ident) if ident.sym == *"require")
+                    }
+                    Callee::Super(_) => false,
+                };
+                if loads
+                    && let [argument] = call.args.as_slice()
+                    && argument.spread.is_none()
+                    && let Some(specifier) =
+                        crate::request_summary::literal_specifier(&argument.expr)
+                {
+                    self.0.push(specifier);
+                }
+                call.visit_children_with(self);
+            }
+        }
+        let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
+            return Vec::new();
+        };
+        let mut found = static_specifiers(&module);
+        found.extend(module.body.iter().filter_map(|item| match item {
+            ModuleItem::ModuleDecl(ModuleDecl::TsImportEquals(decl)) => match &decl.module_ref {
+                TsModuleRef::TsExternalModuleRef(external) => {
+                    Some(external.expr.value.to_string_lossy().into_owned())
+                }
+                TsModuleRef::TsEntityName(_) => None,
+            },
+            _ => None,
+        }));
+        let mut loads = Loads(Vec::new());
+        module.visit_with(&mut loads);
+        found.extend(loads.0);
+        found
+    }
+
     /// Every module specifier `file` imports from, in source order.
     ///
     /// Type-only imports are included: a package imported for its types alone
     /// is still imported, and a shared types package is exactly the member a
     /// dependents list exists to name.
     pub fn import_specifiers(&mut self, file: &Path) -> Vec<String> {
-        use swc_ecma_ast::{ModuleDecl, ModuleItem};
         let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
             return Vec::new();
         };
-        module
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    Some(import.src.value.to_string_lossy().into_owned())
-                }
-                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => export
-                    .src
-                    .as_ref()
-                    .map(|src| src.value.to_string_lossy().into_owned()),
-                ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
-                    Some(export.src.value.to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
-            .collect()
+        static_specifiers(&module)
     }
+}
+
+/// The specifiers `module` names in `import`, `export ... from` and
+/// `export * from`, in source order.
+fn static_specifiers(module: &Module) -> Vec<String> {
+    use swc_ecma_ast::{ModuleDecl, ModuleItem};
+    module
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                Some(import.src.value.to_string_lossy().into_owned())
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => export
+                .src
+                .as_ref()
+                .map(|src| src.value.to_string_lossy().into_owned()),
+            ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
+                Some(export.src.value.to_string_lossy().into_owned())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Parse a JavaScript or TypeScript file into an AST

@@ -2905,7 +2905,7 @@ fn jsx_names(module: &Module) -> HashSet<String> {
 }
 
 /// A string literal, or a template with no hole in it.
-fn literal_specifier(expr: &Expr) -> Option<String> {
+pub(crate) fn literal_specifier(expr: &Expr) -> Option<String> {
     match crate::graphql_document_sites::unwrap_expression(expr) {
         Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() => tpl.quasis.first().map(|quasi| {

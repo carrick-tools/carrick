@@ -6595,6 +6595,7 @@ const MAX_NAMED_CHECKOUTS: usize = 3;
 /// as a reader is told it.
 const CHECKOUTS: &str = "folder(s) with their own .git";
 const UNTRACKED_DOT_FOLDERS: &str = "dot folder(s) git tracks nothing in";
+const IGNORED_PATHS: &str = "path(s) git ignores";
 
 /// The folders of one kind a service's walk did not enter
 /// ([`crate::file_finder::git_boundary`], carrick#1902, carrick#1607), as a
@@ -6761,6 +6762,7 @@ fn discover_files_and_symbols(
     let left_out: Vec<String> = [
         folders_left_out(repo_path, &walk.checkouts_left_out, CHECKOUTS),
         folders_left_out(repo_path, &walk.dot_folders_left_out, UNTRACKED_DOT_FOLDERS),
+        folders_left_out(repo_path, &walk.ignored_left_out, IGNORED_PATHS),
     ]
     .into_iter()
     .flatten()
@@ -9105,6 +9107,25 @@ mod tests {
             Some(
                 "Left out 2 dot folder(s) git tracks nothing in: .venv, web/.next. Name one \
                  under \"include\" in carrick.json to scan it."
+            )
+        );
+    }
+
+    /// carrick#1902: the paths git ignores that a walk left out, files and
+    /// folders alike, said the same way.
+    #[test]
+    fn ignored_paths_a_walk_left_out_are_counted_and_named() {
+        let paths = [
+            PathBuf::from("/work/shop/backup"),
+            PathBuf::from("/work/shop/src/env.local.ts"),
+        ];
+        assert_eq!(
+            super::folders_left_out("/work/shop", &paths, super::IGNORED_PATHS)
+                .map(|left_out| super::left_out_line(&left_out))
+                .as_deref(),
+            Some(
+                "Left out 2 path(s) git ignores: backup, src/env.local.ts. Name one under \
+                 \"include\" in carrick.json to scan it."
             )
         );
     }

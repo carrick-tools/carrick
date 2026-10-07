@@ -516,3 +516,309 @@ fn every_walk_of_the_tree_leaves_the_same_checkout_out() {
         .collect();
     assert_eq!(served, ["graphql|query|orders"]);
 }
+
+/// Every blob a scan of `repo` wrote, by service, and what it printed.
+fn scan_blobs(repo: &Path) -> (BTreeMap<String, serde_json::Value>, String) {
+    let (succeeded, output, storage) = run(repo);
+    assert!(succeeded, "scan exited non-zero:\n{output}");
+    let mut blobs = BTreeMap::new();
+    for entry in std::fs::read_dir(storage.path())
+        .expect("storage dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let blob: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read blob")).expect("parse blob");
+        let service = blob["service_name"]
+            .as_str()
+            .expect("a blob names its service")
+            .to_string();
+        blobs.insert(service, blob);
+    }
+    (blobs, output)
+}
+
+/// carrick#1902, ruling (b), with every shape a repository can hold beside
+/// its source: a copy of the service in a folder git ignores, a linked
+/// worktree in a plain folder git does not ignore, committed generated and
+/// vendored code, an excluded folder, an ignored folder named under
+/// `include`, ignored files the service imports (one through a `paths`
+/// alias, one through another ignored file) and an ignored file nothing
+/// imports. Neither copy reaches the index; everything the service's own
+/// code imports does.
+#[test]
+fn a_root_service_is_scanned_once_beside_an_ignored_copy_and_a_nested_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "carrick.json",
+        r#"{ "services": [{
+            "name": "storefront",
+            "directory": ".",
+            "include": ["codegen"],
+            "exclude": ["scripts/"],
+            "graphqlSchemas": ["**/*.graphql"]
+        }] }"#,
+    );
+    write(root, "package.json", r#"{"name":"storefront"}"#);
+    write(
+        root,
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@gen/*": ["src/gen/*"] } },
+             "include": ["**/*"] }"#,
+    );
+    write(
+        root,
+        ".gitignore",
+        "backup/\ncodegen/\nsrc/env.local.ts\nsrc/gen/\nsrc/scratch.local.ts\n",
+    );
+    write(
+        root,
+        "src/orders.ts",
+        "import { localRegion } from './env.local';\n\
+         import { generatedPrice } from '@gen/prices';\n\
+         import { generatedClient } from './generated/client';\n\
+         import { vendoredMoney } from '../vendor/money';\n\
+         import { codegenApi } from '../codegen/api';\n\
+         export function listOrders() {\n\
+           return [localRegion(), generatedPrice(), generatedClient(), vendoredMoney(), codegenApi()];\n\
+         }\n",
+    );
+    write(root, "schema.graphql", "type Query { orders: [String] }\n");
+    write(
+        root,
+        "src/generated/client.ts",
+        "export function generatedClient() { return 1; }\n",
+    );
+    write(
+        root,
+        "vendor/money.ts",
+        "export function vendoredMoney() { return 2; }\n",
+    );
+    write(
+        root,
+        "scripts/seed.ts",
+        "export function seedOrders() { return 3; }\n",
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "one service"]);
+
+    // Ignored, and imported by the service: directly, through an alias, and
+    // through another ignored file.
+    write(
+        root,
+        "src/env.local.ts",
+        "export function localRegion() { return 'eu'; }\n",
+    );
+    write(
+        root,
+        "src/gen/prices.ts",
+        "import { generatedRate } from './rates';\n\
+         export function generatedPrice() { return generatedRate() * 2; }\n",
+    );
+    write(
+        root,
+        "src/gen/rates.ts",
+        "export function generatedRate() { return 4; }\n",
+    );
+    // Ignored and named under `include`.
+    write(
+        root,
+        "codegen/api.ts",
+        "export function codegenApi() { return 5; }\n",
+    );
+    // Ignored and imported by nothing.
+    write(
+        root,
+        "src/scratch.local.ts",
+        "export function scratchHelper() { return 6; }\n",
+    );
+    // A copy of the service in an ignored folder with no `.git`, a step
+    // ahead of it.
+    write(
+        root,
+        "backup/carrick.json",
+        r#"{ "services": [{ "name": "storefront", "directory": "." }] }"#,
+    );
+    write(root, "backup/package.json", r#"{"name":"storefront"}"#);
+    write(
+        root,
+        "backup/src/orders.ts",
+        "export function listOrders() { return [1]; }\n\
+         export function archivedOrdersExport() { return [7]; }\n",
+    );
+    write(
+        root,
+        "backup/schema.graphql",
+        "type Query { orders: [String] archivedOrders: [String] }\n",
+    );
+    // A linked worktree in a folder git does not ignore and whose name has
+    // no leading dot, with its branch a commit ahead.
+    git(root, &["worktree", "add", "-q", "trees/task", "-b", "task"]);
+    let task = root.join("trees/task");
+    write(
+        &task,
+        "src/orders.ts",
+        "export function listOrders() { return [1]; }\n\
+         export function draftOrdersExport() { return [8]; }\n",
+    );
+    write(
+        &task,
+        "schema.graphql",
+        "type Query { orders: [String] draftOrders: [String] }\n",
+    );
+    git(&task, &["commit", "-q", "-am", "ahead"]);
+
+    let (blobs, output) = scan_blobs(root);
+
+    let blob = &blobs["storefront"];
+    let functions: Vec<&str> = blob["function_definitions"]
+        .as_object()
+        .expect("blob has function_definitions")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        functions,
+        [
+            "codegenApi",
+            "generatedClient",
+            "generatedPrice",
+            "generatedRate",
+            "listOrders",
+            "localRegion",
+            "vendoredMoney"
+        ],
+        "{output}"
+    );
+    let text = blob.to_string();
+    for absent in ["backup/", "trees/", "archivedOrders", "draftOrders"] {
+        assert!(
+            !text.contains(absent),
+            "`{absent}` reached the blob: neither copy is the service's\n{output}"
+        );
+    }
+    assert!(
+        text.contains("schema.graphql"),
+        "the root schema is read:\n{output}"
+    );
+    for line in [
+        "Left out 1 folder(s) with their own .git: trees/task. Name one under \"include\" in \
+         carrick.json to scan it.",
+        "Left out 2 path(s) git ignores: backup, src/scratch.local.ts. Name one under \
+         \"include\" in carrick.json to scan it.",
+        "Left out 1 file(s) matching the 1 exclude pattern(s) in carrick.json.",
+    ] {
+        assert!(output.contains(line), "missing `{line}`:\n{output}");
+    }
+}
+
+/// Every walk of a repository's tree leaves the same ignored copy out
+/// ([`carrick::file_finder::git_boundary`]): a workspace with a copy of
+/// itself in a folder git ignores and that holds no `.git`, sorting before
+/// the real package, so the manifest walk's smallest-directory rule would
+/// otherwise resolve the package into the copy.
+#[test]
+fn every_walk_of_the_tree_leaves_the_same_ignored_copy_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"shop","private":true,"workspaces":["**/packages/*"]}"#,
+    );
+    let package = |at: &str, source: &str| {
+        write(
+            root,
+            &format!("{at}/packages/shared/package.json"),
+            r#"{"name":"@shop/shared","main":"./index.ts"}"#,
+        );
+        write(root, &format!("{at}/packages/shared/index.ts"), source);
+    };
+    package(".", "export function price() { return 1; }\n");
+    write(root, "schema.graphql", "type Query { orders: [String] }\n");
+    write(root, ".gitignore", "backup/\n");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "one package"]);
+
+    let copy = "backup";
+    package(copy, "export function price() { return 0; }\n");
+    write(
+        root,
+        &format!("{copy}/packages/retired/package.json"),
+        r#"{"name":"@shop/retired"}"#,
+    );
+    write(
+        root,
+        &format!("{copy}/packages/retired/index.ts"),
+        "export const retired = true;\n",
+    );
+    write(
+        root,
+        &format!("{copy}/schema.graphql"),
+        "type Query { orders: [String] retiredReport: String }\n",
+    );
+
+    let in_the_copy = |path: &Path| path.starts_with(root.join(copy));
+
+    // The source walk, which the pre-flight and the external-call inventory
+    // read their files through.
+    let (files, _) = carrick::file_finder::find_files(
+        root.to_str().unwrap(),
+        &carrick::packages::MANIFEST_SKIP_DIRS,
+    );
+    assert!(
+        !files.is_empty() && !files.iter().any(|file| in_the_copy(file)),
+        "{files:?}"
+    );
+
+    // The manifest walks: which package names are this repository's, and
+    // which directory an import of one resolves to.
+    let names = carrick::packages::collect_internal_package_names(root);
+    assert!(
+        names.contains("@shop/shared") && !names.contains("@shop/retired"),
+        "{names:?}"
+    );
+    assert_eq!(
+        carrick::workspace_resolver::WorkspaceIndex::build(root)
+            .resolve(Path::new("apps/web/checkout.ts"), "@shop/shared"),
+        carrick::workspace_resolver::Resolution::Internal(PathBuf::from(
+            "packages/shared/index.ts"
+        )),
+        "an import of a workspace package resolves into the repository, not into a copy of it"
+    );
+
+    // The workspace-member walk: the copy's packages are no services.
+    let derived = carrick::service_derivation::resolve(root).unwrap();
+    let directories: Vec<Option<&str>> = derived
+        .services
+        .iter()
+        .map(|service| service.directory.as_deref())
+        .collect();
+    assert_eq!(directories, [Some("packages/shared")]);
+
+    // The GraphQL walk: a schema in the copy is not one this service serves.
+    let served: Vec<String> = carrick::graphql::scan_repo(&[root.to_path_buf()], &[], &[])
+        .producers
+        .iter()
+        .map(|operation| operation.key.canonical())
+        .collect();
+    assert_eq!(served, ["graphql|query|orders"]);
+
+    // `graphqlSchemas`: a glob reads below what it names as a walk would, and
+    // what it names is read whole.
+    let declared = |pattern: &str| {
+        carrick::graphql::resolve_declared_schemas(root, &[pattern.to_string()]).files
+    };
+    assert_eq!(declared("**/*.graphql"), [root.join("schema.graphql")]);
+    assert_eq!(
+        declared("backup/**/*.graphql"),
+        [root.join("backup/schema.graphql")]
+    );
+}

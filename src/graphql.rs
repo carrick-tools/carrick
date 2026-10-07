@@ -533,9 +533,14 @@ pub struct DeclaredSchemas {
 /// Resolve a service's `graphqlSchemas` entries against the repository root.
 ///
 /// Each entry is a path relative to the root (where `carrick.json` sits) or a
-/// glob (`apps/api/dist/**/*.graphql`). Nothing is skipped: the setting exists
-/// for the printed schema in a build folder or another app's directory, which
-/// the service's own SDL walk does not read. A matched file is parsed here as
+/// glob (`apps/api/dist/**/*.graphql`). What an entry names, the part before
+/// its first wildcard, is read whole: the setting exists for the printed
+/// schema in a build folder or another app's directory, which the service's
+/// own SDL walk does not read. Below that part a glob stops where a walk
+/// would ([`crate::file_finder::left_out_below`], carrick#1902), so
+/// `**/*.graphql` reads no schema in a folder git ignores or in another
+/// checkout, and `apps/api/dist/**/*.graphql` still reads an ignored `dist`.
+/// A matched file is parsed here as
 /// well, so a file that is not a schema, or defines no Query, Mutation or
 /// Subscription field, is reported rather than quietly adding nothing.
 pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> DeclaredSchemas {
@@ -577,13 +582,25 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
             glob::Pattern::escape(&repo_root.to_string_lossy()),
             entry
         );
+        // What the entry names is the part before its first wildcard, and
+        // that is read whole. Below it, the glob reads what a walk of it
+        // would (carrick#1902): `**/*.graphql` does not reach into a copy
+        // of the repository in an ignored folder or a worktree.
+        let named = repo_root.join(
+            relative
+                .components()
+                .take_while(|part| !part.as_os_str().to_string_lossy().contains(['*', '?', '[']))
+                .collect::<PathBuf>(),
+        );
         // An escaped root joined to an entry that compiled above is a valid
         // pattern, so the error arm cannot be reached.
         let matches: Vec<PathBuf> = glob::glob_with(&pattern, options)
             .map(|paths| {
                 paths
                     .filter_map(Result::ok)
-                    .filter(|path| path.is_file())
+                    .filter(|path| {
+                        path.is_file() && !crate::file_finder::left_out_below(&named, path)
+                    })
                     .collect()
             })
             .unwrap_or_default();
