@@ -2148,6 +2148,13 @@ impl TypeSidecar {
     }
 
     /// Kill the sidecar process and wait for it to be gone.
+    /// End this process now, whatever it is doing: a request it is answering
+    /// fails as a process death. For a pool process no job is left for
+    /// (carrick#1996).
+    pub(crate) fn stop(&self) {
+        self.kill();
+    }
+
     fn kill(&self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();

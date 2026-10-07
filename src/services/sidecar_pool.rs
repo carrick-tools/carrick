@@ -14,17 +14,18 @@
 //!
 //! - [`pool_size`] decides how many processes a pool may run.
 //! - [`SidecarPool::scoped`] borrows the caller's own sidecar, already scoped
-//!   to the service, and starts the others beside it, each given the files
-//!   of the caller's program so that every process holds the same program.
+//!   to the service, and starts the others beside it, each to be given the
+//!   files of the caller's program so that every process holds the same
+//!   program.
 //! - [`SidecarPool::run`] answers a list of jobs, each on whichever process
-//!   is free next. A process whose answer says it is gone takes no more; the
+//!   is free next; a started process joins once it has built the program. A process whose answer says it is gone takes no more; the
 //!   others take the rest, and with none left the rest are not sent.
 //! - [`jobs_by_file`] cuts a list of items into jobs that keep each file's
 //!   items together, in their order.
 
-use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use tracing::{debug, warn};
 
@@ -173,6 +174,15 @@ pub fn resident_mb(sidecar: &TypeSidecar) -> Option<u64> {
 pub struct SidecarPool<'a> {
     base: &'a TypeSidecar,
     extra: Vec<TypeSidecar>,
+    /// The files `base`'s program was built from, in order, that each of
+    /// `extra` is given before its first job.
+    program: Vec<PathBuf>,
+    /// Whether each of `extra` holds `base`'s program: set once, by its first
+    /// [`SidecarPool::run`].
+    holds_program: Vec<OnceLock<bool>>,
+    /// Each of `extra` that was stopped while it built the program, because
+    /// no job was left for it.
+    stopped: Vec<AtomicBool>,
 }
 
 impl<'a> SidecarPool<'a> {
@@ -181,19 +191,19 @@ impl<'a> SidecarPool<'a> {
     /// more started from the same sidecar script with `base`'s scope copied
     /// exactly (root, tsconfig and scan root) and its operation deadline.
     ///
-    /// Each process started is also given `base`'s program before any other
-    /// request: the files `base`'s program was built from, in order
+    /// Each process started is also given `base`'s program before any job:
+    /// the files `base`'s program was built from, in order, read here
     /// ([`TypeSidecar::program_files`], carrick#2027), so that it builds the
     /// same program. Without them a process builds from its tsconfig alone
     /// and adds a file when it is first asked about it, so two processes can
     /// hold their files in different orders, and the compiler orders two
-    /// types of the same name by that order. The processes build at once.
+    /// types of the same name by that order. The copy is made by
+    /// [`SidecarPool::run`], so `base` is not kept waiting for it.
     ///
-    /// A process that does not start, does not become ready, or cannot take
-    /// `base`'s files is left out and logged; when `base`'s files cannot be
-    /// read, none is started. The pool always holds `base`. An error only
-    /// when `base` cannot be scoped, as a caller with no pool would have met
-    /// it.
+    /// A process that does not start or does not become ready is left out
+    /// and logged; when `base`'s files cannot be read, none is started. The
+    /// pool always holds `base`. An error only when `base` cannot be scoped,
+    /// as a caller with no pool would have met it.
     pub fn scoped(
         base: &'a TypeSidecar,
         root: &Path,
@@ -204,71 +214,89 @@ impl<'a> SidecarPool<'a> {
             base.start_init(root, tsconfig);
             base.wait_ready(ready_budget())?;
         }
+        let alone = |base: &'a TypeSidecar| Self {
+            base,
+            extra: Vec::new(),
+            program: Vec::new(),
+            holds_program: Vec::new(),
+            stopped: Vec::new(),
+        };
         if processes <= 1 {
-            return Ok(Self {
-                base,
-                extra: Vec::new(),
-            });
+            return Ok(alone(base));
         }
-        let files = match base.program_files() {
+        let program = match base.program_files() {
             Ok(files) => files,
             Err(e) => {
                 warn!(
                     "No pool process for {} was started: the files of the program the others would copy could not be read: {e}",
                     root.display()
                 );
-                return Ok(Self {
-                    base,
-                    extra: Vec::new(),
-                });
+                return Ok(alone(base));
             }
         };
-        let mut started = Vec::new();
+        let mut extra = Vec::new();
         for _ in 1..processes {
             match base.spawn_scoped_like(root, tsconfig) {
-                Ok(sidecar) => started.push(sidecar),
+                Ok(sidecar) => extra.push(sidecar),
                 Err(e) => {
                     warn!("A pool process for {} did not start: {e}", root.display());
                     break;
                 }
             }
         }
-        let copied: Vec<Result<usize, SidecarError>> = std::thread::scope(|scope| {
-            let copying: Vec<_> = started
-                .iter()
-                .map(|sidecar| scope.spawn(|| sidecar.add_program_files(&files)))
-                .collect();
-            copying
-                .into_iter()
-                .map(|copy| {
-                    copy.join().unwrap_or_else(|_| {
-                        Err(SidecarError::ProgramFilesFailed(
-                            "the copy panicked".to_string(),
-                        ))
-                    })
-                })
-                .collect()
-        });
-        let mut extra = Vec::new();
-        for (sidecar, copy) in started.into_iter().zip(copied) {
-            match copy {
-                Ok(_) => extra.push(sidecar),
-                Err(e) => {
-                    warn!(
-                        "A pool process for {} could not build the program the others hold, and is left out: {e}",
-                        root.display()
-                    );
-                    let _ = sidecar.shutdown();
-                }
-            }
-        }
         debug!(
-            "Sidecar pool for {}: {} process(es), each built from {} file(s)",
+            "Sidecar pool for {}: {} process(es), each to build from {} file(s)",
             root.display(),
             extra.len() + 1,
-            files.len()
+            program.len()
         );
-        Ok(Self { base, extra })
+        let holds_program = extra.iter().map(|_| OnceLock::new()).collect();
+        let stopped = extra.iter().map(|_| AtomicBool::new(false)).collect();
+        Ok(Self {
+            base,
+            extra,
+            program,
+            holds_program,
+            stopped,
+        })
+    }
+
+    /// Whether started process `index` holds `base`'s program, giving it the
+    /// program's files the first time this is asked. A process that cannot
+    /// take them takes no jobs.
+    fn holds_program(&self, index: usize) -> bool {
+        *self.holds_program[index].get_or_init(|| {
+            let sidecar = &self.extra[index];
+            match sidecar.add_program_files(&self.program) {
+                Ok(_) => true,
+                Err(_) if self.stopped[index].load(Ordering::SeqCst) => {
+                    debug!(
+                        "A sidecar pool process (pid {}) was stopped while it built the program: no job was left for it",
+                        sidecar.pid()
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "A sidecar pool process (pid {}) could not build the program the others hold, and takes no jobs: {e}",
+                        sidecar.pid()
+                    );
+                    false
+                }
+            }
+        })
+    }
+
+    /// Stop every started process that is still building `base`'s program,
+    /// once no job is left: it would take none, and the run would otherwise
+    /// wait for its build before it returns.
+    fn stop_the_unready(&self) {
+        for (index, sidecar) in self.extra.iter().enumerate() {
+            if self.holds_program[index].get().is_none() {
+                self.stopped[index].store(true, Ordering::SeqCst);
+                sidecar.stop();
+            }
+        }
     }
 
     /// How many processes the pool runs, `base` included.
@@ -286,6 +314,12 @@ impl<'a> SidecarPool<'a> {
     /// is not one, as its process has already been replaced). That process
     /// takes no more jobs in this run, and the jobs left go to the others.
     /// A job no process was left to take is `None`: it failed, unsent.
+    ///
+    /// `base` starts on the jobs at once. Each other process first builds
+    /// `base`'s program (once per pool) and then joins in, so a process that
+    /// is still building costs the run no time: the jobs it would have taken
+    /// go to a process that is ready, and once no job is left it is stopped
+    /// rather than waited for.
     ///
     /// With one process, the jobs run on `base` in order, and the first
     /// answer that leaves no process leaves the rest unsent.
@@ -312,17 +346,21 @@ impl<'a> SidecarPool<'a> {
         }
         let next = AtomicUsize::new(0);
         let answers: Vec<Mutex<Option<R>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
-        let workers: Vec<&TypeSidecar> = std::iter::once(self.base)
-            .chain(self.extra.iter())
+        let workers: Vec<(Option<usize>, &TypeSidecar)> = std::iter::once((None, self.base))
+            .chain(self.extra.iter().enumerate().map(|(i, s)| (Some(i), s)))
             .collect();
         std::thread::scope(|scope| {
-            for sidecar in workers {
+            for (started, sidecar) in workers {
                 let (next, answers, work, leaves_no_process) =
                     (&next, &answers, &work, &leaves_no_process);
                 scope.spawn(move || {
+                    if started.is_some_and(|index| !self.holds_program(index)) {
+                        return;
+                    }
                     loop {
                         let index = next.fetch_add(1, Ordering::SeqCst);
                         let Some(job) = jobs.get(index) else {
+                            self.stop_the_unready();
                             break;
                         };
                         let answer = work(sidecar, job);
@@ -423,9 +461,9 @@ pub(crate) mod test_support {
     ///
     /// It keeps a program's file list as the sidecar does (carrick#2027):
     /// `list_program_files` answers it, `add_program_files` appends the files
-    /// it does not hold (and refuses a list naming a file with `refuse` in
-    /// its path), and a retype item's file joins it when the item is asked
-    /// about. Every retype answer carries the list as it stood, joined with
+    /// it does not hold (refusing a list naming a file with `refuse` in its
+    /// path, and taking 3 s over one naming a file with `slow` in it), and a
+    /// retype item's file joins it when the item is asked about. Every retype answer carries the list as it stood, joined with
     /// commas, as the message of its one diagnostic.
     pub(crate) fn stand_in(dir: &Path) -> PathBuf {
         let script = dir.join("stand-in-sidecar.cjs");
@@ -445,6 +483,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
   if (request.action === 'add_program_files') {
     if (request.files.some((file) => file.includes('refuse'))) {
       return write({ request_id, status: 'error', errors: ['the stand-in refuses these files'] });
+    }
+    if (request.files.some((file) => file.includes('slow'))) {
+      const until = Date.now() + 3000;
+      while (Date.now() < until) {}
     }
     const held = files.length;
     request.files.forEach(load);
@@ -658,7 +700,7 @@ mod tests {
     /// in their order. The caller was asked about two files in an order no
     /// sort would give, and every job, whichever process took it, is judged
     /// in a program holding those two in that order. A process that cannot
-    /// take the caller's files is left out of the pool.
+    /// take the caller's files takes no job; the caller answers them all.
     #[test]
     fn every_process_of_a_pool_holds_the_callers_program_before_its_first_job() {
         let dir = tempfile::tempdir().unwrap();
@@ -714,10 +756,50 @@ mod tests {
             .retype_check(&[retype_item("/repo/src/refuse.ts", "x-0")])
             .unwrap();
         let pool = SidecarPool::scoped(&refused, &root, None, 3).unwrap();
-        assert_eq!(
-            pool.processes(),
-            1,
-            "a process without the program is left out"
+        let answers = pool.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        let own = refused.pid().to_string();
+        assert!(
+            answers
+                .iter()
+                .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
+            "a process without the program takes no job: {answers:?}"
+        );
+    }
+
+    /// A started process still building the program costs the run no time:
+    /// the caller starts on the jobs at once, answers all four before the
+    /// others' 3 s builds end, and the run returns without waiting for them.
+    /// A process stopped that way takes no job in a later run either.
+    #[test]
+    fn the_caller_does_not_wait_for_a_process_still_building_the_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = base_at(&root);
+        base.retype_check(&[retype_item("/repo/src/slow.ts", "x-0")])
+            .unwrap();
+        let pool = SidecarPool::scoped(&base, &root, None, 3).unwrap();
+        assert_eq!(pool.processes(), 3);
+        let jobs: Vec<String> = (0..4).map(|n| format!("job-{n}")).collect();
+        let started = std::time::Instant::now();
+        let answers = pool.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        let took = started.elapsed();
+        let own = base.pid().to_string();
+        assert!(
+            answers
+                .iter()
+                .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
+            "{answers:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(2500),
+            "the run waited for the builds: {took:?}"
+        );
+        let again = pool.run(&jobs, gone, |sidecar, job| ask(sidecar, job));
+        assert!(
+            again
+                .iter()
+                .all(|answer| matches!(answer, Some(Ok(pid)) if *pid == own)),
+            "{again:?}"
         );
     }
 
