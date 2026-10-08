@@ -56,6 +56,11 @@ export interface SymbolAnchorRequest {
    * `import('./m').Sym[]`. Omitted/0 captures the symbol as-is.
    */
   array_depth?: number;
+  /**
+   * carrick#1841: the symbol names what a consumer receives, so a response
+   * table keyed by status code captures as its 2xx body, not as the table.
+   */
+  consumer_response?: boolean;
 }
 
 /**

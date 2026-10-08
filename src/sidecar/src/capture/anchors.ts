@@ -21,6 +21,7 @@ import {
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
+import { statusTableBody } from '../status-table.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,
@@ -266,6 +267,51 @@ export function resolveAnchor(
 
     const arrayDepth = Math.max(0, request.array_depth ?? 0);
     const declared = checker.getDeclaredTypeOfSymbol(resolvedExport);
+
+    // carrick#1841: a symbol named for what a consumer receives that is a
+    // response table keyed by status code (`{ 200: Item; 404: Problem }`) is
+    // not the body. The body is its 2xx rows, indexed out of the table so the
+    // compiler still emits it (`import('./m').Table[200]`). A table with no
+    // success body abstains, decided. The v1 bundle reads the same rule
+    // (`TypeBundler.statusTableBodyText`).
+    if (request.consumer_response) {
+      const table = statusTableBody(
+        checker,
+        declared,
+        resolvedExport.declarations?.[0] ?? sourceFile
+      );
+      if (table?.kind === 'no_body') {
+        return {
+          request,
+          aliasText: 'unknown',
+          serialization: 'structural_fallback',
+          abstainReason:
+            `'${request.symbol_name}' is a response table keyed by status code with no ` +
+            'success row that states a body, so this consumer states no response contract',
+        };
+      }
+      if (table?.kind === 'body') {
+        const rows = [...new Set(table.entries.map((entry) => entry.key))].map((key) =>
+          /^\d+$/.test(key)
+            ? `import('${spec}').${request.symbol_name}[${key}]`
+            : `import('${spec}').${request.symbol_name}[${JSON.stringify(key)}]`
+        );
+        const body = rows.join(' | ');
+        const unresolvedBody = unresolvedAtAnchor(
+          program,
+          sourceFile,
+          declared,
+          resolvedExport.declarations?.[0] ?? sourceFile,
+          '<0>'.repeat(arrayDepth)
+        );
+        return {
+          request,
+          aliasText: arraySuffix && rows.length > 1 ? `(${body})${arraySuffix}` : `${body}${arraySuffix}`,
+          serialization: 'emitted',
+          ...(unresolvedBody ? { unresolved: unresolvedBody } : {}),
+        };
+      }
+    }
     const unresolved = unresolvedAtAnchor(
       program,
       sourceFile,

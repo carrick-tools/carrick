@@ -9319,6 +9319,7 @@ mod tests {
                 alias: Some(name.into()),
                 array_depth: None,
                 payload_borrow_witness: false,
+                consumer_response: false,
             })
             .collect();
         let mut data = service_data("fixture", Some("api"));
@@ -9528,6 +9529,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     alias: Some(anchor.into()),
                     array_depth: None,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 }],
                 &[],
                 &TypeResolutionResult {

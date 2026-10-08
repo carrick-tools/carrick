@@ -801,6 +801,7 @@ export async function getOrderCount(): Promise<number> {
         alias: Some(alias.to_string()),
         array_depth: None,
         payload_borrow_witness: false,
+        consumer_response: false,
     }];
     // The LLM's compact single-line locator for the multi-line call.
     let infer = vec![InferRequestItem {
@@ -1003,6 +1004,7 @@ notificationRouter.get('/status', async () => {
         alias: Some(alias.to_string()),
         array_depth: None,
         payload_borrow_witness: false,
+        consumer_response: false,
     }];
     // Span locator only — the live data_call carried no expression text.
     let infer = vec![InferRequestItem {
@@ -1179,6 +1181,7 @@ notificationRouter.get('/status', async () => {
         alias: Some(alias.to_string()),
         array_depth: None,
         payload_borrow_witness: false,
+        consumer_response: false,
     }];
     let infer = vec![InferRequestItem {
         file_path: repo.join("src/api.ts").to_string_lossy().to_string(),
@@ -1399,6 +1402,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
             alias: Some(demoted_alias.to_string()),
             array_depth: None,
             payload_borrow_witness: true,
+            consumer_response: false,
         },
         // The same borrowed anchor WITHOUT a witness: must stay explicit.
         SymbolRequest {
@@ -1407,6 +1411,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
             alias: Some(kept_alias.to_string()),
             array_depth: None,
             payload_borrow_witness: false,
+            consumer_response: false,
         },
     ];
     let infer_item = |alias: &str| InferRequestItem {

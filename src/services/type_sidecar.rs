@@ -147,6 +147,13 @@ pub struct SymbolRequest {
     /// never serialized to the sidecar.
     #[serde(skip)]
     pub payload_borrow_witness: bool,
+    /// The symbol names what a consumer receives (carrick#1841). A symbol that
+    /// is a response table keyed by status code (`{ 200: Item }`) then bundles
+    /// and captures as its 2xx body, never as the table. Set only where a
+    /// consumer call's response symbol is requested; the sidecar decides
+    /// whether the symbol is a table.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consumer_response: bool,
 }
 
 /// Request for type inference at a specific location
@@ -214,6 +221,9 @@ pub enum CaptureAnchor {
         /// Use-site `[]` levels around the element symbol (#248/#306).
         #[serde(skip_serializing_if = "Option::is_none")]
         array_depth: Option<u32>,
+        /// Carried from [`SymbolRequest::consumer_response`] (carrick#1841).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        consumer_response: bool,
     },
     /// Addressable handler: `Awaited<ReturnType<typeof import('./m').fn>>`.
     HandlerReturn {
@@ -3178,6 +3188,7 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 alias: req.alias.clone(),
                 array_depth: inf.array_depth,
                 payload_borrow_witness: false,
+                consumer_response: false,
             })
         })
         .collect();
@@ -3272,6 +3283,7 @@ fn arbitrate_stated_body(
             alias: req.alias.clone(),
             array_depth: stated.array_depth,
             payload_borrow_witness: false,
+            consumer_response: false,
         });
     }
     info!(
@@ -3630,6 +3642,7 @@ mod tests {
             alias: Some("UserResponse".to_string()),
             array_depth: None,
             payload_borrow_witness: false,
+            consumer_response: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""symbol_name":"User""#));
@@ -3685,6 +3698,7 @@ mod tests {
                 alias: None,
                 array_depth: None,
                 payload_borrow_witness: false,
+                consumer_response: false,
             }],
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -3703,9 +3717,25 @@ mod tests {
             source_file: "src/types.ts".into(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: Some(2),
+            consumer_response: false,
         };
         let json = serde_json::to_string(&symbol).unwrap();
         assert!(json.contains(r#""kind":"symbol""#));
+        // carrick#1841: the consumer-response marker rides only when set.
+        assert!(!json.contains("consumer_response"), "{json}");
+        let consumer = CaptureAnchor::Symbol {
+            alias: "A".into(),
+            symbol_name: "WidgetResponses".into(),
+            source_file: "src/types.ts".into(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: None,
+            consumer_response: true,
+        };
+        let consumer_json = serde_json::to_string(&consumer).unwrap();
+        assert!(
+            consumer_json.contains(r#""consumer_response":true"#),
+            "{consumer_json}"
+        );
         assert!(json.contains(r#""anchor_origin":"llm-symbol""#));
         assert!(json.contains(r#""array_depth":2"#));
 
@@ -3845,6 +3875,7 @@ mod tests {
                     alias: Some("A".into()),
                     array_depth: Some(1),
                     payload_borrow_witness: true,
+                    consumer_response: false,
                 }],
             },
             SidecarRequest::Infer {
@@ -3886,6 +3917,7 @@ mod tests {
                         source_file: "src/types.ts".into(),
                         anchor_origin: AnchorOrigin::LlmSymbol,
                         array_depth: Some(1),
+                        consumer_response: false,
                     },
                     CaptureAnchor::HandlerReturn {
                         alias: "B".into(),
@@ -4890,6 +4922,7 @@ mod tests {
             alias: Some(alias.to_string()),
             array_depth,
             payload_borrow_witness: false,
+            consumer_response: false,
         }
     }
 
@@ -5565,6 +5598,7 @@ mod tests {
             alias: Some("Endpoint_abc_Response".to_string()),
             array_depth: None,
             payload_borrow_witness: false,
+            consumer_response: false,
         }];
 
         if had_explicit_dts {

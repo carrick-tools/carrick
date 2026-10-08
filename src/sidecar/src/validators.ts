@@ -93,6 +93,9 @@ export const SymbolRequestSchema = z.object({
   // `symbol_failures` entry rather than sinking every other symbol in the
   // batch.
   array_depth: z.number().int().nonnegative().optional(),
+  // carrick#1841: the symbol names a consumer's response (a status-keyed
+  // response table bundles as its 2xx body).
+  consumer_response: z.boolean().optional(),
 });
 
 // ============================================================================
@@ -189,6 +192,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     source_file: z.string().min(1),
     anchor_origin: AnchorOriginSchema,
     array_depth: z.number().int().nonnegative().optional(),
+    consumer_response: z.boolean().optional(),
   }),
   z.object({
     kind: z.literal('handler_return'),

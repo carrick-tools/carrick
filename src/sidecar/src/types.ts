@@ -572,6 +572,12 @@ export interface SymbolRequest {
    * symbol as-is (the HTTP/socket/consumer default).
    */
   array_depth?: number;
+  /**
+   * carrick#1841: the symbol names what a consumer receives. A symbol that is
+   * a response table keyed by status code (`{ 200: Item }`) then bundles as
+   * its 2xx body, never as the table.
+   */
+  consumer_response?: boolean;
 }
 
 /**

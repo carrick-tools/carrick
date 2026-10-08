@@ -3854,24 +3854,30 @@ impl FileOrchestrator {
                 "POST" | "PUT" | "PATCH" | "DELETE" | "ALL" | "UNKNOWN"
             )
         };
-        let mut push_explicit =
-            |symbol_name: String, source_file: String, alias: Option<String>| {
-                let key = format!(
-                    "{}|{}|{}",
-                    source_file,
+        // `consumer_response` marks a symbol named for what a consumer call
+        // receives (carrick#1841): the sidecar reads a response table keyed
+        // by status code as its 2xx body there.
+        let mut push_explicit = |symbol_name: String,
+                                 source_file: String,
+                                 alias: Option<String>,
+                                 consumer_response: bool| {
+            let key = format!(
+                "{}|{}|{}",
+                source_file,
+                symbol_name,
+                alias.as_deref().unwrap_or("")
+            );
+            if explicit_seen.insert(key) {
+                explicit_requests.push(SymbolRequest {
                     symbol_name,
-                    alias.as_deref().unwrap_or("")
-                );
-                if explicit_seen.insert(key) {
-                    explicit_requests.push(SymbolRequest {
-                        symbol_name,
-                        source_file,
-                        alias,
-                        array_depth: None,
-                        payload_borrow_witness: false,
-                    });
-                }
-            };
+                    source_file,
+                    alias,
+                    array_depth: None,
+                    payload_borrow_witness: false,
+                    consumer_response,
+                });
+            }
+        };
         // Source text of each file a span locator addresses, read once and kept
         // for the rest of the collection. Converting a span into the sidecar's
         // numbering needs the bytes between the file's start and the site, and
@@ -4112,6 +4118,7 @@ impl FileOrchestrator {
                             symbol.clone(),
                             Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
+                            false,
                         );
                     } else if endpoint.primary_type_symbol.is_some()
                         && endpoint.type_import_source.is_none()
@@ -4122,6 +4129,7 @@ impl FileOrchestrator {
                                 symbol.clone(),
                                 file_path_absolute.clone(),
                                 Some(response_alias.clone()),
+                                false,
                             );
                         }
                     } else if endpoint.type_import_source.is_some()
@@ -4445,6 +4453,7 @@ impl FileOrchestrator {
                             symbol.clone(),
                             Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
+                            true,
                         );
                     } else if data_call.primary_type_symbol.is_some()
                         && data_call.type_import_source.is_none()
@@ -4455,6 +4464,7 @@ impl FileOrchestrator {
                                 symbol.clone(),
                                 file_path_absolute.clone(),
                                 Some(response_alias.clone()),
+                                true,
                             );
                         }
                     } else if data_call.type_import_source.is_some()
@@ -4594,6 +4604,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth: None,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         };
@@ -4770,6 +4781,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         array_depth: None,
                         payload_borrow_witness,
+                        consumer_response: false,
                     });
                 }
             }
@@ -5059,6 +5071,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth: None,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         }
@@ -5103,6 +5116,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     array_depth,
                     payload_borrow_witness: false,
+                    consumer_response: false,
                 });
             }
         }

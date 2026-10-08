@@ -515,6 +515,7 @@ pub(crate) fn derive_capture_anchors(
             source_file: repo_relative(&request.source_file, repo_root),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: request.array_depth.filter(|d| *d > 0),
+            consumer_response: request.consumer_response,
         });
     }
 
@@ -3690,6 +3691,7 @@ mod tests {
             alias: Some("Endpoint_a_Response".to_string()),
             array_depth: Some(1),
             payload_borrow_witness: false,
+            consumer_response: false,
         }];
         let infer = vec![
             crate::services::type_sidecar::InferRequestItem {
@@ -3800,6 +3802,7 @@ mod tests {
             // schema contract, so this is the state every unjoined alias is in.
             array_depth: None,
             payload_borrow_witness: false,
+            consumer_response: false,
         }
     }
 
@@ -3815,6 +3818,42 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
         }
+    }
+
+    /// carrick#1841: a symbol requested for a consumer's response carries
+    /// that fact onto its capture anchor, where the sidecar reads a response
+    /// table keyed by status code as its 2xx body. Any other symbol anchor
+    /// does not carry it.
+    #[test]
+    fn a_consumer_response_symbol_keeps_its_marker_on_the_capture_anchor() {
+        let explicit = vec![
+            SymbolRequest {
+                consumer_response: true,
+                ..order_explicit("Endpoint_consumer_Response")
+            },
+            order_explicit("Endpoint_producer_Response"),
+        ];
+
+        let anchors = derive_capture_anchors(&explicit, &[], &[], &[], &[], "/repo");
+
+        let markers: Vec<(&str, bool)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Symbol {
+                    alias,
+                    consumer_response,
+                    ..
+                } => (alias.as_str(), *consumer_response),
+                other => panic!("expected symbol anchors, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            vec![
+                ("Endpoint_consumer_Response", true),
+                ("Endpoint_producer_Response", false),
+            ]
+        );
     }
 
     /// A manifest alias no type request reached still has to reach the
@@ -3982,6 +4021,7 @@ mod tests {
             alias: Some(alias.to_string()),
             array_depth: None,
             payload_borrow_witness: false,
+            consumer_response: false,
         }];
         let infer = vec![InferRequestItem {
             file_path: "/repo/src/api.ts".to_string(),
@@ -4576,6 +4616,7 @@ mod tests {
             source_file: "src/routes.ts".to_string(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
+            consumer_response: false,
         }
     }
 
@@ -5918,6 +5959,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             source_file: "src/types/order.ts".to_string(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
+            consumer_response: false,
         }];
         let mut billing_anchors = vec![CaptureAnchor::Symbol {
             alias: consumer_alias.clone(),
@@ -5925,6 +5967,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             source_file: "src/types/billing.ts".to_string(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
+            consumer_response: false,
         }];
         let mut orders_manifest = vec![entry(
             key.clone(),
@@ -7265,6 +7308,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             source_file: "main.ts".to_string(),
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
+            consumer_response: false,
         });
         let backfill = HashMap::from([("Missing".to_string(), "{ count: number }".to_string())]);
         let (dir, artifact) = run_capture(
@@ -7344,6 +7388,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 source_file: "src/http/routes.ts".to_string(),
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
+                consumer_response: false,
             },
             CaptureAnchor::Symbol {
                 alias: "Pub_OrderPlacedEvent".to_string(),
@@ -7351,6 +7396,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 source_file: "src/types/events.ts".to_string(),
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
+                consumer_response: false,
             },
         ];
         // The scanner-side literal text for the operation (what v1 resolution
@@ -7419,6 +7465,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 source_file: "lib/api.ts".to_string(),
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
+                consumer_response: false,
             }],
             &HashMap::new(),
             None,
