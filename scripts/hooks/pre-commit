@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Carrick Pre-Commit Hook
-# Runs formatting checks, linter, and tests before allowing a commit.
+# Runs the formatting check before allowing a commit; clippy and tests run in CI.
 #
 # This file is the tracked source. `scripts/install-hooks.sh` copies it into
 # the repository's hooks directory, which every worktree of the clone shares.
@@ -57,86 +57,17 @@ fi
 
 echo "✅ Code formatting looks good!"
 
-# Run clippy
-echo ""
-echo "Running clippy linter..."
-echo ""
 
-# Not captured to a file (carrick#740). A fixed path under /tmp is one file
-# shared by every checkout of this repo, so two hooks running at once delete
-# each other's copy mid-run and the second commit fails on a missing file
-# rather than on a failing check. Nothing ever read this one back.
-if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "❌ Clippy warnings found! Commit blocked."
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Fix the clippy warnings and try again."
-    echo ""
-    exit 1
-fi
-
-echo "✅ Clippy checks passed!"
-
-# Build the type sidecar first: several integration tests spawn
-# src/sidecar/dist and either fail against a stale build or skip silently
-# when there is none, so a green run on an old dist proves nothing.
-#
-# A fresh `git worktree add` has no src/sidecar/node_modules, and the build
-# died there on `tsc: command not found`, which is why agents committed around
-# this hook (carrick#1363). npm writes node_modules/.package-lock.json on every
-# install: no such file means the checkout was never installed, and one older
-# than package-lock.json means the dependencies changed since.
-if [ -f src/sidecar/package.json ]; then
-    INSTALL_MARKER=src/sidecar/node_modules/.package-lock.json
-    if [ ! -f "$INSTALL_MARKER" ] || [ src/sidecar/package-lock.json -nt "$INSTALL_MARKER" ]; then
-        echo ""
-        echo "Installing sidecar dependencies (npm ci in src/sidecar): this checkout has none, or its lockfile changed..."
-        if ! (cd src/sidecar && npm ci --no-audit --no-fund); then
-            echo ""
-            echo "❌ Sidecar install failed. Run: cd src/sidecar && npm ci"
-            exit 1
-        fi
-    fi
-    echo ""
-    echo "Building type sidecar..."
-    if ! (cd src/sidecar && npm run build --silent); then
-        echo ""
-        echo "❌ Sidecar build failed. Run: cd src/sidecar && npm ci && npm run build"
-        exit 1
-    fi
-    echo "✅ Sidecar built"
-fi
-
-# Run Rust tests
-echo ""
-echo "Running Rust test suite..."
-echo ""
-
-# Not captured either, and for the same reason: the only thing ever read back
-# out of this capture was a count nothing printed.
-if cargo test --quiet 2>&1; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "✅ Rust tests passed!"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-else
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "❌ Tests failed! Commit blocked."
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Fix the failing tests and try again."
-    echo ""
-
-    exit 1
-fi
+# Clippy, the sidecar build and the Rust test suite run in CI, not here
+# (David, 2026-10-08). Each one is a full compile on every commit, and with
+# several agents committing in parallel worktrees they held the machine at a
+# load of 30 to 44. CI's Linting, Build and Rust test jobs run them on every PR
+# and again in the merge queue. Run the tests a change affects before you
+# push: `cargo test --test <name>`, or `npm test` in src/sidecar.
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ All tests passed!"
+echo "✅ Formatting checked. Clippy and tests run in CI."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
