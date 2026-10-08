@@ -22,7 +22,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { installedPackageDirectory } from '../installed-package-directory.js';
+import { installedPackageDirectory } from './installed-package-directory.js';
 import { isPublishedSemver } from './lockfile.js';
 
 /** The stub file the check reads to pin transitive edges. */

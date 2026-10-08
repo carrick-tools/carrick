@@ -1,9 +1,10 @@
 /**
- * Where an installed package sits on disk, by path alone. Shared by the
- * library-claims reader and capture's resolution walk, so that both agree on
- * what counts as installed.
+ * Where an installed package sits on disk, by path alone, for capture's
+ * resolution walk. It mirrors `DeclarationReader.installedPackage` in
+ * library-claims.ts: the capture seam (pinned decision 11a) lets neither side
+ * import the other, so a change to what counts as installed changes both.
  *
- * Seam: node builtins only (the surface lister bundles this file).
+ * Seam: node builtins only.
  */
 
 import * as path from 'node:path';

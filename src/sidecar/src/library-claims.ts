@@ -57,7 +57,6 @@ import type {
   SurfaceReceiver,
   SurfaceSignature,
 } from './types.js';
-import { installedPackageDirectory } from './installed-package-directory.js';
 
 /** The methods a `verb` claim may name, and a method key may accept. */
 const HTTP_METHODS: ReadonlySet<string> = new Set([
@@ -2817,18 +2816,27 @@ class DeclarationReader {
   }
 
   /**
-   * The installed package a file belongs to: the package directory
-   * `installedPackageDirectory` finds from the service root, holding a
-   * package.json.
+   * The installed package a file belongs to. Its path, taken relative to the
+   * service root, has a package directory after its last `node_modules`
+   * segment (two segments for a scope), holding a package.json. A service
+   * source file in a directory that happens to be named `node_modules`, or a
+   * repository checked out under a `node_modules` ancestor, is not installed.
+   * An install hoisted above the service root (`../../node_modules/pkg`) and
+   * a pnpm store (`node_modules/.pnpm/pkg@1/node_modules/pkg`) are.
+   * Mirrored by `installedPackageDirectory` in capture/, which the capture
+   * seam keeps from being shared.
    */
   private installedPackage(fileName: string): InstalledPackage | undefined {
-    const installed = installedPackageDirectory(this.root, this.realpath(fileName));
-    if (installed === undefined) return undefined;
-    const { directory, name } = installed;
+    const segments = path.relative(this.root, this.realpath(fileName)).split(path.sep);
+    const last = segments.lastIndexOf('node_modules');
+    if (last < 0) return undefined;
+    const width = segments[last + 1]?.startsWith('@') ? 2 : 1;
+    const nameSegments = segments.slice(last + 1, last + 1 + width);
     // No package.json there (a file directly under node_modules included) means no package.
+    const directory = path.resolve(this.root, ...segments.slice(0, last + 1 + width));
     let known = this.packageDirectories.get(directory);
     if (known === undefined) {
-      known = readInstalledPackage(this.host, directory, name);
+      known = readInstalledPackage(this.host, directory, nameSegments.join('/'));
       this.packageDirectories.set(directory, known);
     }
     return known ?? undefined;
