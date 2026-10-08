@@ -10388,6 +10388,12 @@ impl FileOrchestrator {
         // Sixth pass: resolve full paths for endpoints
         self.resolve_endpoint_paths(&mut graph, &registration_literals);
 
+        // One row per operation (carrick#2094): a route the service documents
+        // as data and also registers is one operation. Once every full path
+        // is final, so the documented path and the handler's composed path
+        // can agree.
+        Self::fold_documented_operations(&mut graph);
+
         // Evidence classification (#379): an "endpoint" whose exact source
         // site was ALSO extracted as a data call is a client call expression
         // the extraction double-classified (an integration/SDK operation
@@ -10487,18 +10493,13 @@ impl FileOrchestrator {
         if unread_scopes.is_empty() {
             return corroborated;
         }
-        let documented: HashSet<(String, String)> = graph
+        let documented: Vec<(&str, &str)> = graph
             .endpoints
             .iter()
             .filter(|endpoint| {
                 endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
             })
-            .map(|endpoint| {
-                (
-                    endpoint.method.clone(),
-                    Self::placeholder_normalised(&endpoint.path),
-                )
-            })
+            .map(|endpoint| (endpoint.method.as_str(), endpoint.path.as_str()))
             .collect();
         if documented.is_empty() {
             return corroborated;
@@ -10535,10 +10536,11 @@ impl FileOrchestrator {
                 }
                 let documents = |chains: &Vec<String>| {
                     chains.iter().any(|chain| {
-                        documented.contains(&(
-                            endpoint.method.clone(),
-                            Self::placeholder_normalised(&Self::join_paths(chain, &endpoint.path)),
-                        ))
+                        let full_path = Self::join_paths(chain, &endpoint.path);
+                        documented.iter().any(|(method, path)| {
+                            *method == endpoint.method
+                                && MountGraph::paths_equal_modulo_param_names(path, &full_path)
+                        })
                     })
                 };
                 if documents(without) {
@@ -10567,20 +10569,78 @@ impl FileOrchestrator {
         corroborated
     }
 
-    /// A path with every placeholder segment written one way, so `{id}` and
-    /// `:id` compare equal.
-    fn placeholder_normalised(path: &str) -> String {
-        path.trim_end_matches('/')
-            .split('/')
-            .map(|segment| {
-                if carrick_match::is_param_segment(segment) {
-                    ":"
-                } else {
-                    segment
+    /// Fold each documentation row into the handler row that serves the same
+    /// operation (carrick#2094). Returns how many rows were folded.
+    ///
+    /// A route descriptor that names no handler (`{ method, path, summary,
+    /// responses }` documentation data) states an operation's method and
+    /// absolute path as a fact, and nothing to type it by. The handler row the
+    /// registration states carries the type anchors. Two rows for one
+    /// operation make every consumer pair twice, once with the untyped one, so
+    /// the descriptor folds into its partner: the single other row of this
+    /// service with the same method, the same full path (placeholders written
+    /// either way) and the same dispatch case. The partner keeps its own site,
+    /// which is what its types are read at, and takes the descriptor's
+    /// `descriptor_route` label: the method and path are the descriptor's fact.
+    ///
+    /// With no partner the descriptor stays, as the only row of its
+    /// operation. With several, every row stays: which one the documentation
+    /// describes is not something the paths can say.
+    fn fold_documented_operations(graph: &mut MountGraph) -> usize {
+        let documentation = |endpoint: &ResolvedEndpoint| {
+            endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
+                && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
+        };
+        let mut folded_into = vec![false; graph.endpoints.len()];
+        let mut drop = vec![false; graph.endpoints.len()];
+        for (index, descriptor) in graph.endpoints.iter().enumerate() {
+            if !documentation(descriptor) {
+                continue;
+            }
+            let partners: Vec<usize> = graph
+                .endpoints
+                .iter()
+                .enumerate()
+                .filter(|(other, endpoint)| {
+                    *other != index
+                        && endpoint.resolution_source != Some(ResolutionSource::DescriptorRoute)
+                        && endpoint.method == descriptor.method
+                        && MountGraph::paths_equal_modulo_param_names(
+                            &endpoint.full_path,
+                            &descriptor.full_path,
+                        )
+                        && endpoint.dispatch == descriptor.dispatch
+                })
+                .map(|(other, _)| other)
+                .collect();
+            match partners.as_slice() {
+                [] => {}
+                [partner] if !folded_into[*partner] => {
+                    folded_into[*partner] = true;
+                    drop[index] = true;
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("/")
+                _ => debug!(
+                    "Documented operation {} {} at {} not folded: {} rows of this service \
+                     serve it",
+                    descriptor.method,
+                    descriptor.full_path,
+                    descriptor.file_location,
+                    partners.len()
+                ),
+            }
+        }
+        for (endpoint, folded) in graph.endpoints.iter_mut().zip(&folded_into) {
+            if *folded {
+                endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
+            }
+        }
+        let folded = drop.iter().filter(|dropped| **dropped).count();
+        if folded > 0 {
+            debug!("Documented operations folded into the handler row serving them: {folded}");
+        }
+        let mut keep = drop.iter().map(|dropped| !dropped);
+        graph.endpoints.retain(|_| keep.next().unwrap_or(true));
+        folded
     }
 
     fn normalize_import_source(source: &str) -> String {

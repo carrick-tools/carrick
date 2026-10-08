@@ -584,6 +584,96 @@ async fn a_descriptor_documenting_the_unprefixed_path_refuses_the_candidate() {
     assert_eq!(result.stats.mount_prefixes_corroborated, 0);
 }
 
+// --- one row per operation (carrick#2094) ---------------------------------
+//
+// Once the scope's prefix is read, the handler and the documentation state
+// one operation. It is one row: the handler's site, which its types are read
+// at, under the documentation's fact label.
+
+/// The rows serving `GET /api/v1/items/<param>`, as (file, label).
+fn item_rows(result: &FileCentricAnalysisResult) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = result
+        .mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .filter(|endpoint| {
+            endpoint.method == "GET"
+                && endpoint
+                    .full_path
+                    .strip_prefix("/api/v1/items/")
+                    .is_some_and(|rest| !rest.contains('/'))
+        })
+        .map(|endpoint| {
+            let file = endpoint
+                .file_location
+                .rsplit_once("/src/")
+                .map(|(_, file)| file.split(':').next().unwrap_or(file).to_string())
+                .unwrap_or_default();
+            (file, format!("{:?}", endpoint.resolution_source))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+#[serial]
+async fn a_documented_handler_is_one_operation() {
+    let result = analyze(vec![
+        unstated("src/documented.ts"),
+        item_detail(),
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(
+        item_rows(&result),
+        vec![(
+            "item-detail.ts".to_string(),
+            "Some(DescriptorRoute)".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_documented_route_with_no_handler_stays_untyped() {
+    let result = analyze(vec![docs("src/docs.ts")]).await;
+    assert_eq!(
+        item_rows(&result),
+        vec![("docs.ts".to_string(), "Some(DescriptorRoute)".to_string())]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn two_handlers_for_one_documented_path_are_not_merged() {
+    let twin = answer(
+        "src/twin.ts",
+        &[],
+        &[(
+            "app.get('/api/v1/items/:id'",
+            "app",
+            "GET",
+            "/api/v1/items/:id",
+        )],
+    );
+    let result = analyze(vec![
+        unstated("src/documented.ts"),
+        item_detail(),
+        twin,
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(
+        item_rows(&result),
+        vec![
+            ("docs.ts".to_string(), "Some(DescriptorRoute)".to_string()),
+            ("item-detail.ts".to_string(), "Some(Model)".to_string()),
+            ("twin.ts".to_string(), "Some(Model)".to_string()),
+        ]
+    );
+}
+
 #[test]
 fn the_fixture_root_is_on_disk() {
     assert!(Path::new(&root()).join("src/nullish.ts").is_file());

@@ -608,7 +608,7 @@ impl MountGraph {
     /// ignored: same segment count, and each segment pair is literally equal
     /// or a param on BOTH sides (`:id` vs `:param`). Trailing `?` optional
     /// markers are ignored for the comparison.
-    fn paths_equal_modulo_param_names(a: &str, b: &str) -> bool {
+    pub(crate) fn paths_equal_modulo_param_names(a: &str, b: &str) -> bool {
         let a_segments: Vec<&str> = a.split('/').collect();
         let b_segments: Vec<&str> = b.split('/').collect();
         a_segments.len() == b_segments.len()
