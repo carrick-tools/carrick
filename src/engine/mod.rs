@@ -6606,7 +6606,7 @@ const IGNORED_PATHS: &str = "path(s) git ignores";
 /// counted by the folder that holds them, because that is the shape the case
 /// takes: a tool keeps its worktrees side by side in one folder, and eight
 /// paths that differ in their last segment say less than "8 in" that folder.
-fn folders_left_out(repo_path: &str, checkouts: &[PathBuf], what: &str) -> Option<String> {
+fn folders_left_out(repo_path: &str, checkouts: &[PathBuf], what: &'static str) -> Option<LeftOut> {
     if checkouts.is_empty() {
         return None;
     }
@@ -6653,23 +6653,58 @@ fn folders_left_out(repo_path: &str, checkouts: &[PathBuf], what: &str) -> Optio
         .skip(MAX_NAMED_CHECKOUTS)
         .map(|(_, count)| count)
         .sum();
-    Some(format!(
-        "{} {what}: {}{}",
-        relative.len(),
-        named.join(", "),
-        if rest > 0 {
-            format!(" and {rest} more")
-        } else {
-            String::new()
-        }
-    ))
+    Some(LeftOut {
+        count: relative.len(),
+        what,
+        listing: format!(
+            "{}{}",
+            named.join(", "),
+            if rest > 0 {
+                format!(" and {rest} more")
+            } else {
+                String::new()
+            }
+        ),
+    })
+}
+
+/// One kind of folder a walk left out: how many, what they are, and the
+/// paths named (with the "and N more" tail when the list is capped).
+struct LeftOut {
+    count: usize,
+    what: &'static str,
+    listing: String,
+}
+
+impl LeftOut {
+    /// The clause the zero-files error joins: `2 path(s) git ignores: a, b`.
+    fn summary(&self) -> String {
+        format!("{} {}: {}", self.count, self.what, self.listing)
+    }
 }
 
 /// What a scan prints when a service's walk left folders out: how many,
 /// which, and how to scan one. A file that is missing from the index because
 /// of where it sits is never a silent decision.
-fn left_out_line(left_out: &str) -> String {
-    format!("Left out {left_out}. Name one under \"include\" in carrick.json to scan it.")
+fn left_out_line(left_out: &LeftOut) -> String {
+    if left_out.what == CHECKOUTS {
+        // Copy approved by David 2026-10-08.
+        return if left_out.count == 1 {
+            format!(
+                "Skipped 1 folder that is its own git repository: {}. To scan it, add it under \"include\" in carrick.json.",
+                left_out.listing
+            )
+        } else {
+            format!(
+                "Skipped {} folders that are their own git repositories: {}. To scan one, add it under \"include\" in carrick.json.",
+                left_out.count, left_out.listing
+            )
+        };
+    }
+    format!(
+        "Left out {}. Name one under \"include\" in carrick.json to scan it.",
+        left_out.summary()
+    )
 }
 
 /// What a scan prints when the service states `exclude` patterns
@@ -6759,7 +6794,7 @@ fn discover_files_and_symbols(
         service.directory.as_deref().unwrap_or("the repo root"),
         walk_started.elapsed().as_secs_f64()
     );
-    let left_out: Vec<String> = [
+    let left_out: Vec<LeftOut> = [
         folders_left_out(repo_path, &walk.checkouts_left_out, CHECKOUTS),
         folders_left_out(repo_path, &walk.dot_folders_left_out, UNTRACKED_DOT_FOLDERS),
         folders_left_out(repo_path, &walk.ignored_left_out, IGNORED_PATHS),
@@ -6788,7 +6823,11 @@ fn discover_files_and_symbols(
         } else {
             format!(
                 "Left out {}. Scan one of them, or name it under \"include\" in carrick.json.",
-                left_out.join("; ")
+                left_out
+                    .iter()
+                    .map(LeftOut::summary)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         };
         return Err(format!(
@@ -9051,8 +9090,16 @@ mod tests {
         assert_eq!(
             line(&["/work/shop/./vendor/clone"]).as_deref(),
             Some(
-                "Left out 1 folder(s) with their own .git: vendor/clone. Name one under \
-                 \"include\" in carrick.json to scan it."
+                "Skipped 1 folder that is its own git repository: vendor/clone. To scan it, add \
+                 it under \"include\" in carrick.json."
+            )
+        );
+
+        assert_eq!(
+            line(&["/work/shop/a", "/work/shop/b"]).as_deref(),
+            Some(
+                "Skipped 2 folders that are their own git repositories: a, b. To scan one, \
+                 add it under \"include\" in carrick.json."
             )
         );
 
@@ -9065,11 +9112,11 @@ mod tests {
         let counted = line(&worktrees).expect("a line");
         assert_eq!(
             counted,
-            "Left out 9 folder(s) with their own .git: 8 in .agent/worktrees, vendor/clone. Name \
-             one under \"include\" in carrick.json to scan it."
+            "Skipped 9 folders that are their own git repositories: 8 in .agent/worktrees, \
+             vendor/clone. To scan one, add it under \"include\" in carrick.json."
         );
         assert!(
-            counted.split_whitespace().count() <= 22,
+            counted.split_whitespace().count() <= 28,
             "the count, the folders and what to do, and nothing about what the copies cost: \
              {counted}"
         );
@@ -9086,7 +9133,7 @@ mod tests {
         .expect("a line");
         assert!(
             scattered.starts_with(
-                "Left out 6 folder(s) with their own .git: top, a/one, b/two and 3 more."
+                "Skipped 6 folders that are their own git repositories: top, a/one, b/two and 3 more."
             ),
             "{scattered}"
         );

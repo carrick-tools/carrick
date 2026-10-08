@@ -361,7 +361,7 @@ fn a_declared_submodule_is_read_and_an_undeclared_clone_is_read_when_named() {
     assert!(
         scan_before
             .output
-            .contains("Left out 1 folder(s) with their own .git: scratch/clone."),
+            .contains("Skipped 1 folder that is its own git repository: scratch/clone."),
         "{}",
         scan_before.output
     );
@@ -708,8 +708,8 @@ fn a_root_service_is_scanned_once_beside_an_ignored_copy_and_a_nested_worktree()
         "the root schema is read:\n{output}"
     );
     for line in [
-        "Left out 1 folder(s) with their own .git: trees/task. Name one under \"include\" in \
-         carrick.json to scan it.",
+        "Skipped 1 folder that is its own git repository: trees/task. To scan it, add it under \
+         \"include\" in carrick.json.",
         "Left out 2 path(s) git ignores: backup, src/scratch.local.ts. Name one under \
          \"include\" in carrick.json to scan it.",
         "Left out 1 file(s) matching the 1 exclude pattern(s) in carrick.json.",
