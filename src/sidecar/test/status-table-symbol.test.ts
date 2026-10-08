@@ -72,6 +72,15 @@ describe('carrick#1841: a status-table symbol named for a consumer response', ()
           { symbol_name: 'DeleteItemResponses', source_file: TYPES, alias: 'Delete_Response', consumer_response: true },
           { symbol_name: 'GetItemResponses', source_file: TYPES, alias: 'Producer_Table' },
           { symbol_name: 'Item', source_file: TYPES, alias: 'Item_Response', consumer_response: true },
+          // carrick#1967: a depth the join copied from the call's list result.
+          {
+            symbol_name: 'ListItemsResponses',
+            source_file: TYPES,
+            alias: 'List_Depth_Response',
+            consumer_response: true,
+            array_depth: 1,
+          },
+          { symbol_name: 'Item', source_file: TYPES, alias: 'Item_List_Response', consumer_response: true, array_depth: 1 },
         ],
       });
       assert.strictEqual(bundle.status, 'success', JSON.stringify(bundle.errors));
@@ -97,6 +106,17 @@ describe('carrick#1841: a status-table symbol named for a consumer response', ()
       assert.strictEqual(aliasLine(dts, 'Delete_Response'), 'export type Delete_Response = unknown;');
     });
 
+    it('carrick#1967: a depth read off the body is already in the success row', () => {
+      assert.strictEqual(
+        aliasLine(dts, 'List_Depth_Response'),
+        'export type List_Depth_Response = { id: string; name: string; }[];'
+      );
+      assert.strictEqual(
+        aliasLine(dts, 'Item_List_Response'),
+        'export type Item_List_Response = { id: string; name: string; }[];'
+      );
+    });
+
     it('control: the table is bundled as written where no consumer response is marked', () => {
       assert.match(aliasLine(dts, 'Producer_Table'), /\b200:/);
     });
@@ -111,13 +131,19 @@ describe('carrick#1841: a status-table symbol named for a consumer response', ()
     let surface: string;
 
     before(() => {
-      const anchor = (alias: string, symbol_name: string, consumer_response?: boolean) => ({
+      const anchor = (
+        alias: string,
+        symbol_name: string,
+        consumer_response?: boolean,
+        array_depth?: number
+      ) => ({
         kind: 'symbol' as const,
         alias,
         symbol_name,
         source_file: TYPES,
         anchor_origin: 'llm-symbol' as const,
         ...(consumer_response ? { consumer_response } : {}),
+        ...(array_depth ? { array_depth } : {}),
       });
       result = captureStub({
         repoRoot: repoDir,
@@ -127,6 +153,8 @@ describe('carrick#1841: a status-table symbol named for a consumer response', ()
           anchor('Get_Response', 'GetItemResponses', true),
           anchor('Delete_Response', 'DeleteItemResponses', true),
           anchor('Producer_Table', 'GetItemResponses'),
+          anchor('List_Depth_Response', 'ListItemsResponses', true, 1),
+          anchor('Item_List_Response', 'Item', true, 1),
         ],
       });
       assert.strictEqual(result.success, true, JSON.stringify(result.errors));
@@ -151,6 +179,12 @@ describe('carrick#1841: a status-table symbol named for a consumer response', ()
       const r = record('Delete_Response');
       assert.strictEqual(r.capture_failure_reason, undefined, 'an abstain is not a demotion');
       assert.match(r.self_check_detail ?? '', /response table keyed by status code/);
+    });
+
+    it('carrick#1967: a depth read off the body is already in the success row', () => {
+      assert.match(aliasLine(surface, 'List_Depth_Response'), /\.ListItemsResponses\[200\];$/);
+      assert.strictEqual(record('List_Depth_Response').self_check, 'ok');
+      assert.match(aliasLine(surface, 'Item_List_Response'), /\.Item\[\];$/);
     });
 
     it('control: an unmarked table anchor captures the symbol as written', () => {

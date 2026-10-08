@@ -380,14 +380,11 @@ export class TypeBundler {
   ): { definition: string; typeString: string } | null {
     const tableBody = symbol.consumer_response ? this.statusTableBodyText(symbol) : undefined;
     if (tableBody !== undefined) {
+      // The success row IS the body, list or not. A depth on this request was
+      // read off the body (carrick#1967) and is already in the row, so it is
+      // not applied again; the capture's symbol anchor reads the same rule.
       const alias = symbol.alias || symbol.symbol_name;
-      const depth = symbol.array_depth ?? 0;
-      if (depth > MAX_ARRAY_DEPTH) return null;
-      const typeString =
-        depth > 0 && tableBody !== 'unknown'
-          ? `(${tableBody})${'[]'.repeat(depth)}`
-          : tableBody;
-      return { definition: `export type ${alias} = ${typeString};`, typeString };
+      return { definition: `export type ${alias} = ${tableBody};`, typeString: tableBody };
     }
     const base = this.extractTypeDefinitionBase(symbol);
     if (!base) return null;

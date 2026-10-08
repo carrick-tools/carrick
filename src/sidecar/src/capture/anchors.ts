@@ -297,16 +297,19 @@ export function resolveAnchor(
             : `import('${spec}').${request.symbol_name}[${JSON.stringify(key)}]`
         );
         const body = rows.join(' | ');
+        // The success row IS the body, list or not. A depth on this request
+        // was read off the body (carrick#1967) and is already in the row, so
+        // it is not applied again.
         const unresolvedBody = unresolvedAtAnchor(
           program,
           sourceFile,
           declared,
           resolvedExport.declarations?.[0] ?? sourceFile,
-          '<0>'.repeat(arrayDepth)
+          ''
         );
         return {
           request,
-          aliasText: arraySuffix && rows.length > 1 ? `(${body})${arraySuffix}` : `${body}${arraySuffix}`,
+          aliasText: body,
           serialization: 'emitted',
           ...(unresolvedBody ? { unresolved: unresolvedBody } : {}),
         };

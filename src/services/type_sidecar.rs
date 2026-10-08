@@ -1159,7 +1159,7 @@ pub struct InferredType {
     /// `resolve_all_types` copies this onto an explicit `SymbolRequest` for the
     /// same alias/symbol so the bundle keeps the use-site's array-ness instead
     /// of the bare element. Absent when 0. Reported without an anchor symbol
-    /// too (carrick#1967): at a handler's send the join copies it onto the
+    /// too (carrick#1967): on a response read the join copies it onto the
     /// model's symbol, which names the element the compiler printed
     /// structurally. On a `call_result` it describes the call's result, which
     /// is not always what `type_string` prints (a def-use walk's terminal).
@@ -3317,22 +3317,23 @@ fn arbitrate_stated_body(
 ///
 /// An element with no symbol of its own (carrick#1967) has no name to
 /// disagree with: a list of object literals, or of an alias the compiler
-/// prints structurally. At a handler's send (`response_body`) the depth is
-/// the compiler's reading of the body the handler sends, and the model's
-/// symbol names its element by schema contract, so the depth is copied.
-/// Nowhere else: a consumer's symbol may be a status table whose success row
-/// already is the list (the capture indexes the row out, so a copied depth
-/// would wrap it twice), and request bodies and pub/sub payloads can be read
-/// at a value other than the payload (a wrapper's argument, a batch
-/// envelope).
+/// prints structurally. On a response read the depth is the compiler's
+/// reading of the body: what a handler sends (`response_body`), or the
+/// result of the call a consumer makes (`call_result`, whose anchor is the
+/// call's result even where its text is a later read). The model's symbol
+/// names the element by schema contract, so the depth is copied. A status
+/// table the model named instead holds the list in its success row, and the
+/// bundle and the capture read that row without a depth. Not for request
+/// bodies or pub/sub payloads, which can be read at a value other than the
+/// payload (a wrapper's argument, a batch envelope).
 pub(crate) fn apply_inferred_array_depth(
     explicit: &[SymbolRequest],
     inferred: &[InferredType],
 ) -> Vec<SymbolRequest> {
     // First anchor-carrying inference per alias wins, mirroring the
     // `or_insert` join `enrich_manifest_with_type_resolution` uses. A named
-    // element decides; a send's symbol-less one is read only where none is
-    // named.
+    // element decides; a response read's symbol-less one is read only where
+    // none is named.
     let mut depth_by_alias: HashMap<&str, (&str, u32)> = HashMap::new();
     let mut unnamed_depth_by_alias: HashMap<&str, u32> = HashMap::new();
     for inf in inferred {
@@ -3345,7 +3346,11 @@ pub(crate) fn apply_inferred_array_depth(
                     .entry(inf.alias.as_str())
                     .or_insert((symbol, depth));
             }
-            None if inf.infer_kind == InferKind::ResponseBody => {
+            None if matches!(
+                inf.infer_kind,
+                InferKind::ResponseBody | InferKind::CallResult
+            ) =>
+            {
                 unnamed_depth_by_alias
                     .entry(inf.alias.as_str())
                     .or_insert(depth);
@@ -5023,14 +5028,14 @@ mod tests {
         assert_eq!(adjusted[0].array_depth, None);
     }
 
-    /// carrick#1967: a handler sends a list whose element has no symbol of its
-    /// own (`rows.map(r => ({ ... }))`, or an alias the compiler prints
-    /// structurally). The model names the element; the send's depth is copied
-    /// onto it. Nothing else reads a symbol-less depth: a consumer's read (its
-    /// symbol may be a status table already holding the list), a request body
-    /// or a pub/sub payload. A named element at the same alias still decides.
+    /// carrick#1967: a handler sends, or a consumer's call returns, a list
+    /// whose element has no symbol of its own (`rows.map(r => ({ ... }))`, or
+    /// an alias the compiler prints structurally). The model names the
+    /// element; the depth is copied onto it. A request body or a pub/sub
+    /// payload's symbol-less depth is not read. A named element at the same
+    /// alias still decides.
     #[test]
-    fn inferred_array_depth_copies_a_sends_unnamed_list() {
+    fn inferred_array_depth_copies_a_response_reads_unnamed_list() {
         let read = |kind: InferKind, symbol: Option<&str>| InferredType {
             infer_kind: kind,
             ..inferred("Alias_Response", symbol, Some(1))
@@ -5047,8 +5052,11 @@ mod tests {
             depth_after(vec![read(InferKind::ResponseBody, None)]),
             Some(1)
         );
+        assert_eq!(
+            depth_after(vec![read(InferKind::CallResult, None)]),
+            Some(1)
+        );
         for kind in [
-            InferKind::CallResult,
             InferKind::RequestBody,
             InferKind::FunctionParam,
             InferKind::Expression,
