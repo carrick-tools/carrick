@@ -110,14 +110,11 @@ fn sheet_lists_the_extensions_the_file_walk_takes() {
         .map(String::from)
         .collect();
     let src = read("src/file_finder.rs");
-    let at = src
-        .find("pub fn is_scanned_source")
-        .expect("is_scanned_source");
-    let walk = &src[at..];
-    let line = walk
+    let line = src
         .lines()
-        .find(|l| l.contains("\" | \""))
-        .expect("extension match arm in is_scanned_source");
+        .find(|l| l.starts_with("pub const SOURCE_EXTENSIONS"))
+        .expect("SOURCE_EXTENSIONS in src/file_finder.rs");
+    // The array's type names its length (`[&str; 8]`), which holds no quote.
     let actual: BTreeSet<String> = line
         .split('"')
         .skip(1)

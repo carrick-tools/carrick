@@ -39,13 +39,13 @@ subscriber is the producer, the publisher is the consumer.
 
 <!-- capability:js-read: yes -->
 
-- The scanner opens files with these extensions only (`is_scanned_source`,
-  `src/file_finder.rs:136`). Test paths are skipped.
+- The scanner opens files with these extensions only (`SOURCE_EXTENSIONS`,
+  `src/file_finder.rs:47`). Test paths are skipped.
 
-<!-- capability:scanned-extensions: js jsx ts tsx -->
+<!-- capability:scanned-extensions: ts tsx mts cts js jsx mjs cjs -->
 
-  So `.mjs`, `.cjs`, `.mts` and `.cts` files are never scanned (carrick#904,
-  open). The workspace resolver takes the same four (`src/workspace_resolver.rs:45`).
+  `.mts`/`.cts` parse as TypeScript; `.mjs`/`.cjs` parse as `.js` does. The
+  workspace resolver and the socket, event and GraphQL passes take the same list.
 
 ## 3. Fact and candidate rows
 
