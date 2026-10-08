@@ -1158,7 +1158,9 @@ pub struct InferredType {
     /// (#306): `TimelineEvent[]` reports symbol `TimelineEvent` + depth 1.
     /// `resolve_all_types` copies this onto an explicit `SymbolRequest` for the
     /// same alias/symbol so the bundle keeps the use-site's array-ness instead
-    /// of the bare element. Absent when 0 or when there is no anchor symbol.
+    /// of the bare element. Absent when 0. Reported without an anchor symbol
+    /// too (carrick#1967): the capture's anchor gate reads it to keep a bare
+    /// model symbol from being published over a list (`Sightings::contradict`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
     /// Declaration file (absolute path) of `primary_type_symbol`. Not every
