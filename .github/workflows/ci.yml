@@ -15,7 +15,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Rust tests run as three shards on three runners. Before this split one
+  # The Rust tests run as four shards on four runners (rust-unit and rust-fast-b split the
+  # fast integration binaries). Before this split one
   # job ran every target in series and took fourteen minutes, of which the
   # `local_mode_test` binary alone was 2.4 min, three scan-driving binaries
   # another 1.5, and the sidecar's own unit tests five (see `sidecar` below).
@@ -103,80 +104,34 @@ jobs:
       # (workflow_dispatch), NOT here. action_install_test is the Action's
       # dependency-install step (carrick#706), which uses a `file:` dependency
       # and so needs no registry.
-      - name: Run library and fast integration tests
+      - name: Run library and fast integration tests (a)
         run: >-
           cargo nextest run --no-fail-fast
           --lib
           --test action_install_test
-          --test alias_import_callers_test
-          --test alias_shaped_type_imports_test
-          --test analysis_failure_keeps_deterministic_rows_test
           --test ask_in_parts_test
-          --test bundle_row_id_golden_test
-          --test client_semantics_test
-          --test commonjs_require_callers_test
-          --test dependency_analysis_test
-          --test derive_matches_scan_test
-          --test dispatch_resume_test
-          --test env_var_template_call_segment_test
-          --test eval_xrepo
-          --test extraction_config_test
-          --test file_based_routing_test
-          --test file_centric_analysis_test
-          --test framework_coverage_test
           --test graphql_code_first_resolvers_test
-          --test graphql_code_first_response_types_test
-          --test graphql_declared_result_types_test
           --test graphql_document_call_sites_test
-          --test graphql_extraction_test
           --test graphql_located_operation_types_test
           --test graphql_schema_identity_test
-          --test graphql_schemas_setting_test
-          --test graphql_walked_schema_evidence_test
           --test in_process_publish_test
           --test incremental_raw_cache_test
-          --test inline_registration_scope_test
           --test intent_incremental_test
           --test jsx_component_callers_test
-          --test library_claims_sidecar_test
           --test library_store_test
-          --test literal_base_url_test
-          --test llm_mock_pipeline_test
-          --test log_value_guard_test
-          --test mock_storage_test
-          --test module_resolution_parity_test
           --test nested_service_walk_test
-          --test new_url_target_test
           --test nonhttp_source_labels_test
-          --test object_export_surface_test
-          --test object_key_url_wrapper_test
-          --test output_contract_test
           --test own_route_calls_test
-          --test pr_on_main_test
-          --test prompt_determinism_test
           --test receiver_type_classification_test
           --test request_summary_test
-          --test retype_consumer_test
-          --test route_request_anchor_test
           --test scan_durability_test
-          --test scan_timing_lines_test
-          --test service_derivation_test
-          --test shadowed_binding_test
           --test sidecar_integration_test
-          --test sidecar_parent_gone_test
           --test sidecar_program_files_test
           --test socket_class_field_test
-          --test socket_extraction_test
-          --test socket_generic_test
-          --test socket_namespace_test
-          --test socket_type_alias_test
           --test span_locator_units_test
-          --test url_alias_matching_test
           --test url_bases_through_bindings_test
-          --test workspace_member_callers_test
           --test workspace_package_client_test
           --test wrapper_chain_const_url_test
-          --test wrapper_dispatch_test
 
       # Every tests/*.rs must be run by a step in one of the Rust shards or be
       # listed here with a reason. Nine of twenty were silently local-only
@@ -194,6 +149,77 @@ jobs:
             fi
           done
           exit $missing
+
+
+  # The other half of the fast integration binaries, split off rust-unit by
+  # measured test time (summed per binary from a nextest run: about 920 CPU
+  # seconds each side) so the two halves finish together. The sum is CPU
+  # bound on a four-core runner, so a second runner is what shortens the
+  # wall clock; nextest alone took the single shard from 943 s to 448 s of
+  # tests. Same setup, same env as rust-unit.
+  rust-fast-b:
+    name: Rust fast integration (b)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/rust-test-setup
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: nextest@0.9.148
+
+      - name: Run fast integration tests (b)
+        run: >-
+          cargo nextest run --no-fail-fast
+          --test alias_import_callers_test
+          --test alias_shaped_type_imports_test
+          --test analysis_failure_keeps_deterministic_rows_test
+          --test bundle_row_id_golden_test
+          --test client_semantics_test
+          --test commonjs_require_callers_test
+          --test dependency_analysis_test
+          --test derive_matches_scan_test
+          --test dispatch_resume_test
+          --test env_var_template_call_segment_test
+          --test eval_xrepo
+          --test extraction_config_test
+          --test file_based_routing_test
+          --test file_centric_analysis_test
+          --test framework_coverage_test
+          --test graphql_code_first_response_types_test
+          --test graphql_declared_result_types_test
+          --test graphql_extraction_test
+          --test graphql_schemas_setting_test
+          --test graphql_walked_schema_evidence_test
+          --test inline_registration_scope_test
+          --test library_claims_sidecar_test
+          --test literal_base_url_test
+          --test llm_mock_pipeline_test
+          --test log_value_guard_test
+          --test mock_storage_test
+          --test module_resolution_parity_test
+          --test new_url_target_test
+          --test object_export_surface_test
+          --test object_key_url_wrapper_test
+          --test output_contract_test
+          --test pr_on_main_test
+          --test prompt_determinism_test
+          --test retype_consumer_test
+          --test route_request_anchor_test
+          --test scan_timing_lines_test
+          --test service_derivation_test
+          --test shadowed_binding_test
+          --test sidecar_parent_gone_test
+          --test socket_extraction_test
+          --test socket_generic_test
+          --test socket_namespace_test
+          --test socket_type_alias_test
+          --test url_alias_matching_test
+          --test workspace_member_callers_test
+          --test wrapper_dispatch_test
 
   # The binaries that drive whole scans through the sidecar over fixture
   # repos: seconds to minutes each, and the reason the single job was slow.
