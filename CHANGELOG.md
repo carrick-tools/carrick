@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.110](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.109...carrick-v0.3.110) (2026-10-08)
+
+
+### Features
+
+* **sidecar:** read which incoming-message field picks each member of a response union ([#2054](https://github.com/carrick-tools/carrick/issues/2054), PR A) ([#2083](https://github.com/carrick-tools/carrick/issues/2083)) ([acc0133](https://github.com/carrick-tools/carrick/commit/acc01339665283f8601841e3708326225ab49aba))
+
+
+### Bug Fixes
+
+* **scanner:** a file git ignores stays out of every walk unless the service's own code imports it ([#1902](https://github.com/carrick-tools/carrick/issues/1902)) ([#2086](https://github.com/carrick-tools/carrick/issues/2086)) ([d95536c](https://github.com/carrick-tools/carrick/commit/d95536ca6cfa179a769952f443ccb7cc7dccf77e))
+* **scanner:** a route the service documents and registers is one operation ([#2094](https://github.com/carrick-tools/carrick/issues/2094)) ([#2109](https://github.com/carrick-tools/carrick/issues/2109)) ([bbbab10](https://github.com/carrick-tools/carrick/commit/bbbab107e0896f82dc23ca01e72b0927a1a9edd1))
+* **scanner:** a scope prefix the service's own route descriptors corroborate is read ([#2092](https://github.com/carrick-tools/carrick/issues/2092)) ([#2106](https://github.com/carrick-tools/carrick/issues/2106)) ([fbe6cc3](https://github.com/carrick-tools/carrick/commit/fbe6cc3eac4bb17bdc79c6dded0d3d65204527b1))
+* **scan:** reword the skipped-repository line (Refs [#1902](https://github.com/carrick-tools/carrick/issues/1902)) ([#2107](https://github.com/carrick-tools/carrick/issues/2107)) ([b8baad0](https://github.com/carrick-tools/carrick/commit/b8baad02b3f6a8badf95706f8bbea6c939bae6df))
+* **sidecar:** a response table keyed by status code publishes its 2xx body, not the table ([#1841](https://github.com/carrick-tools/carrick/issues/1841)) ([#2105](https://github.com/carrick-tools/carrick/issues/2105)) ([b2866a4](https://github.com/carrick-tools/carrick/commit/b2866a45fda4384b20eb2e291042f66e10c55419))
+* **sidecar:** the run log says what the check found for a same-service mismatch held back as unverifiable ([#2053](https://github.com/carrick-tools/carrick/issues/2053)) ([#2075](https://github.com/carrick-tools/carrick/issues/2075)) ([9d16723](https://github.com/carrick-tools/carrick/commit/9d1672339385b4633ad2999fb45198b4329b4605))
+* **sidecar:** the type check installs each transitive dependency at the version the scanned repo installed ([#2091](https://github.com/carrick-tools/carrick/issues/2091), slice A) ([#2102](https://github.com/carrick-tools/carrick/issues/2102)) ([e58b5a0](https://github.com/carrick-tools/carrick/commit/e58b5a0cede9d4b80e2807ed096eb4fb71604a22))
+* **types:** a route descriptor never types its route as the descriptor ([#2094](https://github.com/carrick-tools/carrick/issues/2094)) ([#2108](https://github.com/carrick-tools/carrick/issues/2108)) ([4b7e7bd](https://github.com/carrick-tools/carrick/commit/4b7e7bd6cd86c40addc50a91d6aa1155ad6322cd))
+
+
+### Performance
+
+* **sidecar:** the text locator reads node lines from a per-file index ([#1935](https://github.com/carrick-tools/carrick/issues/1935)) ([#2101](https://github.com/carrick-tools/carrick/issues/2101)) ([9f0cb1e](https://github.com/carrick-tools/carrick/commit/9f0cb1ecb94eeb3081baf1682eae0fbbf831359b))
+
 ## [0.3.109](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.108...carrick-v0.3.109) (2026-10-07)
 
 

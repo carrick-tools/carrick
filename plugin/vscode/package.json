@@ -2,7 +2,7 @@
   "name": "carrick",
   "displayName": "Carrick",
   "description": "Maps your TypeScript codebase across services and repositories, showing existing types, routes and callers in your editor before you write duplicate or breaking code.",
-  "version": "0.3.109",
+  "version": "0.3.110",
   "publisher": "carrick-tools",
   "icon": "icon.png",
   "license": "SEE LICENSE IN LICENSE.md",
