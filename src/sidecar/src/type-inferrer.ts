@@ -1496,9 +1496,12 @@ export class TypeInferrer {
       // argument is the route path, not a payload. The span locator falls
       // back to exactly this shape when no payload expression was reported,
       // so drilling here would put the path literal's type in the manifest.
-      const registersCallback = args.some(
-        (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
-      );
+      // A call handed a function whose result is plain data is not a
+      // registration but the payload: `rows.map((r) => ({ ... }))` sends the
+      // list, not the callback's return (carrick#2055).
+      const registersCallback =
+        args.some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) &&
+        !this.callResultIsPlainData(node);
       if (registersCallback) {
         // A registration that DECLARES its response contract in a schema needs
         // no indirection: the declaration is the contract the framework
@@ -1566,9 +1569,11 @@ export class TypeInferrer {
       // `typeText` keeps the bare name `Payment`, which dangles in the
       // source-less cross-repo bundle → `any` → unverifiable. Expand the
       // resolved object structurally so the real members land in the bundle.
+      // The name it falls back to is the awaited one: a located call under
+      // `await` sends what it resolves to, never the promise (carrick#2055).
       typeString = this.expandResolvedTypeStructural(
         resolved,
-        typeString,
+        typeText(resolved, payloadNode),
         this.wireFormatFor(request)
       );
     }
@@ -1776,6 +1781,7 @@ export class TypeInferrer {
    * returns the repo's own type (`toInstance(View, plain)`) is the payload.
    */
   private callResultIsPayload(call: CallExpression): boolean {
+    if (this.callResultIsPlainData(call)) return true;
     const { element } = this.unwrapArrayLevels(this.unwrapPromiseType(call.getType()));
     if (this.symbolIsLibOrExternalOrigin(element.getSymbol() ?? element.getAliasSymbol())) {
       return false;
@@ -1784,6 +1790,53 @@ export class TypeInferrer {
     // serialises to a string is still what the route sends, and drilling into
     // the call that built it would publish what it was built from.
     return this.nodeCarriesPayloadContract(call, false, false);
+  }
+
+  /**
+   * True when a located call evaluates to plain data, so it is the payload
+   * whatever its arguments and wherever its type is declared (carrick#2055).
+   *
+   * `rows.map(toDto)`, `rows.filter(cb)` and `listItems(ownerId)` produce the
+   * list a route sends. Read as a send, the first produced the mapper's
+   * function type, the second a callback's return, and the third `string`.
+   * What a send or a registration hands back is never plain data: a reply
+   * builder or a router carries methods, a bare send returns `void`, and a
+   * serialiser returns a primitive. So the result alone tells them apart.
+   *
+   * Plain data, once promise levels are taken off: an object with at least
+   * one member, no call or construct signature, and no member that is itself
+   * callable; an array of one; or a union whose members other than `null` and
+   * `undefined` all are. Tuples and empty objects are left to the callers'
+   * own reading.
+   */
+  private callResultIsPlainData(call: CallExpression): boolean {
+    const isPlainData = (type: Type, depth: number): boolean => {
+      if (depth > 3) return false;
+      if (type.isAny() || type.isUnknown() || type.isNever()) return false;
+      if (type.isUnion()) {
+        const members = type
+          .getUnionTypes()
+          .filter((member) => !member.isNull() && !member.isUndefined());
+        return members.length > 0 && members.every((member) => isPlainData(member, depth + 1));
+      }
+      if (type.isIntersection()) {
+        return type.getIntersectionTypes().every((member) => isPlainData(member, depth + 1));
+      }
+      const element = type.getArrayElementType();
+      if (element) return isPlainData(element, depth + 1);
+      if (!type.isObject() || type.isTuple() || this.isCallableType(type)) return false;
+      if (this.typeIsOrContainsResponseMachinery(type)) return false;
+      const members = type.getProperties();
+      const indexed = type.getStringIndexType() ?? type.getNumberIndexType();
+      if (members.length === 0 && !indexed) return false;
+      const callable = (held: Type): boolean =>
+        held.isUnion()
+          ? held.getUnionTypes().some((member) => this.isCallableType(member))
+          : this.isCallableType(held);
+      if (indexed && callable(indexed)) return false;
+      return members.every((member) => !callable(member.getTypeAtLocation(call)));
+    };
+    return isPlainData(this.unwrapPromiseType(call.getType()), 0);
   }
 
   /**
