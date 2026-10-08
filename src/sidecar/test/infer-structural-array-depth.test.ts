@@ -6,8 +6,8 @@
  * (`ItemDto`), bare by schema contract, so the use site's array-ness reaches
  * the capture only through the inference's `array_depth`. The inferrer used to
  * report that depth only beside a primary symbol, so a structural element
- * carried none, and the Rust anchor gate (`Sightings::contradict`,
- * engine/type_compat_v2.rs) had nothing to tell the bare symbol from a list.
+ * carried none, and the Rust depth join (`apply_inferred_array_depth`,
+ * services/type_sidecar.rs) had nothing to copy onto the model's symbol.
  *
  * Pinned here: the depth is reported for a structural element at a send and at
  * a consumer's call result, and a named element keeps its symbol and depth.

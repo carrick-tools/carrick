@@ -1014,7 +1014,8 @@ export interface InferredType {
    * bundle the bare element and erase the array (array-vs-scalar scored
    * compatible, #306). Omitted when 0. Reported without an anchor symbol
    * too (carrick#1967): a list whose element prints structurally is still a
-   * list, and a bare model symbol must not be published over it.
+   * list, and at a handler's send the join copies its depth onto the model's
+   * symbol.
    */
   array_depth?: number;
   /**

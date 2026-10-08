@@ -227,8 +227,14 @@ pub(crate) fn unwidened_alias(alias: &str) -> String {
 /// A symbol the answer names beside the bare top type is not part of the
 /// question. Whether that symbol witnesses an anchor is asked of the anchor's
 /// own symbol, by [`Sightings::none_of`].
+///
+/// An array level counts only beside an element symbol. A `call_result`
+/// reports the depth of the call's result even where its text is a decayed
+/// read of something after it, and a depth with no element named says nothing
+/// of the symbol this is asked about (carrick#1967).
 fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
-    inf.array_depth.is_none() && text_is_bare_top_type(&inf.type_string)
+    let peeled_a_named_list = inf.primary_type_symbol.is_some() && inf.array_depth.is_some();
+    !peeled_a_named_list && text_is_bare_top_type(&inf.type_string)
 }
 
 /// What the deterministic inferences saw at each alias, asked of one model
@@ -269,68 +275,6 @@ impl<'a> Sightings<'a> {
                 inference_read_no_shape(inf) && inf.primary_type_symbol.as_deref() != Some(symbol)
             })
         })
-    }
-
-    /// True when a response read for `alias` contradicts the model symbol
-    /// (carrick#1967, cause B). `depth` is the array depth the symbol request
-    /// carries: one the caller knows, or one the depth join copied from an
-    /// inference that named this same symbol.
-    ///
-    /// Two readings contradict a symbol with no depth:
-    ///
-    ///  - an array level. The symbol is the bare element by schema contract,
-    ///    and the join copies a depth only where the inference names the same
-    ///    symbol, so an array whose element prints structurally (`{ id:
-    ///    string; }[]`) or under another name left the symbol bare. Publishing
-    ///    it states one element where the source reads a list;
-    ///  - another named root at a handler's send (`response_body`). The send
-    ///    is read where the handler writes it; a different named type there is
-    ///    the model naming something else, such as the argument a mapper was
-    ///    given instead of what it returns.
-    ///
-    /// A consumer's named root is not asked here: where the source states the
-    /// body it reads, the two-anchor arbitration has already decided the
-    /// symbol (`demote_witnessed_borrowed_anchors`), and an unstated read is
-    /// a def-use walk whose terminal can be a value computed from the body.
-    /// Request bodies and pub/sub payloads keep that arbitration's rule. A
-    /// structural reading at depth zero names nothing to disagree with.
-    fn contradict(&self, alias: &str, symbol: &str, depth: Option<u32>) -> bool {
-        if depth.is_some() {
-            return false;
-        }
-        let Some(answers) = self.by_alias.get(alias) else {
-            return false;
-        };
-        // A list read under this same symbol is the depth join's to copy
-        // (`apply_inferred_array_depth`), not a disagreement.
-        let listed = answers.iter().any(|inf| {
-            matches!(
-                inf.infer_kind,
-                InferKind::ResponseBody | InferKind::CallResult
-            ) && inf.array_depth.is_some_and(|d| d > 0)
-                && inf.primary_type_symbol.as_deref() != Some(symbol)
-        });
-        // The reading the alias publishes in the symbol's place: its first
-        // usable inference, as `derive_capture_anchors` takes it.
-        let renamed = answers
-            .iter()
-            .find(|inf| usable_inferred_text(&inf.type_string).is_some())
-            .is_some_and(|inf| {
-                inf.infer_kind == InferKind::ResponseBody
-                    && inf
-                        .primary_type_symbol
-                        .as_deref()
-                        .is_some_and(|named| named != symbol)
-            });
-        listed || renamed
-    }
-
-    /// True when the model symbol is not published for `alias`, as its
-    /// anchor or as the text a backfill re-anchors with: nothing witnessed it
-    /// ([`Self::none_of`]), or a response read contradicts it
-    /// ([`Self::contradict`]).
-    fn withhold(&self, alias: &str, symbol: &str, depth: Option<u32>) -> bool {
-        (depth.is_none() && self.none_of(alias, symbol)) || self.contradict(alias, symbol, depth)
     }
 }
 
@@ -559,15 +503,11 @@ pub(crate) fn derive_capture_anchors(
         // IsAny gate to unverifiable. A depth the caller already knows (the
         // GraphQL SDL list marker, or a depth the join did land) is evidence
         // in its own right and keeps the anchor.
-        //
-        // The same holds where a response read contradicts the symbol (an
-        // array level it does not carry, or another named type at the send):
-        // the infer anchor below then publishes what the compiler read.
-        if sightings.withhold(alias, &request.symbol_name, request.array_depth) {
+        if request.array_depth.is_none() && sightings.none_of(alias, &request.symbol_name) {
             debug!(
-                "v2 capture: alias {} has an explicit '{}' anchor that its inference \
-                 did not witness at this depth; skipping the symbol anchor so the \
-                 published type is the deterministic reading or unknown",
+                "v2 capture: alias {} has an explicit '{}' anchor but its inference \
+                 resolved to a bare top type; skipping the symbol anchor so the \
+                 array-ness is not guessed (pair verdicts unverifiable)",
                 alias, request.symbol_name
             );
             continue;
@@ -1089,19 +1029,84 @@ fn usable_backfill_text(text: &str) -> Option<&str> {
     }
 }
 
+/// True when a printed type text names no declaration: every identifier in
+/// it is a property or method name, a keyword, or a global the compiler
+/// declares itself. Such a text means the same in any file, so a backfill
+/// literal can carry it with no record of where its names came from.
+fn text_names_no_declaration(text: &str) -> bool {
+    const BUILT_IN: &[&str] = &[
+        "string",
+        "number",
+        "boolean",
+        "bigint",
+        "symbol",
+        "object",
+        "null",
+        "undefined",
+        "void",
+        "never",
+        "true",
+        "false",
+        "readonly",
+        "Array",
+        "ReadonlyArray",
+        "Record",
+        "Date",
+    ];
+    let scrubbed = strip_string_literal_contents(text);
+    let bytes = scrubbed.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut i = 0;
+    while i < bytes.len() {
+        let quoted = matches!(bytes[i], b'"' | b'\'' | b'`');
+        if quoted {
+            // `strip_string_literal_contents` left the quotes adjacent.
+            i += 2;
+            continue;
+        }
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let begin = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        let word = &scrubbed[begin..i];
+        if word.as_bytes()[0].is_ascii_digit() {
+            // A numeric literal type (`200`, `1e3`).
+            continue;
+        }
+        let rest = scrubbed[i..].trim_start();
+        let rest = rest.strip_prefix('?').unwrap_or(rest);
+        let names_a_member = rest.starts_with(':') || rest.starts_with('(');
+        if !names_a_member && !BUILT_IN.contains(&word) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Alias -> literal type text the scanner can stand behind for a backfill
 /// re-anchor, from the SAME v1 resolution results the enrich join consumes.
 /// Precedence mirrors that join: the explicit bundle's structural expansion
 /// wins over the inference result for the same alias; first usable text wins
 /// within each source.
 ///
+/// Except at a handler's send (carrick#1967): there the inference is the
+/// compiler's reading of the body the handler sends, and the explicit text is
+/// the model's symbol, which can name another type (the argument a mapper was
+/// given instead of what it returns). The send's own text goes first when it
+/// names no declaration ([`text_names_no_declaration`]): a backfill literal
+/// carries no printed names, and one name it cannot resolve would reject the
+/// service's whole backfill.
+///
 /// The explicit bundle's text is a model symbol's own expansion, so it is
 /// offered only where the symbol anchor is (carrick#1967): an alias at which
-/// nothing witnessed the symbol, or at which a response read contradicts it,
-/// gets no text from it ([`Sightings::withhold`]). Its symbol anchor was
-/// withheld because its array-ness or its name would be a guess, and
-/// re-anchoring the alias with the same symbol's text publishes the same
-/// guess one step later; the inference's own text is offered instead.
+/// nothing witnessed the symbol, and for which the caller knows no depth, gets
+/// no text from it. Its symbol anchor was withheld because its array-ness
+/// would be a guess, and re-anchoring the alias with the same symbol's text
+/// publishes the same guess one step later.
 pub(crate) fn derive_backfill_texts(
     explicit_manifest: &[ManifestEntry],
     inferred: &[crate::services::type_sidecar::InferredType],
@@ -1113,11 +1118,23 @@ pub(crate) fn derive_backfill_texts(
         .filter_map(|request| Some((request.alias.as_deref()?, request)))
         .collect();
     let mut texts: HashMap<String, String> = HashMap::new();
+    let mut first_usable: HashSet<&str> = HashSet::new();
+    for inf in inferred {
+        let Some(text) = usable_backfill_text(&inf.type_string) else {
+            continue;
+        };
+        if !first_usable.insert(inf.alias.as_str()) {
+            continue;
+        }
+        if inf.infer_kind == InferKind::ResponseBody && text_names_no_declaration(text) {
+            texts.insert(inf.alias.clone(), text.to_string());
+        }
+    }
     for entry in explicit_manifest {
         let request = request_of.get(entry.alias.as_str());
         let symbol = request.map_or(entry.original_name.as_str(), |r| r.symbol_name.as_str());
-        let depth = request.and_then(|r| r.array_depth);
-        if sightings.withhold(&entry.alias, symbol, depth) {
+        let depth_known = request.is_some_and(|r| r.array_depth.is_some());
+        if !depth_known && sightings.none_of(&entry.alias, symbol) {
             continue;
         }
         if let Some(text) = usable_backfill_text(&entry.type_string) {
@@ -5185,150 +5202,6 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(backfill_anchors(&anchors, &demoted, &texts).is_none());
     }
 
-    /// carrick#1967, cause B: the model names the element (`ItemDto`, bare by
-    /// schema contract), and the compiler read the send as a list whose
-    /// element prints structurally, so the depth join had no symbol to agree
-    /// with and left the request bare. Neither the symbol anchor nor the
-    /// symbol's text may then publish one element: the alias is anchored by
-    /// the reading, and a backfill offers the reading's text.
-    #[test]
-    fn a_listed_reading_withholds_a_bare_model_symbol() {
-        let alias = "Endpoint_items_Response";
-        let item_dto = |depth: Option<u32>| SymbolRequest {
-            symbol_name: "ItemDto".to_string(),
-            array_depth: depth,
-            ..order_explicit(alias)
-        };
-        let listed = inferred(alias, "{ id: string; }[]", None, Some(1));
-        let anchors = derive_capture_anchors(
-            &[item_dto(None)],
-            &[response_body_infer(alias)],
-            &[],
-            std::slice::from_ref(&listed),
-            &[],
-            "/repo",
-        );
-        assert_eq!(anchors.len(), 1, "{anchors:?}");
-        assert!(
-            matches!(&anchors[0], CaptureAnchor::Literal { type_text, anchor_origin: AnchorOrigin::DeterministicInfer, .. } if type_text == "{ id: string; }[]"),
-            "the compiler's list is published, not the bare symbol: {anchors:?}"
-        );
-
-        let manifest = vec![ManifestEntry {
-            alias: alias.to_string(),
-            original_name: "ItemDto".to_string(),
-            source_file: "src/types.ts".to_string(),
-            type_string: "{ id: string; }".to_string(),
-            is_explicit: true,
-        }];
-        let texts =
-            derive_backfill_texts(&manifest, std::slice::from_ref(&listed), &[item_dto(None)]);
-        assert_eq!(
-            texts.get(alias).map(String::as_str),
-            Some("{ id: string; }[]")
-        );
-
-        // A consumer's read of the same list (`const r: ItemDto[] = await
-        // client.list()` where the alias prints structurally) is withheld the
-        // same way.
-        let mut read = inferred(alias, "{ id: string; }[]", Some("Other"), Some(1));
-        read.infer_kind = InferKind::CallResult;
-        let anchors = derive_capture_anchors(
-            &[item_dto(None)],
-            &[response_body_infer(alias)],
-            &[],
-            &[read],
-            &[],
-            "/repo",
-        );
-        assert!(
-            matches!(&anchors[0], CaptureAnchor::Literal { .. }),
-            "{anchors:?}"
-        );
-
-        // A depth the request carries (the caller's, or one the join copied
-        // from an inference naming this symbol) keeps the symbol at it.
-        let anchors = derive_capture_anchors(
-            &[item_dto(Some(1))],
-            &[response_body_infer(alias)],
-            &[],
-            &[inferred(alias, "ItemDto[]", Some("ItemDto"), Some(1))],
-            &[],
-            "/repo",
-        );
-        assert!(
-            matches!(&anchors[0], CaptureAnchor::Symbol { symbol_name, array_depth: Some(1), .. } if symbol_name == "ItemDto"),
-            "{anchors:?}"
-        );
-    }
-
-    /// carrick#1967, cause B: at a handler's send the compiler read another
-    /// named type than the model's (`normalize(input)` returns `OutputDto`;
-    /// the model named `InputDto`, the argument). The reading is published.
-    /// Where nothing names a type to disagree with, or the read is not a
-    /// response read, the model symbol keeps today's rule.
-    #[test]
-    fn a_send_that_reads_another_named_type_withholds_the_model_symbol() {
-        let alias = "Endpoint_normalize_Response";
-        let input_dto = SymbolRequest {
-            symbol_name: "InputDto".to_string(),
-            ..order_explicit(alias)
-        };
-        let anchor_for = |answer: crate::services::type_sidecar::InferredType| {
-            derive_capture_anchors(
-                std::slice::from_ref(&input_dto),
-                &[response_body_infer(alias)],
-                &[],
-                &[answer],
-                &[],
-                "/repo",
-            )
-            .remove(0)
-        };
-        let symbol_kept = |anchor: &CaptureAnchor| matches!(anchor, CaptureAnchor::Symbol { symbol_name, .. } if symbol_name == "InputDto");
-
-        let renamed = anchor_for(inferred(alias, "OutputDto", Some("OutputDto"), None));
-        assert!(
-            matches!(&renamed, CaptureAnchor::Literal { type_text, .. } if type_text == "OutputDto"),
-            "{renamed:?}"
-        );
-        let manifest = vec![ManifestEntry {
-            alias: alias.to_string(),
-            original_name: "InputDto".to_string(),
-            source_file: "src/types.ts".to_string(),
-            type_string: "{ raw: string; }".to_string(),
-            is_explicit: true,
-        }];
-        let texts = derive_backfill_texts(
-            &manifest,
-            &[inferred(alias, "OutputDto", Some("OutputDto"), None)],
-            std::slice::from_ref(&input_dto),
-        );
-        assert_eq!(texts.get(alias).map(String::as_str), Some("OutputDto"));
-
-        // The reading names the model's own symbol.
-        assert!(symbol_kept(&anchor_for(inferred(
-            alias,
-            "InputDto",
-            Some("InputDto"),
-            None
-        ))));
-        // A structural reading at depth zero names nothing to disagree with.
-        assert!(symbol_kept(&anchor_for(inferred(
-            alias,
-            "{ raw: string; }",
-            None,
-            None
-        ))));
-        // A consumer's unstated read and a request body keep today's rule.
-        let mut consumer = inferred(alias, "OutputDto", Some("OutputDto"), None);
-        consumer.infer_kind = InferKind::CallResult;
-        assert!(symbol_kept(&anchor_for(consumer)));
-        let mut request = inferred(alias, "{ id: string; }[]", Some("OutputDto"), Some(1));
-        request.infer_kind = InferKind::RequestBody;
-        assert!(symbol_kept(&anchor_for(request)));
-    }
-
     #[test]
     fn derive_backfill_texts_precedence_and_filters() {
         let manifest_entry = |alias: &str, text: &str| ManifestEntry {
@@ -5366,20 +5239,35 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             manifest_entry("A", "{ id: string; read: boolean; }"),
             manifest_entry("B", "interface Notification { id: string; }"), // declaration text
             manifest_entry("C", "{ metadata: any }"),                      // poisoned
+            manifest_entry("E", "{ raw: string; }"),
+            manifest_entry("F", "{ raw: string; }"),
         ];
         let inferred = vec![
-            inferred_type("A", "{ id: string }"), // loses to the explicit text
+            // A consumer's read loses to the explicit text.
+            crate::services::type_sidecar::InferredType {
+                infer_kind: InferKind::CallResult,
+                ..inferred_type("A", "{ id: string }")
+            },
             inferred_type("B", "{ id: string; }"),
             inferred_type("C", "unknown"),
             inferred_type("D", "{ ok: boolean; }"),
+            // carrick#1967: a send's own text that names no declaration wins;
+            // one that names a declaration does not.
+            inferred_type("E", "{ enabled: boolean; }"),
+            inferred_type("F", "OutputDto"),
         ];
 
         let texts = derive_backfill_texts(&explicit, &inferred, &[]);
         assert_eq!(
             texts.get("A").map(String::as_str),
             Some("{ id: string; read: boolean; }"),
-            "explicit bundle text wins"
+            "explicit bundle text wins over a consumer's read"
         );
+        assert_eq!(
+            texts.get("E").map(String::as_str),
+            Some("{ enabled: boolean; }")
+        );
+        assert_eq!(texts.get("F").map(String::as_str), Some("{ raw: string; }"));
         assert_eq!(
             texts.get("B").map(String::as_str),
             Some("{ id: string; }"),
@@ -5387,6 +5275,79 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         assert!(!texts.contains_key("C"), "poisoned texts never backfill");
         assert_eq!(texts.get("D").map(String::as_str), Some("{ ok: boolean; }"));
+    }
+
+    /// carrick#1967, cause B: the issue's fixture. The model names the
+    /// element (`ItemDto`) and the handler sends a list whose element prints
+    /// structurally; the symbol anchor demoted. The backfill re-anchors with
+    /// the send's list, not the symbol's bare element.
+    #[test]
+    fn a_demoted_send_backfills_the_list_the_handler_sends() {
+        let alias = "Endpoint_items_Response";
+        let manifest = vec![ManifestEntry {
+            alias: alias.to_string(),
+            original_name: "ItemDto".to_string(),
+            source_file: "src/types.ts".to_string(),
+            type_string: "{ id: string; }".to_string(),
+            is_explicit: true,
+        }];
+        let request = SymbolRequest {
+            symbol_name: "ItemDto".to_string(),
+            ..order_explicit(alias)
+        };
+        let send = inferred(alias, "{ id: string; }[]", None, Some(1));
+        let texts = derive_backfill_texts(&manifest, &[send], &[request]);
+        assert_eq!(
+            texts.get(alias).map(String::as_str),
+            Some("{ id: string; }[]")
+        );
+    }
+
+    /// carrick#1967: a `call_result` reports the depth of the call's result,
+    /// which its text need not print (a def-use walk's decayed terminal). A
+    /// depth with no element named is no sighting of the model symbol, so a
+    /// body read untyped still withholds the symbol anchor.
+    #[test]
+    fn an_unnamed_depth_beside_a_decayed_read_is_no_sighting() {
+        let alias = "Endpoint_orders_Response_Call1";
+        let mut read = inferred(alias, "unknown", None, Some(1));
+        read.infer_kind = InferKind::CallResult;
+        let anchors = derive_capture_anchors(
+            &[order_explicit(alias)],
+            &[response_body_infer(alias)],
+            &[],
+            &[read],
+            &[],
+            "/repo",
+        );
+        assert!(
+            !anchors
+                .iter()
+                .any(|anchor| matches!(anchor, CaptureAnchor::Symbol { .. })),
+            "{anchors:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_names_no_declaration_only_when_every_name_is_a_member_or_built_in() {
+        for text in [
+            "{ id: string; }[]",
+            "{ enabled: boolean; source?: \"api\" | \"cli\"; at: Date | null; }",
+            "readonly { a: number; b: 200; }[]",
+            "{ [key: string]: number; }",
+            "{ run(input: string): void; tags: Array<string>; byId: Record<string, 1e3>; }",
+        ] {
+            assert!(text_names_no_declaration(text), "{text}");
+        }
+        for text in [
+            "OutputDto",
+            "{ item: ItemDto; }",
+            "ItemDto[]",
+            "{ [K in Keys]: string; }",
+            "import(\"./m\").Item",
+        ] {
+            assert!(!text_names_no_declaration(text), "{text}");
+        }
     }
 
     // ---- build_check_pairs ------------------------------------------------

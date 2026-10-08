@@ -8350,10 +8350,9 @@ export class TypeInferrer {
       payload_type_string: payloadTypeString,
       primary_type_symbol: primaryTypeSymbol,
       // Reported whether or not the element has a symbol (carrick#1967): an
-      // array whose element prints structurally is still a list, and the
-      // Rust anchor gate reads the depth to keep a bare model symbol from
-      // being published over it. The depth join copies it onto a model
-      // symbol only when the symbols agree.
+      // array whose element prints structurally is still a list. The Rust
+      // depth join copies it onto the model's symbol when the symbols agree,
+      // or, at a handler's send, when the element has no symbol to disagree.
       array_depth: arrayDepth !== undefined && arrayDepth > 0 ? arrayDepth : undefined,
       // Same gate: a declaration source without an anchor symbol is useless.
       primary_type_symbol_source:
