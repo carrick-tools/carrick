@@ -2124,7 +2124,7 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
 
 /// [`upload_run_logs`], reading `log_path` — the run's own file, or `None`
 /// when this process has none.
-pub(crate) async fn upload_run_log_from<T: CloudStorage>(
+pub async fn upload_run_log_from<T: CloudStorage>(
     storage: &T,
     repo_path: &str,
     log_path: Option<&Path>,

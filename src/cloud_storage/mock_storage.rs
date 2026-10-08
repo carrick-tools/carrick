@@ -42,24 +42,19 @@ impl MockStorage {
 
     /// The failures reported against this storage, in order.
     ///
-    /// Test-only: the mock is a production type (it backs `CARRICK_MOCK_ALL`),
-    /// and a recorder nobody reads outside a test is dead code in every other
-    /// build.
-    #[cfg(test)]
+    /// Read by tests only, the library's and the binary's. Not `cfg(test)`:
+    /// the binary's unit tests link the library built without it.
     pub fn scan_failures(&self) -> Vec<(String, String)> {
         self.scan_failures.lock().unwrap().clone()
     }
 
     /// The pre-scan failures reported against this storage, in order.
-    /// Test-only, for the same reason.
-    #[cfg(test)]
     pub fn preflight_failures(&self) -> Vec<PreflightFailure> {
         self.preflight_failures.lock().unwrap().clone()
     }
 
     /// The run logs this storage was handed, in order, as the redaction left
-    /// them. Test-only, for the same reason.
-    #[cfg(test)]
+    /// them.
     pub fn uploaded_logs(&self) -> Vec<String> {
         self.logs.lock().unwrap().clone()
     }

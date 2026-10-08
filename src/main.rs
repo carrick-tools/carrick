@@ -1,99 +1,17 @@
-mod agent_service;
-mod agents;
-mod analysis_channel;
-mod analysis_job;
-mod analyzer;
-mod app_context;
-mod binding_scope;
-mod boundary;
-mod call_base;
-mod call_graph;
-mod call_site_extractor;
-mod client_semantics;
-mod cloud_storage;
-mod commonjs;
-mod config;
-mod console;
-mod consumer_row_fold;
-mod credentials;
-mod current_service;
-mod deno_support;
-mod dispatch;
-mod engine;
-mod env_alias;
-mod eval_output;
-mod event_emitter;
-mod external_call_candidates;
-mod extractor;
-mod file_based_router;
-mod file_finder;
-mod findings;
-mod formatter;
-mod forwarded_body;
-mod framework_detector;
-mod git_state;
-mod graphql;
-mod graphql_document_sites;
-mod graphql_resolver_anchor;
-mod graphql_schema_builder;
-mod handler_span;
-mod help;
-mod import_bindings;
-mod imported_request_member;
-mod in_process_pubsub;
-mod intent_generator;
-mod keep_awake;
-mod library_claims;
-mod library_store;
-mod local_http_wrapper;
-mod local_mode;
-mod logging;
-mod module_aliases;
-mod mount_graph;
-mod multi_agent_orchestrator;
-mod new_url_target;
-mod oidc;
-mod operation;
-mod packages;
-mod panic_report;
-mod parser;
-mod phase_timing;
-mod pr_baseline;
-mod preflight;
-mod progress;
-mod receiver_origin;
-mod receiver_type;
-mod registration_scope;
-mod request_summary;
-mod retry_budget;
-mod scan_health;
-mod scan_spend;
-mod scan_stage;
-mod scan_timing;
-mod sdk_edges;
-mod sdk_surface;
-mod service_derivation;
-mod services;
-mod shutdown;
-mod signature_pass;
-mod socket_io;
-mod swc_scanner;
-mod time_limits;
-mod type_manifest;
-mod url_normalizer;
-mod utils;
-mod visitor;
-mod workspace_resolver;
-mod wrapper_call_join;
-mod wrapper_call_method;
-mod wrapper_call_route;
-mod wrapper_dispatch;
-mod wrapper_request_shape;
+//! The `carrick` binary: argument parsing, process lifecycle and exit codes
+//! over the `carrick` library crate. Every scanner module lives in the
+//! library (`src/lib.rs`); declaring them here again would compile the whole
+//! tree a second time for the binary and its unit tests.
 
-use crate::cloud_storage::{AwsStorage, LocalDirStorage, MockStorage};
-use crate::services::TypeSidecar;
-use crate::services::type_sidecar;
-use engine::run_analysis_engine_with_sidecar;
+use carrick::cloud_storage::{self, AwsStorage, LocalDirStorage, MockStorage};
+use carrick::engine::{self, run_analysis_engine_with_sidecar};
+use carrick::services::TypeSidecar;
+use carrick::services::type_sidecar;
+use carrick::{
+    analysis_channel, config, credentials, deno_support, help, keep_awake, local_mode, logging,
+    panic_report, preflight, progress, scan_health, scan_stage, service_derivation, shutdown,
+};
+use carrick::{errln, outln};
 use std::env;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
@@ -134,7 +52,7 @@ impl CliArgs {
                 // What the npm shim asks an overridden binary before it runs
                 // it, so the run says which build it was (carrick#1100).
                 "--version" | "-V" => {
-                    crate::outln!("carrick {}", env!("CARGO_PKG_VERSION"));
+                    outln!("carrick {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
                 "--verbose" | "-v" => {
@@ -154,7 +72,7 @@ impl CliArgs {
                     repo_path = arg.to_string();
                 }
                 _ => {
-                    crate::errln!("Unknown argument: {}", args[i]);
+                    errln!("Unknown argument: {}", args[i]);
                     Self::print_help();
                     std::process::exit(1);
                 }
@@ -171,7 +89,7 @@ impl CliArgs {
     }
 
     fn print_help() {
-        crate::errln!("{}", crate::help::HELP);
+        errln!("{}", help::HELP);
     }
 }
 
@@ -205,14 +123,14 @@ async fn main() {
                 std::process::exit(run_build(command).await);
             }
             Err(message) => {
-                crate::errln!("carrick: {message}");
+                errln!("carrick: {message}");
                 std::process::exit(2);
             }
         }
     }
 
     if let Some(problem) = unknown_command(&argv) {
-        crate::errln!("carrick: {problem}");
+        errln!("carrick: {problem}");
         std::process::exit(2);
     }
 
