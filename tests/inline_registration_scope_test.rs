@@ -472,6 +472,118 @@ async fn a_scope_inside_a_mounted_plugin_composes_under_both() {
     );
 }
 
+// --- a prefix the service's own descriptors corroborate (slice 1b) --------
+//
+// The model stated no row for the registration, so the prefix is unread. The
+// registration's other arguments read to one route path, and the service
+// documents its routes as data: where the documentation states a route under
+// that path and never without it, the prefix is read.
+
+fn item_detail() -> (String, FileAnalysisResult) {
+    answer(
+        "src/item-detail.ts",
+        &[],
+        &[("app.get('/items/:id'", "app", "GET", "/items/:id")],
+    )
+}
+
+/// A registering file whose outer registration the model left unstated.
+fn unstated(file: &str) -> (String, FileAnalysisResult) {
+    answer(
+        file,
+        &[(
+            "api.register(itemDetailRoutes)",
+            "api",
+            "itemDetailRoutes",
+            "",
+            Some("./item-detail"),
+        )],
+        &[],
+    )
+}
+
+/// A documentation file: the deterministic layer reads it, the model is not
+/// asked about it.
+fn docs(file: &str) -> (String, FileAnalysisResult) {
+    (
+        root().join(file).to_string_lossy().into_owned(),
+        FileAnalysisResult::default(),
+    )
+}
+
+/// What the handler file serves, documentation rows left out.
+fn handler_serves(result: &FileCentricAnalysisResult) -> BTreeSet<String> {
+    result
+        .mount_graph
+        .get_resolved_endpoints()
+        .iter()
+        .filter(|endpoint| endpoint.file_location.contains("src/item-detail.ts"))
+        .map(|endpoint| format!("{} {}", endpoint.method, endpoint.full_path))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_scope_prefix_the_service_documents_is_read() {
+    let result = analyze(vec![
+        unstated("src/documented.ts"),
+        item_detail(),
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /api/v1/items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 1);
+    assert_eq!(result.stats.mount_prefixes_unread, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_undocumented_scope_keeps_its_prefix_unread() {
+    let result = analyze(vec![unstated("src/documented.ts"), item_detail()]).await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+    assert_eq!(result.stats.mount_prefixes_unread, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_descriptor_under_another_prefix_refuses_the_candidate() {
+    let result = analyze(vec![
+        unstated("src/documented.ts"),
+        item_detail(),
+        docs("src/docs-v2.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn two_route_shaped_option_values_abstain() {
+    let result = analyze(vec![
+        unstated("src/two-options.ts"),
+        item_detail(),
+        docs("src/docs.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_descriptor_documenting_the_unprefixed_path_refuses_the_candidate() {
+    let result = analyze(vec![
+        unstated("src/documented.ts"),
+        item_detail(),
+        docs("src/docs-unprefixed.ts"),
+    ])
+    .await;
+    assert_eq!(handler_serves(&result), set(&["GET /items/:id"]));
+    assert_eq!(result.stats.mount_prefixes_corroborated, 0);
+}
+
 #[test]
 fn the_fixture_root_is_on_disk() {
     assert!(Path::new(&root()).join("src/nullish.ts").is_file());

@@ -433,7 +433,10 @@ pub struct FileCentricAnalysisResult {
     /// Processing statistics
     pub stats: ProcessingStats,
     /// Inline-plugin registrations whose prefix the source does not state as
-    /// a literal (carrick#2092), one per scope.
+    /// a literal (carrick#2092), one per scope. The mount graph reads each
+    /// one's candidates and may corroborate it there
+    /// (`stats.mount_prefixes_corroborated`), so a record here is an input to
+    /// the graph, not a verdict that the prefix stayed unread.
     pub unread_mount_prefixes: Vec<crate::registration_scope::UnreadPrefix>,
     /// Bundled type definitions (if sidecar was used)
     pub bundled_types: Option<String>,
@@ -523,6 +526,10 @@ pub struct ProcessingStats {
     /// a literal (carrick#2092). Each is logged with its site; the scope's
     /// routes are served without a prefix rather than under a guessed one.
     pub mount_prefixes_unread: usize,
+    /// Of those, the ones whose prefix was read after all: the registration's
+    /// other arguments read to one route path, and the service's own route
+    /// descriptors state the scope's routes under it (carrick#2092).
+    pub mount_prefixes_corroborated: usize,
     /// LLM-emitted pub/sub operations dropped because their topic has no
     /// literal witness (string literal or template-literal shape) in the
     /// analyzed file's source (carrick#311). The analyzer occasionally invents
@@ -3825,8 +3832,18 @@ impl FileOrchestrator {
         }
 
         // STEP 5: Build aggregated mount graph from all file results
-        let mount_graph =
-            self.build_mount_graph(&file_results, normalizer, service_root, Path::new(""));
+        let (mount_graph, corroborated) = self.build_mount_graph_reading_scopes(
+            &file_results,
+            normalizer,
+            service_root,
+            Path::new(""),
+            &unread_prefixes,
+        );
+        // A scope whose prefix the service's descriptors corroborated is no
+        // longer unread (carrick#2092). The records stay in the result: the
+        // engine's rebuild of the graph reads them the same way.
+        stats.mount_prefixes_corroborated = corroborated.len();
+        stats.mount_prefixes_unread -= corroborated.len();
 
         Ok(FileCentricAnalysisResult {
             file_results,
@@ -9927,6 +9944,21 @@ impl FileOrchestrator {
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         normalizer: &UrlNormalizer,
+        scan_root: &Path,
+        file_root: &Path,
+    ) -> MountGraph {
+        self.build_mount_graph_reading_scopes(file_results, normalizer, scan_root, file_root, &[])
+            .0
+    }
+
+    /// [`Self::build_mount_graph`], reading the prefix of each registration
+    /// scope the source did not state as a literal (carrick#2092 slice 1b).
+    /// Returns the graph and the scope ids whose prefix the service's own
+    /// route descriptors corroborated.
+    pub fn build_mount_graph_reading_scopes(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        normalizer: &UrlNormalizer,
         // Root the `file_results` keys are resolved against when classifying
         // endpoint provenance (real route vs mock/test handler): the service
         // scan root when keys are as-scanned paths, or `Path::new("")` when
@@ -9939,7 +9971,8 @@ impl FileOrchestrator {
         // (absolute, or relative to the working directory); the repo root
         // when the engine has normalized them to repo-relative paths.
         file_root: &Path,
-    ) -> MountGraph {
+        unread_scopes: &[crate::registration_scope::UnreadPrefix],
+    ) -> (MountGraph, Vec<String>) {
         let mut graph = MountGraph::new();
 
         // Every pass reads the files in path order, so the graph's rows come
@@ -10345,6 +10378,13 @@ impl FileOrchestrator {
             graph.data_calls.push(call);
         }
 
+        // A registration scope whose prefix the source did not state as a
+        // literal takes the one route path its arguments read to, where the
+        // service's own route descriptors state its routes under it
+        // (carrick#2092). Before the paths are composed, so it composes like
+        // any other prefix.
+        let corroborated = Self::corroborate_scope_prefixes(&mut graph, unread_scopes);
+
         // Sixth pass: resolve full paths for endpoints
         self.resolve_endpoint_paths(&mut graph, &registration_literals);
 
@@ -10420,7 +10460,127 @@ impl FileOrchestrator {
             call.own_route = own_route;
         }
 
-        graph
+        (graph, corroborated)
+    }
+
+    /// Read the prefix of each registration scope the source did not state
+    /// as a literal, where the service's own route descriptors corroborate it
+    /// (carrick#2092 slice 1b). Returns the scope ids whose prefix was set.
+    ///
+    /// Two signals, both required, neither naming an option, a library or a
+    /// framework:
+    ///
+    /// * the registration's other arguments read to exactly one route path
+    ///   `P` ([`crate::registration_scope::UnreadPrefix::candidates`]);
+    /// * among the routes under the scope, at least one is documented by a
+    ///   route descriptor of this service (`{ method, path, … }` data) at the
+    ///   same method and `P` + its path, and none at its own unprefixed path.
+    ///
+    /// Anything else leaves the prefix unread. Runs before the paths are
+    /// composed, while each endpoint's `path` is still router-relative and a
+    /// descriptor row's `path` is its absolute path.
+    fn corroborate_scope_prefixes(
+        graph: &mut MountGraph,
+        unread_scopes: &[crate::registration_scope::UnreadPrefix],
+    ) -> Vec<String> {
+        let mut corroborated = Vec::new();
+        if unread_scopes.is_empty() {
+            return corroborated;
+        }
+        let documented: HashSet<(String, String)> = graph
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
+            })
+            .map(|endpoint| {
+                (
+                    endpoint.method.clone(),
+                    Self::placeholder_normalised(&endpoint.path),
+                )
+            })
+            .collect();
+        if documented.is_empty() {
+            return corroborated;
+        }
+        for scope in unread_scopes {
+            let [prefix] = scope.candidates.as_slice() else {
+                continue; // none, or several the source does not tell apart
+            };
+            let Some(edge) = graph
+                .mounts
+                .iter()
+                .position(|mount| mount.child == scope.scope_id && mount.path_prefix.is_empty())
+            else {
+                continue;
+            };
+            let before = Self::mount_prefix_chains(&graph.mounts);
+            let mut with_prefix = graph.mounts.clone();
+            with_prefix[edge].path_prefix = prefix.clone();
+            let after = Self::mount_prefix_chains(&with_prefix);
+
+            let mut agreeing = 0usize;
+            let mut unprefixed = 0usize;
+            for endpoint in &graph.endpoints {
+                if endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute) {
+                    continue;
+                }
+                let (Some(without), Some(with)) =
+                    (before.get(&endpoint.owner), after.get(&endpoint.owner))
+                else {
+                    continue;
+                };
+                if without == with {
+                    continue; // not under this scope
+                }
+                let documents = |chains: &Vec<String>| {
+                    chains.iter().any(|chain| {
+                        documented.contains(&(
+                            endpoint.method.clone(),
+                            Self::placeholder_normalised(&Self::join_paths(chain, &endpoint.path)),
+                        ))
+                    })
+                };
+                if documents(without) {
+                    unprefixed += 1;
+                }
+                if documents(with) {
+                    agreeing += 1;
+                }
+            }
+            if agreeing > 0 && unprefixed == 0 {
+                debug!(
+                    "Mount prefix corroborated at {}: '{}' read from '{}'; this service's route \
+                     descriptors state {} of the scope's routes under it",
+                    scope.site, prefix, scope.expression, agreeing
+                );
+                graph.mounts[edge].path_prefix = prefix.clone();
+                corroborated.push(scope.scope_id.clone());
+            } else {
+                debug!(
+                    "Mount prefix left unread at {}: '{}' is documented for {} of the scope's \
+                     routes, and {} are documented without it",
+                    scope.site, prefix, agreeing, unprefixed
+                );
+            }
+        }
+        corroborated
+    }
+
+    /// A path with every placeholder segment written one way, so `{id}` and
+    /// `:id` compare equal.
+    fn placeholder_normalised(path: &str) -> String {
+        path.trim_end_matches('/')
+            .split('/')
+            .map(|segment| {
+                if carrick_match::is_param_segment(segment) {
+                    ":"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn normalize_import_source(source: &str) -> String {

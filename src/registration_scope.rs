@@ -85,6 +85,29 @@ pub struct UnreadPrefix {
     pub scope_id: String,
     /// The expression the prefix may be in, as written.
     pub expression: String,
+    /// Every distinct route path the registration's other arguments read to
+    /// (carrick#2092 slice 1b): the source states each as a literal, but
+    /// nothing says which option, if any, is the prefix. The mount graph
+    /// accepts one only where the service's own route descriptors agree.
+    pub candidates: Vec<String>,
+}
+
+impl RegistrationSite {
+    /// The distinct non-empty route paths this call's other arguments read
+    /// to, in source order.
+    fn prefix_candidates(&self) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        for value in &self.option_values {
+            if let PrefixRead::Stated(values) = &value.read {
+                for value in values {
+                    if !value.is_empty() && !candidates.contains(value) {
+                        candidates.push(value.clone());
+                    }
+                }
+            }
+        }
+        candidates
+    }
 }
 
 /// The graph node a registration scope stands for. An identifier never holds
@@ -499,6 +522,7 @@ pub fn apply_registration_scopes(
                     site: site_text.clone(),
                     scope_id: id.clone(),
                     expression: text.clone(),
+                    candidates: site.prefix_candidates(),
                 });
             }
             continue;
@@ -526,6 +550,7 @@ pub fn apply_registration_scopes(
                         site: site_text.clone(),
                         scope_id: id.clone(),
                         expression: mount.mount_path.clone(),
+                        candidates: site.prefix_candidates(),
                     });
                     mount.mount_path = String::new();
                 }

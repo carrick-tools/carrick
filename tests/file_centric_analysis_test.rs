@@ -338,6 +338,7 @@ fn test_processing_stats_tracking() {
         total_endpoints: 10,
         pubsub_anchor_backfills: 0,
         mount_prefixes_unread: 0,
+        mount_prefixes_corroborated: 0,
         pubsub_phantom_topic_drops: 0,
         graphql_document_site_drops: Default::default(),
         consumer_row_folds: Default::default(),

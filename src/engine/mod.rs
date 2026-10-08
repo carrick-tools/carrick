@@ -3177,13 +3177,16 @@ async fn analyze_current_repo_incremental(
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
             // `merged_results` keys were normalized to repo-relative paths
             // above, so provenance classification resolves against "" here.
-            let mut mount_graph = graph_orchestrator.build_mount_graph(
+            let (mut mount_graph, _) = graph_orchestrator.build_mount_graph_reading_scopes(
                 &merged_results,
                 &normalizer,
                 std::path::Path::new(""),
                 // Keys are repo-relative here, so the import/mount resolution
                 // needs the repo root to reach the modules on disk.
                 std::path::Path::new(repo_path),
+                // The analysis reported these with the counts; the rebuild
+                // reads the same scopes so the two graphs agree (carrick#2092).
+                &analysis.unread_mount_prefixes,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Graph);
 
