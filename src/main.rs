@@ -63,6 +63,7 @@ mod preflight;
 mod progress;
 mod receiver_origin;
 mod receiver_type;
+mod registration_scope;
 mod request_summary;
 mod retry_budget;
 mod scan_health;

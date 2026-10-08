@@ -63,6 +63,7 @@ pub mod preflight;
 pub mod progress;
 pub mod receiver_origin;
 pub mod receiver_type;
+pub mod registration_scope;
 pub mod request_summary;
 pub mod retry_budget;
 pub mod scan_health;

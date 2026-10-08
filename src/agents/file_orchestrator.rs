@@ -432,6 +432,9 @@ pub struct FileCentricAnalysisResult {
     pub mount_graph: MountGraph,
     /// Processing statistics
     pub stats: ProcessingStats,
+    /// Inline-plugin registrations whose prefix the source does not state as
+    /// a literal (carrick#2092), one per scope.
+    pub unread_mount_prefixes: Vec<crate::registration_scope::UnreadPrefix>,
     /// Bundled type definitions (if sidecar was used)
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
@@ -516,6 +519,10 @@ pub struct ProcessingStats {
     /// anchors themselves are computed for every gated file; only the ones the
     /// LLM missed are counted here.
     pub pubsub_anchor_backfills: usize,
+    /// Inline-plugin registrations whose prefix the source does not state as
+    /// a literal (carrick#2092). Each is logged with its site; the scope's
+    /// routes are served without a prefix rather than under a guessed one.
+    pub mount_prefixes_unread: usize,
     /// LLM-emitted pub/sub operations dropped because their topic has no
     /// literal witness (string literal or template-literal shape) in the
     /// analyzed file's source (carrick#311). The analyzer occasionally invents
@@ -681,6 +688,9 @@ struct FileSymbols {
     /// Which import each local binding's value traces back to (carrick#666).
     /// Constrains the package-surface member join below.
     receiver_origins: ReceiverOrigins,
+    /// Calls that hand an inline function the instance it registers routes
+    /// on (carrick#2092), read after the join.
+    registration_sites: Vec<crate::registration_scope::RegistrationSite>,
 }
 
 /// Where one request member is declared (carrick#656).
@@ -1669,6 +1679,7 @@ impl FileOrchestrator {
         // read as "the model said nothing about it" and freeze the skip for as
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        let mut unread_prefixes: Vec<crate::registration_scope::UnreadPrefix> = Vec::new();
         let mut stats = ProcessingStats::default();
         // Every path that reaches a prompt is reduced against this (see
         // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
@@ -1830,6 +1841,9 @@ impl FileOrchestrator {
             /// Call sites whose callee provably sends nothing (carrick#1555),
             /// by span start: a model row at one is withdrawn after the join.
             silent_sites: BTreeSet<u32>,
+            /// Calls in this file that hand an inline function the instance
+            /// it registers routes on (carrick#2092).
+            registration_sites: Vec<crate::registration_scope::RegistrationSite>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1885,6 +1899,7 @@ impl FileOrchestrator {
             member_deficits: &mut HashMap<String, u32>,
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
             dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
+            unread_prefixes: &mut Vec<crate::registration_scope::UnreadPrefix>,
         ) {
             // A model row at a site whose callee provably sends nothing is
             // the model reading a request into a name (carrick#1555).
@@ -1948,6 +1963,18 @@ impl FileOrchestrator {
             // router's structural entries instead of both surviving and flipping
             // form between non-deterministic scans.
             FileOrchestrator::canonicalize_endpoint_paths(adjusted);
+
+            // Give each inline plugin's instance a node of its own and state
+            // its prefix where the source does (carrick#2092). After the
+            // paths are canonical, and over the joined rows on both arms, so
+            // a cached answer gets it without a model call.
+            let unread = crate::registration_scope::apply_registration_scopes(
+                adjusted,
+                &pf.registration_sites,
+                &pf.prompt_path,
+            );
+            stats.mount_prefixes_unread += unread.len();
+            unread_prefixes.extend(unread);
 
             // Drop LLM-emitted pub/sub ops whose topic has no literal
             // witness in the file's source (carrick#311): the analyzer
@@ -2466,6 +2493,7 @@ impl FileOrchestrator {
                 request_members: symbols.request_members,
                 dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
+                registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
@@ -2934,6 +2962,7 @@ impl FileOrchestrator {
                 request_members: RequestMemberIndex::default(),
                 dispatch_members: DispatchMemberIndex::default(),
                 receiver_origins: ReceiverOrigins::default(),
+                registration_sites: symbols.registration_sites,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
                 dispatch_sites: HashMap::new(),
@@ -3195,6 +3224,7 @@ impl FileOrchestrator {
                 raw_model_results: HashMap::new(),
                 mount_graph: MountGraph::new(),
                 stats,
+                unread_mount_prefixes: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -3433,6 +3463,7 @@ impl FileOrchestrator {
                         &mut member_deficits,
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
+                        &mut unread_prefixes,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -3513,6 +3544,7 @@ impl FileOrchestrator {
                         &mut member_deficits,
                         &mut resolved_member_rows,
                         &mut dispatch_sites,
+                        &mut unread_prefixes,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -3801,6 +3833,7 @@ impl FileOrchestrator {
             raw_model_results,
             mount_graph,
             stats,
+            unread_mount_prefixes: unread_prefixes,
             bundled_types: None,
             type_resolution: None,
         })
@@ -5867,6 +5900,9 @@ impl FileOrchestrator {
         // Same parse again: the origins are read off the declarators the
         // extractors above already walked.
         let receiver_origins = collect_receiver_origins(&module);
+        // Same parse again (carrick#2092): the resolver's scopes are what
+        // read a prefix binding by its declaration rather than its name.
+        let registration_sites = crate::registration_scope::collect_registration_sites(&module, cm);
 
         FileSymbols {
             table: SymbolTable {
@@ -5880,6 +5916,7 @@ impl FileOrchestrator {
             request_members,
             dispatch_members,
             receiver_origins,
+            registration_sites,
         }
     }
 
@@ -10033,13 +10070,22 @@ impl FileOrchestrator {
                     continue;
                 }
 
-                // Try to resolve the owner using import information
-                let resolved_owner = Self::resolve_endpoint_owner(
-                    &owner_bindings,
-                    &import_map,
-                    &endpoint.owner_node,
-                    file_path,
-                );
+                // Try to resolve the owner using import information. A
+                // registration scope (carrick#2092) is already the node its
+                // routes hang from: the file-first identity would hand them
+                // to the plugin binding the file is mounted under and drop
+                // the scope's own prefix.
+                let resolved_owner = if crate::registration_scope::is_scope_id(&endpoint.owner_node)
+                {
+                    endpoint.owner_node.clone()
+                } else {
+                    Self::resolve_endpoint_owner(
+                        &owner_bindings,
+                        &import_map,
+                        &endpoint.owner_node,
+                        file_path,
+                    )
+                };
 
                 graph.endpoints.push(ResolvedEndpoint {
                     method,
