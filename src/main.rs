@@ -8,6 +8,7 @@ mod binding_scope;
 mod boundary;
 mod call_base;
 mod call_graph;
+mod call_reach;
 mod call_site_extractor;
 mod client_semantics;
 mod cloud_storage;

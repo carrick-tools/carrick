@@ -8,6 +8,7 @@ pub mod binding_scope;
 pub mod boundary;
 pub mod call_base;
 pub mod call_graph;
+pub mod call_reach;
 pub mod call_site_extractor;
 pub mod client_semantics;
 pub mod cloud_storage;

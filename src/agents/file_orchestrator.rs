@@ -50,7 +50,7 @@ use crate::{
     operation::{OperationKey, Protocol},
     parser::parse_file,
     receiver_origin::{ReceiverOrigins, collect_receiver_origins},
-    request_summary::{RequestSummaryIndex, SummaryRow},
+    request_summary::{RequestSummaryIndex, RequestSummaryInputs, SummaryRow},
     services::type_sidecar::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
@@ -79,8 +79,8 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Ident, Lit, ModuleDecl, ModuleItem,
-    Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator,
+    BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Lit, ModuleDecl, ModuleItem, Pat, Str,
+    Tpl, TsEntityName, TsType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
@@ -322,7 +322,7 @@ pub fn merge_part_answers(
 
 /// What asking a file in parts reads of it (carrick#1898): the inputs of its
 /// whole prompt, the order that prompt lists its candidates in, and which of
-/// its attached modules each imported name reaches.
+/// its attached modules each of its call sites reaches.
 struct PartedFile<'a> {
     prompt_path: &'a str,
     content: &'a str,
@@ -333,78 +333,9 @@ struct PartedFile<'a> {
     graphql_producer_hints: &'a [String],
     graphql_consumer_hints: &'a [String],
     wrapper_context: &'a [String],
-    wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
-}
-
-/// Every place a file's source names one of `imports`, as (where the name
-/// starts, the modules it reaches).
-struct ImportReferences<'a> {
-    imports: &'a BTreeMap<String, Vec<usize>>,
-    found: Vec<(u32, &'a [usize])>,
-}
-
-impl Visit for ImportReferences<'_> {
-    /// Bindings and references. A property name (`x.name`, `{ name: 1 }`) is
-    /// not an `Ident`, so it is not read as naming an import.
-    fn visit_ident(&mut self, ident: &Ident) {
-        if let Some(modules) = self.imports.get(ident.sym.as_ref()) {
-            self.found.push((ident.span.lo.0, modules));
-        }
-    }
-}
-
-/// For each listed candidate, the attached modules its source span names
-/// through an import, as positions in the file's `wrapper_context`
-/// (carrick#1898).
-///
-/// Read off the syntax tree: an identifier inside the candidate's span that is
-/// one of the file's imported names reaches the modules that import stands
-/// for. `None` when the file does not parse here; the caller then keeps every
-/// module in every part, because a module that cannot be shown to be unnamed
-/// is not left out.
-fn modules_named_by_candidates(file: &PartedFile<'_>) -> Option<Vec<BTreeSet<usize>>> {
-    if file.wrapper_imports.is_empty() {
-        return Some(vec![BTreeSet::new(); file.listed.len()]);
-    }
-    use swc_common::FileName;
-    use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
-    let path = Path::new(file.prompt_path);
-    let (syntax, _) = crate::parser::syntax_for_path(path);
-    // A source map of its own, as the scan that raised the candidates used:
-    // spans count from the start of this file.
-    let source_map: Lrc<SourceMap> = Default::default();
-    let source = source_map.new_source_file(
-        Lrc::new(FileName::Real(path.to_path_buf())),
-        file.content.to_string(),
-    );
-    let lexer = Lexer::new(
-        syntax,
-        Default::default(),
-        StringInput::from(&*source),
-        None,
-    );
-    let module = Parser::new_from(lexer).parse_module().ok()?;
-    let mut references = ImportReferences {
-        imports: file.wrapper_imports,
-        found: Vec::new(),
-    };
-    module.visit_with(&mut references);
-    references.found.sort_by_key(|(start, _)| *start);
-    Some(
-        file.listed
-            .iter()
-            .map(|candidate| {
-                let from = references
-                    .found
-                    .partition_point(|(start, _)| *start < candidate.span_start);
-                references.found[from..]
-                    .iter()
-                    .take_while(|(start, _)| *start < candidate.span_end)
-                    .flat_map(|(_, modules)| modules.iter().copied())
-                    .collect()
-            })
-            .collect(),
-    )
+    /// [`crate::call_reach::Reach::sites`]: each call site that reaches one
+    /// of `wrapper_context`'s modules, with that module's place in it.
+    wrapper_sites: &'a [(u32, usize)],
 }
 
 /// Complete result of file-centric analysis
@@ -605,8 +536,9 @@ pub struct ProcessingStats {
 /// A same-repo module that itself performs HTTP and exports a binding — the
 /// shape of a request wrapper another file imports (#369/#370).
 struct WrapperModule {
-    /// The module's source, injected into the importing file's prompt so its
-    /// delegating call sites can be emitted with a resolved target.
+    /// The module's source, injected into the prompt of a file a call in
+    /// which reaches the module (carrick#1928), so its delegating call sites
+    /// can be emitted with a resolved target.
     snippet: String,
     /// The method (and body presence) every request in the module agrees on,
     /// read off the AST. `None` when the module parameterizes its method, its
@@ -1459,7 +1391,6 @@ impl FileOrchestrator {
         if wave.is_empty() {
             return Err(Box::new(verdict));
         }
-        let named = modules_named_by_candidates(file);
         // The request that was cut, to tell a part that would repeat it.
         let whole = self.file_analyzer.prompt_for(
             file.prompt_path,
@@ -1481,16 +1412,10 @@ impl FileOrchestrator {
 
         let mut answers: Vec<(usize, FileAnalysisResult)> = Vec::new();
         while !wave.is_empty() {
-            let outcomes = futures::future::join_all(wave.iter().map(|part| {
-                self.ask_part(
-                    file,
-                    guidance,
-                    part,
-                    named.as_deref(),
-                    whole.as_ref(),
-                    &verdict,
-                )
-            }))
+            let outcomes = futures::future::join_all(
+                wave.iter()
+                    .map(|part| self.ask_part(file, guidance, part, whole.as_ref(), &verdict)),
+            )
             .await;
             // `join_all` answers in the order it was given the parts, which is
             // source order, so the failure kept is the first in the source
@@ -1528,8 +1453,10 @@ impl FileOrchestrator {
     }
 
     /// Ask about one part of a file: the file's own prompt, listing only the
-    /// part's candidates and carrying only the modules those candidates name
-    /// through an import (carrick#1898).
+    /// part's candidates and carrying only the modules the part's own call
+    /// sites reach (carrick#1898). That is the rule the whole prompt attaches
+    /// by ([`crate::call_reach`], carrick#1928), applied to the call sites
+    /// written inside the part's candidates.
     ///
     /// A part whose prompt is byte for byte the request that was cut is not
     /// sent: its verdict is the one already given.
@@ -1538,7 +1465,6 @@ impl FileOrchestrator {
         file: &PartedFile<'_>,
         guidance: &crate::agents::framework_guidance_agent::FrameworkGuidance,
         part: &CandidatePart,
-        named: Option<&[BTreeSet<usize>]>,
         whole: Option<&crate::agents::file_analyzer_agent::AnalysisPrompt>,
         verdict: &crate::agent_service::AgentCallError,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
@@ -1552,16 +1478,20 @@ impl FileOrchestrator {
             .map(|position| file.candidate_contexts[*position].clone())
             .collect();
         // In the context's own order, which is the modules' sorted order.
-        let modules: Vec<String> = match named {
-            Some(named) => positions
-                .iter()
-                .flat_map(|position| named[*position].iter().copied())
-                .collect::<BTreeSet<usize>>()
-                .into_iter()
-                .map(|place| file.wrapper_context[place].clone())
-                .collect(),
-            None => file.wrapper_context.to_vec(),
-        };
+        let modules: Vec<String> = positions
+            .iter()
+            .flat_map(|position| {
+                let candidate = &file.listed[*position];
+                crate::call_reach::places_within(
+                    file.wrapper_sites,
+                    candidate.span_start,
+                    candidate.span_end,
+                )
+            })
+            .collect::<BTreeSet<usize>>()
+            .into_iter()
+            .map(|place| file.wrapper_context[place].clone())
+            .collect();
         let prompt = self.file_analyzer.prompt_for(
             file.prompt_path,
             file.content,
@@ -1646,6 +1576,12 @@ impl FileOrchestrator {
         // sidecar that never became ready, or a failed request — leaves every
         // such site exactly where it was: the model's to classify.
         sidecar: Option<&TypeSidecar>,
+        // What discovery resolved for THIS service: where each call site
+        // lands and what each import binding names. Read before the model is
+        // asked, to keep the source of a module a file imports out of its
+        // prompt unless a call in the file reaches that module
+        // (carrick#1928).
+        call_resolution: &RequestSummaryInputs,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -1767,23 +1703,30 @@ impl FileOrchestrator {
             /// file; cloned per-pending so the concurrent dispatch closure owns
             /// its copy. Empty for repos with no unanchored GraphQL consumers.
             graphql_consumer_hints: Vec<String>,
-            /// Source of same-repo HTTP wrapper modules this file imports
-            /// (#369 — cross-file wrapper-site resolution). Injected into the
-            /// user message so call sites of an imported wrapper can be emitted
-            /// as resolved data calls. Empty for files with no such imports.
+            /// Source of the same-repo HTTP wrapper modules this file imports
+            /// and a call in it reaches (#369 — cross-file wrapper-site
+            /// resolution; carrick#1928, [`crate::call_reach`]). Injected
+            /// into the user message so call sites of an imported wrapper can
+            /// be emitted as resolved data calls. Empty for files with no
+            /// such call.
             wrapper_context: Vec<String>,
-            /// Which of `wrapper_context`'s modules each imported local name
-            /// reaches, as positions in it (carrick#1898). A file asked in
-            /// parts gives each part only the modules its own candidates name
-            /// through an import. Empty for files with no such imports.
-            wrapper_imports: BTreeMap<String, Vec<usize>>,
-            /// The request shape every wrapper module behind `wrapper_context`
-            /// agrees on (carrick-cloud#386): the literal HTTP method, and
-            /// whether the request carries a body. `None` — the common case —
-            /// whenever the wrappers parameterize the method, disagree, or this
-            /// file imports none. Propagated onto the resolved call sites after
-            /// the LLM pass, because the delegating site itself carries no
-            /// method and would otherwise default to GET.
+            /// [`crate::call_reach::Reach::sites`]: each call site that
+            /// reaches one of `wrapper_context`'s modules, with that module's
+            /// place in it. A file asked in parts gives each part only the
+            /// modules the call sites inside its own candidates reach
+            /// (carrick#1898).
+            wrapper_sites: Vec<(u32, usize)>,
+            /// The request shape every wrapper module this file imports by a
+            /// relative specifier agrees on (carrick-cloud#386): the literal
+            /// HTTP method, and whether the request carries a body. `None` —
+            /// the common case — whenever the wrappers parameterize the
+            /// method, disagree, or this file imports none. Propagated onto
+            /// the resolved call sites after the LLM pass, because the
+            /// delegating site itself carries no method and would otherwise
+            /// default to GET. Folded over every wrapper module the file
+            /// imports, as it was before carrick#1928, not over the ones
+            /// `wrapper_context` keeps: that change moves what the model is
+            /// asked and no row the scanner states.
             wrapper_request_shape: Option<WrapperRequestShape>,
             /// Pub/sub operations asserted deterministically from the AST
             /// (carrick#387), merged in after the LLM pass so an extraction
@@ -1833,10 +1776,13 @@ impl FileOrchestrator {
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
-        /// repo's wrapper modules are known (#369): if it imports a same-repo
-        /// module that performs HTTP, it is rescued into the LLM pass with
-        /// that wrapper's source as context; otherwise it is skipped exactly
-        /// as before. Content is deliberately NOT retained — most files in a
+        /// repo's wrapper modules are known (#369): if a call in it reaches a
+        /// same-repo module that performs HTTP, it is rescued into the LLM
+        /// pass with that wrapper's source as context (carrick#1928);
+        /// otherwise it is skipped. Importing such a module without calling
+        /// into it rescues nothing.
+        ///
+        /// Content is deliberately NOT retained — most files in a
         /// repo land here, so holding their bodies would spike peak memory to
         /// roughly the repo's source size; the rare rescued file is re-read.
         /// A file no model is asked about whose request-summary rows are
@@ -2459,7 +2405,7 @@ impl FileOrchestrator {
                 },
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
-                wrapper_imports: BTreeMap::new(),
+                wrapper_sites: Vec::new(),
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
@@ -2528,8 +2474,14 @@ impl FileOrchestrator {
         }
 
         // Attach wrapper context to files that import a wrapper module via a
-        // RELATIVE specifier (v1 scope: `./`/`../` only — tsconfig path
-        // aliases would need sidecar-grade resolution).
+        // RELATIVE specifier (`./`/`../` only; an alias or a package name is
+        // carrick#474), and of those modules only the ones a call in the file
+        // reaches (carrick#1928): the call graph says where the site lands,
+        // or the site is rooted at a binding the file imports from the
+        // module. So the call rule only ever removes a module from a prompt.
+        // See `crate::call_reach` and docs/reference/module-resolution.md,
+        // "What a prompt attaches".
+        let mut module_reach = crate::call_reach::ModuleReach::new(call_resolution);
         // Re-export specifiers per module, memoized across every importer in the
         // repo (#472): the follow only runs on a `wrapper_map` miss, which is the
         // common case, so without this a scan would re-parse the same barrels
@@ -2593,10 +2545,6 @@ impl FileOrchestrator {
                     }
                     import_owners.insert(local_name.clone(), owner);
                 }
-                // The wrapper modules each imported module stands for, kept so
-                // a file asked in parts can say which of them one imported
-                // name reaches (carrick#1898).
-                let mut wrappers_behind: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
                     else {
@@ -2608,20 +2556,17 @@ impl FileOrchestrator {
                     if wrapper_map.is_empty() {
                         continue;
                     }
-                    let behind = Self::wrapper_modules_behind(
+                    matched.extend(Self::wrapper_modules_behind(
                         &resolved,
                         self_canon.as_ref(),
                         &wrapper_map,
                         &mut reexport_cache,
                         &cm,
                         &handler,
-                    );
-                    matched.extend(behind.iter().cloned());
-                    wrappers_behind.insert(resolved, behind);
+                    ));
                 }
-                // `imported_symbols` is a HashMap, so sort before materializing
-                // the prompt context: identical inputs must yield identical
-                // wrapper context.
+                // `imported_symbols` is a HashMap, so sort before folding:
+                // identical inputs must yield an identical shape.
                 matched.sort();
                 matched.dedup();
                 pf.wrapper_request_shape = wrapper_request_shape::fold_wrappers(
@@ -2630,32 +2575,29 @@ impl FileOrchestrator {
                         .filter_map(|path| wrapper_map.get(path))
                         .map(|module| module.request_shape.as_ref()),
                 );
-                pf.wrapper_context = matched
-                    .iter()
-                    .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
-                    .collect();
-                // Every matched path came out of `wrapper_map`
-                // (`wrapper_modules_behind` returns nothing else), so the
-                // context holds one snippet per matched path in the same
-                // order, and a path's place in `matched` is its snippet's
-                // place in the context. Only a file with candidates can be
-                // asked in parts.
-                debug_assert_eq!(pf.wrapper_context.len(), matched.len());
-                if !pf.listed.is_empty() {
-                    pf.wrapper_imports = import_owners
+                // What the prompt carries: of the wrapper modules the import
+                // table reaches (`matched`), the ones a call in this file
+                // reaches, in sorted order (carrick#1928). Every matched path
+                // came out of `wrapper_map` (`wrapper_modules_behind` returns
+                // nothing else), so the context holds one snippet per module
+                // of the reach in the same order, and a module's place in the
+                // reach is its snippet's place in the context.
+                if !matched.is_empty() {
+                    let reach = module_reach.of(&importer, &pf.content, |module| {
+                        matched
+                            .binary_search_by(|imported| imported.as_path().cmp(module))
+                            .is_ok()
+                    });
+                    pf.wrapper_context = reach
+                        .modules
                         .iter()
-                        .filter_map(|(local_name, owner)| {
-                            let behind = wrappers_behind.get(owner.as_ref()?)?;
-                            let places: Vec<usize> = behind
-                                .iter()
-                                .filter_map(|path| matched.binary_search(path).ok())
-                                .collect();
-                            (!places.is_empty()).then(|| (local_name.clone(), places))
-                        })
+                        .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                         .collect();
+                    debug_assert_eq!(pf.wrapper_context.len(), reach.modules.len());
+                    pf.wrapper_sites = reach.sites;
                 }
                 // Members reached directly by a relative import, plus those
-                // behind a re-export barrel the wrapper pass already followed,
+                // behind a re-export barrel the pass above already followed,
                 // and then one hop further: the modules those import. A
                 // factory that constructs the client and hands it back inside
                 // a record is the common shape (carrick#655): the consumer
@@ -2817,9 +2759,12 @@ impl FileOrchestrator {
         }
 
         // Rescue or finalize the deferred zero-candidate skips: a file that
-        // imports a wrapper module is force-analyzed with the wrapper's source
-        // as context (its call sites are the repo's real outbound calls);
-        // everything else is skipped exactly as before this pass existed.
+        // imports a wrapper module and holds a call that reaches it is
+        // force-analyzed with that wrapper's source as context (its call sites
+        // are the repo's real outbound calls); everything else is skipped.
+        // Importing a wrapper module is not enough: a file that only names
+        // one in a type, hands it on as an argument or never uses it has no
+        // call for the model to resolve through it (carrick#1928).
         for deferred in deferred_zero_candidates {
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut matched: Vec<PathBuf> = Vec::new();
@@ -2851,11 +2796,28 @@ impl FileOrchestrator {
                     .filter_map(|path| wrapper_map.get(path))
                     .map(|module| module.request_shape.as_ref()),
             );
-            let ctx: Vec<String> = matched
+            // Of the wrapper modules the file imports, the ones a call in it
+            // reaches (carrick#1928). The file is read again only where it
+            // imports one: content was not retained at defer time (memory),
+            // and a file that cannot be read now reaches nothing.
+            let content = (!matched.is_empty())
+                .then(|| std::fs::read_to_string(&deferred.file_path).ok())
+                .flatten();
+            let ctx: Vec<String> = content
+                .as_deref()
+                .map(|content| {
+                    module_reach.of(&deferred.file_path, content, |module| {
+                        matched
+                            .binary_search_by(|imported| imported.as_path().cmp(module))
+                            .is_ok()
+                    })
+                })
+                .unwrap_or_default()
+                .modules
                 .iter()
                 .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                 .collect();
-            if ctx.is_empty() {
+            let (Some(content), false) = (content, ctx.is_empty()) else {
                 debug!(
                     "Skipped (no API patterns): {} [0 candidates]",
                     deferred.path_str
@@ -2878,22 +2840,11 @@ impl FileOrchestrator {
                 });
                 file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
-            }
+            };
             debug!(
-                "Force-analyzing wrapper-importing file (no HTTP candidates): {}",
+                "Force-analyzing a file that calls into a wrapper module (no HTTP candidates): {}",
                 deferred.path_str
             );
-            // Re-read the rescued file: content was not retained at defer time
-            // (memory), and the file was readable moments ago in this pass.
-            let Ok(content) = std::fs::read_to_string(&deferred.file_path) else {
-                warn!(
-                    "Wrapper-importing file became unreadable, skipping: {}",
-                    deferred.path_str
-                );
-                stats.files_skipped += 1;
-                file_results.insert(deferred.path_str, FileAnalysisResult::default());
-                continue;
-            };
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
                 prompt_path: crate::utils::repo_relative_source_path(
@@ -2920,8 +2871,8 @@ impl FileOrchestrator {
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
                 // No candidate, so the file is never asked in parts and
-                // nothing reads which name reaches which module.
-                wrapper_imports: BTreeMap::new(),
+                // nothing reads which call site reaches which module.
+                wrapper_sites: Vec::new(),
                 wrapper_request_shape: rescued_shape,
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
@@ -3267,7 +3218,7 @@ impl FileOrchestrator {
                                 graphql_producer_hints: &pf.graphql_producer_hints,
                                 graphql_consumer_hints: &pf.graphql_consumer_hints,
                                 wrapper_context: &pf.wrapper_context,
-                                wrapper_imports: &pf.wrapper_imports,
+                                wrapper_sites: &pf.wrapper_sites,
                             };
                             self.ask_in_parts(&file, guidance, verdict).await
                         }
@@ -21895,103 +21846,6 @@ export async function POST(request: Request): Promise<Response> {
                 "a row that differs in any field is a row of its own"
             );
         }
-    }
-
-    /// The spans of the calls in `source` that start with `callee`, one a
-    /// line, as the scanner numbers them.
-    fn calls_of(source: &str, callee: &str) -> Vec<(u32, u32)> {
-        let mut spans = Vec::new();
-        let mut offset = 0;
-        for line in source.split_inclusive('\n') {
-            if let Some(at) = line.find(callee) {
-                let start = (offset + at) as u32 + crate::swc_scanner::SWC_SPAN_BASE;
-                let end = (offset + line.rfind(')').expect("a call") + 1) as u32
-                    + crate::swc_scanner::SWC_SPAN_BASE;
-                spans.push((start, end));
-            }
-            offset += line.len();
-        }
-        spans
-    }
-
-    fn parted<'a>(
-        content: &'a str,
-        listed: &'a [ListedCandidate],
-        wrapper_imports: &'a BTreeMap<String, Vec<usize>>,
-        no_symbols: &'a HashMap<String, ImportedSymbol>,
-    ) -> PartedFile<'a> {
-        PartedFile {
-            prompt_path: "src/table.ts",
-            content,
-            listed,
-            candidate_hints: &[],
-            candidate_contexts: &[],
-            imported_symbols: no_symbols,
-            graphql_producer_hints: &[],
-            graphql_consumer_hints: &[],
-            wrapper_context: &[],
-            wrapper_imports,
-        }
-    }
-
-    #[test]
-    fn a_candidate_names_the_modules_its_own_span_imports() {
-        let source = "\
-import { alpha } from \"./alpha\";
-import * as beta from \"./beta\";
-declare const table: any;
-declare const other: any;
-table.get(\"/a\", alpha);
-table.get(\"/b\", (request: any) => beta.run(request));
-table.get(\"/c\", other.alpha);
-table.get(\"/d\", \"alpha\");
-table.get(\"/e\", () => alpha(beta));
-";
-        let listed = listed_at(&calls_of(source, "table.get("));
-        assert_eq!(listed.len(), 5);
-        let imports: BTreeMap<String, Vec<usize>> = [
-            ("alpha".to_string(), vec![0]),
-            ("beta".to_string(), vec![1]),
-        ]
-        .into();
-        let no_symbols = HashMap::new();
-
-        let named = modules_named_by_candidates(&parted(source, &listed, &imports, &no_symbols))
-            .expect("the file parses");
-        let named: Vec<Vec<usize>> = named
-            .into_iter()
-            .map(|modules| modules.into_iter().collect())
-            .collect();
-        assert_eq!(
-            named,
-            [
-                vec![0],    // the imported binding itself
-                vec![1],    // inside the handler written at the call
-                vec![],     // a property that shares the import's name
-                vec![],     // a string that spells it
-                vec![0, 1], // both
-            ]
-        );
-    }
-
-    /// A file that cannot be read as a module here says nothing about what
-    /// its candidates name, so nothing is concluded from it.
-    #[test]
-    fn a_file_that_does_not_parse_names_nothing_and_says_so() {
-        let source = "table.get(\"/a\", alpha;\n";
-        let listed = listed_at(&[(1, 10)]);
-        let imports: BTreeMap<String, Vec<usize>> = [("alpha".to_string(), vec![0])].into();
-        let no_symbols = HashMap::new();
-        assert!(
-            modules_named_by_candidates(&parted(source, &listed, &imports, &no_symbols)).is_none()
-        );
-        // With no imported module to name, there is nothing to read the file
-        // for, and every candidate names none.
-        let none = BTreeMap::new();
-        assert_eq!(
-            modules_named_by_candidates(&parted(source, &listed, &none, &no_symbols)),
-            Some(vec![BTreeSet::new()])
-        );
     }
 
     #[test]

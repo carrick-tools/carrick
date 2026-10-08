@@ -226,6 +226,7 @@ async fn deterministic_rows(installed: bool, source: &str) -> Option<Rows> {
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             Some(&sidecar),
+            &Default::default(),
         )
         .await
         .expect("analysis should succeed");
