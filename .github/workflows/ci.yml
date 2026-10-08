@@ -37,8 +37,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
 
-      - name: Run library tests
-        run: cargo test --lib --verbose
+      # cargo-nextest runs each test in its own process and the processes of
+      # every binary in parallel, where `cargo test` runs one binary after
+      # another (the fast-integration step alone was 762 s that way). Pinned
+      # to a release commit; the action downloads the prebuilt binary.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: nextest@0.9.148
+
+      # The library tests share one nextest run with the fast integration
+      # tests below, so they fill the same worker pool. `cargo test --lib`
+      # never ran doc tests, so nothing is dropped; carrick-match stays on
+      # cargo test.
 
       - name: Run capability sheet test
         run: cargo test --test capability_sheet_test --verbose
@@ -92,9 +103,10 @@ jobs:
       # (workflow_dispatch), NOT here. action_install_test is the Action's
       # dependency-install step (carrick#706), which uses a `file:` dependency
       # and so needs no registry.
-      - name: Run fast integration tests
+      - name: Run library and fast integration tests
         run: >-
-          cargo test --verbose
+          cargo nextest run --no-fail-fast
+          --lib
           --test action_install_test
           --test alias_import_callers_test
           --test alias_shaped_type_imports_test
