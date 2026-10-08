@@ -2967,8 +2967,8 @@ export class TypeInferrer {
           kind: 'unknown',
           reason: 'no_request_body',
           detail:
-            `the located argument is the call's request config, and it sets no '${inCall.member}' ` +
-            'member, which is where the call takes its body, so the call sends no request body',
+            `the call's request config sets no '${inCall.member}' member, which is where the call ` +
+            'takes its body, so the call sends no request body',
         },
       ];
       return abstain;
