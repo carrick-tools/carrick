@@ -39,10 +39,11 @@ use crate::module_aliases::{
 };
 use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_manifest};
 
-/// Source extensions a specifier may resolve to, in the order they are tried.
-/// TypeScript first: in a repo that has both, the `.ts` file is the source and
-/// the `.js` file is build output that the walk usually excludes anyway.
-const SOURCE_EXTENSIONS: [&str; 4] = ["ts", "tsx", "js", "jsx"];
+// Source extensions a specifier may resolve to, in the order they are tried:
+// the scan's own list, TypeScript first. In a repo that has both, the `.ts`
+// file is the source and the `.js` file is build output that the walk usually
+// excludes anyway.
+use crate::file_finder::SOURCE_EXTENSIONS;
 
 /// What a module specifier names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,7 +672,7 @@ impl WorkspaceIndex {
             if file
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| e == "ts" || e == "tsx")
+                .is_some_and(|e| matches!(e, "ts" | "tsx" | "mts" | "cts"))
             {
                 return Some(file);
             }
@@ -703,7 +704,7 @@ impl WorkspaceIndex {
         let has_source_extension = base
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e));
+            .is_some_and(crate::file_finder::is_source_extension);
         if has_source_extension && self.exists(base) {
             return Some(base.to_path_buf());
         }
@@ -718,7 +719,14 @@ impl WorkspaceIndex {
             }
         }
 
-        for (written, source) in [("js", "ts"), ("js", "tsx"), ("jsx", "tsx"), ("jsx", "ts")] {
+        for (written, source) in [
+            ("js", "ts"),
+            ("js", "tsx"),
+            ("jsx", "tsx"),
+            ("jsx", "ts"),
+            ("mjs", "mts"),
+            ("cjs", "cts"),
+        ] {
             if let Some(stem) = name.strip_suffix(&format!(".{}", written)) {
                 let candidate = parent.join(format!("{}.{}", stem, source));
                 if self.exists(&candidate) {

@@ -202,6 +202,7 @@ jobs:
           --test mock_storage_test
           --test module_resolution_parity_test
           --test new_url_target_test
+          --test node_module_extensions_test
           --test object_export_surface_test
           --test object_key_url_wrapper_test
           --test output_contract_test

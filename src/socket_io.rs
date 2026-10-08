@@ -272,7 +272,7 @@ pub fn scan_files(service_files: &[PathBuf], socket_clients: &[String]) -> Socke
         let is_script = file
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "js" | "jsx"));
+            .is_some_and(crate::file_finder::is_source_extension);
         if !is_script {
             continue;
         }

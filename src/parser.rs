@@ -14,7 +14,8 @@ use tracing::warn;
 ///
 /// Two facts decide it, and nothing else:
 ///
-/// - **TypeScript or ES**, from `.ts`/`.tsx` against everything else.
+/// - **TypeScript or ES**, from `.ts`/`.tsx`/`.mts`/`.cts` against everything
+///   else. `.mts`/`.cts` never hold JSX, as `.ts` does not (carrick#904).
 ///   Decorators are enabled on the TypeScript arms so a decorated class parses
 ///   into `Decorator` nodes instead of failing outright.
 /// - **JSX**, which is enabled for every ES parse (carrick#803). Keying JSX on
@@ -27,7 +28,7 @@ use tracing::warn;
 ///   valid file parses, which is why the extension still decides it.
 pub(crate) fn syntax_for_path(file_path: &Path) -> (Syntax, bool) {
     match file_path.extension().and_then(|ext| ext.to_str()) {
-        Some("ts") => (
+        Some("ts" | "mts" | "cts") => (
             Syntax::Typescript(TsSyntax {
                 decorators: true,
                 ..Default::default()

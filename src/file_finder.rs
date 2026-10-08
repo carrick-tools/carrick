@@ -36,23 +36,40 @@ const TEST_DIR_NAMES: &[&str] = &[
     ".storybook",
 ];
 
-const TEST_FILE_SUFFIXES: &[&str] = &[
-    ".test.ts",
-    ".test.tsx",
-    ".spec.ts",
-    ".spec.tsx",
-    ".test.js",
-    ".test.jsx",
-    ".spec.js",
-    ".spec.jsx",
+/// The source extensions a scan reads, TypeScript first: every gate that asks
+/// "is this file source?" and every resolver that tries extensions in turn
+/// reads this one list, so they cannot disagree about a file (carrick#904).
+/// The ES-module and CommonJS spellings (`.mjs`/`.cjs`, `.mts`/`.cts`) are the
+/// same languages as `.js`/`.ts`; the extension names how Node loads the
+/// module, not what the scanner reads in it. A declaration file
+/// (`.d.ts`/`.d.mts`/`.d.cts`) carries a source extension and is walked like
+/// any other; the resolvers that care skip it by name.
+pub const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+/// Whether `extension` (without the dot, any case) is one the scan reads.
+pub fn is_source_extension(extension: &str) -> bool {
+    SOURCE_EXTENSIONS
+        .iter()
+        .any(|source| source.eq_ignore_ascii_case(extension))
+}
+
+/// Whether `path` ends in one of [`SOURCE_EXTENSIONS`].
+pub fn has_source_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(is_source_extension)
+}
+
+/// File-name infixes that mark a source file as a test or a story, matched
+/// before any [`SOURCE_EXTENSIONS`] entry: `x.test.mjs` is as much a test as
+/// `x.test.ts`.
+const TEST_FILE_INFIXES: &[&str] = &[
+    ".test", ".spec",
     // Storybook stories are dev-only component showcases: they never run in
     // production, so any fetch/publish inside one is not a real contract
-    // surface — and on UI-heavy repos they are numerous enough to matter for
-    // LLM-analysis cost (metamask-extension alone has hundreds).
-    ".stories.ts",
-    ".stories.tsx",
-    ".stories.js",
-    ".stories.jsx",
+    // surface — and on UI-heavy repos they number in the hundreds, enough to
+    // matter for LLM-analysis cost.
+    ".stories",
 ];
 
 /// Directory-name conventions that mark a subtree as mock/test-double code
@@ -106,15 +123,15 @@ pub fn is_under_test_dir(path: &Path, root_dir: &Path) -> bool {
 }
 
 fn has_test_suffix(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| {
-            let lower = name.to_ascii_lowercase();
-            TEST_FILE_SUFFIXES
-                .iter()
-                .any(|suffix| lower.ends_with(suffix))
+    if !has_source_extension(path) {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            let lower = stem.to_ascii_lowercase();
+            TEST_FILE_INFIXES.iter().any(|infix| lower.ends_with(infix))
         })
-        .unwrap_or(false)
 }
 
 fn is_test_path(path: &Path, root_dir: &Path) -> bool {
@@ -123,8 +140,8 @@ fn is_test_path(path: &Path, root_dir: &Path) -> bool {
 
 /// Whether a scan rooted at `root_dir` would read this file at all.
 ///
-/// The one statement of what the scanner's input IS: the four extensions
-/// [`find_files`] collects, minus the test paths it skips. Purely a question
+/// The one statement of what the scanner's input IS: the
+/// [`SOURCE_EXTENSIONS`] [`find_files`] collects, minus the test paths it skips. Purely a question
 /// about the path, so it answers for a file that has been deleted as readily
 /// as for one on disk.
 ///
@@ -134,16 +151,7 @@ fn is_test_path(path: &Path, root_dir: &Path) -> bool {
 /// user who had just finished onboarding that six files had moved under their
 /// brand-new index (carrick#1007 item 5).
 pub fn is_scanned_source(path: &Path, root_dir: &Path) -> bool {
-    let Some(extension) = path.extension() else {
-        return false;
-    };
-    if !matches!(
-        extension.to_string_lossy().to_lowercase().as_str(),
-        "js" | "ts" | "jsx" | "tsx"
-    ) {
-        return false;
-    }
-    !is_test_path(path, root_dir)
+    has_source_extension(path) && !is_test_path(path, root_dir)
 }
 
 /// Whether any path segment BELOW the scan root matches an ignore pattern
@@ -1062,6 +1070,37 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use tempfile::tempdir;
+
+    /// Node's module spellings are source, and a test or story file is left
+    /// out whichever spelling it uses (carrick#904).
+    #[test]
+    fn every_module_spelling_is_scanned_source() {
+        let root = Path::new("/repo");
+        for name in [
+            "a.ts", "a.tsx", "a.mts", "a.cts", "a.js", "a.jsx", "a.mjs", "a.cjs", "A.MJS",
+        ] {
+            assert!(
+                is_scanned_source(&root.join("src").join(name), root),
+                "{name} is source"
+            );
+        }
+        for name in [
+            "a.test.mjs",
+            "a.spec.cjs",
+            "a.test.mts",
+            "a.spec.cts",
+            "a.stories.mjs",
+            "a.test.ts",
+            "a.json",
+            "a.css",
+            "Makefile",
+        ] {
+            assert!(
+                !is_scanned_source(&root.join("src").join(name), root),
+                "{name} is not scanned source"
+            );
+        }
+    }
 
     #[test]
     fn service_manifest_accepts_deno_and_prefers_package_json() {

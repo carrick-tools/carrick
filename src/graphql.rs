@@ -501,7 +501,7 @@ pub fn scan_repo(
         let is_script = file
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "js" | "jsx"));
+            .is_some_and(crate::file_finder::is_source_extension);
         if !is_script {
             continue;
         }
@@ -750,12 +750,7 @@ pub fn file_env_reads(file_path: &Path) -> BTreeSet<String> {
     let is_script = file_path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext,
-                "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
-            )
-        });
+        .is_some_and(crate::file_finder::is_source_extension);
     if !is_script {
         return BTreeSet::new();
     }

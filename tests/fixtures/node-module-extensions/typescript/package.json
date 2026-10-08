@@ -1,0 +1,1 @@
+{ "name": "orders-node-modules-typed", "private": true, "type": "module", "main": "src/server.mts" }

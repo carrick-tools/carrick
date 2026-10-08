@@ -281,7 +281,7 @@ pub fn collect_document_site_consumers(
         let is_script = file
             .extension()
             .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mts" | "cts"));
+            .is_some_and(crate::file_finder::is_source_extension);
         if !is_script {
             continue;
         }
