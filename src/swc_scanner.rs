@@ -356,6 +356,12 @@ pub struct RouteDescriptorEndpoint {
     /// The handler identifier (`healthCheckHandler`) — the route's real owner.
     /// `None` when the handler is absent or not a bare identifier.
     pub handler: Option<String>,
+    /// Whether the descriptor's `handler` value is one the type layer follows
+    /// to a function: an inline function or a bare identifier (carrick#2094).
+    /// A descriptor without one (a documentation entry, a `handler` read off
+    /// a member) states no body anywhere on the object, so its row asks for
+    /// no type rather than have the object literal read as the response.
+    pub handler_followable: bool,
     /// 1-based line number of the descriptor object literal.
     pub line_number: usize,
     /// Start byte offset of the descriptor object literal.
@@ -2144,6 +2150,7 @@ impl RouteDescriptorVisitor {
             method,
             path,
             handler: descriptor.handler,
+            handler_followable: descriptor.handler_followable,
             line_number: self.source_map.lookup_char_pos(span.lo).line,
             span_start: span.lo.0,
             span_end: span.hi.0,
@@ -2174,6 +2181,8 @@ struct RouteDescriptor {
     method: Option<String>,
     path: Option<String>,
     handler: Option<String>,
+    /// See [`RouteDescriptorEndpoint::handler_followable`].
+    handler_followable: bool,
 }
 
 /// Visitor that collects potential API call sites.
@@ -3024,6 +3033,7 @@ impl CandidateVisitor {
         let mut method = None;
         let mut path = None;
         let mut handler = None;
+        let mut handler_followable = false;
 
         for prop in &node.props {
             let PropOrSpread::Prop(prop) = prop else {
@@ -3059,12 +3069,32 @@ impl CandidateVisitor {
                 }
                 _ => {}
             }
+            // The type layer reads a descriptor's response off a property
+            // named `handler` in any case, through the wrappers it strips,
+            // when the value is an inline function or an identifier
+            // (carrick#2094). This states the same rule, so a row is asked
+            // for a type exactly when the answer can be the handler's.
+            if name.eq_ignore_ascii_case("handler") {
+                let mut value = &*kv.value;
+                loop {
+                    value = match value {
+                        Expr::Paren(inner) => &inner.expr,
+                        Expr::Await(inner) => &inner.arg,
+                        Expr::TsAs(inner) => &inner.expr,
+                        Expr::TsNonNull(inner) => &inner.expr,
+                        _ => break,
+                    };
+                }
+                handler_followable |=
+                    matches!(value, Expr::Arrow(_) | Expr::Fn(_) | Expr::Ident(_));
+            }
         }
 
         (has_method && has_path).then_some(RouteDescriptor {
             method,
             path,
             handler,
+            handler_followable,
         })
     }
 
@@ -4724,6 +4754,43 @@ export { routes };
         assert_eq!(endpoints[0].method, "POST");
         assert_eq!(endpoints[0].path, "/widgets");
         assert_eq!(endpoints[0].handler, None);
+        assert!(!endpoints[0].handler_followable);
+    }
+
+    #[test]
+    fn route_descriptor_handler_is_followable_only_as_a_function_or_identifier() {
+        // carrick#2094: the type layer reads a descriptor's response off its
+        // handler only when that is an inline function or an identifier.
+        let content = r#"
+const routes = [
+  { method: 'GET', path: '/a', handler: getA },
+  { method: 'GET', path: '/b', handler: async () => ({ b: 1 }) },
+  { method: 'GET', path: '/c', handler: function () { return 1; } },
+  { method: 'GET', path: '/d', Handler: (getD as Fn) },
+  { method: 'GET', path: '/e', handler: controller.getE },
+  { method: 'GET', path: '/f', handler: makeHandler() },
+  { method: 'GET', path: '/g', summary: 'documented only' },
+];
+"#;
+        let scanner = SwcScanner::new();
+        let followable: Vec<(String, bool)> = scanner
+            .route_descriptor_endpoints(&PathBuf::from("routes.ts"), content)
+            .into_iter()
+            .map(|d| (d.path, d.handler_followable))
+            .collect();
+        let expected: Vec<(String, bool)> = [
+            ("/a", true),
+            ("/b", true),
+            ("/c", true),
+            ("/d", true),
+            ("/e", false),
+            ("/f", false),
+            ("/g", false),
+        ]
+        .into_iter()
+        .map(|(path, followable)| (path.to_string(), followable))
+        .collect();
+        assert_eq!(followable, expected);
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{
+  "name": "descriptor-route-anchor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: routes declared as data, documented with a schema reference or registered with a handler (carrick#2094)",
+  "main": "src/registry.ts"
+}

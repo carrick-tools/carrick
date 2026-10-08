@@ -4038,6 +4038,10 @@ impl FileOrchestrator {
         for (file_path, result) in files {
             // Convert file_path to absolute path relative to repo root
             let file_path_absolute = Self::to_absolute_path(file_path, &repo_root_absolute);
+            // The descriptors of this file whose handler the type layer can
+            // follow, by span start, read once and only when the file holds
+            // a descriptor row (carrick#2094).
+            let mut followable_descriptors: Option<HashSet<u32>> = None;
 
             // Process endpoints
             for endpoint in &result.endpoints {
@@ -4276,6 +4280,41 @@ impl FileOrchestrator {
                         );
                     }
                     continue;
+                }
+
+                // A route declared as data (carrick#2094). Its span is the
+                // descriptor object itself, and the type layer answers a span
+                // request there with the handler the object names when that
+                // is an inline function or an identifier. With no such
+                // handler (a documentation entry, a handler read off a
+                // member) nothing on the object sends a body, and the answer
+                // would be the descriptor literal published as the route's
+                // contract. A `$ref` schema needs a name lookup and a schema
+                // library's type needs library knowledge, so that row asks
+                // for nothing and its manifest entry stays `unknown`. A file
+                // that cannot be read again asks for nothing either.
+                if endpoint.pattern_matched == ROUTE_DESCRIPTOR_PATTERN {
+                    let followable = followable_descriptors.get_or_insert_with(|| {
+                        std::fs::read_to_string(&file_path_absolute)
+                            .map(|content| {
+                                self.swc_scanner
+                                    .route_descriptor_endpoints(
+                                        Path::new(&file_path_absolute),
+                                        &content,
+                                    )
+                                    .into_iter()
+                                    .filter(|descriptor| descriptor.handler_followable)
+                                    .map(|descriptor| descriptor.span_start)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    });
+                    if !endpoint
+                        .call_expression_span_start
+                        .is_some_and(|start| followable.contains(&start))
+                    {
+                        continue;
+                    }
                 }
 
                 // Route response inference by the model's emission_style
