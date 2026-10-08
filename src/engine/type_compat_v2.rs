@@ -301,11 +301,14 @@ impl<'a> Sightings<'a> {
         let Some(answers) = self.by_alias.get(alias) else {
             return false;
         };
+        // A list read under this same symbol is the depth join's to copy
+        // (`apply_inferred_array_depth`), not a disagreement.
         let listed = answers.iter().any(|inf| {
             matches!(
                 inf.infer_kind,
                 InferKind::ResponseBody | InferKind::CallResult
             ) && inf.array_depth.is_some_and(|d| d > 0)
+                && inf.primary_type_symbol.as_deref() != Some(symbol)
         });
         // The reading the alias publishes in the symbol's place: its first
         // usable inference, as `derive_capture_anchors` takes it.
