@@ -32,3 +32,23 @@ export type ItemCounts = {
   200: number;
   404: number;
 };
+
+export interface ItemInput {
+  name: string;
+}
+
+export type CreateItemData = {
+  body: ItemInput;
+  path?: never;
+  url: '/items';
+};
+
+export type CreateItemResponses = {
+  201: Item;
+};
+
+export type RemoveItemData = {
+  body?: never;
+  path: { id: string };
+  url: '/items/{id}';
+};

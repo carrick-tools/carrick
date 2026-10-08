@@ -30,3 +30,26 @@ export interface Client {
 }
 
 export declare const client: Client;
+
+// carrick#1841, request half: what an operation sends rides on the same
+// options object, as `body`. An operation's own options type takes the body
+// from its data type, so the object handed to the method carries the body's
+// real type, while the method's own parameter only says `unknown`.
+export interface RequestOptions<ThrowOnError extends boolean = boolean> {
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
+export interface TDataShape {
+  body?: unknown;
+  path?: unknown;
+  url: string;
+}
+
+export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean> =
+  Omit<RequestOptions<ThrowOnError>, 'body' | 'path' | 'url'> & Omit<TData, 'url'>;
+
+export interface Client {
+  post: MethodFn;
+  patch: MethodFn;
+}

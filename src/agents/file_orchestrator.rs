@@ -4599,6 +4599,25 @@ impl FileOrchestrator {
                 // line states it.
                 if should_infer_request_body(&method) {
                     match &data_call.call_body {
+                        // A request spec states its URL on the call's one
+                        // object argument, and the body rides on that object
+                        // too, written there or spread in (carrick#1841). The
+                        // sidecar reads it at the call; the model's payload
+                        // there names the options parameter, not the body.
+                        None if data_call.resolution_source
+                            == Some(ResolutionSource::RequestSpec) =>
+                        {
+                            push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::RequestBody,
+                                request_alias.clone(),
+                                InferLocator::Span {
+                                    span_start: data_call.call_expression_span_start,
+                                    span_end: data_call.call_expression_span_end,
+                                },
+                            );
+                        }
                         None => {
                             push_infer(
                                 &file_path_absolute,
@@ -14601,6 +14620,113 @@ export * from "./aFetch.js";"#,
         let body_alias = at_declaration.alias.clone().expect("body alias");
         assert!(body_alias.contains("_Request_"), "{body_alias}");
         assert_eq!(call_id(&body_alias), call_id(&result_at_30));
+    }
+
+    /// carrick#1841, request half: a request spec states its URL on the
+    /// call's one object argument (`client.post({ url: "/items", ...options
+    /// })`), and the body rides on that object, written there or spread in.
+    /// The row asks for its request body at the call, by the call's span, so
+    /// the sidecar reads the object's `body` member. The payload a model row
+    /// folded onto the site names the options parameter, which is not the
+    /// body. A model row keeps its own payload.
+    #[test]
+    fn a_spread_request_spec_states_its_body() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let source = "export const createItem = (options: Options<CreateItemData>) =>\n  client.post<CreateItemResponses>({ url: \"/items\", ...options });\nexport const legacy = (options: LegacyOptions) =>\n  send(\"/items\", options);\n";
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join("src/sdk.ts");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("source dir");
+        std::fs::write(&file, source).expect("source");
+        let offset =
+            |needle: &str| u32::try_from(source.find(needle).expect("needle")).expect("offset");
+        let (spec_start, spec_end) = (
+            offset("client.post"),
+            offset(" }") + u32::try_from(" })".len()).expect("len"),
+        );
+        let (model_start, model_end) = (offset("send("), offset("options);") + 8);
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let row = |line: i32, start: u32, end: u32, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{}-{}", start + base, end + base),
+            line_number: line,
+            target: "/items".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "client".to_string(),
+            call_expression_span_start: Some(start + base),
+            call_expression_span_end: Some(end + base),
+            call_expression_text: None,
+            call_expression_line: Some(line),
+            // Where the model points a generated operation's payload: the
+            // options parameter on the declaration line.
+            payload_expression_text: Some("options".to_string()),
+            payload_expression_line: Some(line - 1),
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/sdk.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    row(2, spec_start, spec_end, ResolutionSource::RequestSpec),
+                    row(4, model_start, model_end, ResolutionSource::Model),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        let body_at = |line: u32| {
+            infer
+                .iter()
+                .find(|item| item.infer_kind == InferKind::RequestBody && item.line_number == line)
+                .unwrap_or_else(|| panic!("a request body is asked for at line {line}: {infer:?}"))
+        };
+        let spec = body_at(2);
+        // The span goes out in the sidecar's numbering: from zero.
+        assert_eq!(
+            (
+                spec.span_start,
+                spec.span_end,
+                spec.expression_text.as_deref()
+            ),
+            (Some(spec_start), Some(spec_end), None),
+            "the request spec asks at its call"
+        );
+        let model = body_at(4);
+        assert_eq!(
+            (model.span_start, model.expression_text.as_deref()),
+            (None, Some("options")),
+            "a model row keeps its own payload"
+        );
     }
 
     /// carrick#1601: the mark a summary row carries reaches the call row the

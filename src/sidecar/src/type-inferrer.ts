@@ -6779,14 +6779,9 @@ export class TypeInferrer {
     | { kind: 'no_body'; member: string } {
     if (Node.isCallExpression(node)) {
       const args = node.getArguments();
+      if (args.length === 1) return this.requestObjectBody(args[0]);
       if (args.length < 2) return { kind: 'none' };
-      const first = args[0].getType();
-      const stringLike =
-        first.isString() ||
-        first.isStringLiteral() ||
-        first.isTemplateLiteral() ||
-        (first.isUnion() && first.getUnionTypes().every((t) => t.isString() || t.isStringLiteral()));
-      if (!stringLike) return { kind: 'none' };
+      if (!this.isStringLikeType(args[0].getType())) return { kind: 'none' };
       const slots = this.requestBodySlots(node);
       for (let i = 1; i < args.length; i++) {
         const slot = slots[i];
@@ -6817,6 +6812,98 @@ export class TypeInferrer {
     }
 
     return { kind: 'none' };
+  }
+
+  /** A string, a string literal, a template literal, or a union of strings. */
+  private isStringLikeType(type: Type): boolean {
+    return (
+      type.isString() ||
+      type.isStringLiteral() ||
+      type.isTemplateLiteral() ||
+      (type.isUnion() && type.getUnionTypes().every((t) => t.isString() || t.isStringLiteral()))
+    );
+  }
+
+  /**
+   * carrick#1841, request half: a request call that states its URL on its one
+   * object argument (`client.post({ url: '/items', ...options })`, the way a
+   * generated client issues every operation). The method's own parameter
+   * types the body `unknown`, so the object is the only statement of it: its
+   * `body` member, the member `RequestInit` defines, written on the object or
+   * carried in by a spread whose type says what it is.
+   *
+   * - A `body` written after the object's last spread is the body.
+   * - Otherwise the object's own type has the answer. No `body` member, or
+   *   one typed `undefined` or `never`, means the call sends no body.
+   * - A member typed `any`, `unknown` or a type parameter, or one only the
+   *   compiler's default library declares (a spread `RequestInit` carries the
+   *   serialised `BodyInit`, not a payload), states no payload: abstain. So
+   *   does an object that carries another body-named member and no `body`.
+   *
+   * An object with no string-typed `url` member is not a request object.
+   */
+  private requestObjectBody(
+    arg: Node
+  ):
+    | { kind: 'none' }
+    | { kind: 'abstain'; why: string }
+    | { kind: 'body'; node: Node; from: string }
+    | { kind: 'body_type'; type: Type; at: Node; from: string }
+    | { kind: 'no_body'; member: string } {
+    const literal = this.unwrapExpressionNode(arg);
+    if (!Node.isObjectLiteralExpression(literal)) return { kind: 'none' };
+    const objectType = literal.getType();
+    const url = objectType.getProperty('url');
+    if (!url || !this.isStringLikeType(url.getTypeAtLocation(literal).getNonNullableType())) {
+      return { kind: 'none' };
+    }
+    const from = "the request call's request object";
+    const member = 'body';
+
+    const properties = literal.getProperties();
+    const written = properties.findIndex(
+      (p) =>
+        (Node.isPropertyAssignment(p) || Node.isShorthandPropertyAssignment(p)) &&
+        p.getName() === member
+    );
+    const spreadAfter = properties.some((p, i) => i > written && Node.isSpreadAssignment(p));
+    if (written >= 0 && !spreadAfter) {
+      const value = this.objectLiteralMemberValue(literal, member);
+      if (value) return { kind: 'body', node: value, from };
+    }
+
+    const property = objectType.getProperty(member);
+    if (!property) {
+      const otherBodyMember = [...BODY_MEMBER_NAMES].some(
+        (name) => name !== member && objectType.getProperty(name)
+      );
+      return otherBodyMember
+        ? { kind: 'abstain', why: `the request object carries no '${member}' member but another body-named one` }
+        : { kind: 'no_body', member };
+    }
+    const type = property.getTypeAtLocation(literal);
+    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) {
+      return { kind: 'abstain', why: `the request object's '${member}' member is not typed` };
+    }
+    const bare = type.getNonNullableType();
+    if (bare.isNever() || bare.isUndefined() || bare.isVoid()) {
+      return { kind: 'no_body', member };
+    }
+    if (bare.isAny() || bare.isUnknown() || bare.isTypeParameter()) {
+      return { kind: 'abstain', why: `the request object's '${member}' member is not typed` };
+    }
+    const program = this.project.getProgram().compilerObject;
+    const declarations = property.getDeclarations();
+    if (
+      declarations.length > 0 &&
+      declarations.every((d) => program.isSourceFileDefaultLibrary(d.getSourceFile().compilerNode))
+    ) {
+      return {
+        kind: 'abstain',
+        why: `the request object's '${member}' member is the platform's serialised body, not a payload`,
+      };
+    }
+    return { kind: 'body_type', type: bare, at: literal, from };
   }
 
   /**
