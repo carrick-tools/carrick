@@ -91,9 +91,17 @@ describe('capture bundle seam (pinned decision 11a)', () => {
       const base = path.basename(file);
       for (const spec of importsOf(file)) {
         if (!spec.includes('capture/')) continue;
-        if (base === 'index.ts' || base === 'project-loader.ts' || base === 'definition-resolver.ts') {
-          // Shared Deno resolution, and the options every program carries
-          // (`sidecarCompilerOptions`, carrick#2019).
+        if (
+          base === 'index.ts' ||
+          base === 'project-loader.ts' ||
+          base === 'definition-resolver.ts' ||
+          base === 'type-inferrer.ts' ||
+          base === 'bundler.ts'
+        ) {
+          // Shared Deno resolution, the options every program carries
+          // (`sidecarCompilerOptions`, carrick#2019), and the response-table
+          // reading the inferrer and the v1 bundle share with the capture's
+          // symbol anchor (carrick#1841).
           assert.strictEqual(
             spec,
             './capture/index.js',

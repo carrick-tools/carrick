@@ -909,3 +909,16 @@ function resolveAnchors(
     if (fs.existsSync(ctx.entryPath)) ctx.guard.unlink(ctx.entryPath);
   }
 }
+
+// carrick#1841: the response-table reading the inferrer and the v1 bundle
+// share with the capture's symbol anchor.
+export {
+  classifyStatusCodes,
+  constituents,
+  httpStatus,
+  statesNoBody,
+  statusKeyCode,
+  statusTableBody,
+  statusTableOf,
+  successEntries,
+} from './status-table.js';

@@ -23,7 +23,7 @@ import {
   type ExpandOrigin,
 } from './type-structural-expander.js';
 import { externalImportsOf } from './origin.js';
-import { statusTableBody } from './status-table.js';
+import { statusTableBody } from './capture/index.js';
 
 /**
  * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is

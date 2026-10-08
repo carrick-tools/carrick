@@ -21,7 +21,7 @@ import {
 import { typeIsOrContainsMachinery } from './machinery.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
-import { statusTableBody } from '../status-table.js';
+import { statusTableBody } from './status-table.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import {
   unresolvedAtAnchor,

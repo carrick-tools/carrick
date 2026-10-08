@@ -67,7 +67,7 @@ import {
   statusKeyCode,
   statusTableOf,
   successEntries,
-} from './status-table.js';
+} from './capture/index.js';
 import {
   addedDiagnostics,
   applyInsertions,
