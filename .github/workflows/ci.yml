@@ -40,6 +40,9 @@ jobs:
       - name: Run library tests
         run: cargo test --lib --verbose
 
+      - name: Run capability sheet test
+        run: cargo test --test capability_sheet_test --verbose
+
       - name: Run carrick-match tests
         run: cargo test -p carrick-match --verbose
 
