@@ -125,6 +125,13 @@ fn is_route_path(value: &str) -> bool {
             && !value.chars().any(char::is_whitespace))
 }
 
+/// A path a route is served at: `/`-led. A row whose path is anything else
+/// (a header name read off a request, a content type) registers nothing, so
+/// it cannot make a callback a scope.
+fn is_served_path(path: &str) -> bool {
+    path.starts_with('/')
+}
+
 /// Every registration site in a module. `source_map` must be the one the
 /// module was parsed with, and the module must have been through the
 /// resolver: bindings are read by scope, never by name.
@@ -417,6 +424,15 @@ pub fn apply_registration_scopes(
             u32::try_from(line)
                 .is_ok_and(|line| line >= site.body_start_line && line <= site.body_end_line)
         };
+        // A call that itself registers a route hands its callback a request,
+        // not an instance: `router.get('/me', async (c) => c.get('user'))`.
+        if result.endpoints.iter().any(|endpoint| {
+            u32::try_from(endpoint.line_number) == Ok(site.line)
+                && endpoint.owner_node == site.receiver
+                && is_served_path(&endpoint.path)
+        }) {
+            continue;
+        }
         let registrations: Vec<usize> = result
             .mounts
             .iter()
@@ -447,6 +463,7 @@ pub fn apply_registration_scopes(
             .filter(|(index, endpoint)| {
                 !endpoint_claimed[*index]
                     && endpoint.owner_node == site.param
+                    && is_served_path(&endpoint.path)
                     && inside(endpoint.line_number)
             })
             .map(|(index, _)| index)

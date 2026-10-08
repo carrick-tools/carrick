@@ -394,6 +394,29 @@ async fn inline_callbacks_that_head_no_rows_emit_nothing() {
 
 #[tokio::test]
 #[serial]
+async fn a_route_handler_callback_is_not_a_scope() {
+    // The model may read `c.get('user')` inside the handler as a row hanging
+    // from `c`. The call that passes the callback registers a route, so the
+    // callback is handed a request and is no scope.
+    let handler = answer(
+        "src/handler.ts",
+        &[],
+        &[
+            ("router.get('/me'", "router", "GET", "/me"),
+            ("c.get('user')", "c", "GET", "user"),
+        ],
+    );
+    let result = analyze(vec![handler]).await;
+    assert!(
+        result.mount_graph.get_mounts().is_empty(),
+        "{:?}",
+        result.mount_graph.get_mounts()
+    );
+    assert_eq!(served(&result), set(&["GET /me"]));
+}
+
+#[tokio::test]
+#[serial]
 async fn a_group_callback_with_a_first_argument_prefix() {
     let group = answer(
         "src/group.ts",
