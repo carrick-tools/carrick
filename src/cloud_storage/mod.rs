@@ -1365,6 +1365,9 @@ pub struct UploadOutcome {
     pub scan_spend: Option<crate::scan_spend::ScanSpend>,
 }
 
+// `async_trait` marks each generated future `#[must_use]`, and clippy then
+// reports the attribute as redundant on a method that returns a `Result`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CloudStorage {
     /// Upload one service's payload.

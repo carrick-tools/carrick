@@ -2479,12 +2479,10 @@ impl CandidateVisitor {
             Expr::Tpl(tpl) => {
                 let mut resolved = String::new();
                 for (i, quasi) in tpl.quasis.iter().enumerate() {
-                    match &quasi.cooked {
-                        Some(cooked) => resolved.push_str(&cooked.to_string_lossy()),
-                        // A quasi with no cooked value contains an invalid
-                        // escape — not a resolvable literal.
-                        None => return None,
-                    }
+                    // A quasi with no cooked value contains an invalid
+                    // escape — not a resolvable literal.
+                    let cooked = quasi.cooked.as_ref()?;
+                    resolved.push_str(&cooked.to_string_lossy());
                     if let Some(interp) = tpl.exprs.get(i) {
                         let Expr::Ident(ident) = &**interp else {
                             return None;

@@ -459,7 +459,6 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-        continue-on-error: true
 
   build:
     name: Build

@@ -6541,7 +6541,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 resolution_source: None,
-                dispatch: value.map(&case),
+                dispatch: value.map(case),
                 schema_binding: None,
                 handler_span: None,
                 name_scope: None,

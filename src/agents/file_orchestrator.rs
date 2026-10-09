@@ -10037,10 +10037,9 @@ impl FileOrchestrator {
             (stem, &[".tsx", ".ts", ".d.ts"])
         } else if let Some(stem) = base.strip_suffix(".mjs") {
             (stem, &[".mts", ".d.mts"])
-        } else if let Some(stem) = base.strip_suffix(".cjs") {
-            (stem, &[".cts", ".d.cts"])
         } else {
-            return None;
+            let stem = base.strip_suffix(".cjs")?;
+            (stem, &[".cts", ".d.cts"])
         };
         let mut candidates: Vec<String> =
             ts_exts.iter().map(|ext| format!("{stem}{ext}")).collect();
