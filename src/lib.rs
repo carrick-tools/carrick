@@ -89,3 +89,8 @@ pub mod wrapper_call_method;
 pub mod wrapper_call_route;
 pub mod wrapper_dispatch;
 pub mod wrapper_request_shape;
+
+pub fn clippy_probe() -> bool {
+    let v: Vec<u8> = Vec::new();
+    v.len() == 0
+}
