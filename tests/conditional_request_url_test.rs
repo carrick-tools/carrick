@@ -138,3 +138,67 @@ fn a_query_a_test_adds_is_no_part_of_the_route() {
         stated(&[("GET", "/api/content")])
     );
 }
+
+#[test]
+fn a_test_and_its_negation_are_one_choice() {
+    // `!isDraft` is `isDraft` with its branches swapped: drafts are saved,
+    // posts are published, and nothing else is sent.
+    assert_eq!(
+        rows_at("src/content.ts", 48),
+        stated(&[
+            ("POST", "/api/content/drafts/${id}/save"),
+            ("POST", "/api/content/posts/${id}/publish"),
+        ])
+    );
+    // `!==` is `===` with its branches swapped.
+    assert_eq!(
+        rows_at("src/content.ts", 53),
+        stated(&[
+            ("POST", "/api/content/drafts/${id}/save"),
+            ("POST", "/api/content/posts/${id}/publish"),
+        ])
+    );
+}
+
+#[test]
+fn two_tests_on_one_name_state_no_row() {
+    // `kind === "a"` and `kind === "b"` cannot both hold, and nothing here
+    // says which combinations can: no row rather than one the source cannot
+    // send.
+    assert_eq!(rows_at("src/content.ts", 58), Vec::new());
+}
+
+#[test]
+fn tests_on_unrelated_names_combine_freely() {
+    assert_eq!(
+        rows_at("src/content.ts", 63),
+        stated(&[
+            ("POST", "/api/content/drafts/${id}/archive"),
+            ("POST", "/api/content/drafts/${id}/restore"),
+            ("POST", "/api/content/posts/${id}/archive"),
+            ("POST", "/api/content/posts/${id}/restore"),
+        ])
+    );
+}
+
+#[test]
+fn an_else_if_chain_on_one_name_states_a_row_per_branch() {
+    // The inner test refines the outer one's alternate: each branch is a
+    // request the source can send.
+    assert_eq!(
+        rows_at("src/content.ts", 68),
+        stated(&[
+            ("POST", "/api/content/drafts/${id}"),
+            ("POST", "/api/content/posts/${id}"),
+            ("POST", "/api/content/posts/${id}/copy"),
+        ])
+    );
+}
+
+#[test]
+fn a_chain_beside_one_of_its_own_tests_states_no_row() {
+    // The first segment is an else-if chain on `mode`, the last reads
+    // `mode === "copy"` alone: `drafts` (mode is "edit") beside `dup` (mode
+    // is "copy") is a pair the source cannot send.
+    assert_eq!(rows_at("src/content.ts", 73), Vec::new());
+}

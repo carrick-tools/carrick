@@ -17,6 +17,12 @@ than either route.
 | 32 | the conditional leads the URL (a base) | `GET ${base}/health`, as before |
 | 38 | two parameters, neither read | `GET /api/content/${owner}/items`, as before |
 | 44 | the conditional adds a query | `GET /api/content` |
+| 48 | `isDraft` and `!isDraft` in one template at the call | `POST /api/content/drafts/${id}/save`, `POST /api/content/posts/${id}/publish` |
+| 53 | `kind === "draft"` and `kind !== "draft"`, URL in a binding | the same two |
+| 58 | `kind === "a"` and `kind === "b"`, URL in a binding | none |
+| 63 | `isDraft` and `archived`, URL in a binding | all four combinations |
+| 68 | an else-if chain on `mode`, URL in a binding | one row per branch, three |
+| 73 | that chain in one segment, `mode === "copy"` alone in another | none |
 
 The model's cassette (`__llm__/analyze-file/content.json`) states a row at
 lines 5 and 26, and both routes at line 15. Its candidate ids are byte offsets into

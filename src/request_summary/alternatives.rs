@@ -17,7 +17,14 @@
 //! - **A conditional whose branches can both be read is two readings.**
 //!   Templates and `+` carry them through, and so does a local the function
 //!   declares once. A test written twice is one choice: its branches are
-//!   taken together.
+//!   taken together. A test and its negation (`!x` beside `x`, `a !== b`
+//!   beside `a === b`) are one choice with the branches swapped.
+//! - **Two different tests on one name may not be independent.** `kind ===
+//!   "a"` and `kind === "b"` in two parts of one URL cannot both hold, so
+//!   their cross product holds readings the source cannot send, and no row is
+//!   stated. Tests on names unrelated to each other are independent and
+//!   combine freely, and a test written inside a branch of another only
+//!   refines that branch (`mode === "a" ? A : mode === "b" ? B : C`).
 //! - **A value that may hold a `/` is no path parameter.** Where one branch
 //!   writes a path and the other is a value nothing here read, the slot may
 //!   span segments, so the request states no row rather than a placeholder
@@ -29,7 +36,7 @@
 //! Everything else is read exactly as before: this module only answers where
 //! a conditional is reachable from the URL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
@@ -61,6 +68,50 @@ pub(super) struct Alternatives {
     /// One branch writes a path and another is a value nothing read, so the
     /// slot may span segments.
     poisoned: bool,
+    /// The names each stable test reads, by the test's key.
+    tests: Tests,
+    /// Two different tests in it read one name.
+    entangled: bool,
+}
+
+/// The names each stable test reads, by the test's key.
+type Tests = BTreeMap<String, BTreeSet<String>>;
+
+/// Whether two names may hold the same value: equal, or one a member of the
+/// other.
+fn related(a: &str, b: &str) -> bool {
+    let nested = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with("?."))
+    };
+    a == b || nested(a, b) || nested(b, a)
+}
+
+/// Every test two values read, with the names each one reads.
+fn tests_of(a: &Tests, b: &Tests) -> Tests {
+    let mut merged = a.clone();
+    for (key, names) in b {
+        merged
+            .entry(key.clone())
+            .or_default()
+            .extend(names.iter().cloned());
+    }
+    merged
+}
+
+/// Whether two readings, taken together, each rest on a test the other does
+/// not, and the two read one name. Such tests are not independent
+/// (`kind === "a"` beside `kind === "b"`), so the pair may be one the source
+/// cannot send. A test inside another's branch never makes such a pair: the
+/// readings of an else-if chain on one name each hold the outer test.
+fn entangled(a: &Taken, b: &Taken, tests: &Tests) -> bool {
+    let names = |key: &String| tests.get(key).into_iter().flatten();
+    a.keys().filter(|key| !b.contains_key(*key)).any(|ours| {
+        b.keys()
+            .filter(|key| !a.contains_key(*key))
+            .any(|theirs| names(ours).any(|name| names(theirs).any(|other| related(name, other))))
+    })
 }
 
 /// The branches two readings take, when no test is taken both ways.
@@ -86,6 +137,8 @@ impl Alternatives {
             }],
             leading: false,
             poisoned: false,
+            tests: Tests::new(),
+            entangled: false,
         }
     }
 
@@ -124,10 +177,13 @@ impl Alternatives {
 
     /// This, then `next`, in every combination that can be taken together.
     fn then(&self, next: &Alternatives) -> Option<Alternatives> {
+        let tests = tests_of(&self.tests, &next.tests);
+        let mut tangled = self.entangled || next.entangled;
         let mut readings = Vec::new();
         for a in &self.readings {
             for b in &next.readings {
                 if let Some(taken) = together(&a.taken, &b.taken) {
+                    tangled |= entangled(&a.taken, &b.taken, &tests);
                     readings.push(Reading {
                         taken,
                         pieces: concat([a.pieces.clone(), b.pieces.clone()]),
@@ -142,6 +198,8 @@ impl Alternatives {
             readings,
             leading: self.leading || (self.writes_nothing() && next.leading),
             poisoned: self.poisoned || next.poisoned,
+            tests,
+            entangled: tangled,
         })
     }
 }
@@ -230,9 +288,18 @@ impl Reader<'_> {
             || alternate.poisoned
             || (consequent.writes_a_path() && alternate.holds_an_unread_value())
             || (alternate.writes_a_path() && consequent.holds_an_unread_value());
-        let test = self.test_key(&cond.test, scope, cond.span);
+        let (test, swapped, names) = self.test_key(&cond.test, scope, cond.span);
+        // The branches are exclusive, and a test inside one only refines it
+        // (`mode === "a" ? A : mode === "b" ? B : C`), so neither is a cross
+        // product: only a test entangled within a branch entangles this.
+        let mut tests = tests_of(&consequent.tests, &alternate.tests);
+        tests.entry(test.clone()).or_default().extend(names);
+        let entangled = consequent.entangled || alternate.entangled;
         let mut readings = Vec::new();
-        for (branch, side) in [consequent, alternate].iter().enumerate() {
+        for (written, side) in [consequent, alternate].iter().enumerate() {
+            // The branch of the test as it is keyed: a negation's consequent
+            // is the alternate of the test it negates.
+            let branch = written ^ usize::from(swapped);
             for reading in &side.readings {
                 let mut taken = reading.taken.clone();
                 if taken.get(&test).is_some_and(|prior| *prior != branch) {
@@ -252,16 +319,77 @@ impl Reader<'_> {
             readings,
             leading: true,
             poisoned,
+            tests,
+            entangled,
         })
     }
 
-    /// The name of a test: its text when it is one the function reads the same
-    /// way every time, and otherwise a name only this conditional has.
-    fn test_key(&self, test: &Expr, scope: &Scope<'_>, at: Span) -> String {
-        if is_stable(test, scope) {
-            format!("t:{}", self.text(test.span()))
-        } else {
-            format!("@{}", at.lo.0)
+    /// The name of a test, whether its branches are swapped against the test
+    /// that name stands for, and the names it reads. A test the function reads
+    /// the same way every time is named by the test it affirms: a leading
+    /// `!`, `!=` and `!==` are read as the test they negate with the branches
+    /// swapped. Any other test has a name only this conditional has and
+    /// reads no name.
+    fn test_key(
+        &self,
+        test: &Expr,
+        scope: &Scope<'_>,
+        at: Span,
+    ) -> (String, bool, BTreeSet<String>) {
+        if !is_stable(test, scope) {
+            return (format!("@{}", at.lo.0), false, BTreeSet::new());
+        }
+        let (text, swapped) = self.affirmed_test(test);
+        let mut names = BTreeSet::new();
+        self.names_read(test, &mut names);
+        (format!("t:{text}"), swapped, names)
+    }
+
+    /// A stable test as the test it affirms, and whether it negates it.
+    fn affirmed_test(&self, test: &Expr) -> (String, bool) {
+        match test {
+            Expr::Paren(e) => self.affirmed_test(&e.expr),
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+                let (text, swapped) = self.affirmed_test(&unary.arg);
+                (text, !swapped)
+            }
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    BinaryOp::EqEq | BinaryOp::NotEq | BinaryOp::EqEqEq | BinaryOp::NotEqEq
+                ) =>
+            {
+                let (op, swapped) = match bin.op {
+                    BinaryOp::EqEq => ("==", false),
+                    BinaryOp::NotEq => ("==", true),
+                    BinaryOp::EqEqEq => ("===", false),
+                    _ => ("===", true),
+                };
+                let side = |expr: &Expr| self.text(expr.unwrap_parens().span());
+                (
+                    format!("{} {op} {}", side(&bin.left), side(&bin.right)),
+                    swapped,
+                )
+            }
+            other => (self.text(other.span()), false),
+        }
+    }
+
+    /// The names a stable test reads: each name, and each member of one, in
+    /// it.
+    fn names_read(&self, test: &Expr, names: &mut BTreeSet<String>) {
+        match test {
+            Expr::Ident(_) | Expr::Member(_) => {
+                names.insert(self.text(test.span()));
+            }
+            Expr::Paren(e) => self.names_read(&e.expr, names),
+            Expr::TsNonNull(e) => self.names_read(&e.expr, names),
+            Expr::Unary(unary) => self.names_read(&unary.arg, names),
+            Expr::Bin(bin) => {
+                self.names_read(&bin.left, names);
+                self.names_read(&bin.right, names);
+            }
+            _ => {}
         }
     }
 
@@ -290,6 +418,11 @@ impl Reader<'_> {
         // own: read as it was before a conditional was.
         if readings.poisoned || !readings.readings.iter().all(|r| states(&r.pieces)) {
             return Alternation::Single;
+        }
+        // Two different tests on one name: some combinations of their
+        // branches cannot be taken together, and nothing here says which.
+        if readings.entangled {
+            return Alternation::Nothing;
         }
         // Readings that differ only in a query or a fragment reach one route.
         // The one without the query is the one that is kept.

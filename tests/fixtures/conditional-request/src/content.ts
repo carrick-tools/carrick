@@ -43,3 +43,32 @@ export async function list(archived: boolean) {
   const url = `/api/content${filter}`;
   await fetch(url, { method: "GET" });
 }
+
+export async function saveOrPublish(isDraft: boolean, id: string) {
+  await fetch(`/api/content/${isDraft ? "drafts" : "posts"}/${id}/${!isDraft ? "publish" : "save"}`, { method: "POST" });
+}
+
+export async function saveOrPublishCompared(kind: string, id: string) {
+  const url = `/api/content/${kind === "draft" ? "drafts" : "posts"}/${id}/${kind !== "draft" ? "publish" : "save"}`;
+  await fetch(url, { method: "POST" });
+}
+
+export async function moveByKind(kind: string, id: string) {
+  const url = `/api/content/${kind === "a" ? "drafts" : "posts"}/${id}/${kind === "b" ? "publish" : "save"}`;
+  await fetch(url, { method: "POST" });
+}
+
+export async function archiveOrRestore(isDraft: boolean, archived: boolean, id: string) {
+  const url = `/api/content/${isDraft ? "drafts" : "posts"}/${id}/${archived ? "archive" : "restore"}`;
+  await fetch(url, { method: "POST" });
+}
+
+export async function editCopyOrSave(mode: string, id: string) {
+  const url = mode === "edit" ? `/api/content/drafts/${id}` : mode === "copy" ? `/api/content/posts/${id}/copy` : `/api/content/posts/${id}`;
+  await fetch(url, { method: "POST" });
+}
+
+export async function editCopyOrSaveSplit(mode: string, id: string) {
+  const url = `/api/content/${mode === "edit" ? "drafts" : mode === "copy" ? "copies" : "posts"}/${id}/${mode === "copy" ? "dup" : "save"}`;
+  await fetch(url, { method: "POST" });
+}
