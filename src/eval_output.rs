@@ -698,6 +698,8 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         }
     }

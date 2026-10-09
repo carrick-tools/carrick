@@ -159,7 +159,7 @@ pub fn parse_file_location(location: &str) -> (String, u32) {
     (file_path, line_number)
 }
 
-fn fnv1a_hash(input: &str) -> u64 {
+pub(crate) fn fnv1a_hash(input: &str) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -762,6 +762,8 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         }
     }

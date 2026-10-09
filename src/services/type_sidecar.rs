@@ -1226,6 +1226,65 @@ pub struct InferredType {
     /// the check phase reads the pair unverifiable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw_text_read: bool,
+    /// carrick#2054, response inferences only: which fields of the incoming
+    /// message the handler's branches test to choose among the success bodies
+    /// `type_string` joins, and, when one placed field decides it, the union
+    /// each value receives. `type_string` is unchanged by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_modes: Option<InferredResponseModes>,
+}
+
+/// Where in the incoming message a field is read from (carrick#2054).
+/// Protocol-neutral: only the HTTP sources are read so far, and a source this
+/// scanner does not know (another protocol's, written by a newer sidecar or a
+/// newer peer's blob) reads as `unplaced` rather than failing the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSource {
+    /// A query parameter (`URLSearchParams.get`).
+    Query,
+    /// A top-level property of a JSON body.
+    Body,
+    /// Anything else: a header, a path parameter, a framework accessor.
+    #[serde(other)]
+    Unplaced,
+}
+
+impl MessageSource {
+    /// The name the sidecar and the blob write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageSource::Query => "query",
+            MessageSource::Body => "body",
+            MessageSource::Unplaced => "unplaced",
+        }
+    }
+}
+
+/// One incoming-message field a response union depends on (carrick#2054).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MessageRead {
+    pub location: MessageSource,
+    pub field: String,
+}
+
+/// The union one stated value of the field receives, as the inferrer printed
+/// it (carrick#2054). `value: None` is any value no other case names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferredModeCase {
+    #[serde(default)]
+    pub value: Option<String>,
+    pub type_string: String,
+}
+
+/// The sidecar's `response_modes` (carrick#2054).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferredResponseModes {
+    pub reads: Vec<MessageRead>,
+    /// Present only when `reads` is one placed field whose every test was
+    /// read. Sorted by value, the `None` case last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<InferredModeCase>,
 }
 
 /// The declaration a bare name in an inference's printed text meant
@@ -3612,29 +3671,53 @@ mod tests {
     /// inference that carries it must come through as the same value, so no
     /// stored artifact changes until the reader of the field lands.
     #[test]
-    fn an_inference_with_response_modes_reads_as_one_without_them() {
-        let without = serde_json::json!({
+    fn an_inference_reads_its_response_modes() {
+        let read: InferredType = serde_json::from_value(serde_json::json!({
             "alias": "Route",
             "type_string": "{ x: number; } | { y: string; }",
             "is_explicit": false,
             "source_location": { "file_path": "/repo/src/route.ts", "start_line": 3, "end_line": 3 },
             "infer_kind": "response_body",
-        });
-        let mut with = without.clone();
-        with["response_modes"] = serde_json::json!({
-            "reads": [{ "location": "query", "field": "mode" }],
-            "cases": [
-                { "value": "a", "type_string": "{ x: number; }" },
-                { "value": null, "type_string": "{ y: string; }" },
-            ],
-        });
-
-        let read_without: InferredType = serde_json::from_value(without).unwrap();
-        let read_with: InferredType = serde_json::from_value(with).unwrap();
+            "response_modes": {
+                "reads": [{ "location": "query", "field": "mode" }],
+                "cases": [
+                    { "value": "a", "type_string": "{ x: number; }" },
+                    { "value": null, "type_string": "{ y: string; }" },
+                ],
+            },
+        }))
+        .unwrap();
         assert_eq!(
-            serde_json::to_value(&read_with).unwrap(),
-            serde_json::to_value(&read_without).unwrap()
+            read.response_modes,
+            Some(InferredResponseModes {
+                reads: vec![MessageRead {
+                    location: MessageSource::Query,
+                    field: "mode".to_string(),
+                }],
+                cases: vec![
+                    InferredModeCase {
+                        value: Some("a".to_string()),
+                        type_string: "{ x: number; }".to_string(),
+                    },
+                    InferredModeCase {
+                        value: None,
+                        type_string: "{ y: string; }".to_string(),
+                    },
+                ],
+            })
         );
+    }
+
+    /// carrick#2081 adds the sources of other protocols. A source this
+    /// scanner does not know is a read it cannot place, never a record that
+    /// fails to parse.
+    #[test]
+    fn a_message_source_this_scanner_does_not_know_reads_as_unplaced() {
+        let read: MessageRead = serde_json::from_value(
+            serde_json::json!({ "location": "socket_payload", "field": "op" }),
+        )
+        .unwrap();
+        assert_eq!(read.location, MessageSource::Unplaced);
     }
 
     /// The cap tracks the machine, with a floor and a ceiling. Without one,
@@ -4987,6 +5070,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         }
     }
 

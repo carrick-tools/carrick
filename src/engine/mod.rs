@@ -3331,6 +3331,7 @@ async fn analyze_current_repo_incremental(
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
             drop_call_through_entries(&mut manifest_entries, &merged_results);
+            stamp_stated_values(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(
                 &mut manifest_entries,
                 &merged_results,
@@ -5527,6 +5528,8 @@ fn add_graphql_request_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        response_modes: None,
+        stated_values: Default::default(),
         v1_state_before_demotion: None,
     });
 }
@@ -5587,6 +5590,8 @@ fn add_protocol_manifest_entry(
         defined_in: None,
         any_provenance: Vec::new(),
         unwidened_definition: None,
+        response_modes: None,
+        stated_values: Default::default(),
         v1_state_before_demotion: None,
     });
 }
@@ -6398,6 +6403,9 @@ fn run_capture_for_service(
     );
     if anchors.is_empty() {
         return None;
+    }
+    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+        stamp_response_modes(manifest, &type_resolution.inferred_types);
     }
 
     // Literal texts for the last-resort backfill re-anchor: when capture
@@ -7378,8 +7386,9 @@ fn join_capture_answers(
 /// made that order — and the bytes of the request — differ between two runs of
 /// the same binary over an unchanged tree.
 ///
-/// Beside each entry, the capture alias that carries its unwidened reading
-/// (carrick#1516) when the capture recorded one.
+/// Beside each entry, the capture aliases that carry its unwidened reading
+/// (carrick#1516) and each case of its response modes (carrick#2054), when
+/// the capture recorded them.
 fn aliases_to_resolve(
     manifest: &[TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
@@ -7388,8 +7397,13 @@ fn aliases_to_resolve(
         .iter()
         .flat_map(|e| {
             let unwidened = type_compat_v2::unwidened_alias(&e.type_alias);
-            let captured = records.contains_key(&unwidened);
-            std::iter::once(e.type_alias.clone()).chain(captured.then_some(unwidened))
+            let cases = e
+                .response_modes
+                .iter()
+                .flat_map(|modes| modes.cases.iter().map(|case| case.alias.clone()));
+            std::iter::once(e.type_alias.clone())
+                .chain(std::iter::once(unwidened).chain(cases))
+                .filter(move |alias| *alias == e.type_alias || records.contains_key(alias))
         })
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -7494,6 +7508,25 @@ fn apply_resolved_definitions(
                         .is_none_or(|record| record.unpublishable_reason().is_none())
             })
             .map(|u| u.expanded.clone());
+        // carrick#2054: each case keeps the text the capture published for
+        // it, on the same terms as the unwidened reading. A case with no
+        // text narrows no call.
+        for case in entry
+            .response_modes
+            .iter_mut()
+            .flat_map(|modes| modes.cases.iter_mut())
+        {
+            case.expanded = lookup
+                .get(&case.alias)
+                .filter(|c| {
+                    !type_compat_v2::contains_disqualifying_top_type(&c.expanded)
+                        && !c.expanded.trim().is_empty()
+                        && records
+                            .get(&c.type_alias)
+                            .is_none_or(|record| record.unpublishable_reason().is_none())
+                })
+                .map(|c| c.expanded.clone());
+        }
 
         let settles = !type_compat_v2::contains_disqualifying_top_type(&r.expanded)
             || records.get(&entry.type_alias).is_some_and(|record| {
@@ -7659,6 +7692,128 @@ fn build_type_manifest_entries(
     }
 
     entries
+}
+
+/// Write each producer response's modes onto its manifest entries
+/// (carrick#2054): which fields of the incoming message the handler's
+/// branches read to choose its body, and each case's capture alias. The
+/// case texts are written by the definitions pass, from the capture.
+/// Taken from the inference that supplies the published text, so an entry
+/// whose inference read no modes carries none.
+fn stamp_response_modes(
+    manifest: &mut [TypeManifestEntry],
+    inferred: &[crate::services::type_sidecar::InferredType],
+) {
+    let modes = type_compat_v2::inferred_response_modes(inferred);
+    for entry in manifest.iter_mut() {
+        if entry.role != ManifestRole::Producer || entry.type_kind != ManifestTypeKind::Response {
+            continue;
+        }
+        entry.response_modes = modes
+            .get(entry.type_alias.as_str())
+            .map(|(found, _)| found.clone());
+    }
+}
+
+/// The literal `key=value` pairs of a call target's query string
+/// (carrick#2054). A key written twice, a value built from an
+/// interpolation, or one carrying an escape (`%`, `+`) states nothing.
+fn stated_query(target: &str) -> std::collections::BTreeMap<String, String> {
+    let mut stated = std::collections::BTreeMap::new();
+    let Some(start) = crate::analyzer::query_string_start(target) else {
+        return stated;
+    };
+    let query = target[start + 1..].split('#').next().unwrap_or_default();
+    let mut repeated: HashSet<&str> = HashSet::new();
+    let mut values: HashMap<&str, &str> = HashMap::new();
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        if values.insert(key, value).is_some() {
+            repeated.insert(key);
+        }
+    }
+    for (key, value) in values {
+        let opaque = |text: &str| text.contains("${") || text.contains(['%', '+']);
+        if repeated.contains(key) || opaque(key) || opaque(value) {
+            continue;
+        }
+        stated.insert(key.to_string(), value.to_string());
+    }
+    stated
+}
+
+/// Write on each consumer response entry what its call states about the
+/// message it sends (carrick#2054): the request body's literal top-level
+/// values and the literal values of its query string.
+///
+/// Only rows the request summaries stated: their body literals and their
+/// target are read off the source, never the model's reading (carrick#1560).
+/// Joined to the call rows as [`drop_call_through_entries`] joins them, by
+/// `(file_path, line)` and the verb. Two summary rows at one site that state
+/// different values state nothing.
+fn stamp_stated_values(
+    manifest: &mut [TypeManifestEntry],
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) {
+    use crate::services::type_sidecar::MessageSource;
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
+    let mut by_site: HashMap<(&str, u32, String), Option<crate::cloud_storage::StatedValues>> =
+        HashMap::new();
+    for (file_path, result) in file_results {
+        for call in &result.data_calls {
+            if call.resolution_source
+                != Some(crate::agents::file_analyzer_agent::ResolutionSource::RequestSummary)
+            {
+                continue;
+            }
+            let mut stated = crate::cloud_storage::StatedValues::new();
+            if !call.body_literals.is_empty() {
+                stated.insert(MessageSource::Body, call.body_literals.clone());
+            }
+            let query = stated_query(&call.target);
+            if !query.is_empty() {
+                stated.insert(MessageSource::Query, query);
+            }
+            let site = (
+                file_path.as_str(),
+                normalize_line(call.line_number),
+                normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+            );
+            match by_site.entry(site) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(stated));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if slot.get().as_ref() != Some(&stated) {
+                        slot.insert(None);
+                    }
+                }
+            }
+        }
+    }
+    if by_site.is_empty() {
+        return;
+    }
+    for entry in manifest.iter_mut() {
+        if entry.role != ManifestRole::Consumer || entry.type_kind != ManifestTypeKind::Response {
+            continue;
+        }
+        let Some((method, _)) = entry.key.as_http() else {
+            continue;
+        };
+        if let Some(Some(stated)) = by_site.get(&(
+            entry.file_path.as_str(),
+            entry.line_number,
+            method.to_string(),
+        )) {
+            entry.stated_values = stated.clone();
+        }
+    }
 }
 
 /// Drop the consumer type entries a row stated at a call to a function the
@@ -8143,6 +8298,8 @@ fn add_manifest_pair(
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         });
     }
@@ -8592,6 +8749,7 @@ async fn analyze_current_repo(
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
     drop_call_through_entries(&mut manifest_entries, &analysis_result.file_results);
+    stamp_stated_values(&mut manifest_entries, &analysis_result.file_results);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
         &analysis_result.file_results,
@@ -11154,6 +11312,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 defined_in: None,
                 any_provenance: Vec::new(),
                 unwidened_definition: None,
+                response_modes: None,
+                stated_values: Default::default(),
                 v1_state_before_demotion: None,
             }]),
             file_results: Some(file_results),
@@ -16605,6 +16765,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         }
     }
@@ -16727,6 +16889,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -16763,6 +16926,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -16799,6 +16963,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            response_modes: None,
         }
     }
 
@@ -17855,6 +18020,196 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             aliases_to_resolve(&[consumer_entry("OrderView")], &records),
             vec!["OrderView".to_string(), sibling.clone()],
             "the sibling is asked about only when the capture recorded it"
+        );
+    }
+
+    /// carrick#2054: a response's modes come from the inference that
+    /// publishes it, on its producer entries only, and each case is written
+    /// the text the capture published for it on the same terms as the
+    /// unwidened reading; the case aliases are asked about only when the
+    /// capture recorded them.
+    #[test]
+    fn a_response_s_modes_are_stamped_and_each_case_takes_its_captured_text() {
+        use crate::services::type_sidecar::{
+            InferredModeCase, InferredResponseModes, MessageRead, MessageSource,
+        };
+        let mut producer = consumer_entry("OrderView");
+        producer.role = ManifestRole::Producer;
+        let mut inference = inferred_with_symbol("Order");
+        inference.alias = "OrderView".to_string();
+        inference.type_string = "{ x: number; } | { y: string; }".to_string();
+        let read = MessageRead {
+            location: MessageSource::Query,
+            field: "mode".to_string(),
+        };
+        inference.response_modes = Some(InferredResponseModes {
+            reads: vec![read.clone()],
+            cases: vec![
+                InferredModeCase {
+                    value: Some("a".to_string()),
+                    type_string: "{ x: number; }".to_string(),
+                },
+                InferredModeCase {
+                    value: None,
+                    type_string: "{ y: string; }".to_string(),
+                },
+            ],
+        });
+        let mut manifest = vec![producer, consumer_entry("OrderView")];
+        stamp_response_modes(&mut manifest, std::slice::from_ref(&inference));
+        assert_eq!(
+            manifest[1].response_modes, None,
+            "a consumer entry has none"
+        );
+        let case_a = crate::engine::type_compat_v2::mode_alias("OrderView", &read, Some("a"));
+        let other = crate::engine::type_compat_v2::mode_alias("OrderView", &read, None);
+        let modes = manifest[0].response_modes.clone().expect("stamped");
+        assert_eq!(modes.reads, vec![read.clone()]);
+        assert_eq!(
+            modes
+                .cases
+                .iter()
+                .map(|case| (
+                    case.value.as_deref(),
+                    case.alias.as_str(),
+                    case.expanded.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("a"), case_a.as_str(), None),
+                (None, other.as_str(), None)
+            ]
+        );
+
+        let records = read_records_with(&case_a);
+        assert_eq!(
+            aliases_to_resolve(&manifest[..1], &records),
+            vec!["OrderView".to_string(), case_a.clone()],
+            "a case is asked about only when the capture recorded it"
+        );
+
+        apply_resolved_definitions(
+            &mut manifest[..1],
+            vec![
+                captured("OrderView", "{ x: number; } | { y: string; }"),
+                captured(&case_a, "{ x: number; }"),
+                captured(&other, "{ y: any; }"),
+            ],
+            &HashMap::new(),
+        );
+        let cases = &manifest[0].response_modes.as_ref().unwrap().cases;
+        assert_eq!(cases[0].expanded.as_deref(), Some("{ x: number; }"));
+        assert_eq!(
+            cases[1].expanded, None,
+            "a case with a top type keeps no text"
+        );
+
+        // An inference with no modes stamps none, and leaves no stale map.
+        inference.response_modes = None;
+        stamp_response_modes(&mut manifest, std::slice::from_ref(&inference));
+        assert_eq!(manifest[0].response_modes, None);
+    }
+
+    /// carrick#2054: a call states the literal values its request summary
+    /// reads off the source, by location, on its response entry. A model row,
+    /// a key written twice, an escaped value, an interpolated value and two
+    /// rows that disagree state nothing.
+    #[test]
+    fn a_summary_row_states_its_body_and_query_literals_on_its_response_entry() {
+        use crate::services::type_sidecar::MessageSource;
+        let row = |line: i32, target: &str, body: &[(&str, &str)]| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{line}"),
+            line_number: line,
+            target: target.to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "fetch".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::RequestSummary,
+            ),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: body
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    row(4, "/items?mode=a&page=${page}#top", &[("kind", "r")]),
+                    DataCallResult {
+                        resolution_source: None,
+                        ..row(9, "/items?mode=a", &[("kind", "r")])
+                    },
+                    row(12, "/items?mode=a&mode=b&sort=x%20y&tag=a+b", &[]),
+                    row(15, "/items?mode=a", &[]),
+                    row(15, "/items?mode=b", &[]),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let mut manifest = Vec::new();
+        for line in [4, 9, 12, 15] {
+            add_manifest_pair(
+                &mut manifest,
+                OperationKey::http("GET", "/items"),
+                ManifestRole::Consumer,
+                "src/page.ts",
+                line,
+                Some(&format!("site{line}")),
+            );
+        }
+        stamp_stated_values(&mut manifest, &file_results);
+
+        let stated: Vec<(u32, ManifestTypeKind, crate::cloud_storage::StatedValues)> = manifest
+            .iter()
+            .filter(|entry| !entry.stated_values.is_empty())
+            .map(|entry| {
+                (
+                    entry.line_number,
+                    entry.type_kind,
+                    entry.stated_values.clone(),
+                )
+            })
+            .collect();
+        let values = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            stated,
+            vec![(
+                4,
+                ManifestTypeKind::Response,
+                crate::cloud_storage::StatedValues::from([
+                    (MessageSource::Body, values(&[("kind", "r")])),
+                    (MessageSource::Query, values(&[("mode", "a")])),
+                ]),
+            )]
         );
     }
 

@@ -1352,7 +1352,7 @@ fn top_level_fallback_op(s: &str) -> Option<usize> {
 /// A `?` INSIDE an interpolation belongs to the substituted expression —
 /// optional chaining, a ternary, a `??` fallback — and separates nothing, so
 /// `${cfg?.url ?? 'x'}/p` has no query string and is judged whole.
-fn query_string_start(route: &str) -> Option<usize> {
+pub(crate) fn query_string_start(route: &str) -> Option<usize> {
     let bytes = route.as_bytes();
     let mut depth = 0usize;
     let mut i = 0;

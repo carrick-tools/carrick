@@ -154,6 +154,19 @@ pub struct TypeManifestEntry {
     /// `None` unless it differs from `expanded_definition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwidened_definition: Option<String>,
+    /// A producer response whose union the handler chooses by a field of the
+    /// incoming message (carrick#2054): which fields it reads, and the type
+    /// each stated value of one placed field receives. The published type is
+    /// still `expanded_definition`; the check narrows it to the case a call
+    /// states. `None` on every entry whose union no request read decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_modes: Option<ResponseModes>,
+    /// What a consumer call states about the incoming message it sends
+    /// (carrick#2054), by where it states it: the literal values of the
+    /// request body's top-level keys and of its query string, read by the
+    /// request summaries. Empty on every call they did not state.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stated_values: StatedValues,
     /// The state v1 gave this entry before a top type inside its printed
     /// shape demoted it to `Unknown` (carrick#1752). v1's text cannot say who
     /// put the top type there; the capture's record can, later in the same
@@ -162,6 +175,42 @@ pub struct TypeManifestEntry {
     #[serde(skip)]
     pub v1_state_before_demotion: Option<ManifestTypeState>,
 }
+
+/// A producer response's modes (carrick#2054): see
+/// [`TypeManifestEntry::response_modes`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ResponseModes {
+    /// Every message field the union depends on, sorted.
+    pub reads: Vec<crate::services::type_sidecar::MessageRead>,
+    /// One case per value the handler compares the one placed field with,
+    /// and `value: None` for any other value, when the handler has a body for
+    /// one. Empty when `reads` is not one placed field whose every test was
+    /// read: such a union depends on the message in a way no stated value
+    /// selects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<ResponseModeCase>,
+}
+
+/// The union one stated value receives (carrick#2054).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ResponseModeCase {
+    /// The value; `None` for any value no other case names.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// The capture alias that carries this case's type in the stub.
+    pub alias: String,
+    /// The case's type, fully inlined. `None` when the capture could not
+    /// publish it, and then no call is narrowed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<String>,
+}
+
+/// What a call states about the message it sends, by source (carrick#2054):
+/// field name to the literal value the source writes.
+pub type StatedValues = std::collections::BTreeMap<
+    crate::services::type_sidecar::MessageSource,
+    std::collections::BTreeMap<String, String>,
+>;
 
 /// The declaration site of a manifest entry's anchor symbol (carrick#649).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -2077,6 +2126,8 @@ mod tests {
             defined_in: None,
             any_provenance: Vec::new(),
             unwidened_definition: None,
+            response_modes: None,
+            stated_values: Default::default(),
             v1_state_before_demotion: None,
         };
 
@@ -2085,8 +2136,57 @@ mod tests {
         assert_eq!(json["method"], "GET");
         assert_eq!(json["path"], "/api/users/:id");
 
-        let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
+        let back: TypeManifestEntry = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back.key, key);
+
+        // carrick#2054: an entry with no modes and no stated values writes
+        // neither field, so its bytes are what they were before them.
+        assert!(json.get("response_modes").is_none(), "{json}");
+        assert!(json.get("stated_values").is_none(), "{json}");
+
+        // Both fields round-trip.
+        use crate::services::type_sidecar::{MessageRead, MessageSource};
+        let mut moded = entry.clone();
+        moded.response_modes = Some(ResponseModes {
+            reads: vec![MessageRead {
+                location: MessageSource::Query,
+                field: "mode".to_string(),
+            }],
+            cases: vec![
+                ResponseModeCase {
+                    value: Some("a".to_string()),
+                    alias: "Endpoint_abc_Response_Mode1".to_string(),
+                    expanded: Some("{ x: number; }".to_string()),
+                },
+                ResponseModeCase {
+                    value: None,
+                    alias: "Endpoint_abc_Response_ModeOther".to_string(),
+                    expanded: None,
+                },
+            ],
+        });
+        moded.stated_values = StatedValues::from([(
+            MessageSource::Body,
+            std::collections::BTreeMap::from([("kind".to_string(), "r".to_string())]),
+        )]);
+        let json = serde_json::to_value(&moded).unwrap();
+        assert_eq!(
+            json["response_modes"],
+            serde_json::json!({
+                "reads": [{ "location": "query", "field": "mode" }],
+                "cases": [
+                    { "value": "a", "alias": "Endpoint_abc_Response_Mode1", "expanded": "{ x: number; }" },
+                    { "value": null, "alias": "Endpoint_abc_Response_ModeOther" },
+                ],
+            })
+        );
+        assert_eq!(
+            json["stated_values"],
+            serde_json::json!({ "body": { "kind": "r" } })
+        );
+        let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.response_modes, moded.response_modes);
+        assert_eq!(back.stated_values, moded.stated_values);
     }
 
     /// The uploaded index (extraction output) must carry each endpoint's
