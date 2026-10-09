@@ -75,3 +75,9 @@ serial_test = "3.0"
 # The upload's landed-check waits half a minute for a handler that may still be
 # committing (carrick#1067), and no test should.
 tokio = { version = "1", features = ["test-util"] }
+
+# Line tables keep panic locations and backtraces readable; full debuginfo is
+# what a debugger wants. Cuts a cold test build by about 40% and the target
+# dir by about a quarter (carrick#2155). CI sets no profile env of its own.
+[profile.dev]
+debug = "line-tables-only"

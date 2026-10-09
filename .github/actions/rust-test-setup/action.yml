@@ -19,10 +19,10 @@ runs:
         toolchain: stable
         components: rustfmt, clippy
 
-    # Keyed apart from the lint/build caches: the test jobs compile with
-    # `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (ci.yml), and a target
-    # directory built with full debuginfo is a full rebuild under that
-    # profile, which the once-per-lockfile save would then never replace.
+    # Keyed apart from the lint/build caches: the dev profile in Cargo.toml
+    # sets `debug = "line-tables-only"`, and a target directory built with
+    # full debuginfo is a full rebuild under that profile, which the
+    # once-per-lockfile save would then never replace.
     # Restore only: each job ends with ./.github/actions/rust-test-cache-save,
     # which saves dependencies without this repo's own build output.
     - name: Restore dependencies

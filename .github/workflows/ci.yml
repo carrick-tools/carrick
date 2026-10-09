@@ -29,11 +29,6 @@ jobs:
   rust-unit:
     name: Rust unit and fast integration
     runs-on: ubuntu-latest
-    env:
-      # Line tables keep panic locations and backtraces readable; full
-      # debuginfo is what a debugger wants, and nothing here attaches one.
-      # Cuts the compile and the link of ~45 test binaries.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
@@ -207,8 +202,6 @@ jobs:
   rust-fast-b:
     name: Rust fast integration (b)
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
@@ -285,8 +278,6 @@ jobs:
   rust-scan:
     name: Rust scan integration
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
@@ -333,8 +324,6 @@ jobs:
   rust-local-mode:
     name: Rust local mode
     runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
