@@ -8284,7 +8284,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         web_sidecar
             .wait_ready(crate::services::type_sidecar::ready_budget())
             .expect("web init");
-        let calls: [(&OperationKey, u32, &str, &[(&str, &str)]); 6] = [
+        // (operation, line, call expression, body literals)
+        type Call<'a> = (&'a OperationKey, u32, &'a str, &'a [(&'a str, &'a str)]);
+        let calls: [Call; 6] = [
             (&items, 2, "fetch(\"/api/items?mode=a\")", &[]),
             (&items, 6, "fetch(\"/api/items?mode=a\")", &[]),
             (&items, 11, "fetch(\"/api/items?mode=b\")", &[]),
