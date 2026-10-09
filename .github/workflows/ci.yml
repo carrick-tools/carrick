@@ -68,9 +68,7 @@ jobs:
           --test ask_in_parts_test
           --test graphql_code_first_resolvers_test
           --test graphql_document_call_sites_test
-          --test graphql_located_operation_types_test
           --test graphql_schema_identity_test
-          --test in_process_publish_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
           --test jsx_component_callers_test
@@ -79,7 +77,6 @@ jobs:
           --test nonhttp_source_labels_test
           --test own_route_calls_test
           --test receiver_type_classification_test
-          --test request_summary_test
           --test scan_durability_test
           --test sidecar_integration_test
           --test sidecar_program_files_test
@@ -146,9 +143,7 @@ jobs:
           --test ask_in_parts_test
           --test graphql_code_first_resolvers_test
           --test graphql_document_call_sites_test
-          --test graphql_located_operation_types_test
           --test graphql_schema_identity_test
-          --test in_process_publish_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
           --test jsx_component_callers_test
@@ -157,7 +152,6 @@ jobs:
           --test nonhttp_source_labels_test
           --test own_route_calls_test
           --test receiver_type_classification_test
-          --test request_summary_test
           --test scan_durability_test
           --test sidecar_integration_test
           --test sidecar_program_files_test
@@ -319,8 +313,9 @@ jobs:
         with:
           cache-hit: ${{ steps.setup.outputs.cache-hit }}
 
-  # local_mode_test on its own: its 26 tests are one binary, and pairing it
-  # with anything puts the longest of them on the critical path.
+  # local_mode_test plus three binaries moved off rust-unit by measured time
+  # (carrick#2152). local_mode_test's two timing tests claim every slot, so
+  # the other binaries only fill the gaps between them.
   rust-local-mode:
     name: Rust local mode
     runs-on: ubuntu-latest
@@ -336,7 +331,12 @@ jobs:
 
       # Tests that must not overlap another are named in .config/nextest.toml.
       - name: Run local mode tests
-        run: cargo nextest run --no-fail-fast --test local_mode_test
+        run: >-
+          cargo nextest run --no-fail-fast
+          --test graphql_located_operation_types_test
+          --test in_process_publish_test
+          --test local_mode_test
+          --test request_summary_test
 
       - uses: ./.github/actions/rust-test-cache-save
         with:
