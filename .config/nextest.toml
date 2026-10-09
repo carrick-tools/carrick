@@ -1,0 +1,21 @@
+# Settings for `cargo nextest run`, which runs each test in its own process
+# and every binary's tests side by side (see .github/workflows/ci.yml).
+# `#[serial]` only orders tests inside one process, so a test that must not
+# overlap another is named here instead.
+
+[test-groups]
+# `carrick check --recheck` writes a `carrick-recheck-*` generation into the
+# system temp directory. The budget test counts those before and after its own
+# run, so no other re-check may run beside it. These three are the only tests
+# that re-check (carrick#2151).
+recheck-temp = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(=local_mode_test) & (test(=an_edit_is_re_judged_before_the_index_catches_up) | test(=a_re_check_names_the_functions_the_index_does_not_hold) | test(=a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking))'
+test-group = 'recheck-temp'
+
+# Both assert a 300 ms median for a read, which another running test's CPU use
+# would inflate. Claiming every slot keeps them alone on the machine.
+[[profile.default.overrides]]
+filter = 'binary(=local_mode_test) & (test(=status_answers_for_the_workspace) | test(=a_read_costs_what_a_hook_can_afford))'
+threads-required = 'num-cpus'

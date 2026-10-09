@@ -292,9 +292,14 @@ jobs:
       - uses: ./.github/actions/rust-test-setup
         id: setup
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: nextest@0.9.148
+
       - name: Run scan-driving integration tests
         run: >-
-          cargo test --verbose
+          cargo nextest run --no-fail-fast
           --test call_states_its_verb_test
           --test descriptor_route_anchor_test
           --test deterministic_emission_test
@@ -328,8 +333,8 @@ jobs:
         with:
           cache-hit: ${{ steps.setup.outputs.cache-hit }}
 
-  # local_mode_test on its own: at 2.4 minutes it is the longest single
-  # binary, and pairing it with anything puts that on the critical path.
+  # local_mode_test on its own: its 26 tests are one binary, and pairing it
+  # with anything puts the longest of them on the critical path.
   rust-local-mode:
     name: Rust local mode
     runs-on: ubuntu-latest
@@ -340,8 +345,14 @@ jobs:
       - uses: ./.github/actions/rust-test-setup
         id: setup
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: nextest@0.9.148
+
+      # Tests that must not overlap another are named in .config/nextest.toml.
       - name: Run local mode tests
-        run: cargo test --verbose --test local_mode_test
+        run: cargo nextest run --no-fail-fast --test local_mode_test
 
       - uses: ./.github/actions/rust-test-cache-save
         with:
