@@ -162,8 +162,7 @@ function runSelfCheck(
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const options: ts.CompilerOptions = { ...SELF_CHECK_OPTIONS };
-  const program = ts.createProgram(treeFiles, options, args.compilerHost?.(options));
+  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, args.compilerHost?.(SELF_CHECK_OPTIONS));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 
