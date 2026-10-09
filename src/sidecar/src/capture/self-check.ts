@@ -4,7 +4,9 @@
  *
  * The stub tree is typechecked standalone with `skipLibCheck: false` --
  * spike-verified as load-bearing: the tree is entirely .d.ts and skipLibCheck
- * skips declaration files wholesale, making the gate vacuous. When the
+ * skips declaration files wholesale, making the gate vacuous. It also sets
+ * `skipDefaultLibCheck: true`, which skips only the compiler's own default
+ * lib files, never a stub file (see `SELF_CHECK_OPTIONS`). When the
  * source repo has node_modules, resolution is pointed at it via a temporary
  * node_modules symlink inside the stub, so externals resolve exactly as they
  * will at check time against installed pins.
@@ -128,20 +130,39 @@ interface SelfCheckPass {
   internalFailuresByFile: Map<string, Set<string>>;
 }
 
+/**
+ * The options of every self-check program.
+ *
+ * `skipLibCheck: false` keeps every stub `.d.ts` checked (see module header).
+ * `skipDefaultLibCheck: true` skips only files the program loaded as a default
+ * lib (the default lib, `lib` entries, `/// <reference lib>` targets), which
+ * was most of a capture's check time (carrick#2158). It is safe here because
+ * the self-check reads only resolution diagnostics (2307, 2792, `Cannot find
+ * name|namespace`), attributes them only through the stub tree, and the
+ * compiler reports each at the referencing stub node when it checks that stub.
+ *
+ * It must NOT be set on the judge's `tsc` (`CHECKER_TSCONFIG`): some checks of
+ * a merged interface run only when its FIRST declaration is checked, so a stub
+ * that augments `interface Window { 0: number }` loses its TS2411 when
+ * `lib.dom.d.ts` is skipped, and the judge counts any stub diagnostic.
+ */
+export const SELF_CHECK_OPTIONS: Readonly<ts.CompilerOptions> = sidecarCompilerOptions({
+  noEmit: true,
+  strict: true,
+  // MUST be false: the whole stub tree is .d.ts (see module header).
+  skipLibCheck: false,
+  skipDefaultLibCheck: true,
+  module: ts.ModuleKind.ESNext,
+  moduleResolution: ts.ModuleResolutionKind.Bundler,
+  types: [],
+});
+
 function runSelfCheck(
   args: SelfCheckArgs,
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const options: ts.CompilerOptions = sidecarCompilerOptions({
-    noEmit: true,
-    strict: true,
-    // MUST be false: the whole stub tree is .d.ts (see module header).
-    skipLibCheck: false,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    types: [],
-  });
+  const options: ts.CompilerOptions = { ...SELF_CHECK_OPTIONS };
   const program = ts.createProgram(treeFiles, options, args.compilerHost?.(options));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
