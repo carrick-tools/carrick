@@ -1,0 +1,10 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {"candidate_id": "span:184-244", "line_number": 5, "target": "/api/content/${segment}/publish", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(`/api/content/${segment}/publish`", "call_expression_line": 5, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:545-663", "line_number": 15, "target": "/api/content/drafts/${id}/publish", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(kind === \"draft\" ? `/api/content/drafts/${id}/publish` : `/api/content/posts/${id}/publish`", "call_expression_line": 15, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:545-663", "line_number": 15, "target": "/api/content/posts/${id}/publish", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(kind === \"draft\" ? `/api/content/drafts/${id}/publish` : `/api/content/posts/${id}/publish`", "call_expression_line": 15, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:1046-1106", "line_number": 26, "target": "/api/content/${segment}/publish", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(`/api/content/${segment}/publish`", "call_expression_line": 26, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null}
+  ]
+}

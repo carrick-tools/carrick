@@ -8411,7 +8411,7 @@ impl FileOrchestrator {
             }
             let line = call.line_number;
             let span = call.call_expression_span_start;
-            let twin = result.data_calls.iter().position(|row| {
+            let at_site = |row: &DataCallResult| {
                 if row.resolution_source == Some(ResolutionSource::Model) {
                     return false;
                 }
@@ -8423,7 +8423,26 @@ impl FileOrchestrator {
                     // candidate and carried its own span.
                     None => row.line_number == line || row.call_expression_line == Some(line),
                 }
-            });
+            };
+            // A site that sends several requests holds several rows, and the
+            // model's row for one of them is that one's twin, not the first
+            // row's (carrick#2050): the row that states the same method and
+            // route, among those no model row has joined yet. Otherwise the
+            // first row at the site, as it always was.
+            let restates = |row: &DataCallResult| {
+                row.method
+                    .as_deref()
+                    .zip(call.method.as_deref())
+                    .is_some_and(|(stated, model)| stated.eq_ignore_ascii_case(model))
+                    && normalize_path_params(row.target.trim())
+                        == normalize_path_params(call.target.trim())
+            };
+            let agreeing = result
+                .data_calls
+                .iter()
+                .enumerate()
+                .position(|(index, row)| !folded.contains(&index) && at_site(row) && restates(row));
+            let twin = agreeing.or_else(|| result.data_calls.iter().position(at_site));
             match twin.filter(|index| folded.insert(*index)) {
                 Some(index) => {
                     Self::fold_model_call(&mut result.data_calls[index], call, file_path, stats);
