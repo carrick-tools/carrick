@@ -387,7 +387,7 @@ export function renderPostToolUse(
     const rest = uses.length - Math.min(uses.length, MAX_USE_LINES);
     if (rest > 0) {
       lines.push(
-        `- and ${rest} more function(s) or type(s) in this file used elsewhere, from \`carrick check\`.`,
+        `- and ${rest} more line(s) like these; \`carrick check\` on this file prints them all.`,
       );
     }
   }

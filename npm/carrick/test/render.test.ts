@@ -651,7 +651,7 @@ test("more than eight uses lines are cut to eight and counted", () => {
   assert.deepEqual(lines.slice(1, 9), many.slice(0, 8));
   assert.equal(
     lines[9],
-    "- and 3 more function(s) or type(s) in this file used elsewhere, from `carrick check`.",
+    "- and 3 more line(s) like these; `carrick check` on this file prints them all.",
   );
   assert.equal(lines.length, 10);
 });
