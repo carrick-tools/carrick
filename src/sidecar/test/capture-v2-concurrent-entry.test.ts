@@ -52,6 +52,13 @@ fs.cpSync(BARE, TREE, {
   filter: (src) => !path.basename(src).startsWith('__carrick_surface__'),
 });
 
+/**
+ * Each capture boots its own sidecar (a fresh compiler) and four run at once,
+ * so on a loaded runner a capture waits for CPU well past the helper's 10 s
+ * default. Same limit the other capture_v2 tests use; a hang still fails.
+ */
+const CAPTURE_TIMEOUT_MS = 120000;
+
 interface CaptureV2ResponseShape {
   request_id: string;
   status: string;
@@ -95,14 +102,17 @@ async function capture(label: string): Promise<CaptureOutcome> {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), `carrick-concurrent-${label}-`));
   try {
     await client.start();
-    const response = (await client.send({
-      request_id: `capture-v2-concurrent-${label}`,
-      action: 'capture_v2',
-      repo_root: TREE,
-      service_name: 'Capture Bare Svc',
-      out_dir: path.join(outDir, 'stub'),
-      anchors: ANCHORS,
-    })) as CaptureV2ResponseShape;
+    const response = (await client.send(
+      {
+        request_id: `capture-v2-concurrent-${label}`,
+        action: 'capture_v2',
+        repo_root: TREE,
+        service_name: 'Capture Bare Svc',
+        out_dir: path.join(outDir, 'stub'),
+        anchors: ANCHORS,
+      },
+      CAPTURE_TIMEOUT_MS
+    )) as CaptureV2ResponseShape;
     assert.equal(response.status, 'success', JSON.stringify(response.errors));
     const aliases = response.result?.aliases ?? [];
     assert.equal(aliases.length, ANCHORS.length, `${label} answered every anchor`);
