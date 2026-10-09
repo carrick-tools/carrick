@@ -17,6 +17,7 @@ pub mod console;
 pub mod consumer_row_fold;
 pub mod credentials;
 pub mod current_service;
+pub mod declared_verbs;
 pub mod deno_support;
 pub mod dispatch;
 pub mod engine;

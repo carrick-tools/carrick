@@ -62,6 +62,18 @@
 //!   field table reads as set once to the global, to such a constructor
 //!   parameter, or to `options.fetch ?? fetch`, are the platform's `fetch`,
 //!   whatever a caller hands in instead.
+//! - **A declared method is every verb it names** (carrick#2049). A method
+//!   that is a parameter typed as a closed set of HTTP verbs (`method:
+//!   "POST" | "DELETE"`, or an alias the file declares:
+//!   [`crate::declared_verbs`]) is sent as one of them, so the request's own
+//!   line states a row per verb, even where its URL is written at the call.
+//!   Which verbs: those its calls write, when every call writes one; every
+//!   verb the declaration allows when a call hands it a value nothing here
+//!   reads, or nothing calls it. A caller that writes a verb states that one
+//!   at its own line as well. A parameter typed `string`, an optional one,
+//!   one the body assigns again, one typed by an import and one of a
+//!   function written inside another (whose callers are not resolved here)
+//!   states no verb.
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
@@ -432,6 +444,23 @@ struct RequestShape {
     /// request only where something else the source states says so
     /// ([`Composer::request_of`]).
     init_only: bool,
+    /// The verbs the source declares the method parameter can be, when the
+    /// method is a parameter whose annotation is a closed set of them
+    /// (carrick#2049). Empty for every other request.
+    declared_methods: Vec<String>,
+}
+
+impl RequestShape {
+    /// Whether the request is stated at its own line though its URL is
+    /// written at the call (carrick#2049). The method is a parameter the
+    /// source declares as a closed set of verbs, which is one row per verb,
+    /// a count the single row of a model cannot hold. Only a URL that starts
+    /// with its path is stated here: one that leads with a base is read by
+    /// the passes that settle a base, and keeps their row.
+    fn states_each_declared_method(&self) -> bool {
+        !self.declared_methods.is_empty()
+            && matches!(self.url.first(), Some(Piece::Lit(text)) if text.starts_with('/'))
+    }
 }
 
 /// A client of a library package, as the source names it (carrick#1564): a
@@ -1047,6 +1076,7 @@ pub fn extract_file_ir(
         subclass_methods: subclass_members(&classes, |class| &class.methods),
         class_this: library_sites::class_this(module),
         declared_below: redeclared_names(module),
+        verb_aliases: crate::declared_verbs::TypeAliases::of(module),
     };
     module_scope.receivers = import_receivers(&imports)
         .into_iter()
@@ -1409,6 +1439,9 @@ struct ModuleScope {
     /// Every declaration below module scope ([`redeclared_names`]): what a
     /// function, a block or a parameter binds.
     declared_below: Declarations,
+    /// The type aliases the file declares that name a closed set of HTTP
+    /// verbs (carrick#2049).
+    verb_aliases: crate::declared_verbs::TypeAliases,
 }
 
 impl ModuleScope {
@@ -3044,6 +3077,10 @@ struct Scope<'a> {
     /// fetch`, `{ fetchImpl = fetch } = {}`), and that the body never
     /// assigns again: a call through one is a `fetch` (carrick#1562).
     fetches: HashSet<BindingKey>,
+    /// The HTTP verbs the function declares a plain parameter can be, by
+    /// position (carrick#2049): `method: "POST" | "DELETE"`, or an alias of
+    /// one the file declares. Never a parameter the body assigns again.
+    param_verbs: HashMap<usize, Vec<String>>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -3061,6 +3098,7 @@ impl<'a> Scope<'a> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches: HashSet::new(),
+            param_verbs: HashMap::new(),
             fields: None,
             module,
         }
@@ -3086,6 +3124,7 @@ impl<'a> Scope<'a> {
         params: impl IntoIterator<Item = &'p Pat>,
         function: &N,
         module: &ModuleScope,
+        type_params: &HashSet<String>,
     ) where
         N: VisitWith<Declarations> + VisitWith<Reassigned>,
     {
@@ -3103,12 +3142,24 @@ impl<'a> Scope<'a> {
             {
                 self.key_objects.insert(key.clone());
             }
-            self.params.push(key);
             // `{ url }: Options = {}`: the pattern is the left side.
             let pattern = match pat {
                 Pat::Assign(assign) => &*assign.left,
                 other => other,
             };
+            // `method: "POST" | "DELETE"`: every verb the request can send
+            // (carrick#2049). An optional parameter may arrive as nothing.
+            if let Pat::Ident(ident) = pattern
+                && !ident.id.optional
+                && let Some(annotation) = &ident.type_ann
+                && key.as_ref().is_some_and(settled)
+                && let Some(verbs) = module
+                    .verb_aliases
+                    .verbs_of(&annotation.type_ann, type_params)
+            {
+                self.param_verbs.insert(index, verbs);
+            }
+            self.params.push(key);
             if let Pat::Object(object) = pattern {
                 for (binding, key) in keyed_names(object) {
                     if settled(&binding) {
@@ -3484,6 +3535,7 @@ impl Reader<'_> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches,
+            param_verbs: HashMap::new(),
             fields,
             module,
         };
@@ -3491,6 +3543,7 @@ impl Reader<'_> {
             function.params.iter().map(|param| &param.pat),
             function,
             module,
+            &type_param_names(function.type_params.as_deref()),
         );
         let mut ir = FnIr {
             params: ParamDecl::all(
@@ -3531,10 +3584,16 @@ impl Reader<'_> {
             let_makers: HashMap::new(),
             bodies: HashMap::new(),
             fetches,
+            param_verbs: HashMap::new(),
             fields,
             module,
         };
-        scope.read_params(&arrow.params, arrow, module);
+        scope.read_params(
+            &arrow.params,
+            arrow,
+            module,
+            &type_param_names(arrow.type_params.as_deref()),
+        );
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
@@ -4250,6 +4309,11 @@ impl Reader<'_> {
             },
         };
 
+        let declared_methods = match &method {
+            MethodValue::Param(index) => scope.param_verbs.get(index).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
         let body = match options {
             _ if options_param.is_some() => {
                 BodyValue::ParamKey(options_param.unwrap_or_default(), "body".to_string())
@@ -4286,6 +4350,7 @@ impl Reader<'_> {
             semantics: BTreeSet::new(),
             // Only the bag says this is a request: not `fetch`, and no verb.
             init_only: kind == RequestKind::Bag && verb.is_none() && init_only,
+            declared_methods,
         })
     }
 
@@ -5261,6 +5326,22 @@ impl Effect {
         effect
     }
 
+    /// This effect once per verb its method parameter is declared with
+    /// (carrick#2049): the request line states every method the request can
+    /// send. An effect whose method is anything else is itself.
+    fn each_declared_method(&self, declared: &[String]) -> Vec<Effect> {
+        if declared.is_empty() || !matches!(self.method, MethodValue::Param(_)) {
+            return vec![self.clone()];
+        }
+        declared
+            .iter()
+            .map(|verb| Effect {
+                method: MethodValue::Lit(verb.clone()),
+                ..self.clone()
+            })
+            .collect()
+    }
+
     /// A key of a parameter is a caller's to fill in only where the request
     /// states no route without it (carrick#1950).
     ///
@@ -5845,6 +5926,33 @@ pub struct RequestSummaryIndex {
     passes_body: HashSet<(PathBuf, String)>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
+    /// What the requests whose method is a parameter declared as a set of
+    /// verbs wait on (carrick#2049).
+    methods: Box<DeclaredMethods>,
+}
+
+/// What the requests whose method is a parameter declared as a set of verbs
+/// wait on (carrick#2049).
+#[derive(Debug, Default)]
+struct DeclaredMethods {
+    /// The verbs the calls of each request whose method is a parameter write
+    /// for it, by the request's line.
+    supplied: HashMap<RequestSite, BTreeSet<String>>,
+    /// The requests whose method is a parameter that some call hands a value
+    /// this pass does not read as a verb.
+    unread: HashSet<RequestSite>,
+    /// The rows a request line states for a method declared as a set of
+    /// verbs, kept until every call of it has been read.
+    pending: Vec<DeclaredRows>,
+}
+
+/// One row per verb a request's method parameter is declared with.
+#[derive(Debug)]
+struct DeclaredRows {
+    file: PathBuf,
+    span_start: u32,
+    site: RequestSite,
+    rows: Vec<SummaryRow>,
 }
 
 impl RequestSummaryIndex {
@@ -6133,7 +6241,7 @@ pub fn summarize(
         keys.sort();
         for key in keys {
             let ir = &files[*path].functions[key];
-            emit(&mut composer, path, ir, &mut index);
+            emit(&mut composer, path, ir, &mut index, true);
         }
     }
     // Every function, not only the ones a resolved call site composed: a
@@ -6155,6 +6263,31 @@ pub fn summarize(
             }
         }
     }
+    // A request whose method is a parameter declared as a set of verbs states
+    // the verbs its calls write when every call writes one (carrick#2049),
+    // and every verb the declaration allows otherwise: a call nothing here
+    // reads, or no call at all, may send any of them.
+    for pending in std::mem::take(&mut index.methods.pending) {
+        let written = index
+            .methods
+            .supplied
+            .get(&pending.site)
+            .filter(|verbs| !verbs.is_empty() && !index.methods.unread.contains(&pending.site));
+        let stated: Vec<SummaryRow> = pending
+            .rows
+            .into_iter()
+            .filter(|row| written.is_none_or(|verbs| verbs.contains(&row.method)))
+            .collect();
+        if !stated.is_empty() {
+            index
+                .rows
+                .entry(pending.file)
+                .or_default()
+                .entry(pending.span_start)
+                .or_default()
+                .extend(stated);
+        }
+    }
     for sites in index.rows.values_mut() {
         for rows in sites.values_mut() {
             rows.sort();
@@ -6164,7 +6297,13 @@ pub fn summarize(
     index
 }
 
-fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut RequestSummaryIndex) {
+fn emit(
+    composer: &mut Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    index: &mut RequestSummaryIndex,
+    top_level: bool,
+) {
     let (files, sites) = (composer.files, composer.sites);
     for call in &ir.calls {
         if call.invokes_param.is_some() {
@@ -6185,6 +6324,23 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                         continue;
                     }
                     let instantiated = effect.instantiate(&call.args);
+                    // What this call writes for a method that is a parameter
+                    // (carrick#2049).
+                    if matches!(effect.method, MethodValue::Param(_)) {
+                        match &instantiated.method {
+                            MethodValue::Lit(verb) => {
+                                index
+                                    .methods
+                                    .supplied
+                                    .entry(effect.site.clone())
+                                    .or_default()
+                                    .insert(verb.clone());
+                            }
+                            _ => {
+                                index.methods.unread.insert(effect.site.clone());
+                            }
+                        }
+                    }
                     if instantiated.has_params() {
                         // Still open: a caller further up fills it.
                         continue;
@@ -6263,20 +6419,47 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
-                if let Some(request) = composer.request_of(file, call) {
+                if let Some(mut request) = composer.request_of(file, call) {
+                    // A function written inside another has callers this pass
+                    // does not resolve, so what its declaration allows is not
+                    // what it sends (carrick#2049): its calls are the model's
+                    // to read.
+                    if !top_level && !request.declared_methods.is_empty() {
+                        request.to_mut().declared_methods.clear();
+                    }
                     let library = request.kind == RequestKind::Library;
-                    if library || (request.kind != RequestKind::Verb && !request.url_inline) {
+                    if library
+                        || (request.kind != RequestKind::Verb
+                            && (!request.url_inline || request.states_each_declared_method()))
+                    {
                         let effect = Effect::from_shape(&request, file, call.site.line);
-                        if !effect.has_params() {
-                            let at = if library {
-                                RowSite::Library
-                            } else {
-                                RowSite::Own
-                            };
-                            match row(&effect, file, composer.files, call, None, at, None) {
-                                Some(row) => rows.push(row),
-                                None => index.undetermined += 1,
+                        let site = effect.site.clone();
+                        let declared = matches!(effect.method, MethodValue::Param(_))
+                            && !request.declared_methods.is_empty();
+                        let mut verbs: Vec<SummaryRow> = Vec::new();
+                        for effect in effect.each_declared_method(&request.declared_methods) {
+                            if !effect.has_params() {
+                                let at = if library {
+                                    RowSite::Library
+                                } else {
+                                    RowSite::Own
+                                };
+                                match row(&effect, file, composer.files, call, None, at, None) {
+                                    Some(row) if declared => verbs.push(row),
+                                    Some(row) => rows.push(row),
+                                    None => index.undetermined += 1,
+                                }
                             }
+                        }
+                        // Which of the declared verbs the line states waits on
+                        // every call of the request having been read.
+                        if declared && !verbs.is_empty() {
+                            index.methods.pending.push(DeclaredRows {
+                                file: file.to_path_buf(),
+                                span_start: call.site.span_start,
+                                site,
+                                rows: verbs,
+                            });
                         }
                     }
                 }
@@ -6293,7 +6476,7 @@ fn emit(composer: &mut Composer<'_>, file: &Path, ir: &FnIr, index: &mut Request
         }
     }
     for nested in ir.nested.iter().chain(&ir.detached) {
-        emit(composer, file, nested, index);
+        emit(composer, file, nested, index, false);
     }
 }
 
@@ -6618,6 +6801,7 @@ fn library_shape(
         base_scope: None,
         semantics: used,
         init_only: false,
+        declared_methods: Vec::new(),
     })
 }
 

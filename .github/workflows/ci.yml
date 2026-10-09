@@ -254,6 +254,7 @@ jobs:
           --test socket_generic_test
           --test socket_namespace_test
           --test socket_type_alias_test
+          --test union_method_param_test
           --test url_alias_matching_test
           --test workspace_member_callers_test
           --test wrapper_dispatch_test
