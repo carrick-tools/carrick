@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.3.111](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.110...carrick-v0.3.111) (2026-10-09)
+
+
+### Features
+
+* **compat:** judge a response chosen by a request field against the case the call states ([#2054](https://github.com/carrick-tools/carrick/issues/2054), PR B) ([#2144](https://github.com/carrick-tools/carrick/issues/2144)) ([f28ec13](https://github.com/carrick-tools/carrick/commit/f28ec13198eb3f3480c73f77b57a59a5b3ec3f39))
+
+
+### Bug Fixes
+
+* **compat:** the type check pairs a call to a dispatching route as the matcher does ([#2059](https://github.com/carrick-tools/carrick/issues/2059)) ([#2143](https://github.com/carrick-tools/carrick/issues/2143)) ([84ffc2d](https://github.com/carrick-tools/carrick/commit/84ffc2d65fe1e6cd63bb3510617a39b0d476cda3))
+* **hook:** post-edit prints one file-scoped line, not the service-wide boundary ([#2087](https://github.com/carrick-tools/carrick/issues/2087)) ([abd0bc0](https://github.com/carrick-tools/carrick/commit/abd0bc0f0d48554cbaf3f9d77360ccdf07d8c5b9))
+* **join:** every dispatch case of a stated route is a row of its own ([#2048](https://github.com/carrick-tools/carrick/issues/2048)) ([#2078](https://github.com/carrick-tools/carrick/issues/2078)) ([55c05e4](https://github.com/carrick-tools/carrick/commit/55c05e43166e6bf698afa24babbe6ffdee8e2c84))
+* **scanner:** read .mjs, .cjs, .mts and .cts files as source ([#2128](https://github.com/carrick-tools/carrick/issues/2128)) ([a8ad6c6](https://github.com/carrick-tools/carrick/commit/a8ad6c6085e8304816c574f62350c1d60408c239))
+* **sidecar:** a list whose element has no symbol keeps its depth on the model's symbol ([#1967](https://github.com/carrick-tools/carrick/issues/1967)) ([#2120](https://github.com/carrick-tools/carrick/issues/2120)) ([931f0eb](https://github.com/carrick-tools/carrick/commit/931f0ebf6506285c610b003b5e6fede735d8b699))
+* **sidecar:** a located call that produces data is the route's payload, not a send ([#2055](https://github.com/carrick-tools/carrick/issues/2055)) ([#2118](https://github.com/carrick-tools/carrick/issues/2118)) ([13c0721](https://github.com/carrick-tools/carrick/commit/13c0721c32a28a1cdbe0a7b3209e0abbaef932d3))
+* **sidecar:** a route's response row located at a send inside its handler is typed from the handler's success sends, and a chained status is read there ([#2005](https://github.com/carrick-tools/carrick/issues/2005)) ([#2079](https://github.com/carrick-tools/carrick/issues/2079)) ([481c7bc](https://github.com/carrick-tools/carrick/commit/481c7bc42fd50862081c60b532dc51a29e3a356f))
+* **sidecar:** the no-request-body detail names the call's request config, not a located argument ([#1841](https://github.com/carrick-tools/carrick/issues/1841)) ([#2141](https://github.com/carrick-tools/carrick/issues/2141)) ([d7ad144](https://github.com/carrick-tools/carrick/commit/d7ad1445cac274ea2fa26bab3e18f6e582ddbaa7))
+* **types:** a request call that states its URL on its one object argument sends that object's body ([#1841](https://github.com/carrick-tools/carrick/issues/1841)) ([#2130](https://github.com/carrick-tools/carrick/issues/2130)) ([99829ae](https://github.com/carrick-tools/carrick/commit/99829ae66327ea85f19207e4bd6f0e795310a421))
+
+
+### Refactoring
+
+* build the binary on the library crate ([#2129](https://github.com/carrick-tools/carrick/issues/2129)) ([9b0e420](https://github.com/carrick-tools/carrick/commit/9b0e4200cca6903c7bdd831f89cf271fc875b13b))
+
+
+### Documentation
+
+* agent capability sheet, pinned to OperationKey, allowJs and the file walk ([#2121](https://github.com/carrick-tools/carrick/issues/2121)) ([556da9d](https://github.com/carrick-tools/carrick/commit/556da9d1753e3526fa53d2a9b446b4e7f8a09329))
+
+
+### CI/CD
+
+* run lib and fast integration tests with cargo-nextest ([#2119](https://github.com/carrick-tools/carrick/issues/2119)) ([6347abf](https://github.com/carrick-tools/carrick/commit/6347abfd24de44c81af152a1cf9733548e09ea2e))
+
 ## [0.3.110](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.109...carrick-v0.3.110) (2026-10-08)
 
 
