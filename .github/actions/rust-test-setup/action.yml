@@ -5,6 +5,11 @@ description: >-
   One action rather than a copy per job so the three test shards in ci.yml
   cannot drift apart.
 
+outputs:
+  cache-hit:
+    description: "true when the dependency cache restored on its exact key"
+    value: ${{ steps.cache.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
@@ -18,16 +23,19 @@ runs:
     # `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (ci.yml), and a target
     # directory built with full debuginfo is a full rebuild under that
     # profile, which the once-per-lockfile save would then never replace.
-    - name: Cache dependencies
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+    # Restore only: each job ends with ./.github/actions/rust-test-cache-save,
+    # which saves dependencies without this repo's own build output.
+    - name: Restore dependencies
+      id: cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-test-ltd-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-test-deps-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-test-ltd-
+          ${{ runner.os }}-cargo-test-deps-
 
     - name: Install Node.js
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4

@@ -1,0 +1,38 @@
+name: Rust test cache save
+description: >-
+  Saves the dependency cache that rust-test-setup restores, without this
+  repo's own build output. A fresh checkout marks every workspace crate Dirty,
+  so those bytes were restored and never reused (carrick#2154). Skipped when
+  the restore hit the exact key.
+
+inputs:
+  cache-hit:
+    description: "the cache-hit output of rust-test-setup"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Remove this repo's own build output
+      if: inputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        d=target/debug
+        rm -rf "$d/carrick" "$d/carrick.d" "$d/incremental"
+        rm -rf "$d"/deps/carrick-* "$d"/deps/libcarrick-* "$d"/deps/carrick_match-* "$d"/deps/libcarrick_match-*
+        rm -rf "$d"/.fingerprint/carrick-* "$d"/build/carrick-*
+        for f in tests/*.rs; do
+          n=$(basename "$f" .rs)
+          rm -rf "$d/deps/$n"-*
+        done
+        du -sh target ~/.cargo/registry ~/.cargo/git 2>/dev/null || true
+
+    - name: Save dependencies
+      if: inputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-test-deps-${{ hashFiles('**/Cargo.lock') }}

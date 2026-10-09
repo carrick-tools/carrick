@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
+        id: setup
 
       # cargo-nextest runs each test in its own process and the processes of
       # every binary in parallel, where `cargo test` runs one binary after
@@ -52,11 +53,49 @@ jobs:
       # never ran doc tests, so nothing is dropped; carrick-match stays on
       # cargo test.
 
+      # One build of every target this job runs, before any step runs one.
+      # The steps below then find their binaries Fresh. The carrick-match
+      # step used to sit between the first library build and the nextest
+      # build: `cargo test -p carrick-match` drops the `serde` feature the
+      # carrick crate turns on, so the next step rebuilt carrick-match and the
+      # whole library (carrick#2150). It runs last now.
+      - name: Build every target this job runs
+        run: >-
+          cargo test --no-run --lib
+          --test capability_sheet_test
+          --test sidecar_readiness_test
+          --test sidecar_operation_timeout_test
+          --test sidecar_fresh_process_test
+          --test shutdown_signal_test
+          --test shutdown_drain_test
+          --test panic_hook_test
+          --test action_install_test
+          --test ask_in_parts_test
+          --test graphql_code_first_resolvers_test
+          --test graphql_document_call_sites_test
+          --test graphql_located_operation_types_test
+          --test graphql_schema_identity_test
+          --test in_process_publish_test
+          --test incremental_raw_cache_test
+          --test intent_incremental_test
+          --test jsx_component_callers_test
+          --test library_store_test
+          --test nested_service_walk_test
+          --test nonhttp_source_labels_test
+          --test own_route_calls_test
+          --test receiver_type_classification_test
+          --test request_summary_test
+          --test scan_durability_test
+          --test sidecar_integration_test
+          --test sidecar_program_files_test
+          --test socket_class_field_test
+          --test span_locator_units_test
+          --test url_bases_through_bindings_test
+          --test workspace_package_client_test
+          --test wrapper_chain_const_url_test
+
       - name: Run capability sheet test
         run: cargo test --test capability_sheet_test --verbose
-
-      - name: Run carrick-match tests
-        run: cargo test -p carrick-match --verbose
 
       # Timing assertions on the readiness budget: its own step so the waits
       # are not competing with another test binary for the machine. Needs node
@@ -133,6 +172,11 @@ jobs:
           --test workspace_package_client_test
           --test wrapper_chain_const_url_test
 
+      # Last: it flips carrick-match's features, which would make every target
+      # above Dirty if it ran first.
+      - name: Run carrick-match tests
+        run: cargo test -p carrick-match --verbose
+
       # Every tests/*.rs must be run by a step in one of the Rust shards or be
       # listed here with a reason. Nine of twenty were silently local-only
       # before this step.
@@ -150,6 +194,9 @@ jobs:
           done
           exit $missing
 
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}
 
   # The other half of the fast integration binaries, split off rust-unit by
   # measured test time (summed per binary from a nextest run: about 920 CPU
@@ -165,6 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
+        id: setup
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
@@ -223,6 +271,10 @@ jobs:
           --test workspace_member_callers_test
           --test wrapper_dispatch_test
 
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}
+
   # The binaries that drive whole scans through the sidecar over fixture
   # repos: seconds to minutes each, and the reason the single job was slow.
   # llm_cassette_hard_gate_test is the frozen-LLM-input golden;
@@ -238,6 +290,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
+        id: setup
 
       - name: Run scan-driving integration tests
         run: >-
@@ -271,6 +324,10 @@ jobs:
           --test wrapper_call_route_test
           --test xrepo_harness_test
 
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}
+
   # local_mode_test on its own: at 2.4 minutes it is the longest single
   # binary, and pairing it with anything puts that on the critical path.
   rust-local-mode:
@@ -281,9 +338,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
+        id: setup
 
       - name: Run local mode tests
         run: cargo test --verbose --test local_mode_test
+
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}
 
   # The type sidecar's own unit tests, no Rust. Two shards: four files run
   # real package managers, Deno and tsc over fixture projects (the Deno
@@ -450,9 +512,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-lint-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -479,9 +541,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-release-
 
       # Release only. The debug build is what every Rust test shard already
       # compiles; repeating it here doubled this job for nothing.
@@ -506,9 +568,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-release-
 
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
