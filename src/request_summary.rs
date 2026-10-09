@@ -79,6 +79,11 @@
 //!   local or written in the URL) is one row per branch. A branch nothing
 //!   here read, beside one that writes a path, may span any number of
 //!   segments, so no placeholder stands for it ([`alternatives`]).
+//! - **One test is one choice** (carrick#2051). A method and a URL a test
+//!   chooses together (`fetch(existing ? `/notes/${id}` : "/notes", { method:
+//!   existing ? "PATCH" : "POST" })`, or the same through locals) pair branch
+//!   with branch: `PATCH /notes/:id` and `POST /notes`. Two different tests
+//!   pair nothing, and no row is stated.
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
@@ -171,7 +176,8 @@
 #[allow(dead_code)]
 mod library_sites;
 
-// What a conditional leaves a URL able to read as (carrick#2050).
+// What a conditional leaves a URL or a method able to read as (carrick#2050,
+// carrick#2051).
 mod alternatives;
 use alternatives::{Alternation, Alternatives};
 
@@ -457,7 +463,8 @@ struct RequestShape {
     /// method is a parameter whose annotation is a closed set of them
     /// (carrick#2049). Empty for every other request.
     declared_methods: Vec<String>,
-    /// How a conditional in the URL splits the request (carrick#2050).
+    /// How a conditional in the URL or the method splits the request
+    /// (carrick#2050, carrick#2051).
     alternation: Alternation,
 }
 
@@ -465,7 +472,8 @@ impl RequestShape {
     /// Whether the request is stated at its own line though its URL is
     /// written at the call. The source says it is more than one request: the
     /// method is a parameter declared as a closed set of verbs
-    /// (carrick#2049), or a conditional chooses the URL (carrick#2050). That
+    /// (carrick#2049), or a conditional chooses the URL or the method (carrick#2050,
+    /// carrick#2051). That
     /// is one row per request, a count the
     /// single row of a model cannot hold. Only a URL that starts with its
     /// path is stated here: one that leads with a base is read by the passes
@@ -3107,7 +3115,7 @@ struct Scope<'a> {
     /// initialiser holds one is here.
     alts: HashMap<BindingKey, Alternatives>,
     /// The names the function assigns again, anywhere in it: a test that
-    /// reads one is not the same test twice (carrick#2050).
+    /// reads one is not the same test twice (carrick#2051).
     reassigned: HashSet<String>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
@@ -4365,9 +4373,16 @@ impl Reader<'_> {
             _ => Vec::new(),
         };
 
-        // A conditional that chooses the URL is more than one request
-        // (carrick#2050).
-        let alternation = self.alternation(url_expr, &method, scope);
+        // A conditional that chooses the URL or the method is more than one
+        // request (carrick#2050, carrick#2051). The method is read only
+        // where the options say one last: a spread after it may replace it.
+        let method_expr = match (kind, options, call.args.get(1)) {
+            (RequestKind::Fetch, Some(obj), Some(arg)) if obj.fields.contains_key("method") => {
+                alternatives::method_expr(&arg.expr)
+            }
+            _ => None,
+        };
+        let alternation = self.alternation(url_expr, method_expr.as_ref(), &url, &method, scope);
 
         let body = match options {
             _ if options_param.is_some() => {
@@ -5357,7 +5372,7 @@ struct Effect {
 
 impl Effect {
     /// The requests a shape sends: one, or one per way a conditional in its
-    /// URL can go (carrick#2050), or one that states
+    /// URL or method can go (carrick#2050, carrick#2051), or one that states
     /// no row where the source does not say which goes out
     /// ([`Alternation::Nothing`]).
     fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Vec<Self> {

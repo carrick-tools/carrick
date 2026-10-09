@@ -25,6 +25,27 @@ than either route.
 | 73 | that chain in one segment, `mode === "copy"` alone in another | none |
 
 The model's cassette (`__llm__/analyze-file/content.json`) states a row at
-lines 5 and 26, and both routes at line 15. Its candidate ids are byte offsets into
-`src/content.ts`; editing the source moves them, so re-read them from a
-`CARRICK_EVAL_DUMP_DIR` run.
+lines 5 and 26, and both routes at line 15.
+
+## `src/notes.ts` (carrick#2051)
+
+The model's cassette states the row the field showed at every site: one
+method with the URL of the other branch.
+
+| Line | Shape | Rows |
+|---|---|---|
+| 6 | method and URL in locals, one test | `PATCH /api/notes/${existing.id}`, `POST /api/notes` |
+| 10 | the same test written in the call | the same two |
+| 17 | method chosen, URL fixed | `POST` and `PUT /api/notes/reorder` |
+| 23 | two different tests | the model's row, no structural row |
+| 29 | a test that calls a function | the model's row |
+| 36 | a test whose name the function assigns again | the model's row |
+| 41 | the method is a parameter | none |
+| 47 | `!existing` beside `existing` | the same two as line 6 |
+| 53 | `mode === "edit"` beside `mode === "copy"` | none |
+| 59 | a shared test, and `mode === "replace"` beside `mode === "append"` | none |
+| 65 | one else-if chain on `mode` for both | `PATCH /api/notes/${id}`, `PUT /api/notes/${id}/copy`, `POST /api/notes` |
+| 71 | the chain for the URL, `mode === "copy"` alone for the method | none |
+
+The cassettes' candidate ids are byte offsets into the sources; editing a
+source moves them, so re-read them from a `CARRICK_EVAL_DUMP_DIR` run.
