@@ -809,6 +809,12 @@ fn the_json_matches_the_published_contract() {
     .expect("touch --json was not JSON");
     assert_eq!(touched["items"][0]["verdict"], serde_json::Value::Null);
 
+    // Who uses the file: an object with two lists, and its lines, always a
+    // list (carrick#2067).
+    assert!(body["uses"]["functions"].is_array(), "{body:#}");
+    assert!(body["uses"]["types"].is_array(), "{body:#}");
+    assert!(body["uses_lines"].is_array(), "{body:#}");
+
     // A file nobody indexed still answers, with the boundary and no rows.
     let unknown = check_json(root, "inventory-svc/src/send.ts");
     assert_eq!(
@@ -833,6 +839,91 @@ fn the_json_matches_the_published_contract() {
     let outside: serde_json::Value =
         serde_json::from_slice(&outside.stdout).expect("an error body");
     assert_eq!(outside["error"], serde_json::json!("not_in_workspace"));
+}
+
+/// A file names who uses it from elsewhere in its repo (carrick#2067): the
+/// callers of a member reached through a typed parameter, and of a bare
+/// imported function, folded into the index when it is built.
+#[test]
+#[serial]
+fn a_file_names_who_calls_its_functions() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+
+    let client = check_json(root, "inventory-svc/src/client.ts");
+    let functions = client["uses"]["functions"].as_array().expect("functions");
+    assert_eq!(functions.len(), 1, "{client:#}");
+    assert_eq!(
+        functions[0],
+        serde_json::json!({
+            "name": "CatalogClient.readWidget",
+            "line": 12,
+            "callers_total": 2,
+            "callers": [
+                { "service": "inventory-svc", "file": "src/inventory.ts", "line": 9, "function": "countActive" },
+                { "service": "inventory-svc", "file": "src/inventory.ts", "line": 17, "function": "nameOf" },
+            ],
+        })
+    );
+    let line = "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
+    assert_eq!(client["uses_lines"], serde_json::json!([line]));
+
+    let send = check_json(root, "inventory-svc/src/send.ts");
+    assert_eq!(
+        send["uses"]["functions"],
+        serde_json::json!([{
+            "name": "send",
+            "line": 9,
+            "callers_total": 1,
+            "callers": [{ "service": "inventory-svc", "file": "src/client.ts", "line": 14, "function": "CatalogClient.readWidget" }],
+        }])
+    );
+    assert_eq!(
+        send["uses_lines"],
+        serde_json::json!(["- send (line 9) has 1 caller(s) outside this file: src/client.ts:14"])
+    );
+
+    // The caller file declares nothing another file calls.
+    let inventory = check_json(root, "inventory-svc/src/inventory.ts");
+    assert_eq!(inventory["uses"]["functions"], serde_json::json!([]));
+    assert_eq!(inventory["uses_lines"], serde_json::json!([]));
+
+    // The terminal prints the same bytes, and `touch` carries the same block.
+    let printed = check(root, "inventory-svc/src/client.ts");
+    assert!(
+        printed.contains(&format!("used outside this file, as indexed:\n{line}\n")),
+        "{printed}"
+    );
+    let touched: serde_json::Value = serde_json::from_str(&run(
+        root,
+        &[
+            "touch",
+            "inventory-svc/src/client.ts",
+            "--workspace",
+            ".",
+            "--json",
+        ],
+    ))
+    .expect("touch --json was not JSON");
+    assert_eq!(touched["uses"], client["uses"]);
+
+    // An index written before the field still reads, and says nothing.
+    let items_before = check_json(root, "inventory-svc/src/inventory.ts")["items"].clone();
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for repo in index["repos"].as_array_mut().unwrap() {
+        repo.as_object_mut().unwrap().remove("uses");
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+    let older = check_json(root, "inventory-svc/src/client.ts");
+    assert!(older.get("uses").is_none(), "{older:#}");
+    assert_eq!(older["uses_lines"], serde_json::json!([]));
+    assert_eq!(
+        check_json(root, "inventory-svc/src/inventory.ts")["items"],
+        items_before
+    );
 }
 
 /// The workspace question, with no file in it: what a surface opening a

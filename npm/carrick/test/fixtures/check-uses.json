@@ -1,0 +1,57 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/client.ts",
+  "repo": "/workspace/inventory-svc",
+  "service": "inventory-svc",
+  "index_commit": "abc1234def5678901234567890abcdef12345678",
+  "indexed_at": "2026-10-09T09:00:00Z",
+  "scanner_version": "0.3.112",
+  "changed_since_index": 0,
+  "stale": false,
+  "deleted": false,
+  "items": [],
+  "boundary_note": "A local index holds what the deterministic passes state: 0 candidate(s) in this service need a model and were not classified here.",
+  "uses": {
+    "functions": [
+      {
+        "name": "CatalogClient.readWidget",
+        "line": 12,
+        "callers_total": 2,
+        "callers": [
+          { "service": "inventory-svc", "file": "src/inventory.ts", "line": 9, "function": "countActive" },
+          { "service": "inventory-svc", "file": "src/inventory.ts", "line": 17, "function": "nameOf" }
+        ]
+      }
+    ],
+    "types": [
+      {
+        "symbol": "Widget",
+        "line": 3,
+        "operations": [
+          {
+            "kind": "call",
+            "direction": "response",
+            "service": "inventory-svc",
+            "method": "GET",
+            "path": "/api/v1/widgets/:encoded",
+            "file": "src/inventory.ts",
+            "line": 9,
+            "counterparts": [
+              {
+                "role": "producer",
+                "service": "catalog-web",
+                "file": "app/routes/api.v1.widgets.$widgetId.ts",
+                "line": 11,
+                "repo": "/workspace/catalog-web"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "uses_lines": [
+    "- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 1 call(s): src/inventory.ts:9. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11",
+    "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17"
+  ]
+}

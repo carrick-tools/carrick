@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { CheckResult } from "../contract.ts";
 
 /** One function the working tree declares and the index does not. */
 export type NewFunction = {
@@ -37,6 +38,11 @@ export type SessionRecord = {
   found: NewFunction[];
   /** `file::name` for the ones a nudge has already listed. */
   nudged: string[];
+  /**
+   * `repo::file` for every file whose uses lines this session has been shown
+   * (carrick#2067), so the post-edit hook prints them once per file.
+   */
+  told: string[];
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -76,7 +82,7 @@ function key(entry: NewFunction): string {
 
 /** A session's record, or an empty one. Never throws. */
 export function readSession(sessionId: string, home?: string): SessionRecord {
-  const empty: SessionRecord = { found: [], nudged: [], updated: "" };
+  const empty: SessionRecord = { found: [], nudged: [], told: [], updated: "" };
   const file = sessionFile(sessionId, home);
   if (file === null) return empty;
   let body: string;
@@ -98,6 +104,9 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
         : [],
       nudged: Array.isArray(record.nudged)
         ? record.nudged.filter((entry): entry is string => typeof entry === "string")
+        : [],
+      told: Array.isArray(record.told)
+        ? record.told.filter((entry): entry is string => typeof entry === "string")
         : [],
       updated: typeof record.updated === "string" ? record.updated : "",
     };
@@ -222,6 +231,30 @@ export function markNudged(sessionId: string, entries: NewFunction[], home?: str
   const nudged = new Set(current.nudged);
   for (const entry of entries) nudged.add(key(entry));
   current.nudged = [...nudged];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/**
+ * The key a file's uses lines are remembered under: its repo and its
+ * repo-relative path, so one path in two repos is two files.
+ */
+export function toldKey(result: CheckResult, fallbackFile: string): string {
+  return `${result.repo ?? ""}::${result.file ?? fallbackFile}`;
+}
+
+/** Whether this session has already been shown the uses lines under `key`. */
+export function wasTold(sessionId: string, key: string, home?: string): boolean {
+  return readSession(sessionId, home).told.includes(key);
+}
+
+/** Remember that this session has been shown the uses lines under `keys`. */
+export function markTold(sessionId: string, keys: string[], home?: string): void {
+  if (keys.length === 0) return;
+  const current = readSession(sessionId, home);
+  const told = new Set(current.told);
+  for (const key of keys) told.add(key);
+  current.told = [...told];
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

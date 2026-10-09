@@ -27,7 +27,7 @@ use crate::boundary::ServiceBoundary;
 pub const READ_MODEL_VERSION: u32 = 5;
 
 /// A route the service serves, or a call it makes.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Route,
@@ -207,6 +207,80 @@ pub struct IndexedRepo {
     pub services: Vec<IndexedService>,
     /// Repo-relative path -> the rows the index holds for it, in line order.
     pub files: BTreeMap<String, Vec<IndexedItem>>,
+    /// Repo-relative path -> what other files use from it: the callers of its
+    /// functions and the operations its types are read by (carrick#2067),
+    /// folded from the blobs by [`super::uses::fold`].
+    ///
+    /// Absent on an index written before the field existed, which is not the
+    /// same answer as present and empty: `None` says this index never
+    /// recorded uses, and a file missing from `Some(map)` says it recorded
+    /// none for that file. Defaulted rather than versioned, so an existing
+    /// `.carrick/index.json` still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<BTreeMap<String, FileUses>>,
+}
+
+/// What other files of the same repo use from one file.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileUses {
+    /// Functions declared in the file that something in another file calls,
+    /// in line order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<IndexedFunctionUse>,
+    /// Types declared in the file that an operation in another file reads,
+    /// in line order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<IndexedTypeUse>,
+}
+
+/// One function and who calls it from outside its file.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IndexedFunctionUse {
+    /// As the call sites name it: `Class.member` where any of them qualifies
+    /// it, the bare name otherwise.
+    pub name: String,
+    /// Where the function starts. Zero when the scan recorded no line.
+    pub line: u32,
+    /// Every distinct caller, of which `callers` holds at most
+    /// [`super::uses::MAX_CALLERS`].
+    pub callers_total: usize,
+    pub callers: Vec<IndexedCaller>,
+}
+
+/// One call site of a function, in another file of the same repo.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexedCaller {
+    pub service: String,
+    pub file: String,
+    pub line: u32,
+    /// The calling function, or `<module>` for a call at the top of a file.
+    pub function: String,
+}
+
+/// One type and the operations that read it from outside its file.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IndexedTypeUse {
+    pub symbol: String,
+    /// Where the type is declared.
+    pub line: u32,
+    pub operations: Vec<IndexedTypeOperation>,
+}
+
+/// One operation side whose type is declared elsewhere. Counterparts are not
+/// stored: the reader takes them off the matching row in `files`, so a
+/// refresh of a remote's counterparts reaches this too.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexedTypeOperation {
+    pub kind: ItemKind,
+    /// `request` or `response`.
+    pub direction: String,
+    pub service: String,
+    /// `OperationKey::canonical()`, the row's own key.
+    pub key: String,
+    pub method: String,
+    pub path: String,
+    pub file: String,
+    pub line: u32,
 }
 
 impl IndexedRepo {
@@ -429,6 +503,7 @@ mod tests {
             name: name.to_string(),
             services: Vec::new(),
             files: BTreeMap::new(),
+            uses: None,
         }
     }
 

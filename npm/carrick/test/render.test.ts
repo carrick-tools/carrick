@@ -629,3 +629,43 @@ test("a session that starts while Carrick Cloud is analysing is told so", () => 
   assert.match(handed, /handed this workspace to Carrick Cloud/);
   assert.doesNotMatch(handed, /is running|\.log/, "it is not still going, and its log ended");
 });
+
+// Who uses the edited file (carrick#2067): the CLI's lines, after everything the
+// hook printed before them, at most eight, and only when the hook asks.
+test("uses lines follow the file's own lines, in the CLI's order", () => {
+  const withUnclassified = { ...fixture("check-mismatch.json"), uses_lines: ["- a (line 1) has 1 caller(s) outside this file: src/b.ts:2", "- c (line 3) has 1 caller(s) outside this file: src/d.ts:4"] };
+  const lines = (renderPostToolUse(withUnclassified) ?? "").split("\n");
+  const unclassifiedAt = lines.findIndex((line) => line.includes("not classified locally"));
+  assert.ok(unclassifiedAt > 0);
+  assert.deepEqual(lines.slice(unclassifiedAt + 1), withUnclassified.uses_lines);
+
+  const uses = fixture("check-uses.json");
+  const context = renderPostToolUse(uses) ?? "";
+  assert.deepEqual(context.split("\n").slice(1), uses.uses_lines);
+});
+
+test("more than eight uses lines are cut to eight and counted", () => {
+  const many = Array.from({ length: 11 }, (_, n) => `- f${n} (line ${n + 1}) has 1 caller(s) outside this file: src/x.ts:${n + 1}`);
+  const context = renderPostToolUse({ ...fixture("check-uses.json"), uses_lines: many }) ?? "";
+  const lines = context.split("\n");
+  assert.deepEqual(lines.slice(1, 9), many.slice(0, 8));
+  assert.equal(
+    lines[9],
+    "- and 3 more function(s) or type(s) in this file used elsewhere, from `carrick check`.",
+  );
+  assert.equal(lines.length, 10);
+});
+
+test("a hook that has already shown a file's uses prints the rest unchanged", () => {
+  const uses = fixture("check-uses.json");
+  const { uses_lines: _dropped, ...without } = uses;
+  assert.equal(renderPostToolUse(uses, undefined, { uses: false }), renderPostToolUse(without));
+});
+
+test("a payload without uses lines renders exactly as before", () => {
+  for (const name of ["check-mismatch.json", "check-counterpart.json", "check-clean.json"]) {
+    const parsed = fixture(name);
+    assert.equal(parsed.uses_lines, undefined, name);
+    assert.equal(renderPostToolUse(parsed), renderPostToolUse(parsed, undefined, { uses: true }), name);
+  }
+});

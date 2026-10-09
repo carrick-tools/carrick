@@ -92,9 +92,76 @@
           "items": { "type": "string" },
           "description": "The boundary as the CLI prints it, line by line (boundary_note first, then the counts). Print these bytes rather than re-wording the struct."
         },
-        "recheck": { "$ref": "#/$defs/recheck" }
+        "recheck": { "$ref": "#/$defs/recheck" },
+        "uses": { "$ref": "#/$defs/uses" },
+        "uses_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "`uses` as the CLI prints it, one line per type use and per used function (carrick#2067). Empty when there is nothing to say or the index predates `uses`."
+        }
       },
       "additionalProperties": true
+    },
+    "uses": {
+      "type": "object",
+      "description": "Who uses this file from elsewhere in its repo, as indexed (carrick#2067). Absent when the index predates the field; empty lists when the index recorded nothing for this file. Every file is relative to the top-level repo.",
+      "required": ["functions", "types"],
+      "properties": {
+        "functions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "line", "callers_total", "callers"],
+            "properties": {
+              "name": { "type": "string" },
+              "line": { "type": "integer" },
+              "callers_total": { "type": "integer", "minimum": 0 },
+              "callers": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                  "type": "object",
+                  "required": ["service", "file", "line", "function"],
+                  "properties": {
+                    "service": { "type": "string" },
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "function": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["symbol", "line", "operations"],
+            "properties": {
+              "symbol": { "type": "string" },
+              "line": { "type": "integer" },
+              "operations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["kind", "direction", "service", "method", "path", "file", "line", "counterparts"],
+                  "properties": {
+                    "kind": { "enum": ["route", "call"] },
+                    "direction": { "enum": ["request", "response"] },
+                    "service": { "type": "string" },
+                    "method": { "type": "string" },
+                    "path": { "type": "string" },
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "counterparts": { "type": "array", "items": { "$ref": "#/$defs/counterpart" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "recheck": {
       "type": "object",

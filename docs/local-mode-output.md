@@ -175,6 +175,8 @@ counter means this scan did not record it.
 | `boundary_note` | string | hosted provenance, replay limits or the reason enrichment is unavailable, with the counts the scan kept. Always present. |
 | `boundary_lines` | string[] | the boundary as the CLI prints it, line by line: `boundary_note` first, then the counts. A reader rendering the boundary prints these bytes rather than re-wording the struct, so a hook and a terminal say the same sentence about the same number. |
 | `recheck` | object \| absent | what a `--recheck` call did (below). Absent on every other read, which means the items are the indexed ones — the answer this document described before carrick#1036 |
+| `uses` | object \| absent | who uses this file from elsewhere in its repo, as indexed (below). Absent when the index predates the field; present with empty lists when the index recorded nothing for this file |
+| `uses_lines` | string[] | `uses` as the CLI prints it, one line per type use and per used function. Always present; `[]` when there is nothing to say or the index predates `uses` |
 
 ### `recheck`
 
@@ -219,6 +221,47 @@ same service is named after its GitHub repository. The two agree whenever the
 directory is the repo name, which is the ordinary case, and a workspace holding
 two repos with one directory name is refused before anything is scanned rather
 than silently overwritten.
+
+### `uses`
+
+What other files of the same repo use from this one (carrick#2067), folded from
+the blobs in `.carrick/repos/` when the index is built (`src/local_mode/uses.rs`).
+Locations only, never a verdict, so `touch` carries it too. A re-check replaces
+the items and leaves this block as indexed. Every `file` is relative to the
+top-level `repo`, because a call edge and a type's declaration never leave a
+repo; counterparts keep their own `repo`. Callers and type uses inside the
+queried file itself are left out.
+
+An absent `uses` and an empty one are different answers: absent means the
+index was written before the field existed, and `{ "functions": [], "types": [] }`
+means the index recorded nothing outside this file using it.
+
+| field | type | meaning |
+|---|---|---|
+| `functions[]` | array | functions this file declares that a function in another file calls, in line order |
+| `functions[].name` | string | `Class.member` where a call site qualifies it, the bare name otherwise |
+| `functions[].line` | int | where the function starts; `0` when the scan recorded no line |
+| `functions[].callers_total` | int | every distinct caller |
+| `functions[].callers[]` | array | at most 20 of them, by file and line: `{ "service", "file", "line", "function" }`. `function` is `<module>` for a call at the top of a file |
+| `types[]` | array | types this file declares that a route or call in another file reads, in line order |
+| `types[].symbol`, `types[].line` | string, int | the declared type and its line |
+| `types[].operations[]` | array | `{ "kind", "direction", "service", "method", "path", "file", "line", "counterparts" }`: the row whose `request` or `response` type it is, and that row's counterparts in the `items[].counterparts[]` shape |
+
+A type use is recorded only where the scan stated the type's declaration
+(`defined_in` on the type manifest). A type nested in another, and a call made
+through a published package, are not recorded.
+
+### `uses_lines`
+
+```
+- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 2 call(s): src/inventory.ts:9, src/inventory.ts:17. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11
+- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17
+```
+
+Types first in line order, one line per operation; then functions, most callers
+first. A location in another service is prefixed with that service. A line
+names at most four locations and counts the rest. The post-edit hook prints at
+most eight of these lines, once per file per session.
 
 ### `items[]`
 
@@ -348,7 +391,8 @@ on line 1 of the open file, and the session-start line repeats it.
 
 Without `--json`, the same content in the same order: the file and its service,
 then one block per item (location, method and path, source label, counterparts
-with their locations), then the staleness line, then the boundary. Written for
+with their locations), then `uses_lines` under `used outside this file, as
+indexed:` when there are any, then the staleness line, then the boundary. Written for
 a model reading a terminal, so every location is a path a reader can open and
 no line needs a legend.
 

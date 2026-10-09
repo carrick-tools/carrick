@@ -148,6 +148,12 @@ export type CheckResult = {
    * Absent only on a read that did not ask for a re-check.
    */
   recheck?: Recheck;
+  /**
+   * Who uses this file from elsewhere in its repo, already rendered by the CLI:
+   * one line per type an operation reads and per function with callers in
+   * other files (carrick#2067). Printed as it stands. Absent from an older CLI.
+   */
+  uses_lines?: string[];
 };
 
 /** The `recheck` block of a `carrick.check/0` answer. */
@@ -423,6 +429,12 @@ export function parseCheckResult(stdout: string): CheckResult | null {
       (line): line is string => typeof line === "string",
     );
     if (lines.length) result.boundary_lines = lines;
+  }
+  if (Array.isArray(parsed["uses_lines"])) {
+    const lines = (parsed["uses_lines"] as unknown[]).filter(
+      (line): line is string => typeof line === "string",
+    );
+    if (lines.length) result.uses_lines = lines;
   }
   const recheck = parsed["recheck"];
   if (isRecord(recheck) && typeof recheck["ran"] === "string") {

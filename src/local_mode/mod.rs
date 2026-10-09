@@ -28,6 +28,7 @@ pub(crate) mod query;
 mod read_model;
 pub(crate) mod recheck;
 pub(crate) mod scan_state;
+mod uses;
 mod workspace;
 
 pub use join::{JoinTypeCheck, LocalJoin};

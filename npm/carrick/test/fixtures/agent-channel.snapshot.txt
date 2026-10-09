@@ -51,6 +51,11 @@ Carrick checked user-service/src/routes/users.ts against the workspace index (us
 - user-service/src/routes/users.ts:42:3 route GET /api/users [fact, file_based_route] response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number. Type 'UsersResponse' is not assignable to type 'number'. Consumers: notification-service server.ts:25
 - user-service/src/routes/users.ts:71:5 call POST /api/users [fact, imported_member] request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }. Property 'email' is missing in type '{ name: string }'. Producers: identity-service src/routes/users.ts:14
 
+### check-uses.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (inventory-svc, indexed at abc1234).
+- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 1 call(s): src/inventory.ts:9. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11
+- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17
+
 ### status-not-indexed.json :: renderSessionStart
 Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.
 

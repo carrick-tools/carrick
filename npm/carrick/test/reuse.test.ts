@@ -18,6 +18,9 @@ import {
   removeSessions,
   sessionFile,
   sessionsDir,
+  markTold,
+  toldKey,
+  wasTold,
   type NewFunction,
 } from "../src/hook/reuse.ts";
 
@@ -147,4 +150,29 @@ test("a set compared against more than one index says so instead of naming a com
   const line = nudge([fn("slugify"), { ...fn("titleCase"), indexCommit: "ffffffffffffffff" }]);
   assert.match(line, /the index this workspace holds/);
   assert.doesNotMatch(line, /the index at /);
+});
+
+// The files whose uses lines a session has been shown (carrick#2067), kept in
+// the same record as the reuse nudge and never at its expense.
+test("a told file is remembered beside the reuse record, and neither drops the other", (t) => {
+  const { dir, cleanup } = home();
+  t.after(cleanup);
+
+  record("sess-told", [fn("slugify")], dir);
+  const key = toldKey({ schema: "carrick.check/0", repo: "/w/api", file: "src/a.ts" }, "ignored.ts");
+  assert.equal(key, "/w/api::src/a.ts");
+  assert.equal(wasTold("sess-told", key, dir), false);
+  markTold("sess-told", [key], dir);
+  assert.equal(wasTold("sess-told", key, dir), true);
+  assert.deepEqual(
+    readSession("sess-told", dir).found.map((entry) => entry.name),
+    ["slugify"],
+  );
+
+  // And the reuse writes keep what the told list holds.
+  record("sess-told", [fn("titleCase")], dir);
+  markNudged("sess-told", [fn("slugify")], dir);
+  assert.deepEqual(readSession("sess-told", dir).told, [key]);
+  // Without a repo or file in the answer, the hook's own path stands in.
+  assert.equal(toldKey({ schema: "carrick.check/0" }, "src/b.ts"), "::src/b.ts");
 });

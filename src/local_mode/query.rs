@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::contract::{
-    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, ReadFailure, Recheck, SCHEMA,
-    STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, Verdict,
+    Caller, CheckOutput, Counterpart, FunctionUse, Item, MAX_STALE_FILES, ReadError, ReadFailure,
+    Recheck, SCHEMA, STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, TypeOperation,
+    TypeUse, Uses, Verdict,
 };
-use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
+use super::read_model::{FileUses, IndexedItem, IndexedRepo, LocalIndex};
 
 /// Which of the two read-only commands is asking. The only difference is
 /// whether verdicts are stated: `touch` answers "what is on the other side of
@@ -166,6 +167,17 @@ pub fn answer(
         })
         .collect();
 
+    // Who uses this file is a fact about the index, not about the edit: a
+    // re-check replaces the rows and leaves this as indexed (carrick#2067).
+    let uses = repo
+        .uses
+        .as_ref()
+        .map(|all| project_uses(all.get(&relative), repo, &repo_of_service));
+    let uses_lines = uses
+        .as_ref()
+        .map(|uses| uses.lines(&service))
+        .unwrap_or_default();
+
     Ok(CheckOutput {
         hosted: enrichment.hosted,
         hosted_state: enrichment.hosted_state,
@@ -197,6 +209,8 @@ pub fn answer(
         boundary,
         boundary_note,
         boundary_lines,
+        uses,
+        uses_lines,
     })
 }
 
@@ -396,16 +410,13 @@ fn rechecked(
     }
 }
 
-fn project(
+/// A row's counterparts as the contract states them, each with the repo it
+/// can be opened in.
+fn counterparts_of(
     item: &IndexedItem,
-    mode: Mode,
-    stale: bool,
-    deleted: bool,
-    repo: &IndexedRepo,
     repo_of_service: &BTreeMap<String, String>,
-) -> Item {
-    let counterparts: Vec<Counterpart> = item
-        .counterparts
+) -> Vec<Counterpart> {
+    item.counterparts
         .iter()
         .map(|counterpart| Counterpart {
             role: counterpart.role.clone(),
@@ -419,7 +430,85 @@ fn project(
                 repo_of_service.get(&counterpart.service).cloned()
             },
         })
+        .collect()
+}
+
+/// What the index recorded about who uses this file (carrick#2067). A type
+/// use takes its counterparts off the operation's own row, so they are the
+/// ones the row's item line names.
+fn project_uses(
+    recorded: Option<&FileUses>,
+    repo: &IndexedRepo,
+    repo_of_service: &BTreeMap<String, String>,
+) -> Uses {
+    let Some(recorded) = recorded else {
+        return Uses::default();
+    };
+    let functions = recorded
+        .functions
+        .iter()
+        .map(|function| FunctionUse {
+            name: function.name.clone(),
+            line: function.line,
+            callers_total: function.callers_total,
+            callers: function
+                .callers
+                .iter()
+                .map(|caller| Caller {
+                    service: caller.service.clone(),
+                    file: caller.file.clone(),
+                    line: caller.line,
+                    function: caller.function.clone(),
+                })
+                .collect(),
+        })
         .collect();
+    let types = recorded
+        .types
+        .iter()
+        .map(|used| TypeUse {
+            symbol: used.symbol.clone(),
+            line: used.line,
+            operations: used
+                .operations
+                .iter()
+                .map(|operation| {
+                    let row = repo.files.get(&operation.file).and_then(|items| {
+                        items.iter().find(|item| {
+                            item.service == operation.service
+                                && item.kind == operation.kind
+                                && item.key == operation.key
+                                && item.line == Some(operation.line)
+                        })
+                    });
+                    TypeOperation {
+                        kind: operation.kind.as_str().to_string(),
+                        direction: operation.direction.clone(),
+                        service: operation.service.clone(),
+                        method: operation.method.clone(),
+                        path: operation.path.clone(),
+                        file: operation.file.clone(),
+                        line: operation.line,
+                        counterparts: row
+                            .map(|row| counterparts_of(row, repo_of_service))
+                            .unwrap_or_default(),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    Uses { functions, types }
+}
+
+fn project(
+    item: &IndexedItem,
+    mode: Mode,
+    stale: bool,
+    deleted: bool,
+    repo: &IndexedRepo,
+    repo_of_service: &BTreeMap<String, String>,
+) -> Item {
+    let counterparts = counterparts_of(item, repo_of_service);
 
     let verdict = match mode {
         // `touch` states where things are, and nothing about whether they
@@ -1142,6 +1231,7 @@ mod drift_tests {
                 services: vec![service(None, &commit)],
                 name: "service-repo".to_string(),
                 files: Default::default(),
+                uses: None,
             }],
             type_check: None,
         };
@@ -1196,6 +1286,7 @@ mod drift_tests {
                 name: "monorepo".to_string(),
                 services: vec![service(Some("apps/gateway"), &commit)],
                 files: Default::default(),
+                uses: None,
             }],
             type_check: None,
         };
@@ -1250,6 +1341,7 @@ mod drift_tests {
             name: name.to_string(),
             services: vec![service(None, "")],
             files: Default::default(),
+            uses: None,
         };
         let index = LocalIndex {
             hosted_identity: None,
@@ -1293,5 +1385,59 @@ mod drift_tests {
             ask("api").is_ok(),
             "and the repo this install covers still is"
         );
+    }
+
+    /// An index that predates `uses` and one that recorded none for the file
+    /// are different answers, and the wire keeps them apart (carrick#2067).
+    #[test]
+    fn an_index_without_uses_says_nothing_and_one_with_none_says_none() {
+        let answer_with = |uses: Option<BTreeMap<String, FileUses>>| {
+            let folder = tempfile::tempdir().unwrap();
+            let root = folder.path().join("api");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/main.ts"), "export const a = 1;").unwrap();
+            let index = LocalIndex {
+                hosted_identity: None,
+                hosted_workspace: None,
+                repos_detected_by: None,
+                repos_added: Vec::new(),
+                repos_excluded: Vec::new(),
+                hosted_source_key: None,
+                hosted_checked_at: None,
+                version: crate::local_mode::read_model::READ_MODEL_VERSION,
+                scanner_version: "test".to_string(),
+                indexed_at: "2026-09-12T10:00:00Z".to_string(),
+                repos: vec![IndexedRepo {
+                    path: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+                    name: "api".to_string(),
+                    services: vec![service(None, "")],
+                    files: Default::default(),
+                    uses,
+                }],
+                type_check: None,
+            };
+            let index_dir = folder.path().join(crate::local_mode::workspace::INDEX_DIR);
+            std::fs::create_dir_all(&index_dir).unwrap();
+            index.write(&index_dir.join("index.json")).unwrap();
+            let output = answer(
+                folder.path(),
+                &root.join("src/main.ts"),
+                Mode::Check,
+                Freshness::Indexed,
+            )
+            .expect("an answer");
+            serde_json::to_value(output).unwrap()
+        };
+
+        let before = answer_with(None);
+        assert!(before.get("uses").is_none(), "{before:#}");
+        assert_eq!(before["uses_lines"], serde_json::json!([]));
+
+        let none = answer_with(Some(BTreeMap::new()));
+        assert_eq!(
+            none["uses"],
+            serde_json::json!({ "functions": [], "types": [] })
+        );
+        assert_eq!(none["uses_lines"], serde_json::json!([]));
     }
 }

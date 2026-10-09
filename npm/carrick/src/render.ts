@@ -23,6 +23,8 @@ import {
 export const MAX_ITEM_LINES = 12;
 /** How many counterpart sites one item line names before the same. */
 export const MAX_COUNTERPARTS = 4;
+/** How many uses lines one hook message carries before it says how many are left. */
+export const MAX_USE_LINES = 8;
 
 export function shortHash(commit: string | undefined): string {
   if (!commit) return "an unknown commit";
@@ -348,8 +350,16 @@ function unclassifiedLine(result: CheckResult): string | null {
  * every edit, which is what an agent learns to skip, so `renderSessionStart`
  * prints it once. An edit adds one line, only when this file holds call sites
  * the local index did not classify.
+ *
+ * Then the CLI's `uses_lines`, who calls this file's functions and which
+ * operations read its types (carrick#2067), unless `options.uses` is `false`:
+ * the hook shows them once per file per session.
  */
-export function renderPostToolUse(result: CheckResult, displayFile?: string): string | null {
+export function renderPostToolUse(
+  result: CheckResult,
+  displayFile?: string,
+  options: { uses?: boolean } = {},
+): string | null {
   if (result.error) return null;
   const items = reportableItems(result);
   const unclassified = unclassifiedLine(result);
@@ -371,6 +381,16 @@ export function renderPostToolUse(result: CheckResult, displayFile?: string): st
   const stale = staleLine(result);
   if (stale) lines.push(stale);
   if (unclassified) lines.push(unclassified);
+  if (options.uses !== false) {
+    const uses = result.uses_lines ?? [];
+    lines.push(...uses.slice(0, MAX_USE_LINES));
+    const rest = uses.length - Math.min(uses.length, MAX_USE_LINES);
+    if (rest > 0) {
+      lines.push(
+        `- and ${rest} more function(s) or type(s) in this file used elsewhere, from \`carrick check\`.`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 

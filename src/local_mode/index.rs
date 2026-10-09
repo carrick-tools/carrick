@@ -1466,6 +1466,7 @@ pub(super) fn build(
             name,
             services,
             files: BTreeMap::new(),
+            uses: None,
         });
     }
 
@@ -1539,6 +1540,13 @@ pub(super) fn build(
                 ))
             });
         }
+        // Who uses what across this repo's files, from the same local blobs
+        // its services came from: an edge never crosses repos (carrick#2067).
+        let local: Vec<&CloudRepoData> = blobs
+            .iter()
+            .filter(|blob| blob.repo_name == repo.name && !remotes.contains_key(&service_id(blob)))
+            .collect();
+        repo.uses = Some(super::uses::fold(&local, &repo.files));
     }
 
     Ok(LocalIndex {

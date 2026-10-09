@@ -24,7 +24,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { record } from "./reuse.ts";
+import { markTold, record, toldKey, wasTold } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
 
@@ -138,6 +138,9 @@ async function main(): Promise<void> {
 
   const found: NewFunction[] = [];
   const contexts: string[] = [];
+  // Files whose uses lines this message carries, remembered only once it is
+  // delivered: who uses a file is shown once per file per session (carrick#2067).
+  const told: string[] = [];
   for (const file of edited) {
     const relative = path.relative(choice.root, file);
     // The edit just landed, so the index describes the file as it was before
@@ -152,7 +155,10 @@ async function main(): Promise<void> {
       continue;
     }
     found.push(...newFunctions(outcome.result, relative));
-    const context = renderPostToolUse(outcome.result, relative);
+    const key = toldKey(outcome.result, relative);
+    const show = !payload.session_id || !wasTold(payload.session_id, key);
+    if (show && outcome.result.uses_lines?.length) told.push(key);
+    const context = renderPostToolUse(outcome.result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${outcome.ms}ms`);
     if (context) contexts.push(context);
   }
@@ -175,6 +181,7 @@ async function main(): Promise<void> {
   // stdout line, which this host reads as a malformed hook response.
   const mismatch = throttledVersionMismatch(choice.root, currentVersion());
   if (mismatch) contexts.push(mismatch);
+  if (told.length > 0 && payload.session_id) markTold(payload.session_id, told);
   if (contexts.length > 0) emit(contexts.join("\n\n"));
 }
 
