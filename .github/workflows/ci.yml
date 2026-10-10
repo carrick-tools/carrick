@@ -186,6 +186,64 @@ jobs:
           esac
           exit $rc
 
+      # Endpoint smoke (carrick#2174): two scans of fixture repos on the debug
+      # binary the `cargo test --no-run` above already built (it is the binary
+      # CARGO_BIN_EXE_carrick points at), in the shard with the fewest slow
+      # tests. Never add `cargo build` here: dev-dependencies turn on features
+      # (tokio test-util, bitflags std), so it would compile a second copy of
+      # the crate and of every dependency that uses them.
+      - name: Test basic endpoint detection (express-single)
+        if: matrix.shard == 'steps'
+        env:
+          CARRICK_MOCK_ALL: "true"
+        run: |
+          mkdir -p examples/express-single/output
+          ./target/debug/carrick ./examples/express-single/ > examples/express-single/output/test_output.txt 2>&1
+          echo "=== express-single output ==="
+          cat examples/express-single/output/test_output.txt
+          # Check that we find the expected 3 endpoints
+          if ! grep -q "Indexed \*\*3 endpoints\*\*" examples/express-single/output/test_output.txt; then
+            echo "ERROR: Expected to find 3 endpoints in examples/express-single"
+            exit 1
+          fi
+          echo "✅ Basic endpoint detection working correctly"
+
+      - name: Test imported router resolution
+        if: matrix.shard == 'steps'
+        env:
+          CARRICK_MOCK_ALL: "true"
+        run: |
+          mkdir -p tests/fixtures/imported-routers/output
+          ./target/debug/carrick ./tests/fixtures/imported-routers/ > tests/fixtures/imported-routers/output/test_output.txt 2>&1
+          echo "=== Imported routers test output ==="
+          cat tests/fixtures/imported-routers/output/test_output.txt
+          # Check that we don't have the regression bug
+          if grep -q "Unique endpoint paths: 0" tests/fixtures/imported-routers/output/test_output.txt; then
+            echo "ERROR: Found 'Unique endpoint paths: 0' - imported router resolution bug has regressed!"
+            exit 1
+          fi
+          # Check that we find a reasonable number of endpoints (at least 10)
+          if ! grep -E "Indexed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt; then
+            echo "ERROR: Expected to find some endpoints in imported router test, but found none"
+            exit 1
+          fi
+          ENDPOINT_COUNT=$(grep -E "Indexed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt | sed -E 's/.*Indexed \*\*([0-9]+) endpoints\*\*.*/\1/')
+          if [ "$ENDPOINT_COUNT" -lt 10 ]; then
+            echo "ERROR: Expected at least 10 endpoints, but found $ENDPOINT_COUNT"
+            exit 1
+          fi
+          echo "✅ Imported router resolution working correctly"
+          echo "✅ Imported router resolution working correctly ($ENDPOINT_COUNT endpoints found)"
+
+      - name: Upload test outputs as artifacts
+        if: always() && matrix.shard == 'steps'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-outputs
+          path: |
+            examples/express-single/output/test_output.txt
+            tests/fixtures/imported-routers/output/test_output.txt
+
       - uses: ./.github/actions/rust-test-cache-save
         with:
           cache-hit: ${{ steps.setup.outputs.cache-hit }}
@@ -213,7 +271,6 @@ jobs:
       - rust-tests
       - wired
       - sidecar
-      - endpoint-regression-test
       - build
       - lint
       - security
@@ -432,95 +489,6 @@ jobs:
       # compiles; repeating it here doubled this job for nothing.
       - name: Build release
         run: cargo build --release --verbose
-
-  endpoint-regression-test:
-    name: Endpoint Detection Regression Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-
-      - name: Cache dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-release-
-
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-
-      - name: Install express-single example dependencies
-        run: cd examples/express-single && npm install
-
-      - name: Install imported-routers test dependencies
-        run: cd tests/fixtures/imported-routers && npm install
-
-      - name: Build sidecar
-        run: cd src/sidecar && npm ci && npm run build
-
-      - name: Build carrick
-        run: cargo build --release
-
-      - name: Test basic endpoint detection (express-single)
-        env:
-          CARRICK_MOCK_ALL: "true"
-        run: |
-          mkdir -p examples/express-single/output
-          ./target/release/carrick ./examples/express-single/ > examples/express-single/output/test_output.txt 2>&1
-          echo "=== express-single output ==="
-          cat examples/express-single/output/test_output.txt
-          # Check that we find the expected 3 endpoints
-          if ! grep -q "Indexed \*\*3 endpoints\*\*" examples/express-single/output/test_output.txt; then
-            echo "ERROR: Expected to find 3 endpoints in examples/express-single"
-            exit 1
-          fi
-          echo "✅ Basic endpoint detection working correctly"
-
-      - name: Test imported router resolution
-        env:
-          CARRICK_MOCK_ALL: "true"
-        run: |
-          mkdir -p tests/fixtures/imported-routers/output
-          ./target/release/carrick ./tests/fixtures/imported-routers/ > tests/fixtures/imported-routers/output/test_output.txt 2>&1
-          echo "=== Imported routers test output ==="
-          cat tests/fixtures/imported-routers/output/test_output.txt
-          # Check that we don't have the regression bug
-          if grep -q "Unique endpoint paths: 0" tests/fixtures/imported-routers/output/test_output.txt; then
-            echo "ERROR: Found 'Unique endpoint paths: 0' - imported router resolution bug has regressed!"
-            exit 1
-          fi
-          # Check that we find a reasonable number of endpoints (at least 10)
-          if ! grep -E "Indexed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt; then
-            echo "ERROR: Expected to find some endpoints in imported router test, but found none"
-            exit 1
-          fi
-          ENDPOINT_COUNT=$(grep -E "Indexed \*\*[0-9]+ endpoints\*\*" tests/fixtures/imported-routers/output/test_output.txt | sed -E 's/.*Indexed \*\*([0-9]+) endpoints\*\*.*/\1/')
-          if [ "$ENDPOINT_COUNT" -lt 10 ]; then
-            echo "ERROR: Expected at least 10 endpoints, but found $ENDPOINT_COUNT"
-            exit 1
-          fi
-          echo "✅ Imported router resolution working correctly"
-          echo "✅ Imported router resolution working correctly ($ENDPOINT_COUNT endpoints found)"
-
-      - name: Upload test outputs as artifacts
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: test-outputs
-          path: |
-            examples/express-single/output/test_output.txt
-            tests/fixtures/imported-routers/output/test_output.txt
 
   security:
     name: Security Audit
