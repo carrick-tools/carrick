@@ -24,12 +24,23 @@ fn main() {
 /// a build of main between two releases names the previous one; this is what
 /// says which code it actually was. Read by `ScannerBuild::current`.
 ///
+/// Release builds only (carrick#2157). A debug build stamps nothing and watches
+/// neither `.git` nor any source file: cargo reruns a build script, and so
+/// rebuilds the whole crate, on every commit and every sidecar edit otherwise.
+/// Debug builds are local and test builds; the release guard and installed
+/// binaries are release builds.
+///
 /// Both values are empty/false when no commit can be named without guessing:
 /// no git, no checkout, or a checkout whose root is not this package (a copy
 /// of the sources inside some other repository would otherwise stamp that
 /// repository's commit). No CI variable is used as a fallback: on a dispatched
 /// release, `GITHUB_SHA` is main's head, not the tag being built.
 fn stamp_build() {
+    if env::var("PROFILE").as_deref() != Ok("release") {
+        println!("cargo:rustc-env=CARRICK_BUILD_COMMIT=");
+        println!("cargo:rustc-env=CARRICK_BUILD_DIRTY=false");
+        return;
+    }
     let in_own_checkout = git(&["rev-parse", "--show-toplevel"])
         .and_then(|top| Path::new(top.trim()).canonicalize().ok())
         .zip(
