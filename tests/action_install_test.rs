@@ -585,3 +585,430 @@ fn the_installer_prepares_the_roots_the_scan_would_refuse_at_a_git_root() {
         detected.text()
     );
 }
+
+// ---------------------------------------------------------------------------
+// carrick#2211: CARRICK_INSTALL_UNTRUSTED=1.
+//
+// A machine that scans repositories it does not own cannot let a file from the
+// tree run, and `--ignore-scripts` alone leaves three ways in: a pnpm
+// `.pnpmfile.cjs`, a Yarn `yarnPath` / `yarn-path` release, and Yarn Berry
+// `plugins`. Each case below generates a tree with one such vector whose code
+// writes a marker file OUTSIDE the tree, installs it both ways, and reads the
+// marker. The default-mode half proves the case can see the vector at all;
+// the untrusted half is the claim. Nothing here is third-party code.
+// ---------------------------------------------------------------------------
+
+/// A git repository the installer is pointed at, and a marker directory beside
+/// it that the repository's code writes to when it runs.
+struct Untrusted {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    markers: PathBuf,
+}
+
+fn have(tool: &str) -> bool {
+    Command::new("bash")
+        .args(["-c", &format!("command -v {tool}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn sh(dir: &Path, command: &str) {
+    let output = Command::new("bash")
+        .args(["-c", command])
+        .current_dir(dir)
+        .env("COREPACK_ENABLE_AUTO_PIN", "0")
+        .output()
+        .expect("run shell");
+    assert!(
+        output.status.success(),
+        "`{command}` in {} failed: {}{}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+impl Untrusted {
+    fn new() -> Self {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let base = scratch.path().canonicalize().expect("canonical scratch");
+        let repo = base.join("repo");
+        let markers = base.join("markers");
+        fs::create_dir_all(&repo).expect("repo dir");
+        fs::create_dir_all(&markers).expect("marker dir");
+        Self {
+            _scratch: scratch,
+            repo,
+            markers,
+        }
+    }
+
+    fn marker(&self, name: &str) -> PathBuf {
+        self.markers.join(name)
+    }
+
+    /// JavaScript that records that it ran.
+    fn witness(&self, name: &str) -> String {
+        format!(
+            "require('fs').writeFileSync({:?}, 'ran');\n",
+            self.marker(name).to_str().expect("utf-8 path")
+        )
+    }
+
+    /// Commit the tree as it stands, so `git status` afterwards names every
+    /// tracked file the install changed.
+    fn commit(&self) {
+        sh(
+            &self.repo,
+            "printf 'node_modules\\n' > .gitignore && git init -q . \
+             && git add -A && git -c user.email=t@t -c user.name=t commit -q -m tree",
+        );
+    }
+
+    fn changed_tracked_files(&self) -> String {
+        let output = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .current_dir(&self.repo)
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn install_one(&self, root: &str, manager: &str, untrusted: bool) -> Run {
+        let dir = self.repo.join(root);
+        let mut command = Command::new("bash");
+        command
+            .arg(script())
+            .args(["install-one", dir.to_str().expect("utf-8 path"), manager])
+            .env_remove("CARRICK_CLI")
+            .env_remove("CARRICK_INSTALL_UNTRUSTED");
+        if untrusted {
+            command.env("CARRICK_INSTALL_UNTRUSTED", "1");
+        }
+        let output = command.output().expect("run install-scanned-deps.sh");
+        Run {
+            out: String::from_utf8_lossy(&output.stdout).into_owned(),
+            err: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: output.status.code().unwrap_or(-1),
+        }
+    }
+
+    /// The claim common to every vector: the script exited 0, the root is
+    /// either installed or named in a warning, and no tracked file changed.
+    fn assert_safe(&self, root: &str, run: &Run) {
+        assert_eq!(run.status, 0, "install exits 0: {}", run.text());
+        let dir = self.repo.join(root);
+        let dir_text = dir.to_str().expect("utf-8 path");
+        let named = run.text().contains("::warning::") && run.text().contains(dir_text);
+        let installed = run
+            .text()
+            .contains(&format!("Installed {dir_text} dependencies"));
+        assert!(
+            installed || named,
+            "{root} is neither installed nor named in a warning: {}",
+            run.text()
+        );
+        assert_eq!(
+            self.changed_tracked_files(),
+            "",
+            "the install rewrote a tracked file: {}",
+            run.text()
+        );
+    }
+}
+
+const EMPTY_PNPM_LOCK: &str = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n";
+
+#[test]
+fn untrusted_mode_never_loads_a_pnpmfile() {
+    if !have("corepack") {
+        eprintln!("skipped: corepack is not on PATH");
+        return;
+    }
+    let build = |t: &Untrusted| {
+        write(
+            &t.repo,
+            "pnpm/package.json",
+            r#"{"name":"p","private":true}"#,
+        );
+        write(&t.repo, "pnpm/pnpm-lock.yaml", EMPTY_PNPM_LOCK);
+        write(&t.repo, "pnpm/.pnpmfile.cjs", &t.witness("pnpmfile"));
+        t.commit();
+    };
+
+    let default = Untrusted::new();
+    build(&default);
+    let run = default.install_one("pnpm", "pnpm", false);
+    assert!(
+        default.marker("pnpmfile").exists(),
+        "default mode runs the pnpmfile, so this case can see it: {}",
+        run.text()
+    );
+
+    let untrusted = Untrusted::new();
+    build(&untrusted);
+    let run = untrusted.install_one("pnpm", "pnpm", true);
+    assert!(
+        !untrusted.marker("pnpmfile").exists(),
+        "the pnpmfile ran in untrusted mode: {}",
+        run.text()
+    );
+    untrusted.assert_safe("pnpm", &run);
+}
+
+#[test]
+fn untrusted_mode_never_hands_a_yarn_install_to_a_committed_release() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    // Classic: `.yarnrc` `yarn-path`.
+    let classic = |t: &Untrusted| {
+        write(
+            &t.repo,
+            "classic/package.json",
+            r#"{"name":"c","private":true}"#,
+        );
+        write(&t.repo, "classic/yarn.lock", "# yarn lockfile v1\n\n\n");
+        write(
+            &t.repo,
+            "classic/.yarnrc",
+            "yarn-path \".yarn/release.cjs\"\n",
+        );
+        write(
+            &t.repo,
+            "classic/.yarn/release.cjs",
+            &t.witness("yarn-path"),
+        );
+        t.commit();
+    };
+    // Berry: `.yarnrc.yml` `yarnPath`, with no `packageManager` pin.
+    let berry = |t: &Untrusted| {
+        write(
+            &t.repo,
+            "berry/package.json",
+            r#"{"name":"b","private":true}"#,
+        );
+        write(&t.repo, "berry/yarn.lock", "__metadata:\n  version: 8\n");
+        write(
+            &t.repo,
+            "berry/.yarnrc.yml",
+            "yarnPath: .yarn/release.cjs\n",
+        );
+        write(&t.repo, "berry/.yarn/release.cjs", &t.witness("yarnPath"));
+        t.commit();
+    };
+
+    for (root, marker, build) in [
+        ("classic", "yarn-path", &classic as &dyn Fn(&Untrusted)),
+        ("berry", "yarnPath", &berry as &dyn Fn(&Untrusted)),
+    ] {
+        let default = Untrusted::new();
+        build(&default);
+        let run = default.install_one(root, "yarn", false);
+        assert!(
+            default.marker(marker).exists(),
+            "default mode runs the committed {root} release, so this case can see it: {}",
+            run.text()
+        );
+
+        let untrusted = Untrusted::new();
+        build(&untrusted);
+        let run = untrusted.install_one(root, "yarn", true);
+        assert!(
+            !untrusted.marker(marker).exists(),
+            "the committed {root} release ran in untrusted mode: {}",
+            run.text()
+        );
+        untrusted.assert_safe(root, &run);
+    }
+}
+
+#[test]
+fn untrusted_mode_refuses_a_berry_root_it_cannot_install_without_the_trees_code() {
+    if !have("yarn") {
+        eprintln!("skipped: yarn is not on PATH");
+        return;
+    }
+    let t = Untrusted::new();
+    write(
+        &t.repo,
+        "plugin/package.json",
+        r#"{"name":"p","private":true}"#,
+    );
+    write(&t.repo, "plugin/yarn.lock", "__metadata:\n  version: 8\n");
+    write(
+        &t.repo,
+        "plugin/.yarnrc.yml",
+        "plugins:\n  - path: .yarn/plugins/p.cjs\n",
+    );
+    write(&t.repo, "plugin/.yarn/plugins/p.cjs", &t.witness("plugin"));
+    t.commit();
+
+    let run = t.install_one("plugin", "yarn", true);
+    assert!(
+        !t.marker("plugin").exists(),
+        "the plugin ran: {}",
+        run.text()
+    );
+    assert!(
+        run.text().contains("::warning::") && run.text().contains("lists plugins"),
+        "a root listing plugins is named in a warning: {}",
+        run.text()
+    );
+    assert!(
+        !t.repo.join("plugin/node_modules").exists(),
+        "a refused root is not installed"
+    );
+    t.assert_safe("plugin", &run);
+
+    // A yarnPath with no packageManager pin is refused; with a pin it is not.
+    let t = Untrusted::new();
+    write(
+        &t.repo,
+        "pinned/package.json",
+        r#"{"name":"b","packageManager":"yarn@4.9.2"}"#,
+    );
+    write(&t.repo, "pinned/yarn.lock", "__metadata:\n  version: 8\n");
+    write(
+        &t.repo,
+        "pinned/.yarnrc.yml",
+        "yarnPath: .yarn/release.cjs\n",
+    );
+    write(&t.repo, "pinned/.yarn/release.cjs", &t.witness("pinned"));
+    write(&t.repo, "unpinned/package.json", r#"{"name":"b"}"#);
+    write(&t.repo, "unpinned/yarn.lock", "__metadata:\n  version: 8\n");
+    write(
+        &t.repo,
+        "unpinned/.yarnrc.yml",
+        "yarnPath: .yarn/release.cjs\n",
+    );
+    t.commit();
+    let unpinned = t.install_one("unpinned", "yarn", true);
+    assert!(
+        unpinned.text().contains("pins no packageManager"),
+        "an unpinned yarnPath is named in a warning: {}",
+        unpinned.text()
+    );
+    let pinned = t.install_one("pinned", "yarn", true);
+    assert!(
+        !pinned.text().contains("pins no packageManager") && !t.marker("pinned").exists(),
+        "a pinned root is not refused for its yarnPath, and the file is not run: {}",
+        pinned.text()
+    );
+}
+
+/// A manifest one entry ahead of its lockfile is what an unfrozen install
+/// rewrites. The lockfile is generated by the manager itself from a manifest
+/// with one dependency, then the manifest gains a second.
+fn ahead_of_its_lockfile(t: &Untrusted, root: &str, generate: &str) {
+    for dep in ["a", "b"] {
+        write(
+            &t.repo,
+            &format!("{root}/{dep}/package.json"),
+            &format!(r#"{{"name":"{dep}","version":"1.0.0"}}"#),
+        );
+    }
+    let manifest =
+        |deps: &str| format!(r#"{{"name":"{root}","private":true,"dependencies":{{{deps}}}}}"#);
+    write(
+        &t.repo,
+        &format!("{root}/package.json"),
+        &manifest(r#""a":"file:./a""#),
+    );
+    sh(&t.repo.join(root), generate);
+    let _ = fs::remove_dir_all(t.repo.join(root).join("node_modules"));
+    write(
+        &t.repo,
+        &format!("{root}/package.json"),
+        &manifest(r#""a":"file:./a","b":"file:./b""#),
+    );
+    t.commit();
+}
+
+#[test]
+fn untrusted_mode_installs_classic_yarn_and_bun_frozen() {
+    for (tool, root, generate) in [
+        ("yarn", "classic", "yarn install --ignore-scripts"),
+        ("bun", "bun", "bun install --ignore-scripts"),
+    ] {
+        if !have(tool) {
+            eprintln!("skipped: {tool} is not on PATH");
+            continue;
+        }
+        let default = Untrusted::new();
+        ahead_of_its_lockfile(&default, root, generate);
+        default.install_one(root, tool, false);
+        assert_ne!(
+            default.changed_tracked_files(),
+            "",
+            "an unfrozen {tool} install rewrites the lockfile, so this case can see it"
+        );
+
+        let untrusted = Untrusted::new();
+        ahead_of_its_lockfile(&untrusted, root, generate);
+        let run = untrusted.install_one(root, tool, true);
+        untrusted.assert_safe(root, &run);
+    }
+}
+
+#[test]
+fn an_npm_file_dependency_cannot_run_its_preinstall() {
+    let t = Untrusted::new();
+    write(
+        &t.repo,
+        "npm/dep/package.json",
+        r#"{"name":"dep","version":"1.0.0","scripts":{"preinstall":"node preinstall.cjs"}}"#,
+    );
+    write(&t.repo, "npm/dep/preinstall.cjs", &t.witness("preinstall"));
+    write(
+        &t.repo,
+        "npm/package.json",
+        r#"{"name":"n","private":true,"dependencies":{"dep":"file:./dep"}}"#,
+    );
+    sh(
+        &t.repo.join("npm"),
+        "npm install --package-lock-only --ignore-scripts",
+    );
+    t.commit();
+
+    let run = t.install_one("npm", "npm", true);
+    assert!(
+        !t.marker("preinstall").exists(),
+        "preinstall ran: {}",
+        run.text()
+    );
+    t.assert_safe("npm", &run);
+}
+
+#[test]
+fn untrusted_mode_leaves_bun_with_nothing_from_the_tree_to_run() {
+    if !have("bun") {
+        eprintln!("skipped: bun is not on PATH");
+        return;
+    }
+    let t = Untrusted::new();
+    write(
+        &t.repo,
+        "bun/dep/package.json",
+        r#"{"name":"dep","version":"1.0.0","scripts":{"preinstall":"node preinstall.cjs","postinstall":"node preinstall.cjs"}}"#,
+    );
+    write(&t.repo, "bun/dep/preinstall.cjs", &t.witness("lifecycle"));
+    write(
+        &t.repo,
+        "bun/package.json",
+        r#"{"name":"d","private":true,"dependencies":{"dep":"file:./dep"}}"#,
+    );
+    sh(&t.repo.join("bun"), "bun install --ignore-scripts");
+    let _ = fs::remove_dir_all(t.repo.join("bun/node_modules"));
+    t.commit();
+    let run = t.install_one("bun", "bun", true);
+    assert!(
+        !t.marker("lifecycle").exists(),
+        "bun ran a lifecycle script: {}",
+        run.text()
+    );
+    t.assert_safe("bun", &run);
+}

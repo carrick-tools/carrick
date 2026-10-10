@@ -8,3 +8,5 @@ sidecar/
 LICENSE.md
 # Copied from the repo's plugin/ by prepack.
 plugin/
+# Copied from the repo root by prepack (scripts/bundle-install-script.mjs).
+scripts/install-scanned-deps.sh

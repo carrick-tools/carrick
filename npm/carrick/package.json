@@ -36,6 +36,7 @@
     "bin",
     "dist",
     "plugin",
+    "scripts/install-scanned-deps.sh",
     "sidecar",
     "templates",
     "LICENSE.md"
@@ -45,7 +46,7 @@
     "typecheck": "tsc --noEmit",
     "selftest": "node test/selftest.ts",
     "bundle": "node scripts/bundle-sidecar.mjs",
-    "prepack": "npm run build && node scripts/bundle-sidecar.mjs",
+    "prepack": "npm run build && node scripts/bundle-sidecar.mjs && node scripts/bundle-install-script.mjs",
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {

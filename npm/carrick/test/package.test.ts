@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { PLATFORMS, platformPackage } from "../src/native.ts";
@@ -234,4 +235,29 @@ test("the platform builder writes a package when run as a command", async () => 
   assert.ok(fs.existsSync(path.join(built, "package.json")), "no package.json was written");
   assert.ok(fs.existsSync(path.join(built, "bin", "carrick")), "no binary was written");
   assert.equal(readJson(path.join(built, "package.json"))["version"], "9.9.9");
+});
+
+test("the tarball carries the dependency-install script, executable (carrick#2211)", () => {
+  // A machine that installs this package needs scripts/install-scanned-deps.sh
+  // at the binary's version. `prepack` copies it in, so a pack that skips
+  // scripts (the only one that works without a built sidecar) runs the copy
+  // by hand, then asks npm what it would put in the tarball.
+  const bundle = spawnSync(process.execPath, ["scripts/bundle-install-script.mjs"], {
+    cwd: packageRoot,
+    encoding: "utf8",
+  });
+  assert.equal(bundle.status, 0, bundle.stderr);
+  const packed = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+    cwd: packageRoot,
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.stderr);
+  const files: { path: string; mode: number }[] = JSON.parse(packed.stdout)[0].files;
+  const script = files.find((file) => file.path === "scripts/install-scanned-deps.sh");
+  assert.ok(script, "scripts/install-scanned-deps.sh is not in the tarball");
+  assert.ok(script.mode & 0o111, "scripts/install-scanned-deps.sh is not executable");
+  assert.ok(
+    !files.some((file) => file.path.startsWith("scripts/") && file.path !== script.path),
+    "the other scripts here are build tooling and do not ship",
+  );
 });
