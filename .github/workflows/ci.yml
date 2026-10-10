@@ -303,9 +303,15 @@ jobs:
           EXCLUDED: ""
         run: |
           f=.github/workflows/ci.yml
-          missing=$(comm -23 \
-            <(yq -r '.jobs | keys | .[]' "$f" | grep -vx ci-result | sort) \
-            <(yq -r '.jobs["ci-result"].needs[]' "$f" | sort))
+          # Read both lists first: a yq failure inside `<( )` would not stop
+          # the step, and two empty lists compare as "nothing missing".
+          jobs=$(yq -r '.jobs | keys | .[]' "$f" | grep -vx ci-result | sort)
+          needs=$(yq -r '.jobs["ci-result"].needs[]' "$f" | sort)
+          if [ -z "$jobs" ] || [ -z "$needs" ]; then
+            echo "::error::could not read the job ids or ci-result.needs from $f"
+            exit 1
+          fi
+          missing=$(comm -23 <(echo "$jobs") <(echo "$needs"))
           rc=0
           for job in $missing; do
             case " $EXCLUDED " in
