@@ -72,7 +72,10 @@ Every row, and every pairing of rows, carries a source (`EdgeSource`,
   destructured discriminator, `addEventListener("message", ...)`, and a handler
   table on a class field are not read (`src/socket_io.rs:116-145`, carrick#1298).
   The runtime's own events (`message`, `open`, `close`) are never keyed
-  (`src/event_emitter.rs:122`).
+  (`src/event_emitter.rs:160`). A listener on an object a package or the
+  runtime makes (a stream, a line reader, a browser page) is not a pub/sub
+  endpoint unless detection lists that package as a messaging or socket
+  client (`src/event_emitter.rs:43`, carrick#941).
 - A consumer that reaches a producer through a published SDK package has no
   call site of its own. Its pairs are reported separately as `via_sdk`, with
   the verdict stored for the SDK repo's own call (`src/sdk_edges.rs:1`).
