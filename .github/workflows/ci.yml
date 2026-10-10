@@ -344,9 +344,13 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm --release
 
       # Version must match the exact wasm-bindgen pin in
-      # crates/carrick-match/Cargo.toml; bump both in lockstep.
+      # crates/carrick-match/Cargo.toml; bump both in lockstep. The upstream
+      # release binary: `cargo install` compiled the CLI from source on every
+      # run, 82 s of a 96 s job.
       - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: wasm-bindgen@0.2.126
 
       - name: Generate Node.js glue
         run: wasm-bindgen --target nodejs --out-dir target/wasm-smoke target/wasm32-unknown-unknown/release/carrick_match.wasm
