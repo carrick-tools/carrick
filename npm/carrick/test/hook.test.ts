@@ -614,3 +614,194 @@ test("a channel that prints nothing remembers nothing as shown", async (t) => {
   });
   assert.ok(contextOf(hook.stdout).includes(USES_LINE));
 });
+
+// ---------------------------------------------------------------------------
+// The Read hook (carrick#2069): who depends on a file, when the agent opens it.
+
+function readPayload(workspace: { root: string; file: string }, session?: string) {
+  return {
+    hook_event_name: "PostToolUse",
+    tool_name: "Read",
+    cwd: workspace.root,
+    tool_input: { file_path: workspace.file },
+    tool_response: { file: { filePath: workspace.file, content: "const a = 1;" } },
+    ...(session ? { session_id: session } : {}),
+  };
+}
+
+function runCount(argvLog: string): number {
+  return fs.existsSync(argvLog)
+    ? fs.readFileSync(argvLog, "utf8").split("\n").filter((line) => line.trim()).length
+    : 0;
+}
+
+test("the first Read of a file prints who uses it, with a plain check", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  const run = await runHook("post-read.ts", {
+    payload: readPayload(workspace, "sess-r1"),
+    env: fakeEnv({
+      HOME: home,
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+      CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"),
+    }),
+  });
+  assert.equal(run.code, 0);
+  const context = contextOf(run.stdout);
+  assert.ok(context.includes(USES_LINE), context);
+  assert.match(context, /^Carrick: other code depends on user-service\/src\/routes\/users\.ts/);
+  const call = firstCall(argvLog);
+  assert.ok(call);
+  assert.deepEqual(call.argv.slice(0, 1), ["check"]);
+  assert.ok(call.argv.includes("--json"));
+  assert.equal(call.argv.includes("--recheck"), false, call.argv.join(" "));
+});
+
+test("a second Read of the same file in a session prints nothing and starts no process", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(workspace.root, "argv.log");
+  const env = fakeEnv({
+    HOME: home,
+    CARRICK_FAKE_ARGV_LOG: argvLog,
+    CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"),
+  });
+
+  const first = await runHook("post-read.ts", { payload: readPayload(workspace, "sess-r2"), env });
+  assert.ok(contextOf(first.stdout).includes(USES_LINE));
+  const second = await runHook("post-read.ts", { payload: readPayload(workspace, "sess-r2"), env });
+  assert.equal(second.stdout, "");
+  assert.equal(runCount(argvLog), 1);
+  // Another session is asked afresh.
+  const other = await runHook("post-read.ts", { payload: readPayload(workspace, "sess-r2b"), env });
+  assert.ok(contextOf(other.stdout).includes(USES_LINE));
+  assert.equal(runCount(argvLog), 2);
+});
+
+test("a Read prints the other side of a route or call, and no verdict words", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  const run = await runHook("post-read.ts", {
+    payload: readPayload(workspace, "sess-r3"),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+  });
+  const context = contextOf(run.stdout);
+  assert.match(
+    context,
+    /- user-service\/src\/routes\/users\.ts:18:3 call GET \/api\/users\/:id\. Producers: user-service src\/routes\/users\.ts:42/,
+  );
+  assert.doesNotMatch(context, /type_mismatch|no longer carries|\[fact|Read off/);
+});
+
+test("a Read of a file nothing depends on prints nothing, not even a header", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  for (const name of ["check-clean.json", "check-silent.json"]) {
+    const run = await runHook("post-read.ts", {
+      payload: readPayload(workspace, `sess-r4-${name}`),
+      env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath(name) }),
+    });
+    assert.equal(run.code, 0, name);
+    assert.equal(run.stdout, "", name);
+  }
+});
+
+test("a Read of a file that is not TypeScript starts no process", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  const run = await runHook("post-read.ts", {
+    payload: {
+      tool_name: "Read",
+      cwd: workspace.root,
+      session_id: "sess-r5",
+      tool_input: { file_path: path.join(workspace.root, "README.md") },
+    },
+    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "");
+  assert.equal(runCount(argvLog), 0);
+});
+
+test("a Read the index cannot answer, or that runs past its limit, prints nothing and exits 0", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  const notIndexed = await runHook("post-read.ts", {
+    payload: readPayload(workspace, "sess-r6a"),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-not-indexed.json") }),
+  });
+  assert.equal(notIndexed.code, 0);
+  assert.equal(notIndexed.stdout, "");
+
+  const slow = await runHook("post-read.ts", {
+    payload: readPayload(workspace, "sess-r6b"),
+    env: fakeEnv({
+      HOME: home,
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+      CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"),
+      CARRICK_FAKE_DELAY_MS: "4000",
+      CARRICK_TIMEOUT_MS: "250",
+    }),
+  });
+  assert.equal(slow.code, 0);
+  assert.equal(slow.stdout, "");
+  // Asked once: the timeout is not asked again on the next Read.
+  await runHook("post-read.ts", {
+    payload: readPayload(workspace, "sess-r6b"),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  assert.equal(runCount(argvLog), 1);
+});
+
+test("a Read and then an Edit: the edit has its header and not the uses lines", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+
+  const read = await runHook("post-read.ts", { payload: readPayload(workspace, "sess-r7"), env });
+  assert.ok(contextOf(read.stdout).includes(USES_LINE));
+  const edit = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-r7" },
+    env,
+  });
+  const context = contextOf(edit.stdout);
+  assert.ok(context.startsWith("Carrick checked "), context);
+  assert.equal(context.includes(USES_LINE), false, context);
+});
+
+test("the lsp and off channels print nothing from a Read and write no session file", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  for (const channel of ["lsp", "off"]) {
+    const run = await runHook("post-read.ts", {
+      payload: readPayload(workspace, `sess-r8-${channel}`),
+      env: fakeEnv({
+        HOME: home,
+        CARRICK_CHANNEL: channel,
+        CARRICK_FAKE_ARGV_LOG: argvLog,
+        CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"),
+      }),
+    });
+    assert.equal(run.code, 0, channel);
+    assert.equal(run.stdout, "", channel);
+  }
+  assert.equal(runCount(argvLog), 0);
+  assert.equal(fs.existsSync(path.join(home, ".carrick", "sessions")), false);
+});

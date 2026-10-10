@@ -78,6 +78,12 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         matcher: "Write|Edit|MultiEdit",
         hooks: [{ type: "command", command: `${command} hook post-edit`, timeout: 15 }],
       },
+      // Who depends on a file, delivered when the agent opens it rather than
+      // after it has edited (carrick#2069).
+      {
+        matcher: "Read",
+        hooks: [{ type: "command", command: `${command} hook post-read`, timeout: 5 }],
+      },
     ],
     // No matcher: a resumed, cleared or compacted session has lost the map and
     // re-orients for one read of the index.

@@ -43,6 +43,11 @@ export type SessionRecord = {
    * (carrick#2067), so the post-edit hook prints them once per file.
    */
   told: string[];
+  /**
+   * Absolute paths the Read hook has already asked about (carrick#2069): it
+   * asks once per file per session, whatever the answer was.
+   */
+  read: string[];
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -82,7 +87,7 @@ function key(entry: NewFunction): string {
 
 /** A session's record, or an empty one. Never throws. */
 export function readSession(sessionId: string, home?: string): SessionRecord {
-  const empty: SessionRecord = { found: [], nudged: [], told: [], updated: "" };
+  const empty: SessionRecord = { found: [], nudged: [], told: [], read: [], updated: "" };
   const file = sessionFile(sessionId, home);
   if (file === null) return empty;
   let body: string;
@@ -108,6 +113,9 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       told: Array.isArray(record.told)
         ? record.told.filter((entry): entry is string => typeof entry === "string")
         : [],
+      read: Array.isArray(record.read)
+        ? record.read.filter((entry): entry is string => typeof entry === "string")
+        : [],
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -120,12 +128,25 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
 function write(sessionId: string, record: SessionRecord, home?: string): void {
   const file = sessionFile(sessionId, home);
   if (file === null) return;
+  // Written beside the record and renamed over it: Claude Code runs Reads in
+  // parallel, so several hook processes read, change and write one file at
+  // once, and a writer that empties the file first lets a reader parse an
+  // empty record and write that back over `found` and `told` (carrick#2069).
+  // Two complete writes can still overwrite each other, which costs one
+  // repeated print or one repeated check.
+  const temp = `${file}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(temp, file);
   } catch {
     // Nothing to do and nothing to say: the nudge is a nicety and the edit it
     // rides behind is not.
+    try {
+      fs.unlinkSync(temp);
+    } catch {
+      // No temp file was left.
+    }
   }
   prune(home);
 }
@@ -255,6 +276,20 @@ export function markTold(sessionId: string, keys: string[], home?: string): void
   const told = new Set(current.told);
   for (const key of keys) told.add(key);
   current.told = [...told];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** Whether the Read hook has already asked about this absolute path. */
+export function wasRead(sessionId: string, file: string, home?: string): boolean {
+  return readSession(sessionId, home).read.includes(file);
+}
+
+/** Remember that the Read hook has asked about this absolute path. */
+export function markRead(sessionId: string, file: string, home?: string): void {
+  const current = readSession(sessionId, home);
+  if (current.read.includes(file)) return;
+  current.read.push(file);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

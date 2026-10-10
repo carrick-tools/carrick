@@ -37,6 +37,7 @@ if (nodeMajor() < NODE_FLOOR) {
 
 const HOOKS = {
   "post-edit": "../dist/hook/post-edit.js",
+  "post-read": "../dist/hook/post-read.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",
   "user-prompt": "../dist/hook/user-prompt.js",
@@ -288,6 +289,8 @@ function extraHelp() {
     "                                 that speaks LSP",
     "    hook post-edit               PostToolUse hook for either host (reads the",
     "                                 tool payload on stdin)",
+    "    hook post-read               Claude Code PostToolUse hook for Read (who",
+    "                                 depends on the file, once per file per session)",
     "    hook session-start           Claude Code SessionStart hook",
     "    hook stop                    Claude Code Stop hook (one reuse nudge per",
     "                                 task, silent when the task added no function)",

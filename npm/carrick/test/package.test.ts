@@ -153,6 +153,7 @@ test("the host manifests name this CLI's commands, and travel with the package",
   );
   assert.deepEqual(commands.sort(), [
     "carrick hook post-edit",
+    "carrick hook post-read",
     "carrick hook session-start",
     "carrick hook stop",
   ]);
