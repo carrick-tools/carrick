@@ -607,7 +607,8 @@ pub struct ScannerBuild {
 
 impl ScannerBuild {
     /// The running binary's own build, compiled in by `build.rs`, or `None`
-    /// when it was built where no commit could be named.
+    /// for a debug build (carrick#2157) or one made where no commit could be
+    /// named.
     pub fn current() -> Option<Self> {
         let commit = env!("CARRICK_BUILD_COMMIT");
         (!commit.is_empty()).then(|| Self {
@@ -2071,6 +2072,12 @@ mod tests {
     /// tree: tests in this crate write to tracked fixtures.
     #[test]
     fn scanner_build_names_the_commit_the_binary_was_built_from() {
+        // Debug builds are not stamped (carrick#2157), so there is no commit
+        // to compare; `cargo test --release` runs the check below.
+        if cfg!(debug_assertions) {
+            assert_eq!(ScannerBuild::current(), None);
+            return;
+        }
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let git = |args: &[&str]| {
             std::process::Command::new("git")
