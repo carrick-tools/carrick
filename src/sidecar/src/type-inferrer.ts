@@ -24,6 +24,7 @@ import {
   SourceFile,
   Node,
   SyntaxKind,
+  VariableDeclarationKind,
   type FunctionDeclaration,
   type ArrowFunction,
   type BinaryExpression,
@@ -246,6 +247,30 @@ const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
  * union so no success body is ever guessed away.
  */
 type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
+
+/** One response branch's payload, before branches are joined. */
+interface PayloadCandidate {
+  typeString: string;
+  isExplicit: boolean;
+  node: Node;
+  anchorType: Type;
+  statedTypeNode?: Node;
+}
+
+/** A function that can build a response: one with a body to read. */
+type BuilderFunction = FunctionDeclaration | ArrowFunction | FunctionExpression;
+
+/**
+ * How a repository's own response builder fills an envelope (carrick#2200):
+ * the parameter it serialises into `body`, and the parameter its status
+ * member takes or the status its literal states.
+ */
+interface EnvelopeBuilder {
+  builder: BuilderFunction;
+  payloadParameter: number;
+  statusParameter?: number;
+  fixedStatus?: ResponseSiteStatus;
+}
 
 /** A response payload read out of one or more response sends. */
 interface RecoveredPayload {
@@ -1092,6 +1117,13 @@ export class TypeInferrer {
     const awaitedType = this.unwrapAsyncIterableType(
       this.unwrapPromiseType(returnType)
     );
+    // carrick#2200: a `{ statusCode, body: string }` return is transport the
+    // handler built itself; its contract is the value it serialised into
+    // `body`. Decided before the extraction config, whose rule for the
+    // envelope would read `body` and publish `string`.
+    if (this.typeIsSerialisedBodyEnvelope(awaitedType, func)) {
+      return this.inferSerialisedBodyEnvelope(request, func);
+    }
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
       typeString = unwrapResult.typeString;
@@ -5263,13 +5295,7 @@ export class TypeInferrer {
     wire: WireFormat,
     alsoSerialisers?: ReadonlySet<string>
   ): RecoveredPayload | null {
-    const candidates: Array<{
-      typeString: string;
-      isExplicit: boolean;
-      node: Node;
-      anchorType: Type;
-      statedTypeNode?: Node;
-    }> = [];
+    const candidates: PayloadCandidate[] = [];
 
     const returned = expressions.flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
@@ -5289,36 +5315,55 @@ export class TypeInferrer {
         serialisers
       );
       if (!payloadNode) continue;
-
-      // A `satisfies X` / `as X` on the argument states the contract in source:
-      // read the ANNOTATION, not the literal the compiler widened it from.
-      // `expandAnnotationTypeNode` keeps the bare name when the declaration is
-      // not resolvable, which is the honest answer on a bare checkout.
-      const stated = this.statedTypeNodeOf(payloadNode);
-      if (stated) {
-        candidates.push({
-          typeString: this.expandAnnotationTypeNode(stated, wire),
-          isExplicit: true,
-          node: payloadNode,
-          anchorType: this.unwrapPromiseType(stated.getType()),
-          statedTypeNode: stated,
-        });
-        continue;
-      }
-
-      const payloadType = this.unwrapPromiseType(payloadNode.getType());
-      candidates.push({
-        typeString: this.expandResolvedTypeStructural(
-          payloadType,
-          typeText(payloadType, payloadNode),
-          wire
-        ),
-        isExplicit: false,
-        node: payloadNode,
-        anchorType: payloadType,
-      });
+      candidates.push(this.payloadCandidateOf(payloadNode, wire));
     }
+    return this.joinPayloadCandidates(candidates);
+  }
 
+  /** How one payload node reads: its stated annotation, else its resolved type. */
+  private payloadCandidateOf(payloadNode: Node, wire: WireFormat): PayloadCandidate {
+    // A `satisfies X` / `as X` on the argument states the contract in source:
+    // read the ANNOTATION, not the literal the compiler widened it from.
+    // `expandAnnotationTypeNode` keeps the bare name when the declaration is
+    // not resolvable, which is the honest answer on a bare checkout.
+    const stated = this.statedTypeNodeOf(payloadNode);
+    if (stated) {
+      return this.statedPayloadCandidate(payloadNode, stated, wire);
+    }
+    const payloadType = this.unwrapPromiseType(payloadNode.getType());
+    return {
+      typeString: this.expandResolvedTypeStructural(
+        payloadType,
+        typeText(payloadType, payloadNode),
+        wire
+      ),
+      isExplicit: false,
+      node: payloadNode,
+      anchorType: payloadType,
+    };
+  }
+
+  /** A payload whose contract a type node in the source states. */
+  private statedPayloadCandidate(
+    payloadNode: Node,
+    stated: Node,
+    wire: WireFormat
+  ): PayloadCandidate {
+    return {
+      typeString: this.expandAnnotationTypeNode(stated, wire),
+      isExplicit: true,
+      node: payloadNode,
+      anchorType: this.unwrapPromiseType(stated.getType()),
+      statedTypeNode: stated,
+    };
+  }
+
+  /**
+   * Join the payloads of several response branches into one contract, as
+   * several return statements are joined: an empty object drops beside a
+   * branch with members, equal texts dedupe, and the rest is a union.
+   */
+  private joinPayloadCandidates(candidates: PayloadCandidate[]): RecoveredPayload | null {
     if (candidates.length === 0) {
       return null;
     }
@@ -5353,6 +5398,429 @@ export class TypeInferrer {
       statedTypeNode:
         distinct.length === 1 ? distinct[0].statedTypeNode : undefined,
     };
+  }
+
+  // ===========================================================================
+  // Serialised-body envelopes (carrick#2200)
+  // ===========================================================================
+
+  /**
+   * True when a handler's awaited return, or a member of its union, is a
+   * serialised-body envelope: an object with a numeric `statusCode` or
+   * `status` member and a `body` member typed `string`. Either member may be
+   * optional, as a platform's result type declares them.
+   *
+   * HTTP vocabulary only, the class `RESPONSE_INIT_MEMBER_NAMES` is. A `body`
+   * typed as an object is not an envelope: a runtime that serialises the
+   * handler's return value sends that object as the payload, so the shape is
+   * ambiguous and keeps the ordinary reading.
+   */
+  private typeIsSerialisedBodyEnvelope(type: Type, at: Node): boolean {
+    const members = type.isUnion() ? type.getUnionTypes() : [type];
+    return members.some((member) => {
+      if (!member.isObject() || member.isArray() || member.getCallSignatures().length > 0) {
+        return false;
+      }
+      const body = this.envelopeMemberType(member, 'body', at);
+      if (!body || !(body.isString() || body.isStringLiteral())) return false;
+      return STATUS_MEMBER_NAMES.some((name) => {
+        const status = this.envelopeMemberType(member, name, at);
+        return status !== undefined && (status.isNumber() || statusCodesOfType(status) !== undefined);
+      });
+    });
+  }
+
+  /** A member's type with `undefined` and `null` removed, or `undefined` if absent. */
+  private envelopeMemberType(type: Type, name: string, at: Node): Type | undefined {
+    const property = type.getProperty(name);
+    if (!property) return undefined;
+    return property.getTypeAtLocation(at).getNonNullableType();
+  }
+
+  /**
+   * The `function_return` answer for a handler that returns a serialised-body
+   * envelope: the union of the values its success branches serialised.
+   *
+   * Each returned expression (conditional sides split) is read by
+   * `readEnvelopeBranch`. Error and redirect branches contribute nothing
+   * (carrick#1161). If any branch cannot be read, the answer is `unknown` with
+   * the decided reason `serialised_body_unread`: the branches that did read
+   * are part of the contract, and neither the envelope nor its `string` body
+   * is any of it.
+   */
+  private inferSerialisedBodyEnvelope(
+    request: InferRequestItem,
+    func: FunctionLike
+  ): InferredType {
+    const wire = this.wireFormatFor(request);
+    // A returned call whose callbacks were flattened in is carried by those
+    // callbacks' returns; the call itself is not an envelope expression.
+    const carriedByCallbacks = new Set(
+      this.returnedExpressions(func).filter((expression) => {
+        const call = this.peelTransparentExpression(expression);
+        return (
+          Node.isCallExpression(call) &&
+          call.getArguments().some((arg) => {
+            const peeled = this.peelTransparentExpression(arg);
+            return Node.isArrowFunction(peeled) || Node.isFunctionExpression(peeled);
+          })
+        );
+      })
+    );
+    const branches = this.responseReturnedExpressions(func)
+      .filter((expression) => !carriedByCallbacks.has(expression))
+      .flatMap((expression) => this.expandResponseBranches(expression, 0));
+
+    const candidates: PayloadCandidate[] = [];
+    let unread = 0;
+    for (const branch of branches) {
+      const read = this.readEnvelopeBranch(branch, func, wire, 0);
+      if (read === 'unread') unread += 1;
+      else if (read !== 'dropped') candidates.push(read);
+    }
+
+    const location = this.getNodeLocation(func);
+    if (unread > 0 || branches.length === 0) {
+      this.log(
+        `Return at ${request.file_path}:${request.line_number} is a serialised-body ` +
+          `envelope and ${unread} of ${branches.length} returned branches built its body ` +
+          'some way this layer cannot read; abstaining'
+      );
+      return this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'serialised_body_unread',
+        detail:
+          'this handler returns a status and a body string it serialised itself, and at least one of its returns builds that string some way other than JSON.stringify of a typed value, in the return itself or in a response builder this repository declares, so publishing the bodies that did read would state part of the contract as the whole of it',
+      });
+    }
+    const recovered = this.joinPayloadCandidates(candidates);
+    if (!recovered) {
+      return this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_success_payload',
+        detail:
+          'every status and body this handler returns states an error or redirect status, so it publishes no success body',
+      });
+    }
+    return this.inferredFromRecoveredPayload(request, recovered);
+  }
+
+  /** An `unknown` answer the inferrer decided, carrying its reason at the root. */
+  private decidedAbstain(
+    request: InferRequestItem,
+    location: SourceLocation,
+    reason: TypeProvenance
+  ): InferredType {
+    const abstain = this.createInferredType(request, 'unknown', false, location);
+    abstain.any_provenance = [reason];
+    return abstain;
+  }
+
+  /**
+   * What one returned branch of an envelope handler serialised:
+   *  - an envelope object literal: the argument of the `JSON.stringify` that
+   *    produced its `body`, inline or through a `const` in the same function;
+   *    its status member decides the branch;
+   *  - a call to a response builder this repository declares
+   *    (`envelopeBuilderOf`): the argument the builder serialises; the
+   *    argument or literal its status member takes decides the branch;
+   *  - any other call: a status its own arguments state decides the branch,
+   *    else the one argument that is itself an envelope is read in its place
+   *    (`log(ctx, 503, "code", reply(503, x))`).
+   * Anything else, and a payload typed `any` or `unknown`, is `'unread'`.
+   */
+  private readEnvelopeBranch(
+    expression: Node,
+    scope: FunctionLike,
+    wire: WireFormat,
+    depth: number
+  ): PayloadCandidate | 'dropped' | 'unread' {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return 'unread';
+    const node = this.peelTransparentExpression(expression);
+
+    if (Node.isObjectLiteralExpression(node)) {
+      const status = this.envelopeLiteralStatus(node);
+      if (status === 'error' || status === 'redirect') return 'dropped';
+      const payload = this.serialisedBodyArgument(node, scope);
+      return payload ? this.envelopePayloadCandidate(payload, wire) : 'unread';
+    }
+
+    if (!Node.isCallExpression(node)) return 'unread';
+
+    const builder = this.envelopeBuilderOf(node);
+    if (builder === 'failure') return 'dropped';
+    if (builder) {
+      const args = node.getArguments();
+      const status =
+        builder.statusParameter !== undefined
+          ? this.statusOfValue(args[builder.statusParameter])
+          : builder.fixedStatus;
+      if (status === 'error' || status === 'redirect') return 'dropped';
+      const argument = args[builder.payloadParameter];
+      if (!argument) return 'unread';
+      return this.builderPayloadCandidate(node, builder, argument, wire);
+    }
+
+    const outer = this.responseSiteStatus(node);
+    if (outer === 'error' || outer === 'redirect') return 'dropped';
+    for (const arg of node.getArguments()) {
+      const peeled = this.peelTransparentExpression(arg);
+      if (this.typeIsSerialisedBodyEnvelope(peeled.getType(), peeled)) {
+        return this.readEnvelopeBranch(peeled, scope, wire, depth + 1);
+      }
+    }
+    return 'unread';
+  }
+
+  /** The status an envelope literal's `statusCode` or `status` member states. */
+  private envelopeLiteralStatus(literal: ObjectLiteralExpression): ResponseSiteStatus {
+    for (const name of STATUS_MEMBER_NAMES) {
+      const value = this.envelopeMemberValue(literal, name);
+      if (value) return this.statusOfValue(value);
+    }
+    return 'undecided';
+  }
+
+  /** The status a value states, classified as a send's status argument is. */
+  private statusOfValue(value: Node | undefined): ResponseSiteStatus {
+    if (!value) return 'undecided';
+    const read = this.statedStatusCodes(this.peelTransparentExpression(value));
+    if (read === 'variable') return 'variable';
+    if (!read) return 'undecided';
+    const kind = classifyStatusCodes(read);
+    return kind === 'mixed' ? 'variable' : kind;
+  }
+
+  /**
+   * The value node an object literal gives a member: a property assignment's
+   * initializer, or a shorthand's own name.
+   */
+  private envelopeMemberValue(literal: ObjectLiteralExpression, name: string): Node | undefined {
+    const property = literal.getProperty(name);
+    if (property && Node.isPropertyAssignment(property)) return property.getInitializer();
+    if (property && Node.isShorthandPropertyAssignment(property)) return property.getNameNode();
+    return undefined;
+  }
+
+  /**
+   * The value an envelope literal's `body` serialises: the argument of a
+   * `JSON.stringify` written there, or written as the initializer of a
+   * `const` that `scope` declares and `body` names. `undefined` when `body`
+   * is built any other way.
+   */
+  private serialisedBodyArgument(
+    literal: ObjectLiteralExpression,
+    scope: FunctionLike
+  ): Node | undefined {
+    const raw = this.envelopeMemberValue(literal, 'body');
+    if (!raw) return undefined;
+    const value = this.peelTransparentExpression(raw);
+    const direct = this.unwrapJsonStringifyArg(value);
+    if (direct !== value) return direct;
+    const initializer = this.constInitializerInScope(value, scope);
+    if (!initializer) return undefined;
+    const bound = this.peelTransparentExpression(initializer);
+    const viaConst = this.unwrapJsonStringifyArg(bound);
+    return viaConst !== bound ? viaConst : undefined;
+  }
+
+  /**
+   * The initializer of the `const` an identifier (or a shorthand member's
+   * name) refers to, when `scope` itself declares it.
+   */
+  private constInitializerInScope(node: Node, scope: FunctionLike): Node | undefined {
+    for (const declaration of this.valueSymbolOf(node)?.getDeclarations() ?? []) {
+      if (!Node.isVariableDeclaration(declaration)) continue;
+      if (
+        declaration.getVariableStatement()?.getDeclarationKind() !==
+        VariableDeclarationKind.Const
+      ) {
+        continue;
+      }
+      if (this.findContainingFunctionForNode(declaration) !== scope) continue;
+      return declaration.getInitializer();
+    }
+    return undefined;
+  }
+
+  /**
+   * The symbol of the value a node names: a shorthand member's value symbol
+   * (its own symbol is the property), else the identifier's symbol.
+   */
+  private valueSymbolOf(node: Node): TsSymbol | undefined {
+    const parent = node.getParent();
+    if (parent && Node.isShorthandPropertyAssignment(parent) && parent.getNameNode() === node) {
+      return parent.getValueSymbol();
+    }
+    return Node.isIdentifier(node) ? node.getSymbol() : undefined;
+  }
+
+  /** The index of the `params` entry a node names, or `undefined`. */
+  private parameterIndexOf(node: Node, params: ParameterDeclaration[]): number | undefined {
+    for (const declaration of this.valueSymbolOf(node)?.getDeclarations() ?? []) {
+      const index = params.findIndex((param) => param === declaration);
+      if (index >= 0) return index;
+    }
+    return undefined;
+  }
+
+  /**
+   * How a call's callee builds an envelope, when the callee is a function this
+   * repository declares (not lib, not an installed package) and every return
+   * it makes is an envelope literal:
+   *  - returns whose status member is a literal 4xx or 5xx are its failure
+   *    path and are ignored; a builder with nothing else is `'failure'`, so a
+   *    call to it is an error branch;
+   *  - every other return must serialise the same parameter into `body` and
+   *    take its status from the same parameter, or state the same literal
+   *    success or redirect status.
+   * `undefined` when the callee is anything else.
+   */
+  private envelopeBuilderOf(call: CallExpression): EnvelopeBuilder | 'failure' | undefined {
+    let symbol = call.getExpression().getSymbol();
+    if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+    if (!symbol || this.symbolIsLibOrExternalOrigin(symbol)) return undefined;
+    const builder = this.builderFunctionOf(symbol);
+    if (!builder) return undefined;
+
+    const params = builder.getParameters();
+    const returned = this.returnedExpressions(builder).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    let mapping: EnvelopeBuilder | undefined;
+    let sawFailure = false;
+    for (const expression of returned) {
+      const literal = this.peelTransparentExpression(expression);
+      if (!Node.isObjectLiteralExpression(literal)) return undefined;
+      const statusValue = STATUS_MEMBER_NAMES.map((name) =>
+        this.envelopeMemberValue(literal, name)
+      ).find((value) => value !== undefined);
+      if (!statusValue) return undefined;
+      const statusParameter = this.parameterIndexOf(statusValue, params);
+      let fixedStatus: ResponseSiteStatus | undefined;
+      if (statusParameter === undefined) {
+        const codes = this.statedStatusCodes(this.peelTransparentExpression(statusValue));
+        if (!Array.isArray(codes)) return undefined;
+        const kind = classifyStatusCodes(codes);
+        if (kind === 'error') {
+          sawFailure = true;
+          continue;
+        }
+        if (kind === 'mixed') return undefined;
+        fixedStatus = kind;
+      }
+      const serialised = this.serialisedBodyArgument(literal, builder);
+      const payloadParameter = serialised ? this.parameterIndexOf(serialised, params) : undefined;
+      if (payloadParameter === undefined) return undefined;
+      const here: EnvelopeBuilder = { builder, payloadParameter, statusParameter, fixedStatus };
+      if (
+        mapping &&
+        (mapping.payloadParameter !== here.payloadParameter ||
+          mapping.statusParameter !== here.statusParameter ||
+          mapping.fixedStatus !== here.fixedStatus)
+      ) {
+        return undefined;
+      }
+      mapping = here;
+    }
+    if (mapping) return mapping;
+    return sawFailure ? 'failure' : undefined;
+  }
+
+  /**
+   * The single function a callee symbol declares with a body: a function
+   * declaration, or a variable initialised with an arrow or function
+   * expression.
+   */
+  private builderFunctionOf(symbol: TsSymbol): BuilderFunction | undefined {
+    const bodies: BuilderFunction[] = [];
+    for (const declaration of symbol.getDeclarations()) {
+      if (Node.isFunctionDeclaration(declaration) && declaration.getBody()) {
+        bodies.push(declaration);
+      } else if (Node.isVariableDeclaration(declaration)) {
+        const initializer = declaration.getInitializer();
+        const fn = initializer ? this.peelTransparentExpression(initializer) : undefined;
+        if (fn && (Node.isArrowFunction(fn) || Node.isFunctionExpression(fn))) bodies.push(fn);
+      }
+    }
+    return bodies.length === 1 ? bodies[0] : undefined;
+  }
+
+  /**
+   * The payload a builder call serialises. The source states it, and the
+   * answer is explicit, when the argument carries `satisfies`/`as`, when the
+   * builder's parameter is one of its type parameters and the call passes
+   * type arguments (`reply<AddNoteResult>(201, x)`), or when the parameter is
+   * declared with a type that says something. Otherwise the argument's own
+   * type is read.
+   */
+  private builderPayloadCandidate(
+    call: CallExpression,
+    builder: EnvelopeBuilder,
+    argument: Node,
+    wire: WireFormat
+  ): PayloadCandidate | 'unread' {
+    const payloadNode = this.peelTransparentExpression(argument);
+    if (this.statedTypeNodeOf(payloadNode)) {
+      return this.envelopePayloadCandidate(payloadNode, wire);
+    }
+    const declared = builder.builder.getParameters()[builder.payloadParameter]?.getTypeNode();
+    if (declared) {
+      const typeParameterIndex = builder.builder
+        .getTypeParameters()
+        .findIndex((tp) => tp.getName() === declared.getText().trim());
+      if (typeParameterIndex >= 0) {
+        const typeArgument = call.getTypeArguments()[typeParameterIndex];
+        if (typeArgument) {
+          return this.statedPayloadCandidate(payloadNode, typeArgument, wire);
+        }
+      } else if (!this.typeNodeStatesNothing(declared)) {
+        return this.statedPayloadCandidate(payloadNode, declared, wire);
+      }
+    }
+    return this.envelopePayloadCandidate(payloadNode, wire);
+  }
+
+  /**
+   * True when a declared parameter type does not say what is sent: a top
+   * type, the bare `object`/`{}`, or a type that mentions a type parameter.
+   */
+  private typeNodeStatesNothing(typeNode: Node): boolean {
+    const type = typeNode.getType();
+    if (type.isAny() || type.isUnknown() || type.isTypeParameter()) return true;
+    if (
+      type.isObject() &&
+      !type.isArray() &&
+      type.getProperties().length === 0 &&
+      !type.getStringIndexType() &&
+      !type.getNumberIndexType()
+    ) {
+      return true;
+    }
+    return [typeNode, ...typeNode.getDescendants()].some(
+      (node) => Node.isTypeReference(node) && node.getType().isTypeParameter()
+    );
+  }
+
+  /** A serialised value's candidate, or `'unread'` when its type is a top type. */
+  private envelopePayloadCandidate(
+    payloadNode: Node,
+    wire: WireFormat
+  ): PayloadCandidate | 'unread' {
+    const candidate = this.payloadCandidateOf(payloadNode, wire);
+    const type = candidate.anchorType;
+    if (
+      type.isAny() ||
+      type.isUnknown() ||
+      type.isNever() ||
+      type.isVoid() ||
+      type.isUndefined()
+    ) {
+      return 'unread';
+    }
+    return candidate;
   }
 
   /**
