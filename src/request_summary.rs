@@ -74,6 +74,11 @@
 //!   one the body assigns again, one typed by an import and one of a
 //!   function written inside another (whose callers are not resolved here)
 //!   states no verb.
+//! - **A conditional's branches are requests** (carrick#2050). A URL a test
+//!   chooses (`kind === "draft" ? `drafts/${id}` : `posts/${id}``, held in a
+//!   local or written in the URL) is one row per branch. A branch nothing
+//!   here read, beside one that writes a path, may span any number of
+//!   segments, so no placeholder stands for it ([`alternatives`]).
 //! - **A builder's return is a value** (carrick#1562). A call to a
 //!   module-scope builder (an arrow or a function whose body only returns an
 //!   expression, or one held in a constant object nothing writes through) is
@@ -165,6 +170,10 @@
 // sees it as unused.
 #[allow(dead_code)]
 mod library_sites;
+
+// What a conditional leaves a URL able to read as (carrick#2050).
+mod alternatives;
+use alternatives::{Alternation, Alternatives};
 
 #[allow(unused_imports)]
 pub use library_sites::{
@@ -448,18 +457,30 @@ struct RequestShape {
     /// method is a parameter whose annotation is a closed set of them
     /// (carrick#2049). Empty for every other request.
     declared_methods: Vec<String>,
+    /// How a conditional in the URL splits the request (carrick#2050).
+    alternation: Alternation,
 }
 
 impl RequestShape {
     /// Whether the request is stated at its own line though its URL is
-    /// written at the call (carrick#2049). The method is a parameter the
-    /// source declares as a closed set of verbs, which is one row per verb,
-    /// a count the single row of a model cannot hold. Only a URL that starts
-    /// with its path is stated here: one that leads with a base is read by
-    /// the passes that settle a base, and keeps their row.
-    fn states_each_declared_method(&self) -> bool {
-        !self.declared_methods.is_empty()
-            && matches!(self.url.first(), Some(Piece::Lit(text)) if text.starts_with('/'))
+    /// written at the call. The source says it is more than one request: the
+    /// method is a parameter declared as a closed set of verbs
+    /// (carrick#2049), or a conditional chooses the URL (carrick#2050). That
+    /// is one row per request, a count the
+    /// single row of a model cannot hold. Only a URL that starts with its
+    /// path is stated here: one that leads with a base is read by the passes
+    /// that settle a base, and keeps their row.
+    fn fans_out_inline(&self) -> bool {
+        let path_first =
+            |url: &[Piece]| matches!(url.first(), Some(Piece::Lit(text)) if text.starts_with('/'));
+        match &self.alternation {
+            Alternation::Rows(rows) if rows.len() > 1 => {
+                rows.iter().all(|(_, url)| path_first(url))
+            }
+            Alternation::Rows(_) | Alternation::Single | Alternation::Nothing => {
+                !self.declared_methods.is_empty() && path_first(&self.url)
+            }
+        }
     }
 }
 
@@ -3081,6 +3102,13 @@ struct Scope<'a> {
     /// position (carrick#2049): `method: "POST" | "DELETE"`, or an alias of
     /// one the file declares. Never a parameter the body assigns again.
     param_verbs: HashMap<usize, Vec<String>>,
+    /// What each local the body declares once can read as, one way per branch
+    /// of the conditionals it holds (carrick#2050): only a local whose
+    /// initialiser holds one is here.
+    alts: HashMap<BindingKey, Alternatives>,
+    /// The names the function assigns again, anywhere in it: a test that
+    /// reads one is not the same test twice (carrick#2050).
+    reassigned: HashSet<String>,
     fields: Option<&'a ClassFields>,
     module: &'a ModuleScope,
 }
@@ -3099,6 +3127,8 @@ impl<'a> Scope<'a> {
             bodies: HashMap::new(),
             fetches: HashSet::new(),
             param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields: None,
             module,
         }
@@ -3131,6 +3161,7 @@ impl<'a> Scope<'a> {
         let declared = Declarations::of(function);
         let mut reassigned = Reassigned::default();
         function.visit_with(&mut reassigned);
+        self.reassigned = reassigned.names.clone();
         let settled = |binding: &BindingKey| {
             declared.binding_count(binding) == 1 && !reassigned.names.contains(&binding.0)
         };
@@ -3536,6 +3567,8 @@ impl Reader<'_> {
             bodies: HashMap::new(),
             fetches,
             param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields,
             module,
         };
@@ -3585,6 +3618,8 @@ impl Reader<'_> {
             bodies: HashMap::new(),
             fetches,
             param_verbs: HashMap::new(),
+            alts: HashMap::new(),
+            reassigned: HashSet::new(),
             fields,
             module,
         };
@@ -3704,7 +3739,23 @@ impl Reader<'_> {
                         {
                             scope.texts.insert(key.clone(), pieces);
                         }
+                        // What a conditional in it leaves it able to read as
+                        // (carrick#2050): a request built from it states
+                        // one row per branch.
+                        let alts = if unsettled {
+                            None
+                        } else {
+                            self.alternatives(init, scope)
+                        };
                         scope.locals.insert(key.clone(), value);
+                        match alts {
+                            Some(alts) => {
+                                scope.alts.insert(key.clone(), alts);
+                            }
+                            None => {
+                                scope.alts.remove(&key);
+                            }
+                        }
                         // What a call or its parsed response leaves in it,
                         // for what a `return` of it hands back (carrick#1601).
                         match (!unsettled)
@@ -4314,6 +4365,10 @@ impl Reader<'_> {
             _ => Vec::new(),
         };
 
+        // A conditional that chooses the URL is more than one request
+        // (carrick#2050).
+        let alternation = self.alternation(url_expr, &method, scope);
+
         let body = match options {
             _ if options_param.is_some() => {
                 BodyValue::ParamKey(options_param.unwrap_or_default(), "body".to_string())
@@ -4351,6 +4406,7 @@ impl Reader<'_> {
             // Only the bag says this is a request: not `fetch`, and no verb.
             init_only: kind == RequestKind::Bag && verb.is_none() && init_only,
             declared_methods,
+            alternation,
         })
     }
 
@@ -5300,30 +5356,50 @@ struct Effect {
 }
 
 impl Effect {
-    fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Self {
+    /// The requests a shape sends: one, or one per way a conditional in its
+    /// URL can go (carrick#2050), or one that states
+    /// no row where the source does not say which goes out
+    /// ([`Alternation::Nothing`]).
+    fn from_shape(shape: &RequestShape, file: &Path, line: u32) -> Vec<Self> {
         let (body, body_param) = match &shape.body {
             BodyValue::Fields(obj) => (string_fields(obj), None),
             BodyValue::Param(index) => (BTreeMap::new(), Some((*index, None))),
             BodyValue::ParamKey(index, key) => (BTreeMap::new(), Some((*index, Some(key.clone())))),
             BodyValue::Unstated => (BTreeMap::new(), None),
         };
-        let mut effect = Effect {
-            site: RequestSite {
-                file: file.to_path_buf(),
-                line,
-            },
-            method: shape.method.clone(),
-            url: shape.url.clone(),
-            body,
-            body_param,
-            verb: shape.kind == RequestKind::Verb,
-            base: shape.base.clone(),
-            base_scope: shape.base_scope.clone(),
-            semantics: shape.semantics.clone(),
+        let readings = match &shape.alternation {
+            Alternation::Single => vec![(shape.method.clone(), shape.url.clone())],
+            Alternation::Rows(rows) => rows
+                .iter()
+                .map(|(method, url)| (method.clone(), url.clone()))
+                .collect(),
+            // The request goes out; which one is not stated. It is still a
+            // request the function sends, so a call of the function is not
+            // one that sends nothing.
+            Alternation::Nothing => vec![(MethodValue::Unknown, vec![Piece::Unknown])],
         };
-        effect.settle_keys();
-        effect.settle_outer();
-        effect
+        readings
+            .into_iter()
+            .map(|(method, url)| {
+                let mut effect = Effect {
+                    site: RequestSite {
+                        file: file.to_path_buf(),
+                        line,
+                    },
+                    method,
+                    url,
+                    body: body.clone(),
+                    body_param: body_param.clone(),
+                    verb: shape.kind == RequestKind::Verb,
+                    base: shape.base.clone(),
+                    base_scope: shape.base_scope.clone(),
+                    semantics: shape.semantics.clone(),
+                };
+                effect.settle_keys();
+                effect.settle_outer();
+                effect
+            })
+            .collect()
     }
 
     /// This effect once per verb its method parameter is declared with
@@ -6126,11 +6202,11 @@ impl Composer<'_> {
                 None if call.jsx => {}
                 None => {
                     if let Some(request) = self.request_of(file, call) {
-                        summary.effects.insert(ir.settle_forward(Effect::from_shape(
-                            &request,
-                            file,
-                            call.site.line,
-                        )));
+                        summary.effects.extend(
+                            Effect::from_shape(&request, file, call.site.line)
+                                .into_iter()
+                                .map(|effect| ir.settle_forward(effect)),
+                        );
                     } else if !call.inert {
                         summary.complete = false;
                     }
@@ -6430,36 +6506,37 @@ fn emit(
                     let library = request.kind == RequestKind::Library;
                     if library
                         || (request.kind != RequestKind::Verb
-                            && (!request.url_inline || request.states_each_declared_method()))
+                            && (!request.url_inline || request.fans_out_inline()))
                     {
-                        let effect = Effect::from_shape(&request, file, call.site.line);
-                        let site = effect.site.clone();
-                        let declared = matches!(effect.method, MethodValue::Param(_))
-                            && !request.declared_methods.is_empty();
-                        let mut verbs: Vec<SummaryRow> = Vec::new();
-                        for effect in effect.each_declared_method(&request.declared_methods) {
-                            if !effect.has_params() {
-                                let at = if library {
-                                    RowSite::Library
-                                } else {
-                                    RowSite::Own
-                                };
-                                match row(&effect, file, composer.files, call, None, at, None) {
-                                    Some(row) if declared => verbs.push(row),
-                                    Some(row) => rows.push(row),
-                                    None => index.undetermined += 1,
+                        for effect in Effect::from_shape(&request, file, call.site.line) {
+                            let site = effect.site.clone();
+                            let declared = matches!(effect.method, MethodValue::Param(_))
+                                && !request.declared_methods.is_empty();
+                            let mut verbs: Vec<SummaryRow> = Vec::new();
+                            for effect in effect.each_declared_method(&request.declared_methods) {
+                                if !effect.has_params() {
+                                    let at = if library {
+                                        RowSite::Library
+                                    } else {
+                                        RowSite::Own
+                                    };
+                                    match row(&effect, file, composer.files, call, None, at, None) {
+                                        Some(row) if declared => verbs.push(row),
+                                        Some(row) => rows.push(row),
+                                        None => index.undetermined += 1,
+                                    }
                                 }
                             }
-                        }
-                        // Which of the declared verbs the line states waits on
-                        // every call of the request having been read.
-                        if declared && !verbs.is_empty() {
-                            index.methods.pending.push(DeclaredRows {
-                                file: file.to_path_buf(),
-                                span_start: call.site.span_start,
-                                site,
-                                rows: verbs,
-                            });
+                            // Which of the declared verbs the line states waits
+                            // on every call of the request having been read.
+                            if declared && !verbs.is_empty() {
+                                index.methods.pending.push(DeclaredRows {
+                                    file: file.to_path_buf(),
+                                    span_start: call.site.span_start,
+                                    site,
+                                    rows: verbs,
+                                });
+                            }
                         }
                     }
                 }
@@ -6802,6 +6879,7 @@ fn library_shape(
         semantics: used,
         init_only: false,
         declared_methods: Vec::new(),
+        alternation: Alternation::Single,
     })
 }
 

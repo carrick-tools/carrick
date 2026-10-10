@@ -215,6 +215,7 @@ jobs:
           --test bundle_row_id_golden_test
           --test client_semantics_test
           --test commonjs_require_callers_test
+          --test conditional_request_url_test
           --test dependency_analysis_test
           --test derive_matches_scan_test
           --test dispatch_file_route_test

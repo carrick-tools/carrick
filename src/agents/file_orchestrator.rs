@@ -8396,7 +8396,7 @@ impl FileOrchestrator {
 
         // --- the consumer side ---------------------------------------------
         let mut unjoined = 0;
-        let mut folded: HashSet<usize> = HashSet::new();
+        let mut calls: Vec<Option<DataCallResult>> = Vec::with_capacity(data_calls.len());
         for mut call in data_calls {
             match candidate_map.get(&call.candidate_id) {
                 Some(candidate) => {
@@ -8409,40 +8409,51 @@ impl FileOrchestrator {
                 // scanner raised no candidate for (a wrapper delegation).
                 None => unjoined += 1,
             }
-            let line = call.line_number;
-            let span = call.call_expression_span_start;
-            let twin = result.data_calls.iter().position(|row| {
-                if row.resolution_source == Some(ResolutionSource::Model) {
-                    return false;
-                }
-                match span {
-                    Some(span) => row.call_expression_span_start == Some(span),
-                    // A row the model wrote for a site with no candidate of
-                    // its own: its line is all that places it, and a second
-                    // request on that line would have raised its own
-                    // candidate and carried its own span.
-                    None => row.line_number == line || row.call_expression_line == Some(line),
-                }
-            });
-            match twin.filter(|index| folded.insert(*index)) {
-                Some(index) => {
+            calls.push(Some(call));
+        }
+        // A site that sends several requests holds several rows, and the
+        // model's row for one of them is that one's twin, not the first row's
+        // (carrick#2050). Every model row that states the same method and
+        // route as a row no model row has joined yet folds onto it first, so
+        // a row that agrees with none cannot take an agreeing row's twin.
+        // Each one left then folds onto the first row at the site no model row
+        // has joined, and is kept as its own row only when none is left: a
+        // reading of a site the source already states in full is not a second
+        // request.
+        let n_deterministic = result.data_calls.len();
+        let mut folded = vec![false; n_deterministic];
+        for agreeing_only in [true, false] {
+            for slot in calls.iter_mut() {
+                let Some(call) = slot.as_ref() else {
+                    continue;
+                };
+                let twin = (0..n_deterministic).find(|&index| {
+                    let row = &result.data_calls[index];
+                    !folded[index]
+                        && Self::model_call_at_site(row, call)
+                        && (!agreeing_only || Self::model_call_restates(row, call))
+                });
+                if let Some(index) = twin {
+                    folded[index] = true;
+                    let call = slot.take().expect("slot read above");
                     Self::fold_model_call(&mut result.data_calls[index], call, file_path, stats);
                     stats.model_rows_joined += 1;
                 }
-                None => {
-                    // No row of its own at this span, but the source may still
-                    // state part of what the model reported there.
-                    if let Some(overrule) = overrules
-                        .iter()
-                        .find(|entry| entry.span.map(|(start, _)| start) == span)
-                    {
-                        Self::overrule_model_call(&mut call, overrule, file_path, stats);
-                    }
-                    call.resolution_source = Some(ResolutionSource::Model);
-                    result.data_calls.push(call);
-                    stats.model_only_rows += 1;
-                }
             }
+        }
+        for mut call in calls.into_iter().flatten() {
+            // No row of its own at this span, but the source may still state
+            // part of what the model reported there.
+            let span = call.call_expression_span_start;
+            if let Some(overrule) = overrules
+                .iter()
+                .find(|entry| entry.span.map(|(start, _)| start) == span)
+            {
+                Self::overrule_model_call(&mut call, overrule, file_path, stats);
+            }
+            call.resolution_source = Some(ResolutionSource::Model);
+            result.data_calls.push(call);
+            stats.model_only_rows += 1;
         }
         if unjoined > 0 {
             warn!(
@@ -8535,6 +8546,33 @@ impl FileOrchestrator {
                 .data_calls
                 .iter()
                 .any(|call| call.call_expression_span_start == Some(span_start))
+    }
+
+    /// Whether a deterministic row sits at the site a model row was written
+    /// for: the same span start, or — for a model row whose site raised no
+    /// candidate — the same line, since a second request on that line would
+    /// have raised its own candidate and carried its own span.
+    fn model_call_at_site(row: &DataCallResult, call: &DataCallResult) -> bool {
+        if row.resolution_source == Some(ResolutionSource::Model) {
+            return false;
+        }
+        match call.call_expression_span_start {
+            Some(span) => row.call_expression_span_start == Some(span),
+            None => {
+                row.line_number == call.line_number
+                    || row.call_expression_line == Some(call.line_number)
+            }
+        }
+    }
+
+    /// Whether a model row states the same method and route as a
+    /// deterministic row (carrick#2050).
+    fn model_call_restates(row: &DataCallResult, call: &DataCallResult) -> bool {
+        row.method
+            .as_deref()
+            .zip(call.method.as_deref())
+            .is_some_and(|(stated, model)| stated.eq_ignore_ascii_case(model))
+            && normalize_path_params(row.target.trim()) == normalize_path_params(call.target.trim())
     }
 
     /// Fold one model row into the deterministic row at its span.
@@ -13260,6 +13298,124 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
         }
+    }
+
+    /// Join model rows onto deterministic rows already emitted, with no
+    /// candidate map, so each model row keeps the span it was written with.
+    fn join_calls_at_site(
+        deterministic: Vec<DataCallResult>,
+        model: Vec<DataCallResult>,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        let mut stats = ProcessingStats::default();
+        let mut result = FileAnalysisResult {
+            data_calls: deterministic,
+            ..Default::default()
+        };
+        FileOrchestrator::join_model_rows(
+            &mut result,
+            FileAnalysisResult {
+                data_calls: model,
+                ..Default::default()
+            },
+            &HashMap::new(),
+            &[],
+            "src/client.ts",
+            false,
+            &mut stats,
+        );
+        (result, stats)
+    }
+
+    fn stated_call(method: &str, target: &str, span: u32) -> DataCallResult {
+        DataCallResult {
+            method: Some(method.to_string()),
+            resolution_source: Some(ResolutionSource::RequestSummary),
+            ..call_with_span(10, target, Some(span))
+        }
+    }
+
+    fn model_call(method: &str, target: &str, span: u32, symbol: &str) -> DataCallResult {
+        DataCallResult {
+            method: Some(method.to_string()),
+            primary_type_symbol: Some(symbol.to_string()),
+            ..call_with_span(10, target, Some(span))
+        }
+    }
+
+    /// A site the source states as several requests holds several rows. A
+    /// model reading of that site that restates none of them is a reading
+    /// of a request the source already states, not a request of its own
+    /// (carrick#2050).
+    #[test]
+    fn model_rows_that_restate_no_row_at_a_stated_site_fold_onto_it() {
+        let (result, stats) = join_calls_at_site(
+            vec![
+                stated_call("POST", "/api/brands", 500),
+                stated_call("PUT", "/api/brands/:id", 500),
+                stated_call("POST", "/api/branding", 500),
+            ],
+            vec![
+                model_call("GET", "https://api.example.com", 500, "First"),
+                model_call("GET", "https://api.example.com/other", 500, "Second"),
+            ],
+        );
+        assert_eq!(stats.model_only_rows, 0);
+        assert_eq!(stats.model_rows_joined, 2);
+        assert_eq!(
+            result
+                .data_calls
+                .iter()
+                .map(|row| (row.method.as_deref().unwrap(), row.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("POST", "/api/brands"),
+                ("PUT", "/api/brands/:id"),
+                ("POST", "/api/branding"),
+            ],
+        );
+    }
+
+    /// A model row that restates no row cannot take the row another model
+    /// row restates, whichever order the model answered in.
+    #[test]
+    fn a_model_row_that_restates_a_row_folds_onto_it_before_any_other() {
+        let (result, stats) = join_calls_at_site(
+            vec![
+                stated_call("POST", "/api/links", 500),
+                stated_call("PUT", "/api/links/:id", 500),
+            ],
+            vec![
+                model_call("GET", "https://api.example.com", 500, "Unrelated"),
+                model_call("POST", "/api/links", 500, "CreateLink"),
+            ],
+        );
+        assert_eq!(stats.model_only_rows, 0);
+        assert_eq!(result.data_calls.len(), 2);
+        assert_eq!(
+            result.data_calls[0].primary_type_symbol.as_deref(),
+            Some("CreateLink"),
+            "the agreeing model row joins the row it restates"
+        );
+    }
+
+    /// One row at a site and two model rows: the second is kept as its own
+    /// row, as it always was.
+    #[test]
+    fn a_second_model_row_at_a_one_row_site_is_kept() {
+        let (result, stats) = join_calls_at_site(
+            vec![stated_call("POST", "/api/links", 500)],
+            vec![
+                model_call("POST", "/api/links", 500, "CreateLink"),
+                model_call("GET", "https://api.example.com", 500, "Other"),
+            ],
+        );
+        assert_eq!(stats.model_rows_joined, 1);
+        assert_eq!(stats.model_only_rows, 1);
+        assert_eq!(result.data_calls.len(), 2);
+        assert_eq!(
+            result.data_calls[1].resolution_source,
+            Some(ResolutionSource::Model)
+        );
     }
 
     /// A data call with no method at all — what extraction emits for a site
