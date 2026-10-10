@@ -84,6 +84,13 @@ const PAIRS: CheckPairSpec[] = [
   }),
   mk('wirebigint', 'Wire_Bigint_Producer', 'Wire_Bigint_Consumer'),
   mk('wirepartial', 'Wire_Partial_Producer', 'Wire_Partial_Consumer'),
+  // carrick#2058: the wire form reaches every depth a body has, and a list
+  // takes no level of its own.
+  mk('wiredeep', 'Wire_Deep_Producer', 'Wire_Deep_Consumer'),
+  mk('wirelists', 'Wire_Lists_Producer', 'Wire_Lists_Consumer'),
+  mk('wiretree', 'Wire_Tree_Producer', 'Wire_Tree_Consumer'),
+  mk('wiredeepreverse', 'Wire_Deep_Reverse_Producer', 'Wire_Deep_Reverse_Consumer'),
+  mk('wireselfjson', 'Wire_Self_Producer', 'Wire_Self_Consumer'),
   // carrick#1375, both halves of the ticket's "done when": the envelope the
   // client declares reads compatible against the producer's, and the
   // projection a hook derives off it does not. The type layer's job is to
@@ -142,6 +149,11 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Req_Producer = { at: string; };',
         'export type Wire_Bigint_Producer = { id: string; size: bigint; };',
         'export type Wire_Partial_Producer = { createdAt: Date; size: number; };',
+        'export type Wire_Deep_Producer = { a: { b: { c: { d: { e: { f: { g: { at: Date; }; }; }; }; }; }; }; };',
+        'export type Wire_Lists_Producer = { a: { b: { c: { at: Date; }[]; }[]; }[]; };',
+        'export type Wire_Tree_Producer = { at: Date; children: Wire_Tree_Producer[]; };',
+        'export type Wire_Deep_Reverse_Producer = { a: { b: { c: { at: string; }[]; }[]; }[]; };',
+        'export interface Wire_Self_Producer { toJSON(): Wire_Self_Producer; size: number; }',
         'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Bytes_Producer = Uint8Array;',
         'export type Stream_Expected = ReadableStream<Uint8Array> | null;',
@@ -174,6 +186,11 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Req_Consumer = { at: Date; };',
         'export type Wire_Bigint_Consumer = { id: string; size: string; };',
         'export type Wire_Partial_Consumer = { createdAt: string; size: string; };',
+        'export type Wire_Deep_Consumer = { a: { b: { c: { d: { e: { f: { g: { at: string; }; }; }; }; }; }; }; };',
+        'export type Wire_Lists_Consumer = { a: { b: { c: { at: string; }[]; }[]; }[]; };',
+        'export type Wire_Tree_Consumer = { at: string; children: Wire_Tree_Consumer[]; };',
+        'export type Wire_Deep_Reverse_Consumer = { a: { b: { c: { at: Date; }[]; }[]; }[]; };',
+        'export type Wire_Self_Consumer = { size: number; };',
         'export type Envelope_Consumer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
         'export type Envelope_Projection = { [key: string]: boolean; };',
         'export type Blob_Consumer = Blob;',
@@ -448,6 +465,35 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
       // on the wire it agrees.
       assert.match(v.diagnostic!, /'size' is number on the producer and string on the consumer/);
       assert.ok(!/'createdAt'/.test(v.diagnostic!), v.diagnostic);
+    });
+
+    // carrick#2058: the transform used to stop seven levels down, and each list
+    // took a level, so a Date three lists deep was compared as a Date.
+    it('reaches a Date nested deeper than seven levels', () => {
+      const v = verdicts.get('wiredeep')!;
+      assert.strictEqual(v.bucket, 'compatible', `the deep Date travels as a string: ${v.diagnostic}`);
+    });
+
+    it('maps a list element at the list\'s own depth', () => {
+      const v = verdicts.get('wirelists')!;
+      assert.strictEqual(v.bucket, 'compatible', `a Date three lists down travels as a string: ${v.diagnostic}`);
+    });
+
+    it('checks a recursive type without running out of depth', () => {
+      const v = verdicts.get('wiretree')!;
+      assert.strictEqual(v.bucket, 'compatible', `${v.diagnostic}`);
+      assert.ok(!v.codes.includes(2589), `no instantiation-depth error: ${v.codes}`);
+    });
+
+    it('still flags a consumer that declares a Date three lists down', () => {
+      const v = verdicts.get('wiredeepreverse')!;
+      assert.strictEqual(v.bucket, 'incompatible', 'no Date ever arrives over JSON');
+    });
+
+    it('stops following a toJSON() that returns its own type', () => {
+      const v = verdicts.get('wireselfjson')!;
+      assert.strictEqual(v.bucket, 'compatible', `${v.diagnostic} ${v.codes}`);
+      assert.ok(!v.codes.includes(2589), `no instantiation-depth error: ${v.codes}`);
     });
 
     it('leaves a bigint a mismatch: JSON.stringify throws on one', () => {

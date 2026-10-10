@@ -155,6 +155,14 @@ export interface ProbePlan {
  * `strictNullChecks` (the retype runs under the consumer's own options) both
  * are assignable to every type, so the `toJSON` test held for them and
  * `infer R` came back `unknown` (carrick#1514).
+ *
+ * The depth counts `toJSON()` hops only, never nesting (carrick#2058). A body
+ * is mapped at every depth it has, a list's element at the list's own depth,
+ * so a `Date` three lists down travels as a string like one at the top. The
+ * mapped type is deferred, so a recursive type is expanded only as far as the
+ * compiler's own comparison walks it. What the count bounds is a `toJSON()`
+ * that returns a value with another `toJSON()`, which a type can do forever
+ * (one that returns its own type), and which no depth of nesting reaches.
  */
 export function jsonWireDeclarations(prefix: string): string[] {
   const depth = `${prefix}JsonWireDepth`;
@@ -162,7 +170,7 @@ export function jsonWireDeclarations(prefix: string): string[] {
   const same = `${prefix}JsonWireSame`;
   return [
     `type ${depth} = [never, 0, 1, 2, 3, 4, 5, 6];`,
-    `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends null | undefined ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], ${depth}[D]> } : T;`,
+    `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends null | undefined ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], D> } : T;`,
     `type ${same}<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`,
   ];
 }

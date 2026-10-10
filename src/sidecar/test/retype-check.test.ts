@@ -147,7 +147,21 @@ export const logsIt = async () => {
   const response = await api.post('/p');
   console.log(response.data.x);
 };
+
+export interface Stamped {
+  lists: { b: { c: { at: string }[] }[] }[];
+  deep: { a: { b: { c: { d: { e: { f: { at: string } } } } } } };
+}
+
+export async function stampedRead(): Promise<Stamped> {
+  const stamped = await api.post('/p');
+  return stamped.data;
+}
 `;
+
+/** The 1-based line of the one CONSUMER line holding `marker`. */
+const consumerLine = (marker: string): number =>
+  CONSUMER.split('\n').findIndex((line) => line.includes(marker)) + 1;
 
 const CASES = {
   typed: { line: 6, text: "api.post<{ x: number }>('/p')", read: 7 },
@@ -167,6 +181,11 @@ const CASES = {
   exportedBinding: { line: 93, text: "api.post('/p')" },
   readInCallback: { line: 96, text: "api.post('/p')", read: 97 },
   logsIt: { line: 101, text: "api.post('/p')", read: 102 },
+  stampedRead: {
+    line: consumerLine('const stamped = '),
+    text: "api.post('/p')",
+    read: consumerLine('return stamped.data'),
+  },
 } as const;
 
 interface Outcome {
@@ -359,6 +378,18 @@ describe('carrick#1491: retype an untyped consumer call with the producer respon
     const date = await retype('untyped', '{ x: Date; }');
     assert.strictEqual(date.outcome, 'mismatch', JSON.stringify(date));
     assert.strictEqual(date.diagnostics[0].code, 2322);
+  });
+
+  // carrick#2058: the wire form reaches every depth, and a list takes no level.
+  it('compares the wire form at every depth, through lists', async () => {
+    const deepDates =
+      '{ lists: { b: { c: { at: Date; }[]; }[]; }[]; deep: { a: { b: { c: { d: { e: { f: { at: Date; }; }; }; }; }; }; }; }';
+    const agrees = await retype('stampedRead', deepDates);
+    assert.strictEqual(agrees.outcome, 'agrees', JSON.stringify(agrees));
+    const deepNumbers =
+      '{ lists: { b: { c: { at: number; }[]; }[]; }[]; deep: { a: { b: { c: { d: { e: { f: { at: string; }; }; }; }; }; }; }; }';
+    const mismatch = await retype('stampedRead', deepNumbers);
+    assert.strictEqual(mismatch.outcome, 'mismatch', JSON.stringify(mismatch));
   });
 
   it('abstains when the producer type names something the consumer cannot see', async () => {
