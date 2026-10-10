@@ -375,6 +375,77 @@ function typeText(type: Type, enclosingNode?: Node): string {
  * `text` is `string`, alone or beside `null` and `undefined` in either order:
  * the only payload a raw-text read publishes (carrick#1842).
  */
+/**
+ * Source text with every plain string literal written in double quotes:
+ * `'/a'`, `"/a"` and an interpolation-free `` `/a` `` are one value, so text
+ * that differs only in its quotes compares equal (carrick#2056).
+ *
+ * The text is read left to right, pairing quotes the way the scanner does,
+ * so a template's closing backtick never pairs with the next template's
+ * opening one. A literal holding a quote, a backslash or an interpolation is
+ * copied as it is, and so is an unterminated one with everything after it.
+ */
+export function canonicalStringQuotes(text: string): string {
+  const isQuote = (ch: string): boolean => ch === "'" || ch === '"' || ch === '`';
+  // The index just past the literal opening at `start`, or -1.
+  const literalEnd = (start: number): number => {
+    const quote = text[start];
+    let j = start + 1;
+    while (j < text.length) {
+      const ch = text[j];
+      if (ch === '\\') {
+        j += 2;
+      } else if (ch === quote) {
+        return j + 1;
+      } else if (quote === '`' && ch === '$' && text[j + 1] === '{') {
+        const close = codeEnd(j + 2);
+        if (close < 0) return -1;
+        j = close + 1;
+      } else {
+        j++;
+      }
+    }
+    return -1;
+  };
+  // The index of the `}` that closes an interpolation whose code starts at `start`, or -1.
+  const codeEnd = (start: number): number => {
+    let depth = 0;
+    let j = start;
+    while (j < text.length) {
+      const ch = text[j];
+      if (isQuote(ch)) {
+        const end = literalEnd(j);
+        if (end < 0) return -1;
+        j = end;
+        continue;
+      }
+      if (ch === '{') depth++;
+      if (ch === '}') {
+        if (depth === 0) return j;
+        depth--;
+      }
+      j++;
+    }
+    return -1;
+  };
+
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (!isQuote(text[i])) {
+      out += text[i];
+      i++;
+      continue;
+    }
+    const end = literalEnd(i);
+    if (end < 0) return out + text.slice(i);
+    const body = text.slice(i + 1, end - 1);
+    out += /['"`\\]|\$\{/.test(body) ? text.slice(i, end) : `"${body}"`;
+    i = end;
+  }
+  return out;
+}
+
 function isBareStringText(text: string): boolean {
   const members = text.split('|').map((member) => member.trim());
   return (
@@ -2090,8 +2161,14 @@ export class TypeInferrer {
   ): InferredType | null {
     const callExpr = this.resolveTargetCallExpression(sourceFile, request);
 
+    // A call's result is read off the call. A locator that finds no call names
+    // nothing this can read, and whatever other node its text overlaps is not
+    // the call's result (carrick#2056); the retype abstains on the same miss.
     if (!callExpr) {
-      return this.inferExpression(sourceFile, request, extractionConfig);
+      this.log(
+        `Call-result locator at ${request.file_path}:${request.line_number} finds no call; leaving unresolved`
+      );
+      return null;
     }
 
     // Walk up from the already-found call expression instead of re-searching
@@ -8239,30 +8316,122 @@ export class TypeInferrer {
     // locator whose exact match failed would bind to the smallest embedded
     // sub-expression (pickBestMatch prefers small nodes), e.g. the 8-char
     // literal "active" inside a res.json object payload (#335).
+    //
+    // A node the text itself places strictly inside what it names is a
+    // fragment, however much of the text it covers (carrick#2056): the
+    // `new URLSearchParams(…)` inside a call's URL argument, or the object a
+    // callback nested in the named object returns. Only the node the text
+    // names, or a wrapper the text adds around it, may be bound this way. A
+    // fragment still points at what the text names where the source agrees
+    // with the text up to it: the enclosing node of the named kind whose text
+    // opens with the text's own opening up to the fragment (`new Response(`
+    // before a payload, when the text dropped the call's second argument).
     const MIN_REVERSE_MATCH_LEN = 8;
     const MIN_REVERSE_MATCH_COVERAGE = 0.5;
-    const substringMatches = candidates.filter(
-      (c) =>
-        c.text.includes(normalizedTarget) ||
-        (c.text.length >= MIN_REVERSE_MATCH_LEN &&
-          c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
-          normalizedTarget.includes(c.text))
-    );
-
-    if (substringMatches.length > 0) {
-      // Prefer nodes where the LLM text is contained in the node text
-      const containingMatches = substringMatches.filter((c) =>
-        c.text.includes(normalizedTarget)
-      );
-
-      if (containingMatches.length > 0) {
-        return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
-      }
-
-      return this.pickBestMatch(substringMatches.map((c) => c.node), lineNumber) as T;
+    const containingMatches = candidates.filter((c) => c.text.includes(normalizedTarget));
+    if (containingMatches.length > 0) {
+      return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
     }
+    const reverseMatches = candidates.filter(
+      (c) =>
+        c.text.length >= MIN_REVERSE_MATCH_LEN &&
+        c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
+        normalizedTarget.includes(c.text)
+    );
+    if (reverseMatches.length === 0) return undefined;
 
-    return undefined;
+    const named = this.locatorNames(normalizedTarget);
+    if (!named) {
+      return this.pickBestMatch(reverseMatches.map((c) => c.node), lineNumber) as T;
+    }
+    const textOf = new Map<Node, string>(candidates.map((c) => [c.node, c.text]));
+    const bound = new Set<Node>();
+    for (const c of reverseMatches) {
+      if (named.texts.has(c.text)) {
+        bound.add(c.node);
+        continue;
+      }
+      const at = normalizedTarget.indexOf(c.text, named.rootStart + 1);
+      if (at < 0) continue;
+      const opening = normalizedTarget.slice(named.rootStart, at);
+      const enclosing = c.node.getFirstAncestor(
+        (ancestor) =>
+          ancestor.getKind() === named.rootKind &&
+          textOf.get(ancestor)?.startsWith(opening) === true
+      );
+      if (enclosing) bound.add(enclosing);
+    }
+    return bound.size > 0 ? (this.pickBestMatch([...bound], lineNumber) as T) : undefined;
+  }
+
+  /**
+   * What a locator's text names, read off its own parse (carrick#2056):
+   *
+   *  - `texts`: the normalized text of the expression it names and of each
+   *    wrapper it carries around it (`return`, a `const x =` binding, a label,
+   *    `await`, parentheses, a cast, `satisfies`, `!`). A node strictly inside
+   *    that expression is not among them;
+   *  - `rootKind` and `rootStart`: the innermost of those, its kind, and where
+   *    its text starts in the locator.
+   *
+   * `null` when the text does not parse as one expression or one statement:
+   * there is no structure to read, and the caller keeps its text rule.
+   */
+  private locatorNames(
+    normalizedTarget: string
+  ): { texts: Set<string>; rootKind: SyntaxKind; rootStart: number } | null {
+    const parsed = (source: string): ts.SourceFile | null => {
+      const file = ts.createSourceFile('locator.ts', source, ts.ScriptTarget.Latest, true);
+      const diagnostics = (file as unknown as { parseDiagnostics?: readonly unknown[] })
+        .parseDiagnostics;
+      return diagnostics && diagnostics.length === 0 && file.statements.length === 1 ? file : null;
+    };
+
+    // An object literal is a block as a statement, so try the text as an
+    // expression first.
+    const EXPRESSION_OPENING = '(\n';
+    const asExpression = parsed(`${EXPRESSION_OPENING}${normalizedTarget}\n);`);
+    let node: ts.Node | undefined;
+    let file: ts.SourceFile | null = asExpression;
+    let offset = 0;
+    if (asExpression) {
+      const statement = asExpression.statements[0];
+      if (ts.isExpressionStatement(statement) && ts.isParenthesizedExpression(statement.expression)) {
+        node = statement.expression.expression;
+        offset = EXPRESSION_OPENING.length;
+      }
+    } else {
+      file = parsed(normalizedTarget);
+      node = file?.statements[0];
+    }
+    if (!file || !node) return null;
+
+    const texts = new Set<string>();
+    let root: ts.Node | undefined;
+    while (node) {
+      if (ts.isLabeledStatement(node)) {
+        node = node.statement;
+      } else if (ts.isExpressionStatement(node) || ts.isReturnStatement(node)) {
+        node = node.expression;
+      } else if (ts.isVariableStatement(node)) {
+        const declarations = node.declarationList.declarations;
+        node = declarations.length === 1 ? declarations[0].initializer : undefined;
+      } else {
+        texts.add(this.normalizeWhitespace(node.getText(file)));
+        root = node;
+        node =
+          ts.isParenthesizedExpression(node) ||
+          ts.isAwaitExpression(node) ||
+          ts.isAsExpression(node) ||
+          ts.isSatisfiesExpression(node) ||
+          ts.isNonNullExpression(node) ||
+          ts.isTypeAssertionExpression(node)
+            ? node.expression
+            : undefined;
+      }
+    }
+    if (!root) return null;
+    return { texts, rootKind: root.kind, rootStart: root.getStart(file) - offset };
   }
 
   /**
@@ -8308,7 +8477,7 @@ export class TypeInferrer {
    * for the same reason.
    */
   private normalizeWhitespace(text: string): string {
-    return text
+    const collapsed = text
       .replace(/\s+/g, ' ')
       // A member chain broken before its dot (`client\n  .list(…)`) reads the
       // same as `client.list(…)`; a space around `.` / `?.` means nothing
@@ -8317,6 +8486,8 @@ export class TypeInferrer {
       .replace(/\s*,?\s*([}\)\]])/g, '$1')
       .replace(/([\(\[{])\s+/g, '$1')
       .trim();
+    // A string literal reads the same in any quotes (carrick#2056).
+    return canonicalStringQuotes(collapsed);
   }
 
   /**
