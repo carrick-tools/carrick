@@ -5880,6 +5880,26 @@ export class TypeInferrer {
   }
 
   /**
+   * The symbol an anchor is named from: the type's own symbol, unless that
+   * symbol's name is synthetic (`__type`, `__object`, ...), in which case the
+   * alias symbol (carrick#2148).
+   *
+   * `type Widget = { id: string }` and an instantiated `Page<Order>` carry
+   * the anonymous `__type` as their own symbol and the alias as their alias
+   * symbol. Reading the own symbol first and stopping because it is truthy
+   * left every object-literal alias without an anchor, while the same shape
+   * declared as an interface had one. The own symbol still wins whenever it
+   * has a real name, so every type anchored before keeps its anchor.
+   */
+  private anchorSymbolOf(type: Type): TsSymbol | undefined {
+    const own = type.getSymbol();
+    if (own && !own.getName().startsWith('__')) {
+      return own;
+    }
+    return type.getAliasSymbol() ?? own;
+  }
+
+  /**
    * The deterministic source symbol of a resolved type (`Payment` for a payload
    * typed `Payment`), or `undefined` when there is no single user-defined
    * symbol to anchor on. This is the same `getSymbol() || getAliasSymbol()` name
@@ -5889,7 +5909,7 @@ export class TypeInferrer {
    * `primary_type_symbol` so the manifest anchor no longer depends on the LLM.
    */
   private primaryTypeSymbol(type: Type): string | undefined {
-    const name = (type.getSymbol() || type.getAliasSymbol())?.getName();
+    const name = this.anchorSymbolOf(type)?.getName();
     // Reject the compiler's synthetic names for anonymous shapes (`__type`,
     // `__object`, `__function`, …). They are not user-facing type names, so
     // they would be a meaningless — and non-resolvable — anchor.
@@ -5910,7 +5930,8 @@ export class TypeInferrer {
    * declarations IN its `source_file`, so the request must point at the file
    * that actually declares the tsc-witnessed payload type.
    *
-   * The declarations read are those of the type's own symbol, so a name
+   * The declarations read are those of the symbol the anchor is named from
+   * (`anchorSymbolOf`: the type's own symbol, or its alias's), so a name
    * imported through a barrel reports the file that declares it, and a name
    * two files declare reports the one this type resolves to. A declaration in
    * an installed package or a TypeScript lib is reported as it is found, as
@@ -5929,7 +5950,7 @@ export class TypeInferrer {
     if (this.primaryTypeSymbol(type) === undefined) {
       return undefined;
     }
-    const decls = (type.getSymbol() || type.getAliasSymbol())?.getDeclarations() ?? [];
+    const decls = this.anchorSymbolOf(type)?.getDeclarations() ?? [];
     const declaring = decls.find(
       (d) =>
         Node.isInterfaceDeclaration(d) ||

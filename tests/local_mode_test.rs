@@ -866,8 +866,34 @@ fn a_file_names_who_calls_its_functions() {
             ],
         })
     );
+    // The type the file declares is named with the operations that use it
+    // (carrick#2148): `Widget` is a `type` alias, and its declaration site is
+    // recorded the same as an interface's.
+    let types = client["uses"]["types"].as_array().expect("types");
+    assert_eq!(types.len(), 1, "{client:#}");
+    assert_eq!(types[0]["symbol"], serde_json::json!("Widget"));
+    assert_eq!(types[0]["line"], serde_json::json!(3));
+    let operations: Vec<(String, u64)> = types[0]["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .map(|op| {
+            (
+                op["file"].as_str().expect("file").to_string(),
+                op["line"].as_u64().expect("line"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        operations,
+        vec![
+            ("src/inventory.ts".to_string(), 9),
+            ("src/inventory.ts".to_string(), 17)
+        ]
+    );
+    let type_line = "- type Widget (line 3) is the response type of GET /api/v1/widgets/:encoded at 2 call(s): src/inventory.ts:9, src/inventory.ts:17. Producers: catalog-web app/routes/api.v1.widgets.$widgetId.ts:11";
     let line = "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
-    assert_eq!(client["uses_lines"], serde_json::json!([line]));
+    assert_eq!(client["uses_lines"], serde_json::json!([type_line, line]));
 
     let send = check_json(root, "inventory-svc/src/send.ts");
     assert_eq!(
@@ -892,7 +918,9 @@ fn a_file_names_who_calls_its_functions() {
     // The terminal prints the same bytes, and `touch` carries the same block.
     let printed = check(root, "inventory-svc/src/client.ts");
     assert!(
-        printed.contains(&format!("used outside this file, as indexed:\n{line}\n")),
+        printed.contains(&format!(
+            "used outside this file, as indexed:\n{type_line}\n{line}\n"
+        )),
         "{printed}"
     );
     let touched: serde_json::Value = serde_json::from_str(&run(
@@ -924,6 +952,71 @@ fn a_file_names_who_calls_its_functions() {
         check_json(root, "inventory-svc/src/inventory.ts")["items"],
         items_before
     );
+}
+
+/// A type entry built without the model records where its type is declared
+/// whenever the repo declares it, for a `type` alias as for an interface
+/// (carrick#2148). The fixture declares `Widget` as `type Widget = { … }` in
+/// both repos: the compiler gives such a type the anonymous `__type` as its
+/// own symbol, and the anchor is the alias's name.
+#[test]
+#[serial]
+fn a_type_alias_records_where_it_is_declared() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+
+    let entry = |repo: &str, file: &str, line: u64, kind: &str| -> serde_json::Value {
+        let blob = stored_blob(root, repo);
+        let found: Vec<serde_json::Value> = blob["type_manifest"]
+            .as_array()
+            .expect("type_manifest")
+            .iter()
+            .filter(|e| {
+                e["file_path"] == serde_json::json!(file)
+                    && e["line_number"] == serde_json::json!(line)
+                    && e["type_kind"] == serde_json::json!(kind)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(found.len(), 1, "{repo} {file}:{line} {kind}: {found:#?}");
+        found.into_iter().next().unwrap()
+    };
+
+    // Explicit: the route's annotated return names the alias.
+    let route = entry(
+        "catalog-web",
+        "app/routes/api.v1.widgets.$widgetId.ts",
+        11,
+        "response",
+    );
+    assert_eq!(route["is_explicit"], serde_json::json!(true), "{route:#}");
+    assert_eq!(
+        route["defined_in"],
+        serde_json::json!({
+            "file_path": "app/routes/api.v1.widgets.$widgetId.ts",
+            "line_number": 5,
+            "symbol": "Widget",
+        }),
+        "{route:#}"
+    );
+
+    // Inferred: the call's result is the alias the client declares.
+    let call = entry("inventory-svc", "src/client.ts", 14, "response");
+    assert_eq!(call["is_explicit"], serde_json::json!(false), "{call:#}");
+    assert_eq!(
+        call["defined_in"],
+        serde_json::json!({ "file_path": "src/client.ts", "line_number": 3, "symbol": "Widget" }),
+        "{call:#}"
+    );
+
+    // No declared type, no declaration site: an inline shape, and a request
+    // whose type is unknown.
+    let health = entry("catalog-web", "app/routes/api.v1.health.ts", 4, "response");
+    assert!(health.get("defined_in").is_none(), "{health:#}");
+    assert!(health.get("primary_type_symbol").is_none(), "{health:#}");
+    let request = entry("inventory-svc", "src/client.ts", 14, "request");
+    assert!(request.get("defined_in").is_none(), "{request:#}");
 }
 
 /// The workspace question, with no file in it: what a surface opening a
