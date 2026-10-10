@@ -2103,23 +2103,14 @@ export class TypeInferrer {
         `Response locator at ${request.file_path}:${request.line_number} names an error ` +
           'or redirect send and its handler sends no success body; abstaining'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(site)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'no_success_payload',
-          detail:
-            "every response this route's handler sends states an error or redirect status, " +
-            'or carries no body a JSON contract can describe, so it publishes no success body',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(site), {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_success_payload',
+        detail:
+          "every response this route's handler sends states an error or redirect status, " +
+          'or carries no body a JSON contract can describe, so it publishes no success body',
+      });
     }
 
     if (recovered && recovered.nodes.some((node) => contains(site, node))) {
@@ -2393,24 +2384,15 @@ export class TypeInferrer {
           `members of ${typeText(callExpr.getType(), callExpr)}; a part of a payload is not ` +
           'a payload, so this site states no response contract'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(callExpr)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'projected_value_only',
-          detail:
-            "every read of this call's result takes a member out of it and none reads the " +
-            'value itself, so what this site states is a part of a payload rather than the ' +
-            'payload a caller receives',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+        path: '',
+        kind: 'unknown',
+        reason: 'projected_value_only',
+        detail:
+          "every read of this call's result takes a member out of it and none reads the " +
+          'value itself, so what this site states is a part of a payload rather than the ' +
+          'payload a caller receives',
+      });
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
@@ -3108,23 +3090,14 @@ export class TypeInferrer {
         `Request locator at ${request.file_path}:${request.line_number} is a request config ` +
           'that carries no body member; the call sends no request body'
       );
-      const abstain = this.createInferredType(
-        request,
-        'unknown',
-        false,
-        this.getNodeLocation(unwrapped)
-      );
-      abstain.any_provenance = [
-        {
-          path: '',
-          kind: 'unknown',
-          reason: 'no_request_body',
-          detail:
-            `the call's request config sets no '${inCall.member}' member, which is where the call ` +
-            'takes its body, so the call sends no request body',
-        },
-      ];
-      return abstain;
+      return this.decidedAbstain(request, this.getNodeLocation(unwrapped), {
+        path: '',
+        kind: 'unknown',
+        reason: 'no_request_body',
+        detail:
+          `the call's request config sets no '${inCall.member}' member, which is where the call ` +
+          'takes its body, so the call sends no request body',
+      });
     }
 
     // A `fetch` body is almost always `JSON.stringify(payload)`, whose own type
@@ -3190,23 +3163,14 @@ export class TypeInferrer {
           `Request locator at ${request.file_path}:${request.line_number} reads the validated ` +
             `'${nonBodyPart}' part, which is not a body; the route declares no request body here`
         );
-        const abstain = this.createInferredType(
-          request,
-          'unknown',
-          false,
-          this.getNodeLocation(node)
-        );
-        abstain.any_provenance = [
-          {
-            path: '',
-            kind: 'unknown',
-            reason: 'no_request_body',
-            detail:
-              `the located read is the '${nonBodyPart}' part a validator binds, not a request body, ` +
-              'so the route states no body contract here',
-          },
-        ];
-        return abstain;
+        return this.decidedAbstain(request, this.getNodeLocation(node), {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_request_body',
+          detail:
+            `the located read is the '${nonBodyPart}' part a validator binds, not a request body, ` +
+            'so the route states no body contract here',
+        });
       }
     }
 
@@ -3792,21 +3756,12 @@ export class TypeInferrer {
       'rules verify and read no payload out of (a library response object around the body), ' +
       'so this site states no response contract'
   ): InferredType {
-    const abstain = this.createInferredType(
-      request,
-      'unknown',
-      false,
-      this.getNodeLocation(callExpr)
-    );
-    abstain.any_provenance = [
-      {
-        path: '',
-        kind: 'unknown',
-        reason: 'machinery_envelope',
-        detail,
-      },
-    ];
-    return abstain;
+    return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+      path: '',
+      kind: 'unknown',
+      reason: 'machinery_envelope',
+      detail,
+    });
   }
 
   /**
@@ -6229,15 +6184,8 @@ export class TypeInferrer {
     while (Node.isPropertyAccessExpression(callee)) {
       const receiver = this.peelTransparentExpression(callee.getExpression());
       if (!Node.isCallExpression(receiver)) return undefined;
-      const first = receiver.getArguments()[0];
-      if (first) {
-        const read = this.statedStatusCodes(this.peelTransparentExpression(first));
-        if (read === 'variable') return 'variable';
-        if (read) {
-          const kind = classifyStatusCodes(read);
-          return kind === 'mixed' ? 'variable' : kind;
-        }
-      }
+      const status = this.statusOfValue(receiver.getArguments()[0]);
+      if (status !== 'undecided') return status;
       callee = receiver.getExpression();
     }
     return undefined;
