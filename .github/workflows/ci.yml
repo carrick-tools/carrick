@@ -18,335 +18,218 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Rust tests run as four shards on four runners (rust-unit and rust-fast-b split the
-  # fast integration binaries). Before this split one
-  # job ran every target in series and took fourteen minutes, of which the
-  # `local_mode_test` binary alone was 2.4 min, three scan-driving binaries
-  # another 1.5, and the sidecar's own unit tests five (see `sidecar` below).
-  # Each shard pays its own compile (about two minutes with the cache warm),
-  # which is the price of the wall clock: the slowest shard, not the sum,
-  # is what a PR waits on.
+  # The Rust tests run as 16 shards on 16 runners. Each shard compiles only the
+  # library and the test binaries it runs (about 40 s), so the slowest shard,
+  # not the sum, is what a PR waits on. Before the split four shards of
+  # 260-400 s each compiled every target they ran in one `cargo test` call.
   #
-  # Every tests/*.rs is named by exactly one shard; the "wired into CI" step
-  # in rust-unit greps this file and fails on one that is not.
-  rust-unit:
-    name: Rust unit and fast integration
+  # How the map was built: nextest shards (lib-*, n*) hold about 275 summed
+  # test-seconds each (about 70 s at four tests at once); scan shards hold
+  # about 66 s each. Two things cut a binary across shards, both with nextest
+  # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
+  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3). A
+  # `partitioned:` target runs in its own nextest call, because `--partition`
+  # slices every test of a call, not one binary of it. `local_mode_test` runs
+  # first in its shard; two of its tests claim every slot (.config/nextest.toml).
+  # `scan-*` shards stay on `cargo test`. `steps` keeps one `cargo test` per
+  # binary, in map order, then carrick-match last: the timing tests (readiness,
+  # operation timeout, fresh process) and the signal and panic-hook tests need
+  # a machine with no other test binary on it, and carrick-match flips features
+  # the other targets are built with (carrick#2150).
+  #
+  # To rebalance: sum each binary's per-test durations from a recent main
+  # run (the log parser in the first comment of #2149), read
+  # `finished in` per scan binary (cargo test sometimes prints a binary's
+  # `test result` line after the next binary's `Running` line, so pair
+  # them by test count), and compare shards within one run: the same
+  # tests take 1.6 times longer on the slowest runner than the fastest.
+  #
+  # Every tests/*.rs is named by exactly one shard, or by m shards as
+  # `partition: slice:1/m` to `slice:m/m`; `scripts/ci-wired-check.py`
+  # (job `wired`) fails on one that is not. The `ci-result` gate below is
+  # the single required check for all of CI.
+  rust-tests:
+    name: Rust tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: lib-1
+            runner: nextest
+            partitioned: --lib
+            partition: slice:1/2
+          - shard: lib-2
+            runner: nextest
+            partitioned: --lib
+            partition: slice:2/2
+          - shard: n1
+            runner: nextest
+            targets: >-
+              --test client_semantics_test --test url_bases_through_bindings_test --test nonhttp_source_labels_test --test literal_base_url_test --test object_export_surface_test --test file_centric_analysis_test --test output_contract_test
+          - shard: n2
+            runner: nextest
+            partitioned: --test local_mode_test
+            partition: slice:2/2
+            targets: >-
+              --test socket_namespace_test --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test
+          - shard: n3
+            runner: nextest
+            partitioned: --test local_mode_test
+            partition: slice:1/2
+            targets: >-
+              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test url_alias_matching_test
+          - shard: n4
+            runner: nextest
+            targets: >-
+              --test shadowed_binding_test --test library_store_test --test graphql_declared_result_types_test --test nested_service_walk_test --test graphql_code_first_resolvers_test --test wrapper_chain_const_url_test --test service_derivation_test --test llm_mock_pipeline_test --test extraction_config_test
+          - shard: n5
+            runner: nextest
+            targets: >-
+              --test request_summary_test --test object_key_url_wrapper_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test
+          - shard: n6
+            runner: nextest
+            targets: >-
+              --test conditional_request_url_test --test in_process_publish_test --test graphql_located_operation_types_test --test wrapper_dispatch_test --test workspace_member_callers_test --test jsx_component_callers_test --test module_resolution_parity_test --test mock_storage_test --test graphql_extraction_test
+          - shard: n7
+            runner: nextest
+            targets: >-
+              --test paired_method_url_test --test prompt_determinism_test --test own_route_calls_test --test dispatch_file_route_test --test graphql_schema_identity_test --test sidecar_program_files_test --test inline_registration_scope_test --test socket_generic_test --test dependency_analysis_test
+          - shard: n8
+            runner: nextest
+            targets: >-
+              --test retype_consumer_test --test socket_type_alias_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test alias_import_callers_test --test receiver_type_classification_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test workspace_package_client_test
+          - shard: n9
+            runner: nextest
+            targets: >-
+              --test pr_on_main_test --test sidecar_integration_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test
+          - shard: scan-1
+            runner: cargo
+            targets: >-
+              --test hosted_enrichment_test --test wrapper_call_route_test --test spread_options_verb_test --test scan_leaves_repo_unedited_test --test dispatch_dto_enum_test
+          - shard: scan-2
+            runner: cargo
+            targets: >-
+              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test undeclared_external_host_test --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test
+          - shard: scan-3
+            runner: cargo
+            targets: >-
+              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test
+          - shard: scan-4
+            runner: cargo
+            targets: >-
+              --test integration_test --test inline_handler_response_test --test xrepo_harness_test --test env_var_whole_url_test --test exclude_patterns_test --test stated_generic_body_anchor_test --test llm_cassette_hard_gate_test --test response_init_bag_test --test one_row_per_request_test
+          - shard: steps
+            runner: steps
+            targets: >-
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./.github/actions/rust-test-setup
         id: setup
 
       # cargo-nextest runs each test in its own process and the processes of
-      # every binary in parallel, where `cargo test` runs one binary after
-      # another (the fast-integration step alone was 762 s that way). Pinned
-      # to a release commit; the action downloads the prebuilt binary.
+      # every binary in parallel. Pinned to a release commit; the action
+      # downloads the prebuilt binary.
       - name: Install cargo-nextest
+        if: matrix.runner == 'nextest'
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: nextest@0.9.148
 
-      # The library tests share one nextest run with the fast integration
-      # tests below, so they fill the same worker pool. `cargo test --lib`
-      # never ran doc tests, so nothing is dropped; carrick-match stays on
-      # cargo test.
-
-      # One build of every target this job runs, before any step runs one.
-      # The steps below then find their binaries Fresh. The carrick-match
-      # step used to sit between the first library build and the nextest
-      # build: `cargo test -p carrick-match` drops the `serde` feature the
-      # carrick crate turns on, so the next step rebuilt carrick-match and the
-      # whole library (carrick#2150). It runs last now.
-      - name: Build every target this job runs
-        run: >-
-          cargo test --no-run --lib
-          --test capability_sheet_test
-          --test sidecar_readiness_test
-          --test sidecar_operation_timeout_test
-          --test sidecar_fresh_process_test
-          --test shutdown_signal_test
-          --test shutdown_drain_test
-          --test panic_hook_test
-          --test action_install_test
-          --test ask_in_parts_test
-          --test graphql_code_first_resolvers_test
-          --test graphql_document_call_sites_test
-          --test graphql_schema_identity_test
-          --test incremental_raw_cache_test
-          --test intent_incremental_test
-          --test jsx_component_callers_test
-          --test library_store_test
-          --test nested_service_walk_test
-          --test nonhttp_source_labels_test
-          --test own_route_calls_test
-          --test receiver_type_classification_test
-          --test scan_durability_test
-          --test sidecar_integration_test
-          --test sidecar_program_files_test
-          --test socket_class_field_test
-          --test span_locator_units_test
-          --test url_bases_through_bindings_test
-          --test workspace_package_client_test
-          --test wrapper_chain_const_url_test
-
-      - name: Run capability sheet test
-        run: cargo test --test capability_sheet_test --verbose
-
-      # Timing assertions on the readiness budget: its own step so the waits
-      # are not competing with another test binary for the machine. Needs node
-      # (installed above) to run its stand-in sidecar, and fails rather than
-      # skips if node is missing, so a green tick means the waits were timed.
-      - name: Run sidecar readiness timing tests
-        run: cargo test --test sidecar_readiness_test --verbose
-
-      # Timing assertions on the operation deadline (carrick#1914), against
-      # the same kind of stand-in and in a step of their own for the same
-      # reason: a 1.5 s deadline, progress frames half a second apart.
-      - name: Run sidecar operation timeout tests
-        run: cargo test --test sidecar_operation_timeout_test --verbose
-
-      # Replacing the sidecar process on request, and a process that dies
-      # mid-answer (carrick#1916), against the same kind of stand-in.
-      - name: Run sidecar fresh process tests
-        run: cargo test --test sidecar_fresh_process_test --verbose
-
-      # Each raises a real signal at its own process, and each is the only
-      # test in its binary: the signal and the flag it sets are process-wide,
-      # and the flag keeps the FIRST signal, so a second test in the same
-      # binary reads the other one's signal as its own however they are
-      # ordered (carrick#1387 — it passed on the pull request and failed in
-      # the merge queue on the order alone).
-      #
-      # panic_hook_test is here for the same reason in a different shape: a
-      # panic hook is process-global too, so a test that installs one would
-      # report for every other test sharing the process (carrick#1470).
-      - name: Run the signal tests
+      # One build of every target this shard runs, before any of it runs, so
+      # the test steps find their binaries Fresh.
+      - name: Build this shard's targets
+        env:
+          PARTITIONED: ${{ matrix.partitioned }}
+          TARGETS: ${{ matrix.targets }}
         run: |
-          cargo test --test shutdown_signal_test --verbose
-          cargo test --test shutdown_drain_test --verbose
-          cargo test --test panic_hook_test --verbose
+          # The variables hold several arguments each; word splitting is the point.
+          # shellcheck disable=SC2086
+          cargo test --no-run $PARTITIONED $TARGETS
 
-      # Fixture- and mock-driven; no live LLM, no env beyond what they set
-      # themselves. route_request_anchor_test, span_locator_units_test,
-      # retype_consumer_test, client_semantics_test,
-      # library_claims_sidecar_test, library_store_test,
-      # sidecar_parent_gone_test and sidecar_program_files_test need the
-      # sidecar built above. eval_xrepo
-      # is the cross-repo scorer math only:
-      # default `cargo test` skips its #[ignore]d live scorer + mock smoke (both
-      # spawn the binary / cost money); the live scorer runs via eval-xrepo.yml
-      # (workflow_dispatch), NOT here. action_install_test is the Action's
-      # dependency-install step (carrick#706), which uses a `file:` dependency
-      # and so needs no registry.
-      - name: Run library and fast integration tests (a)
-        run: >-
-          cargo nextest run --no-fail-fast
-          --lib
-          --test action_install_test
-          --test ask_in_parts_test
-          --test graphql_code_first_resolvers_test
-          --test graphql_document_call_sites_test
-          --test graphql_schema_identity_test
-          --test incremental_raw_cache_test
-          --test intent_incremental_test
-          --test jsx_component_callers_test
-          --test library_store_test
-          --test nested_service_walk_test
-          --test nonhttp_source_labels_test
-          --test own_route_calls_test
-          --test receiver_type_classification_test
-          --test scan_durability_test
-          --test sidecar_integration_test
-          --test sidecar_program_files_test
-          --test socket_class_field_test
-          --test span_locator_units_test
-          --test url_bases_through_bindings_test
-          --test workspace_package_client_test
-          --test wrapper_chain_const_url_test
-
-      # Last: it flips carrick-match's features, which would make every target
-      # above Dirty if it ran first.
-      - name: Run carrick-match tests
-        run: cargo test -p carrick-match --verbose
-
-      # Every tests/*.rs must be run by a step in one of the Rust shards or be
-      # listed here with a reason. Nine of twenty were silently local-only
-      # before this step.
-      - name: Every integration test is wired into CI
+      - name: Run this shard's tests
+        env:
+          RUNNER: ${{ matrix.runner }}
+          PARTITIONED: ${{ matrix.partitioned }}
+          PARTITION: ${{ matrix.partition }}
+          TARGETS: ${{ matrix.targets }}
         run: |
-          excluded="eval_tier_a"  # eval harness; needs CARRICK_API_ENDPOINT, skips without it
-          missing=0
-          for f in tests/*.rs; do
-            n=$(basename "$f" .rs)
-            case " $excluded " in *" $n "*) continue;; esac
-            if ! grep -q -- "--test $n" .github/workflows/ci.yml; then
-              echo "::error::tests/$n.rs is not run by any CI step (add it or list it in 'excluded' with a reason)"
-              missing=1
-            fi
-          done
-          exit $missing
+          rc=0
+          # Each variable holds several arguments; word splitting is the point.
+          # shellcheck disable=SC2086
+          case "$RUNNER" in
+            nextest)
+              if [ -n "$PARTITIONED" ]; then
+                cargo nextest run --no-fail-fast $PARTITIONED --partition "$PARTITION" || rc=$?
+              fi
+              if [ -n "$TARGETS" ]; then
+                cargo nextest run --no-fail-fast $TARGETS || rc=$?
+              fi
+              ;;
+            cargo)
+              cargo test --verbose $TARGETS || rc=$?
+              ;;
+            steps)
+              for t in ${TARGETS//--test /}; do
+                cargo test --test "$t" --verbose || rc=$?
+              done
+              # Last: it flips carrick-match's features, which would make every
+              # target above Dirty if it ran first.
+              cargo test -p carrick-match --verbose || rc=$?
+              ;;
+            *)
+              echo "::error::unknown runner $RUNNER"
+              rc=1
+              ;;
+          esac
+          exit $rc
 
       - uses: ./.github/actions/rust-test-cache-save
         with:
           cache-hit: ${{ steps.setup.outputs.cache-hit }}
 
-  # The other half of the fast integration binaries, split off rust-unit by
-  # measured test time (summed per binary from a nextest run: about 920 CPU
-  # seconds each side) so the two halves finish together. The sum is CPU
-  # bound on a four-core runner, so a second runner is what shortens the
-  # wall clock; nextest alone took the single shard from 943 s to 448 s of
-  # tests. Same setup, same env as rust-unit.
-  rust-fast-b:
-    name: Rust fast integration (b)
+  # Every tests/*.rs must be run by a shard above or be listed in the script
+  # with a reason. Nine of twenty were silently local-only before this check.
+  wired:
+    name: Every integration test is wired into CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/rust-test-setup
-        id: setup
+      - run: python3 scripts/ci-wired-check.py
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
-        with:
-          tool: nextest@0.9.148
-
-      - name: Run fast integration tests (b)
-        run: >-
-          cargo nextest run --no-fail-fast
-          --test alias_import_callers_test
-          --test alias_shaped_type_imports_test
-          --test analysis_failure_keeps_deterministic_rows_test
-          --test bundle_row_id_golden_test
-          --test client_semantics_test
-          --test commonjs_require_callers_test
-          --test conditional_request_url_test
-          --test dependency_analysis_test
-          --test derive_matches_scan_test
-          --test dispatch_file_route_test
-          --test dispatch_resume_test
-          --test env_var_template_call_segment_test
-          --test eval_xrepo
-          --test extraction_config_test
-          --test file_based_routing_test
-          --test file_centric_analysis_test
-          --test framework_coverage_test
-          --test graphql_code_first_response_types_test
-          --test graphql_declared_result_types_test
-          --test graphql_extraction_test
-          --test graphql_schemas_setting_test
-          --test graphql_walked_schema_evidence_test
-          --test inline_registration_scope_test
-          --test library_claims_sidecar_test
-          --test literal_base_url_test
-          --test llm_mock_pipeline_test
-          --test log_value_guard_test
-          --test mock_storage_test
-          --test module_resolution_parity_test
-          --test new_url_target_test
-          --test node_module_extensions_test
-          --test object_export_surface_test
-          --test object_key_url_wrapper_test
-          --test output_contract_test
-          --test paired_method_url_test
-          --test pr_on_main_test
-          --test prompt_determinism_test
-          --test retype_consumer_test
-          --test route_request_anchor_test
-          --test scan_timing_lines_test
-          --test service_derivation_test
-          --test shadowed_binding_test
-          --test sidecar_parent_gone_test
-          --test socket_extraction_test
-          --test socket_generic_test
-          --test socket_namespace_test
-          --test socket_type_alias_test
-          --test union_method_param_test
-          --test url_alias_matching_test
-          --test workspace_member_callers_test
-          --test wrapper_dispatch_test
-
-      - uses: ./.github/actions/rust-test-cache-save
-        with:
-          cache-hit: ${{ steps.setup.outputs.cache-hit }}
-
-  # The binaries that drive whole scans through the sidecar over fixture
-  # repos: seconds to minutes each, and the reason the single job was slow.
-  # llm_cassette_hard_gate_test is the frozen-LLM-input golden;
-  # undeclared_external_host_test pins the match key of an absolute
-  # third-party URL (carrick-cloud#656); neither makes a model call.
-  # scan_leaves_repo_unedited_test checks a whole scan leaves the scanned
-  # git tree as it was (carrick#1823).
-  rust-scan:
-    name: Rust scan integration
+  # The one required check. A matrix job reports as many checks as it has
+  # shards, and a ruleset pins each name, so a shard rename or a new job
+  # would need a ruleset edit; this job fails unless every job it needs
+  # succeeded, so adding a shard needs none. `always()` makes it run (and
+  # fail) when a needed job failed or was cancelled instead of being skipped
+  # with them. `lister-artifact` and `release-artifact-steps` are not
+  # required today and are left out.
+  ci-result:
+    name: CI result
+    if: always()
+    needs:
+      - rust-tests
+      - wired
+      - sidecar
+      - endpoint-regression-test
+      - build
+      - lint
+      - security
+      - wasm-match
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/rust-test-setup
-        id: setup
-
-      - name: Run scan-driving integration tests
-        run: >-
-          cargo test --verbose
-          --test call_states_its_verb_test
-          --test descriptor_route_anchor_test
-          --test deterministic_emission_test
-          --test dispatch_dto_enum_test
-          --test env_var_whole_url_test
-          --test exclude_patterns_test
-          --test hosted_enrichment_test
-          --test imported_object_member_test
-          --test imported_request_member_test
-          --test inline_handler_response_test
-          --test integration_test
-          --test interrupted_scan_test
-          --test keep_awake_test
-          --test llm_cassette_hard_gate_test
-          --test method_per_site_test
-          --test one_row_per_request_test
-          --test payload_without_method_test
-          --test props_and_hook_options_test
-          --test pubsub_wrapper_type_capture_test
-          --test response_init_bag_test
-          --test run_log_isolation_test
-          --test scan_leaves_repo_unedited_test
-          --test spread_options_verb_test
-          --test stated_generic_body_anchor_test
-          --test undeclared_external_host_test
-          --test unprepared_refusal_test
-          --test wrapper_call_route_test
-          --test xrepo_harness_test
-
-      - uses: ./.github/actions/rust-test-cache-save
-        with:
-          cache-hit: ${{ steps.setup.outputs.cache-hit }}
-
-  # local_mode_test plus three binaries moved off rust-unit by measured time
-  # (carrick#2152). local_mode_test's two timing tests claim every slot, so
-  # the other binaries only fill the gaps between them.
-  rust-local-mode:
-    name: Rust local mode
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: ./.github/actions/rust-test-setup
-        id: setup
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
-        with:
-          tool: nextest@0.9.148
-
-      # Tests that must not overlap another are named in .config/nextest.toml.
-      - name: Run local mode tests
-        run: >-
-          cargo nextest run --no-fail-fast
-          --test graphql_located_operation_types_test
-          --test in_process_publish_test
-          --test local_mode_test
-          --test request_summary_test
-
-      - uses: ./.github/actions/rust-test-cache-save
-        with:
-          cache-hit: ${{ steps.setup.outputs.cache-hit }}
+      - name: Every job this gate needs succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
+            exit 0
+          fi
+          echo "::error::a job CI result needs did not succeed (failure, cancelled or skipped)"
+          exit 1
 
   # The type sidecar's own unit tests, no Rust. Two shards: four files run
   # real package managers, Deno and tsc over fixture projects (the Deno
