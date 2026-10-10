@@ -21,6 +21,12 @@
  *    scanner's decision, not made here.
  *
  * No symbol, no source.
+ *
+ * carrick#2148: a shape declared as an object-literal alias
+ * (`type Receipt = { … }`) or an instantiated generic alias (`Page<Invoice>`)
+ * anchors at the alias's name and file, as an interface does. The compiler
+ * gives such a type the anonymous `__type` as its own symbol; the alias is
+ * where its name lives.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -46,6 +52,18 @@ const LEGACY_TS = `export interface Invoice {
 }
 `;
 
+/** Object-literal aliases: the shapes a type alias declares. */
+const SHAPES_TS = `export type Receipt = {
+  id: string;
+  settled: boolean;
+};
+
+export type Page<T> = {
+  items: T[];
+  next: string | null;
+};
+`;
+
 const PACKAGE_DTS = `export interface Stamp {
   at: string;
   by: string;
@@ -55,6 +73,7 @@ const PACKAGE_DTS = `export interface Stamp {
 const ROUTES_TS = `import type { Invoice } from "./index";
 import type { Invoice as LegacyInvoice } from "./legacy";
 import type { Stamp } from "doc-lib";
+import type { Receipt, Page } from "./shapes";
 
 interface Reply {
   json(body: unknown): void;
@@ -67,6 +86,38 @@ declare function findStamp(id: string): Stamp;
 declare function loadInvoice(url: string): Promise<Invoice>;
 declare function loadLegacy(url: string): Promise<LegacyInvoice>;
 declare function loadStamp(url: string): Promise<Stamp>;
+declare function findReceipt(id: string): Receipt;
+declare function findPage(id: string): Page<Invoice>;
+declare function loadReceipt(url: string): Promise<Receipt>;
+declare function loadPage(url: string): Promise<Page<Invoice>>;
+
+export function getReceipt(id: string) {
+  return findReceipt(id);
+}
+
+export function getPage(id: string) {
+  return findPage(id);
+}
+
+export function sendReceipt(id: string, reply: Reply) {
+  const receipt = findReceipt(id);
+  reply.json(receipt);
+}
+
+export function sendPage(id: string, reply: Reply) {
+  const page = findPage(id);
+  reply.json(page);
+}
+
+export async function fetchReceipt(id: string) {
+  const receipt = await loadReceipt(\`/receipts/\${id}\`);
+  return receipt;
+}
+
+export async function fetchPage(id: string) {
+  const page = await loadPage(\`/pages/\${id}\`);
+  return page;
+}
 
 export function getInvoice(id: string) {
   return findInvoice(id);
@@ -152,7 +203,7 @@ interface InferShape {
 }
 
 /** The three declaration homes, by the binding that holds a value of each. */
-type Home = 'invoice' | 'legacy' | 'stamp';
+type Home = 'invoice' | 'legacy' | 'stamp' | 'receipt' | 'page';
 
 describe('carrick#1819: an inference that names an anchor symbol reports the file that declares it', () => {
   let client: SidecarClient;
@@ -186,6 +237,7 @@ describe('carrick#1819: an inference that names an anchor symbol reports the fil
     fs.writeFileSync(path.join(repoDir, 'src', 'contracts.ts'), CONTRACTS_TS);
     fs.writeFileSync(path.join(repoDir, 'src', 'index.ts'), BARREL_TS);
     fs.writeFileSync(path.join(repoDir, 'src', 'legacy.ts'), LEGACY_TS);
+    fs.writeFileSync(path.join(repoDir, 'src', 'shapes.ts'), SHAPES_TS);
     routesPath = path.join(repoDir, 'src', 'routes.ts');
     fs.writeFileSync(routesPath, ROUTES_TS);
 
@@ -223,11 +275,15 @@ describe('carrick#1819: an inference that names an anchor symbol reports the fil
     invoice: 'getInvoice',
     legacy: 'getLegacy',
     stamp: 'getStamp',
+    receipt: 'getReceipt',
+    page: 'getPage',
   };
   const LOADER_OF: Record<Home, string> = {
     invoice: 'loadInvoice',
     legacy: 'loadLegacy',
     stamp: 'loadStamp',
+    receipt: 'loadReceipt',
+    page: 'loadPage',
   };
 
   /** One request per path, for the value declared at `home`. */
@@ -300,6 +356,18 @@ describe('carrick#1819: an inference that names an anchor symbol reports the fil
           inferred.primary_type_symbol_source,
           path.join(repoDir, 'node_modules', 'doc-lib', 'index.d.ts')
         );
+      });
+
+      it('anchors an object-literal alias at its name and file (carrick#2148)', async () => {
+        const inferred = await request('receipt');
+        assert.strictEqual(inferred.primary_type_symbol, 'Receipt');
+        assert.strictEqual(inferred.primary_type_symbol_source, inRepo('shapes.ts'));
+      });
+
+      it('anchors an instantiated generic alias at its bare name (carrick#2148)', async () => {
+        const inferred = await request('page');
+        assert.strictEqual(inferred.primary_type_symbol, 'Page');
+        assert.strictEqual(inferred.primary_type_symbol_source, inRepo('shapes.ts'));
       });
 
       it('answers as the expression path does for each of the three', async () => {
