@@ -46,6 +46,11 @@ permissions:
   contents: write
   pull-requests: write
 
+# The oldest glibc the linux binaries run on (carrick#2218). The build links
+# against it and scripts/glibc-floor.sh fails a binary that needs more.
+env:
+  GLIBC_FLOOR: "2.28"
+
 # One release at a time: a push to main and a `workflow_dispatch` rescue of an
 # older tag would otherwise publish npm packages and move release assets
 # concurrently. Queued rather than cancelled, because an npm publish killed
@@ -288,12 +293,46 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          # The linux legs keep their own cache: objects built for the
+          # runner's glibc are not reused by the glibc-2.28 link.
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ matrix.platform == 'linux' && 'glibc-' || '' }}${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ matrix.platform == 'linux' && 'glibc-' || '' }}
+
+      # The linux binaries link against glibc 2.28, not the runner's
+      # (carrick#2218). `cargo zigbuild` with a `.2.28` target suffix links
+      # against zig's glibc stubs for that version; a plain `cargo build` here
+      # links against the runner's glibc (2.39 on ubuntu-24.04), and the
+      # binary then refuses to start on Ubuntu 22.04, Debian 12 or RHEL 9.
+      # Pinned: zig 0.16.0 is the release cargo-zigbuild's own CI tests.
+      - name: Install cargo-zigbuild
+        if: matrix.platform == 'linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet ziglang==0.16.0 cargo-zigbuild==0.23.4
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
 
       - name: Build binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            # The suffix sets the glibc; the binary still lands in
+            # target/<triple>/release.
+            cargo zigbuild --release --target "${{ matrix.target }}.$GLIBC_FLOOR"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      # What the binary asks the loader for, then the loader itself on the
+      # floor and on the systems just below the runner's glibc.
+      - name: The binary needs no glibc above the floor
+        if: matrix.platform == 'linux'
+        run: bash scripts/glibc-floor.sh target/${{ matrix.target }}/release/carrick
+
+      - name: The binary starts on older glibc
+        if: matrix.platform == 'linux'
+        run: bash scripts/glibc-floor-start.sh target/${{ matrix.target }}/release/carrick
 
       - name: Build the platform package
         shell: bash
@@ -367,9 +406,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-glibc-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-release-glibc-
 
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -378,8 +417,28 @@ jobs:
           cache: "npm"
           cache-dependency-path: src/sidecar/package-lock.json
 
+      # The linux binaries link against glibc 2.28, not the runner's
+      # (carrick#2218). `cargo zigbuild` with a `.2.28` target suffix links
+      # against zig's glibc stubs for that version; a plain `cargo build` here
+      # links against the runner's glibc (2.39 on ubuntu-24.04), and the
+      # binary then refuses to start on Ubuntu 22.04, Debian 12 or RHEL 9.
+      # Pinned: zig 0.16.0 is the release cargo-zigbuild's own CI tests.
+      - name: Install cargo-zigbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet ziglang==0.16.0 cargo-zigbuild==0.23.4
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
       - name: Build binary
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+        run: cargo zigbuild --release --target "x86_64-unknown-linux-gnu.$GLIBC_FLOOR"
+
+      # What the binary asks the loader for, then the loader itself on the
+      # floor and on the systems just below the runner's glibc.
+      - name: The binary needs no glibc above the floor
+        run: bash scripts/glibc-floor.sh target/x86_64-unknown-linux-gnu/release/carrick
+
+      - name: The binary starts on older glibc
+        run: bash scripts/glibc-floor-start.sh target/x86_64-unknown-linux-gnu/release/carrick
 
       - name: Build sidecar
         run: cd src/sidecar && npm ci && npm run build
