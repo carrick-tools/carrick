@@ -2574,19 +2574,27 @@ export class TypeInferrer {
       ) {
         break;
       }
-      if (
-        !Node.isParenthesizedExpression(parent) &&
-        !Node.isAwaitExpression(parent) &&
-        !Node.isNonNullExpression(parent) &&
-        !Node.isAsExpression(parent) &&
-        !Node.isTypeAssertion(parent) &&
-        !Node.isSatisfiesExpression(parent)
-      ) {
+      if (!this.wrapsReadTransparently(parent)) {
         return undefined;
       }
       current = parent;
     }
     return typeNode;
+  }
+
+  /**
+   * A wrapper between a body read and the binding it initialises that leaves
+   * the read's value as it is: `await`, parentheses, `!`, a cast, `satisfies`.
+   */
+  private wrapsReadTransparently(node: Node): boolean {
+    return (
+      Node.isParenthesizedExpression(node) ||
+      Node.isAwaitExpression(node) ||
+      Node.isNonNullExpression(node) ||
+      Node.isAsExpression(node) ||
+      Node.isTypeAssertion(node) ||
+      Node.isSatisfiesExpression(node)
+    );
   }
 
   /**
@@ -2929,6 +2937,29 @@ export class TypeInferrer {
         keyedBody,
         this.getNodeLocation(located)
       );
+    }
+
+    // carrick#2057: the locator named a member of the body the handler parsed
+    // (`body.items` after `const body = (await request.json()) as ImportBody`,
+    // or a binding destructured from that read). A member is one field of the
+    // body, so publishing its type states the whole body is that field. The
+    // body is what the source states at the read; where it states nothing,
+    // nothing is published.
+    const bodyRead = this.parsedBodyReadHolding(located);
+    if (bodyRead) {
+      const stated = this.requestStatedAtBodyRead(request, bodyRead);
+      if (stated) {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number} names a member of the ` +
+            'body its handler parses; publishing the body the source states at that read'
+        );
+        return stated;
+      }
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names a member of the ` +
+          'body its handler parses, and the source states no type at that read; leaving unresolved'
+      );
+      return null;
     }
 
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
@@ -6562,6 +6593,57 @@ export class TypeInferrer {
       return call;
     }
     return undefined;
+  }
+
+  /**
+   * The platform body read whose result `located` is a MEMBER of, or
+   * `undefined` (carrick#2057).
+   *
+   * A member is a property or element access off a binding, or a name
+   * destructured out of one. The binding must be initialised by the body read
+   * `platformBodyReadIn` finds in the function that declares it, with only
+   * transparent wrappers between the two (`await`, parentheses, `!`, a cast,
+   * `satisfies`). The binding itself is not a member, and neither is a member
+   * of anything else (a query object, a parameter, an outbound response).
+   */
+  private parsedBodyReadHolding(located: Node): CallExpression | undefined {
+    let node = this.unwrapExpressionNode(located);
+    let member = false;
+    while (
+      Node.isPropertyAccessExpression(node) ||
+      Node.isElementAccessExpression(node) ||
+      Node.isNonNullExpression(node) ||
+      Node.isParenthesizedExpression(node)
+    ) {
+      if (Node.isPropertyAccessExpression(node) || Node.isElementAccessExpression(node)) {
+        member = true;
+      }
+      node = node.getExpression();
+    }
+    if (!Node.isIdentifier(node)) return undefined;
+
+    let declaration: Node | undefined = node.getSymbol()?.getDeclarations()?.[0];
+    while (declaration && Node.isBindingElement(declaration)) {
+      member = true;
+      declaration = declaration.getParent()?.getParent();
+    }
+    if (!member || !declaration || !Node.isVariableDeclaration(declaration)) return undefined;
+
+    const handler = this.findContainingFunctionForNode(declaration);
+    const read = handler ? this.platformBodyReadIn(handler) : undefined;
+    if (!read) return undefined;
+    let current: Node = read;
+    for (;;) {
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (parent === declaration) {
+        return declaration.getInitializer() === current ? read : undefined;
+      }
+      if (!this.wrapsReadTransparently(parent)) {
+        return undefined;
+      }
+      current = parent;
+    }
   }
 
   /**
