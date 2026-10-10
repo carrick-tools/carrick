@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 # A newer push to a PR cancels that PR's older run, so superseded runs stop
-# holding runners (each run starts about 28 jobs; carrick#2156). A merge_group
+# occupying runners (each run starts about 28 jobs; carrick#2156). A merge_group
 # run is never cancelled: `head_ref` is empty there, so the group falls back to
 # the unique run_id.
 concurrency:
