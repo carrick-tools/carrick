@@ -3208,7 +3208,8 @@ async fn analyze_current_repo_incremental(
                 service,
                 &files,
                 &merged_results,
-                &setup.detection.socket_clients,
+                &setup.detection,
+                &service_modules,
             );
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
@@ -3860,7 +3861,8 @@ fn scan_protocol_extractions(
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    socket_clients: &[String],
+    detection: &DetectionResult,
+    service_modules: &crate::workspace_resolver::WorkspaceIndex,
 ) -> (
     ProtocolExtractions,
     crate::graphql_document_sites::DocumentSiteConsumers,
@@ -3888,8 +3890,17 @@ fn scan_protocol_extractions(
         crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
-    let sockets = crate::socket_io::scan_files(files, socket_clients);
-    let event_bus = crate::event_emitter::scan_files(files, &sockets);
+    let sockets = crate::socket_io::scan_files(files, &detection.socket_clients);
+    // A listener is kept by where its receiver comes from (carrick#941):
+    // the service's own module index places an import, and a messaging or
+    // socket client detection lists is a transport.
+    let transports: Vec<String> = detection
+        .messaging_clients
+        .iter()
+        .chain(&detection.socket_clients)
+        .cloned()
+        .collect();
+    let event_bus = crate::event_emitter::scan_files(files, &sockets, service_modules, &transports);
     (
         ProtocolExtractions {
             graphql,
@@ -8667,7 +8678,8 @@ async fn analyze_current_repo(
         service,
         &files,
         &analysis_result.file_results,
-        &setup.detection.socket_clients,
+        &setup.detection,
+        &service_modules,
     );
     let mut analysis_result = analysis_result;
     settle_graphql_documents(

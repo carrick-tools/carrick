@@ -1,0 +1,9 @@
+{
+  "name": "listener-receivers",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@fixture/broker": "1.0.0"
+  }
+}

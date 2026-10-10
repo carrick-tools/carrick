@@ -731,27 +731,9 @@ impl<'a> Classifier<'a> {
         }
     }
 
-    /// Whether `specifier`, imported by `file`, names a package detection
-    /// classed as a transport. Matched as every other detection gate matches
-    /// a specifier: the entry itself or a path under it.
-    fn is_transport_import(&self, file: &Path, specifier: &str) -> bool {
-        let named = |candidate: &str| {
-            self.transports
-                .iter()
-                .any(|entry| candidate == entry || candidate.starts_with(&format!("{entry}/")))
-        };
-        if named(specifier) {
-            return true;
-        }
-        match self.workspace.resolve(file, specifier) {
-            Resolution::External { package, .. } => named(&package),
-            _ => false,
-        }
-    }
-
     /// What an imported binding is, for a call on it.
     fn import_origin(&self, file: &Path, import: &ImportedSymbol) -> ImportOrigin {
-        if self.is_transport_import(file, &import.source) {
+        if is_transport_import(self.workspace, self.transports, file, &import.source) {
             return ImportOrigin::Unproven;
         }
         match self.workspace.resolve(file, &import.source) {
@@ -761,6 +743,30 @@ impl<'a> Classifier<'a> {
             }
             _ => ImportOrigin::Unproven,
         }
+    }
+}
+
+/// Whether `specifier`, imported by `file`, names a package detection classed
+/// as a transport (one of `transports`). Matched as every other detection gate
+/// matches a specifier: the entry itself or a path under it, written in the
+/// import or reached through the manifest that declares it.
+pub(crate) fn is_transport_import(
+    workspace: &WorkspaceIndex,
+    transports: &[String],
+    file: &Path,
+    specifier: &str,
+) -> bool {
+    let named = |candidate: &str| {
+        transports
+            .iter()
+            .any(|entry| candidate == entry || candidate.starts_with(&format!("{entry}/")))
+    };
+    if named(specifier) {
+        return true;
+    }
+    match workspace.resolve(file, specifier) {
+        Resolution::External { package, .. } => named(&package),
+        _ => false,
     }
 }
 
