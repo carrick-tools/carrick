@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.112](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.111...carrick-v0.3.112) (2026-10-10)
+
+
+### Features
+
+* **local:** a checked file names who calls its functions and which operations read its types ([#2067](https://github.com/carrick-tools/carrick/issues/2067)) ([#2163](https://github.com/carrick-tools/carrick/issues/2163)) ([d15bcca](https://github.com/carrick-tools/carrick/commit/d15bcca335c97919598f12680a9093465b14b4ad))
+* **npm:** a Read hook gives the agent a file's callers and counterparts before it edits ([#2185](https://github.com/carrick-tools/carrick/issues/2185)) ([c1ad718](https://github.com/carrick-tools/carrick/commit/c1ad718c499cfce049083bdf94ca01d1d6170beb)), closes [#2069](https://github.com/carrick-tools/carrick/issues/2069)
+
+
+### Bug Fixes
+
+* **lint:** clear clippy errors on current stable and make Linting blocking ([#2162](https://github.com/carrick-tools/carrick/issues/2162)) ([b7840f6](https://github.com/carrick-tools/carrick/commit/b7840f60e4ce42e257798d0dd71c0e1ffb0c2f38))
+* **scanner:** a method and a URL one condition chooses are paired across branches ([#2051](https://github.com/carrick-tools/carrick/issues/2051)) ([#2170](https://github.com/carrick-tools/carrick/issues/2170)) ([f1ca46c](https://github.com/carrick-tools/carrick/commit/f1ca46c4fedc3fc67d62cedcec7c68c04b72be07))
+* **scanner:** a method declared as a union of verbs states one row per verb ([#2049](https://github.com/carrick-tools/carrick/issues/2049)) ([#2168](https://github.com/carrick-tools/carrick/issues/2168)) ([c845686](https://github.com/carrick-tools/carrick/commit/c845686b75e51bc346fd7e41f855ab294dd3e2e5))
+* **scanner:** a URL a conditional chooses states one row per branch ([#2050](https://github.com/carrick-tools/carrick/issues/2050)) ([#2169](https://github.com/carrick-tools/carrick/issues/2169)) ([216ba2c](https://github.com/carrick-tools/carrick/commit/216ba2c8c6ace5d8ae58d061141784f68d016e1f))
+* **sidecar:** a request located at a member of the parsed body publishes the body ([#2057](https://github.com/carrick-tools/carrick/issues/2057)) ([#2183](https://github.com/carrick-tools/carrick/issues/2183)) ([49db217](https://github.com/carrick-tools/carrick/commit/49db21742cce047be266e2cb21d6156614828f54))
+* **sidecar:** a text locator never binds a fragment of what it names ([#2056](https://github.com/carrick-tools/carrick/issues/2056)) ([#2184](https://github.com/carrick-tools/carrick/issues/2184)) ([b691493](https://github.com/carrick-tools/carrick/commit/b691493d8950de42991889895bc9d6f267e82495))
+* **sidecar:** a type alias anchors at its own name ([#2148](https://github.com/carrick-tools/carrick/issues/2148)) ([#2189](https://github.com/carrick-tools/carrick/issues/2189)) ([a72912f](https://github.com/carrick-tools/carrick/commit/a72912f8b249e1b53c0056852d11641c6f18cbf6))
+* **sidecar:** the JSON wire form reaches every depth a body has ([#2058](https://github.com/carrick-tools/carrick/issues/2058)) ([#2182](https://github.com/carrick-tools/carrick/issues/2182)) ([69863e0](https://github.com/carrick-tools/carrick/commit/69863e0644c8da55cde8517246654a1fa3515935))
+
+
+### Performance
+
+* **build:** stamp the commit into release builds only ([#2157](https://github.com/carrick-tools/carrick/issues/2157)) ([#2178](https://github.com/carrick-tools/carrick/issues/2178)) ([412ed88](https://github.com/carrick-tools/carrick/commit/412ed882f0fa53580b022770bec58e58f4cbc709))
+* **sidecar:** self-check skips default lib type-checking ([#2166](https://github.com/carrick-tools/carrick/issues/2166)) ([734b6f2](https://github.com/carrick-tools/carrick/commit/734b6f28ada1c413bb05b8f6170d9d777a766924))
+
+
+### CI/CD
+
+* build the release binary in the merge queue only ([#2192](https://github.com/carrick-tools/carrick/issues/2192)) ([24351f3](https://github.com/carrick-tools/carrick/commit/24351f31bf8f52fcf0395c1279e4b4c02fb4f693)), closes [#2176](https://github.com/carrick-tools/carrick/issues/2176)
+* build the unit job once, key each job's cache apart, cache test dependencies only ([#2159](https://github.com/carrick-tools/carrick/issues/2159)) ([6d2d6c8](https://github.com/carrick-tools/carrick/commit/6d2d6c8684f1f39d64238283741ef8e106c79dbf))
+* install a prebuilt wasm-bindgen-cli in the wasm smoke job ([#2181](https://github.com/carrick-tools/carrick/issues/2181)) ([a4b9cee](https://github.com/carrick-tools/carrick/commit/a4b9cee096649d8e828424ebc0daea54925fd160)), closes [#2177](https://github.com/carrick-tools/carrick/issues/2177)
+* move three heavy fast-integration binaries from (a) to local mode ([#2167](https://github.com/carrick-tools/carrick/issues/2167)) ([f5fbc3c](https://github.com/carrick-tools/carrick/commit/f5fbc3cd1bd4834cdc9cda266f96365d7f549e6d)), closes [#2152](https://github.com/carrick-tools/carrick/issues/2152)
+* restore fixture node_modules and the built sidecar from cache in rust-test-setup ([#2179](https://github.com/carrick-tools/carrick/issues/2179)) ([c9d97f2](https://github.com/carrick-tools/carrick/commit/c9d97f2314718ece6eb52956685f4686f0753d4b)), closes [#2175](https://github.com/carrick-tools/carrick/issues/2175)
+* run the endpoint smoke on the debug binary inside the steps shard ([#2191](https://github.com/carrick-tools/carrick/issues/2191)) ([595d1f7](https://github.com/carrick-tools/carrick/commit/595d1f78e1a830cc28bbb9e0e1e31addec70a4a2)), closes [#2174](https://github.com/carrick-tools/carrick/issues/2174)
+* run the local mode shard under nextest ([#2160](https://github.com/carrick-tools/carrick/issues/2160)) ([5a4ba65](https://github.com/carrick-tools/carrick/commit/5a4ba656bc3af1ade9d0e66982fc01c6dcab953b))
+* run the Rust tests on 16 self-compiling shards behind one CI result gate ([#2180](https://github.com/carrick-tools/carrick/issues/2180)) ([8ec0b47](https://github.com/carrick-tools/carrick/commit/8ec0b4785d1b2c57cb712893d8dc0b13e1a1a869))
+* split the sidecar rest tests into three shards ([#2190](https://github.com/carrick-tools/carrick/issues/2190)) ([a488b64](https://github.com/carrick-tools/carrick/commit/a488b64703c95a7afb4e44512c937438a94c3289)), closes [#2173](https://github.com/carrick-tools/carrick/issues/2173)
+* stop running CI on push to main; save the dependency cache from a lockfile-gated job ([#2171](https://github.com/carrick-tools/carrick/issues/2171)) ([8bfa495](https://github.com/carrick-tools/carrick/commit/8bfa495318663036fd665a37eeb7f5dae1911da4)), closes [#2149](https://github.com/carrick-tools/carrick/issues/2149)
+
 ## [0.3.111](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.110...carrick-v0.3.111) (2026-10-09)
 
 
