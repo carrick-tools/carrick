@@ -1,0 +1,40 @@
+name: Main cache
+
+# Saves the Rust test dependency cache on main, which is the only ref other
+# branches and the merge queue can restore a cache from. CI no longer runs on
+# push to main (carrick#2149), so this is the one job that does. It runs only
+# when a Cargo.lock changed, because the cache key is the lockfile hash:
+# any other push to main would find its exact key already saved. The save
+# itself is `rust-test-cache-save`, the same step the CI shards use, and it
+# skips when the restore hit the exact key.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  save:
+    name: Save dependency cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/rust-test-setup
+        id: setup
+      # Compiles the dependencies into target/ so there is something to save.
+      # Same feature set as the CI shards' first build (the carrick crate turns
+      # on carrick-match's `serde`); the save step strips this repo's own output.
+      - name: Build dependencies
+        if: steps.setup.outputs.cache-hit != 'true'
+        run: cargo test --no-run --all-targets
+      - uses: ./.github/actions/rust-test-cache-save
+        with:
+          cache-hit: ${{ steps.setup.outputs.cache-hit }}

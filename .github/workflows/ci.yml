@@ -1,8 +1,11 @@
 name: CI
 
+# No `push` trigger: a commit reaches main through the merge queue, whose
+# `merge_group` run has already tested that exact tree, so a push run re-tested
+# the same sha and nothing read it (carrick#2149). The one thing the push run
+# did that mattered, saving the dependency cache on main (the only ref other
+# branches can restore from), is now `main-cache.yml`.
 on:
-  push:
-    branches: [main, develop]
   pull_request:
     branches: [main, develop]
   merge_group:
