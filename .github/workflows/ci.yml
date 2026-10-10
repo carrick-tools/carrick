@@ -263,7 +263,10 @@ jobs:
   # succeeded, so adding a shard needs none. `always()` makes it run (and
   # fail) when a needed job failed or was cancelled instead of being skipped
   # with them. `lister-artifact` and `release-artifact-steps` are not
-  # required today and are left out.
+  # required today and are left out. `build` runs only in the merge queue
+  # (carrick#2176), so on a pull request it is skipped and the gate accepts
+  # that one skip; a skip of any other job, or of `build` in the merge queue,
+  # still fails it.
   ci-result:
     name: CI result
     if: always()
@@ -280,9 +283,11 @@ jobs:
       - name: Every job this gate needs succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
         run: |
+          echo "event: $EVENT"
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          if echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
+          if echo "$NEEDS" | jq -e --arg event "$EVENT" 'to_entries | all(.value.result == "success" or (.key == "build" and .value.result == "skipped" and $event == "pull_request"))' > /dev/null; then
             exit 0
           fi
           echo "::error::a job CI result needs did not succeed (failure, cancelled or skipped)"
@@ -473,8 +478,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # The release compile (about 140 s) runs in the merge queue only: a pull
+  # request run skips it, and the `ci-result` gate accepts that skip for this
+  # job on `pull_request` alone, so a release-profile break is caught before
+  # the merge and not while a PR waits (carrick#2176).
   build:
     name: Build
+    if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
