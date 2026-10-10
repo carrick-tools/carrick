@@ -114,14 +114,32 @@ function referenceMatch(
   const exact = candidates.filter((c) => c.text === target);
   if (exact.length > 0) return pick(exact.map((c) => c.node));
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target)) return undefined;
-  const sub = candidates.filter(
-    (c) =>
-      c.text.includes(target) ||
-      (c.text.length >= 8 && c.text.length >= target.length * 0.5 && target.includes(c.text))
+  const containing = candidates.filter((c) => c.text.includes(target));
+  if (containing.length > 0) return pick(containing.map((c) => c.node));
+  const reverse = candidates.filter(
+    (c) => c.text.length >= 8 && c.text.length >= target.length * 0.5 && target.includes(c.text)
   );
-  if (sub.length === 0) return undefined;
-  const containing = sub.filter((c) => c.text.includes(target));
-  return pick((containing.length > 0 ? containing : sub).map((c) => c.node));
+  if (reverse.length === 0) return undefined;
+  // The fragment rule (carrick#2056) reads the locator's own parse; it is
+  // the inferrer's, and only the line each node starts on is this copy's.
+  const named = inferrer.locatorNames(target);
+  if (!named) return pick(reverse.map((c) => c.node));
+  const textOf = new Map<Node, string>(candidates.map((c) => [c.node, c.text]));
+  const bound = new Set<Node>();
+  for (const c of reverse) {
+    if (named.texts.has(c.text)) {
+      bound.add(c.node);
+      continue;
+    }
+    const at = target.indexOf(c.text, named.rootStart + 1);
+    if (at < 0) continue;
+    const opening = target.slice(named.rootStart, at);
+    const enclosing = c.node.getFirstAncestor(
+      (a) => a.getKind() === named.rootKind && textOf.get(a)?.startsWith(opening) === true
+    );
+    if (enclosing) bound.add(enclosing);
+  }
+  return bound.size > 0 ? pick([...bound]) : undefined;
 }
 
 const identity = (n: Node | undefined) =>
