@@ -50,11 +50,23 @@ dispatch carry read that index. It reads its own, which asserts no target.
 | `services.ts:4` `client.findService(name)` | `action=get-cross-repo-data` |
 | `refresh.ts:4` `client.refreshEverything()` | two rows, `action=invalidate-cache` and `action=rebuild-index` — one per request the member sends (carrick#1555) |
 | `local.ts:11` `postToGateway("/rpc/gateway", payload)` | `action=store-metadata` |
+| `factory.ts:7` `client.getAllRepoData()` | `action=get-cross-repo-data`, over the cassette's unwitnessed `get-all-repo-data` (carrick#2201) |
+| `factory.ts:8` `client.refreshEverything()` | none: the cassette's `refresh-everything` is unwitnessed and the member reaches two requests, so it is cleared |
+| `factory.ts:9` `client.send("purge-cache", {})` | `action=purge-cache`, which the site writes, kept |
+
+`src/factory.ts` (carrick#2201) gets its client from a function-typed factory
+(`make: MakeClient`), so no summary row covers its sites and the model's rows
+stand. Its cassette states a value at each site, as the model does when it
+reads one from a method name. A value stands only where the site's file
+writes it: otherwise the wrapper's value replaces it, or it is cleared.
+`send` takes its action as a parameter and writes none, so it carries
+nothing.
 
 ## The cassette
 
-`__llm__/analyze-file/api-client.json` and `local.json` are the only ones that
-state a `dispatch`, and they state it where the model really can: on the
+Apart from `factory.json` (above), `__llm__/analyze-file/api-client.json` and
+`local.json` are the only ones that state a `dispatch`, and they state it where
+the model really can: on the
 client's own requests, beside the object literal that writes it. The client's
 targets are `${this.gatewayUrl}`, which carries no literal path segment. The
 request summaries read the field through the constructor that builds it

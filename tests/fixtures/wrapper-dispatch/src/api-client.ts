@@ -65,4 +65,13 @@ export class ApiClient {
     }
     return data.repos;
   }
+
+  async send(action: string, payload: object): Promise<unknown> {
+    // The action is the caller's: this body writes no value for it.
+    const response = await fetch(this.gatewayUrl, {
+      method: "POST",
+      body: JSON.stringify({ action, ...payload }),
+    });
+    return response.json();
+  }
 }
