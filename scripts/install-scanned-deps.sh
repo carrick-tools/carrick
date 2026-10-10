@@ -42,6 +42,23 @@
 #   install-scanned-deps.sh install     <scan-root>          # always exits 0
 #   install-scanned-deps.sh install-one <root> <manager>     # always exits 0
 #
+# CARRICK_INSTALL_UNTRUSTED=1 is for a machine that scans repositories it does
+# not own (the hosted runner). Lifecycle scripts being off is not enough there:
+# a pnpm `.pnpmfile.cjs`, a Yarn `yarnPath` / `yarn-path` release and Yarn
+# Berry `plugins` are all files from the scanned tree that run during an
+# install. In this mode none of them can:
+#   - pnpm installs with `--ignore-pnpmfile`;
+#   - Yarn runs with YARN_IGNORE_PATH=1, so the launcher never hands the
+#     install to a committed release, and Berry with YARN_ENABLE_SCRIPTS=0;
+#   - a Berry root listing `plugins`, or naming a `yarnPath` with no
+#     `packageManager` pin (the version cannot be known without running the
+#     repo's file), is not installed: it warns and the pre-flight refuses it;
+#   - corepack never writes `packageManager` into the repo's package.json
+#     (COREPACK_ENABLE_AUTO_PIN=0), and classic Yarn and bun install frozen, so
+#     no tracked file differs from the commit afterwards.
+# Unset, the script behaves as it always has: on a developer's own CI the
+# tree is theirs. `action.yml` leaves it unset.
+#
 # CARRICK_CLI names the Carrick to ask for the services. `action.yml` writes a
 # wrapper for whichever copy the run resolved, npm package or release asset.
 # Deliberately NOT `CARRICK_BIN`: that variable names a scanner BINARY to the
@@ -51,6 +68,9 @@ set -uo pipefail
 
 # How long an install may take before it is killed and the scan continues bare.
 INSTALL_TIMEOUT_SECONDS="${CARRICK_INSTALL_TIMEOUT:-300}"
+
+# Set by a machine that scans repositories it does not own; see the header.
+UNTRUSTED="${CARRICK_INSTALL_UNTRUSTED:-}"
 
 # The delimiter for the one multi-line step output this script writes. A
 # workflow reads `cache_dirs` as the `path:` of actions/cache, which takes one
@@ -301,8 +321,30 @@ run_install() {
   fi
 }
 
+# Whether a Yarn root cannot be installed without running a file from the tree.
+# Prints the reason when it cannot. Read as text: nothing here executes the
+# repository's files. Only Yarn Berry's `.yarnrc.yml` carries either key.
+yarn_untrusted_refusal() {
+  local rc="$1/.yarnrc.yml"
+  [ -f "$rc" ] || return 1
+  if grep -Eq '^plugins[[:space:]]*:' "$rc"; then
+    echo "its .yarnrc.yml lists plugins, which Yarn loads at startup"
+    return 0
+  fi
+  if grep -Eq '^yarnPath[[:space:]]*:' "$rc" && ! grep -Eq '"packageManager"[[:space:]]*:' "$1/package.json" 2>/dev/null; then
+    echo "its .yarnrc.yml names a yarnPath and package.json pins no packageManager, so the Yarn version cannot be known without running the repository's own file"
+    return 0
+  fi
+  return 1
+}
+
+# Yarn Berry's lockfile opens with a `__metadata` block; classic's does not.
+yarn_is_berry() {
+  [ -f "$1/.yarnrc.yml" ] || grep -q '^__metadata:' "$1/yarn.lock" 2>/dev/null
+}
+
 cmd_install_one() {
-  local root="$1" manager="$2" log status
+  local root="$1" manager="$2" log status refusal
   if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
     # Mixed roots need the global Deno cache AND the Node compiler's local
     # install. Neither preparation executes authorized project lifecycle code.
@@ -328,17 +370,40 @@ cmd_install_one() {
       status=$?
       ;;
     pnpm)
-      run_install "$root" "$log" corepack pnpm install --frozen-lockfile --ignore-scripts
+      if [ -n "$UNTRUSTED" ]; then
+        # pnpm loads the tree's `.pnpmfile.cjs` on install unless told not to.
+        run_install "$root" "$log" corepack pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile
+      else
+        run_install "$root" "$log" corepack pnpm install --frozen-lockfile --ignore-scripts
+      fi
       status=$?
       ;;
     yarn)
-      # Berry understands `--mode=skip-build`; classic understands
-      # `--ignore-scripts`. Each rejects the other's flag, so try both.
-      run_install "$root" "$log" yarn install --mode=skip-build
-      status=$?
-      if [ $status -ne 0 ]; then
-        run_install "$root" "$log" yarn install --ignore-scripts
+      if [ -n "$UNTRUSTED" ] && refusal=$(yarn_untrusted_refusal "$root"); then
+        [ -f "$log" ] && rm -f "$log"
+        warn "Carrick did not install $root with yarn: $refusal. The scan will refuse that service rather than run the repository's code or index \`any\` through its packages."
+        return 0
+      fi
+      if [ -n "$UNTRUSTED" ]; then
+        # Classic Yarn accepts `--mode=skip-build` without skipping the build,
+        # so the two lines are told apart by what the tree says they are,
+        # never by which command happens to exit 0.
+        if yarn_is_berry "$root"; then
+          run_install "$root" "$log" yarn install --mode=skip-build
+        else
+          # Frozen, or classic rewrites yarn.lock.
+          run_install "$root" "$log" yarn install --frozen-lockfile --ignore-scripts
+        fi
         status=$?
+      else
+        # Berry understands `--mode=skip-build`; classic understands
+        # `--ignore-scripts`. Each rejects the other's flag, so try both.
+        run_install "$root" "$log" yarn install --mode=skip-build
+        status=$?
+        if [ $status -ne 0 ]; then
+          run_install "$root" "$log" yarn install --ignore-scripts
+          status=$?
+        fi
       fi
       ;;
     bun)
@@ -346,7 +411,11 @@ cmd_install_one() {
         warn "Carrick found a bun lockfile but bun is not installed on this runner; add oven-sh/setup-bun before the Carrick step, or types through dependencies stay \`any\`."
         return 0
       fi
-      run_install "$root" "$log" bun install --ignore-scripts
+      if [ -n "$UNTRUSTED" ]; then
+        run_install "$root" "$log" bun install --ignore-scripts --frozen-lockfile
+      else
+        run_install "$root" "$log" bun install --ignore-scripts
+      fi
       status=$?
       ;;
     *)
@@ -389,6 +458,13 @@ cmd_install() {
 
 main() {
   local action="${1:-}"
+  if [ -n "$UNTRUSTED" ]; then
+    # Inherited by every install this script starts. Yarn: never hand the
+    # install to a release file committed in the tree, never run build
+    # scripts, never rewrite the lockfile. corepack: never write
+    # `packageManager` into the repo's package.json.
+    export YARN_IGNORE_PATH=1 YARN_ENABLE_SCRIPTS=0 YARN_ENABLE_IMMUTABLE_INSTALLS=1 COREPACK_ENABLE_AUTO_PIN=0
+  fi
   case "$action" in
     detect)
       [ $# -eq 2 ] || { echo "usage: $0 detect <scan-root>" >&2; exit 2; }
