@@ -9,6 +9,11 @@
 //! carries a value is an assertion about the scanner's join, not about the
 //! model.
 //!
+//! The one exception is `factory.json` (carrick#2201), which states a value
+//! at every site the way the model does when it guesses one from a method
+//! name. The assertions on `factory.ts` measure which of those guesses the
+//! scanner lets stand.
+//!
 //! See `tests/fixtures/wrapper-dispatch/README.md` for the shape and the
 //! answer key.
 
@@ -121,6 +126,41 @@ fn a_site_calling_a_member_that_issues_two_requests_states_one_row_per_request()
     assert_eq!(
         values,
         vec![Some("invalidate-cache"), Some("rebuild-index")]
+    );
+}
+
+/// carrick#2201: `factory.ts` holds the client a function-typed factory
+/// returns, so no summary row covers its sites and the model's rows stand
+/// there. Its cassette states a value at every site, as the model does when
+/// it guesses one from a method name.
+#[test]
+fn a_guessed_site_value_takes_the_wrapper_s_value() {
+    let calls = calls("wrapper-dispatch");
+    assert_eq!(
+        dispatch_value(call_at(&calls, "factory.ts", 7)),
+        Some("get-cross-repo-data"),
+        "`get-all-repo-data` is written nowhere in the file; the wrapper's value replaces it"
+    );
+}
+
+#[test]
+fn a_guessed_site_value_no_wrapper_answers_is_cleared() {
+    let calls = calls("wrapper-dispatch");
+    let site = call_at(&calls, "factory.ts", 8);
+    assert_eq!(
+        dispatch_value(site),
+        None,
+        "`refreshEverything` reaches two requests, so no single value replaces the guess: {site:#?}"
+    );
+}
+
+#[test]
+fn a_site_value_its_file_writes_is_kept() {
+    let calls = calls("wrapper-dispatch");
+    assert_eq!(
+        dispatch_value(call_at(&calls, "factory.ts", 9)),
+        Some("purge-cache"),
+        "the site writes `purge-cache` as the argument `send` posts"
     );
 }
 

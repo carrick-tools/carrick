@@ -517,6 +517,12 @@ pub struct ProcessingStats {
     /// Summary rows whose dispatch value was settled from their own body
     /// under the field the request line's row names (carrick#1555).
     pub summary_dispatch_settled: usize,
+    /// Model rows whose dispatch value no literal in their file witnesses and
+    /// that a wrapper's value replaced (carrick#2201).
+    pub dispatch_carried_over_guess: usize,
+    /// Model rows whose unwitnessed dispatch value was cleared because no
+    /// wrapper's value reached them (carrick#2201).
+    pub dispatch_guesses_cleared: usize,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
     /// anchors themselves are computed for every gated file; only the ones the
@@ -725,6 +731,55 @@ struct DispatchSite {
     module: PathBuf,
     /// 1-based line of the member's sole request, inside that module.
     request_line: u32,
+}
+
+/// What [`FileOrchestrator::carry_wrapper_dispatch`] wrote.
+#[derive(Debug, Default)]
+struct CarriedDispatch {
+    /// Rows that took a wrapper's value.
+    carried: usize,
+    /// Of those, rows whose own value no literal in their file witnessed.
+    over_guess: usize,
+    /// (`file_results` key, site span) of every row that took a value.
+    sites: HashSet<(String, u32)>,
+}
+
+/// The literal witnesses of every file holding a row with a dispatch value,
+/// by `file_results` key (carrick#2201). Only those files are parsed. A file
+/// that does not parse, or that was not read, witnesses every value: no
+/// evidence either way, so nothing is taken from it (fail open, as
+/// carrick#311).
+#[derive(Default)]
+struct DispatchWitnesses(HashMap<String, Option<LiteralWitnessCollector>>);
+
+impl DispatchWitnesses {
+    fn of(file_results: &HashMap<String, FileAnalysisResult>) -> Self {
+        Self(
+            file_results
+                .iter()
+                .filter(|(_, result)| {
+                    result.data_calls.iter().any(|call| {
+                        call.dispatch.is_some()
+                            && call.resolution_source != Some(ResolutionSource::RequestSummary)
+                    })
+                })
+                .map(|(path, _)| {
+                    (
+                        path.clone(),
+                        LiteralWitnessCollector::of_file(Path::new(path)),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether the file at `path` writes `value`.
+    fn witnessed(&self, path: &str, value: &str) -> bool {
+        match self.0.get(path) {
+            Some(Some(witnesses)) => witnesses.witnessed(value),
+            _ => true,
+        }
+    }
 }
 
 /// Reduce a TS type annotation to its primary symbol, stripping the same
@@ -1045,19 +1100,22 @@ fn pubsub_payload_borrow_witness(
         .any(|(binding, syms)| binding != payload_ident && syms.contains(leaf))
 }
 
-/// Collects the textual witnesses `suppress_phantom_pubsub_topics` checks an
-/// LLM-emitted pub/sub topic against (carrick#311): every string-literal value
-/// in the file, plus the static-part shape of every composed string (template
-/// literal or `+` concatenation chain). A topic is witnessed when it equals a
-/// literal (inline topics and same-file const-ref topics) or fits a composed
-/// shape's static parts in order (topics like `` `${this.name}:stateChange` ``
-/// -> `PollController:stateChange`, which the analyzer resolves from context
-/// the AST pre-pass cannot). Witness collection is deliberately lenient — any
-/// literal anywhere in the file counts — because the guard is a precision
-/// tool: it only needs to reject topics with NO textual basis at all, the
-/// invented-from-a-function-name class.
+/// Collects the textual witnesses a value the model read off a file is
+/// checked against: an LLM-emitted pub/sub topic in
+/// `suppress_phantom_pubsub_topics` (carrick#311), and a model row's dispatch
+/// value in `clear_unwitnessed_dispatch` (carrick#2201). Every string-literal
+/// value in the file, plus the static-part shape of every composed string
+/// (template literal or `+` concatenation chain). A value is witnessed when it
+/// equals a literal (inline values and same-file const refs) or fits a
+/// composed shape's static parts in order (topics like
+/// `` `${this.name}:stateChange` `` -> `PollController:stateChange`, which the
+/// analyzer resolves from context the AST pre-pass cannot). Witness
+/// collection is deliberately lenient — any literal anywhere in the file
+/// counts — because both guards are precision tools: they only need to reject
+/// values with NO textual basis at all, the invented-from-a-function-name
+/// class.
 #[derive(Default)]
-struct PubsubTopicWitnessCollector {
+struct LiteralWitnessCollector {
     /// Every string-literal value in the file, including zero-interpolation
     /// template literals.
     literals: HashSet<String>,
@@ -1068,7 +1126,18 @@ struct PubsubTopicWitnessCollector {
     template_patterns: Vec<Vec<String>>,
 }
 
-impl PubsubTopicWitnessCollector {
+impl LiteralWitnessCollector {
+    /// The witnesses in the file at `file_path`, or `None` when it does not
+    /// parse: no evidence either way, so the callers keep what they hold.
+    fn of_file(file_path: &Path) -> Option<Self> {
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let module = parse_file(file_path, &cm, &handler)?;
+        let mut witnesses = Self::default();
+        module.visit_with(&mut witnesses);
+        Some(witnesses)
+    }
+
     /// Record a composed-string pattern, unless every static part is empty
     /// (`` `${x}` ``, `a + b`): a fully dynamic composition provides no
     /// textual evidence FOR any particular topic, and recording it would make
@@ -1080,16 +1149,16 @@ impl PubsubTopicWitnessCollector {
         }
     }
 
-    fn witnessed(&self, topic: &str) -> bool {
-        self.literals.contains(topic)
+    fn witnessed(&self, value: &str) -> bool {
+        self.literals.contains(value)
             || self
                 .template_patterns
                 .iter()
-                .any(|quasis| template_pattern_matches(quasis, topic))
+                .any(|quasis| template_pattern_matches(quasis, value))
     }
 }
 
-impl Visit for PubsubTopicWitnessCollector {
+impl Visit for LiteralWitnessCollector {
     fn visit_str(&mut self, s: &Str) {
         self.literals.insert(s.value.to_string_lossy().into_owned());
     }
@@ -3700,13 +3769,27 @@ impl FileOrchestrator {
         // dispatching route onto the rows emitted at the sites that call it.
         // Cross-file for the same reason as the pass above: the literal is in
         // the wrapper's file and the row is in the consumer's, so neither
-        // file's own pass can see both.
-        let carried = Self::carry_wrapper_dispatch(&mut file_results, &dispatch_sites, &analysed);
-        // The dispatch value a call through a declaration sends, from its own
-        // body, under the field the request line's row names (carrick#1555).
-        stats.summary_dispatch_settled = Self::settle_reached_dispatch(&mut file_results);
-        if carried > 0 {
-            debug!("  - Rows carrying a wrapper's dispatch value: {carried}");
+        // file's own pass can see both. A model row's value stands only where
+        // its own file writes it (carrick#2201).
+        let witnesses = DispatchWitnesses::of(&file_results);
+        let carry = Self::settle_wrapper_dispatch(
+            &mut file_results,
+            &dispatch_sites,
+            &analysed,
+            &witnesses,
+            &mut stats,
+        );
+        if carry.carried > 0 {
+            debug!(
+                "  - Rows carrying a wrapper's dispatch value: {} ({} over an unwitnessed value)",
+                carry.carried, carry.over_guess
+            );
+        }
+        if stats.dispatch_guesses_cleared > 0 {
+            debug!(
+                "  - Model dispatch values with no witness in their file, cleared: {}",
+                stats.dispatch_guesses_cleared
+            );
         }
 
         // PHASE 5c (carrick#1154): a call that hands a GraphQL document to a
@@ -6212,7 +6295,7 @@ impl FileOrchestrator {
     /// only-literal-topics extraction contract (`append_pubsub_operations` doc)
     /// deterministically: a kept topic must equal a string literal in the file
     /// or fit the static parts of a composed string (template literal or `+`
-    /// concatenation; see [`PubsubTopicWitnessCollector`]). Runs BEFORE
+    /// concatenation; see [`LiteralWitnessCollector`]). Runs BEFORE
     /// `merge_pubsub_anchor_ops`, so deterministic anchor ops (carrick#387) are
     /// never candidates for the drop. An unparseable file yields no witness
     /// evidence either way, so everything is kept (fail open, like the other
@@ -6223,13 +6306,9 @@ impl FileOrchestrator {
             return 0;
         }
 
-        let cm: Lrc<SourceMap> = Default::default();
-        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
-        let Some(module) = parse_file(file_path, &cm, &handler) else {
+        let Some(witnesses) = LiteralWitnessCollector::of_file(file_path) else {
             return 0;
         };
-        let mut witnesses = PubsubTopicWitnessCollector::default();
-        module.visit_with(&mut witnesses);
 
         let before = result.pubsub_operations.len();
         result.pubsub_operations.retain(|op| {
@@ -9537,23 +9616,28 @@ impl FileOrchestrator {
     /// Carry the dispatch value a wrapper's own request states onto the rows
     /// emitted at the sites that call it (carrick#872).
     ///
-    /// The value is the MODEL's, read from the wrapper's own row at the line
-    /// [`crate::wrapper_dispatch`] said the wrapper's single request sits on.
-    /// Nothing is inferred from the wrapper's source here: a wrapper the model
-    /// stated no dispatch for carries nothing, which is the right answer for a
-    /// wrapper that takes its action as a parameter and for a plain route
-    /// alike.
+    /// The value is read from the wrapper's own rows at the line
+    /// [`crate::wrapper_dispatch`] said the wrapper's single request sits on:
+    /// a request-summary row's, whose value its own body writes, in
+    /// preference to the model's, and the model's only where the wrapper's
+    /// file witnesses it. Rows there stating two different values carry
+    /// nothing, and so does a wrapper with no value at all, which is the right
+    /// answer for a wrapper that takes its action as a parameter and for a
+    /// plain route alike.
     ///
     /// Read every value BEFORE writing any of them, so a row stamped by this
     /// pass can never be read as another site's wrapper. Stamps `dispatch` and
-    /// nothing else: no target, no method, no key. A site row that already
-    /// states a value of its own keeps it — the site wrote a literal, and a
-    /// literal at the site is a stronger statement than one a delegation away.
+    /// nothing else: no target, no method, no key. A site row whose value its
+    /// own file witnesses keeps it: a literal at the site is a stronger
+    /// statement than one a delegation away. A value nothing in the site's
+    /// file writes is the model's guess (carrick#2201), and the wrapper's
+    /// value replaces it.
     fn carry_wrapper_dispatch(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         sites: &HashMap<String, HashMap<u32, DispatchSite>>,
         analysed: &HashMap<PathBuf, String>,
-    ) -> usize {
+        witnesses: &DispatchWitnesses,
+    ) -> CarriedDispatch {
         // (consumer file, site span, the wrapper's value, the member's name).
         // Sorted, because the debug line this writes is read against a scan
         // that must not reorder itself between runs.
@@ -9573,21 +9657,40 @@ impl FileOrchestrator {
                 let Ok(line) = i32::try_from(site.request_line) else {
                     continue;
                 };
-                // The wrapper's own row for that request. A file whose model
-                // answer never came, or whose request line the model said
-                // nothing about, states no value and nothing is carried.
-                let Some(dispatch) = home
+                // The wrapper's own rows for that request. A file whose model
+                // answer never came, or whose request line nothing states a
+                // value for, carries nothing.
+                let at_line: Vec<&DataCallResult> = home
                     .data_calls
                     .iter()
-                    .find(|call| {
+                    .filter(|call| {
                         (call.line_number == line || call.call_expression_line == Some(line))
-                            && call.dispatch.is_some()
+                            && call.dispatch.as_ref().is_some_and(|dispatch| {
+                                call.resolution_source == Some(ResolutionSource::RequestSummary)
+                                    || witnesses.witnessed(home_path, &dispatch.value)
+                            })
                     })
-                    .and_then(|call| call.dispatch.clone())
-                else {
+                    .collect();
+                let summarised = at_line
+                    .iter()
+                    .any(|call| call.resolution_source == Some(ResolutionSource::RequestSummary));
+                let mut values: Vec<&Dispatch> = Vec::new();
+                for value in at_line
+                    .iter()
+                    .filter(|call| {
+                        !summarised
+                            || call.resolution_source == Some(ResolutionSource::RequestSummary)
+                    })
+                    .filter_map(|call| call.dispatch.as_ref())
+                {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+                let [dispatch] = values.as_slice() else {
                     continue;
                 };
-                stamps.push((path, *span, dispatch, &site.name));
+                stamps.push((path, *span, (*dispatch).clone(), &site.name));
             }
         }
 
@@ -9595,7 +9698,7 @@ impl FileOrchestrator {
             .into_iter()
             .map(|(path, span, dispatch, name)| (path.clone(), span, dispatch, name.clone()))
             .collect();
-        let mut carried = 0;
+        let mut carry = CarriedDispatch::default();
         for (path, span, dispatch, name) in stamps {
             let Some(result) = file_results.get_mut(&path) else {
                 continue;
@@ -9605,20 +9708,95 @@ impl FileOrchestrator {
                 // body writes (carrick#1564 review, finding 9); a wrapper's
                 // model value is not that.
                 if data_call.call_expression_span_start != Some(span)
-                    || data_call.dispatch.is_some()
                     || data_call.resolution_source == Some(ResolutionSource::RequestSummary)
                 {
                     continue;
                 }
+                let guessed = match &data_call.dispatch {
+                    Some(stated) if witnesses.witnessed(&path, &stated.value) => continue,
+                    Some(_) => true,
+                    None => false,
+                };
                 debug!(
                     "Carrying dispatch {}={} from {} onto {}:{}",
                     dispatch.field, dispatch.value, name, path, data_call.line_number
                 );
                 data_call.dispatch = Some(dispatch.clone());
-                carried += 1;
+                carry.carried += 1;
+                if guessed {
+                    carry.over_guess += 1;
+                }
+                carry.sites.insert((path.clone(), span));
             }
         }
-        carried
+        carry
+    }
+
+    /// PHASE 5b's dispatch values, in the order they depend on each other
+    /// (carrick#2201):
+    ///
+    /// 1. The summary rows settle: the value a call through a declaration
+    ///    sends, from its own body, under the field the request line's row
+    ///    names (carrick#1555). A wrapper's request row is often one of them,
+    ///    so this runs first, or the carry finds no value at its line.
+    /// 2. The carry stamps the wrapper's value onto the sites that call it
+    ///    (carrick#872), over a site value its file does not witness.
+    /// 3. Every model value still unwitnessed is cleared.
+    fn settle_wrapper_dispatch(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
+        analysed: &HashMap<PathBuf, String>,
+        witnesses: &DispatchWitnesses,
+        stats: &mut ProcessingStats,
+    ) -> CarriedDispatch {
+        stats.summary_dispatch_settled = Self::settle_reached_dispatch(file_results);
+        let carry = Self::carry_wrapper_dispatch(file_results, sites, analysed, witnesses);
+        stats.dispatch_carried_over_guess = carry.over_guess;
+        stats.dispatch_guesses_cleared =
+            Self::clear_unwitnessed_dispatch(file_results, witnesses, &carry.sites);
+        carry
+    }
+
+    /// Clear the dispatch value on every model row whose file does not
+    /// witness it and that the carry did not replace (carrick#2201).
+    ///
+    /// The model reads a dispatch value off a call, and where the call is a
+    /// client method it makes one up from the method's name. A value the
+    /// file writes nowhere is that guess, and a guess stated as the call's
+    /// case is a `missing_endpoint` the route never had. Cleared, the row
+    /// keeps its field-less edge to the route and reads as a dispatch value
+    /// unknown. A file that does not parse keeps its values (fail open, as
+    /// carrick#311 does). Returns the number of values cleared.
+    fn clear_unwitnessed_dispatch(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        witnesses: &DispatchWitnesses,
+        carried: &HashSet<(String, u32)>,
+    ) -> usize {
+        let mut cleared = 0;
+        for (path, result) in file_results.iter_mut() {
+            for call in &mut result.data_calls {
+                if call.resolution_source != Some(ResolutionSource::Model) {
+                    continue;
+                }
+                let Some(dispatch) = &call.dispatch else {
+                    continue;
+                };
+                if call
+                    .call_expression_span_start
+                    .is_some_and(|span| carried.contains(&(path.clone(), span)))
+                    || witnesses.witnessed(path, &dispatch.value)
+                {
+                    continue;
+                }
+                debug!(
+                    "Clearing dispatch {}={} at {}:{}: no literal in the file states it",
+                    dispatch.field, dispatch.value, path, call.line_number
+                );
+                call.dispatch = None;
+                cleared += 1;
+            }
+        }
+        cleared
     }
 
     /// The path a data call is KEYED on — the one canonicalization every reader
@@ -19605,29 +19783,41 @@ export { routes };
         );
     }
 
-    /// carrick#872: the value the wrapper's own request states reaches the row
-    /// at the site that calls the wrapper, and nothing else on that row moves.
-    #[test]
-    fn carry_wrapper_dispatch_stamps_the_site_row_from_the_wrapper_s_row() {
-        let mut client = FileAnalysisResult::default();
-        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        wrapper_row.dispatch = Some(Dispatch {
+    /// The literal witnesses each named file states, for the dispatch carry
+    /// and clear (carrick#2201).
+    fn witnesses(files: &[(&str, &[&str])]) -> DispatchWitnesses {
+        DispatchWitnesses(
+            files
+                .iter()
+                .map(|(path, literals)| {
+                    (
+                        path.to_string(),
+                        Some(LiteralWitnessCollector {
+                            literals: literals.iter().map(|value| value.to_string()).collect(),
+                            template_patterns: Vec::new(),
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn action(value: &str) -> Option<Dispatch> {
+        Some(Dispatch {
             location: DispatchLocation::Body,
             field: "action".to_string(),
-            value: "search-by-intent".to_string(),
-        });
-        client.data_calls.push(wrapper_row);
-        let mut consumer = FileAnalysisResult::default();
-        consumer
-            .data_calls
-            .push(call_with_span(4, "/rpc/gateway", Some(100)));
-        let mut file_results = HashMap::from([
-            ("client.ts".to_string(), client),
-            ("consumer.ts".to_string(), consumer),
-        ]);
+            value: value.to_string(),
+        })
+    }
 
-        let carried = FileOrchestrator::carry_wrapper_dispatch(
-            &mut file_results,
+    /// `consumer.ts` calls the wrapper at span 100, whose single request is
+    /// line 19 of `client.ts`.
+    fn carry_into_consumer(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        witnesses: &DispatchWitnesses,
+    ) -> CarriedDispatch {
+        FileOrchestrator::carry_wrapper_dispatch(
+            file_results,
             &HashMap::from([(
                 "consumer.ts".to_string(),
                 HashMap::from([(
@@ -19640,16 +19830,63 @@ export { routes };
                 )]),
             )]),
             &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+            witnesses,
+        )
+    }
+
+    /// A wrapper file whose request line holds `rows`, and a consumer whose
+    /// site row states `site`.
+    fn wrapper_and_site(
+        rows: Vec<DataCallResult>,
+        site: Option<Dispatch>,
+    ) -> HashMap<String, FileAnalysisResult> {
+        let client = FileAnalysisResult {
+            data_calls: rows,
+            ..Default::default()
+        };
+        let mut consumer = FileAnalysisResult::default();
+        let mut site_row = call_with_span(4, "/rpc/gateway", Some(100));
+        site_row.dispatch = site;
+        site_row.resolution_source = Some(ResolutionSource::Model);
+        consumer.data_calls.push(site_row);
+        HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ])
+    }
+
+    fn wrapper_row(value: &str, source: ResolutionSource) -> DataCallResult {
+        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
+        row.dispatch = action(value);
+        row.resolution_source = Some(source);
+        row
+    }
+
+    fn site_value(file_results: &HashMap<String, FileAnalysisResult>) -> Option<&str> {
+        file_results["consumer.ts"].data_calls[0]
+            .dispatch
+            .as_ref()
+            .map(|d| d.value.as_str())
+    }
+
+    /// carrick#872: the value the wrapper's own request states reaches the row
+    /// at the site that calls the wrapper, and nothing else on that row moves.
+    #[test]
+    fn carry_wrapper_dispatch_stamps_the_site_row_from_the_wrapper_s_row() {
+        let mut file_results = wrapper_and_site(
+            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
+            None,
         );
 
-        assert_eq!(carried, 1);
-        let row = &file_results["consumer.ts"].data_calls[0];
-        assert_eq!(
-            row.dispatch.as_ref().map(|d| d.value.as_str()),
-            Some("search-by-intent")
+        let carry = carry_into_consumer(
+            &mut file_results,
+            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
         );
+
+        assert_eq!((carry.carried, carry.over_guess), (1, 0));
+        assert_eq!(site_value(&file_results), Some("search-by-intent"));
         assert_eq!(
-            row.target, "/rpc/gateway",
+            file_results["consumer.ts"].data_calls[0].target, "/rpc/gateway",
             "the carry states a value, never a target"
         );
     }
@@ -19659,37 +19896,14 @@ export { routes };
     /// exactly where it was.
     #[test]
     fn carry_wrapper_dispatch_carries_nothing_from_a_wrapper_with_no_value() {
-        let mut client = FileAnalysisResult::default();
-        client
-            .data_calls
-            .push(call_with_span(19, "${this.gatewayUrl}", Some(400)));
-        let mut consumer = FileAnalysisResult::default();
-        consumer
-            .data_calls
-            .push(call_with_span(4, "/rpc/gateway", Some(100)));
-        let mut file_results = HashMap::from([
-            ("client.ts".to_string(), client),
-            ("consumer.ts".to_string(), consumer),
-        ]);
+        let mut row = call_with_span(19, "${this.gatewayUrl}", Some(400));
+        row.resolution_source = Some(ResolutionSource::Model);
+        let mut file_results = wrapper_and_site(vec![row], None);
 
-        let carried = FileOrchestrator::carry_wrapper_dispatch(
-            &mut file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "searchByIntent".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
-        );
+        let carry = carry_into_consumer(&mut file_results, &witnesses(&[]));
 
-        assert_eq!(carried, 0);
-        assert!(file_results["consumer.ts"].data_calls[0].dispatch.is_none());
+        assert_eq!(carry.carried, 0);
+        assert_eq!(site_value(&file_results), None);
     }
 
     /// A row the request summaries state carries only the value its own body
@@ -19697,91 +19911,190 @@ export { routes };
     /// it states none (carrick#1564 review, finding 9).
     #[test]
     fn carry_wrapper_dispatch_leaves_a_row_the_source_states() {
-        let mut client = FileAnalysisResult::default();
-        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        wrapper_row.dispatch = Some(Dispatch {
-            location: DispatchLocation::Body,
-            field: "action".to_string(),
-            value: "findSimilar".to_string(),
-        });
-        client.data_calls.push(wrapper_row);
-        let mut consumer = FileAnalysisResult::default();
-        let mut site_row = call_with_span(4, "/rpc/gateway", Some(100));
-        site_row.resolution_source = Some(ResolutionSource::RequestSummary);
-        consumer.data_calls.push(site_row);
-        let mut file_results = HashMap::from([
-            ("client.ts".to_string(), client),
-            ("consumer.ts".to_string(), consumer),
-        ]);
+        let mut file_results = wrapper_and_site(
+            vec![wrapper_row("findSimilar", ResolutionSource::Model)],
+            None,
+        );
+        file_results.get_mut("consumer.ts").unwrap().data_calls[0].resolution_source =
+            Some(ResolutionSource::RequestSummary);
 
-        let carried = FileOrchestrator::carry_wrapper_dispatch(
+        let carry = carry_into_consumer(
             &mut file_results,
-            &HashMap::from([(
-                "consumer.ts".to_string(),
-                HashMap::from([(
-                    100,
-                    DispatchSite {
-                        name: "findSimilar".to_string(),
-                        module: PathBuf::from("/repo/client.ts"),
-                        request_line: 19,
-                    },
-                )]),
-            )]),
-            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+            &witnesses(&[("client.ts", &["findSimilar"])]),
         );
 
-        assert_eq!(carried, 0);
-        assert!(file_results["consumer.ts"].data_calls[0].dispatch.is_none());
+        assert_eq!(carry.carried, 0);
+        assert_eq!(site_value(&file_results), None);
     }
 
-    /// A site that states a literal of its OWN keeps it: a value written at
-    /// the site is a stronger statement than one a delegation away.
+    /// A site whose own file writes its value keeps it: a literal at the site
+    /// is a stronger statement than one a delegation away.
     #[test]
-    fn carry_wrapper_dispatch_leaves_a_site_that_states_its_own_value() {
-        let mut client = FileAnalysisResult::default();
-        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
-        wrapper_row.dispatch = Some(Dispatch {
-            location: DispatchLocation::Body,
-            field: "action".to_string(),
-            value: "search-by-intent".to_string(),
-        });
-        client.data_calls.push(wrapper_row);
-        let mut consumer = FileAnalysisResult::default();
-        let mut site_row = call_with_span(4, "/rpc/gateway", Some(100));
-        site_row.dispatch = Some(Dispatch {
-            location: DispatchLocation::Body,
-            field: "action".to_string(),
-            value: "list-external-calls".to_string(),
-        });
-        consumer.data_calls.push(site_row);
-        let mut file_results = HashMap::from([
-            ("client.ts".to_string(), client),
-            ("consumer.ts".to_string(), consumer),
-        ]);
+    fn carry_wrapper_dispatch_keeps_a_witnessed_site_value() {
+        let mut file_results = wrapper_and_site(
+            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
+            action("list-external-calls"),
+        );
 
-        let carried = FileOrchestrator::carry_wrapper_dispatch(
+        let carry = carry_into_consumer(
+            &mut file_results,
+            &witnesses(&[
+                ("client.ts", &["search-by-intent"]),
+                ("consumer.ts", &["list-external-calls"]),
+            ]),
+        );
+
+        assert_eq!(carry.carried, 0);
+        assert_eq!(site_value(&file_results), Some("list-external-calls"));
+    }
+
+    /// carrick#2201: a site value no literal in the site's file writes is the
+    /// model's guess from the method name, and the wrapper's value replaces it.
+    #[test]
+    fn carry_wrapper_dispatch_replaces_an_unwitnessed_site_value() {
+        let mut file_results = wrapper_and_site(
+            vec![wrapper_row("search-by-intent", ResolutionSource::Model)],
+            action("searchByIntent"),
+        );
+
+        let carry = carry_into_consumer(
+            &mut file_results,
+            &witnesses(&[("client.ts", &["search-by-intent"]), ("consumer.ts", &[])]),
+        );
+
+        assert_eq!((carry.carried, carry.over_guess), (1, 1));
+        assert_eq!(site_value(&file_results), Some("search-by-intent"));
+        assert!(
+            carry.sites.contains(&("consumer.ts".to_string(), 100)),
+            "the clear must not undo the carried value"
+        );
+    }
+
+    /// carrick#2201: at the wrapper's request line, the request summary's
+    /// value (its own body's) is carried in preference to the model's.
+    #[test]
+    fn carry_wrapper_dispatch_prefers_the_request_summary_row() {
+        let mut file_results = wrapper_and_site(
+            vec![
+                wrapper_row("get-everything", ResolutionSource::Model),
+                wrapper_row("get-cross-repo-data", ResolutionSource::RequestSummary),
+            ],
+            None,
+        );
+
+        let carry = carry_into_consumer(
+            &mut file_results,
+            &witnesses(&[("client.ts", &["get-everything", "get-cross-repo-data"])]),
+        );
+
+        assert_eq!(carry.carried, 1);
+        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
+    }
+
+    /// carrick#2201: rows at the wrapper's request line that state two
+    /// different values leave the wrapper's value unknown, so nothing is
+    /// carried.
+    #[test]
+    fn carry_wrapper_dispatch_carries_nothing_from_two_values() {
+        let mut file_results = wrapper_and_site(
+            vec![
+                wrapper_row("refresh-index", ResolutionSource::Model),
+                wrapper_row("refresh-cache", ResolutionSource::Model),
+            ],
+            None,
+        );
+
+        let carry = carry_into_consumer(
+            &mut file_results,
+            &witnesses(&[("client.ts", &["refresh-index", "refresh-cache"])]),
+        );
+
+        assert_eq!(carry.carried, 0);
+        assert_eq!(site_value(&file_results), None);
+    }
+
+    /// One model row at span 100 of `consumer.ts` stating `value`, cleared
+    /// against a file that writes `literals`; the row's value afterwards.
+    fn cleared_against(value: &str, literals: &[&str]) -> (usize, Option<String>) {
+        let mut row = call_with_span(4, "/rpc/gateway", Some(100));
+        row.dispatch = action(value);
+        row.resolution_source = Some(ResolutionSource::Model);
+        let mut consumer = FileAnalysisResult::default();
+        consumer.data_calls.push(row);
+        let mut file_results = HashMap::from([("consumer.ts".to_string(), consumer)]);
+        let cleared = FileOrchestrator::clear_unwitnessed_dispatch(
+            &mut file_results,
+            &witnesses(&[("consumer.ts", literals)]),
+            &HashSet::new(),
+        );
+        let after = file_results["consumer.ts"].data_calls[0]
+            .dispatch
+            .as_ref()
+            .map(|d| d.value.clone());
+        (cleared, after)
+    }
+
+    /// carrick#2201: an unwitnessed model value no wrapper reaches is cleared.
+    #[test]
+    fn clear_unwitnessed_dispatch_clears_a_value_the_file_never_writes() {
+        assert_eq!(
+            cleared_against("refresh-everything", &["purge-cache"]),
+            (1, None)
+        );
+    }
+
+    /// carrick#2201: a model value its own file writes stays.
+    #[test]
+    fn clear_unwitnessed_dispatch_keeps_a_witnessed_value() {
+        assert_eq!(
+            cleared_against("purge-cache", &["purge-cache"]),
+            (0, Some("purge-cache".to_string()))
+        );
+    }
+
+    /// carrick#2201: the wrapper's request row is a request summary, which
+    /// holds its body's value only once the summary rows settle. Settling runs
+    /// before the carry, so the site's guess is replaced by that value rather
+    /// than cleared.
+    #[test]
+    fn settle_wrapper_dispatch_carries_a_value_the_summary_settles() {
+        let mut request = call_with_span(19, "${config.apiEndpoint}/rpc/gateway", Some(400));
+        request.method = Some("POST".to_string());
+        request.resolution_source = Some(ResolutionSource::RequestSummary);
+        request.body_literals =
+            BTreeMap::from([("action".to_string(), "get-cross-repo-data".to_string())]);
+        let mut file_results = wrapper_and_site(vec![request], action("get-all-repo-data"));
+        file_results.get_mut("consumer.ts").unwrap().data_calls[0].method =
+            Some("POST".to_string());
+
+        let mut stats = ProcessingStats::default();
+        let carry = FileOrchestrator::settle_wrapper_dispatch(
             &mut file_results,
             &HashMap::from([(
                 "consumer.ts".to_string(),
                 HashMap::from([(
                     100,
                     DispatchSite {
-                        name: "searchByIntent".to_string(),
+                        name: "getAllRepoData".to_string(),
                         module: PathBuf::from("/repo/client.ts"),
                         request_line: 19,
                     },
                 )]),
             )]),
             &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+            &witnesses(&[("consumer.ts", &[])]),
+            &mut stats,
         );
 
-        assert_eq!(carried, 0);
+        assert_eq!((carry.carried, carry.over_guess), (1, 1));
+        assert_eq!(site_value(&file_results), Some("get-cross-repo-data"));
         assert_eq!(
-            file_results["consumer.ts"].data_calls[0]
-                .dispatch
-                .as_ref()
-                .map(|d| d.value.as_str()),
-            Some("list-external-calls")
+            (
+                stats.summary_dispatch_settled,
+                stats.dispatch_carried_over_guess,
+                stats.dispatch_guesses_cleared
+            ),
+            (1, 1, 0)
         );
     }
 

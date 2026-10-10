@@ -320,6 +320,8 @@ fn test_processing_stats_tracking() {
         deterministic_rows_emitted: Default::default(),
         summary_rows_withdrawn: 0,
         summary_dispatch_settled: 0,
+        dispatch_carried_over_guess: 0,
+        dispatch_guesses_cleared: 0,
         model_rows_joined: 0,
         model_rows_reconciled: 0,
         model_routes_kept_without_a_site: 0,

@@ -1,0 +1,60 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "/rpc/gateway",
+      "method": "POST",
+      "pattern_matched": "client.getAllRepoData(",
+      "call_expression_text": "client.getAllRepoData()",
+      "call_expression_line": 7,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "get-all-repo-data"
+      }
+    },
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "/rpc/gateway",
+      "method": "POST",
+      "pattern_matched": "client.refreshEverything(",
+      "call_expression_text": "client.refreshEverything()",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "refresh-everything"
+      }
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/rpc/gateway",
+      "method": "POST",
+      "pattern_matched": "client.send(",
+      "call_expression_text": "client.send(\"purge-cache\", {})",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "purge-cache"
+      }
+    }
+  ]
+}
