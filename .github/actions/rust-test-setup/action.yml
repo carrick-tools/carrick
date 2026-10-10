@@ -54,7 +54,27 @@ runs:
       with:
         deno-version: "2.9.4"
 
+    # Fixture dependencies. `express-single` and `fastify-api` have no
+    # lockfile, so on a miss `npm install` resolves whatever is newest and
+    # writes one; the cache then holds that tree (lockfile included, the
+    # sidecar reads it) until a fixture `package.json` or lockfile changes.
+    # Saved by this step's post hook on a miss, on any ref, so a pull request
+    # fills it for its own re-runs and main-cache.yml fills it for everyone.
+    - name: Restore test dependencies
+      id: fixture-deps
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          examples/express-single/node_modules
+          examples/express-single/package-lock.json
+          tests/fixtures/imported-routers/node_modules
+          tests/fixtures/fastify-api/node_modules
+          tests/fixtures/fastify-api/package-lock.json
+          tests/fixtures/koa-api/node_modules
+        key: ${{ runner.os }}-fixture-deps-node24-${{ hashFiles('examples/express-single/package.json', 'tests/fixtures/imported-routers/package.json', 'tests/fixtures/imported-routers/package-lock.json', 'tests/fixtures/fastify-api/package.json', 'tests/fixtures/koa-api/package.json', 'tests/fixtures/koa-api/package-lock.json') }}
+
     - name: Install test dependencies
+      if: steps.fixture-deps.outputs.cache-hit != 'true'
       shell: bash
       run: |
         cd examples/express-single && npm install
@@ -62,6 +82,19 @@ runs:
         cd ../fastify-api && npm install
         cd ../koa-api && npm install
 
+    # Built sidecar. The key covers every input of `npm ci && tsc`: the
+    # lockfile, package.json, tsconfig.json and everything its `include`
+    # names (src/**, test/**), so a sidecar source edit misses and rebuilds.
+    - name: Restore built sidecar
+      id: sidecar
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          src/sidecar/node_modules
+          src/sidecar/dist
+        key: ${{ runner.os }}-sidecar-build-node24-${{ hashFiles('src/sidecar/package-lock.json', 'src/sidecar/package.json', 'src/sidecar/tsconfig.json', 'src/sidecar/src/**', 'src/sidecar/test/**') }}
+
     - name: Build sidecar
+      if: steps.sidecar.outputs.cache-hit != 'true'
       shell: bash
       run: cd src/sidecar && npm ci && npm run build

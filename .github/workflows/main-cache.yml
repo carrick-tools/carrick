@@ -3,8 +3,10 @@ name: Main cache
 # Saves the Rust test dependency cache on main, which is the only ref other
 # branches and the merge queue can restore a cache from. CI no longer runs on
 # push to main (carrick#2149), so this is the one job that does. It runs only
-# when a Cargo.lock changed, because the cache key is the lockfile hash:
-# any other push to main would find its exact key already saved. The save
+# when a Cargo.lock, a fixture package file or a sidecar file changed, because
+# each cache key is a hash of those inputs: any other push to main would find
+# its exact keys already saved. rust-test-setup saves the fixture node_modules
+# and built sidecar caches itself on a miss (this job runs it). The save
 # itself is `rust-test-cache-save`, the same step the CI shards use, and it
 # skips when the restore hit the exact key.
 
@@ -13,6 +15,10 @@ on:
     branches: [main]
     paths:
       - "**/Cargo.lock"
+      - "examples/express-single/package.json"
+      - "tests/fixtures/*/package.json"
+      - "tests/fixtures/*/package-lock.json"
+      - "src/sidecar/**"
   workflow_dispatch:
 
 permissions:
