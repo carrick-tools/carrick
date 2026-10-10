@@ -1,0 +1,12 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {"candidate_id": "span:237-288", "line_number": 6, "target": "/api/notes/${existing.id}", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(url", "call_expression_line": 6, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:384-525", "line_number": 10, "target": "/api/notes/${existing.id}", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(existing ? `/api/notes/${existing.id}` : \"/api/notes\"", "call_expression_line": 10, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:586-649", "line_number": 17, "target": "/api/notes/reorder", "method": "PUT", "pattern_matched": "fetch(", "call_expression_text": "fetch(\"/api/notes/reorder\"", "call_expression_line": 17, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:847-869", "line_number": 23, "target": "/api/notes/${id}", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(url", "call_expression_line": 23, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:1037-1059", "line_number": 29, "target": "/api/notes/${id}", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(url", "call_expression_line": 29, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null},
+    {"candidate_id": "span:1262-1284", "line_number": 36, "target": "/api/notes/${id}", "method": "POST", "pattern_matched": "fetch(", "call_expression_text": "fetch(url", "call_expression_line": 36, "payload_expression_text": null, "payload_expression_line": null, "primary_type_symbol": null, "type_import_source": null}
+  ]
+}

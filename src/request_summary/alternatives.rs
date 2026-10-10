@@ -1,14 +1,20 @@
-//! What a conditional leaves a request's URL able to read as (carrick#2050).
+//! What a conditional leaves a request's URL or method able to read as
+//! (carrick#2050, carrick#2051).
 //!
 //! ```ignore
 //! const segment = kind === "draft" ? `drafts/${id}` : `posts/${id}`;
 //! await fetch(`/api/content/${segment}/publish`, { method: "POST" });
+//!
+//! const method = existing ? "PATCH" : "POST";
+//! const url = existing ? `/api/notes/${existing.id}` : "/api/notes";
+//! await fetch(url, { method });
 //! ```
 //!
 //! A value read through a conditional is not one value. [`Reader::eval`]
 //! keeps the expression's text as an opaque value, which a URL then reads as
 //! one path parameter: here that is a path one segment shorter than either
-//! route the branches write.
+//! route the branches write, and a method taken from one branch beside a URL
+//! taken from the other.
 //!
 //! This reads the branches themselves. A value is a set of readings
 //! ([`Alternatives`]), each holding the branch every test took in it, and a
@@ -25,6 +31,16 @@
 //!   stated. Tests on names unrelated to each other are independent and
 //!   combine freely, and a test written inside a branch of another only
 //!   refines that branch (`mode === "a" ? A : mode === "b" ? B : C`).
+//! - **One test is one choice** (carrick#2051). A method and a URL chosen by
+//!   the same test (the same stable expression: a name, a member of one, a
+//!   comparison or negation of those) pair branch with branch:
+//!   `!existing ? "POST" : "PATCH"` beside `existing ? … : …` pairs `POST`
+//!   with the URL's alternate. A test that calls a function, or reads a name
+//!   the function assigns again, is not the same test twice.
+//! - **Tests that differ pair nothing.** When both the method and the URL
+//!   choose and no test is shared, or two different tests on one name are
+//!   split between them, the source does not say which method goes with
+//!   which URL, and no row is stated.
 //! - **A value that may hold a `/` is no path parameter.** Where one branch
 //!   writes a path and the other is a value nothing here read, the slot may
 //!   span segments, so the request states no row rather than a placeholder
@@ -34,7 +50,7 @@
 //!   route.**
 //!
 //! Everything else is read exactly as before: this module only answers where
-//! a conditional is reachable from the URL.
+//! a conditional is reachable from the URL or the method.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +58,7 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 
 use super::{MethodValue, Piece, Reader, Scope, Value, concat, ident_key, render_target};
+use crate::type_manifest::is_http_method;
 
 /// How many readings a value may have before it is left as the opaque text it
 /// always was.
@@ -201,6 +218,20 @@ impl Alternatives {
             tests,
             entangled: tangled,
         })
+    }
+
+    /// Each reading as a method, when every one is a literal verb.
+    fn as_methods(&self) -> Option<Vec<(Taken, MethodValue)>> {
+        self.readings
+            .iter()
+            .map(|reading| match reading.pieces.as_slice() {
+                [Piece::Lit(verb)] if is_http_method(verb) => Some((
+                    reading.taken.clone(),
+                    MethodValue::Lit(verb.trim().to_uppercase()),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -393,54 +424,114 @@ impl Reader<'_> {
         }
     }
 
-    /// The requests a call sends when a conditional chooses its URL
-    /// (carrick#2050). `method` is what the call read its method as.
+    /// The requests a call sends when a conditional chooses its URL or its
+    /// method (carrick#2050, carrick#2051). `url` and `method` are what the
+    /// call read as before.
     pub(super) fn alternation(
         &self,
         url_expr: Option<&Expr>,
+        method_expr: Option<&Expr>,
+        url: &[Piece],
         method: &MethodValue,
         scope: &Scope<'_>,
     ) -> Alternation {
-        let Some(readings) = url_expr.and_then(|expr| self.alternatives(expr, scope)) else {
-            return Alternation::Single;
-        };
-        // A reading that states a path states one with no empty segment in
-        // it; one that waits on a caller is a caller's to settle.
-        let states = |pieces: &[Piece]| {
-            pieces.iter().any(Piece::is_parameter)
-                || render_target(pieces)
-                    .is_some_and(|target| !target.replace("://", "").contains("//"))
-        };
-        if readings.poisoned && !readings.leading {
-            return Alternation::Nothing;
-        }
-        // A base chosen by a test, or a branch that states no route of its
-        // own: read as it was before a conditional was.
-        if readings.poisoned || !readings.readings.iter().all(|r| states(&r.pieces)) {
-            return Alternation::Single;
-        }
+        let method_readings = method_expr.and_then(|expr| self.alternatives(expr, scope));
+        let methods = method_readings
+            .as_ref()
+            .and_then(Alternatives::as_methods)
+            .filter(|methods| methods.len() > 1);
         // Two different tests on one name: some combinations of their
         // branches cannot be taken together, and nothing here says which.
-        if readings.entangled {
+        if methods.is_some() && method_readings.as_ref().is_some_and(|m| m.entangled) {
             return Alternation::Nothing;
         }
+        let mut urls = url_expr.and_then(|expr| self.alternatives(expr, scope));
+        if let Some(readings) = &urls {
+            // A reading that states a path states one with no empty segment
+            // in it; one that waits on a caller is a caller's to settle.
+            let states = |pieces: &[Piece]| {
+                pieces.iter().any(Piece::is_parameter)
+                    || render_target(pieces)
+                        .is_some_and(|target| !target.replace("://", "").contains("//"))
+            };
+            if readings.poisoned && !readings.leading {
+                return Alternation::Nothing;
+            }
+            // A base chosen by a test, or a branch that states no route of
+            // its own: read as it was before a conditional was.
+            if readings.poisoned || !readings.readings.iter().all(|r| states(&r.pieces)) {
+                urls = None;
+            } else if readings.entangled {
+                // Two different tests on one name in the URL.
+                return Alternation::Nothing;
+            }
+        }
+        if urls.is_none() && methods.is_none() {
+            return Alternation::Single;
+        }
+        // Both choose, and no test is shared: nothing in the source says
+        // which method goes with which URL.
+        if let (Some(urls), Some(methods)) = (&urls, &methods) {
+            let tests = |taken: &mut dyn Iterator<Item = &Taken>| -> BTreeSet<String> {
+                taken.flat_map(|taken| taken.keys().cloned()).collect()
+            };
+            let in_url = tests(&mut urls.readings.iter().map(|reading| &reading.taken));
+            let in_method = tests(&mut methods.iter().map(|(taken, _)| taken));
+            if in_url.is_disjoint(&in_method) {
+                return Alternation::Nothing;
+            }
+        }
+        // Every test the method and the URL read, for the pairs below.
+        let tests = tests_of(
+            &urls
+                .as_ref()
+                .map(|urls| urls.tests.clone())
+                .unwrap_or_default(),
+            &method_readings
+                .as_ref()
+                .map(|readings| readings.tests.clone())
+                .unwrap_or_default(),
+        );
+        let url_rows: Vec<(Taken, Vec<Piece>)> = match urls {
+            Some(urls) => urls
+                .readings
+                .into_iter()
+                .map(|reading| (reading.taken, reading.pieces))
+                .collect(),
+            None => vec![(Taken::new(), url.to_vec())],
+        };
+        let method_rows: Vec<(Taken, MethodValue)> =
+            methods.unwrap_or_else(|| vec![(Taken::new(), method.clone())]);
         // Readings that differ only in a query or a fragment reach one route.
         // The one without the query is the one that is kept.
-        let mut routes: BTreeMap<Vec<Piece>, Vec<Piece>> = BTreeMap::new();
-        for reading in readings.readings {
-            routes
-                .entry(without_query(&reading.pieces))
-                .and_modify(|held| {
-                    if reading.pieces < *held {
-                        held.clone_from(&reading.pieces);
-                    }
-                })
-                .or_insert(reading.pieces);
+        let mut routes: BTreeMap<(MethodValue, Vec<Piece>), Vec<Piece>> = BTreeMap::new();
+        for (url_taken, pieces) in &url_rows {
+            for (method_taken, verb) in &method_rows {
+                if together(url_taken, method_taken).is_none() {
+                    continue;
+                }
+                // Two different tests on one name split between the method
+                // and the URL: this pair may be one the source cannot send.
+                if entangled(url_taken, method_taken, &tests) {
+                    return Alternation::Nothing;
+                }
+                routes
+                    .entry((verb.clone(), without_query(pieces)))
+                    .and_modify(|held| {
+                        if pieces < held {
+                            held.clone_from(pieces);
+                        }
+                    })
+                    .or_insert_with(|| pieces.clone());
+            }
+        }
+        if routes.is_empty() {
+            return Alternation::Nothing;
         }
         Alternation::Rows(
             routes
-                .into_values()
-                .map(|pieces| (method.clone(), pieces))
+                .into_iter()
+                .map(|((verb, _), pieces)| (verb, pieces))
                 .collect(),
         )
     }
@@ -495,5 +586,31 @@ fn is_stable(expr: &Expr, scope: &Scope<'_>) -> bool {
                 && is_stable(&bin.right, scope)
         }
         _ => false,
+    }
+}
+
+/// The expression a call's options object writes its `method` as, when it
+/// writes one last.
+pub(super) fn method_expr(options: &Expr) -> Option<Expr> {
+    let Expr::Object(object) = options.unwrap_parens() else {
+        return None;
+    };
+    object.props.iter().rev().find_map(|prop| match prop {
+        PropOrSpread::Prop(prop) => match &**prop {
+            Prop::KeyValue(pair) if prop_name(&pair.key).as_deref() == Some("method") => {
+                Some((*pair.value).clone())
+            }
+            Prop::Shorthand(ident) if ident.sym == *"method" => Some(Expr::Ident(ident.clone())),
+            _ => None,
+        },
+        PropOrSpread::Spread(_) => None,
+    })
+}
+
+fn prop_name(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(text) => Some(text.value.to_string_lossy().into_owned()),
+        _ => None,
     }
 }
