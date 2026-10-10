@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.113](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.112...carrick-v0.3.113) (2026-10-10)
+
+
+### CI/CD
+
+* cancel superseded pull_request runs ([#2194](https://github.com/carrick-tools/carrick/issues/2194)) ([e720aec](https://github.com/carrick-tools/carrick/commit/e720aec5da61461a4aa00e9e644514b7a3d44362))
+* gate every job in CI result; smoke the release binary in Build ([#2198](https://github.com/carrick-tools/carrick/issues/2198)) ([449a4be](https://github.com/carrick-tools/carrick/commit/449a4be9e5356cc4845e196e6f4f60f191f99ba8))
+
 ## [0.3.112](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.111...carrick-v0.3.112) (2026-10-10)
 
 
