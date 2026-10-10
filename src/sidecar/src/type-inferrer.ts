@@ -5740,18 +5740,15 @@ export class TypeInferrer {
 
   /**
    * True when a declared parameter type does not say what is sent: a top
-   * type, the bare `object`/`{}`, or a type that mentions a type parameter.
+   * type, an object type that names no member (`object`, `{}`,
+   * `Record<string, unknown>`), or a type that mentions a type parameter.
+   * A builder that takes "any object" states nothing about the payload a
+   * call hands it, so the argument's own type is read instead.
    */
   private typeNodeStatesNothing(typeNode: Node): boolean {
     const type = typeNode.getType();
     if (type.isAny() || type.isUnknown() || type.isTypeParameter()) return true;
-    if (
-      type.isObject() &&
-      !type.isArray() &&
-      type.getProperties().length === 0 &&
-      !type.getStringIndexType() &&
-      !type.getNumberIndexType()
-    ) {
+    if (type.isObject() && !type.isArray() && type.getProperties().length === 0) {
       return true;
     }
     return [typeNode, ...typeNode.getDescendants()].some(

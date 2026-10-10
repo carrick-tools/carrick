@@ -161,6 +161,14 @@ export async function declaredPayload() { // DECLARED
   return respondWith(200, { balance: 1 });
 }
 
+function wide(code: number, payload: Record<string, unknown>): Envelope {
+  return { statusCode: code, body: JSON.stringify(payload) };
+}
+
+export async function widePayload() { // WIDE
+  return wide(200, { total: 3 });
+}
+
 export async function archive() { // ARCHIVE
   if (flag) return reply(200, { archived: true });
   const out: Envelope = { statusCode: 200, body: JSON.stringify({ archived: false }) };
@@ -392,6 +400,13 @@ describe('carrick#2200: a serialised-body envelope publishes what it serialised'
     assert.strictEqual(collapse(inferred.type_string), '{ balance: number; }');
     assert.strictEqual(inferred.is_explicit, true);
     assert.strictEqual(inferred.primary_type_symbol, 'CreditResult');
+  });
+
+  it('reads the argument when the builder declares a type that names no member', async () => {
+    const inferred = await inferReturn('WIDE');
+    assertNoEnvelope(inferred);
+    assert.strictEqual(collapse(inferred.type_string), '{ total: number; }');
+    assert.strictEqual(inferred.is_explicit, false);
   });
 
   it('answers unknown when one branch returns an identifier', async () => {
