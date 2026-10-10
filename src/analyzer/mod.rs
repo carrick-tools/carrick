@@ -614,6 +614,31 @@ fn verdict_state_for(outcome: &PairCheckOutcome) -> crate::findings::VerdictStat
 /// Apply it where a stored location is RENDERED. Not where one is JOINED: the
 /// compat-verdict join pairs a call's location against the manifest's
 /// `consumer_file`, and stripping one side only would break the join.
+/// What one side of a type-mismatch finding can be labelled with: its anchor
+/// symbol, its expanded type text, and the display name its alias falls back
+/// to.
+struct SideLabel {
+    symbol: Option<String>,
+    text: Option<String>,
+    display: String,
+}
+
+/// The producer and consumer labels a type-mismatch finding prints.
+///
+/// Each side prints its anchor symbol, else its expanded text, else its
+/// display name. When both sides would print the same symbol, the name says
+/// nothing about the difference (two repos that each declare `type Widget`
+/// with different shapes would read `Widget` against `Widget`), so each side
+/// prints its type text instead (carrick#2148).
+fn mismatch_type_labels(producer: SideLabel, consumer: SideLabel) -> (String, String) {
+    let same_name = producer.symbol.is_some() && producer.symbol == consumer.symbol;
+    let label = |side: SideLabel| -> String {
+        let symbol = if same_name { None } else { side.symbol };
+        symbol.or(side.text).unwrap_or(side.display)
+    };
+    (label(producer), label(consumer))
+}
+
 fn strip_ci_workspace_prefix(location: &str) -> &str {
     location
         .strip_prefix("/home/runner/work/")
@@ -3581,19 +3606,16 @@ impl Analyzer {
             .iter()
             .map(|e| (e.type_alias.as_str(), e))
             .collect();
-        let type_label = |alias: &str| -> String {
-            if let Some(entry) = manifest_by_alias.get(alias) {
-                if let Some(symbol) = entry.primary_type_symbol.as_deref() {
-                    return symbol.to_string();
-                }
-                if let Some(expanded) = entry.expanded_definition.as_deref() {
-                    return expanded.to_string();
-                }
+        let side_label = |alias: &str| -> SideLabel {
+            let entry = manifest_by_alias.get(alias);
+            SideLabel {
+                symbol: entry.and_then(|e| e.primary_type_symbol.clone()),
+                text: entry.and_then(|e| e.expanded_definition.clone()),
+                display: display_names
+                    .get(alias)
+                    .cloned()
+                    .unwrap_or_else(|| alias.to_string()),
             }
-            display_names
-                .get(alias)
-                .cloned()
-                .unwrap_or_else(|| alias.to_string())
         };
 
         let consumer_rows = self.consumer_rows();
@@ -3686,13 +3708,17 @@ impl Analyzer {
                         strip_ci_workspace_prefix(&site).to_string()
                     })
                     .collect();
+                let (producer_label, consumer_label) = mismatch_type_labels(
+                    side_label(&outcome.producer_alias),
+                    side_label(&outcome.consumer_alias),
+                );
                 Finding::type_mismatch(
                     method,
                     path,
                     None,
                     call_sites,
-                    self.clean_type_string(&type_label(&outcome.producer_alias), &display_names),
-                    self.clean_type_string(&type_label(&outcome.consumer_alias), &display_names),
+                    self.clean_type_string(&producer_label, &display_names),
+                    self.clean_type_string(&consumer_label, &display_names),
                     &self.clean_error_message(&detail, &display_names),
                 )
                 .with_consumer_reads(consumer_reads)
@@ -3964,6 +3990,43 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn side(symbol: Option<&str>, text: &str) -> SideLabel {
+        SideLabel {
+            symbol: symbol.map(str::to_string),
+            text: Some(text.to_string()),
+            display: "Endpoint_x_Response".to_string(),
+        }
+    }
+
+    /// Two sides anchored at one name print their type text, so the finding
+    /// still shows where they differ (carrick#2148).
+    #[test]
+    fn a_mismatch_between_two_types_of_one_name_prints_their_text() {
+        let (producer, consumer) = mismatch_type_labels(
+            side(Some("Widget"), "{ activeCount: string; }"),
+            side(Some("Widget"), "{ activeCount: number; }"),
+        );
+        assert_eq!(producer, "{ activeCount: string; }");
+        assert_eq!(consumer, "{ activeCount: number; }");
+    }
+
+    /// Two sides with different names print their names, as before.
+    #[test]
+    fn a_mismatch_between_two_named_types_prints_their_names() {
+        let (producer, consumer) = mismatch_type_labels(
+            side(Some("OrderV2"), "{ id: string; }"),
+            side(Some("Order"), "{ id: number; }"),
+        );
+        assert_eq!(producer, "OrderV2");
+        assert_eq!(consumer, "Order");
+        let (producer, consumer) = mismatch_type_labels(
+            side(Some("Order"), "{ id: string; }"),
+            side(None, "{ id: number; }"),
+        );
+        assert_eq!(producer, "Order");
+        assert_eq!(consumer, "{ id: number; }");
+    }
 
     /// A handler name nothing else claims resolves by key, exactly as before.
     /// One that two files both define is stored per file (#582), so the key
