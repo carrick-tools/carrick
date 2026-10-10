@@ -231,9 +231,12 @@ jobs:
           echo "::error::a job CI result needs did not succeed (failure, cancelled or skipped)"
           exit 1
 
-  # The type sidecar's own unit tests, no Rust. Two shards: four files run
+  # The type sidecar's own unit tests, no Rust. Four shards: four files run
   # real package managers, Deno and tsc over fixture projects (the Deno
-  # resolution test alone is two minutes), the other fifty-odd are quick.
+  # resolution test alone is two minutes), `heavy`; the other fifty-odd are
+  # quick and are dealt out to `rest-1` to `rest-3` by position in the sorted
+  # list (every third file), so a new test file lands in a shard with no
+  # workflow edit (carrick#2173).
   # Without `--experimental-test-coverage`: the coverage report went to the
   # job log where nobody read it, and instrumenting every file made the
   # suite three times slower (349 s against 114 s, measured on the same
@@ -244,7 +247,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [heavy, rest]
+        shard: [heavy, rest-1, rest-2, rest-3]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -267,18 +270,21 @@ jobs:
         working-directory: src/sidecar
         run: |
           heavy='deno-project|check-v2-corpus|capture-v2-installed-pin|sidecar\.test\.js'
-          if [ "${{ matrix.shard }}" = "heavy" ]; then
+          shard="${{ matrix.shard }}"
+          if [ "$shard" = "heavy" ]; then
             files=$(ls dist/test/*.test.js | grep -E "dist/test/($heavy)")
           else
-            files=$(ls dist/test/*.test.js | grep -v -E "dist/test/($heavy)")
+            n="${shard#rest-}"
+            files=$(ls dist/test/*.test.js | grep -v -E "dist/test/($heavy)" | awk -v n="$n" 'NR % 3 == n % 3')
           fi
+          echo "$shard: $(echo "$files" | wc -l | tr -d ' ') files"
           echo "$files" | tr ' ' '\n'
           # shellcheck disable=SC2086
           node --test $files
 
   # The surface lister carrick-cloud's library store runs (carrick#1660): the
   # sidecar bundled into one file, on the store's Node 22 runtime. The listing
-  # tests also run on Node 24 in the `rest` shard above; the artifact test
+  # tests also run on Node 24 in the `rest-*` shards above; the artifact test
   # (dist/test/lister/, outside the shards' glob) needs the bundler's own
   # install. The release builds the artifact and runs both again on the bytes
   # it attaches (wasm-artifact.yml).
