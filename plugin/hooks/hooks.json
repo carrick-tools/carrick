@@ -10,6 +10,16 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook post-read",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionStart": [

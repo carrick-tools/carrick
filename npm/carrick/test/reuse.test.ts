@@ -18,8 +18,10 @@ import {
   removeSessions,
   sessionFile,
   sessionsDir,
+  markRead,
   markTold,
   toldKey,
+  wasRead,
   wasTold,
   type NewFunction,
 } from "../src/hook/reuse.ts";
@@ -175,4 +177,37 @@ test("a told file is remembered beside the reuse record, and neither drops the o
   assert.deepEqual(readSession("sess-told", dir).told, [key]);
   // Without a repo or file in the answer, the hook's own path stands in.
   assert.equal(toldKey({ schema: "carrick.check/0" }, "src/b.ts"), "::src/b.ts");
+});
+
+// The files the Read hook has asked about (carrick#2069), kept in the same
+// record and written whole: no partial or temp file is left behind.
+test("a read file survives a write and a read back, and a write leaves no temp file", (t) => {
+  const { dir, cleanup } = home();
+  t.after(cleanup);
+
+  record("sess-read", [fn("slugify")], dir);
+  assert.equal(wasRead("sess-read", "/w/api/src/a.ts", dir), false);
+  markRead("sess-read", "/w/api/src/a.ts", dir);
+  markRead("sess-read", "/w/api/src/a.ts", dir);
+  assert.equal(wasRead("sess-read", "/w/api/src/a.ts", dir), true);
+  assert.deepEqual(readSession("sess-read", dir).read, ["/w/api/src/a.ts"]);
+  // Neither list drops the other.
+  markTold("sess-read", ["/w/api::src/a.ts"], dir);
+  markNudged("sess-read", [fn("slugify")], dir);
+  const after = readSession("sess-read", dir);
+  assert.deepEqual(after.read, ["/w/api/src/a.ts"]);
+  assert.deepEqual(after.told, ["/w/api::src/a.ts"]);
+  assert.deepEqual(
+    after.found.map((entry) => entry.name),
+    ["slugify"],
+  );
+  assert.deepEqual(fs.readdirSync(sessionsDir(dir)), ["sess-read.json"]);
+
+  // A write replaces the file rather than emptying it in place, so a reader
+  // that arrives mid-write sees the old record whole and not an empty one: the
+  // file after a write is a different file (a new inode), not the same one.
+  const file = sessionFile("sess-read", dir)!;
+  const before = fs.statSync(file).ino;
+  markRead("sess-read", "/w/api/src/b.ts", dir);
+  assert.notEqual(fs.statSync(file).ino, before);
 });

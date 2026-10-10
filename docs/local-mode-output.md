@@ -261,7 +261,10 @@ through a published package, are not recorded.
 Types first in line order, one line per operation; then functions, most callers
 first. A location in another service is prefixed with that service. A line
 names at most four locations and counts the rest. The post-edit hook prints at
-most eight of these lines, once per file per session.
+most eight of these lines, once per file per session. The Read hook
+(`carrick hook post-read`) prints them, with the other side of each route or
+call in the file, the first time a session reads a TypeScript file; the
+post-edit hook then leaves them out for that file.
 
 ### `items[]`
 

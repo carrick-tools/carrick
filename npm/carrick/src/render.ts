@@ -247,10 +247,22 @@ function verdictText(item: CheckItem): string {
 }
 
 /** One line for one route or call: where it is, what it is, what is known about it. */
-export function itemLine(item: CheckItem, file: string | undefined): string {
+export function itemLine(
+  item: CheckItem,
+  file: string | undefined,
+  options: { locatorsOnly?: boolean } = {},
+): string {
   const where = `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
   const operation = [item.method, item.path].filter(Boolean).join(" ");
   const counterparts = item.counterparts ?? [];
+  // Locators only (carrick#2069): where the row is, what it is, and who is on
+  // the other side. The Read hook has no edit to judge, so no verdict words.
+  if (options.locatorsOnly) {
+    const head = `- ${where} ${item.kind}${operation ? ` ${operation}` : ""}`;
+    return counterparts.length
+      ? `${head}. ${roleLabel(counterparts)}: ${counterpartText(counterparts)}`
+      : head;
+  }
   const segments = [
     `- ${where} ${item.kind}${operation ? ` ${operation}` : ""}${sourceLabel(item)}${verdictText(item)}`,
   ];
@@ -390,6 +402,35 @@ export function renderPostToolUse(
         `- and ${rest} more line(s) like these; \`carrick check\` on this file prints them all.`,
       );
     }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The PostToolUse context for a file the agent has just read (carrick#2069), or
+ * `null` when there is nothing to say: no header on an empty answer, because a
+ * header on every Read would be noise.
+ *
+ * Locations only, never verdicts: nothing has been edited, so there is nothing
+ * to judge. The CLI's `uses_lines` first, then one line for each route or call
+ * that names a counterpart in another service.
+ */
+export function renderPostRead(result: CheckResult, displayFile?: string): string | null {
+  if (result.error) return null;
+  const where = displayFile ?? result.file ?? "this file";
+  const uses = result.uses_lines ?? [];
+  const items = connectedItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+  if (uses.length === 0 && items.length === 0) return null;
+
+  const lines: string[] = [
+    `Carrick: other code depends on ${where} (indexed at ${shortHash(result.index_commit)}). Open these before you change what they use:`,
+  ];
+  lines.push(...uses.slice(0, MAX_USE_LINES));
+  for (const item of items.slice(0, MAX_ITEM_LINES)) {
+    lines.push(itemLine(item, where, { locatorsOnly: true }));
+  }
+  if (uses.length > MAX_USE_LINES || items.length > MAX_ITEM_LINES) {
+    lines.push(`- more are listed by \`carrick check ${where}\`.`);
   }
   return lines.join("\n");
 }

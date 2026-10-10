@@ -484,6 +484,11 @@ test("the hook entries land beside everything else the settings file holds", () 
   assert.match(written.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
   assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
+  // The Read hook (carrick#2069) is its own group beside the Edit one.
+  assert.equal(written.hooks.PostToolUse[0].matcher, "Write|Edit|MultiEdit");
+  assert.equal(written.hooks.PostToolUse[1].matcher, "Read");
+  assert.equal(written.hooks.PostToolUse[1].hooks[0].command, "carrick hook post-read");
+  assert.equal(written.hooks.PostToolUse[1].hooks[0].timeout, 5);
   // The end-of-task reuse nudge (carrick#1330). Installed beside the other two
   // rather than by anything the user has to add.
   assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
@@ -529,7 +534,7 @@ test("an entry of ours that has moved on is replaced, not duplicated", () => {
   const commands = written.hooks.PostToolUse.flatMap((group: { hooks: Array<{ command: string }> }) =>
     group.hooks.map((entry) => entry.command),
   );
-  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit"]);
+  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read"]);
 });
 
 test("a settings file that is not JSON is reported, never overwritten", () => {
@@ -568,7 +573,7 @@ test("an absolute hook command is written, and is still recognised as ours", () 
 
   // The same workspace, now with carrick installed globally: one entry, not two.
   const rewritten = JSON.parse(mergeCarrickHooks(JSON.stringify(written, null, 2)).body);
-  assert.equal(rewritten.hooks.PostToolUse.length, 1);
+  assert.equal(rewritten.hooks.PostToolUse.length, 2);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   assert.equal(rewritten.hooks.SessionStart.length, 1);
@@ -597,7 +602,11 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
   const commands = written.hooks.PostToolUse.flatMap(
     (group: { hooks: Array<{ command: string }> }) => group.hooks.map((entry) => entry.command),
   );
-  assert.deepEqual(commands, ["carrickctl hook post-edit", "carrick hook post-edit"]);
+  assert.deepEqual(commands, [
+    "carrickctl hook post-edit",
+    "carrick hook post-edit",
+    "carrick hook post-read",
+  ]);
 });
 
 // carrick#1331. A checkout with `core.autocrlf` rewrites every tracked file to
