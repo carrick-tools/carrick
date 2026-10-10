@@ -546,6 +546,34 @@ jobs:
       - name: Build release
         run: cargo build --release --verbose
 
+      # Run the binary this job just built (carrick#2197), so a break that only
+      # a release build has (build.rs stamps the commit only when PROFILE is
+      # release, #2178; debug-only checks compile out) is found in the merge
+      # queue and not at the RC scan. express-single needs no `node_modules`
+      # or sidecar build to be indexed: types degrade, the count does not.
+      # Same scan and grep as the debug Endpoint smoke in `rust-tests`.
+      - name: Smoke the release binary (scan and commit stamp)
+        env:
+          CARRICK_MOCK_ALL: "true"
+          BIN: ./target/release/carrick
+          EXPECTED_ENDPOINTS: "3"
+        run: |
+          out="$RUNNER_TEMP/express-single-release.txt"
+          "$BIN" ./examples/express-single/ > "$out" 2>&1
+          grep -F "Indexed **" "$out" || true
+          if ! grep -q "Indexed \*\*$EXPECTED_ENDPOINTS endpoints\*\*" "$out"; then
+            echo "::error::release binary: expected 'Indexed **$EXPECTED_ENDPOINTS endpoints**' from examples/express-single"
+            cat "$out"
+            exit 1
+          fi
+          # No command prints the stamp (it goes into the uploaded blob), but
+          # `env!` puts the full commit id in the binary's bytes.
+          if [ -z "$GITHUB_SHA" ] || ! grep -aqF "$GITHUB_SHA" "$BIN"; then
+            echo "::error::release binary does not carry the commit it was built from ($GITHUB_SHA)"
+            exit 1
+          fi
+          echo "release binary carries commit $GITHUB_SHA"
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
