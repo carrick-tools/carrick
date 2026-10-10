@@ -30,6 +30,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
+import { canonicalStringQuotes } from '../src/type-inferrer.js';
 
 const SOURCE_TS = `type Row = { id: string; label: string };
 type Hits = { hits: string[] };
@@ -42,6 +43,14 @@ export async function concatenated(term: string) {
 
 export async function interpolated(term: string) {
   const res = await fetch(\`/api/lookup?\${new URLSearchParams({ q: term })}\`);
+  const found = (await res.json()) as Hits;
+  return found;
+}
+
+export async function twoTemplates(origin: string, path: string, token: string) {
+  const res = await fetch(\`\${origin}\${path}\`, {
+    headers: { Authorization: \`Bearer \${token}\` },
+  });
   const found = (await res.json()) as Hits;
   return found;
 }
@@ -189,6 +198,16 @@ describe('carrick#2056: a text locator never binds a fragment of what it names',
     assert.strictEqual(text, HITS);
   });
 
+  it('still finds a call located by its first line when the call holds two templates', async () => {
+    const text = await infer(
+      'TwoTemplates',
+      'call_result',
+      'fetch(`${origin}${path}`, {',
+      'await fetch(`${origin}${path}`'
+    );
+    assert.strictEqual(text, HITS);
+  });
+
   it('still finds a call whose text matches exactly', async () => {
     const text = await infer(
       'Exact',
@@ -197,5 +216,22 @@ describe('carrick#2056: a text locator never binds a fragment of what it names',
       'await fetch(`/api/search?`'
     );
     assert.strictEqual(text, HITS);
+  });
+});
+
+describe('carrick#2056: string literals compare by value, not by quotes', () => {
+  it('writes every plain literal in double quotes', () => {
+    assert.strictEqual(canonicalStringQuotes("f('/a', \"/b\", `/c`)"), 'f("/a", "/b", "/c")');
+  });
+
+  it('pairs quotes left to right, so two templates never pair with each other', () => {
+    const text = 'f(`${o}${p}`, {h: `Bearer ${t}`}) + `/x`';
+    assert.strictEqual(canonicalStringQuotes(text), 'f(`${o}${p}`, {h: `Bearer ${t}`}) + "/x"');
+  });
+
+  it('copies a literal holding a quote, an escape or an interpolation as it is', () => {
+    for (const text of ['"it\'s"', "'a\\'b'", '`a${"b"}c`', "'unterminated"]) {
+      assert.strictEqual(canonicalStringQuotes(text), text);
+    }
   });
 });

@@ -375,6 +375,77 @@ function typeText(type: Type, enclosingNode?: Node): string {
  * `text` is `string`, alone or beside `null` and `undefined` in either order:
  * the only payload a raw-text read publishes (carrick#1842).
  */
+/**
+ * Source text with every plain string literal written in double quotes:
+ * `'/a'`, `"/a"` and an interpolation-free `` `/a` `` are one value, so text
+ * that differs only in its quotes compares equal (carrick#2056).
+ *
+ * The text is read left to right, pairing quotes the way the scanner does,
+ * so a template's closing backtick never pairs with the next template's
+ * opening one. A literal holding a quote, a backslash or an interpolation is
+ * copied as it is, and so is an unterminated one with everything after it.
+ */
+export function canonicalStringQuotes(text: string): string {
+  const isQuote = (ch: string): boolean => ch === "'" || ch === '"' || ch === '`';
+  // The index just past the literal opening at `start`, or -1.
+  const literalEnd = (start: number): number => {
+    const quote = text[start];
+    let j = start + 1;
+    while (j < text.length) {
+      const ch = text[j];
+      if (ch === '\\') {
+        j += 2;
+      } else if (ch === quote) {
+        return j + 1;
+      } else if (quote === '`' && ch === '$' && text[j + 1] === '{') {
+        const close = codeEnd(j + 2);
+        if (close < 0) return -1;
+        j = close + 1;
+      } else {
+        j++;
+      }
+    }
+    return -1;
+  };
+  // The index of the `}` that closes an interpolation whose code starts at `start`, or -1.
+  const codeEnd = (start: number): number => {
+    let depth = 0;
+    let j = start;
+    while (j < text.length) {
+      const ch = text[j];
+      if (isQuote(ch)) {
+        const end = literalEnd(j);
+        if (end < 0) return -1;
+        j = end;
+        continue;
+      }
+      if (ch === '{') depth++;
+      if (ch === '}') {
+        if (depth === 0) return j;
+        depth--;
+      }
+      j++;
+    }
+    return -1;
+  };
+
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (!isQuote(text[i])) {
+      out += text[i];
+      i++;
+      continue;
+    }
+    const end = literalEnd(i);
+    if (end < 0) return out + text.slice(i);
+    const body = text.slice(i + 1, end - 1);
+    out += /['"`\\]|\$\{/.test(body) ? text.slice(i, end) : `"${body}"`;
+    i = end;
+  }
+  return out;
+}
+
 function isBareStringText(text: string): boolean {
   const members = text.split('|').map((member) => member.trim());
   return (
@@ -8324,7 +8395,7 @@ export class TypeInferrer {
    * for the same reason.
    */
   private normalizeWhitespace(text: string): string {
-    return text
+    const collapsed = text
       .replace(/\s+/g, ' ')
       // A member chain broken before its dot (`client\n  .list(…)`) reads the
       // same as `client.list(…)`; a space around `.` / `?.` means nothing
@@ -8332,12 +8403,9 @@ export class TypeInferrer {
       .replace(/\s*(\?\.|\.)\s*/g, '$1')
       .replace(/\s*,?\s*([}\)\]])/g, '$1')
       .replace(/([\(\[{])\s+/g, '$1')
-      // A string literal reads the same in any quotes: `'/a'`, `"/a"` and an
-      // interpolation-free `` `/a` `` are one value (carrick#2056). Only a
-      // literal holding no quote, backslash or `$` is rewritten.
-      .replace(/'([^'"`\\$\n]*)'/g, '"$1"')
-      .replace(/`([^'"`\\$\n]*)`/g, '"$1"')
       .trim();
+    // A string literal reads the same in any quotes (carrick#2056).
+    return canonicalStringQuotes(collapsed);
   }
 
   /**
