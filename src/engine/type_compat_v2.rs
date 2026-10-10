@@ -447,11 +447,15 @@ fn path_names_a_member(path: &str) -> bool {
 /// (carrick#1166), or a request config that sets no body member
 /// (carrick-cloud#1366). `projected_value_only`: every read of the call's result
 /// takes a member out of it, so the site states a part of a payload and not a
-/// payload (carrick#1375).
+/// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
+/// and a body string it serialised itself, and a return builds that string in a
+/// way the inferrer cannot read, so the envelope is never the contract
+/// (carrick#2200).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
+    "serialised_body_unread",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -4885,6 +4889,44 @@ mod tests {
             "a blind inference without a decision keeps its infer anchor, got {:?}",
             anchors[1]
         );
+    }
+
+    /// carrick#2200: a handler that returns a status and a body string it
+    /// serialised, where a return builds that string in a way the inferrer
+    /// cannot read, is answered `unknown` with `serialised_body_unread`. That
+    /// is a decision: the capture's raw locator re-run would publish the
+    /// envelope, `{ statusCode: number; body: string }`, as the contract.
+    #[test]
+    fn derive_anchors_keeps_an_unread_serialised_body_decision() {
+        let unread = || crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "serialised_body_unread".to_string(),
+            detail: None,
+        };
+        let mut decided = inferred("Endpoint_archive_Response", "unknown", None, None);
+        decided.infer_kind = InferKind::FunctionReturn;
+        decided.any_provenance = vec![unread()];
+        assert!(
+            inference_decided_no_contract(&decided),
+            "an unread serialised body is a decided abstain"
+        );
+
+        let mut request = response_body_infer("Endpoint_archive_Response");
+        request.infer_kind = InferKind::FunctionReturn;
+
+        let anchors = derive_capture_anchors(&[], &[request], &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_archive_Response");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("an unread serialised body must stay a literal unknown, got {other:?}"),
+        }
     }
 
     /// carrick#1841: a consumer call whose result carries a library's own

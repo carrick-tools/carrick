@@ -225,6 +225,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *  - `projected_value_only`: every read of a call's result takes a member out
  *    of it and none reads the value itself, so the site states a part of a
  *    payload rather than the payload a caller receives (carrick#1375).
+ *  - `serialised_body_unread`: a handler returns a status and a body string it
+ *    serialised itself, and at least one return builds that string in a way
+ *    the inferrer cannot trace to a typed value, so it publishes no part of
+ *    the contract (carrick#2200).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -238,6 +242,7 @@ export type TypeProvenanceReason =
   | 'no_success_payload'
   | 'no_request_body'
   | 'projected_value_only'
+  | 'serialised_body_unread'
   | 'not_recorded';
 
 /**
