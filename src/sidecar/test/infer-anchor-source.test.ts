@@ -55,7 +55,7 @@ const LEGACY_TS = `export interface Invoice {
 /** Object-literal aliases: the shapes a type alias declares. */
 const SHAPES_TS = `export type Receipt = {
   id: string;
-  paid: boolean;
+  settled: boolean;
 };
 
 export type Page<T> = {
