@@ -24,6 +24,12 @@ fi
 binary="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 failed=0
 for image in almalinux:8 debian:12 ubuntu:22.04; do
+  # Pulled first, so what is captured below is the binary's output alone.
+  if ! docker pull --quiet "$image" > /dev/null; then
+    echo "::error::could not pull $image"
+    failed=1
+    continue
+  fi
   if out="$(docker run --rm -v "$binary:/usr/local/bin/carrick:ro" "$image" \
     /usr/local/bin/carrick --version 2>&1)"; then
     echo "$image: $out"
