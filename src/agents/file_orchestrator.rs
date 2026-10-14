@@ -46,6 +46,7 @@ use crate::{
         collect_request_members, fold_indexes_with_conflicts,
     },
     local_http_wrapper::LocalWrapperCall,
+    loop_registration::DeclaredArray,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     operation::{OperationKey, Protocol},
     parser::parse_file,
@@ -532,6 +533,11 @@ pub struct ProcessingStats {
     /// a literal (carrick#2092). Each is logged with its site; the scope's
     /// routes are served without a prefix rather than under a guessed one.
     pub mount_prefixes_unread: usize,
+    /// Registrations in a loop over values the source holds whose model rows
+    /// were replaced by one row per value (carrick#2093).
+    pub loop_registrations_expanded: usize,
+    /// The rows those registrations state.
+    pub loop_routes_stated: usize,
     /// Of those, the ones whose prefix was read after all: the registration's
     /// other arguments read to one route path, and the service's own route
     /// descriptors state the scope's routes under it (carrick#2092).
@@ -1885,6 +1891,11 @@ impl FileOrchestrator {
             /// Their sites raise no candidate, so without this the endpoints
             /// they reach are absent from the index entirely.
             local_wrapper_calls: Vec<LocalWrapperCall>,
+            /// Template registrations over loop bindings, by call span
+            /// start (carrick#2093): read off the AST at scan time, their
+            /// imported arrays resolved after phase 1c, and applied to the
+            /// model's rows after the join.
+            loop_templates: crate::loop_registration::LoopTemplates,
             /// This file's OWN request members, keyed by name (carrick#588).
             /// Read for the files that import it, never for itself.
             request_members: RequestMemberIndex,
@@ -2038,6 +2049,19 @@ impl FileOrchestrator {
                 &pf.env_fallbacks,
                 env_schema,
             );
+
+            // A registration in a loop over values the source holds states
+            // one route per value (carrick#2093). Before the paths are
+            // canonical, so the rows it states are canonicalized with every
+            // other, and before the registration scopes, which re-point
+            // their owner as they do any row's.
+            let expanded = FileOrchestrator::expand_loop_registrations(
+                adjusted,
+                &pf.loop_templates,
+                &pf.prompt_path,
+                stats,
+            );
+            stats.loop_registrations_expanded += expanded;
 
             // Canonicalize LLM-emitted endpoint paths to colon-style params
             // (`/w/[slug]` -> `/w/:slug`) so they dedupe against the file-based
@@ -2580,6 +2604,7 @@ impl FileOrchestrator {
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
+                loop_templates: scan_result.loop_templates,
                 request_members: symbols.request_members,
                 dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
@@ -3047,6 +3072,8 @@ impl FileOrchestrator {
                 // Nor any same-file wrapper: a file with no HTTP candidate
                 // issues no request of its own for one to be built out of.
                 local_wrapper_calls: Vec::new(),
+                // Nor any registration for the model to state a row at.
+                loop_templates: HashMap::new(),
                 // A rescued file raised no candidate of its own, so it is not
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
@@ -3139,6 +3166,30 @@ impl FileOrchestrator {
                     &importer,
                     &pf.symbol_table.imported_symbols,
                     &mut module_bases_cache,
+                    &cm,
+                    &handler,
+                );
+            }
+        }
+
+        // The same hop for a route registered in a loop over an imported
+        // array (carrick#2093): the array's values are read from the module
+        // that declares it. Nothing here reaches a prompt (the values are
+        // applied to the model's rows after the join), so every specifier
+        // this service's resolver follows is followed, aliases included.
+        {
+            let mut bindings = BindingResolver::with_workspace(service_modules.clone());
+            let mut arrays = HashMap::new();
+            for pf in &mut pending {
+                if pf.loop_templates.is_empty() {
+                    continue;
+                }
+                Self::resolve_loop_imports(
+                    &mut pf.loop_templates,
+                    Path::new(&pf.path_str),
+                    service_modules,
+                    &mut bindings,
+                    &mut arrays,
                     &cm,
                     &handler,
                 );
@@ -7022,6 +7073,225 @@ impl FileOrchestrator {
                 mount.mount_path = trimmed.to_string();
             }
         }
+    }
+
+    /// Read the values of every loop over an imported array in one file's
+    /// templates from the module that declares the array (carrick#2093). A
+    /// template any of whose loops cannot be read is left unread, with why.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_loop_imports(
+        templates: &mut crate::loop_registration::LoopTemplates,
+        importer: &Path,
+        workspace: &WorkspaceIndex,
+        bindings: &mut BindingResolver,
+        arrays: &mut HashMap<PathBuf, HashMap<String, DeclaredArray>>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) {
+        use crate::loop_registration::LoopSource;
+        for entry in templates.values_mut() {
+            let Ok(template) = entry else {
+                continue;
+            };
+            let mut unread = None;
+            for each in &mut template.loops {
+                let LoopSource::Imported {
+                    specifier,
+                    exported_name,
+                } = &each.source
+                else {
+                    continue;
+                };
+                let values = Self::declared_array(
+                    importer,
+                    specifier,
+                    exported_name,
+                    workspace,
+                    bindings,
+                    arrays,
+                    cm,
+                    handler,
+                )
+                .and_then(|elements| {
+                    crate::loop_registration::element_values(&elements, &each.parts)
+                });
+                match values {
+                    Ok(values) => each.source = LoopSource::Stated(values),
+                    Err(reason) => {
+                        unread = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = unread {
+                *entry = Err(reason);
+            }
+        }
+    }
+
+    /// The elements of the array `importer` imports from `specifier` as
+    /// `exported_name`, read from the top-level `const` of the module that
+    /// declares it, re-exports followed (carrick#2093).
+    #[allow(clippy::too_many_arguments)]
+    fn declared_array(
+        importer: &Path,
+        specifier: &str,
+        exported_name: &str,
+        workspace: &WorkspaceIndex,
+        bindings: &mut BindingResolver,
+        arrays: &mut HashMap<PathBuf, HashMap<String, DeclaredArray>>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) -> DeclaredArray {
+        let module = workspace
+            .resolve_module_path(importer, specifier)
+            .ok_or_else(|| format!("`{specifier}` names no module in this service"))?;
+        let declared = bindings
+            .resolve_export(&module, exported_name)
+            .ok_or_else(|| format!("`{specifier}` declares no export `{exported_name}`"))?;
+        let local = declared
+            .local_name
+            .ok_or_else(|| format!("`{exported_name}` is exported as no named binding"))?;
+        let table = arrays.entry(declared.file.clone()).or_insert_with(|| {
+            crate::parser::parse_file(&declared.file, cm, handler)
+                .map(|module| crate::loop_registration::top_level_const_arrays(&module))
+                .unwrap_or_default()
+        });
+        table.get(&local).cloned().unwrap_or_else(|| {
+            Err(format!(
+                "`{local}` is not a top-level const in the module that declares it"
+            ))
+        })
+    }
+
+    /// Replace the model's rows at a registration in a loop over values the
+    /// source holds with one row per value (carrick#2093). Returns how many
+    /// registrations were expanded.
+    ///
+    /// The rows are the endpoint rows joined at the registration's call. With
+    /// none, the model stated no route there and none is made up. The first
+    /// is the prototype every new row is cloned from, so the role, owner and
+    /// handler stay the model's; only the path is the source's. Where the
+    /// model wrote a prefix in front of the template (a router's base path,
+    /// or a copy of the segment it is mounted under), the prefix is kept and
+    /// the template's value handed on as the registration literal, exactly as
+    /// [`Self::settle_registration_literal`] does for a string literal, so
+    /// the mount chain decides which it is.
+    fn expand_loop_registrations(
+        result: &mut FileAnalysisResult,
+        templates: &crate::loop_registration::LoopTemplates,
+        file: &str,
+        stats: &mut ProcessingStats,
+    ) -> usize {
+        let mut spans: Vec<u32> = templates.keys().copied().collect();
+        spans.sort_unstable();
+        let mut expanded = 0;
+        for span in spans {
+            let Some(first) = result
+                .endpoints
+                .iter()
+                .position(|endpoint| endpoint.call_expression_span_start == Some(span))
+            else {
+                continue;
+            };
+            let line = result.endpoints[first].line_number;
+            let template = match &templates[&span] {
+                Ok(template) => template,
+                Err(reason) => {
+                    debug!(
+                        "Kept the model's path for the template registration at {file}:{line}: {reason}"
+                    );
+                    continue;
+                }
+            };
+            if result.endpoints.iter().any(|endpoint| {
+                endpoint.call_expression_span_start == Some(span) && endpoint.dispatch.is_some()
+            }) {
+                debug!(
+                    "Kept the model's path for the template registration at {file}:{line}: a row there dispatches on a request field"
+                );
+                continue;
+            }
+            let literals = match template.paths() {
+                Ok(literals) => literals,
+                Err(reason) => {
+                    debug!(
+                        "Kept the model's path for the template registration at {file}:{line}: {reason}"
+                    );
+                    continue;
+                }
+            };
+            let prototype = result.endpoints[first].clone();
+            let prefix = Self::loop_template_prefix(&prototype.path, &template.quasis);
+            let rows: Vec<EndpointResult> = literals
+                .iter()
+                .map(|literal| {
+                    let literal = Self::canonicalize_route_path(literal);
+                    let mut row = prototype.clone();
+                    row.path = format!("{prefix}{literal}");
+                    row.registration_literal = (!prefix.is_empty()).then_some(literal);
+                    row.resolution_source = Some(ResolutionSource::InlineLiteral);
+                    row
+                })
+                .collect();
+            debug!(
+                "The registration at {file}:{line} is in a loop over values the source holds: {} {} states {} routes",
+                prototype.method,
+                prototype.path,
+                rows.len()
+            );
+            stats.loop_routes_stated += rows.len();
+            expanded += 1;
+            let mut rows = Some(rows);
+            let endpoints = std::mem::take(&mut result.endpoints);
+            for (index, endpoint) in endpoints.into_iter().enumerate() {
+                if index == first {
+                    result.endpoints.extend(rows.take().into_iter().flatten());
+                } else if endpoint.call_expression_span_start != Some(span) {
+                    result.endpoints.push(endpoint);
+                }
+            }
+        }
+        expanded
+    }
+
+    /// What the model wrote in front of a loop template's path: the part of
+    /// `path` before a segment boundary from which the rest is the template,
+    /// each hole read as one non-empty run of characters that is not `/`
+    /// (so `${action}`, `:action`, `{action}` and a value all match). Empty
+    /// when the whole path is the template, or when no such split exists.
+    fn loop_template_prefix(path: &str, quasis: &[String]) -> String {
+        const HOLE: char = '\u{1}';
+        let template = Self::canonicalize_route_path(&quasis.join(&HOLE.to_string()));
+        let pieces: Vec<&str> = template.split(HOLE).collect();
+        let path = Self::canonicalize_route_path(path);
+        let boundaries = path
+            .char_indices()
+            .filter(|(_, c)| *c == '/')
+            .flat_map(|(index, _)| [index, index + 1]);
+        std::iter::once(0)
+            .chain(boundaries)
+            .find(|start| Self::matches_template(&path[*start..], &pieces))
+            .map(|start| path[..start].to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether `text` is `pieces` with one hole between each pair, a hole
+    /// being one or more characters that are not `/`.
+    fn matches_template(text: &str, pieces: &[&str]) -> bool {
+        let Some((first, rest)) = pieces.split_first() else {
+            return text.is_empty();
+        };
+        let Some(after) = text.strip_prefix(first) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return after.is_empty();
+        }
+        let run = after.find('/').unwrap_or(after.len());
+        (1..=run).any(|taken| {
+            after.is_char_boundary(taken) && Self::matches_template(&after[taken..], rest)
+        })
     }
 
     /// Resolve every HTTP candidate in one file, plus the routes and wrapper

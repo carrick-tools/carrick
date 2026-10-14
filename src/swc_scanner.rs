@@ -27,6 +27,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::binding_scope::Declarations;
 use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
+use crate::loop_registration::{LoopTemplates, collect_loop_templates};
 use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
@@ -257,6 +258,12 @@ pub struct ScanResult {
     /// own URL resolves to nothing, so the join is read off the AST and merged
     /// into the file's extraction afterwards. See `crate::local_http_wrapper`.
     pub local_wrapper_calls: Vec<LocalWrapperCall>,
+    /// Calls whose first argument is a template over loop bindings, keyed by
+    /// the call's span start: the paths a registration in a loop over values
+    /// the source holds states, or why it states none (carrick#2093). Applied
+    /// to the endpoint rows the model states at the call, after the join.
+    /// See `crate::loop_registration`.
+    pub loop_templates: LoopTemplates,
 }
 
 /// A pub/sub operation asserted deterministically from the AST (carrick#387):
@@ -538,6 +545,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    loop_templates: HashMap::new(),
                 };
             }
         };
@@ -555,6 +563,7 @@ impl SwcScanner {
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
         let new_url_paths = collect_new_url_paths(&module, &self.source_map);
+        let loop_templates = collect_loop_templates(&module);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             package_import_locals(&module, data_fetchers),
@@ -573,6 +582,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            loop_templates,
         }
     }
 
@@ -622,6 +632,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    loop_templates: HashMap::new(),
                 };
             }
         };
@@ -647,6 +658,7 @@ impl SwcScanner {
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
         let new_url_paths = collect_new_url_paths(&module, &file_source_map);
+        let loop_templates = collect_loop_templates(&module);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             package_import_locals(&module, data_fetchers),
@@ -665,6 +677,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            loop_templates,
         }
     }
 
