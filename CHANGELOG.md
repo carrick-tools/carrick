@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.118](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.117...carrick-v0.3.118) (2026-10-17)
+
+
+### Features
+
+* **scanner:** a large file is asked in windows under a 250,000-byte line, and the cloud's size verdict cuts a request smaller ([#2308](https://github.com/carrick-tools/carrick/issues/2308), [#2309](https://github.com/carrick-tools/carrick/issues/2309), [#2310](https://github.com/carrick-tools/carrick/issues/2310)) ([#2476](https://github.com/carrick-tools/carrick/issues/2476)) ([a33c2dd](https://github.com/carrick-tools/carrick/commit/a33c2dda4651f26bea495c9c38d4e2403aa275bb))
+* **scanner:** a scan waits for the library packages the store is building ([#2496](https://github.com/carrick-tools/carrick/issues/2496)) ([#2498](https://github.com/carrick-tools/carrick/issues/2498)) ([f9d17ee](https://github.com/carrick-tools/carrick/commit/f9d17ee6383bd08d7821d7debe73dec18e7c7905))
+* **scanner:** a site answer is in band only when every asked slot is ([#2495](https://github.com/carrick-tools/carrick/issues/2495)) ([b69d157](https://github.com/carrick-tools/carrick/commit/b69d157e6065bc5ca176a22d203ab8997f6d8262))
+* **scanner:** call targets from compiler rows and discovery for every protocol ([#2413](https://github.com/carrick-tools/carrick/issues/2413) D/E, [#2431](https://github.com/carrick-tools/carrick/issues/2431)) ([#2479](https://github.com/carrick-tools/carrick/issues/2479)) ([f6767f6](https://github.com/carrick-tools/carrick/commit/f6767f640565962421c65db1ea00e868eeaeff49))
+* **scanner:** possible_calls on the index blob (Part of [#2438](https://github.com/carrick-tools/carrick/issues/2438)) ([#2487](https://github.com/carrick-tools/carrick/issues/2487)) ([9d1b632](https://github.com/carrick-tools/carrick/commit/9d1b6324603c389cdb1ff572aea251f630d48dd0))
+* **scanner:** report a discovered call where its name is decided, and keep a record per site ([#2433](https://github.com/carrick-tools/carrick/issues/2433), [#2435](https://github.com/carrick-tools/carrick/issues/2435)) ([#2478](https://github.com/carrick-tools/carrick/issues/2478)) ([efb4575](https://github.com/carrick-tools/carrick/commit/efb4575402b687b732285246587a0e860c6831dc))
+* **scanner:** send the repo's declared service set on each write (Part of carrick-cloud[#909](https://github.com/carrick-tools/carrick/issues/909)) ([#2481](https://github.com/carrick-tools/carrick/issues/2481)) ([61d509c](https://github.com/carrick-tools/carrick/commit/61d509c86ebb1457fb557a0af66deb910148f66a))
+* **scanner:** site answers become rows and fold with the reader's rows, behind CARRICK_SITE_QUESTIONS (Part of [#2439](https://github.com/carrick-tools/carrick/issues/2439)) ([#2493](https://github.com/carrick-tools/carrick/issues/2493)) ([ce4bc2f](https://github.com/carrick-tools/carrick/commit/ce4bc2f2b757ed6898897cca8b1365abe41d6568))
+* **scanner:** site record states an env base, carries the concept's syntax kinds, uses lane 2's wire types ([#2441](https://github.com/carrick-tools/carrick/issues/2441)) ([#2484](https://github.com/carrick-tools/carrick/issues/2484)) ([6ae11fb](https://github.com/carrick-tools/carrick/commit/6ae11fb4ecf893ae9b324969f34a33118c164877))
+* **scanner:** with rows, read imported names, instances and getters as the declaration the compiler names ([#2413](https://github.com/carrick-tools/carrick/issues/2413) slice B) ([#2467](https://github.com/carrick-tools/carrick/issues/2467)) ([25781e9](https://github.com/carrick-tools/carrick/commit/25781e970360417b81d76d7cf1ddb3faebd4d345))
+* **sidecar:** impl rows for a member whose symbol has no declaration, asked at the use site ([#2430](https://github.com/carrick-tools/carrick/issues/2430), [#2441](https://github.com/carrick-tools/carrick/issues/2441)) ([#2475](https://github.com/carrick-tools/carrick/issues/2475)) ([059c6f2](https://github.com/carrick-tools/carrick/commit/059c6f2c2f55bd00cd13d9b7e65ba29e05168319))
+* **sidecar:** per-position rows v2: impl rows name what implements a bodyless declaration, jsx rows record each element ([#2430](https://github.com/carrick-tools/carrick/issues/2430)) ([#2473](https://github.com/carrick-tools/carrick/issues/2473)) ([9eb2696](https://github.com/carrick-tools/carrick/commit/9eb2696885294b030ff073f8fe0241730c2ae09d))
+* **site-questions:** the site-question wire contract and client ([#2437](https://github.com/carrick-tools/carrick/issues/2437)) ([#2471](https://github.com/carrick-tools/carrick/issues/2471)) ([36cfc04](https://github.com/carrick-tools/carrick/commit/36cfc04d51c93694438403312e56817ab54cf428))
+
+
+### Bug Fixes
+
+* **scanner:** a service whose only losses are final is complete, not pending ([#2488](https://github.com/carrick-tools/carrick/issues/2488)) ([#2491](https://github.com/carrick-tools/carrick/issues/2491)) ([64fa795](https://github.com/carrick-tools/carrick/commit/64fa795f76b41820667c747e7dea9339ad972574))
+* **scanner:** final-only services read as complete; plainer too-large-file warning ([#2494](https://github.com/carrick-tools/carrick/issues/2494)) ([a101859](https://github.com/carrick-tools/carrick/commit/a101859f47b236c1993b8bed949657494daa6946))
+* **sidecar:** returnSaysNothing tracks the conditionals it has walked ([#2500](https://github.com/carrick-tools/carrick/issues/2500)) ([3eba3b0](https://github.com/carrick-tools/carrick/commit/3eba3b0ade5c36b1229bed0fb30f7fe3d5fc4f9e))
+
+
+### CI/CD
+
+* split the slowest test shard (no test dropped) ([#2470](https://github.com/carrick-tools/carrick/issues/2470)) ([eef3c3e](https://github.com/carrick-tools/carrick/commit/eef3c3eba0019a4059e9fa77b53e8c174ef33aa0))
+
 ## [0.3.117](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.116...carrick-v0.3.117) (2026-10-17)
 
 
