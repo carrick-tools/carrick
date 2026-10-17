@@ -2850,7 +2850,9 @@ export class TypeInferrer {
    * `extractExplicitTypeFromAncestor` printed for it is stated AT the read
    * (carrick#1749): the read is the operand of that cast, or the initializer
    * of that annotated declaration, through wrappers that leave a value as it
-   * is (parentheses, `await`, `!`, another cast). An annotation further out —
+   * is (parentheses, `await`, `!`, `satisfies`, `.catch`/`.finally`, a
+   * `JSON.parse`), the
+   * nearest cast answering. An annotation further out —
    * the declared type of the function the read sits in — describes something
    * else, and is not reported.
    */
@@ -2868,26 +2870,7 @@ export class TypeInferrer {
    */
   private typeNodeStatedAtRead(terminal: Node): Node | undefined {
     const typeNode = this.explicitTypeNodeFromAncestor(terminal);
-    const owner = typeNode?.getParent();
-    if (!typeNode || !owner || this.leavesAPositionOpen(typeNode)) return undefined;
-    let current: Node = terminal;
-    for (;;) {
-      if (current === owner) break;
-      const parent = current.getParent();
-      if (!parent) return undefined;
-      if (
-        parent === owner &&
-        Node.isVariableDeclaration(parent) &&
-        parent.getInitializer() === current
-      ) {
-        break;
-      }
-      if (!this.wrapsReadTransparently(parent)) {
-        return undefined;
-      }
-      current = parent;
-    }
-    return typeNode;
+    return typeNode && !this.leavesAPositionOpen(typeNode) ? typeNode : undefined;
   }
 
   /**
@@ -5528,41 +5511,78 @@ export class TypeInferrer {
     return typeNode ? this.expandAnnotationTypeNode(typeNode) : null;
   }
 
-  /** The annotation `extractExplicitTypeFromAncestor` prints, as a node. */
+  /**
+   * The type the source states AT `node` (carrick#2113): the first `as T` /
+   * `<T>` met climbing from `node` (itself included), or the annotation of
+   * the declaration `node` initialises, through wrappers that leave a value
+   * as it is (parentheses, `await`, `!`, `satisfies`), a `.catch(cb)` /
+   * `.finally(cb)` on it (the Promise protocol hands the value on as it is),
+   * and a `JSON.parse` of it (the text's body).
+   * Any other parent — a call argument, an object or array member, the body
+   * or return of a nested function, a property read, an operand — ends the
+   * walk with nothing: an annotation further out describes that other value
+   * (the result of the call the node is passed to, the table a callback sits
+   * in), never the node.
+   */
   private explicitTypeNodeFromAncestor(node: Node): Node | undefined {
-    const varDecl = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
-    if (varDecl) {
-      const typeNode = varDecl.getTypeNode();
-      if (typeNode) {
-        return typeNode;
+    let current: Node = node;
+    for (;;) {
+      if (Node.isAsExpression(current) || Node.isTypeAssertion(current)) {
+        const typeNode = current.getTypeNode();
+        if (typeNode) return typeNode;
       }
-    }
-
-    // Consider the node ITSELF as well as its ancestors: the `call_result`
-    // path's terminal node for `return res.json() as Promise<T>` IS the
-    // `as` cast (an ancestor walk from it would miss it), so the #257 consumer
-    // shape would never be recovered. `as T` and `<T>x` assertions both apply.
-    const asExpr = Node.isAsExpression(node)
-      ? node
-      : node.getFirstAncestorByKind(SyntaxKind.AsExpression);
-    if (asExpr) {
-      const typeNode = asExpr.getTypeNode();
-      if (typeNode) {
-        return typeNode;
+      const parent = current.getParent();
+      if (!parent) return undefined;
+      if (Node.isVariableDeclaration(parent)) {
+        return parent.getInitializer() === current ? parent.getTypeNode() : undefined;
       }
-    }
-
-    const typeAssertion = Node.isTypeAssertion(node)
-      ? node
-      : node.getFirstAncestorByKind(SyntaxKind.TypeAssertionExpression);
-    if (typeAssertion) {
-      const typeNode = typeAssertion.getTypeNode();
-      if (typeNode) {
-        return typeNode;
+      const link = this.promiseLinkKeepingValue(current) ?? this.jsonParseOf(current);
+      if (link) {
+        current = link;
+        continue;
       }
+      if (!this.wrapsReadTransparently(parent)) return undefined;
+      current = parent;
     }
+  }
 
-    return undefined;
+  /**
+   * The `JSON.parse(current)` call `current` is the text of, or `undefined`.
+   * The platform's `parse` returns `any`, so what the source states for its
+   * result is its statement of the body the text holds
+   * (`const receipt: Receipt = JSON.parse(await res.text())`).
+   */
+  private jsonParseOf(current: Node): Node | undefined {
+    const call = current.getParent();
+    if (!call || !Node.isCallExpression(call) || call.getArguments()[0] !== current) {
+      return undefined;
+    }
+    const callee = call.getExpression();
+    if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== 'parse') return undefined;
+    const obj = callee.getExpression();
+    return Node.isIdentifier(obj) && obj.getText() === 'JSON' ? call : undefined;
+  }
+
+  /**
+   * The `current.catch(cb)` / `current.finally(cb)` call made on `current`,
+   * or `undefined`. A `.then` maps the value, so it is no link.
+   */
+  private promiseLinkKeepingValue(current: Node): Node | undefined {
+    const access = current.getParent();
+    if (
+      !access ||
+      !Node.isPropertyAccessExpression(access) ||
+      access.getExpression() !== current ||
+      access.hasQuestionDotToken()
+    ) {
+      return undefined;
+    }
+    const name = access.getName();
+    if (name !== 'catch' && name !== 'finally') return undefined;
+    const call = access.getParent();
+    return call && Node.isCallExpression(call) && call.getExpression() === access
+      ? call
+      : undefined;
   }
 
   /**
