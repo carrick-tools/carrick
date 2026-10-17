@@ -18,6 +18,11 @@ const response = z.object({
     // outside the pinned three reads as unknown too, rather than failing the
     // whole read.
     role: z.enum(["owner", "admin", "member"]).optional().catch(undefined),
+    // Who builds this workspace's index (carrick-cloud#1969). Only "cloud"
+    // changes what `carrick init` does: absent, "laptop" and a value this
+    // build does not know all read as the laptop lane, never as a failed read
+    // (carrick#2219).
+    index_builder: z.enum(["cloud", "laptop"]).optional().catch(undefined),
   }),
   allowance_sentence: z.string().nullable(),
   repos: z.array(repository),

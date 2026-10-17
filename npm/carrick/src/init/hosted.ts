@@ -569,8 +569,16 @@ function commitCause(missing: MissingCommit[]): { failure: string; action: strin
  * skipped it took a second and a run that did not took minutes, and a reader
  * who cannot tell them apart cannot tell whether their next `carrick init` is
  * a wait (carrick#1373).
+ *
+ * `lane` is who builds this workspace's index. Where Carrick builds it, no
+ * command on a laptop clears a version mismatch, so the line says what still
+ * answers instead (carrick#2219).
  */
-export function hostedReport(outcome: HostedDownload, seconds: number | null = null): StepReport {
+export function hostedReport(
+  outcome: HostedDownload,
+  seconds: number | null = null,
+  lane: "cloud" | "laptop" = "laptop",
+): StepReport {
   const plural = (count: number): string => `${count} service${count === 1 ? "" : "s"}`;
   // The total and the time, on the line that stays once the ticking one is
   // gone: a wait of minutes that ends on a line with no duration leaves the
@@ -587,7 +595,10 @@ export function hostedReport(outcome: HostedDownload, seconds: number | null = n
     case "version_mismatch":
       return {
         kind: "warn",
-        text: "Hosted index is older than this CLI: run `carrick index --detach` once from main",
+        text:
+          lane === "cloud"
+            ? "Hosted index was built by a different Carrick release than this CLI, so it was not read into .carrick/. Your agent still reads it through Carrick's MCP server."
+            : "Hosted index is older than this CLI: run `carrick index --detach` once from main",
       };
     // The failure first, then what moves it, then what `.carrick/` holds in
     // the meantime: the line used to open on the holdings and end on the
