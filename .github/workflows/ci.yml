@@ -427,6 +427,11 @@ jobs:
       - name: Dry-run the release steps with a failed and a passed lister
         run: bash scripts/release-artifacts.test.sh
 
+      # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
+      # against stubbed objdump output: it must fail a binary above the floor.
+      - name: The glibc floor check fails a binary above the floor
+        run: bash scripts/glibc-floor.test.sh
+
   wasm-match:
     name: carrick-match wasm smoke
     runs-on: ubuntu-latest
