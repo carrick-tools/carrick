@@ -458,12 +458,15 @@ fn path_names_a_member(path: &str) -> bool {
 /// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
 /// and a body string it serialised itself, and a return builds that string in a
 /// way the inferrer cannot read, so the envelope is never the contract
-/// (carrick#2200).
+/// (carrick#2200). `handler_unproven`: the response would be read from one of
+/// several functions handed to a registration call, and nothing states which
+/// one handles the route (carrick#2364).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
     "serialised_body_unread",
+    "handler_unproven",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -5096,6 +5099,42 @@ mod tests {
             }
             other => panic!("an unread serialised body must stay a literal unknown, got {other:?}"),
         }
+    }
+
+    /// carrick#2364: a response read from one of several functions handed to
+    /// a registration call is answered `unknown` with `handler_unproven`. That
+    /// is a decision: the capture's raw locator re-run would read the line's
+    /// first function, a descriptor callback, as the route's response.
+    #[test]
+    fn derive_anchors_keeps_an_unproven_handler_decision() {
+        let mut decided = inferred("Endpoint_disconnect_Response", "unknown", None, None);
+        decided.infer_kind = InferKind::FunctionReturn;
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "handler_unproven".to_string(),
+            detail: None,
+        }];
+        assert!(
+            inference_decided_no_contract(&decided),
+            "an unproven handler is a decided abstain"
+        );
+
+        let mut request = response_body_infer("Endpoint_disconnect_Response");
+        request.infer_kind = InferKind::FunctionReturn;
+
+        let anchors = derive_capture_anchors(&[], &[request], &[], &[decided], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert!(
+            matches!(
+                &anchors[0],
+                CaptureAnchor::Literal { alias, type_text, .. }
+                    if alias == "Endpoint_disconnect_Response" && type_text == "unknown"
+            ),
+            "an unproven handler must stay a literal unknown, got {:?}",
+            anchors[0]
+        );
     }
 
     /// carrick#1841: a consumer call whose result carries a library's own

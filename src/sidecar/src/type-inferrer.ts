@@ -1179,6 +1179,10 @@ export class TypeInferrer {
     // payload. The containing-function walk below then resolves the function
     // that registers the route, not the handler — so a registration declaring
     // its response contract is read from that declaration first.
+    const unproven = this.unprovenRegistrationFor(sourceFile, request);
+    if (unproven) {
+      return this.unprovenHandlerAbstain(request, unproven);
+    }
     const registration = this.routeRegistrationForRequest(sourceFile, request);
     if (registration) {
       const declared = this.declaredResponseInferredType(request, registration);
@@ -1538,6 +1542,10 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    const unproven = this.unprovenRegistrationFor(sourceFile, request);
+    if (unproven) {
+      return this.unprovenHandlerAbstain(request, unproven);
+    }
     const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
@@ -1636,6 +1644,12 @@ export class TypeInferrer {
     // `{ method; path; handler }` shape. Follow the handler before treating the
     // object as a payload. (A call-shaped registration is handled below.)
     if (!Node.isCallExpression(node)) {
+      // The climb below reads the handler of the call the node sits in; a
+      // call passed several functions has none it can prove (carrick#2364).
+      const enclosingCall = node.getFirstAncestorByKind(SyntaxKind.CallExpression);
+      if (enclosingCall && this.functionArguments(enclosingCall).length > 1) {
+        return this.unprovenHandlerAbstain(request, enclosingCall);
+      }
       const registryHandler = this.resolveRegisteredHandler(node);
       if (registryHandler) {
         const declared = this.declaredResponseInferredType(request, node);
@@ -7430,22 +7444,103 @@ export class TypeInferrer {
   }
 
   /**
-   * The handler function referenced by a route-registration call: the first
+   * The handler function referenced by a route-registration call: its one
    * argument that is an inline function, or an identifier bound to a function
-   * (typically the 2nd+ arg — the path literal is not function-valued, so it is
-   * skipped naturally). No callee-name check: a call whose argument resolves to
-   * a function is structurally a registration regardless of the framework.
+   * (the path literal is not function-valued, so it is skipped naturally). No
+   * callee-name check: a call whose argument resolves to a function is
+   * structurally a registration regardless of the framework.
+   *
+   * A call passed more than one function names no handler (carrick#2364): a
+   * route helper taking a descriptor callback beside the handler, or a
+   * middleware beside it, states nothing about which one answers the route,
+   * and no argument position or name is taken to decide it.
    */
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
+    const functions = this.functionArguments(call);
+    return functions.length === 1 ? functions[0] : undefined;
+  }
+
+  /** Every function `call` is passed, inline or through a binding, each once. */
+  private functionArguments(call: CallExpression): FunctionLike[] {
+    const functions: FunctionLike[] = [];
     for (const arg of call.getArguments()) {
-      const handler = this.asHandlerFunction(arg);
-      if (handler) {
-        return handler;
+      const fn = this.asHandlerFunction(arg);
+      if (fn && !functions.includes(fn)) {
+        functions.push(fn);
       }
     }
+    return functions;
+  }
+
+  /**
+   * The call that passes `fn` beside another function, when `fn` is one of
+   * several functions handed to one call (through parentheses or an `as`).
+   * Which of them is a route's handler is then not proven by anything here.
+   */
+  private callPassingFunctionBesideOthers(fn: Node): CallExpression | undefined {
+    let argument: Node = fn;
+    let parent = argument.getParent();
+    while (
+      parent &&
+      (Node.isParenthesizedExpression(parent) ||
+        Node.isAsExpression(parent) ||
+        Node.isSatisfiesExpression(parent))
+    ) {
+      argument = parent;
+      parent = parent.getParent();
+    }
+    if (
+      parent &&
+      Node.isCallExpression(parent) &&
+      parent.getArguments().some((arg) => arg === argument) &&
+      this.functionArguments(parent).length > 1
+    ) {
+      return parent;
+    }
     return undefined;
+  }
+
+  /**
+   * The call a response request reaches whose handler is unproven: the
+   * located node is itself a call passed several functions, or, for a request
+   * that locates nothing, the function its line names is one of several
+   * functions handed to one call. Reading any of them as the route's response
+   * would be a guess, so the caller abstains (carrick#2364).
+   */
+  private unprovenRegistrationFor(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): CallExpression | undefined {
+    const located = this.resolveTargetNode(sourceFile, request);
+    if (located) {
+      const node = this.unwrapExpressionNode(located);
+      return Node.isCallExpression(node) && this.functionArguments(node).length > 1
+        ? node
+        : undefined;
+    }
+    const byLine = this.findFunctionByLine(sourceFile, request.line_number);
+    return byLine ? this.callPassingFunctionBesideOthers(byLine) : undefined;
+  }
+
+  /** The decided abstain for a response whose handler is unproven. */
+  private unprovenHandlerAbstain(
+    request: InferRequestItem,
+    call: CallExpression
+  ): InferredType {
+    this.log(
+      `Registration at ${request.file_path}:${request.line_number} is passed more than one ` +
+        'function and nothing states which one handles the route; abstaining'
+    );
+    return this.decidedAbstain(request, this.getNodeLocation(call), {
+      path: '',
+      kind: 'unknown',
+      reason: 'handler_unproven',
+      detail:
+        'the registration is passed more than one function and nothing in the source ' +
+        'states which one handles the route, so no response was read from any of them',
+    });
   }
 
   /**

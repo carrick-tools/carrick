@@ -229,6 +229,9 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    serialised itself, and at least one return builds that string in a way
  *    the inferrer cannot trace to a typed value, so it publishes no part of
  *    the contract (carrick#2200).
+ *  - `handler_unproven`: the response would be read from a function handed to
+ *    a registration call beside another function, and nothing states which of
+ *    them handles the route, so no response is read from any (carrick#2364).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -243,6 +246,7 @@ export type TypeProvenanceReason =
   | 'no_request_body'
   | 'projected_value_only'
   | 'serialised_body_unread'
+  | 'handler_unproven'
   | 'not_recorded';
 
 /**
