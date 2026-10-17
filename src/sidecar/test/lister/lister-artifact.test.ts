@@ -128,7 +128,7 @@ async function runLister(entry: string, dir: string, nodeArgs: string[] = [], ex
       request_id: 'list',
       action: 'list_library_surface',
       from_dir: dir,
-      packages: ['fixture-queue', 'node:events'],
+      packages: ['fixture-queue', 'node:events', 'lib:lib.es5.d.ts'],
       max_entries: 1_000_000,
     });
     child.stdin.write(`${JSON.stringify({ request_id: 'bye', action: 'shutdown' })}\n`);
@@ -225,6 +225,10 @@ describe('the surface lister artifact (carrick#1660)', () => {
     assert.strictEqual(publish.signatures[0].returns, 'Promise<Message>');
     // No runtime types package is installed, so the runtime module lists nothing.
     assert.strictEqual(run.listed.surfaces[1].reason, 'module_unresolved');
+    // The default library's globals, from the copy the artifact carries (carrick#2445).
+    const language = run.listed.surfaces[2];
+    assert.strictEqual(language.reason, undefined);
+    assert.ok(language.exports.some(e => e.export === 'parseInt'));
   });
 
   it('lists exactly what the unbundled sidecar lists', async () => {
