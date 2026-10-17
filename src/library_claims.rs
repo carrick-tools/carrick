@@ -1472,6 +1472,58 @@ mod tests {
         );
     }
 
+    /// carrick#2436: with site questions on the store answers every network
+    /// role, and a claim of a role other than the message roles (an HTTP
+    /// client's, a server framework's) feeds discovery and the site rows
+    /// only. Here it asks no check and states no library row: the rows are
+    /// those of the message-role claims alone, byte for byte.
+    #[test]
+    fn claims_of_the_roles_site_questions_add_state_no_library_row() {
+        let http = export(json!({
+            "package": "@fixture/http", "version": "2.0.0", "specifier": "@fixture/http",
+            "export": "http", "role": "http_client", "side": "client",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "publish", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } },
+                { "kind": "op", "op": "request", "member": "get", "on": "export",
+                  "name": { "arg": 0 }, "method": "GET" }
+            ]
+        }));
+        let server = export(json!({
+            "package": "@fixture/server", "version": "3.0.0", "specifier": "@fixture/server",
+            "export": "app", "role": "server_framework", "side": "server",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": "subscribe", "on": "export",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/orders.ts",
+            "import { bus } from \"@fixture/bus\";\n\
+             import { http } from \"@fixture/http\";\n\
+             import { app } from \"@fixture/server\";\n\
+             export async function send() {\n\
+             \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+             \x20 await http.publish(\"orders.created\", { id: 1 });\n\
+             \x20 await http.get(\"/orders\");\n\
+             \x20 app.subscribe(\"orders.created\", (message) => {});\n\
+             }\n",
+        )]);
+        let message = vec![bus()];
+        let network = vec![bus(), http, server];
+        let asked_message = std::cell::RefCell::new(Vec::new());
+        let asked_network = std::cell::RefCell::new(Vec::new());
+        let from_message = read(&sites, &message, verifier(&asked_message, all));
+        let from_network = read(&sites, &network, verifier(&asked_network, all));
+        assert!(!from_message.rows.is_empty(), "the bus states its rows");
+        assert_eq!(from_network, from_message);
+        assert_eq!(
+            format!("{:?}", from_network.rows),
+            format!("{:?}", from_message.rows)
+        );
+        assert_eq!(*asked_network.borrow(), *asked_message.borrow());
+    }
+
     /// An op claimed on one receiver by its id (`of`) is read only through
     /// that receiver, and a name a scope member binds is carrick#1678's.
     #[test]

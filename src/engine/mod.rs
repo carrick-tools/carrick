@@ -4678,6 +4678,25 @@ impl LibraryAsk {
         if crate::local_mode::no_model() || sidecar.is_none() {
             return None;
         }
+        Self::of(
+            inputs,
+            service_root,
+            repo_root,
+            turns,
+            crate::site_questions::enabled(),
+        )
+    }
+
+    /// What the service asks: the roles [`crate::library_store::roles_for`]
+    /// `site_questions` (carrick#2436), for the public registry packages its
+    /// library calls go through.
+    fn of(
+        inputs: &crate::request_summary::RequestSummaryInputs,
+        service_root: &Path,
+        repo_root: &Path,
+        turns: setup_ahead::AskTurns,
+        site_questions: bool,
+    ) -> Option<Self> {
         let sites = crate::request_summary::library_sites(inputs);
         let specifiers: BTreeSet<String> = sites.packages().into_values().flatten().collect();
         let home = dirs::home_dir();
@@ -4692,7 +4711,8 @@ impl LibraryAsk {
                 yarn_registry_env: yarn_registry_env.as_deref(),
                 npm_registry_env: npm_registry_env.as_deref(),
             },
-        )?;
+        )?
+        .with_roles(crate::library_store::roles_for(site_questions));
         Some(Self {
             sites,
             asked,
@@ -4797,26 +4817,11 @@ async fn site_rows_of(
         return crate::site_rows::SiteRows::default();
     }
     let root = Path::new(repo_path);
-    let labels = crate::request_summary::discovery::Labels::of(claims);
-    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> =
-        crate::request_summary::discovery::discover(inputs, &labels, root)
-            .sites
-            .iter()
-            .filter_map(|site| {
-                serde_json::to_value(site)
-                    .and_then(serde_json::from_value)
-                    .ok()
-            })
-            .collect();
-    let site_labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
-    let decided = crate::request_summary::decided_sites::decided_sites(
-        inputs,
-        root,
-        &discovered,
-        &site_labels,
-    );
-    let records =
-        crate::request_summary::site_record::site_records(inputs, root, &decided, &site_labels);
+    let SiteRecordsOf {
+        decided,
+        records,
+        labels: site_labels,
+    } = site_records_of(inputs, root, claims);
     let answers = crate::site_questions::ask_service(
         &crate::site_questions::agent(),
         &get_repository_name(repo_path),
@@ -4836,6 +4841,46 @@ async fn site_rows_of(
         "site questions: rows"
     );
     rows
+}
+
+/// What a service's site questions read before anything is asked
+/// ([`site_records_of`]).
+struct SiteRecordsOf {
+    decided: crate::request_summary::decided_sites::Decided,
+    records: Vec<crate::request_summary::site_record::SiteRecord>,
+    labels: Vec<crate::request_summary::decided_sites::SiteLabel>,
+}
+
+/// The site labels the settled `claims` give, of every role the store was
+/// asked for (carrick#2436), every call discovery finds that reaches one,
+/// where each one's name is decided, and each decided site's record. Files
+/// are named relative to `root`, the scanned repo's root.
+fn site_records_of(
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    root: &Path,
+    claims: &[crate::library_claims::ExportClaims],
+) -> SiteRecordsOf {
+    let labels = crate::request_summary::discovery::Labels::of(claims);
+    let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> =
+        crate::request_summary::discovery::discover(inputs, &labels, root)
+            .sites
+            .iter()
+            .filter_map(|site| {
+                serde_json::to_value(site)
+                    .and_then(serde_json::from_value)
+                    .ok()
+            })
+            .collect();
+    let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(claims);
+    let decided =
+        crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels);
+    let records =
+        crate::request_summary::site_record::site_records(inputs, root, &decided, &labels);
+    SiteRecordsOf {
+        decided,
+        records,
+        labels,
+    }
 }
 
 /// `sites` read through `claims`, each verified by the sidecar against the
@@ -21467,6 +21512,142 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(blob(off), before);
         assert_eq!(blob(stray), before);
         assert!(!before.contains("possible_calls") && !before.contains("inference"));
+    }
+
+    /// carrick#2436: a service's library ask names every network role with
+    /// site questions on, and today's message roles, byte for byte, with them
+    /// off, for the same packages.
+    #[test]
+    fn a_service_s_library_ask_names_the_roles_its_switch_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |file: &str, text: &str| {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{ "name": "service", "dependencies": { "fixture-bus": "^1.0.0" } }"#,
+        );
+        write(
+            "node_modules/fixture-bus/package.json",
+            r#"{"name":"fixture-bus","version":"1.0.0"}"#,
+        );
+        write(
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/fixture-bus":{"version":"1.0.0","resolved":"https://registry.npmjs.org/fixture-bus/-/fixture-bus-1.0.0.tgz"}}}"#,
+        );
+        write(
+            "src/orders.ts",
+            "import { bus } from \"fixture-bus\";\nexport async function send() {\n  await bus.publish(\"orders.created\", { id: 1 });\n}\n",
+        );
+        let inputs = crate::engine::discover_request_inputs(root);
+        let body = |site_questions: bool| {
+            let ask =
+                super::LibraryAsk::of(&inputs, root, root, Default::default(), site_questions)
+                    .expect("the service asks about its public package");
+            serde_json::to_string(&ask.asked.request).unwrap()
+        };
+        let packages = r#""packages":[{"package":"fixture-bus","version":"1.0.0","specifiers":["fixture-bus"]}]"#;
+        assert_eq!(
+            body(false),
+            format!(r#"{{"roles":["broker","socket","in_process_bus"],{packages}}}"#)
+        );
+        assert_eq!(
+            body(true),
+            format!(
+                r#"{{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],{packages}}}"#
+            )
+        );
+    }
+
+    /// The store's answer for the HTTP client the site fixture calls
+    /// through: its export when the request names `http_client`, nothing for
+    /// a request that names only other roles, as the store answers.
+    fn http_store(request: &crate::library_store::LibraryClaimsRequest) -> String {
+        if !request.roles.contains(&"http_client") {
+            return r#"{"library_claims":[{"package":"fixture-http","version":"1.0.0","status":"answered","exports":[]}]}"#
+                .to_string();
+        }
+        r#"{"library_claims":[{"package":"fixture-http","version":"1.0.0","status":"answered","exports":[
+            {"specifier":"fixture-http","export":"default","role":"http_client","side":"client",
+             "makes":[],"scopes":[],
+             "ops":[{"op":"request","member":"get","on":"export","name":{"arg":0},"method":"GET"}],
+             "reserved":[],"calls":[],"patterns":[]}]}]}"#
+            .to_string()
+    }
+
+    /// carrick#2436: with site questions on, the scan asks the store for
+    /// every network role, so a call through an HTTP client's export is a
+    /// discovery site with its record. Off, the ask names the message roles
+    /// alone, the store answers no HTTP label, and the call is no site.
+    #[tokio::test]
+    async fn an_http_client_s_call_is_a_site_only_when_site_questions_ask_its_role() {
+        let edit = [
+            (
+                "node_modules/fixture-http/package.json",
+                r#"{ "name": "fixture-http", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/fixture-http/index.d.ts",
+                "export interface HttpStatic {\n  get(url: string): Promise<unknown>;\n}\ndeclare const http: HttpStatic;\nexport default http;\n",
+            ),
+            (
+                "src/orders-api.ts",
+                "import http from \"fixture-http\";\n\nexport function listOrders(): Promise<unknown> {\n  return http.get(\"/orders\");\n}\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "discovery",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let file = "services/web/src/orders-api.ts";
+        for site_questions in [false, true] {
+            let asked = crate::library_store::Asked::naming_for(
+                &["fixture-http"],
+                crate::library_store::roles_for(site_questions),
+            );
+            let settled = crate::library_store::ask_until_settled(
+                &asked,
+                |_| async {},
+                |request| async move { Ok(http_store(&request)) },
+            )
+            .await;
+            let of = super::site_records_of(&on.inputs, &on.repo, &settled.exports);
+            let sites: Vec<(String, u32, String)> = of
+                .decided
+                .sites
+                .iter()
+                .filter(|site| site.file == file)
+                .map(|site| (site.file.clone(), site.line, site.end.role.clone()))
+                .collect();
+            let records = of
+                .records
+                .iter()
+                .filter(|record| {
+                    serde_json::to_string(&record.state.point)
+                        .unwrap()
+                        .contains("orders-api.ts")
+                })
+                .count();
+            if site_questions {
+                assert_eq!(
+                    sites,
+                    vec![(file.to_string(), 4, "http_client".to_string())],
+                    "on: the HTTP call is a site"
+                );
+                assert_eq!(records, 1, "on: the site has its record");
+            } else {
+                assert!(sites.is_empty(), "off: no HTTP label, no site");
+                assert_eq!(records, 0);
+            }
+        }
     }
 
     /// carrick#2439: on, an answer in the band replaces the model's pub/sub

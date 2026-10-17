@@ -48,6 +48,31 @@ use crate::services::type_sidecar::{LibraryClaim, LibraryRole};
 /// The roles this scanner reads rows for: the store spends nothing on others.
 pub const ROLES: [&str; 3] = ["broker", "socket", "in_process_bus"];
 
+/// Every network role the store answers (carrick-cloud#2377), asked when
+/// site questions are on ([`crate::site_questions::enabled`], carrick#2436):
+/// discovery and the site labels read all of them. The message roles come
+/// first, in [`ROLES`]' order. Library rows still read the message roles
+/// only ([`crate::library_claims::read`]), so a claim of another role feeds
+/// discovery and the site rows and states no library row.
+pub const NETWORK_ROLES: [&str; 6] = [
+    "broker",
+    "socket",
+    "in_process_bus",
+    "http_client",
+    "graphql_client",
+    "server_framework",
+];
+
+/// The roles a scan asks the store for: every network role with site
+/// questions on, the message roles alone with them off.
+pub fn roles_for(site_questions: bool) -> &'static [&'static str] {
+    if site_questions {
+        &NETWORK_ROLES
+    } else {
+        &ROLES
+    }
+}
+
 /// The store's route.
 pub const ROUTE: &str = "/library-claims";
 
@@ -148,9 +173,15 @@ impl Asked {
     /// without an install.
     #[cfg(test)]
     pub(crate) fn naming(packages: &[&str]) -> Self {
+        Self::naming_for(packages, &ROLES)
+    }
+
+    /// [`Self::naming`], asking `roles`.
+    #[cfg(test)]
+    pub(crate) fn naming_for(packages: &[&str], roles: &[&'static str]) -> Self {
         Self {
             request: LibraryClaimsRequest {
-                roles: ROLES.to_vec(),
+                roles: roles.to_vec(),
                 packages: packages
                     .iter()
                     .map(|name| RegistryPackage {
@@ -162,6 +193,12 @@ impl Asked {
             },
             spellings: BTreeMap::new(),
         }
+    }
+
+    /// The same packages, asking `roles` instead.
+    pub fn with_roles(mut self, roles: &[&'static str]) -> Self {
+        self.request.roles = roles.to_vec();
+        self
     }
 
     /// The request for only `packages`, or `None` when it names none of
@@ -1224,6 +1261,30 @@ mod tests {
             }),
             "no workspace_packages: in-repo packages are carrick#1666's"
         );
+    }
+
+    /// carrick#2436: with site questions off the request is today's, byte for
+    /// byte. On, it asks every network role the store answers for the same
+    /// packages, and so does the re-ask of a package still being built.
+    #[test]
+    fn the_request_asks_every_network_role_only_with_site_questions_on() {
+        let dir = tempfile::tempdir().unwrap();
+        install_package(dir.path(), "lib", "1.0.0");
+        npm_lockfile(dir.path(), &[("lib", PUBLIC_TGZ)]);
+        let asked = request(&specifiers(&["lib"]), &install_at(dir.path())).unwrap();
+        let off = asked.clone().with_roles(roles_for(false));
+        assert_eq!(off, asked);
+        assert_eq!(
+            serde_json::to_string(&off.request).unwrap(),
+            r#"{"roles":["broker","socket","in_process_bus"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#
+        );
+        let on = asked.with_roles(roles_for(true));
+        assert_eq!(
+            serde_json::to_string(&on.request).unwrap(),
+            r#"{"roles":["broker","socket","in_process_bus","http_client","graphql_client","server_framework"],"packages":[{"package":"lib","version":"1.0.0","specifiers":["lib"]}]}"#
+        );
+        let again = on.only(&BTreeSet::from(["lib".to_string()])).unwrap();
+        assert_eq!(again.roles, NETWORK_ROLES.to_vec());
     }
 
     #[test]

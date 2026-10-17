@@ -215,7 +215,7 @@ pub(crate) mod discovery;
 // One fixture service walked with or without rows, for the tests of what
 // the summaries read through them.
 #[cfg(test)]
-mod fixture_walk;
+pub(crate) mod fixture_walk;
 
 // What the compiler's per-position rows say at each lookup the summaries
 // make by name today (carrick#2413): an offline census.
