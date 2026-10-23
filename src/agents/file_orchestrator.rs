@@ -7561,20 +7561,14 @@ impl FileOrchestrator {
                     // An export named for a method *is* that method; a
                     // convention whose route modules name their handlers for a
                     // role instead (a read export, a write export) maps those
-                    // names itself, and a method guard inside the body narrows
-                    // that default to the verbs actually served (carrick#601).
-                    // Either way the endpoint is anchored on the export's own
+                    // names itself. Either way the endpoint is anchored on the export's own
                     // span, so an exported binding initialized from a call — a
                     // handler built by a route-builder factory rather than
                     // declared as a function — anchors exactly like a function
                     // declaration does (carrick#473). The anchor stays the
                     // export span, never the guard line: the sidecar's
                     // return-type lookup is keyed on it.
-                    let methods = route.http_methods_for_export(
-                        &h.name,
-                        &h.method_guards,
-                        &h.declared_methods,
-                    );
+                    let methods = route.http_methods_for_export(&h.name, &h.declared_methods);
                     methods
                         .into_iter()
                         .map(|method| EndpointResult {

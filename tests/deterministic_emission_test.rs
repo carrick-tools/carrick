@@ -37,8 +37,7 @@
 //!   present below.
 //! - `flat-routes-method-guard`: every row. The fixture carries no manifest, so
 //!   no routing convention is bootstrapped for an end-to-end scan of it and the
-//!   file-based pass is a no-op; its routes are pinned by
-//!   `file_based_routing_test` at the pass itself. `remix-flat` DOES carry a
+//!   file-based pass is a no-op. `remix-flat` DOES carry a
 //!   manifest, so a scan of it bootstraps the convention and its route rows are
 //!   emitted end-to-end — which is what the claimed-module test at the bottom
 //!   of this file needs.

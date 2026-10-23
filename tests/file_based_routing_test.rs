@@ -387,13 +387,6 @@ fn astro_convention_rejects_a_non_astro_layout() {
     );
 }
 
-/// carrick#601: a route module that exports a generic write handler and
-/// narrows the HTTP method with a guard inside the body serves exactly the
-/// guarded verb. Emitting the convention's default verb as well produces a
-/// phantom row — an endpoint nothing serves — and a consumer call extracted
-/// with the wrong method matches it and reads as a confident green edge. So
-/// the guard, where one exists, is the only row; where none exists, the
-/// convention's default stands.
 /// carrick#665: a route builder that takes the HTTP method as an option
 /// states the route's verb outright. Reading only the convention's default for
 /// the export name records a PUT route as a POST, and the consumer that really
@@ -440,50 +433,5 @@ fn a_declared_method_option_replaces_the_convention_default_verb() {
     assert_eq!(
         routes, expected,
         "a route whose builder declares its method should yield exactly that verb"
-    );
-}
-
-#[test]
-fn method_guard_replaces_the_convention_default_verb() {
-    let routes = synthesized_routes(
-        "flat-routes-method-guard",
-        &builtin_conventions(&["Remix".to_string()], &[]),
-    );
-
-    let expected: BTreeSet<String> = [
-        // Guarded on PUT: the default (POST) is never served, so it is absent.
-        "PUT /api/v1/items/:itemId",
-        // Guarded on GET through a destructured local binding.
-        "GET /api/v1/items/:itemId/status",
-        // carrick#622: the guard is a comparison against a call on the member
-        // (`request.method.toUpperCase()`), which narrows the same way.
-        "PUT /api/v1/items/:itemId/archive",
-        // The mirror: case-folded down, with a lowercase literal to match.
-        "GET /api/v1/items/:itemId/labels",
-        // A switch on the case-folded method serves the verbs it branches on.
-        "PATCH /api/v1/items/:itemId/settings",
-        "DELETE /api/v1/items/:itemId/settings",
-        // carrick#628: a branch on OPTIONS is a CORS preflight the handler
-        // answers, not the verb it serves, so it never displaces the read
-        // export's default. Both spellings of the branch read the same.
-        "GET /api/v1/items/:itemId/preflight",
-        "GET /api/v1/items/:itemId/preflightFolded",
-        // A preflight branch alongside a real narrowing leaves the narrowing
-        // alone, and still no OPTIONS row.
-        "PUT /api/v1/items/:itemId/preflightWrite",
-        // HEAD is protocol plumbing too, so a handler branching only on it
-        // reads as unguarded and the write export's default stands.
-        "POST /api/v1/items/:itemId/probe",
-        // No guard: the convention's default for a write export stands.
-        "POST /api/v1/items",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-
-    assert_eq!(
-        routes, expected,
-        "a method-guarded handler should yield exactly the guarded verb and no \
-         phantom default-verb row"
     );
 }
