@@ -798,23 +798,19 @@ impl SwcScanner {
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => &e.decl,
                 _ => continue,
             };
-            match decl {
-                Decl::Var(var) => {
-                    for d in &var.decls {
-                        let Some(init) = &d.init else {
-                            continue;
-                        };
-                        for (binding, methods) in declared_route_methods(&d.name, init) {
-                            declared_by_binding.insert(binding, methods);
-                        }
-                        if let (Pat::Ident(ident), Some(root)) =
-                            (&d.name, member_root_binding(init))
-                        {
-                            handlers_off_a_binding.push((ident.id.sym.to_string(), root));
-                        }
-                    }
+            let Decl::Var(var) = decl else {
+                continue;
+            };
+            for d in &var.decls {
+                let Some(init) = &d.init else {
+                    continue;
+                };
+                for (binding, methods) in declared_route_methods(&d.name, init) {
+                    declared_by_binding.insert(binding, methods);
                 }
-                _ => {}
+                if let (Pat::Ident(ident), Some(root)) = (&d.name, member_root_binding(init)) {
+                    handlers_off_a_binding.push((ident.id.sym.to_string(), root));
+                }
             }
         }
 
