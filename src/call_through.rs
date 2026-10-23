@@ -899,11 +899,6 @@ pub struct Settled {
     /// Corrected rows that kept their response entry and lost their request
     /// entry: the call's arguments are the called function's parameters.
     pub requests_not_carried: usize,
-    /// Rows not corrected (confirmed, or left alone) whose response entry
-    /// was dropped: the row's own callee is a function the repository
-    /// declares that does not hand back a request's parsed body, so the
-    /// call's value is that function's own result.
-    pub responses_not_carried: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -911,9 +906,9 @@ pub struct Settled {
 ///
 /// | Reached | The row |
 /// |---|---|
-/// | One operation, the row's own | stays the model's and keeps its type anchors, except a response entry its own callee does not hand back (below); gains `role: wrapper_call` and `reaches_request` |
+/// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
 /// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation where the call hands back the request's parsed body, and goes otherwise; its request type entry goes |
-/// | None, several, or one beside a request no fact states | left as it is, except a response entry its own callee does not hand back (below), and counted |
+/// | None, several, or one beside a request no fact states | left as it is, and counted |
 ///
 /// A corrected row keeps the RESPONSE type anchored at it only where the
 /// row's call is itself the call that reaches the request (its own callee
@@ -926,14 +921,6 @@ pub struct Settled {
 /// callee returns an envelope, a mapped object, or a value nothing here
 /// reads) the anchor names a function's own result, and the entries are
 /// dropped and counted.
-///
-/// A row that is not corrected loses its RESPONSE entry on the same reading
-/// (carrick#1801): where the row's own call resolves to a function the
-/// repository declares and that function does not hand back a request's
-/// parsed body unchanged, the call's value is the function's own result (a
-/// copy it maps, an envelope), whatever operation the row names. A row whose
-/// own callee resolves to nothing the repository declares (a library call)
-/// keeps its entries: nothing here reads what that call returns.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
@@ -951,31 +938,10 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     for service in services.iter_mut().filter(|service| service.writable) {
         let mut corrected = 0;
         for row in &service.sites.rows {
-            // What the row's own call returns: nothing here reads it where
-            // the callee resolves to no definition of the repository; the
-            // request's parsed body where every definition it goes through
-            // hands that body back unchanged (carrick#1601); the function's
-            // own result anywhere else.
-            let callee = row.steps.first().filter(|callee| !callee.is_empty());
-            let callee_hands_back = callee.is_some_and(|callee| {
-                callee
-                    .iter()
-                    .all(|definition| hands_back_body.contains(definition))
-            });
-            let returns_own_result = callee.is_some() && !callee_hands_back;
-            let left_alone = match decider.decide(row) {
-                Reach::None => {
-                    settled.reaches_none += 1;
-                    true
-                }
-                Reach::Several => {
-                    settled.reaches_several += 1;
-                    true
-                }
-                Reach::Unstated => {
-                    settled.reaches_unstated += 1;
-                    true
-                }
+            match decider.decide(row) {
+                Reach::None => settled.reaches_none += 1,
+                Reach::Several => settled.reaches_several += 1,
+                Reach::Unstated => settled.reaches_unstated += 1,
                 Reach::One {
                     request,
                     by_own_callee,
@@ -983,16 +949,19 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     service.data,
                     row,
                     request,
-                    // The row's call is the one that reaches the request,
-                    // and it hands back the request's parsed body.
-                    by_own_callee && callee_hands_back,
-                    returns_own_result,
+                    // What the row's call returns is the request's parsed
+                    // body only where its own callee decided and every
+                    // definition that callee goes through hands that body
+                    // back unchanged (carrick#1601).
+                    by_own_callee
+                        && row.steps.first().is_some_and(|callee| {
+                            !callee.is_empty()
+                                && callee
+                                    .iter()
+                                    .all(|definition| hands_back_body.contains(definition))
+                        }),
                 ) {
-                    Some(Change::Relabelled { response_dropped }) => {
-                        settled.relabelled += 1;
-                        settled.responses_not_carried += usize::from(response_dropped);
-                        false
-                    }
+                    Some(Change::Relabelled) => settled.relabelled += 1,
                     Some(Change::Corrected {
                         types_dropped,
                         request_dropped,
@@ -1000,17 +969,9 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                         corrected += 1;
                         settled.types_not_carried += usize::from(types_dropped);
                         settled.requests_not_carried += usize::from(request_dropped);
-                        false
                     }
-                    None => false,
+                    None => {}
                 },
-            };
-            if left_alone
-                && returns_own_result
-                && let Some((method, path)) = model_row_key(service.data, row)
-                && drop_response(service.data, row, &method, &path)
-            {
-                settled.responses_not_carried += 1;
             }
         }
         settled.corrected += corrected;
@@ -1022,15 +983,14 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146); {} confirmed or left alone lost a response type their callee does not hand back (carrick#1801)",
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
         settled.relabelled,
         settled.corrected,
         settled.types_not_carried,
         settled.requests_not_carried,
         settled.reaches_none,
         settled.reaches_several,
-        settled.reaches_unstated,
-        settled.responses_not_carried
+        settled.reaches_unstated
     );
     settled
 }
@@ -1522,11 +1482,7 @@ fn site_of(call: &DataFetchingCall) -> Option<(&str, u32)> {
 }
 
 enum Change {
-    Relabelled {
-        /// The row's response entry was dropped: its own callee does not
-        /// hand back the request's parsed body.
-        response_dropped: bool,
-    },
+    Relabelled,
     Corrected {
         /// The row held consumer type entries and they were dropped, because
         /// the row's call is not the call that reaches the request.
@@ -1539,10 +1495,7 @@ enum Change {
 
 /// Change the one row of `data` that `row` names to what `reached` states.
 /// `carries_response`: the row's call is worth the request's parsed body
-/// unchanged, so the response type anchored there is the request's.
-/// `returns_own_result`: the row's own callee is a function the repository
-/// declares that does not hand that body back, so a confirmed row's response
-/// entry goes too. `None`
+/// unchanged, so the response type anchored there is the request's. `None`
 /// when the blob holds no such row: the graph build keeps fewer rows than the
 /// analysis stated.
 fn apply(
@@ -1550,7 +1503,6 @@ fn apply(
     row: &SiteRow,
     reached: &Reached,
     carries_response: bool,
-    returns_own_result: bool,
 ) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
     let graph = data.mount_graph.as_mut()?;
@@ -1574,9 +1526,7 @@ fn apply(
             "  - {location}: the model's {} {} is the call through to {}",
             call.method, call.canonical_path, reached.site
         );
-        let (method, path) = (call.method.clone(), call.canonical_path.clone());
-        let response_dropped = returns_own_result && drop_response(data, row, &method, &path);
-        return Some(Change::Relabelled { response_dropped });
+        return Some(Change::Relabelled);
     }
 
     let before = OperationKey::http(&call.method, call.canonical_path.clone());
@@ -1694,58 +1644,6 @@ fn apply(
         types_dropped,
         request_dropped,
     })
-}
-
-/// The method and canonical path of the model row `row` names in `data`'s
-/// graph, as its type entries are keyed.
-fn model_row_key(data: &CloudRepoData, row: &SiteRow) -> Option<(String, String)> {
-    let location = format!("{}:{}", row.file, row.line);
-    data.mount_graph
-        .as_ref()?
-        .data_calls
-        .iter()
-        .find(|call| {
-            call.file_location == location
-                && call.method == row.method
-                && call.target_url == row.target
-                && call.resolution_source == Some(ResolutionSource::Model)
-                && call.reaches_request.is_none()
-        })
-        .map(|call| (call.method.clone(), call.canonical_path.clone()))
-}
-
-/// Drop the consumer response entry anchored at `row`'s site under the
-/// operation `method` `path`, and the response type its projection carries:
-/// the call's value is a function's own result, not a response body
-/// (carrick#1801). The request entry stays. Whether an entry went.
-fn drop_response(data: &mut CloudRepoData, row: &SiteRow, method: &str, path: &str) -> bool {
-    let location = format!("{}:{}", row.file, row.line);
-    let key = OperationKey::http(method, path.to_string());
-    if let Some(projected) = data.calls.iter_mut().find(|operation| {
-        operation.key == key
-            && operation.resolution_source == Some(ResolutionSource::Model)
-            && operation.file_path == Path::new(&location)
-    }) {
-        projected.response_type = None;
-    }
-    let Some(manifest) = data.type_manifest.as_mut() else {
-        return false;
-    };
-    let method = normalize_manifest_method(method);
-    let before = manifest.len();
-    manifest.retain(|entry| {
-        !(entry.role == ManifestRole::Consumer
-            && entry.type_kind == ManifestTypeKind::Response
-            && entry.file_path == row.file
-            && entry.line_number == row.line
-            && entry
-                .key
-                .as_http()
-                .is_some_and(|(entry_method, entry_path)| {
-                    entry_method == method && entry_path == path
-                }))
-    });
-    manifest.len() < before
 }
 
 #[cfg(test)]
