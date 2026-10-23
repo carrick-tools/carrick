@@ -24,10 +24,8 @@
 //! literal with an interpolation, and a member of a constant object
 //! (`ROUTES.items`).
 //!
-//! The reader is shared: the join keeps a model route whose echoed id names
-//! no listed site on it (`RouteLiteralWitness` in
-//! `src/agents/file_orchestrator.rs`), and a candidate pass for hand-written
-//! dispatch can raise sites from the same positions (carrick#2386).
+//! The reader is shared: a candidate pass for hand-written dispatch can raise
+//! sites from the same positions (carrick#2386).
 //!
 //! [`compared_literals`] reads the same positions for any literal a caller
 //! keeps: the offline guard census counts every string a module compares
