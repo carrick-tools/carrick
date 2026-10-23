@@ -30,7 +30,6 @@ use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
 use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
-use crate::request_helper_sites::collect_request_helper_sites;
 use crate::type_manifest::is_http_method;
 use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
 
@@ -273,8 +272,6 @@ pub struct ScanResult {
 /// once the fact layer selects its files without it (carrick#2613).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegisterSignal {
-    /// Signal 4b: a call into a request helper the module declares.
-    C1,
     /// Signal 4: an awaited call with a string argument.
     C2,
     /// Signal 5: the method-name and object-name lists.
@@ -284,11 +281,10 @@ pub enum RegisterSignal {
 }
 
 impl RegisterSignal {
-    pub const ALL: [Self; 4] = [Self::C1, Self::C2, Self::C3, Self::C4];
+    pub const ALL: [Self; 3] = [Self::C2, Self::C3, Self::C4];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::C1 => "C1",
             Self::C2 => "C2",
             Self::C3 => "C3",
             Self::C4 => "C4",
@@ -593,7 +589,6 @@ impl SwcScanner {
             HashMap::new()
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
-        let request_helper_sites = collect_request_helper_sites(&module, &local_wrapper_calls);
         let new_url_paths = collect_new_url_paths(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
@@ -604,7 +599,6 @@ impl SwcScanner {
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
             Declarations::of(&module),
-            request_helper_sites,
         );
         module.visit_with(&mut visitor);
 
@@ -724,7 +718,6 @@ impl SwcScanner {
             HashMap::new()
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
-        let request_helper_sites = collect_request_helper_sites(&module, &local_wrapper_calls);
         let new_url_paths = collect_new_url_paths(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
@@ -735,7 +728,6 @@ impl SwcScanner {
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
             Declarations::of(&module),
-            request_helper_sites,
         );
         visitor.wanted = wanted;
         module.visit_with(&mut visitor);
@@ -2341,9 +2333,6 @@ struct CandidateVisitor {
     messaging_import_locals: HashSet<String>,
     /// Every declaration in the file, for [`CandidateTarget::url_binding`].
     declarations: Declarations,
-    /// Spans of calls that pass a route literal to a same-module request
-    /// helper (Signal 4b; see [`crate::request_helper_sites`]).
-    request_helper_sites: HashSet<(u32, u32)>,
     /// The signal whose block is running ([`RegisterSignal`]), set at the
     /// block's edges in `visit_call_expr`.
     register_signal: Option<RegisterSignal>,
@@ -2369,7 +2358,6 @@ impl CandidateVisitor {
         repo_has_messaging_clients: bool,
         messaging_import_locals: HashSet<String>,
         declarations: Declarations,
-        request_helper_sites: HashSet<(u32, u32)>,
     ) -> Self {
         Self {
             candidates: Vec::new(),
@@ -2386,7 +2374,6 @@ impl CandidateVisitor {
             pubsub_anchor_ops: Vec::new(),
             messaging_import_locals,
             declarations,
-            request_helper_sites,
             register_signal: None,
             register_hits: BTreeMap::new(),
             kept_hits: BTreeSet::new(),
@@ -3664,39 +3651,6 @@ impl Visit for CandidateVisitor {
                 _ => ("<awaited-call>".to_string(), None),
             };
             self.push_candidate(call, obj, prop);
-        }
-
-        self.register_signal = Some(RegisterSignal::C1);
-        // FROZEN (old path, 2026-10-21): Signal 4b, the stopgap in
-        // `crate::request_helper_sites`. Deletions and safety fixes only.
-        // Fixes for wrong or missing rows go in discovery (a call that reaches
-        // a labelled library export, reported where its name is decided).
-        // Delete when discovery is on by default and the four-repo replay
-        // shows no site only this signal raised (carrick#2440, target 1).
-        // Signal 4b: a call into a request helper this module declares, with a
-        // route literal where the helper builds its URL, awaited or not
-        // (carrick-cloud#2373). Signal 4 needs an `await`, and a client object
-        // of arrow methods returns the helper's promise without one. The
-        // site's options bag belongs to the site, not to the module's request
-        // shape, so it never enters the cross-file fold.
-        if self
-            .request_helper_sites
-            .contains(&(call.span.lo.0, call.span.hi.0))
-        {
-            let (obj, prop) = match &call.callee {
-                Callee::Expr(e) => (
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<helper-call>".to_string()),
-                    Self::callee_member_prop(e),
-                ),
-                _ => ("<helper-call>".to_string(), None),
-            };
-            let pushed_before = self.candidates.len();
-            self.push_candidate(call, obj, prop);
-            if self.candidates.len() > pushed_before
-                && let Some(site) = self.candidates.last_mut()
-            {
-                site.request_shape = RequestShapeSignal::NotARequest;
-            }
         }
 
         self.register_signal = Some(RegisterSignal::C3);
@@ -6953,125 +6907,6 @@ class Supervisor {
                 .iter()
                 .any(|c| c.callee_property.as_deref() == Some("lookup")),
             "a chain naming nothing api-shaped raises no candidate: {:?}",
-            result.candidates
-        );
-    }
-
-    /// An authored client of the shape carrick-cloud#2373 describes: one
-    /// request helper whose URL is built by a call, whose method is
-    /// destructured with a default, and whose sites mostly forward their own
-    /// options bag, called un-awaited from a client object of arrow methods.
-    const UNAWAITED_HELPER_CLIENT: &str =
-        include_str!("../tests/fixtures/unawaited-request-helper/client.ts");
-
-    fn line_of(content: &str, needle: &str) -> usize {
-        content
-            .lines()
-            .position(|line| line.contains(needle))
-            .map(|index| index + 1)
-            .unwrap_or_else(|| panic!("`{needle}` is not in the fixture"))
-    }
-
-    #[test]
-    fn an_unawaited_call_into_a_request_helper_with_a_route_literal_is_a_candidate() {
-        let content = UNAWAITED_HELPER_CLIENT;
-        let result = scan_test_content(content);
-        let at = |needle: &str| -> Vec<&CandidateTarget> {
-            let line = line_of(content, needle);
-            result
-                .candidates
-                .iter()
-                .filter(|c| c.line_number == line && c.callee_object == "call")
-                .collect()
-        };
-
-        for (needle, snippet) in [
-            ("list: (o", "'/books'"),
-            ("get: (id", "`/books/${encodeURIComponent(id)}`"),
-            ("search: (q", "'/books/search'"),
-            ("remove: (id", "`/books/${encodeURIComponent(id)}`"),
-            // Awaited: Signal 4 already raised it, and 4b must not add a second.
-            ("async create", "'/books'"),
-        ] {
-            let found = at(needle);
-            assert_eq!(found.len(), 1, "`{needle}` must raise one candidate");
-            assert_eq!(found[0].path_snippet.as_deref(), Some(snippet), "{needle}");
-        }
-        // Signal 4b hands the site's options bag to nobody.
-        for needle in ["list: (o", "search: (q", "remove: (id"] {
-            assert_eq!(
-                at(needle)[0].request_shape,
-                RequestShapeSignal::NotARequest,
-                "`{needle}`: an options bag at a site never enters the module fold"
-            );
-        }
-        // The literal reaches only a body, or no request at all.
-        for needle in ["view: () =>", "title: () =>"] {
-            let line = line_of(content, needle);
-            assert!(
-                result.candidates.iter().all(|c| c.line_number != line),
-                "`{needle}` must raise nothing: {:?}",
-                result.candidates
-            );
-        }
-    }
-
-    #[test]
-    fn a_route_literal_through_a_chain_of_helpers_reaches_the_request() {
-        let content = r#"
-function send(url: string) { return fetch(url); }
-function viaPrefix(p: string) { return send('/api' + p); }
-const outer = (name: string) => viaPrefix(name);
-export const a = () => outer('/a');
-export const b = () => outer('plain');
-"#;
-        let result = scan_test_content(content);
-        let a = line_of(content, "export const a");
-        let b = line_of(content, "export const b");
-        assert!(result.candidates.iter().any(|c| c.line_number == a));
-        assert!(
-            result.candidates.iter().all(|c| c.line_number != b),
-            "a literal that is not a route is not offered"
-        );
-    }
-
-    #[test]
-    fn a_file_with_no_request_helper_gets_no_helper_candidate() {
-        let content = r#"
-function shout(path: string) { return path.toUpperCase(); }
-export const a = () => shout('/a');
-"#;
-        assert!(scan_test_content(content).candidates.is_empty());
-    }
-
-    /// Control: a helper whose URL sits inline at the `fetch` is read by the
-    /// same-file wrapper pass, which already states each site, so 4b adds no
-    /// second candidate for it.
-    #[test]
-    fn a_site_the_same_file_wrapper_pass_states_gets_no_helper_candidate() {
-        let content = r#"
-async function requestJson(base: string, path: string, token: string) {
-  const res = await fetch(`${base}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return res.json();
-}
-
-export function buildTools(base: string, token: string) {
-  return {
-    listWidgets: () => requestJson(base, "/api/v1/widgets", token),
-  };
-}
-"#;
-        let result = scan_test_content(content);
-        let line = line_of(content, "listWidgets");
-        assert!(
-            !result.local_wrapper_calls.is_empty(),
-            "the control must be a stated site"
-        );
-        assert!(
-            result.candidates.iter().all(|c| c.line_number != line),
-            "{:?}",
             result.candidates
         );
     }

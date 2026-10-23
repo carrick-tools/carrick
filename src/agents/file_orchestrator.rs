@@ -628,7 +628,7 @@ pub struct ProcessingStats {
     /// candidate there (carrick#2613, `CARRICK_FACT_FILES=1`).
     pub fact_layer_files: usize,
     /// Register-signal candidates kept for the reader at a call discovery
-    /// could not follow, by signal (`C1`-`C4`): the old path's selection
+    /// could not follow, by signal (`C2`-`C4`): the old path's selection
     /// fallback, stated on the scan's fallbacks line (carrick#2613, D4).
     pub fallback_selection: BTreeMap<&'static str, usize>,
     pub total_mounts: usize,
@@ -2510,7 +2510,7 @@ impl FileOrchestrator {
             when_empty: WhenEmpty,
             /// How many candidates of an unrouted protocol it raised.
             unrouted: usize,
-            /// The candidates only register signals raised (C1-C4), by span,
+            /// The candidates only register signals raised (C2-C4), by span,
             /// with those signals. Filled only when the fact layer chooses
             /// the reader's files (carrick#2613, D4).
             held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>>,
@@ -19294,59 +19294,6 @@ export { routes };
         assert_eq!(call.target, "/widgets");
         assert_eq!(call.resolution_source, Some(ResolutionSource::ReceiverType));
         assert_eq!(stats.unemitted_literal_candidates, 0);
-    }
-
-    /// carrick-cloud#2373: the sites of an unreadable same-module request
-    /// helper reach the model as candidates, so a site it leaves out is
-    /// counted and named instead of vanishing with every counter at 0.
-    #[test]
-    fn an_unanswered_site_of_a_request_helper_is_counted() {
-        let content = include_str!("../../tests/fixtures/unawaited-request-helper/client.ts");
-        let scanned = SwcScanner::new().scan_content(
-            std::path::Path::new("src/client.ts"),
-            content,
-            &[],
-            &[],
-        );
-        let candidates: HashMap<String, CandidateTarget> = scanned
-            .candidates
-            .into_iter()
-            .map(|candidate| (candidate.candidate_id.clone(), candidate))
-            .collect();
-        let line = |needle: &str| {
-            content
-                .lines()
-                .position(|l| l.contains(needle))
-                .map(|i| i + 1)
-                .expect("the fixture holds the site")
-        };
-
-        let (_, stats) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/client.ts",
-            false,
-            &HashMap::new(),
-        );
-
-        let named = |needle: &str| format!("src/client.ts:{}", line(needle));
-        for needle in ["list: (o", "search: (q"] {
-            assert!(
-                stats.unemitted_literal_sites.contains(&named(needle)),
-                "`{needle}` must be counted: {:?}",
-                stats.unemitted_literal_sites
-            );
-        }
-        assert_eq!(
-            stats.unemitted_literal_candidates, 4,
-            "`list`, `search`, `create` and `track`'s fetch; `get` and `remove` write an interpolated template, which this count never read: {:?}",
-            stats.unemitted_literal_sites
-        );
     }
 
     #[test]
