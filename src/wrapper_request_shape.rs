@@ -1,16 +1,8 @@
-//! The request shape a wrapper module fixes for every call site that delegates
-//! to it: the HTTP method, and whether the request carries a body.
+//! The request shape one call states: the HTTP method, and whether the
+//! request carries a body.
 //!
-//! Cross-file wrapper-site resolution (#369/#370) resolves the TARGET of a call
-//! that delegates to a same-repo request wrapper, because the wrapper's source
-//! is injected into the analyzing prompt. The METHOD was never resolved the
-//! same way: a wrapper that hardcodes `method: "POST"` inside its own `fetch`
-//! tells the delegating site nothing, the model emits no method for the site,
-//! and `normalize_consumer_method` falls back to `GET`. Every resolved site of
-//! a POST-only client is then indexed as a GET (carrick-cloud#386).
-//!
-//! The method is a structural fact of the wrapper's own request call, so it is
-//! read off the AST rather than asked for. What is read is deliberately narrow:
+//! The method is a structural fact of the request call, so it is read off the
+//! AST rather than asked for. What is read is deliberately narrow:
 //!
 //! - A call counts as a REQUEST only on a structural signature — an HTTP-verb
 //!   callee property (`client.post(...)`), or an object-literal argument
@@ -20,15 +12,12 @@
 //!   an HTTP candidate too, and must not be mistaken for a second request with
 //!   an unreadable method.
 //! - A request whose method is not a literal (`fetch(url, { method })` — the
-//!   wrapper parameterizes it, so the SITE's argument is the real method) makes
-//!   the whole module's shape unknown. The site keeps whatever extraction gave
-//!   it.
-//! - So does a bag whose method a spread or a computed key may write
+//!   caller parameterizes it, so the SITE's argument is the real method) is
+//!   `Unreadable`.
+//! - So is a bag whose method a spread or a computed key may write
 //!   (`fetch(url, { ...init, headers })`): an entry overwrites the ones before
 //!   it, so only a `method` written after every such entry is read, and the
 //!   verb a call is spelled with still counts (carrick#1603).
-//! - Requests that disagree on the method make the module's shape unknown: a
-//!   delegating site could be reaching either.
 //!
 //! No library, framework or package name appears anywhere in here — the rules
 //! are the shape of the syntax, not a list of clients.
@@ -440,87 +429,27 @@ fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Optio
     }
 }
 
-// FROZEN (old path, 2026-10-21): `fold_module` and `fold_wrappers` only (the
-// request predicates above stay and move first; `wrapper_call_method` also
-// reads `fold_module`). Deletions and safety fixes only. Fixes for wrong or
-// missing rows go in per-function composition in request summaries
-// (`crate::request_summary`). Delete when summaries give the same or better
-// rows on this pass's fixtures and the four-repo replay, with no true row lost
-// (carrick#1561).
-/// The shape a whole module fixes, folded over its call sites.
-///
-/// `None` — no propagation — whenever the module issues no readable request,
-/// issues one whose method cannot be read, or issues requests that disagree.
-/// Body presence collapses to `None` on disagreement, which downstream reads as
-/// "do not touch the payload anchor".
-pub fn fold_module<'a>(
-    signals: impl IntoIterator<Item = &'a RequestShapeSignal>,
-) -> Option<WrapperRequestShape> {
-    let mut folded: Option<WrapperRequestShape> = None;
-    for signal in signals {
-        match signal {
-            RequestShapeSignal::NotARequest => continue,
-            RequestShapeSignal::Unreadable => return None,
-            RequestShapeSignal::Known(shape) => match &mut folded {
-                None => folded = Some(shape.clone()),
-                Some(acc) => {
-                    if acc.method != shape.method {
-                        return None;
-                    }
-                    if acc.has_body != shape.has_body {
-                        acc.has_body = None;
-                    }
-                }
-            },
-        }
-    }
-    folded
-}
-
-// FROZEN (old path, 2026-10-21): this function only. Deletions and safety
-// fixes only. Fixes for wrong or missing rows go in per-function composition
-// in request summaries (`crate::request_summary`). Delete when summaries give
-// the same or better rows on this pass's fixtures and the four-repo replay,
-// with no true row lost (carrick#1561).
-/// The shape one importing file may propagate, folded over every wrapper module
-/// its imports resolved to. An unknown shape on any of them makes the whole
-/// thing unknown: the file could be delegating to either.
-pub fn fold_wrappers<'a>(
-    shapes: impl IntoIterator<Item = Option<&'a WrapperRequestShape>>,
-) -> Option<WrapperRequestShape> {
-    let mut folded: Option<WrapperRequestShape> = None;
-    let mut any = false;
-    for shape in shapes {
-        any = true;
-        let shape = shape?;
-        match &mut folded {
-            None => folded = Some(shape.clone()),
-            Some(acc) => {
-                if acc.method != shape.method {
-                    return None;
-                }
-                if acc.has_body != shape.has_body {
-                    acc.has_body = None;
-                }
-            }
-        }
-    }
-    if any { folded } else { None }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::swc_scanner::SwcScanner;
     use std::path::PathBuf;
 
-    /// Fold the request shape of a module the way the orchestrator does: over
-    /// the HTTP candidates the gatekeeper raised for it.
+    /// The shape of the one request a module issues, over the HTTP candidates
+    /// the gatekeeper raised for it: `None` when its method cannot be read.
     fn module_shape(content: &str) -> Option<WrapperRequestShape> {
         let scanner = SwcScanner::new();
         let result = scanner.scan_content(&PathBuf::from("client.ts"), content, &[], &[]);
         assert!(!result.parse_failed, "fixture must parse");
-        fold_module(result.candidates.iter().map(|c| &c.request_shape))
+        result
+            .candidates
+            .iter()
+            .find_map(|c| match &c.request_shape {
+                RequestShapeSignal::NotARequest => None,
+                RequestShapeSignal::Unreadable => Some(None),
+                RequestShapeSignal::Known(shape) => Some(Some(shape.clone())),
+            })
+            .flatten()
     }
 
     #[test]
@@ -587,23 +516,6 @@ export async function load(id: string) {
                 r#"
 export async function request(method: string, path: string) {
   return fetch(`${BASE}${path}`, { method, headers: {} });
-}
-"#,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn requests_that_disagree_leave_the_module_unknown() {
-        assert_eq!(
-            module_shape(
-                r#"
-export async function read(id: string) {
-  return fetch(`${BASE}/things/${id}`, { method: "GET" });
-}
-export async function write(body: unknown) {
-  return fetch(`${BASE}/things`, { method: "POST", body: JSON.stringify(body) });
 }
 "#,
             ),
@@ -757,18 +669,6 @@ export async function create(payload: unknown) {
         );
     }
 
-    #[test]
-    fn one_unknown_wrapper_makes_the_importer_unknown() {
-        let known = WrapperRequestShape {
-            method: "POST".to_string(),
-            has_body: Some(true),
-        };
-        assert_eq!(fold_wrappers([Some(&known)]), Some(known.clone()));
-        assert_eq!(fold_wrappers([Some(&known), None]), None);
-        // No wrapper at all is not "agreed": there is nothing to propagate.
-        assert_eq!(fold_wrappers([]), None);
-    }
-
     fn object(source: &str) -> ObjectLit {
         use swc_common::{FileName, SourceMap, sync::Lrc};
         use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
@@ -816,24 +716,5 @@ export async function create(payload: unknown) {
         ] {
             assert!(!could_be_response_init(&object(source)), "{source}");
         }
-    }
-
-    #[test]
-    fn wrappers_that_agree_on_the_method_but_not_the_body_keep_the_method() {
-        let with_body = WrapperRequestShape {
-            method: "POST".to_string(),
-            has_body: Some(true),
-        };
-        let without_body = WrapperRequestShape {
-            method: "POST".to_string(),
-            has_body: Some(false),
-        };
-        assert_eq!(
-            fold_wrappers([Some(&with_body), Some(&without_body)]),
-            Some(WrapperRequestShape {
-                method: "POST".to_string(),
-                has_body: None,
-            })
-        );
     }
 }
