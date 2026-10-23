@@ -120,7 +120,7 @@ jobs:
           - shard: scan-1
             runner: cargo
             targets: >-
-              --test hosted_enrichment_test --test wrapper_call_route_test --test spread_options_verb_test --test scan_leaves_repo_unedited_test --test dispatch_dto_enum_test --test sibling_sites_test
+              --test hosted_enrichment_test --test spread_options_verb_test --test scan_leaves_repo_unedited_test --test dispatch_dto_enum_test --test sibling_sites_test
           - shard: scan-2
             runner: cargo
             targets: >-

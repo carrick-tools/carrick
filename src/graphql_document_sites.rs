@@ -641,8 +641,6 @@ enum Argument {
 }
 
 /// One name an importing file binds, and where the module graph reads it from.
-/// Shared with [`crate::wrapper_call_join`], which resolves a call's callee the
-/// same way this pass resolves an argument.
 #[derive(Debug, Clone)]
 pub(crate) struct Import {
     pub(crate) specifier: String,

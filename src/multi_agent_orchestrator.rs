@@ -97,10 +97,6 @@ impl MultiAgentOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
-        // The one module resolver for this service
-        // (`engine::service_module_index`, carrick#1416), read by the passes
-        // that resolve a call's specifier after the model has answered.
-        service_modules: &crate::workspace_resolver::WorkspaceIndex,
         // What each call site's callee sends (carrick#1555), possibly still
         // being composed while the library semantics settle (carrick#1564).
         request_summaries: crate::agents::file_orchestrator::SummarySource,
@@ -152,7 +148,6 @@ impl MultiAgentOrchestrator {
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
-                service_modules,
             )
             .await?;
 

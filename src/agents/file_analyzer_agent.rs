@@ -520,20 +520,17 @@ pub struct DataCallResult {
     /// `"<file>:<line>"` in the same spelling `file_location` carries, when
     /// this row is a call through a declaration in another module.
     ///
-    /// Never from the model — set by [`crate::wrapper_call_join`] once every
-    /// file's rows are in, from the file's import table and the resolution
-    /// source of the rows in the module its callee resolves to. Absent on
-    /// every row that IS the request, and on every call through a declaration
-    /// this scan could not read.
+    /// Never from the model — set by [`crate::call_through`] once every
+    /// file's rows are in. Absent on every row that IS the request, and on
+    /// every call through a declaration this scan could not read.
     ///
     /// Carrying it makes the row a `wrapper_call` in the graph
     /// ([`crate::mount_graph::ConsumerRole`]) and names the row it should be
     /// grouped with, which is what a reader needs to count one request once.
     ///
     /// Unlike `consumers_not_resolved`, this cannot go stale on an incremental
-    /// scan: the cache holds the model's RAW answer, so the join runs again
-    /// over every file's rows on every scan and computes this from the lines
-    /// the declaring module has now.
+    /// scan: the cache holds the model's RAW answer, so it is computed again
+    /// over every file's rows on every scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaches_request: Option<String>,
     /// The request body's plain keys whose values are literals the source

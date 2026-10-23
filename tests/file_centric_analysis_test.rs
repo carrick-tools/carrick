@@ -335,7 +335,6 @@ fn test_processing_stats_tracking() {
         unemitted_literal_candidates: 0,
         unemitted_literal_sites: Vec::new(),
         candidates_awaiting_model: 0,
-        wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
         pubsub_anchor_backfills: 0,
@@ -347,9 +346,6 @@ fn test_processing_stats_tracking() {
         consumer_row_folds: Default::default(),
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
-        wrapper_call_joins: Default::default(),
-        wrapper_method_corrections: Default::default(),
-        wrapper_route_corrections: Default::default(),
     };
 
     assert_eq!(stats.files_processed, 5);
@@ -978,7 +974,6 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
-            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
         )
         .await;
 
@@ -1023,7 +1018,6 @@ async fn test_file_orchestrator_handles_empty_files() {
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
-            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
         )
         .await;
 
@@ -1067,10 +1061,6 @@ async fn test_file_orchestrator_handles_missing_files() {
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
-            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(
-                empty_root.path(),
-                None,
-            ),
         )
         .await;
 

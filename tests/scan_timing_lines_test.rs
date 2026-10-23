@@ -97,7 +97,6 @@ async fn analyze(
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
-            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(root, None),
         )
         .await
         .expect("the analysis ran")
