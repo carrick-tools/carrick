@@ -27,3 +27,21 @@ Discovery of `app` with `client` as its sibling
 No record, site or unfollowed, names a file under `packages/`: a run records
 only the calls of its own service's files. Without siblings, lines 5, 9 and
 14 are `unfollowed: outside_service`.
+
+Decided sites of the same walk (`decided_sites_with`,
+`src/request_summary/decided_sites.rs`): lines 5, 9 and 14 are sites at the
+app's own call, named by the client's code (`/v1/api/items/${id}`,
+`/v1/api/events`, `/v1/api/items/${id}`). The client's calls are never the
+site.
+
+## The scan
+
+`repo/__llm__/library-claims/default.json` is the store's cassette for the
+same `fetch`, so `tests/sibling_sites_test.rs` scans the repo as the Action
+does (`carrick .`, compiler rows and site questions on). The app's blob then
+holds `GET /v1/api/items/:id` (line 5), `POST /v1/api/events` (line 9) and
+`DELETE /v1/api/items/:id` (line 14) of `services/app/src/main.ts`, and no
+row names a file of the other service. The app asks for `fetch` only because
+the client does: the scan adds the services a walk may enter to the app's ask.
+A `--changed-only` scan of a change to the app alone carries the client, walks
+it for the app's calls, and states the same rows.

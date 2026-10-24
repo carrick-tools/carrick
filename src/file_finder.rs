@@ -1150,7 +1150,7 @@ pub fn walk_service(
 }
 
 /// [`walk_service`], saying nothing.
-fn walk_service_quietly(
+pub fn walk_service_quietly(
     repo_path: &str,
     service: &crate::config::Config,
     ignore_patterns: &[&str],

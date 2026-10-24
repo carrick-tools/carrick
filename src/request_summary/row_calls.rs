@@ -554,6 +554,27 @@ impl RequestSummaryInputs {
     }
 }
 
+impl RequestSummaryInputs {
+    /// The files, outside this service's own, that its calls' callees are
+    /// declared in ([`Reach::OutsideService`]): the files of the other
+    /// services of the run a walk from this service may enter
+    /// (carrick#2618). Sorted.
+    pub(crate) fn outside_declarations(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = every_call(&self.files)
+            .into_iter()
+            .filter_map(
+                |(file, call, _)| match self.reach(file, call.site.lo, call.site.hi) {
+                    Reach::OutsideService(declaring, _) => Some(declaring),
+                    _ => None,
+                },
+            )
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+}
+
 /// One call [`RequestSummaryInputs::calls_into_other_files`] lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallIntoFile {

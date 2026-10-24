@@ -210,6 +210,18 @@ impl FactFiles {
         facts
     }
 
+    /// These fact files, less every file `owns` refuses (carrick#2618): a
+    /// walk that enters a sibling service's code ends in a file this service
+    /// does not read, and selects no file of its own and lists no span there.
+    /// The sibling's own scan states its own.
+    pub fn within(mut self, owns: impl Fn(&str) -> bool) -> Self {
+        self.files.retain(|file, _| owns(file));
+        self.listed.retain(|file, _| owns(file));
+        self.calls.retain(|(file, _, _), _| owns(file));
+        self.server_framework_calls.retain(|file, _| owns(file));
+        self
+    }
+
     /// Record what discovery found at one call. A site wins over anything
     /// else recorded there, and anything else over a finished walk.
     fn record(&mut self, file: &str, span: (u32, u32), followed: Followed) {
@@ -396,6 +408,35 @@ mod tests {
         assert_eq!(facts.listed_in("b.ts"), BTreeSet::from([(5, 9)]));
         assert!(facts.listed_in("d.ts").is_empty());
         assert!(facts.listed_in("e.ts").is_empty());
+    }
+
+    /// carrick#2618: a walk that enters a sibling service's code ends in a
+    /// file this service does not read. That file selects nothing and lists
+    /// no span, while the service's own call that enters it stays a site.
+    #[test]
+    fn a_file_outside_the_service_selects_nothing() {
+        let discovery = Discovery {
+            sites: vec![site(
+                "a.ts",
+                (1, 4),
+                Some(end("packages/b.ts", LibraryRole::HttpClient)),
+                None,
+            )],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        )
+        .within(|file| !file.starts_with("packages/"));
+        let files: Vec<&str> = facts.files.keys().map(String::as_str).collect();
+        assert_eq!(files, ["a.ts"]);
+        assert_eq!(facts.listed_in("a.ts"), BTreeSet::from([(1, 4)]));
+        assert!(facts.listed_in("packages/b.ts").is_empty());
+        assert_eq!(facts.followed("a.ts", (1, 4)), Some(&Followed::Site));
     }
 
     /// carrick#2725: a route registered on a framework instance handed in as

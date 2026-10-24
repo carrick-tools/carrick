@@ -226,6 +226,56 @@ impl Asked {
         Some(asked)
     }
 
+    /// `own` plus what each of `siblings` asks that it does not
+    /// (carrick#2618): a walk that enters a sibling service's code reads its
+    /// calls through the sibling's packages, which only an answer for them
+    /// labels. The service's own entries come first, so the cap drops a
+    /// sibling's, and the count of those dropped comes back. A package at the
+    /// same version is asked once, with every specifier either imports it by.
+    pub fn merged(
+        own: Option<Self>,
+        siblings: impl IntoIterator<Item = Self>,
+    ) -> (Option<Self>, usize) {
+        let mut dropped = 0;
+        let mut merged = own;
+        for other in siblings {
+            let Some(asked) = merged.as_mut() else {
+                merged = Some(other);
+                continue;
+            };
+            for package in other.request.packages {
+                let known = asked.request.packages.iter().position(|known| {
+                    known.package == package.package && known.version == package.version
+                });
+                match known {
+                    Some(at) => {
+                        let known = &mut asked.request.packages[at];
+                        for specifier in package.specifiers {
+                            if known.specifiers.len() < MAX_SPECIFIERS
+                                && !known.specifiers.contains(&specifier)
+                            {
+                                known.specifiers.push(specifier);
+                            }
+                        }
+                        for export in package.exports {
+                            if !known.exports.contains(&export) {
+                                known.exports.push(export);
+                            }
+                        }
+                    }
+                    None if asked.request.packages.len() < MAX_PACKAGES => {
+                        asked.request.packages.push(package);
+                    }
+                    None => dropped += 1,
+                }
+            }
+            for (module, spellings) in other.spellings {
+                asked.spellings.entry(module).or_default().extend(spellings);
+            }
+        }
+        (merged, dropped)
+    }
+
     /// The same packages, asking `roles` instead.
     pub fn with_roles(mut self, roles: &[&'static str]) -> Self {
         self.request.roles = roles.to_vec();
@@ -2196,6 +2246,38 @@ mod tests {
         let request = request(&wanted.into_iter().collect(), &install_at(dir.path())).unwrap();
         assert_eq!(request.request.packages.len(), MAX_PACKAGES);
         assert_eq!(request.request.packages[0].specifiers.len(), MAX_SPECIFIERS);
+    }
+
+    /// carrick#2618: a service's ask takes the packages its siblings ask.
+    /// Its own come first, a package at one version is asked once with every
+    /// specifier, and the cap drops a sibling's entries, counted.
+    #[test]
+    fn a_siblings_packages_join_the_ask_after_the_services_own() {
+        let own = Asked::naming(&["a", "b"]);
+        let mut sibling = Asked::naming(&["b", "c"]);
+        sibling.request.packages[0].specifiers = vec!["b/sub".to_string()];
+        let (merged, dropped) = Asked::merged(Some(own.clone()), [sibling.clone()]);
+        let merged = merged.unwrap();
+        let names: Vec<&str> = merged
+            .request
+            .packages
+            .iter()
+            .map(|package| package.package.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(dropped, 0);
+        assert_eq!(merged.request.packages[1].specifiers, ["b", "b/sub"]);
+        // A service that asks nothing takes the sibling's whole ask.
+        let (alone, _) = Asked::merged(None, [sibling.clone()]);
+        assert_eq!(alone.unwrap().request.packages.len(), 2);
+        // No siblings: the ask is as it was.
+        assert_eq!(Asked::merged(Some(own.clone()), []).0, Some(own));
+        // The cap keeps the service's own and drops the sibling's extra.
+        let names: Vec<String> = (0..MAX_PACKAGES).map(|i| format!("p{i:03}")).collect();
+        let full = Asked::naming(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let (capped, dropped) = Asked::merged(Some(full), [Asked::naming(&["extra"])]);
+        assert_eq!(capped.unwrap().request.packages.len(), MAX_PACKAGES);
+        assert_eq!(dropped, 1);
     }
 
     #[test]
