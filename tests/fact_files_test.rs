@@ -16,8 +16,8 @@
 //!   answered yet;
 //! - `src/serve.ts`, a route registered through a labelled server-framework
 //!   export that no signal raises;
-//! - `src/hook.ts`, an awaited call with a string argument (register signal
-//!   C2) on a function a factory returned, a call discovery cannot follow;
+//! - `src/hook.ts`, a call on an object named `api` (register signal C3) to
+//!   a function a factory returned, a call discovery cannot follow;
 //! - `src/twice.ts`, the same signal on a local helper whose walk finishes
 //!   with no network call;
 //! - `src/nested.ts`, the same signal on a local helper that calls a function
@@ -97,17 +97,17 @@ const NOTIFY: &str = "import relay from \"@fixture/relay\"; // café, naïve, �
 
 const SERVE: &str = "import { answer } from \"@fixture/serve\";\n\nfunction pong(): string {\n  return \"pong\";\n}\n\nanswer(\"/ping\", pong);\n";
 
-const HOOK: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst post = makeSender();\n\nexport async function hook(): Promise<void> {\n  await post(\"/hooks\");\n}\n";
+const HOOK: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst api = { send: makeSender() };\n\nexport async function hook(): Promise<void> {\n  await api.send(\"/hooks\");\n}\n";
 
 const MEMBERS: &str = "export class Pusher {\n  constructor(private readonly base: string) {}\n\n  push(item: string): Promise<Response> {\n    return fetch(`${this.base}/api/v2/items/${item}`, { method: \"PUT\" });\n  }\n}\n";
 
 const MEMBER_CALLER: &str = "import { Pusher } from \"./members\";\n\ninterface Sender {\n  push(item: string): Promise<Response>;\n}\n\nconst client: Sender = new Pusher(\"http://items.internal\");\n\nexport async function run(): Promise<void> {\n  await client.push(\"a\");\n}\n";
 
-const TWICE: &str = "async function double(text: string): Promise<string> {\n  return text + text;\n}\n\nexport async function twice(): Promise<string> {\n  return await double(\"/twice\");\n}\n";
+const TWICE: &str = "class Doubler {\n  double(text: string): string {\n    return text + text;\n  }\n}\n\nconst api = new Doubler();\n\nexport function twice(): string {\n  return api.double(\"/twice\");\n}\n";
 
-const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst deliver = makeSender();\n\nasync function send(path: string): Promise<void> {\n  await deliver(path);\n}\n\nexport async function nested(): Promise<void> {\n  await send(\"/nested\");\n}\n";
+const NESTED: &str = "function makeSender(): (path: string) => Promise<void> {\n  return async (path) => {\n    void path;\n  };\n}\n\nconst deliver = makeSender();\n\nconst api = {\n  async send(path: string): Promise<void> {\n    await deliver(path);\n  },\n};\n\nexport async function nested(): Promise<void> {\n  await api.send(\"/nested\");\n}\n";
 
-const TRACED: &str = "import relay from \"@fixture/relay\";\nimport span from \"@fixture/span\";\n\nasync function traced(url: string): Promise<void> {\n  span(() => relay(url));\n}\n\nexport async function go(): Promise<void> {\n  await traced(\"/traced\");\n}\n";
+const TRACED: &str = "import relay from \"@fixture/relay\";\nimport span from \"@fixture/span\";\n\nconst api = {\n  async traced(url: string): Promise<void> {\n    span(() => relay(url));\n  },\n};\n\nexport async function go(): Promise<void> {\n  await api.traced(\"/traced\");\n}\n";
 
 const REGISTERS: &str = "import server from \"@fixture/server\";\n\nfunction health(): string {\n  return \"ok\";\n}\n\nexport function createServer() {\n  const srv = server();\n  srv.get(\"/health\", () => health());\n  return srv;\n}\n";
 
@@ -525,14 +525,12 @@ fn files_only_the_fact_layer_finds_are_logged_as_fact_only() {
             .any(|line| line.contains("packages unanswered at dispatch 1")),
         "{lines:#?}"
     );
-    for signal in ["C2", "C3"] {
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains(&format!("{signal} candidates: at a site"))),
-            "{signal} is counted: {lines:#?}"
-        );
-    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("C3 candidates: at a site")),
+        "C3 is counted: {lines:#?}"
+    );
     // Record-only: the reader was sent neither file.
     for file in ["src/notify.ts", "src/slow.ts"] {
         assert!(
@@ -642,12 +640,12 @@ fn a_readers_route_at_a_fact_site_survives_the_unlisted_id_drop() {
 #[test]
 fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     let (off, on) = (recording(), choosing());
-    let hook = span_id(HOOK, "post(\"/hooks\")");
+    let hook = span_id(HOOK, "api.send(\"/hooks\")");
     assert_eq!(off.listed("src/hook.ts"), vec![hook.clone()]);
     assert_eq!(on.listed("src/hook.ts"), vec![hook], "kept under its id");
     assert_eq!(
         off.listed("src/twice.ts"),
-        vec![span_id(TWICE, "double(\"/twice\")")]
+        vec![span_id(TWICE, "api.double(\"/twice\")")]
     );
     assert!(
         on.prompt("src/twice.ts").is_none(),
@@ -656,12 +654,12 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     assert!(on.log_has(&["Skipped (no API patterns)", "src/twice.ts"]));
     // A walk that found no site but passed a call it could not follow on the
     // way has not read everything: the candidate stays.
-    let nested = span_id(NESTED, "send(\"/nested\")");
+    let nested = span_id(NESTED, "api.send(\"/nested\")");
     assert_eq!(off.listed("src/nested.ts"), vec![nested.clone()]);
     assert_eq!(on.listed("src/nested.ts"), vec![nested]);
     // So has one that hands a package's function a callback that reaches a
     // labelled export: the walk never entered it from this call.
-    let traced = span_id(TRACED, "traced(\"/traced\")");
+    let traced = span_id(TRACED, "api.traced(\"/traced\")");
     assert!(off.listed("src/traced.ts").contains(&traced));
     assert!(
         on.listed("src/traced.ts").contains(&traced),
@@ -670,11 +668,11 @@ fn a_register_candidate_stays_only_where_discovery_cannot_follow_its_call() {
     );
     let fallbacks = on.fallbacks();
     assert!(
-        fallbacks["fallback_selection_C2"].as_u64().unwrap_or(0) >= 1,
+        fallbacks["fallback_selection_C3"].as_u64().unwrap_or(0) >= 1,
         "{fallbacks}"
     );
     assert!(
-        off.fallbacks().get("fallback_selection_C2").is_none(),
+        off.fallbacks().get("fallback_selection_C3").is_none(),
         "without the switch the line is as it was"
     );
 }
