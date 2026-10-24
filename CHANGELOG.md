@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.129](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.128...carrick-v0.3.129) (2026-10-24)
+
+
+### Features
+
+* **trace:** a carried service stores and brings its route boundaries ([#2474](https://github.com/carrick-tools/carrick/issues/2474) R5c) ([#2752](https://github.com/carrick-tools/carrick/issues/2752)) ([0e12915](https://github.com/carrick-tools/carrick/commit/0e12915d5daf1ee726f1d2c3060f50d22e067b64))
+
 ## [0.3.128](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.127...carrick-v0.3.128) (2026-10-24)
 
 
