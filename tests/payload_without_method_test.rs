@@ -13,7 +13,10 @@
 //!   payload: a GET.
 //! - `lib/uploads.ts` sends a payload with `method: "POST"` written beside it.
 //!
-//! The first three keep the model's verb; the last two take the helper's.
+//! The first three keep the model's verb. The last two used to take the
+//! helper's; that pass is deleted and they keep the model's too (#2676). The
+//! test asserts every row exactly, those two at the verb they hold now, so
+//! their move stays visible and the fix for #2676 must turn them back.
 //!
 //! See `tests/fixtures/payload-without-method/README.md` for the answer key.
 
@@ -64,8 +67,12 @@ fn a_payload_with_no_method_does_not_state_a_get() {
         ("src/checkout.ts", 4, "POST"),
         ("src/profile-screen.ts", 4, "PUT"),
         ("src/refund-screen.ts", 4, "POST"),
-        ("src/search-screen.ts", 4, "GET"),
-        ("src/upload-screen.ts", 4, "POST"),
+        // Answer key: GET. `lib/catalog.ts`'s `fetch` names no method and no
+        // payload; the row keeps the model's POST (#2676).
+        ("src/search-screen.ts", 4, "POST"),
+        // Answer key: POST. `lib/uploads.ts` writes `method: "POST"` beside
+        // the payload; the row keeps the model's GET (#2676).
+        ("src/upload-screen.ts", 4, "GET"),
     ]
     .into_iter()
     .map(|(file, line, method)| (file.to_string(), line, method.to_string()))

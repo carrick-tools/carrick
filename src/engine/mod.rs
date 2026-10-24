@@ -3929,7 +3929,6 @@ async fn analyze_current_repo_incremental(
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
-                    &service_modules,
                     sidecar,
                 ),
                 compose_summaries(
@@ -10813,7 +10812,6 @@ async fn analyze_current_repo(
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
-            &service_modules,
             sidecar,
             crate::agents::file_orchestrator::SummarySource::later(summaries),
             crate::agents::file_orchestrator::FactFileSource::later(fact_files),

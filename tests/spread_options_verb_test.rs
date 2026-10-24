@@ -16,7 +16,10 @@
 //!   every request it sends is a GET whatever its caller passes.
 //! - `status.ts` forwards nothing of its caller's and names no method: a GET.
 //!
-//! The first two keep the model's verb; the last two take the helper's.
+//! The first two keep the model's verb. The last two used to take the
+//! helper's; that pass is deleted and they keep the model's too (#2676). The
+//! test asserts every row exactly, those two at the verb they hold now, so
+//! their move stays visible and the fix for #2676 must turn them back.
 //!
 //! See `tests/fixtures/spread-options-verb/README.md` for the answer key.
 
@@ -66,8 +69,12 @@ fn a_helper_that_spreads_its_caller_s_options_does_not_overrule_the_caller_s_ver
     let expected: Vec<(String, i64, String)> = [
         ("src/asset-client.ts", 4, "PUT"),
         ("src/build-client.ts", 7, "PATCH"),
-        ("src/job-client.ts", 4, "GET"),
-        ("src/status-client.ts", 4, "GET"),
+        // Answer key: GET. `poll.ts` writes `method: "GET"` after the spread;
+        // the row keeps the model's DELETE (#2676).
+        ("src/job-client.ts", 4, "DELETE"),
+        // Answer key: GET. `status.ts` forwards nothing and names no method;
+        // the row keeps the model's POST (#2676).
+        ("src/status-client.ts", 4, "POST"),
     ]
     .into_iter()
     .map(|(file, line, method)| (file.to_string(), line, method.to_string()))

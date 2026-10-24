@@ -18,10 +18,21 @@
 //! its own makes its call worth that copy, so the hook's row keeps its route
 //! and states no consumer response type.
 //!
-//! Deterministic end to end: the model is replayed from `__llm__/`.
+//! Deterministic end to end: the model is replayed from `__llm__/`. Both
+//! scans run with the fact layer's switches on (`CARRICK_FACT_FILES`,
+//! `CARRICK_SITE_QUESTIONS`, `CARRICK_POSITION_ROWS`): the wrapper passes that
+//! once made these answers are deleted (carrick#2440 batch B), so the fact
+//! layer's call-through rows must make them.
 
 use std::path::PathBuf;
 use std::process::Command;
+
+/// The fact layer's switches, on for every scan in this file.
+const FACT_LAYER: [(&str, &str); 3] = [
+    ("CARRICK_FACT_FILES", "1"),
+    ("CARRICK_SITE_QUESTIONS", "1"),
+    ("CARRICK_POSITION_ROWS", "1"),
+];
 
 fn calls(fixture_dir: &str) -> Vec<serde_json::Value> {
     let repo = env!("CARGO_MANIFEST_DIR");
@@ -34,6 +45,7 @@ fn calls(fixture_dir: &str) -> Vec<serde_json::Value> {
         .env("CARRICK_MOCK_FIXTURE_DIR", &mock_dir)
         .env("CARRICK_OUTPUT_JSON", "1")
         .env("CARRICK_SKIP_INTENTS", "1")
+        .envs(FACT_LAYER)
         .env_remove("GITHUB_REPOSITORY")
         .env_remove("GITHUB_ACTIONS")
         .env_remove("CI")
@@ -114,7 +126,8 @@ fn blobs(fixture_dir: &str) -> Vec<serde_json::Value> {
             format!("{}/", fixture.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
-        .env("CARRICK_ALLOW_MISSING_TYPES", "1");
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .envs(FACT_LAYER);
     for var in [
         "GITHUB_REPOSITORY",
         "GITHUB_REF",
@@ -138,9 +151,11 @@ fn blobs(fixture_dir: &str) -> Vec<serde_json::Value> {
     std::fs::read_dir(storage.path())
         .expect("storage dir")
         .flatten()
-        .map(|entry| {
-            serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
-                .expect("parse blob")
+        .map(|entry| entry.path())
+        // The fact layer also stores its records under a directory here.
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .map(|path| {
+            serde_json::from_slice(&std::fs::read(path).expect("read blob")).expect("parse blob")
         })
         .collect()
 }

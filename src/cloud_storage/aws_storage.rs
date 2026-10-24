@@ -4011,7 +4011,6 @@ mod tests {
                     &Default::default(),
                     &Default::default(),
                     &crate::url_normalizer::UrlNormalizer::default_permissive(),
-                    &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
                     None,
                 )
                 .await

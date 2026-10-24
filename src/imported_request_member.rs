@@ -29,8 +29,6 @@
 //!   relative specifier, with the URL at an argument position other than the
 //!   first, so the candidate scanner raises nothing for it and the client
 //!   module's real requests are invisible.
-//! - [`crate::wrapper_request_shape`] folds a method per MODULE, so a client
-//!   with one verb per method collapses to no method at all.
 //! - [`crate::local_http_wrapper`] resolves the same indirection within one
 //!   file, and only for a wrapper the site passes its path INTO.
 //!

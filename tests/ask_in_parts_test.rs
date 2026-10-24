@@ -183,7 +183,6 @@ impl Fixture {
                 &Default::default(),
                 consumer,
                 &carrick::url_normalizer::UrlNormalizer::default_permissive(),
-                &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&self.root, None),
                 None,
             )
             .await
