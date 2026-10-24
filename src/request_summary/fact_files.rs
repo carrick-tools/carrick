@@ -89,6 +89,12 @@ pub struct FactFiles {
     /// them apart. The orchestrator keeps these calls out of the request
     /// members it joins to callers.
     pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
+    /// The spans of the calls whose labelled export is a GraphQL client, by
+    /// file (carrick#2763). A hook that hands a document to a client executes
+    /// an operation; the HTTP reader is never asked about it, so a row the
+    /// reader states there is not a request the call makes. The site selects
+    /// its file and lists nothing.
+    pub graphql_client_calls: BTreeMap<String, BTreeSet<(u32, u32)>>,
     /// Packages the first answer left without exports.
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
@@ -126,6 +132,13 @@ impl FactFiles {
             };
             facts.record(&site.file, (site.span_start, site.span_end), followed);
             if let Some(end) = &site.end {
+                if end.role == LibraryRole::GraphqlClient {
+                    facts
+                        .graphql_client_calls
+                        .entry(site.file.clone())
+                        .or_default()
+                        .insert((site.span_start, site.span_end));
+                }
                 let listed = listed_role(end.role);
                 facts.select(&site.file, (site.span_start, site.span_end), listed);
                 facts.select(&end.file, (end.span_start, end.span_end), listed);
@@ -230,6 +243,16 @@ impl FactFiles {
         self.server_framework_calls
             .iter()
             .any(|(file, lines)| module.ends_with(Path::new(file)) && lines.contains(&line))
+    }
+
+    /// Whether the call at `span` in `module` reaches an export the store
+    /// labels a GraphQL client (carrick#2763). `module` is compared
+    /// component-wise by its tail, so a canonical path still matches the
+    /// repo-relative key.
+    pub fn graphql_client_call(&self, module: &Path, span: (u32, u32)) -> bool {
+        self.graphql_client_calls
+            .iter()
+            .any(|(file, spans)| module.ends_with(Path::new(file)) && spans.contains(&span))
     }
 
     /// What discovery recorded at the call at `span` in `file`, or `None`

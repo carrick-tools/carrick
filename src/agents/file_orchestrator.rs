@@ -683,6 +683,9 @@ pub struct ProcessingStats {
     /// HTTP rows dropped at call sites that execute a GraphQL document
     /// (carrick#1154), by the step that decided it.
     pub graphql_document_site_drops: crate::graphql_document_sites::DocumentSiteDrops,
+    /// HTTP rows the reader stated at a call whose labelled export is a
+    /// GraphQL client (carrick#2763).
+    pub graphql_client_site_drops: usize,
     /// Consumer rows folded onto the request they belong to (carrick#1371),
     /// by the rule that decided it.
     pub consumer_row_folds: crate::consumer_row_fold::ConsumerRowFolds,
@@ -4683,6 +4686,23 @@ impl FileOrchestrator {
                 stats.graphql_document_site_drops.document_argument,
                 stats.graphql_document_site_drops.document_executor
             );
+        }
+
+        // PHASE 5c2 (carrick#2763): the same withdrawal, decided by the role
+        // the store gives the export instead of by reading the document. A
+        // call into a GraphQL client lists no HTTP candidate, so the reader's
+        // answer for the file (replayed from the cache or not) can hold a row
+        // that joined none and has no span, which 5c does not parse a file
+        // for.
+        if let Some(facts) = fact_files.as_ref().filter(|_| choosing_files) {
+            stats.graphql_client_site_drops =
+                Self::withdraw_graphql_client_rows(&mut file_results, facts);
+            if stats.graphql_client_site_drops > 0 {
+                debug!(
+                    "  - HTTP rows withdrawn at calls into a GraphQL client: {}",
+                    stats.graphql_client_site_drops
+                );
+            }
         }
 
         // PHASE 5c1 (carrick#1794): the route at a direct call of an imported
@@ -10359,6 +10379,47 @@ impl FileOrchestrator {
             .callee_property
             .as_deref()
             .unwrap_or(&candidate.callee_object)
+    }
+
+    /// Withdraw every HTTP data call the reader stated at a call whose
+    /// labelled export is a GraphQL client (carrick#2763). The key is the
+    /// row's own span, else the span its `candidate_id` names: a cached answer
+    /// is replayed only for a file whose bytes are unchanged, so the id still
+    /// names the call it was recorded at. Never the line alone. A row another
+    /// layer stated (a request summary, a request spec) is left alone.
+    fn withdraw_graphql_client_rows(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        facts: &crate::request_summary::fact_files::FactFiles,
+    ) -> usize {
+        let mut withdrawn = 0;
+        for (file, result) in file_results.iter_mut() {
+            let module = Path::new(file);
+            result.data_calls.retain(|call| {
+                if call.resolution_source != Some(ResolutionSource::Model) {
+                    return true;
+                }
+                let span = match (call.call_expression_span_start, call.call_expression_span_end) {
+                    (Some(lo), Some(hi)) => (lo, hi),
+                    _ => match crate::call_through::span_named_by_id(&call.candidate_id) {
+                        Some(span) => span,
+                        None => return true,
+                    },
+                };
+                if !facts.graphql_client_call(module, span) {
+                    return true;
+                }
+                debug!(
+                    "Withdrawing HTTP row {} {} at {}:{}: the store labels the export this call reaches a GraphQL client",
+                    call.method.as_deref().unwrap_or("?"),
+                    call.target,
+                    file,
+                    call.line_number
+                );
+                withdrawn += 1;
+                false
+            });
+        }
+        withdrawn
     }
 
     /// Where each request member the scan read is declared, keyed by name
@@ -20850,6 +20911,74 @@ export { routes };
             Some(&facts),
         );
         assert_eq!(elsewhere.len(), 2);
+    }
+
+    /// carrick#2763: a reader row at a call into a GraphQL client export is
+    /// withdrawn by its own span, or, with none, by the span its id names; a
+    /// row at another span, or another layer's row at that span, stays.
+    #[test]
+    fn a_reader_row_at_a_graphql_client_call_is_withdrawn_by_span() {
+        let row = |id: &str, span: Option<(u32, u32)>, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: id.to_string(),
+            line_number: 3,
+            target: "/graphql".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: String::new(),
+            call_expression_span_start: span.map(|s| s.0),
+            call_expression_span_end: span.map(|s| s.1),
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+        };
+        let facts = crate::request_summary::fact_files::FactFiles {
+            graphql_client_calls: BTreeMap::from([(
+                "ui.tsx".to_string(),
+                BTreeSet::from([(10, 40)]),
+            )]),
+            ..Default::default()
+        };
+        let mut file_results = HashMap::from([(
+            "/repo/ui.tsx".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    row("span:10-40", None, ResolutionSource::Model),
+                    row("@line:3", Some((10, 40)), ResolutionSource::Model),
+                    row("span:50-80", None, ResolutionSource::Model),
+                    row("span:10-40", None, ResolutionSource::RequestSummary),
+                ],
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            FileOrchestrator::withdraw_graphql_client_rows(&mut file_results, &facts),
+            2
+        );
+        let kept: Vec<_> = file_results["/repo/ui.tsx"]
+            .data_calls
+            .iter()
+            .map(|call| (call.candidate_id.as_str(), call.resolution_source))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("span:50-80", Some(ResolutionSource::Model)),
+                ("span:10-40", Some(ResolutionSource::RequestSummary)),
+            ]
+        );
     }
 
     /// A member two modules declare is attributed to neither: a site naming it

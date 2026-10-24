@@ -119,6 +119,8 @@ const POLL: &str = "import { readStatus } from \"./status\";\n\nexport function 
 
 const HELPER: &str = "import relay from \"@fixture/relay\";\n\nfunction withPath(path: string): string {\n  return `/v2${path}`;\n}\n\nfunction request(path: string): void {\n  relay(withPath(path));\n}\n\nfunction shout(path: string): string {\n  return path.toUpperCase();\n}\n\nexport const items = {\n  list: () => request(\"/items\"),\n  title: () => shout(\"/items\"),\n};\n";
 
+const UI: &str = "import { useQuery } from \"@fixture/gql\";\n\nconst ItemsDocument = \"query Items { items { id } }\";\n\nexport async function load(): Promise<unknown> {\n  useQuery(ItemsDocument, {});\n  return fetch(\"/api/items\");\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -173,6 +175,37 @@ fn repo(tmp: &Path) -> PathBuf {
         "@fixture/http",
         "1.0.0",
         "declare function send(target: string, init?: { method?: string }): Promise<unknown>;\nexport default send;\n",
+    );
+    add_package(
+        &repo,
+        "@fixture/gql",
+        "1.0.0",
+        "export declare function useQuery(document: string, variables: object): unknown;\n",
+    );
+    fs::write(repo.join("src/ui.ts"), UI).unwrap();
+    // The reader answers a `POST /graphql` row for the hook call, which no
+    // signal lists, under the span id discovery gave the site (a `@line:N`
+    // id is rewritten only for a listed candidate).
+    canned_answer(
+        &repo,
+        "ui",
+        serde_json::json!({
+            "mounts": [], "endpoints": [],
+            "data_calls": [{
+                "candidate_id": span_id(UI, "useQuery(ItemsDocument, {})"),
+                "line_number": 6, "target": "/graphql",
+                "method": "POST", "pattern_matched": "useQuery(",
+                "call_expression_text": null, "call_expression_line": null,
+                "payload_expression_text": null, "payload_expression_line": null,
+                "primary_type_symbol": null, "type_import_source": null
+            }, {
+                "candidate_id": "@line:7", "line_number": 7, "target": "/api/items",
+                "method": "GET", "pattern_matched": "fetch(",
+                "call_expression_text": null, "call_expression_line": null,
+                "payload_expression_text": null, "payload_expression_line": null,
+                "primary_type_symbol": null, "type_import_source": null
+            }]
+        }),
     );
     fs::write(repo.join("src/registers.ts"), REGISTERS).unwrap();
     fs::write(repo.join("src/registers_caller.ts"), REGISTERS_CALLER).unwrap();
@@ -253,6 +286,15 @@ fn repo(tmp: &Path) -> PathBuf {
             }]
         }));
     }
+    claims.push(serde_json::json!({
+        "package": "@fixture/gql", "version": "1.0.0", "status": "answered",
+        "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "exports": [{
+            "specifier": "@fixture/gql", "export": "useQuery", "role": "graphql_client",
+            "side": null, "classifier": "fixture-classifier", "makes": [], "scopes": [],
+            "ops": [], "reserved": [], "calls": [], "patterns": []
+        }]
+    }));
     claims.push(serde_json::json!({
         "package": "@fixture/slow", "version": "1.0.0", "status": "pending",
         "reason": "lister_unavailable"
@@ -689,5 +731,42 @@ fn an_unawaited_call_into_a_request_helper_is_a_fact_site() {
     assert!(
         recording().prompt("src/helper.ts").is_none(),
         "without the switch the file is not read"
+    );
+}
+
+/// carrick#2763: a call into an export the store labels a GraphQL client
+/// executes an operation. No HTTP candidate is listed there, so the reader's
+/// row for it joins none and has no span; it is withdrawn by the span its id
+/// names. The fetch beside it keeps its row.
+#[test]
+fn a_row_at_a_call_into_a_graphql_client_is_withdrawn() {
+    let on = choosing();
+    let at = |scan: &Scan, line: i64| -> Vec<serde_json::Value> {
+        scan.calls
+            .iter()
+            .filter(|call| {
+                call["file"].as_str().is_some_and(|f| f.ends_with("ui.ts"))
+                    && call["line"].as_i64() == Some(line)
+            })
+            .cloned()
+            .collect()
+    };
+    let fetched = at(on, 7);
+    assert_eq!(
+        fetched.len(),
+        1,
+        "the control keeps its row: {:#?}",
+        on.calls
+    );
+    assert_eq!(fetched[0]["path"], "/api/items", "{}", fetched[0]);
+    assert!(
+        !on.calls.iter().any(|call| call["path"] == "/graphql"),
+        "no HTTP row at a GraphQL client call: {:#?}",
+        on.calls
+    );
+    assert!(
+        on.log_has(&["Withdrawing HTTP row", "/graphql", "GraphQL client"]),
+        "the withdrawal is logged: {}",
+        on.log
     );
 }

@@ -820,14 +820,20 @@ impl FileCalls {
         if row.call_expression_span_start.is_some() {
             return None;
         }
-        let (lo, hi) = row.candidate_id.strip_prefix("span:")?.split_once('-')?;
-        let span = (lo.parse::<u32>().ok()?, hi.parse::<u32>().ok()?);
+        let span = span_named_by_id(&row.candidate_id)?;
         let line = u32::try_from(row.line_number).ok()?;
         self.calls
             .iter()
             .find(|call| call.span() == span && (call.line..=call.last_line).contains(&line))
             .map(|call| call.lo)
     }
+}
+
+/// The SWC span a `span:<lo>-<hi>` candidate id names, or `None` for any
+/// other spelling.
+pub(crate) fn span_named_by_id(candidate_id: &str) -> Option<(u32, u32)> {
+    let (lo, hi) = candidate_id.strip_prefix("span:")?.split_once('-')?;
+    Some((lo.parse().ok()?, hi.parse().ok()?))
 }
 
 /// `text` with every whitespace character removed.
