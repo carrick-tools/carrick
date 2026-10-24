@@ -1535,6 +1535,15 @@ impl<'a> Walker<'a> {
                         self.bind(inner, invoke, callee).under(hop.clone())
                     }
                 };
+                // A sibling's code is read without the instances its makers
+                // build (carrick#2618): a walk into it that finds no site
+                // has not read everything the call runs, as one that passed
+                // a call it could not follow has not. The fact layer keeps
+                // the candidate there, as it did when the call was outside
+                // the service.
+                if !self.inputs.files.contains_key(&id.0) {
+                    out.missed = true;
+                }
                 // A function written at the call that the callee runs.
                 let runs = callee
                     .map(|(_, callee)| callee.invoked_params.clone())
@@ -3085,6 +3094,19 @@ mod tests {
             with.sites.iter().all(|site| site.line != 18),
             "format() reaches no labelled call"
         );
+        // A walk into a sibling that finds no site is not followed to the
+        // end (its instances are not read): `format(n)` is missed inside, not
+        // finished, so the fact layer keeps a candidate there. Without the
+        // sibling it was unfollowed, which keeps the candidate too.
+        let text = std::fs::read_to_string(on.repo.join(file)).unwrap();
+        let at = |needle: &str| {
+            // SWC numbers a file's bytes from 1.
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (file.to_string(), lo, lo + needle.len() as u32)
+        };
+        assert_eq!(with.missed_inside, vec![at("format(n)")]);
+        // The construction reads a class with no constructor: nothing to miss.
+        assert_eq!(with.finished, vec![at("new ItemsClient()")]);
         let unfollowed: Vec<(u32, Option<&str>)> = with
             .unfollowed
             .iter()
