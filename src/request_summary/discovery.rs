@@ -1813,7 +1813,21 @@ impl<'a> Walker<'a> {
                     _ => nothing(),
                 }
             }
-            ValueAt::Returned { lo, hi } => {
+            ValueAt::Returned { lo, hi, member } => {
+                // `f.bind(this)` is `f`: the member the compiler's row names
+                // as the language library's `bind` returns its object.
+                if let Some(call) = member
+                    && call.args == 1
+                    && self.is_library_bind(file, call.lo, call.hi)
+                {
+                    let mut out = Vec::new();
+                    for object in &call.object {
+                        out.extend(self.read_value(file, object, invoke, at_caller));
+                    }
+                    if !out.is_empty() {
+                        return out;
+                    }
+                }
                 let Reach::Function(target, key) = self.inputs_for(file).reach(file, *lo, *hi)
                 else {
                     return nothing();
@@ -1856,6 +1870,26 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Whether the member read at `lo..hi` in `file` is a `bind` the
+    /// language's own library declares: the compiler's row there names a
+    /// declaration in a `lib:` file.
+    fn is_library_bind(&self, file: &Path, lo: u32, hi: u32) -> bool {
+        let inputs = self.inputs_for(file);
+        let (Some(positions), Some(ir)) = (inputs.positions.as_ref(), inputs.files.get(file))
+        else {
+            return false;
+        };
+        positions
+            .lookup(file, ir.swc_start(lo), ir.swc_start(hi), Kind::Member)
+            .ok()
+            .is_some_and(|row| {
+                row.symbol() == Some("bind")
+                    && row
+                        .decl_file()
+                        .is_some_and(|declared| declared.starts_with("lib:"))
+            })
+    }
+
     /// The labelled call `invoke` is when the name or member read at
     /// `lo..hi` in `file` holds a labelled export: by the name its package
     /// publishes the declaration the compiler's row there names, or a
@@ -1885,7 +1919,11 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        if kind == Kind::Ident
+        // A global the language's library declares, read by its name or as a
+        // member of the global object (`globalThis.fetch`): the compiler's
+        // row marks the declaration published under that name, which a
+        // member of a class or an interface never is (carrick#2432 slice A2).
+        if (kind == Kind::Ident || row.flags() & FLAG_PUBLISHED != 0)
             && (row
                 .decl_file()
                 .is_some_and(|declared| declared.starts_with("lib:"))
@@ -2537,6 +2575,68 @@ mod tests {
                 .unfollowed
                 .iter()
                 .all(|site| site.stop.as_deref() != Some(UNANSWERED_PACKAGE))
+        );
+    }
+
+    /// carrick#2432 slice A2: a factory that returns a function it declares,
+    /// which sends through `options.fetch ?? globalThis.fetch.bind(globalThis)`.
+    /// A call through what the factory returned is a site whose end is the
+    /// global `fetch`, reached through the value hop at the declared
+    /// function; a factory returning a function that sends nothing is no
+    /// site. The answer key is
+    /// `tests/fixtures/discovery-factory-function/README.md`.
+    #[test]
+    fn a_function_a_factory_declares_and_returns_is_read_through_a_bound_fetch() {
+        let Some(on) = walked(
+            "discovery-factory-function",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-factory-function/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for line in [5, 10] {
+            let [site] = at("items.ts", line)[..] else {
+                panic!(
+                    "a site at items.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib.dom", "fetch")
+            );
+            assert!(end.file.ends_with("http.ts"), "{end:?}");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert!(
+                hops.contains(&(VALUE_HOP, 9)),
+                "the chain goes through the declared function: {hops:?}"
+            );
+        }
+        assert!(
+            at("plain.ts", 10).iter().all(|site| site.end.is_none()),
+            "a factory's function that sends nothing is no site"
         );
     }
 

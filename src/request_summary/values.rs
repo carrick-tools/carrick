@@ -40,8 +40,15 @@ pub(super) enum ValueAt {
         class: u32,
         field: String,
     },
-    /// What the call spanning `lo..hi` returns.
-    Returned { lo: u32, hi: u32 },
+    /// What the call spanning `lo..hi` returns. A call of a member
+    /// (`f.bind(x)`) carries the member read's span and what its object may
+    /// hold, for a member the language's own library declares to return its
+    /// object (carrick#2432 slice A2).
+    Returned {
+        lo: u32,
+        hi: u32,
+        member: Option<Box<MemberCall>>,
+    },
     /// A function written here, by where its node starts.
     Function(u32),
     /// An object literal: each key's values, and whether a spread or a
@@ -52,6 +59,18 @@ pub(super) enum ValueAt {
     },
     /// Anything else.
     Unread,
+}
+
+/// A call of a member, `object.method(…)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MemberCall {
+    /// The member read `object.method`, by its span (discovery numbering).
+    pub(super) lo: u32,
+    pub(super) hi: u32,
+    /// How many arguments the call passes.
+    pub(super) args: usize,
+    /// What the object may hold.
+    pub(super) object: Vec<ValueAt>,
 }
 
 impl ValueAt {
@@ -213,10 +232,29 @@ impl Reader<'_> {
             }
             Expr::Arrow(arrow) => vec![ValueAt::Function(arrow.span.lo.0)],
             Expr::Fn(function) => vec![ValueAt::Function(function.function.span.lo.0)],
-            Expr::Call(call) if matches!(call.callee, Callee::Expr(_)) => vec![ValueAt::Returned {
-                lo: call.span.lo.0,
-                hi: call.span.hi.0,
-            }],
+            Expr::Call(call) if matches!(call.callee, Callee::Expr(_)) => {
+                let member = match &call.callee {
+                    Callee::Expr(callee) => {
+                        match crate::graphql_document_sites::unwrap_expression(callee) {
+                            Expr::Member(member) if matches!(member.prop, MemberProp::Ident(_)) => {
+                                Some(Box::new(MemberCall {
+                                    lo: member.span.lo.0,
+                                    hi: member.span.hi.0,
+                                    args: call.args.len(),
+                                    object: self.values_in(&member.obj, scope, bound, depth + 1),
+                                }))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                vec![ValueAt::Returned {
+                    lo: call.span.lo.0,
+                    hi: call.span.hi.0,
+                    member,
+                }]
+            }
             Expr::Object(object) => {
                 let mut fields: BTreeMap<String, Vec<ValueAt>> = BTreeMap::new();
                 let mut open = false;
