@@ -22,20 +22,14 @@ no correct id to echo for the four routes. The listed candidates that state
 no route path are calls the handler makes; the answers use the body read,
 `request.json()` on line 28.
 
-The model's answers live outside the fixture root, one set per run, chosen
-with `CARRICK_MOCK_FIXTURE_DIR`:
+The model's answers live outside the fixture root, chosen with
+`CARRICK_MOCK_FIXTURE_DIR`:
 
 - `../hand-dispatch-worker.answers/listed/`: the four routes, each echoing the
   id of `request.json()` (`"@line:28"`). The join keeps each at its own line
   with no span, as it keeps a route whose id names a call the handler makes
   (carrick#1448).
-- `../hand-dispatch-worker.answers/invented/`: the same four routes with ids
-  the model made up, plus two more with made-up ids: `GET /metrics`, which no
-  literal in the file states, and `POST /audit`, which the file only
-  requests. The four are kept because the file compares the request path
-  against each; the two are dropped and counted.
+The set states the `/audit` request as a data call at its listed site.
 
-Both sets state the `/audit` request as a data call at its listed site.
-
-`expected.json` is the answer key: the four route rows, and the two drops the
-`invented` set must count. `tests/unanchored_route_rows_test.rs` reads it.
+`expected.json` is the answer key: the four route rows.
+`tests/unanchored_route_rows_test.rs` reads it.

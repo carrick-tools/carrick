@@ -28,7 +28,6 @@ use crate::{
     },
     call_base::{resolve_call_base, stated_base, written_base},
     cloud_storage::{ManifestRole, ManifestTypeKind},
-    compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
@@ -59,7 +58,7 @@ use crate::{
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
         RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
-        normalize_path_params, parse_standalone_module,
+        normalize_path_params,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -712,12 +711,6 @@ pub struct ProcessingStats {
     /// route nothing else states. Each is kept at the model's line with no
     /// span, rather than taking that call's span (carrick#1448).
     pub model_routes_kept_without_a_site: usize,
-    /// Model endpoint rows whose `candidate_id` names no listed site, kept at
-    /// the model's own line with no span because the file's source states the
-    /// route's path in a dispatch position: an equality operand, a `case`
-    /// test or a `startsWith` argument (carrick#2382). Also counted in
-    /// `model_only_rows`.
-    pub model_routes_kept_on_a_path_literal: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -904,84 +897,6 @@ impl DispatchWitnesses {
             Some(Some(witnesses)) => witnesses.witnessed(value),
             _ => true,
         }
-    }
-}
-
-// FROZEN (old path, 2026-10-21): `RouteLiteralWitness` and its impl only.
-// Deletions and safety fixes only. Fixes for wrong or missing rows go in guard
-// sites with chains (carrick#2474 R4). Delete after R4, with discovery on by
-// default and a clean four-repo replay (carrick#2474).
-/// The route paths a file's source states in a dispatch position
-/// (carrick#2382), read by [`compared_route_literals`]: a literal compared by
-/// equality, a `case` test, or a `startsWith` argument, directly or through a
-/// top-level constant.
-///
-/// The join keeps a model route whose echoed id names no listed site when
-/// this witness states its path. It records values, not byte spans, so it has
-/// no span base to agree with the candidate map on.
-#[derive(Debug, Default)]
-struct RouteLiteralWitness {
-    /// Values compared by equality or written as a `case` test.
-    equal: Vec<String>,
-    /// Values passed to `startsWith`.
-    prefixes: Vec<String>,
-}
-
-impl RouteLiteralWitness {
-    /// The witness in `content`, parsed with a source map of its own. `None`
-    /// when it does not parse, which states nothing. `file_path` decides the
-    /// syntax only.
-    fn of_source(file_path: &str, content: &str) -> Option<Self> {
-        let (_, module) = parse_standalone_module(Path::new(file_path), content)?;
-        let mut witness = Self::default();
-        for found in compared_route_literals(&module) {
-            let value = FileOrchestrator::canonicalize_route_path(&found.value);
-            match found.position {
-                ComparisonPosition::Equality | ComparisonPosition::Case => {
-                    witness.equal.push(value)
-                }
-                ComparisonPosition::StartsWith => witness.prefixes.push(value),
-            }
-        }
-        Some(witness)
-    }
-
-    /// Whether the source states `route_path`.
-    ///
-    /// By equality or `case`: the same number of segments, every literal
-    /// segment equal, and a parameter only where the row has one, so
-    /// `"/items"` states `/items` and `"/items/"` does not state `/items/:id`.
-    /// By `startsWith`, and only for a path with a parameter: the literal is
-    /// the path's literal segments before its first parameter, with or
-    /// without the trailing slash, so `"/items/"` states `/items/:id`. A path
-    /// whose first segment is a parameter has no witness.
-    fn states(&self, route_path: &str) -> bool {
-        let canonical = FileOrchestrator::canonicalize_route_path(route_path);
-        let segments: Vec<&str> = canonical.split('/').collect();
-        let is_param = |segment: &str| segment.starts_with(':') || segment.starts_with('*');
-        let Some(first_param) = segments.iter().position(|segment| is_param(segment)) else {
-            return self.equal.contains(&canonical);
-        };
-        if first_param <= 1 {
-            return false;
-        }
-        let equal = self.equal.iter().any(|value| {
-            let theirs: Vec<&str> = value.split('/').collect();
-            theirs.len() == segments.len()
-                && theirs.iter().zip(&segments).all(|(theirs, ours)| {
-                    match (is_param(theirs), is_param(ours)) {
-                        (true, true) => true,
-                        (false, false) => theirs == ours,
-                        _ => false,
-                    }
-                })
-        });
-        let prefix = segments[..first_param].join("/");
-        equal
-            || self
-                .prefixes
-                .iter()
-                .any(|value| value.strip_suffix('/').unwrap_or(value) == prefix)
     }
 }
 
@@ -4530,19 +4445,10 @@ impl FileOrchestrator {
                         std::mem::take(&mut pf.resolved),
                         &mut stats.deterministic_rows_emitted,
                     );
-                    // Read only when an endpoint's id names no listed site,
-                    // the one case the join asks it about (carrick#2382).
-                    let path_literals = model
-                        .endpoints
-                        .iter()
-                        .any(|endpoint| !pf.candidate_map.contains_key(&endpoint.candidate_id))
-                        .then(|| RouteLiteralWitness::of_source(&pf.path_str, &pf.content))
-                        .flatten();
                     Self::join_model_rows(
                         &mut adjusted,
                         model,
                         &pf.candidate_map,
-                        path_literals.as_ref(),
                         &overrules,
                         &pf.path_str,
                         pf.route_module_claimed,
@@ -4747,10 +4653,6 @@ impl FileOrchestrator {
         debug!(
             "  - Model routes kept at their own line with no site: {}",
             stats.model_routes_kept_without_a_site
-        );
-        debug!(
-            "  - Model routes kept at their own line on a path literal the file compares: {}",
-            stats.model_routes_kept_on_a_path_literal
         );
         debug!(
             "  - Model statements discarded as contradictions: {}",
@@ -9161,15 +9063,13 @@ impl FileOrchestrator {
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
     ///
-    /// `path_literals` is what the file's source compares a path against
-    /// (carrick#2382). `None` states nothing: an endpoint whose id names no
-    /// listed site is then dropped and counted.
+    /// An endpoint whose id names no listed site is dropped and counted
+    /// (carrick#2382).
     #[allow(clippy::too_many_arguments)]
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
-        path_literals: Option<&RouteLiteralWitness>,
         overrules: &[Resolved],
         file_path: &str,
         route_module_claimed: bool,
@@ -9254,8 +9154,6 @@ impl FileOrchestrator {
             );
         }
         for mut endpoint in cases.into_iter().chain(plain) {
-            // Kept only on a path literal the file compares (carrick#2382).
-            let mut on_a_path_literal = false;
             // The id the model echoed, and whether the site it names could be
             // the one this route is registered at. A route registration is a
             // call that states a route path, or — for a route whose
@@ -9342,22 +9240,6 @@ impl FileOrchestrator {
                         // at the model's own line with no span, the way an
                         // unjoinable data call is kept.
                         Some(_) => None,
-                        // The id names no listed site, but the file compares
-                        // a path against this route's own path, which is how
-                        // a service with no router states a route
-                        // (carrick#2382). The row is kept the way the arm
-                        // above keeps one, at its own line with no span. The
-                        // method stays the model's reading: a guard on the
-                        // method cannot be tied to one branch. A file the
-                        // scanner listed no candidate for was sent whole
-                        // (carrick#462) and keeps the drop.
-                        None if !candidate_map.is_empty()
-                            && path_literals
-                                .is_some_and(|literals| literals.states(&endpoint.path)) =>
-                        {
-                            on_a_path_literal = true;
-                            None
-                        }
                         None => {
                             dropped.push(format!(
                                 "{} {} (candidate_id '{}')",
@@ -9380,20 +9262,6 @@ impl FileOrchestrator {
                     endpoint.call_expression_span_start = Some(candidate.span_start);
                     endpoint.call_expression_span_end = Some(candidate.span_end);
                     Self::settle_registration_literal(&mut endpoint, candidate, file_path, stats);
-                }
-                None if on_a_path_literal => {
-                    debug!(
-                        "Keeping the model's {} {} in {} at its own line {} with no span: \
-                         the id it echoed ('{}') names no listed site, and the file compares \
-                         a path against this route's path",
-                        endpoint.method,
-                        endpoint.path,
-                        file_path,
-                        endpoint.line_number,
-                        endpoint.candidate_id
-                    );
-                    endpoint.call_expression_span_start = None;
-                    endpoint.call_expression_span_end = None;
                 }
                 None => {
                     debug!(
@@ -9598,9 +9466,6 @@ impl FileOrchestrator {
                 }
                 None => {
                     stats.model_only_rows += 1;
-                    if on_a_path_literal {
-                        stats.model_routes_kept_on_a_path_literal += 1;
-                    }
                 }
             }
             result.endpoints.push(endpoint);
@@ -14727,7 +14592,6 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &HashMap::new(),
-            None,
             &[],
             "src/client.ts",
             false,
@@ -14870,7 +14734,6 @@ export * from "./aFetch.js";"#,
                 ..Default::default()
             },
             &candidate_map,
-            None,
             &[],
             "src/client.ts",
             false,
@@ -19633,35 +19496,6 @@ export { routes };
             file_path,
             false,
             &HashMap::new(),
-            None,
-        )
-    }
-
-    /// The same seam with the source a file's path literals are read from
-    /// (carrick#2382).
-    fn emit_and_join_with_source(
-        model: FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        route_endpoints: &[EndpointResult],
-        source: &str,
-        file_path: &str,
-        route_module_claimed: bool,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        let path_literals =
-            RouteLiteralWitness::of_source(file_path, source).expect("the source parses");
-        emit_and_join_core(
-            model,
-            candidate_map,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &LiteralBaseMap::new(),
-            route_endpoints,
-            file_path,
-            route_module_claimed,
-            &HashMap::new(),
-            Some(&path_literals),
         )
     }
 
@@ -19691,7 +19525,6 @@ export { routes };
             file_path,
             route_module_claimed,
             receiver_roles,
-            None,
         )
     }
 
@@ -19710,7 +19543,6 @@ export { routes };
         file_path: &str,
         route_module_claimed: bool,
         receiver_roles: &HashMap<u32, ReceiverRole>,
-        path_literals: Option<&RouteLiteralWitness>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
@@ -19739,7 +19571,6 @@ export { routes };
             &mut result,
             model,
             candidate_map,
-            path_literals,
             &overrules,
             file_path,
             route_module_claimed,
@@ -20473,179 +20304,6 @@ export { routes };
         let (forced, stats) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
         assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
-    }
-
-    // --- carrick#2382: a made-up id kept on a path literal the file compares -
-
-    /// One listed candidate that states no route path: a call the handler
-    /// makes, so no route row can anchor on it.
-    fn one_listed_call() -> HashMap<String, CandidateTarget> {
-        HashMap::from([("c1".to_string(), candidate_with_snippet("c1", None))])
-    }
-
-    /// A model route at line 3 with an id that names no listed site.
-    fn route_with_a_made_up_id(method: &str, path: &str) -> EndpointResult {
-        let mut row = endpoint_with_candidate(path, "endpoint:made-up");
-        row.method = method.to_string();
-        row.line_number = 3;
-        row
-    }
-
-    fn join_on_source(
-        rows: Vec<EndpointResult>,
-        candidates: &HashMap<String, CandidateTarget>,
-        source: &str,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_with_source(
-            FileAnalysisResult {
-                endpoints: rows,
-                ..Default::default()
-            },
-            candidates,
-            &[],
-            source,
-            "src/worker.ts",
-            false,
-        )
-    }
-
-    /// Each comparison form the language writes a route with keeps the row,
-    /// at the model's own line with no span, as the listed-id arm keeps one.
-    #[test]
-    fn a_made_up_id_route_is_kept_when_the_file_compares_a_path_against_it() {
-        for (source, method, path) in [
-            ("if (pathname === \"/items\") {}", "GET", "/items"),
-            (
-                "switch (pathname) { case \"/health\": break; }",
-                "GET",
-                "/health",
-            ),
-            (
-                "if (pathname.startsWith(\"/items/\")) {}",
-                "DELETE",
-                "/items/:id",
-            ),
-            (
-                "if (pathname.startsWith(ITEM_PREFIX)) {}\nconst ITEM_PREFIX = \"/items/\";",
-                "DELETE",
-                "/items/:id",
-            ),
-            ("if (pathname === `/items`) {}", "POST", "/items"),
-        ] {
-            let (result, stats) = join_on_source(
-                vec![route_with_a_made_up_id(method, path)],
-                &one_listed_call(),
-                source,
-            );
-            assert_eq!(result.endpoints.len(), 1, "{source}");
-            let row = &result.endpoints[0];
-            assert_eq!((row.method.as_str(), row.path.as_str()), (method, path));
-            assert_eq!(row.line_number, 3, "the model's own line: {source}");
-            assert_eq!(row.call_expression_span_start, None, "{source}");
-            assert_eq!(row.call_expression_span_end, None, "{source}");
-            assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
-            assert_eq!(stats.model_routes_kept_on_a_path_literal, 1, "{source}");
-            assert_eq!(stats.model_only_rows, 1, "{source}");
-            assert_eq!(stats.model_routes_kept_without_a_site, 0, "{source}");
-            assert_eq!(stats.model_endpoints_dropped_unanchored, 0, "{source}");
-        }
-    }
-
-    /// A path the file states nowhere in a dispatch position is no witness,
-    /// so the row is dropped and counted as before.
-    #[test]
-    fn a_made_up_id_route_with_no_compared_path_literal_is_dropped_and_counted() {
-        for (source, path) in [
-            ("export default {};", "/items"),
-            ("await fetch(\"/items\", { method: \"POST\" });", "/items"),
-            ("const routes = { \"/items\": list };", "/items"),
-            ("if (pathname === \"/items/\") {}", "/items/:id"),
-            ("if (pathname.startsWith(\"/\")) {}", "/:id"),
-            ("if (pathname === \"/:id\") {}", "/:id"),
-            (
-                "const P = \"/items\";\nfunction f(P) { return pathname === P; }",
-                "/items",
-            ),
-        ] {
-            let (result, stats) = join_on_source(
-                vec![route_with_a_made_up_id("GET", path)],
-                &one_listed_call(),
-                source,
-            );
-            assert!(result.endpoints.is_empty(), "{source}");
-            assert_eq!(stats.model_endpoints_dropped_unanchored, 1, "{source}");
-            assert_eq!(
-                stats.model_endpoints_dropped_unanchored_sites,
-                vec![format!("src/worker.ts:3 GET {path}")],
-                "{source}"
-            );
-            assert_eq!(stats.model_routes_kept_on_a_path_literal, 0, "{source}");
-        }
-    }
-
-    /// A force-analyzed file offered no candidate (carrick#462), so a witness
-    /// does not keep its rows: the drop and its count stay.
-    #[test]
-    fn a_force_analyzed_file_keeps_the_drop_whatever_its_source_compares() {
-        let (result, stats) = join_on_source(
-            vec![route_with_a_made_up_id("GET", "/items")],
-            &HashMap::new(),
-            "if (pathname === \"/items\") {}",
-        );
-        assert!(result.endpoints.is_empty());
-        assert_eq!(stats.model_endpoints_dropped_unanchored, 1);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
-    }
-
-    /// In a module a routing convention claimed, the witness never admits a
-    /// row the convention's route set excludes (carrick#703): the row is
-    /// discarded there and counted as a claimed-module discard, not a drop.
-    #[test]
-    fn a_witnessed_made_up_id_route_in_a_claimed_module_is_discarded_by_the_convention() {
-        let derived = synthetic_endpoint("GET", "/settings/builds");
-        let (result, stats) = emit_and_join_with_source(
-            FileAnalysisResult {
-                endpoints: vec![route_with_a_made_up_id("POST", "/api/build-settings")],
-                ..Default::default()
-            },
-            &one_listed_call(),
-            std::slice::from_ref(&derived),
-            "if (pathname === \"/api/build-settings\") {}",
-            "app/routes/settings.builds.tsx",
-            true,
-        );
-        assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
-        assert_eq!(result.endpoints[0].path, "/settings/builds");
-        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
-        assert_eq!(stats.model_endpoints_dropped_unanchored, 0);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 0);
-        assert_eq!(stats.model_only_rows, 0);
-    }
-
-    /// A case of a body-dispatching handler with a made-up id is kept as a
-    /// model case row, the way the listed-id arm keeps one (carrick#2048).
-    #[test]
-    fn a_witnessed_made_up_id_case_is_kept_as_a_model_case_row() {
-        let mut case = route_with_a_made_up_id("PATCH", "/things");
-        case.dispatch = Some(crate::dispatch::Dispatch {
-            location: crate::dispatch::DispatchLocation::Body,
-            field: "action".to_string(),
-            value: "archive".to_string(),
-        });
-        let (result, stats) = join_on_source(
-            vec![case],
-            &one_listed_call(),
-            "if (url.pathname === \"/things\") {}",
-        );
-        assert_eq!(result.endpoints.len(), 1);
-        let row = &result.endpoints[0];
-        assert_eq!(row.resolution_source, Some(ResolutionSource::Model));
-        assert_eq!(
-            row.dispatch.as_ref().map(|d| d.value.as_str()),
-            Some("archive")
-        );
-        assert_eq!(row.call_expression_span_start, None);
-        assert_eq!(stats.model_routes_kept_on_a_path_literal, 1);
     }
 
     /// carrick#2382: a candidate that holds a route literal and states no

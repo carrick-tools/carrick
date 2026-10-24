@@ -4,9 +4,5 @@
     { "file": "src/worker.ts", "line": 27, "method": "POST", "path": "/items" },
     { "file": "src/worker.ts", "line": 34, "method": "DELETE", "path": "/items/:id" },
     { "file": "src/worker.ts", "line": 42, "method": "GET", "path": "/health" }
-  ],
-  "dropped_unanchored": [
-    "src/worker.ts:44 GET /metrics",
-    "src/worker.ts:16 POST /audit"
   ]
 }
