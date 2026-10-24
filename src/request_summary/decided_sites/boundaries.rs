@@ -26,7 +26,7 @@
 //! Every list is sorted and serialisable. None of it is part of a site
 //! record's state, so no site's sha moves.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -535,6 +535,11 @@ pub struct Resolved {
     pub paths: Vec<String>,
     /// Hosts whose path is not read, written around under (ii).
     pub unread_hosts: usize,
+    /// For each full path that crossed a service, the files (repo-relative)
+    /// of the scope and register calls it was composed through: what the
+    /// documentation fold across services reads (carrick#2474 R5d).
+    #[serde(skip)]
+    pub scope_files: BTreeMap<String, BTreeSet<String>>,
     /// Why nothing resolves: `unmatched_boundary`, `cycle`,
     /// `unread_prefix`, `trimmed`, `hole_<x>`, `mount_unverified` or
     /// `unread_host`.
@@ -840,6 +845,7 @@ fn resolve_segment(
         Boundary::CallbackOption { .. } => vec![across.up(&segment.at, None, &mut Vec::new())],
     };
     let mut paths: Vec<String> = Vec::new();
+    let mut scope_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut unread_hosts = 0;
     for ways in hosts {
@@ -848,10 +854,19 @@ fn resolve_segment(
         for way in ways {
             let composed = way.and_then(|mut parts| {
                 parts.extend(segment.below.iter().cloned());
-                full_paths(&parts, &segment.path)
+                let files = edge_files(&parts);
+                full_paths(&parts, &segment.path).map(|paths| (paths, files))
             });
             match composed {
-                Ok(composed) => host_paths.extend(composed),
+                Ok((composed, files)) => {
+                    for path in &composed {
+                        scope_files
+                            .entry(path.clone())
+                            .or_default()
+                            .extend(files.iter().cloned());
+                    }
+                    host_paths.extend(composed);
+                }
                 Err(reason) => {
                     host_reason.get_or_insert(reason);
                 }
@@ -888,7 +903,9 @@ fn resolve_segment(
     };
     if untraced.is_some() {
         paths.clear();
+        scope_files.clear();
     }
+    scope_files.retain(|path, _| paths.contains(path));
     Resolved {
         service: service.to_string(),
         file: segment.file.clone(),
@@ -899,8 +916,25 @@ fn resolve_segment(
         owner: segment.owner.clone(),
         paths,
         unread_hosts,
+        scope_files,
         untraced,
     }
+}
+
+/// The files of the scope and register calls `parts` pass through: each
+/// edge's `file:line`, repo-relative.
+fn edge_files(parts: &[Part]) -> BTreeSet<String> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Edge { edge } => edge
+                .split_whitespace()
+                .next()
+                .and_then(|at| at.rsplit_once(':'))
+                .map(|(file, _)| file.to_string()),
+            Part::Prefix { .. } => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1025,6 +1059,31 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].paths, vec!["/root/api/x".to_string()]);
         assert_eq!(resolved[0].untraced, None);
+    }
+
+    /// carrick#2474 R5d: each full path names the files of the scope and
+    /// register calls it was composed through, so the documentation fold
+    /// across services can tell whose code gave the route its path.
+    #[test]
+    fn a_path_names_the_files_of_the_calls_it_was_composed_through() {
+        let (r, mut s, _, _) = two_crossings();
+        s.call_ins[0].above = vec![top(vec![
+            Part::Edge {
+                edge: "packages/s/src/main.ts:3 register /root".to_string(),
+            },
+            stated("/root"),
+        ])];
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        let files: Vec<&str> = resolved[0].scope_files["/root/api/x"]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(files, vec!["packages/s/src/main.ts"]);
+        // A path that does not resolve names none.
+        let (r, mut s, _, _) = two_crossings();
+        s.call_ins[0].at = "packages/s/src/other.ts:4".to_string();
+        let resolved = resolve(&[("r", &r), ("s", &s)], FanOut::StatedHosts);
+        assert!(resolved[0].scope_files.is_empty());
     }
 
     /// carrick#2474 R5a: a callback option belongs to its host's object

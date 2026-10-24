@@ -646,9 +646,12 @@ fn producer_manifest(blobs: &Blobs) -> Vec<String> {
 /// No host's `basePrefix` value is ever read (2026-10-14
 /// ruling 1). Each corrected row's producer manifest entries take its new
 /// key and keep their alias. The routes package's documentation rows then
-/// fold onto the rows written in its own service; the two documenting the
-/// host's audit routes stay (the fold across services is R5d). With the
-/// switch off, or with the fact layer off, nothing moves.
+/// fold onto the rows written in its own service. The two documenting the
+/// host's audit routes are the host's rows, composed through the scope call
+/// the routes package wrote (R5d): the one whose row holds types folds onto
+/// it, and the one whose row was added untyped stays, counted, so the
+/// documentation's types are not lost. With the switch off, or with the
+/// fact layer off, nothing moves.
 #[test]
 fn routes_across_services_take_the_receiving_scope() {
     let off = scan_fixture("receiver-scopes-across", true, None);
@@ -679,8 +682,9 @@ fn routes_across_services_take_the_receiving_scope() {
             "packages/routes/src/admin.ts:6 POST /api/v1/admin/users library_claim app",
             "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
             // The host's audit routes are documented here, in another
-            // service: the fold across services is carrick#2474 R5d.
-            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events descriptor_route __route_descriptor__",
+            // service (carrick#2474 R5d): `audit.ts:6` holds types and takes
+            // the documentation's place, `audit.ts:7` was added untyped and
+            // the documentation of it stays.
             "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
             "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
             // Q5 (ii): the path two hosts state; the third is counted.
@@ -689,7 +693,7 @@ fn routes_across_services_take_the_receiving_scope() {
             // (PR #2734 review): that chain stays in the service, and its
             // path stands beside the hosts'.
             "packages/routes/src/orders.ts:4 GET /orders library_claim app",
-            "packages/server/src/audit.ts:6 GET /api/v1/audit/events library_claim app",
+            "packages/server/src/audit.ts:6 GET /api/v1/audit/events descriptor_route app",
             "packages/server/src/audit.ts:7 GET /api/v1/audit/events/:id library_claim app",
         ]
     );
@@ -730,7 +734,6 @@ fn routes_across_services_take_the_receiving_scope() {
             "packages/routes/src/admin.ts:5 GET /api/v1/admin/users response Endpoint_decf5c62b6c61845_Response_At436386aec40a3379",
             "packages/routes/src/docs.ts:16 POST /api/v1/admin/users request Endpoint_e6205bbde80997f6_Request_At0138837ffadb39d2",
             "packages/routes/src/docs.ts:16 POST /api/v1/admin/users response Endpoint_f23468c0fbf2a02a_Response_At0138837ffadb39d2",
-            "packages/routes/src/docs.ts:22 GET /api/v1/audit/events response Endpoint_e2d4eb6e1675c5c9_Response_Ate98fc63c17a3e34a",
             "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} response Endpoint_096ab5a590512c13_Response_At811f38cb9a8a62a6",
             "packages/routes/src/docs.ts:4 GET /api/v1/orders response Endpoint_8cc6f21213a20a01_Response_Atc7ccf7294327f4bc",
             "packages/server/src/audit.ts:6 GET /api/v1/audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
@@ -761,6 +764,8 @@ fn routes_across_services_take_the_receiving_scope() {
             "routes_across_added_untyped=3",
             "routes_across_corrected=1",
             "routes_across_unread_host=1",
+            // `docs.ts:28`: its handler row was written untyped.
+            "routes_documented_across_unfolded=1",
             // The package's own sites end at the plugin's parameter: the
             // reader keeps them inside the service, and the join point
             // writes them.
