@@ -518,7 +518,7 @@ mod tests {
     /// the HTTP candidates the gatekeeper raised for it.
     fn module_shape(content: &str) -> Option<WrapperRequestShape> {
         let scanner = SwcScanner::new();
-        let result = scanner.scan_content(&PathBuf::from("client.ts"), content, &[], &[]);
+        let result = scanner.scan_content(&PathBuf::from("client.ts"), content, &[]);
         assert!(!result.parse_failed, "fixture must parse");
         fold_module(result.candidates.iter().map(|c| &c.request_shape))
     }
