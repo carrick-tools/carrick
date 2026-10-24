@@ -345,12 +345,6 @@ pub struct ExportedHandler {
     pub span_start: u32,
     /// End byte offset of the exported declaration.
     pub span_end: u32,
-    /// HTTP-method literals the handler body compares the request method
-    /// against (carrick#601). Empty when the handler reads no method guard.
-    /// A route module that exports one generic handler and narrows the method
-    /// inside the body serves only the guarded verbs, so the convention's
-    /// default verb for that export would be an endpoint nothing serves.
-    pub method_guards: Vec<String>,
     /// HTTP-method literals the call that BUILT this handler was given as an
     /// option (carrick#665). A route-builder factory takes an options object,
     /// and a `method` on it is the route's verb stated outright: the module
@@ -788,14 +782,10 @@ impl SwcScanner {
             Err(_) => return ModuleExports::default(),
         };
 
-        // Method guards are read per top-level *binding*, exported or not, so a
-        // handler declared above an `export { ... }` list reads its guard the
-        // same way an inline `export function` does.
-        let mut guards_by_binding: HashMap<String, Vec<String>> = HashMap::new();
         // The verbs the call that built a binding was given as an option
-        // (carrick#665), read per top-level binding for the same reason the
-        // guards are: the builder call and the `export` of its result are
-        // routinely two statements apart.
+        // (carrick#665), read per top-level binding, exported or not: the
+        // builder call and the `export` of its result are routinely two
+        // statements apart.
         let mut declared_by_binding: HashMap<String, Vec<String>> = HashMap::new();
         // Bindings taken as a MEMBER of another binding (`const action =
         // route.action`), with the binding they came off. A route module that
@@ -808,31 +798,19 @@ impl SwcScanner {
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(e)) => &e.decl,
                 _ => continue,
             };
-            match decl {
-                Decl::Fn(f) => {
-                    guards_by_binding
-                        .insert(f.ident.sym.to_string(), collect_method_guards(&*f.function));
+            let Decl::Var(var) = decl else {
+                continue;
+            };
+            for d in &var.decls {
+                let Some(init) = &d.init else {
+                    continue;
+                };
+                for (binding, methods) in declared_route_methods(&d.name, init) {
+                    declared_by_binding.insert(binding, methods);
                 }
-                Decl::Var(var) => {
-                    for d in &var.decls {
-                        let Some(init) = &d.init else {
-                            continue;
-                        };
-                        if let Pat::Ident(ident) = &d.name {
-                            guards_by_binding
-                                .insert(ident.id.sym.to_string(), collect_method_guards(&**init));
-                        }
-                        for (binding, methods) in declared_route_methods(&d.name, init) {
-                            declared_by_binding.insert(binding, methods);
-                        }
-                        if let (Pat::Ident(ident), Some(root)) =
-                            (&d.name, member_root_binding(init))
-                        {
-                            handlers_off_a_binding.push((ident.id.sym.to_string(), root));
-                        }
-                    }
+                if let (Pat::Ident(ident), Some(root)) = (&d.name, member_root_binding(init)) {
+                    handlers_off_a_binding.push((ident.id.sym.to_string(), root));
                 }
-                _ => {}
             }
         }
 
@@ -858,21 +836,14 @@ impl SwcScanner {
 
         let mut out = Vec::new();
         let mut reexports_all = false;
-        let mut push = |name: String,
-                        span: swc_common::Span,
-                        method_guards: Vec<String>,
-                        declared_methods: Vec<String>| {
+        let mut push = |name: String, span: swc_common::Span, declared_methods: Vec<String>| {
             out.push(ExportedHandler {
                 name,
                 line_number: sm.lookup_char_pos(span.lo).line,
                 span_start: span.lo.0,
                 span_end: span.hi.0,
-                method_guards,
                 declared_methods,
             });
-        };
-        let guards_of = |binding: &str| -> Vec<String> {
-            guards_by_binding.get(binding).cloned().unwrap_or_default()
         };
         let declared_of = |binding: &str| -> Vec<String> {
             declared_by_binding
@@ -890,13 +861,12 @@ impl SwcScanner {
                 ModuleDecl::ExportDecl(export) => match &export.decl {
                     Decl::Fn(f) => {
                         let name = f.ident.sym.to_string();
-                        let guards = guards_of(&name);
                         let declared = declared_of(&name);
-                        push(name, export.span(), guards, declared);
+                        push(name, export.span(), declared);
                     }
                     Decl::Class(c) => {
                         let name = c.ident.sym.to_string();
-                        push(name, export.span(), Vec::new(), Vec::new());
+                        push(name, export.span(), Vec::new());
                     }
                     Decl::Var(var) => {
                         for d in &var.decls {
@@ -905,9 +875,8 @@ impl SwcScanner {
                             // does, and until carrick#665 it yielded no handler
                             // at all.
                             for name in destructured_binding_names(&d.name) {
-                                let guards = guards_of(&name);
                                 let declared = declared_of(&name);
-                                push(name, export.span(), guards, declared);
+                                push(name, export.span(), declared);
                             }
                         }
                     }
@@ -922,30 +891,23 @@ impl SwcScanner {
                                 ModuleExportName::Ident(id) => id.sym.to_string(),
                                 ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
                             };
-                            // The guard lives on the *local* binding the
+                            // The declared verb lives on the *local* binding the
                             // specifier renames, not on the exported alias.
-                            let (guards, declared) = match &n.orig {
-                                ModuleExportName::Ident(id) => {
-                                    (guards_of(id.sym.as_ref()), declared_of(id.sym.as_ref()))
-                                }
-                                ModuleExportName::Str(s) => {
-                                    let name = s.value.to_string_lossy();
-                                    (guards_of(&name), declared_of(&name))
-                                }
+                            let declared = match &n.orig {
+                                ModuleExportName::Ident(id) => declared_of(id.sym.as_ref()),
+                                ModuleExportName::Str(s) => declared_of(&s.value.to_string_lossy()),
                             };
-                            push(name, n.span(), guards, declared);
+                            push(name, n.span(), declared);
                         }
                     }
                 }
                 // `export default function () {}` / `export default expr`
                 ModuleDecl::ExportDefaultDecl(d) => {
-                    let guards = collect_method_guards(&d.decl);
-                    push("default".to_string(), d.span(), guards, Vec::new());
+                    push("default".to_string(), d.span(), Vec::new());
                 }
                 ModuleDecl::ExportDefaultExpr(e) => {
-                    let guards = collect_method_guards(&*e.expr);
                     let declared = call_declared_methods(&e.expr);
-                    push("default".to_string(), e.span(), guards, declared);
+                    push("default".to_string(), e.span(), declared);
                 }
                 // `export * from "./x"`: the bindings are named in another
                 // module, so nothing is pushed and the list is recorded as
@@ -1122,35 +1084,6 @@ impl SwcScanner {
     }
 }
 
-/// Read the HTTP-method guard a handler body applies to the incoming request
-/// (carrick#601).
-///
-/// Structural and framework-agnostic: the guard is recognized as *the handler
-/// comparing the request's method against a literal*, never as any framework's
-/// API. Two spellings are read, which is what the shape reduces to in any
-/// stack:
-///
-/// * a comparison (`===`/`!==`/`==`/`!=`) between something's `.method` and an
-///   HTTP-method string literal, in either operand order;
-/// * a `switch` whose discriminant is that `.method` and whose cases are those
-///   literals.
-///
-/// A local binding initialized from a `.method` member (`const m = req.method`,
-/// `const { method } = request`) counts as the same expression, because a
-/// handler that destructures first is doing the same narrowing.
-///
-/// A handler that case-folds or trims the method before comparing it is still
-/// comparing the method, so those calls are transparent here (carrick#622):
-/// `request.method.toUpperCase() !== "PUT"` reads as a PUT guard, and the
-/// literal is case-folded on the way in, so the mirrored
-/// `request.method.toLowerCase() !== "put"` reads the same.
-///
-/// Deliberately NOT required: that the non-matching branch rejects. Detecting
-/// "rejects" means enumerating throw/`405`/early-return spellings across
-/// frameworks, which is the brittleness this module exists to avoid. The cost
-/// is that a handler which merely *branches* on the method reads as guarded on
-/// the methods it branches on — which is still nearer the truth than the
-/// convention's single default verb.
 /// Every binding a declarator pattern introduces at its top level: the name
 /// itself, or the names a destructuring pattern picks out of the initialiser.
 ///
@@ -1293,195 +1226,6 @@ fn declared_route_methods(pat: &Pat, init: &Expr) -> Vec<(String, Vec<String>)> 
         .into_iter()
         .map(|binding| (binding, methods.clone()))
         .collect()
-}
-
-// FROZEN (old path, 2026-10-21): `collect_method_guards` and
-// `MethodGuardVisitor` only. Deletions and safety fixes only. Fixes for wrong
-// or missing rows go in the guard chain's conjoined method comparison
-// (carrick#2474 R4). Delete after R4, with discovery on by default and a clean
-// four-repo replay (carrick#2474).
-fn collect_method_guards<N>(node: &N) -> Vec<String>
-where
-    N: VisitWith<MethodGuardVisitor> + ?Sized,
-{
-    // Two passes so a comparison is read the same whether it precedes or
-    // follows the binding it compares against.
-    let mut visitor = MethodGuardVisitor {
-        aliases: HashSet::new(),
-        collecting_aliases: true,
-        methods: Vec::new(),
-    };
-    node.visit_with(&mut visitor);
-    visitor.collecting_aliases = false;
-    node.visit_with(&mut visitor);
-    visitor.methods
-}
-
-/// Collector behind [`collect_method_guards`].
-struct MethodGuardVisitor {
-    /// Local bindings initialized from a request's `.method`.
-    aliases: HashSet<String>,
-    /// First pass (bindings) rather than second pass (comparisons).
-    collecting_aliases: bool,
-    /// HTTP-method literals found, in source order, deduplicated.
-    methods: Vec<String>,
-}
-
-/// `true` when the expression is a `.method` member access on anything.
-fn is_method_member(expr: &Expr) -> bool {
-    match unwrap_expr(expr) {
-        Expr::Member(m) => matches!(&m.prop, MemberProp::Ident(i) if i.sym.as_ref() == "method"),
-        _ => false,
-    }
-}
-
-/// The receiver of a call that leaves the method it is applied to intact for
-/// guard purposes (carrick#622), if the expression is such a call.
-///
-/// Case-folding and trimming do not change *which* method is being compared,
-/// and neither does stringifying it, so a guard written on the result of one
-/// of these is still a guard on the method. Read structurally: a zero-argument
-/// `.toUpperCase()`, `.toLowerCase()` or `.trim()`, or `String(x)`. Anything
-/// else (a `.slice()`, a call carrying arguments) can change the value, so it
-/// is not seen through.
-fn method_preserving_call(expr: &Expr) -> Option<&Expr> {
-    let Expr::Call(call) = unwrap_expr(expr) else {
-        return None;
-    };
-    let Callee::Expr(callee) = &call.callee else {
-        return None;
-    };
-    match unwrap_expr(callee) {
-        Expr::Member(member) => {
-            let folds = matches!(
-                &member.prop,
-                MemberProp::Ident(i)
-                    if matches!(i.sym.as_ref(), "toUpperCase" | "toLowerCase" | "trim")
-            );
-            (folds && call.args.is_empty()).then_some(&*member.obj)
-        }
-        Expr::Ident(id) if id.sym.as_ref() == "String" && call.args.len() == 1 => {
-            let arg = &call.args[0];
-            arg.spread.is_none().then_some(&*arg.expr)
-        }
-        _ => None,
-    }
-}
-
-/// The HTTP-method literal an expression denotes, uppercased.
-fn method_literal(expr: &Expr) -> Option<String> {
-    let text = match unwrap_expr(expr) {
-        Expr::Lit(Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-        // A no-substitution template literal is the same literal.
-        Expr::Tpl(t) if t.exprs.is_empty() && t.quasis.len() == 1 => t.quasis[0].raw.to_string(),
-        _ => return None,
-    };
-    is_http_method(&text).then(|| text.trim().to_uppercase())
-}
-
-impl MethodGuardVisitor {
-    /// `true` when the expression denotes the request's method, either
-    /// directly, through a local binding taken from it, or through a call that
-    /// leaves the method intact.
-    fn denotes_method(&self, expr: &Expr) -> bool {
-        if is_method_member(expr) {
-            return true;
-        }
-        if let Some(receiver) = method_preserving_call(expr) {
-            return self.denotes_method(receiver);
-        }
-        match unwrap_expr(expr) {
-            Expr::Ident(id) => self.aliases.contains(id.sym.as_ref()),
-            _ => false,
-        }
-    }
-
-    fn record(&mut self, method: String) {
-        if !self.methods.contains(&method) {
-            self.methods.push(method);
-        }
-    }
-}
-
-impl MethodGuardVisitor {
-    /// Record a local binding taken from a request's `.method`, so a later
-    /// comparison against that binding reads as a method comparison.
-    fn record_method_alias(&mut self, node: &VarDeclarator) {
-        let Some(init) = &node.init else {
-            return;
-        };
-        match &node.name {
-            // `const m = req.method`, and equally
-            // `const m = req.method.toLowerCase()` or a binding taken from an
-            // earlier binding: whatever denotes the method denotes it under a
-            // new name too.
-            Pat::Ident(id) if self.denotes_method(init) => {
-                self.aliases.insert(id.id.sym.to_string());
-            }
-            // `const { method } = request` / `const { method: verb } = request`
-            Pat::Object(obj) => {
-                for prop in &obj.props {
-                    match prop {
-                        ObjectPatProp::Assign(a) if a.key.sym.as_ref() == "method" => {
-                            self.aliases.insert(a.key.sym.to_string());
-                        }
-                        ObjectPatProp::KeyValue(kv) => {
-                            let key_is_method = matches!(
-                                &kv.key,
-                                PropName::Ident(i) if i.sym.as_ref() == "method"
-                            );
-                            if let (true, Pat::Ident(id)) = (key_is_method, &*kv.value) {
-                                self.aliases.insert(id.id.sym.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Visit for MethodGuardVisitor {
-    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        if self.collecting_aliases {
-            self.record_method_alias(node);
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_bin_expr(&mut self, node: &BinExpr) {
-        if !self.collecting_aliases
-            && matches!(
-                node.op,
-                BinaryOp::EqEq | BinaryOp::EqEqEq | BinaryOp::NotEq | BinaryOp::NotEqEq
-            )
-        {
-            let pair = if self.denotes_method(&node.left) {
-                method_literal(&node.right)
-            } else if self.denotes_method(&node.right) {
-                method_literal(&node.left)
-            } else {
-                None
-            };
-            if let Some(method) = pair {
-                self.record(method);
-            }
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_switch_stmt(&mut self, node: &SwitchStmt) {
-        if !self.collecting_aliases && self.denotes_method(&node.discriminant) {
-            for case in &node.cases {
-                if let Some(method) = case.test.as_deref().and_then(method_literal) {
-                    self.record(method);
-                }
-            }
-        }
-        node.visit_children_with(self);
-    }
 }
 
 /// Parse `content` as a module with its OWN source map, so a caller that only
@@ -4287,17 +4031,6 @@ export function ping(myTransport: { fire(u: string): void }) {
         assert_eq!(c.callee_property.as_deref(), Some("fire"));
     }
 
-    /// The method guards read off one named export.
-    fn handler_guards(content: &str, export: &str) -> Vec<String> {
-        let scanner = SwcScanner::new();
-        scanner
-            .exported_handlers(&PathBuf::from("route.ts"), content)
-            .into_iter()
-            .find(|h| h.name == export)
-            .unwrap_or_else(|| panic!("export {export} not found"))
-            .method_guards
-    }
-
     fn declared_methods(content: &str, export: &str) -> Vec<String> {
         let scanner = SwcScanner::new();
         scanner
@@ -4400,246 +4133,6 @@ const { action } = createWriteRoute({ method: ["PATCH", verb] }, handler);
 export { action };
 "#;
         assert!(declared_methods(content, "action").is_empty());
-    }
-
-    // --- Method guards (carrick#601) ---
-
-    #[test]
-    fn method_guard_read_from_a_negated_comparison() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (request.method !== "PUT") {
-    throw new Response("Method Not Allowed", { status: 405 });
-  }
-  return Response.json({});
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_a_destructured_local() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  const { method } = request;
-  if (method !== "GET") throw new Response(null, { status: 405 });
-  return Response.json({});
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["GET"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_a_renamed_local() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  const verb = request.method;
-  if (verb === "DELETE") return Response.json({});
-  throw new Response(null, { status: 405 });
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["DELETE"]);
-    }
-
-    #[test]
-    fn method_guard_read_from_a_switch() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  switch (request.method) {
-    case "PUT":
-      return Response.json({});
-    case "DELETE":
-      return new Response(null, { status: 204 });
-    default:
-      throw new Response(null, { status: 405 });
-  }
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PUT", "DELETE"]);
-    }
-
-    #[test]
-    fn method_guard_read_from_a_call_expression_export() {
-        // The handler is the result of a factory call, so the guard lives in
-        // the callback the factory receives.
-        let content = r#"
-export const action = withAuth(async ({ request }) => {
-  if (request.method !== "PATCH") throw new Response(null, { status: 405 });
-  return Response.json({});
-});
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PATCH"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_an_export_list() {
-        // The guard lives on the local binding the specifier renames.
-        let content = r#"
-async function writeHandler({ request }: { request: Request }) {
-  if (request.method !== "PUT") throw new Response(null, { status: 405 });
-  return Response.json({});
-}
-export { writeHandler as action };
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
-    }
-
-    #[test]
-    fn no_method_guard_when_the_handler_does_not_compare_the_method() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  const body = await request.json();
-  if (body.kind !== "PUT") throw new Error("bad kind");
-  return Response.json(body);
-}
-"#;
-        assert!(handler_guards(content, "action").is_empty());
-    }
-
-    #[test]
-    fn a_non_method_literal_is_not_a_guard() {
-        // Only HTTP methods narrow a route; a comparison against anything else
-        // leaves the handler unguarded.
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (request.method !== "QUERY") throw new Response(null, { status: 405 });
-  return Response.json({});
-}
-"#;
-        assert!(handler_guards(content, "action").is_empty());
-    }
-
-    // --- Method guards written as a call on the member (carrick#622) ---
-
-    #[test]
-    fn method_guard_read_through_an_uppercasing_call() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (request.method.toUpperCase() !== "PUT") {
-    throw new Response("Method Not Allowed", { status: 405 });
-  }
-  return Response.json({});
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_a_lowercasing_call_on_a_destructured_local() {
-        // The literal is lowercase to match, so the guard is only read if the
-        // literal is case-folded on the way in.
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  const { method } = request;
-  if (method.toLowerCase() === "get") return Response.json({});
-  throw new Response(null, { status: 405 });
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["GET"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_a_stringifying_call() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (String(request.method) !== "DELETE") throw new Response(null, { status: 405 });
-  return new Response(null, { status: 204 });
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["DELETE"]);
-    }
-
-    #[test]
-    fn method_guard_read_through_a_local_bound_from_a_case_folding_call() {
-        // The binding is initialized from a call on the member, so the binding
-        // denotes the method too.
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  const verb = request.method.toLowerCase().trim();
-  if (verb === "patch") return Response.json({});
-  throw new Response(null, { status: 405 });
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PATCH"]);
-    }
-
-    #[test]
-    fn method_guard_read_from_a_switch_on_a_case_folding_call() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  switch (request.method.toUpperCase()) {
-    case "PUT":
-      return Response.json({});
-    case "DELETE":
-      return new Response(null, { status: 204 });
-    default:
-      throw new Response(null, { status: 405 });
-  }
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["PUT", "DELETE"]);
-    }
-
-    #[test]
-    fn a_call_that_can_change_the_method_is_not_seen_through() {
-        // Only calls that leave the method intact are transparent. A slice can
-        // compare something other than the method, so it is not a guard.
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (request.method.slice(0, 3) === "PUT") return Response.json({});
-  throw new Response(null, { status: 405 });
-}
-"#;
-        assert!(handler_guards(content, "action").is_empty());
-    }
-
-    #[test]
-    fn method_guards_are_per_export_not_per_module() {
-        // A read export and a write export in one module must not borrow each
-        // other's guard.
-        let content = r#"
-export async function loader({ request }: { request: Request }) {
-  return Response.json({});
-}
-export async function action({ request }: { request: Request }) {
-  if (request.method !== "PUT") throw new Response(null, { status: 405 });
-  return Response.json({});
-}
-"#;
-        assert!(handler_guards(content, "loader").is_empty());
-        assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
-    }
-
-    // --- Protocol verbs are collected, then discarded downstream
-    //     (carrick#628) ---
-
-    #[test]
-    fn a_preflight_branch_is_collected_like_any_other_comparison() {
-        // The collector reports what the body compares the method against and
-        // nothing more. That a branch on OPTIONS must not displace the
-        // convention's default verb is a routing decision, so it is applied in
-        // `DerivedRoute::http_methods_for_export` rather than here.
-        let content = r#"
-export async function loader({ request }: { request: Request }) {
-  if (request.method.toUpperCase() === "OPTIONS") {
-    return new Response(null, { status: 204 });
-  }
-  return Response.json({});
-}
-"#;
-        assert_eq!(handler_guards(content, "loader"), vec!["OPTIONS"]);
-    }
-
-    #[test]
-    fn a_preflight_branch_beside_a_narrowing_collects_both() {
-        let content = r#"
-export async function action({ request }: { request: Request }) {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204 });
-  if (request.method !== "PUT") throw new Response(null, { status: 405 });
-  return Response.json({});
-}
-"#;
-        assert_eq!(handler_guards(content, "action"), vec!["OPTIONS", "PUT"]);
     }
 
     #[test]

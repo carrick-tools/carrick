@@ -1410,8 +1410,7 @@ impl Visit for EnvelopeBindings {
 }
 
 /// The three spellings of one comparison, collected from a delivery handler's
-/// body. The same shape `crate::swc_scanner`'s method-guard visitor reads for
-/// HTTP verbs: a discriminant, and the literals written against it.
+/// body: a discriminant, and the literals written against it.
 struct DispatchCollector<'a> {
     bindings: &'a HashSet<String>,
     tables: &'a HashMap<String, Vec<TableEntry>>,
