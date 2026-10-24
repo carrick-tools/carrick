@@ -969,6 +969,79 @@ impl<'a> Outcome<'a> {
     }
 }
 
+/// The inputs that hold `file`: `inputs`, else the first of `siblings` that
+/// does (carrick#2618).
+pub(super) fn inputs_holding<'a>(
+    inputs: &'a RequestSummaryInputs,
+    siblings: &[&'a RequestSummaryInputs],
+    file: &Path,
+) -> &'a RequestSummaryInputs {
+    if inputs.files.contains_key(file) {
+        return inputs;
+    }
+    siblings
+        .iter()
+        .copied()
+        .find(|sibling| sibling.files.contains_key(file))
+        .unwrap_or(inputs)
+}
+
+/// What the call `call` in `file` reaches, [`RequestSummaryInputs::reach`] of
+/// the service that holds `file`. A function of another service of the run
+/// is read in that service's files, from the declaration the call's row names
+/// (or, when the rows say nothing, the key the call graph names); with no
+/// such service the call stays outside the run. The one resolver the
+/// discovery walk and the decided-sites pass share (carrick#2618).
+pub(super) fn reach_across(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    file: &Path,
+    call: &CallIr,
+) -> Reach {
+    let holder = inputs_holding(inputs, siblings, file);
+    let reach = holder.reach(file, call.site.lo, call.site.hi);
+    let Reach::OutsideService(declaring, name) = &reach else {
+        return reach;
+    };
+    let owner = inputs_holding(inputs, siblings, declaring);
+    if !owner.files.contains_key(declaring.as_path()) {
+        return reach;
+    }
+    let named = row_at(holder, file, call).and_then(|row| {
+        let positions = holder.positions.as_ref()?;
+        (positions.path_of(row.decl_file()?) == *declaring && row.symbol() == Some(name.as_str()))
+            .then(|| owner.definition_at(declaring, row.decl_line(), name))
+    });
+    match named {
+        Some(Reach::NoFunction) | None => {
+            let keyed = owner.files[declaring.as_path()]
+                .functions
+                .contains_key(name);
+            if keyed {
+                Reach::Function(declaring.clone(), name.clone())
+            } else {
+                Reach::NoFunction
+            }
+        }
+        Some(read) => read,
+    }
+}
+
+/// The compiler's `call` row for `call` in `file`, from `inputs` (which
+/// holds `file`).
+fn row_at<'a>(inputs: &'a RequestSummaryInputs, file: &Path, call: &CallIr) -> Option<&'a Row> {
+    let positions = inputs.positions.as_ref()?;
+    let ir = inputs.files.get(file)?;
+    positions
+        .lookup(
+            file,
+            ir.swc_start(call.site.lo),
+            ir.swc_start(call.site.hi),
+            Kind::Call,
+        )
+        .ok()
+}
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1007,51 +1080,12 @@ impl<'a> Walker<'a> {
     /// that does. Every read keyed by a file goes through this, so a body the
     /// walk enters in a sibling is read with the sibling's own IR and rows.
     fn inputs_for(&self, file: &Path) -> &'a RequestSummaryInputs {
-        if self.inputs.files.contains_key(file) {
-            return self.inputs;
-        }
-        self.siblings
-            .iter()
-            .copied()
-            .find(|sibling| sibling.files.contains_key(file))
-            .unwrap_or(self.inputs)
+        inputs_holding(self.inputs, self.siblings, file)
     }
 
-    /// What the call `call` in `file` reaches, [`RequestSummaryInputs::reach`]
-    /// of the service that holds `file`. A function of another service of
-    /// the run is read in that service's files, from the declaration the
-    /// call's row names (or, when the rows say nothing, the key the call
-    /// graph names); with no such service the call stays outside the run.
+    /// What the call `call` in `file` reaches ([`reach_across`]).
     fn reach(&self, file: &Path, call: &CallIr) -> Reach {
-        let reach = self
-            .inputs_for(file)
-            .reach(file, call.site.lo, call.site.hi);
-        let Reach::OutsideService(declaring, name) = &reach else {
-            return reach;
-        };
-        let owner = self.inputs_for(declaring);
-        if !owner.files.contains_key(declaring.as_path()) {
-            return reach;
-        }
-        let named = self.row(file, call).and_then(|row| {
-            let positions = self.inputs_for(file).positions.as_ref()?;
-            (positions.path_of(row.decl_file()?) == *declaring
-                && row.symbol() == Some(name.as_str()))
-            .then(|| owner.definition_at(declaring, row.decl_line(), name))
-        });
-        match named {
-            Some(Reach::NoFunction) | None => {
-                let keyed = owner.files[declaring.as_path()]
-                    .functions
-                    .contains_key(name);
-                if keyed {
-                    Reach::Function(declaring.clone(), name.clone())
-                } else {
-                    Reach::NoFunction
-                }
-            }
-            Some(read) => read,
-        }
+        reach_across(self.inputs, self.siblings, file, call)
     }
 
     fn rel(&self, file: &Path) -> String {
@@ -1121,17 +1155,7 @@ impl<'a> Walker<'a> {
 
     /// The call row at `call`, when there are rows to read.
     fn row(&self, file: &Path, call: &CallIr) -> Option<&Row> {
-        let inputs = self.inputs_for(file);
-        let positions = inputs.positions.as_ref()?;
-        let ir = inputs.files.get(file)?;
-        positions
-            .lookup(
-                file,
-                ir.swc_start(call.site.lo),
-                ir.swc_start(call.site.hi),
-                Kind::Call,
-            )
-            .ok()
+        row_at(self.inputs_for(file), file, call)
     }
 
     /// The binding `call` is made on (carrick#2474 R1): the row at the

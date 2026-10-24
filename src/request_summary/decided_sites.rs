@@ -736,6 +736,10 @@ pub struct Decided {
     /// Sites that state no row because their name is one the library emits
     /// itself (carrick#2426), by `file:line`.
     pub reserved: Vec<String>,
+    /// Sites at a call into a sibling service that state no row because the
+    /// calls of the wrapper they sit in state the request (carrick#2618), by
+    /// `file:line`.
+    pub wrapped: Vec<String>,
     /// Calls above a decided site on its chain (carrick#2614).
     pub through: Vec<Through>,
     /// With the receiver trace on, where the service's route chains leave
@@ -871,43 +875,108 @@ type Target = Option<(PathBuf, String)>;
 /// holds it, and by the function of the service the call graph resolves it
 /// to.
 pub(super) struct Calls<'a> {
-    sites: &'a crate::call_graph::CallSiteTargets,
+    /// The service's own inputs, and the siblings whose files are indexed
+    /// (carrick#2618): a call is looked up in the call graph of the service
+    /// that holds its file.
+    own: &'a RequestSummaryInputs,
+    siblings: Vec<&'a RequestSummaryInputs>,
     by_span: HashMap<(&'a Path, u32, u32), Placed<'a>>,
+    /// The calls of the indexed sibling files, by file and span. Kept apart
+    /// from [`Self::by_span`], which the instance and boundary reads walk as
+    /// the service's own calls.
+    aside: HashMap<(&'a Path, u32, u32), Placed<'a>>,
     by_owner: HashMap<(&'a Path, &'a str), Vec<Placed<'a>>>,
     callers: HashMap<(PathBuf, String), Vec<Placed<'a>>>,
+    /// The definition of a sibling a call of this service reaches, by the
+    /// call's file and span (carrick#2618).
+    cross: HashMap<(&'a Path, u32, u32), (PathBuf, String)>,
 }
 
 impl<'a> Calls<'a> {
     fn index(inputs: &'a RequestSummaryInputs) -> Self {
-        Self::build(inputs, |file, call| {
-            inputs
+        Self::build(inputs, &[], |source, file, call| {
+            source
                 .sites
                 .target_at(file, call.site.lo, call.site.hi)
                 .cloned()
         })
     }
 
+    /// [`Self::index`] over this service's files and the files of the
+    /// `siblings` the discovered chains enter (carrick#2618): a sibling's own
+    /// calls take their edges from the sibling's call graph, and a call of
+    /// this service whose row reaches a sibling's definition is a caller of
+    /// that definition.
+    fn index_with(
+        inputs: &'a RequestSummaryInputs,
+        siblings: &[&'a RequestSummaryInputs],
+        entered: &HashSet<PathBuf>,
+    ) -> Self {
+        let entered: Vec<&'a RequestSummaryInputs> = siblings
+            .iter()
+            .copied()
+            .filter(|sibling| sibling.files.keys().any(|file| entered.contains(file)))
+            .collect();
+        let mut calls = Self::build(inputs, &entered, |source, file, call| {
+            source
+                .sites
+                .target_at(file, call.site.lo, call.site.hi)
+                .cloned()
+        });
+        if entered.is_empty() {
+            return calls;
+        }
+        let own: Vec<Placed<'a>> = calls.by_span.values().copied().collect();
+        for placed in own {
+            let Reach::Function(target, key) =
+                super::discovery::reach_across(inputs, &entered, placed.file, placed.call)
+            else {
+                continue;
+            };
+            if inputs.files.contains_key(&target) {
+                continue;
+            }
+            let at = (
+                placed.file,
+                placed.call.site.span_start,
+                placed.call.site.span_end,
+            );
+            calls.cross.insert(at, (target.clone(), key.clone()));
+            calls.callers.entry((target, key)).or_default().push(placed);
+        }
+        calls
+    }
+
     /// The same index, each call's callers edge read from what the rows say
     /// it reaches ([`RequestSummaryInputs::reach`], rows first): the callers
     /// discovery's value walk reads (carrick#2432).
     pub(super) fn through_reach(inputs: &'a RequestSummaryInputs) -> Self {
-        Self::build(inputs, |file, call| {
-            match inputs.reach(file, call.site.lo, call.site.hi) {
+        Self::build(inputs, &[], |source, file, call| {
+            match source.reach(file, call.site.lo, call.site.hi) {
                 super::row_calls::Reach::Function(target, key) => Some((target, key)),
                 _ => None,
             }
         })
     }
 
-    fn build(inputs: &'a RequestSummaryInputs, target: impl Fn(&Path, &CallIr) -> Target) -> Self {
+    fn build(
+        inputs: &'a RequestSummaryInputs,
+        siblings: &[&'a RequestSummaryInputs],
+        target: impl Fn(&RequestSummaryInputs, &Path, &CallIr) -> Target,
+    ) -> Self {
+        struct Source<'s, 'a> {
+            source: &'a RequestSummaryInputs,
+            own: bool,
+            target: &'s dyn Fn(&RequestSummaryInputs, &Path, &CallIr) -> Target,
+        }
         fn walk<'a>(
+            at: &Source<'_, 'a>,
             file: &'a Path,
             key: Option<&'a str>,
             depth: u8,
             ir: &'a FnIr,
             host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
-            target: &dyn Fn(&Path, &CallIr) -> Target,
         ) {
             let written_in = if depth == 0 {
                 None
@@ -923,13 +992,16 @@ impl<'a> Calls<'a> {
                     host,
                     written_in,
                 };
-                out.by_span
-                    .entry((file, call.site.span_start, call.site.span_end))
-                    .or_insert(placed);
+                let span = (file, call.site.span_start, call.site.span_end);
+                if at.own {
+                    out.by_span.entry(span).or_insert(placed);
+                } else {
+                    out.aside.entry(span).or_insert(placed);
+                }
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if let Some(target) = target(file, call) {
+                if let Some(target) = (at.target)(at.source, file, call) {
                     out.callers.entry(target).or_default().push(placed);
                 }
             }
@@ -939,42 +1011,64 @@ impl<'a> Calls<'a> {
                         .iter()
                         .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
                 });
-                walk(file, key, depth.saturating_add(1), inner, host, out, target);
+                walk(at, file, key, depth.saturating_add(1), inner, host, out);
             }
             for inner in &ir.detached {
-                walk(file, key, depth.saturating_add(1), inner, None, out, target);
+                walk(at, file, key, depth.saturating_add(1), inner, None, out);
             }
         }
         let mut calls = Calls {
-            sites: &inputs.sites,
+            own: inputs,
+            siblings: siblings.to_vec(),
             by_span: HashMap::new(),
+            aside: HashMap::new(),
             by_owner: HashMap::new(),
             callers: HashMap::new(),
+            cross: HashMap::new(),
         };
-        let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
-        paths.sort();
-        for path in paths {
-            let file = &inputs.files[path];
-            let mut keys: Vec<&String> = file.functions.keys().collect();
-            keys.sort();
-            for key in keys {
-                walk(
-                    path,
-                    Some(key.as_str()),
-                    0,
-                    &file.functions[key],
-                    None,
-                    &mut calls,
-                    &target,
-                );
+        for (position, source) in std::iter::once(inputs)
+            .chain(siblings.iter().copied())
+            .enumerate()
+        {
+            let at = Source {
+                source,
+                own: position == 0,
+                target: &target,
+            };
+            let mut paths: Vec<&PathBuf> = source.files.keys().collect();
+            paths.sort();
+            for path in paths {
+                let file = &source.files[path];
+                let mut keys: Vec<&String> = file.functions.keys().collect();
+                keys.sort();
+                for key in keys {
+                    walk(
+                        &at,
+                        path,
+                        Some(key.as_str()),
+                        0,
+                        &file.functions[key],
+                        None,
+                        &mut calls,
+                    );
+                }
+                walk(&at, path, None, 0, &file.module_level, None, &mut calls);
             }
-            walk(path, None, 0, &file.module_level, None, &mut calls, &target);
         }
         calls
     }
 
     fn at_span(&self, file: &Path, span_start: u32, span_end: u32) -> Option<Placed<'a>> {
-        self.by_span.get(&(file, span_start, span_end)).copied()
+        let at = (file, span_start, span_end);
+        self.by_span
+            .get(&at)
+            .or_else(|| self.aside.get(&at))
+            .copied()
+    }
+
+    /// Whether `file` is one of this service's own.
+    fn is_own(&self, file: &Path) -> bool {
+        self.own.files.contains_key(file)
     }
 
     /// Whether a call besides `placed` and the calls written around it sits
@@ -990,7 +1084,25 @@ impl<'a> Calls<'a> {
     }
 
     fn target(&self, placed: &Placed<'a>) -> Option<&(PathBuf, String)> {
-        self.sites
+        let at = (
+            placed.file,
+            placed.call.site.span_start,
+            placed.call.site.span_end,
+        );
+        if let Some(crossed) = self.cross.get(&at) {
+            return Some(crossed);
+        }
+        let holder = if self.is_own(placed.file) {
+            self.own
+        } else {
+            self.siblings
+                .iter()
+                .copied()
+                .find(|sibling| sibling.files.contains_key(placed.file))
+                .unwrap_or(self.own)
+        };
+        holder
+            .sites
             .target_at(placed.file, placed.call.site.lo, placed.call.site.hi)
     }
 
@@ -1450,6 +1562,9 @@ struct Walk<'a, 'i> {
     index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
+    /// The client wrappers of this service ([`leaf_wrappers`]); empty without
+    /// siblings (carrick#2618).
+    leaf_wrappers: HashSet<(PathBuf, String)>,
     /// The label of the labelled call being walked.
     label: Option<&'i SiteLabel>,
     /// The receiver of the labelled call being walked, and how discovery
@@ -1470,9 +1585,23 @@ impl<'a> Walk<'a, '_> {
     ) {
         let via = via_of(self.root, down);
         let placed = &down[0];
+        // A site is a call of this service's own files (carrick#2618).
+        if !self.calls.is_own(placed.file) {
+            return;
+        }
         let file = relative(self.root, placed.file);
         let id = (file.clone(), placed.call.site.span_start, None, end.at());
         if !self.seen.insert(id) {
+            return;
+        }
+        // A call into a sibling inside a wrapper whose callers, in other
+        // files of this service, state the request at their own call
+        // (carrick#1146's leaf rows): no second row per operation at the
+        // wrapper's line.
+        if self.in_a_leaf_wrapper(down) {
+            self.out
+                .wrapped
+                .push(format!("{}:{}", file, placed.call.site.line));
             return;
         }
         let label = self.label;
@@ -1521,6 +1650,18 @@ impl<'a> Walk<'a, '_> {
         });
     }
 
+    /// Whether the site whose calls are `down` is a call into a sibling
+    /// service written in a client wrapper ([`leaf_wrappers`]), so the leaf
+    /// call states the request instead.
+    fn in_a_leaf_wrapper(&self, down: &[Placed<'a>]) -> bool {
+        let placed = &down[0];
+        down.iter().skip(1).any(|hop| !self.calls.is_own(hop.file))
+            && placed.key.is_some_and(|key| {
+                self.leaf_wrappers
+                    .contains(&(placed.file.to_path_buf(), key.to_string()))
+            })
+    }
+
     /// With the receiver trace on, the instance ends of the site whose
     /// calls are `down` ([`instances`]); none with it off.
     fn instances(&self, down: &[Placed<'a>]) -> Vec<InstanceEnd> {
@@ -1539,6 +1680,10 @@ impl<'a> Walk<'a, '_> {
     }
 
     fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Undecided) {
+        // A sibling's own call is a lead in that sibling's scan (carrick#2618).
+        if !self.calls.is_own(placed.file) {
+            return;
+        }
         let lead = DecidedLead {
             file: relative(self.root, placed.file),
             line: placed.call.site.line,
@@ -1643,7 +1788,9 @@ impl<'a> Walk<'a, '_> {
             let value = filled(&own, caller.call);
             let mut longer = vec![*caller];
             longer.extend_from_slice(down);
-            if self.settles(caller, &value, end) {
+            // The boundary rule (carrick#2618): a sibling's call never states
+            // the request, so the walk goes on to its callers.
+            if self.calls.is_own(caller.file) && self.settles(caller, &value, end) {
                 self.site(&longer, end, value, parameter_positions(&own));
             } else {
                 self.up(&longer, &value, end, path);
@@ -1724,6 +1871,52 @@ fn supplies(call: &CallIr, slot: &ArgSlot) -> bool {
     }
 }
 
+/// The client wrappers of the service: functions that a call from another
+/// file of the service reaches
+/// ([`RequestSummaryInputs::calls_into_other_files`], the calls that state a
+/// leaf row, carrick#2698) and that make exactly one call into a sibling
+/// that reaches a labelled call. Their callers state the request at their own
+/// call, so the wrapper's call into the sibling states none (carrick#2618;
+/// ruled on carrick#2448). A wrapper with two such calls reaches more than
+/// one request, no leaf call states one, and each stays a site.
+fn leaf_wrappers(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    root: &Path,
+    discovered: &[DiscoverySite],
+    calls: &Calls<'_>,
+) -> HashSet<(PathBuf, String)> {
+    if siblings.is_empty() {
+        return HashSet::new();
+    }
+    let outside = |file: &str| !inputs.files.contains_key(&root.join(file));
+    let mut crossing: HashMap<(PathBuf, String), HashSet<(u32, u32)>> = HashMap::new();
+    for site in discovered {
+        let Some(end) = &site.end else {
+            continue;
+        };
+        if site.stop.is_some()
+            || !(outside(&end.file) || site.chain.iter().any(|hop| outside(&hop.file)))
+        {
+            continue;
+        }
+        if let Some(placed) = calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+            && let Some(key) = placed.key
+        {
+            crossing
+                .entry((placed.file.to_path_buf(), key.to_string()))
+                .or_default()
+                .insert((site.span_start, site.span_end));
+        }
+    }
+    inputs
+        .calls_into_other_files()
+        .into_iter()
+        .map(|call| (call.target, call.key))
+        .filter(|wrapper| crossing.get(wrapper).is_some_and(|spans| spans.len() == 1))
+        .collect()
+}
+
 /// Each call below the first in `down`: its `file:line` and its callee as
 /// written.
 fn via_of(root: &Path, down: &[Placed<'_>]) -> Vec<Via> {
@@ -1749,6 +1942,30 @@ pub fn decided_sites(
 ) -> Decided {
     decide(
         inputs,
+        &[],
+        root,
+        discovered,
+        labels,
+        None,
+        &[],
+        &ProcedureLabels::default(),
+    )
+}
+
+/// [`decided_sites`], with the run's other services `siblings` in declared
+/// order (carrick#2618): a chain discovery followed into a sibling's files is
+/// placed in them, and the request is stated at the call of this service's
+/// own files that enters the sibling, never at a sibling's call.
+pub fn decided_sites_with(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+) -> Decided {
+    decide(
+        inputs,
+        siblings,
         root,
         discovered,
         labels,
@@ -1776,6 +1993,7 @@ pub fn decided_sites_traced(
 ) -> Decided {
     decide(
         inputs,
+        &[],
         root,
         discovered,
         labels,
@@ -1785,8 +2003,35 @@ pub fn decided_sites_traced(
     )
 }
 
+/// [`decided_sites_traced`] with the run's other services `siblings`
+/// ([`decided_sites_with`]).
+#[allow(clippy::too_many_arguments)]
+pub fn decided_sites_traced_with(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    root: &Path,
+    discovered: &[DiscoverySite],
+    labels: &[SiteLabel],
+    makers: &[MakerLabel],
+    scopes: &[ScopeLabel],
+    procedures: &ProcedureLabels,
+) -> Decided {
+    decide(
+        inputs,
+        siblings,
+        root,
+        discovered,
+        labels,
+        Some(makers),
+        scopes,
+        procedures,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decide(
     inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
     root: &Path,
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
@@ -1794,7 +2039,23 @@ fn decide(
     scopes: &[ScopeLabel],
     procedures: &ProcedureLabels,
 ) -> Decided {
-    let calls = Calls::index(inputs);
+    // The files the discovered chains enter or end in: the siblings that
+    // hold one are indexed beside this service (carrick#2618).
+    let entered_files: HashSet<PathBuf> = discovered
+        .iter()
+        .flat_map(|site| {
+            site.chain
+                .iter()
+                .map(|hop| root.join(&hop.file))
+                .chain(site.end.iter().map(|end| root.join(&end.file)))
+        })
+        .collect();
+    let calls = if siblings.is_empty() {
+        Calls::index(inputs)
+    } else {
+        Calls::index_with(inputs, siblings, &entered_files)
+    };
+    let leaf_wrappers = leaf_wrappers(inputs, siblings, root, discovered, &calls);
     let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
@@ -1817,6 +2078,7 @@ fn decide(
         index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
+        leaf_wrappers,
         label: None,
         receiver: None,
         reached: None,
@@ -1872,10 +2134,21 @@ fn decide(
                 walk.out.through.push(through);
             }
         };
+        // The boundary rule (carrick#2618): a labelled call in a sibling's
+        // file is never the site. The request is stated at the call of this
+        // service's files that enters the sibling.
+        let last_is_own = calls.is_own(last.file);
         let Some(slot) = &label.name else {
-            // The label names no slot: the labelled call is the site.
-            walk.site(&[last], end, Vec::new(), BTreeSet::new());
-            through_to_last(&mut walk);
+            // The label names no slot: the labelled call is the site, or for
+            // a sibling's call the call of this service that enters it.
+            if last_is_own {
+                walk.site(&[last], end, Vec::new(), BTreeSet::new());
+                through_to_last(&mut walk);
+            } else if let Some(chain) = place_chain(&calls, root, site, &last) {
+                walk.site(&chain, end, Vec::new(), BTreeSet::new());
+            } else {
+                unplaced.push(format!("{}:{}", site.file, site.line));
+            }
             continue;
         };
         let table = tables
@@ -1883,11 +2156,15 @@ fn decide(
             .or_insert_with(|| loop_table(&root.join(&end.file), end, slot.arg))
             .clone();
         if let Some(keys) = table {
-            walk.table(&last, end, keys);
+            // A handler table a sibling registers is stated in the
+            // sibling's own scan.
+            if last_is_own {
+                walk.table(&last, end, keys);
+            }
             continue;
         }
         let at_end = slot_value(last.call, slot);
-        if walk.settles(&last, &at_end, end) {
+        if last_is_own && walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
             through_to_last(&mut walk);
             continue;
@@ -1938,7 +2215,10 @@ fn decide(
             continue;
         };
         if walk.settles(&chain[0], &top, end) {
+            // Only a call of this service's files can be the site lower down
+            // (carrick#2618): a sibling's call that settles is not one.
             let below_open = n == 1
+                || !calls.is_own(chain[1].file)
                 || values[1]
                     .as_ref()
                     .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
@@ -1948,9 +2228,10 @@ fn decide(
                 // The site is the lowest call whose value still settles.
                 let to = (1..n)
                     .take_while(|&k| {
-                        values[k]
-                            .as_ref()
-                            .is_some_and(|pieces| walk.settles(&chain[k], pieces, end))
+                        calls.is_own(chain[k].file)
+                            && values[k]
+                                .as_ref()
+                                .is_some_and(|pieces| walk.settles(&chain[k], pieces, end))
                     })
                     .last()
                     .unwrap_or(0);
@@ -2001,6 +2282,8 @@ fn decide(
     out.unplaced = unplaced;
     out.ran.sort();
     out.reserved.sort();
+    out.wrapped.sort();
+    out.wrapped.dedup();
     out.through.sort();
     out.through.dedup();
     out.sites.sort_by(|a, b| {
@@ -4072,6 +4355,148 @@ pub(crate) mod tests {
         assert_eq!(
             named_base(&pieces).and_then(|name| render_target(&name)),
             None
+        );
+    }
+
+    /// The `discovery-siblings` fixture's app and client, walked with rows,
+    /// and the sites discovery finds in the app with the client as its
+    /// sibling (carrick#2618).
+    fn sibling_sites(
+        fixture: &str,
+    ) -> Option<(
+        super::super::fixture_walk::WalkedServices,
+        Vec<DiscoverySite>,
+        Vec<SiteLabel>,
+    )> {
+        let on = super::super::fixture_walk::walked_services(
+            fixture,
+            &[("services/app", "app"), ("packages/client", "client")],
+            true,
+        )?;
+        let text = std::fs::read_to_string(
+            manifest().join(format!("tests/fixtures/{fixture}/library-claims.json")),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let discovery = super::super::discovery::discover_with(app, &[client], &labels, &on.repo);
+        let sites = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        Some((on, sites, SiteLabel::from_exports(&answer.exports)))
+    }
+
+    /// carrick#2618: a request a sibling's code decides is a site at the
+    /// call of this service that enters the sibling, with the sibling's
+    /// hops in its `via`, and no site or lead stands in a sibling's file. The
+    /// answer key is `tests/fixtures/discovery-siblings/README.md`.
+    #[test]
+    fn a_request_a_sibling_decides_is_a_site_at_this_service_s_call() {
+        let Some((on, sites, labels)) = sibling_sites("discovery-siblings") else {
+            return;
+        };
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let decided = decided_sites_with(app, &[client], &on.repo, &sites, &labels);
+        let found: Vec<(u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .map(|site| (site.line, site.name_text()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (5, Some("/v1/api/items/${id}".to_string())),
+                (9, Some("/v1/api/events".to_string())),
+                (14, Some("/v1/api/items/${id}".to_string())),
+            ],
+            "{:?}",
+            decided.sites
+        );
+        for site in &decided.sites {
+            assert_eq!(site.file, "services/app/src/main.ts");
+            assert!(
+                site.via
+                    .iter()
+                    .all(|via| via.at.starts_with("packages/client/")),
+                "{:?}",
+                site.via
+            );
+        }
+        assert!(decided.unplaced.is_empty(), "{:?}", decided.unplaced);
+        assert!(
+            decided
+                .leads
+                .iter()
+                .all(|lead| !lead.file.starts_with("packages/")),
+            "{:?}",
+            decided.leads
+        );
+        // Without siblings the same discovery sites are not placed: the
+        // labelled call is in a file this service does not read.
+        let alone = decided_sites(app, &on.repo, &sites, &labels);
+        assert!(alone.sites.is_empty(), "{:?}", alone.sites);
+        assert_eq!(alone.unplaced.len(), 3, "{:?}", alone.unplaced);
+    }
+
+    /// carrick#2618, the amendment ruled on #2448: a call into a sibling
+    /// inside a client wrapper whose methods other files of the service
+    /// call states nothing (the leaf calls state the request, #2698), a
+    /// command that calls the sibling itself is a site, and a wrapper that
+    /// makes two calls into a sibling leaves each a site (no leaf call
+    /// states one request for it). The answer key is
+    /// `tests/fixtures/sibling-wrapper/README.md`.
+    #[test]
+    fn a_call_into_a_sibling_inside_a_client_wrapper_states_no_site() {
+        let Some((on, sites, labels)) = sibling_sites("sibling-wrapper") else {
+            return;
+        };
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let decided = decided_sites_with(app, &[client], &on.repo, &sites, &labels);
+        let found: Vec<(String, u32, Option<String>)> = decided
+            .sites
+            .iter()
+            .map(|site| {
+                (
+                    site.file
+                        .trim_start_matches("services/app/src/")
+                        .to_string(),
+                    site.line,
+                    site.name_text(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("api.ts".to_string(), 14, Some("/api/version".to_string())),
+                ("api.ts".to_string(), 15, Some("/api/items/1".to_string())),
+                (
+                    "commands.ts".to_string(),
+                    21,
+                    Some("/api/health".to_string())
+                ),
+            ],
+            "{:?}",
+            decided.sites
+        );
+        assert_eq!(
+            decided.wrapped,
+            vec![
+                "services/app/src/api.ts:10".to_string(),
+                "services/app/src/api.ts:6".to_string()
+            ],
+            "the wrappers' calls state no site"
         );
     }
 }
