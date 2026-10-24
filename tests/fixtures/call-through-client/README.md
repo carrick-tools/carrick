@@ -101,10 +101,8 @@ client class then states its row from the source alone (`commands.ts` lines
 None is stated at a call one hop further up (`main.ts:5` calls a command of
 another file, which calls the client; `commands.ts:15` and `:46` call a
 command of the same file, `:57` a helper of the same file that reaches two
-operations), at a call nothing resolves (`commands.ts:70`), or in
-`hooks.ts`: the hooks call the client package directly, and `withSpinner`
-(`:19`) only runs the callback it is handed, so no function of the web's own
-calls into the other service on their behalf.
+operations), or at a call nothing resolves (`commands.ts:70`). A call
+straight into the client package is a different case, below.
 
 `packages/cli/src/nested.ts`, with `helpers.ts` and `local-fetch.ts` beside
 it, and `apps/web/src/page.tsx` with `badge.tsx`:
@@ -119,5 +117,37 @@ it, and `apps/web/src/page.tsx` with `badge.tsx`:
 | `nested.ts:39` | `GET /api/v1/status`: `statusViaReader` writes a reader and calls it |
 | `page.tsx:5` | none: a JSX element is no call the source writes |
 | `page.tsx:10` | `GET /api/v1/runs`: the same component called as a function |
+
+## Calls straight into another service
+
+A call into a function another service declares, where that function
+reaches exactly one request written in that service, states the request at
+the call (carrick#2773), whether or not the model stated a row there. The
+function may hand its request back unrun: `getRunOptions` returns a `queryFn`
+that a hook runs later.
+
+- `apps/web` has a `tsconfig.json` that maps `@fixture/client` to the client
+  package, so the compiler's rows read its calls. `packages/cli`'s maps
+  nothing, and its calls are read as the scan reads an import the compiler
+  cannot resolve. Both state the same kind of row.
+- A call written inside a function of its own service that the service's other
+  calls already reach the request through states nothing: those callers are
+  the sites, one per module that calls in. So the client class's methods
+  (`api-client.ts`), the probed clients' methods, `helpers.ts` lines 16 and 21
+  and `badge.tsx:5` (called at `page.tsx:10`) state none.
+- A function that no other file of the service calls, or that reaches two
+  operations, or hands its request back unrun, is no wrapper, and its calls
+  state theirs: `helpers.ts` lines 6 (two rows) and 27, and the probe in
+  `probed-client.ts:14`.
+- A function of the service's own file that is called from its own file only
+  (`commands.ts:171`) is no wrapper either.
+- The request must be written in the service that declares the function
+  called. A function that reaches a request a third service writes states
+  nothing (unit test in `src/call_through.rs`).
+
+With the model's answers for `hooks.ts` and `commands.ts` emptied, the rows
+the pass states are `hooks.ts` lines 9, 14, 19 and 24 and `commands.ts`
+lines 145, 151, 157 and 171; `commands.ts` lines 76, 82 and 94 stay empty, for
+the reasons in the table above.
 
 Driven by `tests/call_through_rows_test.rs`.

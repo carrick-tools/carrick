@@ -26,6 +26,10 @@ const TOOLS: &str = "packages/cli/src/tools.ts";
 const MAIN: &str = "packages/cli/src/main.ts";
 const NESTED: &str = "packages/cli/src/nested.ts";
 const PAGE: &str = "apps/web/src/page.tsx";
+const BADGE: &str = "apps/web/src/badge.tsx";
+const HELPERS: &str = "packages/cli/src/helpers.ts";
+const PROBED: &str = "packages/cli/src/probed-client.ts";
+const API_CLIENT: &str = "packages/cli/src/api-client.ts";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/call-through-client")
@@ -870,11 +874,6 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
         ("cli", COMMANDS, 57),
         // Nothing resolves the receiver.
         ("cli", COMMANDS, 70),
-        // Calls straight into the client package, and a runner of the web's
-        // own that only runs the callback it is handed.
-        ("web", HOOKS, 9),
-        ("web", HOOKS, 14),
-        ("web", HOOKS, 19),
     ] {
         stated.extend(
             rows_in(blobs, service, file, line)
@@ -884,6 +883,89 @@ fn no_row_is_stated_a_hop_above_the_client_or_where_no_function_crosses_for_the_
         );
     }
     assert!(stated.is_empty(), "no call-through row here: {stated:#?}");
+}
+
+/// A call straight into a function another service declares states the
+/// request that function reaches in the service that writes it
+/// (carrick#2773), at the call, where no row sits.
+#[test]
+fn a_call_straight_into_another_services_function_states_the_request_it_reaches() {
+    let blobs = unanswered();
+    for (service, file, line, method, path, request_line) in [
+        // A factory's options spread into a hook: the factory hands its
+        // request back inside the object, unrun.
+        ("web", HOOKS, 9, "GET", "/api/v1/runs/:id", 5),
+        // A callback handed to the hook, and to one of the web's own
+        // functions.
+        ("web", HOOKS, 14, "GET", "/api/v1/runs", 8),
+        ("web", HOOKS, 19, "POST", "/api/v1/audit", 17),
+        ("web", HOOKS, 24, "POST", "/api/v1/audit", 17),
+        ("cli", COMMANDS, 145, "GET", "/api/v1/runs/:id", 45),
+        ("cli", COMMANDS, 151, "GET", "/api/v1/runs/:id", 51),
+        ("cli", COMMANDS, 157, "GET", "/api/v1/runs/:id", 45),
+        // `authorizedRun` is called from its own file, so it is no wrapper.
+        ("cli", COMMANDS, 171, "GET", "/api/v1/runs/:id", 5),
+    ] {
+        let mut row = corrected(method, path, request_line);
+        // The two requests written on a declared environment base keep it in
+        // their target.
+        if request_line == 45 || request_line == 51 {
+            row.target = "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string();
+        }
+        assert_eq!(rows_in(blobs, service, file, line), [row], "{file}:{line}");
+    }
+    // The request is written from the parameters, or only the model states it.
+    for line in [76, 82, 94] {
+        assert_eq!(
+            rows_in(blobs, "cli", COMMANDS, line),
+            [],
+            "{COMMANDS}:{line}"
+        );
+    }
+}
+
+/// A boundary call stated whether or not the model stated a row: the first
+/// scan and the unanswered one alike.
+#[test]
+fn a_boundary_call_in_a_function_no_other_call_reaches_one_request_through_states_its_row() {
+    for blobs in [blobs(), unanswered()] {
+        // `loadPair` reaches two operations, so it is no wrapper.
+        assert_eq!(
+            rows_in(blobs, "cli", HELPERS, 6),
+            [
+                corrected("GET", "/api/v1/runs", 8),
+                corrected("GET", "/api/v1/runs/:id", 5),
+            ]
+        );
+        // `statusReader` hands its reader back unrun: it is no wrapper.
+        assert_eq!(
+            rows_in(blobs, "cli", HELPERS, 27),
+            [corrected("GET", "/api/v1/status", 23)]
+        );
+        // The probe in the private `invoke`, which no other file calls.
+        assert_eq!(
+            rows_in(blobs, "cli", PROBED, 14),
+            [corrected("GET", "/health", 20)]
+        );
+    }
+}
+
+/// A boundary call inside a function whose callers state the row states
+/// nothing: the callers are the sites, one per module that calls in.
+#[test]
+fn a_boundary_call_inside_a_wrapper_states_nothing() {
+    for blobs in [blobs(), unanswered()] {
+        for (service, file, lines) in [
+            ("cli", API_CLIENT, vec![18, 22, 27, 32, 36, 40, 44]),
+            ("cli", PROBED, vec![10, 35]),
+            ("cli", HELPERS, vec![16, 21]),
+            ("web", BADGE, vec![5]),
+        ] {
+            for line in lines {
+                assert_eq!(rows_in(blobs, service, file, line), [], "{file}:{line}");
+            }
+        }
+    }
 }
 
 /// A call written inside another call whose row states the same request is
@@ -1050,6 +1132,10 @@ fn a_pull_request_scan_reports_nothing_as_introduced_against_a_main_copy_without
             (COMMANDS, 121),
             (NESTED, 16),
             (NESTED, 39),
+            (COMMANDS, 171),
+            (HELPERS, 6),
+            (HELPERS, 27),
+            (PROBED, 14),
         ],
     );
     std::fs::write(&path, serde_json::to_string(&cli).unwrap()).unwrap();

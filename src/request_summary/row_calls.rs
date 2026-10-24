@@ -518,8 +518,8 @@ impl RequestSummaryInputs {
     }
 
     /// Every call of the service's files whose callee [`Self::reach`] names
-    /// as a function another file of the service declares
-    /// ([`crate::call_through`]'s leaf calls). A construction (`new
+    /// as a function another file of the service declares, or a function
+    /// another service declares ([`crate::call_through`]'s leaf calls). A construction (`new
     /// Client()`) is left out: it builds a value and sends nothing itself.
     /// So is a JSX element: it renders a component, which is no call the
     /// source writes. Sorted by file and span, each call once.
@@ -527,19 +527,22 @@ impl RequestSummaryInputs {
         let mut out: Vec<CallIntoFile> = every_call(&self.files)
             .into_iter()
             .filter(|(_, call, construction)| !construction && !call.jsx)
-            .filter_map(
-                |(file, call, _)| match self.reach(file, call.site.lo, call.site.hi) {
-                    Reach::Function(target, key) if target != file => Some(CallIntoFile {
-                        file: file.to_path_buf(),
-                        span_start: call.site.span_start,
-                        span_end: call.site.span_end,
-                        line: call.site.line,
-                        target,
-                        key,
-                    }),
-                    _ => None,
-                },
-            )
+            .filter_map(|(file, call, _)| {
+                let (target, key, boundary) = match self.reach(file, call.site.lo, call.site.hi) {
+                    Reach::Function(target, key) if target != file => (target, key, false),
+                    Reach::OutsideService(target, key) => (target, key, true),
+                    _ => return None,
+                };
+                Some(CallIntoFile {
+                    file: file.to_path_buf(),
+                    span_start: call.site.span_start,
+                    span_end: call.site.span_end,
+                    line: call.site.line,
+                    target,
+                    key,
+                    boundary,
+                })
+            })
             .collect();
         out.sort_by(|a, b| {
             (&a.file, a.span_start, a.span_end).cmp(&(&b.file, b.span_start, b.span_end))
@@ -564,6 +567,9 @@ pub(crate) struct CallIntoFile {
     /// The definition the callee resolves to: the file as walked and its key.
     pub(crate) target: PathBuf,
     pub(crate) key: String,
+    /// The definition is not one of this service's files: a call across the
+    /// service boundary, into a function another service declares.
+    pub(crate) boundary: bool,
 }
 
 impl RequestSummaryInputs {
