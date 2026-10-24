@@ -1,0 +1,10 @@
+{
+  "name": "procedure-router-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-procs": "^1.0.0",
+    "fixture-procs-mw": "^1.0.0",
+    "fixture-web": "^1.0.0"
+  }
+}

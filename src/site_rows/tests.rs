@@ -82,6 +82,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         instances: Vec::new(),
         composed: Vec::new(),
         composed_trimmed: false,
+        procedure: None,
     }
 }
 
@@ -1323,6 +1324,7 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
             full_paths: vec!["/v1/items/:id".to_string()],
             handler: None,
             owner: Some("items".to_string()),
+            corrects: true,
         }]
     );
     assert_eq!(

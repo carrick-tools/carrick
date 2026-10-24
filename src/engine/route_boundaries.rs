@@ -99,6 +99,7 @@ pub(super) fn settle(
             full_paths: resolved.paths,
             handler: resolved.handler,
             owner: resolved.owner,
+            corrects: true,
         });
     }
     for ((service, routes), count) in services.iter_mut().zip(traced).zip(counts.iter_mut()) {

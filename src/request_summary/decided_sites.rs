@@ -61,11 +61,13 @@ use super::{CallIr, FnIr, Piece, RequestSummaryInputs, Value, concat, render_tar
 pub mod boundaries;
 mod composed;
 mod instances;
+mod procedures;
 pub use boundaries::RouteBoundaries;
 pub use composed::Composed;
 pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
 };
+pub use procedures::{Procedure, ProcedureLabels};
 
 /// The hop discovery records where a walk enters a function through a value
 /// the call runs (carrick#2432, [`super::discovery`]).
@@ -549,6 +551,11 @@ pub struct DecidedSite {
     /// ([`composed::MAX_COMPOSED`] chains, and paths): some paths are
     /// left out.
     pub composed_trimmed: bool,
+    /// With the receiver trace on, for a procedure op's site (its label
+    /// names it by its key, carrick#2474 R6c), the paths the adapters that
+    /// serve its router serve it at ([`procedures`]); `None` for every
+    /// other site. Never part of a record's state.
+    pub procedure: Option<Procedure>,
 }
 
 impl DecidedSite {
@@ -1354,6 +1361,7 @@ impl<'a> Walk<'a, '_> {
             instances,
             composed: Vec::new(),
             composed_trimmed: false,
+            procedure: None,
         });
     }
 
@@ -1528,6 +1536,7 @@ impl<'a> Walk<'a, '_> {
                 instances: instances.clone(),
                 composed: Vec::new(),
                 composed_trimmed: false,
+                procedure: None,
             });
         }
     }
@@ -1581,7 +1590,15 @@ pub fn decided_sites(
     discovered: &[DiscoverySite],
     labels: &[SiteLabel],
 ) -> Decided {
-    decide(inputs, root, discovered, labels, None, &[])
+    decide(
+        inputs,
+        root,
+        discovered,
+        labels,
+        None,
+        &[],
+        &ProcedureLabels::default(),
+    )
 }
 
 /// [`decided_sites`] with the receiver trace on (carrick#2474 R2a): each
@@ -1589,7 +1606,8 @@ pub fn decided_sites(
 /// makers the store labels (`makers`), one end per caller that hands one in
 /// ([`DecidedSite::instances`]), through the scopes the store's scope
 /// members open (`scopes`), and the full path it is served at under them
-/// and the mounts ([`DecidedSite::composed`], R2b).
+/// and the mounts ([`DecidedSite::composed`], R2b), and each procedure op's
+/// site the paths its router is served at (`procedures`, R6c).
 pub fn decided_sites_traced(
     inputs: &RequestSummaryInputs,
     root: &Path,
@@ -1597,8 +1615,17 @@ pub fn decided_sites_traced(
     labels: &[SiteLabel],
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
+    procedures: &ProcedureLabels,
 ) -> Decided {
-    decide(inputs, root, discovered, labels, Some(makers), scopes)
+    decide(
+        inputs,
+        root,
+        discovered,
+        labels,
+        Some(makers),
+        scopes,
+        procedures,
+    )
 }
 
 fn decide(
@@ -1608,6 +1635,7 @@ fn decide(
     labels: &[SiteLabel],
     makers: Option<&[MakerLabel]>,
     scopes: &[ScopeLabel],
+    procedures: &ProcedureLabels,
 ) -> Decided {
     let calls = Calls::index(inputs);
     let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
@@ -1791,6 +1819,18 @@ fn decide(
                 (site.composed, site.composed_trimmed) =
                     composed::compose(&site.instances, site.name_text().as_deref(), &mounts);
             }
+            procedures::Pass {
+                calls: &calls,
+                inputs,
+                root,
+                makers,
+                scopes,
+                index,
+                mounts: &mounts,
+                labels: procedures,
+                site_labels: labels,
+            }
+            .run(&mut out, discovered);
             mounts
         }
         _ => composed::Mounts::default(),

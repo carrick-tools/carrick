@@ -3534,6 +3534,10 @@ mod tests {
             &SiteLabel::from_exports(exports),
             &MakerLabel::from_exports(exports),
             scopes,
+            &super::super::decided_sites::ProcedureLabels::from_exports(
+                exports,
+                &declarations.verified_scopes,
+            ),
         );
         (discovery, decided)
     }

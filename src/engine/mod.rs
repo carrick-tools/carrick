@@ -5341,6 +5341,10 @@ fn site_records_of(
                 claims,
                 &declarations.verified_scopes,
             ),
+            &crate::request_summary::decided_sites::ProcedureLabels::from_exports(
+                claims,
+                &declarations.verified_scopes,
+            ),
         ),
         None => {
             crate::request_summary::decided_sites::decided_sites(inputs, root, &discovered, &labels)
@@ -5717,7 +5721,8 @@ fn write_traced_routes(
                 row.resolution_source,
                 Some(ResolutionSource::DescriptorRoute | ResolutionSource::DeclaredOperation)
             ) && routes.iter().any(|route| {
-                route.method.eq_ignore_ascii_case(&row.method)
+                route.corrects
+                    && route.method.eq_ignore_ascii_case(&row.method)
                     && MountGraph::paths_equal_modulo_param_names(&route.path, &row.full_path)
             })
         };
@@ -5729,7 +5734,8 @@ fn write_traced_routes(
                 let method = mount_graph.endpoints[index].method.clone();
                 let path = mount_graph.endpoints[index].full_path.clone();
                 let Some(route) = routes.iter().find(|route| {
-                    route.method.eq_ignore_ascii_case(&method)
+                    route.corrects
+                        && route.method.eq_ignore_ascii_case(&method)
                         && MountGraph::paths_equal_modulo_param_names(&route.path, &path)
                 }) else {
                     continue;
@@ -24272,6 +24278,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             full_paths: full_paths.iter().map(|path| path.to_string()).collect(),
             handler: Some("list".to_string()),
             owner: Some("users".to_string()),
+            corrects: true,
         }
     }
 
@@ -24421,6 +24428,40 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         // The copy keeps the row's owner and handler.
         assert_eq!(graph.endpoints[3].owner, "router");
         assert_eq!(graph.endpoints[3].path, "/ping");
+    }
+
+    /// carrick#2474 R6c: a procedure's call writes no path of its own, so a
+    /// reader row at its line that states its key path with no mount is
+    /// another reading, not row 4's: it stays, the site is counted, and
+    /// nothing there is written.
+    #[test]
+    fn a_row_at_a_procedure_s_key_path_is_kept_and_counted() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/router.ts:7",
+            "GET",
+            "/ping",
+            "/ping",
+            ResolutionSource::Model,
+        )];
+        let before = traced_rows(&graph);
+        let applied = apply_traced_routes(
+            &mut graph,
+            &[crate::site_rows::TracedRoute {
+                corrects: false,
+                ..traced_route("src/router.ts", 7, "GET", "/ping", &["/rpc/ping"])
+            }],
+            ".",
+        );
+        assert_eq!(
+            applied,
+            TracedApplied {
+                disagrees: 1,
+                ..TracedApplied::default()
+            }
+        );
+        assert_eq!(traced_rows(&graph), before);
     }
 
     /// carrick#2474 R3 S1 (orchestrator's ruling, 2026-10-23): where a row

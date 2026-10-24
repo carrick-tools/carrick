@@ -569,7 +569,19 @@ fn census_repo(
         // Traced: each site also names its instance (carrick#2474 R2a),
         // which only the routes section reads.
         let started = std::time::Instant::now();
-        let decided = decided_sites_traced(&inputs, &root, &mine, &labels, &makers, &scopes);
+        let procedures = super::decided_sites::ProcedureLabels::from_exports(
+            &exports,
+            &declarations.verified_scopes,
+        );
+        let decided = decided_sites_traced(
+            &inputs,
+            &root,
+            &mine,
+            &labels,
+            &makers,
+            &scopes,
+            &procedures,
+        );
         census.traced_ms += started.elapsed().as_millis();
         boundaries.push((label.clone(), decided.boundaries.clone()));
         census.decided_sites += decided.sites.len();

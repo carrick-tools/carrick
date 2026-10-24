@@ -203,6 +203,11 @@ pub struct TracedRoute {
     pub handler: Option<String>,
     /// The symbol of the binding the route is registered on.
     pub owner: Option<String>,
+    /// Whether a reader row at the route's own path with no prefix takes
+    /// the traced path (carrick#2474 row 4). A procedure's call writes no
+    /// path of its own, so a row at its line states some other reading and
+    /// stays (carrick#2474 R6c).
+    pub corrects: bool,
 }
 
 /// The route sites the receiver trace serves at a full path, and the rest
@@ -231,6 +236,28 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
         let Some(site) = site_of(decided, &record.anchors) else {
             continue;
         };
+        if let Some(procedure) = &site.procedure {
+            // Each adapter and key path that reached it and named no path,
+            // and a procedure nothing serves.
+            for (reason, count) in &procedure.unread {
+                *out.untraced
+                    .entry(format!("procedure_{reason}"))
+                    .or_default() += count;
+            }
+            if procedure.full_paths.is_empty() {
+                if procedure.unread.is_empty() {
+                    *out.untraced
+                        .entry("procedure_unserved".to_string())
+                        .or_default() += 1;
+                }
+                continue;
+            }
+            match procedure_route(site, procedure, record) {
+                Ok(route) => out.routes.push(route),
+                Err(reason) => *out.untraced.entry(reason).or_default() += 1,
+            }
+            continue;
+        }
         match traced_route(site, record) {
             Ok(route) => out.routes.push(route),
             Err(reason) => *out.untraced.entry(reason).or_default() += 1,
@@ -239,16 +266,45 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
     out
 }
 
-/// `site`'s traced route, or why it has none.
-fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, String> {
-    let Some(method) = record
+/// The HTTP method the label forces at `record`'s site.
+fn forced_method(record: &SiteRecord) -> Result<&String, String> {
+    record
         .state
         .forced
         .get(&Slot::Method)
         .filter(|method| crate::type_manifest::is_producer_method(method))
-    else {
-        return Err("method_unstated".to_string());
-    };
+        .ok_or_else(|| "method_unstated".to_string())
+}
+
+/// The route a procedure op's site is served as (carrick#2474 R6c), at
+/// every path its adapters serve it at: the method the label forces, the
+/// handler handed by name, and the router binding that collects it as its
+/// owner. A member the label states no method for is no HTTP operation.
+fn procedure_route(
+    site: &DecidedSite,
+    procedure: &crate::request_summary::decided_sites::Procedure,
+    record: &SiteRecord,
+) -> Result<TracedRoute, String> {
+    let method = forced_method(record)?;
+    let key_path = procedure.key_paths.first().cloned().unwrap_or_default();
+    Ok(TracedRoute {
+        file: site.file.clone(),
+        line: site.line,
+        method: method.to_uppercase(),
+        path: crate::utils::join_prefix_and_path("/", &key_path),
+        full_paths: procedure.full_paths.clone(),
+        handler: site
+            .handler
+            .as_ref()
+            .and_then(|handler| handler.name.clone()),
+        owner: procedure.owner.clone(),
+        corrects: false,
+    })
+}
+
+/// `site`'s traced route, or why it has none.
+fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, String> {
+    let method = forced_method(record)?;
     // A table's keys are registered by one call in a loop, so they share
     // its span and [`site_of`] hands every key's record the first key's
     // site: the site cannot say which key a record is (PR #2687 review).
@@ -297,6 +353,7 @@ fn traced_route(site: &DecidedSite, record: &SiteRecord) -> Result<TracedRoute, 
             .receiver
             .as_ref()
             .and_then(|receiver| receiver.symbol.clone()),
+        corrects: true,
     })
 }
 

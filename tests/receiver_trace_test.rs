@@ -783,3 +783,90 @@ fn routes_across_services_take_the_receiving_scope() {
         scan_fixture("receiver-scopes-across", false, None)
     );
 }
+
+/// carrick#2474 R6c: a procedure router's operations are named by the keys
+/// they sit under, and served under each adapter's mount. With the switch
+/// on, every procedure the three adapters serve is a row at its op call's
+/// line, at the endpoint the fetch adapter is handed (`/rpc`), under the
+/// root the middleware is mounted at (`/`), and under the catch-all route
+/// the other middleware handles (`/api/rpc/*`): an inline procedure, one a
+/// local function returns, a nested router's (imported, keys joined with
+/// the label's `.`) and the key written after a spread and a computed key.
+/// None is written for the key a later spread may set again, the computed
+/// key, the spread's own procedure, or the router no adapter serves: each
+/// is counted and stays a possible call. The member the label states no
+/// method for is no site (the verifier refuses a key-named op with no
+/// method). With the switch off, or with the fact layer off, nothing moves.
+#[test]
+fn procedure_routes_take_their_key_paths() {
+    let off = scan_fixture("procedure-router", true, None);
+    let (off_graph, _) = endpoint_rows(&off);
+    // The mock answer states no row for a call that writes no path.
+    assert_eq!(off_graph, Vec::<String>::new());
+
+    let (on, fallbacks) = scan_fixture_reading("procedure-router", true, Some("1"));
+    let (graph, flat) = endpoint_rows(&on);
+    let served = |file_line: &str, method: &str, key_path: &str, owner: &str| -> Vec<String> {
+        ["/api/rpc", "", "/rpc"]
+            .iter()
+            .map(|mount| format!("{file_line} {method} {mount}/{key_path} library_claim {owner}"))
+            .collect()
+    };
+    let mut expected: Vec<String> = [
+        // Returned by a local function, under the key its call sits at.
+        served("src/health.ts:5", "GET", "health", "appRouter"),
+        // Written after the spread and the computed key.
+        served("src/loose.ts:14", "GET", "loose.after", "looseRouter"),
+        // A nested router imported by name, its keys joined with `.`.
+        served("src/orders.ts:7", "GET", "orders.list", "ordersRouter"),
+        // The outermost call of a builder chain.
+        served("src/orders.ts:8", "POST", "orders.create", "ordersRouter"),
+        // Inline.
+        served("src/router.ts:7", "GET", "ping", "appRouter"),
+    ]
+    .concat();
+    expected.sort();
+    assert_eq!(graph, expected);
+    let flat_of_graph: Vec<String> = {
+        let mut rows: Vec<String> = graph
+            .iter()
+            .map(|row| row.rsplit_once(' ').unwrap().0.to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(flat, flat_of_graph);
+    let counts: Vec<String> = fallbacks["api"]
+        .iter()
+        .filter(|(key, _)| key.starts_with("routes_"))
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            // The two catch-all routes: their label states no method.
+            "routes_untraced_method_unstated=2",
+            // `kept`, the computed key and the spread's `hidden`, once per
+            // adapter.
+            "routes_untraced_procedure_unread_key=9",
+            // `idle`.
+            "routes_untraced_procedure_unserved=1",
+        ]
+    );
+    assert_eq!(
+        possible_calls(&on),
+        vec![
+            "src/loose.ts:11 query",
+            "src/loose.ts:13 query",
+            "src/loose.ts:19 query",
+            "src/loose.ts:4 query",
+            "src/server.ts:19 all",
+            "src/server.ts:9 all",
+        ]
+    );
+    // With the fact layer off the switch changes no byte.
+    assert_eq!(
+        scan_fixture("procedure-router", false, Some("1")),
+        scan_fixture("procedure-router", false, None)
+    );
+}
