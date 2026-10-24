@@ -1,10 +1,10 @@
-import { login, logout } from './client';
+import * as client from './client';
 
 export async function signIn(): Promise<string> {
-  const session = await login('admin@example.com', 'secret');
+  const session = await client.login('admin@example.com', 'secret');
   return session.token;
 }
 
 export async function signOut(): Promise<void> {
-  await logout('everywhere');
+  await client.logout('everywhere');
 }
