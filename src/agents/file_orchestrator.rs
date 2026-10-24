@@ -12173,10 +12173,7 @@ impl FileOrchestrator {
         graph: &MountGraph,
         may_take: impl Fn(usize) -> bool,
     ) -> DocumentedFolds {
-        let documentation = |endpoint: &ResolvedEndpoint| {
-            endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
-                && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
-        };
+        let documentation = Self::is_documentation_row;
         let mut folded_into = vec![false; graph.endpoints.len()];
         let mut drop = vec![false; graph.endpoints.len()];
         for (index, descriptor) in graph.endpoints.iter().enumerate() {
@@ -12219,6 +12216,14 @@ impl FileOrchestrator {
             }
         }
         DocumentedFolds { folded_into, drop }
+    }
+
+    /// Whether `endpoint` is a bare documentation row: a route descriptor
+    /// that names no handler. The fold across services reads it too
+    /// (carrick#2474 R5d).
+    pub(crate) fn is_documentation_row(endpoint: &ResolvedEndpoint) -> bool {
+        endpoint.resolution_source == Some(ResolutionSource::DescriptorRoute)
+            && endpoint.handler.as_deref() == Some(ROUTE_DESCRIPTOR_OWNER)
     }
 
     /// Apply `folds`, read from `graph` by [`Self::documented_folds`]: how
