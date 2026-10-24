@@ -9,7 +9,10 @@
 //! still holds it ([`super::Calls::callers_of`]). There is no agreement
 //! rule: each caller that hands an instance in gives its own end, so a
 //! helper handed two apps serves both. A definition walked once is not
-//! walked again for the same site, which ends a cycle; no hop limit.
+//! walked again for the same site, and one reached again while its own
+//! callers are being walked ends there, whatever value it is handed (a
+//! function that calls itself with a longer one, carrick#2748): that
+//! ends every cycle, with no hop limit.
 //!
 //! Each end is one of:
 //!
@@ -489,6 +492,10 @@ pub(super) struct InstanceWalk<'w, 'a> {
     /// it: a definition reached again adds nothing (a cycle, or a second
     /// path to it).
     walked: HashSet<(PathBuf, String, Vec<Piece>)>,
+    /// The definitions whose callers are being walked, outermost first: one
+    /// reached again inside its own walk ends it, as the site walk's `path`
+    /// does, even where the value it is handed has grown (carrick#2748).
+    passing: Vec<(PathBuf, String)>,
     /// The own factories being followed, so a factory that returns its own
     /// call ends. Two calls of one factory each give their end.
     factories: HashSet<(PathBuf, String)>,
@@ -513,6 +520,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             hosts: Vec::new(),
             ends: Vec::new(),
             walked: HashSet::new(),
+            passing: Vec::new(),
             factories: HashSet::new(),
         }
     }
@@ -657,6 +665,10 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             self.hole(at, InstanceHole::Unread, None);
             return;
         };
+        let here = (placed.file.to_path_buf(), key.to_string());
+        if self.passing.contains(&here) {
+            return;
+        }
         if !self
             .walked
             .insert((placed.file.to_path_buf(), key.to_string(), own.clone()))
@@ -695,6 +707,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             }
             return;
         }
+        self.passing.push(here);
         for caller in callers {
             let value = filled(&own, caller.call);
             if holds_parameter(&value) {
@@ -703,6 +716,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 self.handed(caller, &own, &value);
             }
         }
+        self.passing.pop();
     }
 
     /// The receiver is a parameter of the function `placed` is written in,

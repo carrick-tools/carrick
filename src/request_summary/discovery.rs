@@ -3538,6 +3538,26 @@ mod tests {
         (discovery, decided)
     }
 
+    /// carrick#2748: a function that calls itself with a longer value each
+    /// time (`nest(`${path}/child`)`) hands the library a value no earlier
+    /// walk of it read. The instance walk of what a library call is handed
+    /// (carrick#2474 R3 S0) ends that cycle the way the site walk does,
+    /// instead of walking the callers again for every longer value until
+    /// the stack runs out.
+    #[test]
+    fn a_function_that_calls_itself_with_a_longer_value_ends_the_walk() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-recursive-arg")
+        else {
+            return;
+        };
+        use super::super::decided_sites::ScopeLabel;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        let want = texts(&["src/index.ts:20 <- /tree", "src/index.ts:8 <- /health"]);
+        assert_eq!(got, want, "{got:#?}");
+    }
+
     /// carrick#2474 R2b: with the receiver trace on, each route site names
     /// the full path it is served at, per instance end: the prefixes of the
     /// scopes a labelled member opens (a plugin it runs, handed by name,
