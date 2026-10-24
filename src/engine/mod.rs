@@ -3713,8 +3713,8 @@ async fn analyze_current_repo_incremental(
         Read::Own,
     )?;
     // The services this one's calls are declared in, read for the walks that
-    // enter them (carrick#2618).
-    // Read only where the store is asked (`LibraryAsk::start`).
+    // enter them (carrick#2618), only where the store is asked
+    // (`LibraryAsk::start`).
     let siblings = neighbours
         .filter(|_| sidecar.is_some() && !crate::local_mode::no_model())
         .map(|neighbours| neighbours.reached(&request_inputs))
@@ -9042,7 +9042,11 @@ fn discover_with_positions(
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
     let walk_started = Instant::now();
-    let walk = walk_service(repo_path, service, &ignore_patterns);
+    let walk = if own {
+        walk_service(repo_path, service, &ignore_patterns)
+    } else {
+        crate::file_finder::walk_service_quietly(repo_path, service, &ignore_patterns)
+    };
     let files = walk.files;
     // Timed separately from the parse that follows: the walk and the parse
     // scale with different things, and a scan that spends minutes in the walk
