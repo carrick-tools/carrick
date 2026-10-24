@@ -287,6 +287,8 @@ impl SiblingRegistry {
             Default::default(),
             Some(walked.index()),
             crate::request_summary::ROWS_JOIN_BUDGET,
+            // The files only tests import matter to this service's own trace.
+            false,
             Read::Sibling,
         )
         .ok()?;
