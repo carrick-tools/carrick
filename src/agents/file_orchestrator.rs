@@ -19019,7 +19019,7 @@ export { routes };
         // The structural layer stated this route, so it keeps the claim.
         assert_eq!(
             endpoint.resolution_source,
-            Some(ResolutionSource::DescriptorRoute)
+            Some(ResolutionSource::FileBasedRoute)
         );
         // The model's reading of the path and the literal both survive: which
         // of them the mount chain serves is carrick#1145's question.

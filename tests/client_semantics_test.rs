@@ -836,42 +836,22 @@ async fn the_reviews_adversarial_sites_read_as_they_do_without_semantics() {
         );
     }
 
-    // What that is: the receiver-type rows the site's own literals state,
-    // and nothing where the receiver's type says nothing.
-    let receiver = ResolutionSource::ReceiverType;
-    assert_unread_row(&rows, "src/a1-mutated.ts", 7, receiver, "GET", "/mutated");
-    assert_unread_row(
-        &rows,
-        "src/a2-percall-base.ts",
-        6,
-        receiver,
-        "GET",
-        "/users",
-    );
-    assert_unread_row(
-        &rows,
-        "src/a2-percall-base.ts",
-        10,
-        receiver,
-        "GET",
-        "/plain",
-    );
-    assert_unread_row(
-        &rows,
-        "src/a3-spread-after.ts",
-        7,
-        receiver,
-        "GET",
-        "/spread",
-    );
-    assert_unread_row(
-        &rows,
-        "src/a13-inherit.ts",
-        20,
-        receiver,
-        "GET",
-        "/outer-ok",
-    );
+    // What that is: no row at all. The receiver's type no longer states a
+    // role for a bare `x.verb("/lit", arg)` site, and the model states
+    // nothing at these, so each reads the same with and without the
+    // semantics.
+    for (file, line) in [
+        ("src/a1-mutated.ts", 7),
+        ("src/a2-percall-base.ts", 6),
+        ("src/a2-percall-base.ts", 10),
+        ("src/a3-spread-after.ts", 7),
+        ("src/a13-inherit.ts", 20),
+    ] {
+        assert!(
+            rows_at(&rows, file, line).is_empty(),
+            "{file}:{line}: {rows:#?}"
+        );
+    }
     for (file, line) in [
         ("src/a3-spread-after.ts", 11),
         ("src/a4-ctor-branch.ts", 12),
@@ -938,7 +918,7 @@ async fn a_claimed_option_key_absent_from_the_declarations_stays_a_candidate() {
     let without = rows_without_semantics(&repo, &cassette, &sidecar).await;
     let rows = rows(&scan(&StubStorage::default(), &repo, Some(&sidecar)).await);
     // The instance's sites read exactly as they do with no semantics at all:
-    // the receiver-type rows the site's own literals state (carrick#695),
+    // the model's rows at the site's own literals,
     // with no base, since nothing verified says where the base is.
     for line in [6, 11] {
         assert_eq!(
@@ -965,7 +945,7 @@ async fn a_claimed_option_key_absent_from_the_declarations_stays_a_candidate() {
         &rows,
         "src/http-client.ts",
         6,
-        ResolutionSource::ReceiverType,
+        ResolutionSource::Model,
         "GET",
         "/users",
     );
@@ -973,7 +953,7 @@ async fn a_claimed_option_key_absent_from_the_declarations_stays_a_candidate() {
         &rows,
         "src/http-client.ts",
         11,
-        ResolutionSource::ReceiverType,
+        ResolutionSource::Model,
         "POST",
         "/orders",
     );
