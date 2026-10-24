@@ -1743,7 +1743,22 @@ impl<'a> Walker<'a> {
                 discovery.sites.push(record(None, chain, Some(stop)));
                 continue;
             }
+            let mut sibling_routes = 0;
             for found in outcome.ends {
+                // A route registered in a sibling's code (a plugin another
+                // service declares, registered here) is served by this
+                // process, and the receiver trace writes it at the join point
+                // (carrick#2474 R5b): a walk into a sibling states requests,
+                // not routes. The call keeps its candidate as an unread one.
+                if found.end.role == LibraryRole::ServerFramework
+                    && !self
+                        .inputs
+                        .files
+                        .contains_key(&self.root.join(&found.end.file))
+                {
+                    sibling_routes += 1;
+                    continue;
+                }
                 // One of the labelled exports a callee's disagreeing values
                 // reach: the end is kept, with why it is no site.
                 let stop = found.several.then(|| SEVERAL_VALUES.to_string());
@@ -1757,6 +1772,18 @@ impl<'a> Walker<'a> {
                     reached: found.reached,
                     ..record(Some(found.end), found.chain, stop)
                 });
+            }
+            if sibling_routes > 0 {
+                *discovery
+                    .counts
+                    .entry("sibling_routes".to_string())
+                    .or_default() += sibling_routes;
+                let at = (self.rel(file), call.site.span_start, call.site.span_end);
+                if !discovery.sites.iter().any(|site| {
+                    site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
+                }) {
+                    discovery.missed_inside.push(at);
+                }
             }
         }
         for inner in body.nested.iter().chain(&body.detached) {
@@ -3133,6 +3160,55 @@ mod tests {
             "{:?}",
             records_in(&own, http)
         );
+    }
+
+    /// carrick#2618: a labelled call a walk reaches in a sibling's code is a
+    /// site only when it sends. The same fixture with the store labelling
+    /// the export a server framework (a route the sibling registers, which
+    /// the receiver trace writes at the join point) leaves no site: the
+    /// calls into the sibling stay unread (`missed_inside`), so the fact
+    /// layer keeps their candidates.
+    #[test]
+    fn a_route_registered_in_a_sibling_is_no_site() {
+        let Some(on) = super::super::fixture_walk::walked_services(
+            "discovery-siblings",
+            &[("services/app", "app"), ("packages/client", "client")],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-siblings/library-claims.json"),
+        )
+        .unwrap()
+        .replace("\"http_client\"", "\"server_framework\"");
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0);
+        let labels = Labels::of_answer(&answer);
+        let [app, client] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let with = discover_with(app, &[client], &labels, &on.repo);
+        assert!(with.sites.is_empty(), "{:?}", with.sites);
+        assert_eq!(with.counts.get("sibling_routes"), Some(&3));
+        let file = "services/app/src/main.ts";
+        let source = std::fs::read_to_string(on.repo.join(file)).unwrap();
+        let at = |needle: &str| {
+            let lo = source.find(needle).unwrap() as u32 + 1;
+            (file.to_string(), lo, lo + needle.len() as u32)
+        };
+        for needle in [
+            "getItem(id)",
+            "postTo(\"/api/events\", { at: 1 })",
+            "items.remove(id)",
+        ] {
+            assert!(
+                with.missed_inside.contains(&at(needle)),
+                "{needle}: {:?}",
+                with.missed_inside
+            );
+        }
     }
 
     /// Without rows there is nothing to walk: no site.
