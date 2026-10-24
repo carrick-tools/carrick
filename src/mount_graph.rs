@@ -181,7 +181,6 @@ impl ConsumerRole {
             | S::EnvBasePath
             | S::LiteralBasePath
             | S::NewUrl
-            | S::ReceiverType
             | S::InlineLiteral => Some(Self::NetworkRequest),
             // A request summary states both roles (carrick#1555): the row is
             // a call through a declaration exactly when it names the request
@@ -915,7 +914,6 @@ mod tests {
             S::EnvBasePath,
             S::LiteralBasePath,
             S::NewUrl,
-            S::ReceiverType,
             S::InlineLiteral,
         ] {
             assert_eq!(

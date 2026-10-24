@@ -101,10 +101,6 @@ impl MultiAgentOrchestrator {
         // (`engine::service_module_index`, carrick#1416), read by the passes
         // that resolve a call's specifier after the model has answered.
         service_modules: &crate::workspace_resolver::WorkspaceIndex,
-        // The warm type sidecar for this service, when one is up: the
-        // deterministic layer asks it what a bare `x.verb("/lit", arg)` site's
-        // receiver is (carrick#695).
-        sidecar: Option<&crate::services::type_sidecar::TypeSidecar>,
         // What each call site's callee sends (carrick#1555), possibly still
         // being composed while the library semantics settle (carrick#1564).
         request_summaries: crate::agents::file_orchestrator::SummarySource,
@@ -157,7 +153,6 @@ impl MultiAgentOrchestrator {
                 graphql_consumer_hints,
                 normalizer,
                 service_modules,
-                sidecar,
             )
             .await?;
 

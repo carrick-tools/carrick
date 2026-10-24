@@ -99,7 +99,6 @@ async fn analyze(root: &Path) -> carrick::agents::file_orchestrator::FileCentric
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(root, None),
-            None,
         )
         .await
         .expect("the analysis ran")
@@ -335,7 +334,6 @@ async fn analyze_files(
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(root, None),
-            None,
         )
         .await
         .expect("the analysis ran")

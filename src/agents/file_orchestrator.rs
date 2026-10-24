@@ -30,7 +30,6 @@ use crate::{
     cloud_storage::{ManifestRole, ManifestTypeKind},
     compared_route_literals::{ComparisonPosition, compared_route_literals},
     config::Config,
-    engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
         WholeUrlFallbackMap, base_default_states_a_path, exported_env_aliases,
@@ -760,16 +759,6 @@ pub struct ProcessingStats {
     /// would classify, counted so a free pass is distinguishable from an empty
     /// one (carrick#997 item 8).
     pub candidates_awaiting_model: usize,
-    /// Bare literal candidates the receiver's type classified (carrick#695),
-    /// split by the role it stated. Both are subsets of what
-    /// `unemitted_literal_candidates` would have counted before the arm
-    /// existed, which is what makes a row diff on this change readable.
-    pub receiver_classified_endpoints: usize,
-    pub receiver_classified_calls: usize,
-    /// Bare literal candidates asked about whose receiver type resolved to
-    /// nothing usable — on a checkout with no installed dependencies that is
-    /// every dependency-typed receiver, so the count is the install signal.
-    pub receiver_unresolved: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -807,9 +796,6 @@ const ROUTE_DESCRIPTOR_PATTERN: &str = "route-descriptor";
 /// `pattern_matched` tag for endpoints emitted deterministically from a route
 /// table that binds a path to an imported controller instance (#580).
 const CLASS_CONTROLLER_PATTERN: &str = "class-controller-route";
-
-/// Pattern tag for a route whose ROLE the receiver's type stated (carrick#695).
-const RECEIVER_TYPE_PATTERN: &str = "receiver-type-route";
 
 /// `pattern_matched` tag for endpoints emitted deterministically from a class
 /// that declares its routes with decorators (carrick#732).
@@ -1792,11 +1778,6 @@ impl ResolutionSource {
             | Self::DescriptorRoute
             | Self::ClassController
             | Self::DecoratorRoute => 1,
-            // Above the bare literal it replaces, below every source that
-            // states the TARGET as well as the role: a resolved member or a
-            // whole-URL binding knows where the request goes, and this knows
-            // only what the receiver is.
-            Self::ReceiverType => 1,
             Self::InlineLiteral | Self::Model => 0,
             // Never arbitrated here: a declared operation (carrick#831) is
             // not a statement about a call SITE, so it never competes for one.
@@ -2355,12 +2336,6 @@ impl FileOrchestrator {
         // (carrick#1403, carrick#1384); the analyzer-input path still resolves
         // relatively until carrick#474.
         service_modules: &WorkspaceIndex,
-        // The warm type sidecar for THIS service, when one is up. Read once,
-        // before the model pass, to answer what the receiver of a bare
-        // `x.verb("/lit", arg)` site is (carrick#695). `None` — no sidecar, a
-        // sidecar that never became ready, or a failed request — leaves every
-        // such site exactly where it was: the model's to classify.
-        sidecar: Option<&TypeSidecar>,
     ) -> Result<FileCentricAnalysisResult, Box<dyn std::error::Error>> {
         debug!("=== AST-GATED FILE-CENTRIC ORCHESTRATOR ===");
         debug!("Processing {} files with SWC gatekeeper", files.len());
@@ -2841,9 +2816,6 @@ impl FileOrchestrator {
                     route_endpoints,
                     descriptor_endpoints,
                     decorator_endpoints,
-                    // No call-site candidates here by construction, so
-                    // no receiver to ask about.
-                    &HashMap::new(),
                     // Its request summaries are emitted once they are
                     // composed ([`LateSummaryFile`]).
                     &BTreeMap::new(),
@@ -4085,20 +4057,6 @@ impl FileOrchestrator {
         // is asked anything: a fact the source states outright is not the
         // model's to lose by staying silent.
         //
-        // Before it runs, the one class of candidate the deterministic layer
-        // could never state a row for gets its answer: a bare
-        // `x.verb("/lit", arg)` states a path and a verb but no role, and the
-        // role is a property of the RECEIVER's type (carrick#695). One batched
-        // sidecar request for the whole service, resolved into a per-file
-        // span -> role map that the arm below reads like any other input.
-        let receiver_roles = Self::resolve_receiver_roles(
-            sidecar,
-            pending
-                .iter()
-                .map(|pf| (pf.path_str.as_str(), pf.content.as_str(), &pf.candidate_map)),
-            framework_detection,
-            &mut stats,
-        );
         //
         // The rest of this layer reads the request summaries, which may still
         // be waiting on library semantics the scan is asking about again
@@ -4470,7 +4428,6 @@ impl FileOrchestrator {
                     &[],
                     &[],
                     &[],
-                    &HashMap::new(),
                     summary_rows,
                     &env_schema,
                     // Its rows skip the passes after the join.
@@ -4482,7 +4439,6 @@ impl FileOrchestrator {
                 stats.total_data_calls += result.data_calls.len() - calls_before;
             }
         }
-        let empty_roles: HashMap<u32, ReceiverRole> = HashMap::new();
         let mut analyzed = analyzed;
         for (pf, _) in &mut analyzed {
             let file = Path::new(&pf.path_str);
@@ -4500,7 +4456,6 @@ impl FileOrchestrator {
                 &pf.route_endpoints,
                 &pf.descriptor_endpoints,
                 &pf.decorator_endpoints,
-                receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
                 summaries.rows(file).unwrap_or(&no_summary_rows),
                 &env_schema,
                 true,
@@ -8072,10 +8027,6 @@ impl FileOrchestrator {
         route_endpoints: &[EndpointResult],
         descriptor_endpoints: &[EndpointResult],
         decorator_endpoints: &[EndpointResult],
-        // What the compiler says the receiver of each bare literal candidate
-        // IS, keyed by the candidate's span start (carrick#695). Empty when no
-        // sidecar answered, which is exactly today's behaviour.
-        receiver_roles: &HashMap<u32, ReceiverRole>,
         // What each call site's callee sends, from the request summaries
         // (carrick#1555), keyed by span start. A site may reach more than
         // one request.
@@ -8374,49 +8325,6 @@ impl FileOrchestrator {
                         ResolutionSource::NewUrl,
                         None,
                     ))),
-                });
-            }
-            // FROZEN (old path, 2026-10-21): this `ReceiverType` arm only.
-            // Deletions and safety fixes only. Fixes for wrong or missing rows
-            // go in library claims (the store's role) and compiler rows
-            // (`decl_package`). Delete when the server-framework pick
-            // (carrick-cloud#2378) and the store rebuild (carrick-cloud#2379)
-            // are in, with discovery on by default and a clean four-repo replay
-            // (carrick#2474, R7).
-            // The ROLE of a bare `x.verb("/lit", arg)` site, read off what its
-            // receiver IS (carrick#695). The path and the verb are the site's
-            // own literals, exactly as `InlineLiteral` already reads them; the
-            // only thing the type decides is which side of the boundary the
-            // site sits on — which is why no rule about the call's SHAPE
-            // appears here (ruling, 2026-09-05). An unresolved receiver
-            // contributes no entry to the map at all, so this arm is silent on
-            // a checkout with no installed dependencies.
-            if let Some(role) = receiver_roles.get(&candidate.span_start)
-                && let RequestShapeSignal::Known(shape) = &candidate.request_shape
-                && let Some(path) =
-                    Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-            {
-                let row = match role {
-                    ReceiverRole::Client => ResolvedRow::Call(Box::new(Self::deterministic_call(
-                        candidate,
-                        line,
-                        path.clone(),
-                        Some(shape.method.clone()),
-                        ResolutionSource::ReceiverType,
-                        None,
-                    ))),
-                    ReceiverRole::Server => ResolvedRow::Endpoint(Box::new(
-                        Self::receiver_typed_endpoint(candidate, line, &path, &shape.method),
-                    )),
-                };
-                claim(Resolved {
-                    method: Some(shape.method.clone()),
-                    url: path,
-                    span,
-                    line,
-                    source: ResolutionSource::ReceiverType,
-                    emits: true,
-                    row,
                 });
             }
 
@@ -8877,198 +8785,6 @@ impl FileOrchestrator {
             // function, the imported-member join (carrick#1782).
             call_body: None,
         }
-    }
-
-    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
-    // fixes only. Fixes for wrong or missing rows go in library claims (the
-    // store's role) and compiler rows (`decl_package`). Delete when the
-    // server-framework pick (carrick-cloud#2378) and the store rebuild
-    // (carrick-cloud#2379) are in, with discovery on by default and a clean
-    // four-repo replay (carrick#2474, R7).
-    /// The route row a server-typed receiver states (carrick#695).
-    ///
-    /// Every field is the site's own: the receiver identifier owns the route
-    /// (it is what a mount chain is keyed on), the verb is the member invoked,
-    /// the path is the first-argument literal. Nothing is inferred about the
-    /// handler — the model still fills the response anchors when it returns a
-    /// row at this span.
-    fn receiver_typed_endpoint(
-        candidate: &CandidateTarget,
-        line: i32,
-        path: &str,
-        method: &str,
-    ) -> EndpointResult {
-        EndpointResult {
-            handler_declaration_line: None,
-            registration_literal: None,
-            candidate_id: candidate.candidate_id.clone(),
-            line_number: line,
-            owner_node: candidate
-                .receiver_ident
-                .clone()
-                .unwrap_or_else(|| candidate.callee_object.clone()),
-            method: method.to_string(),
-            path: path.to_string(),
-            handler_name: candidate
-                .enclosing_function
-                .clone()
-                .unwrap_or_else(|| candidate.callee_property.clone().unwrap_or_default()),
-            pattern_matched: RECEIVER_TYPE_PATTERN.to_string(),
-            call_expression_span_start: Some(candidate.span_start),
-            call_expression_span_end: Some(candidate.span_end),
-            payload_expression_text: None,
-            payload_expression_line: None,
-            response_expression_text: None,
-            response_expression_line: None,
-            emission_style: None,
-            primary_type_symbol: None,
-            type_import_source: None,
-            dispatch: None,
-            resolution_source: Some(ResolutionSource::ReceiverType),
-            // A registration call, not a file-router module.
-            view_module: false,
-        }
-    }
-
-    // FROZEN (old path, 2026-10-21): this function only. Deletions and safety
-    // fixes only. Fixes for wrong or missing rows go in library claims (the
-    // store's role) and compiler rows (`decl_package`). Delete when the
-    // server-framework pick (carrick-cloud#2378) and the store rebuild
-    // (carrick-cloud#2379) are in, with discovery on by default and a clean
-    // four-repo replay (carrick#2474, R7).
-    /// Ask the type sidecar what the receiver of every bare
-    /// `x.verb("/lit", arg)` site is, and map the answers onto roles
-    /// (carrick#695).
-    ///
-    /// One batched request for the whole service: the sidecar is warm and
-    /// span-addressed, so the cost is one round trip regardless of how many
-    /// sites there are. Every failure mode — no sidecar, a sidecar that never
-    /// became ready, a request error, a receiver that did not resolve, a
-    /// package in neither detection list — yields no entry, which leaves the
-    /// site exactly where it is today: the model's to classify.
-    ///
-    /// The spans go out in the sidecar's own numbering, not the scanner's
-    /// (carrick#805). A candidate carries an SWC position: a UTF-8 byte offset
-    /// counted from [`SWC_SPAN_BASE`]. The sidecar resolves it against ts-morph
-    /// positions, which TypeScript counts in UTF-16 code units from zero. The
-    /// two agree on an ASCII file and diverge, cumulatively, from a file's
-    /// first multi-byte character onwards, so an unconverted span past one
-    /// resolved to the enclosing call or to nothing at all — and on a repo
-    /// written in a language with accented characters that was almost every
-    /// site in the service.
-    ///
-    /// Converted here rather than stored converted, because the byte span is
-    /// what joins this pass's answers back to the candidate, and
-    /// `candidate_id` — built from the same numbers — keys the raw
-    /// model-result cache.
-    fn resolve_receiver_roles<'a>(
-        sidecar: Option<&TypeSidecar>,
-        files: impl Iterator<Item = (&'a str, &'a str, &'a HashMap<String, CandidateTarget>)>,
-        detection: &DetectionResult,
-        stats: &mut ProcessingStats,
-    ) -> HashMap<String, HashMap<u32, ReceiverRole>> {
-        let mut roles: HashMap<String, HashMap<u32, ReceiverRole>> = HashMap::new();
-        let Some(sidecar) = sidecar else {
-            debug!("Receiver classification skipped: no type sidecar");
-            return roles;
-        };
-        // With neither list populated nothing can be classified, and the
-        // request would be pure cost.
-        if detection.frameworks.is_empty() && detection.data_fetchers.is_empty() {
-            debug!("Receiver classification skipped: detection named no package");
-            return roles;
-        }
-        // The lists a role is decided against. A run where every site comes
-        // back unresolved is ambiguous without them — the package the receiver
-        // resolved to may simply not be on either list (carrick#1260).
-        debug!(
-            "Receiver classification lists: server={:?} client={:?}",
-            detection.frameworks, detection.data_fetchers
-        );
-
-        // alias -> (file, span). The alias is the join key on the way back.
-        let mut sites: HashMap<String, (String, u32)> = HashMap::new();
-        let mut requests: Vec<InferRequestItem> = Vec::new();
-        for (path_str, content, candidate_map) in files {
-            let mut candidates: Vec<&CandidateTarget> = candidate_map
-                .values()
-                .filter(|candidate| candidate.protocol == Protocol::Http)
-                .filter(|candidate| candidate.receiver_ident.is_some())
-                .filter(|candidate| matches!(candidate.request_shape, RequestShapeSignal::Known(_)))
-                .filter(|candidate| {
-                    Self::route_literal_from_snippet(candidate.path_snippet.as_deref()).is_some()
-                })
-                .collect();
-            candidates.sort_by_key(|candidate| candidate.span_start);
-            for candidate in candidates {
-                let alias = format!("Receiver_{}_{}", requests.len(), candidate.span_start);
-                sites.insert(alias.clone(), (path_str.to_string(), candidate.span_start));
-                requests.push(InferRequestItem {
-                    file_path: path_str.to_string(),
-                    line_number: u32::try_from(candidate.line_number).unwrap_or(1).max(1),
-                    span_start: Some(crate::utils::sidecar_position(
-                        content,
-                        candidate.span_start,
-                    )),
-                    span_end: Some(crate::utils::sidecar_position(content, candidate.span_end)),
-                    expression_text: None,
-                    expression_line: None,
-                    infer_kind: InferKind::ReceiverType,
-                    alias: Some(alias),
-                    param_name: None,
-                });
-            }
-        }
-        if requests.is_empty() {
-            debug!("Receiver classification: no bare literal candidate to ask about");
-            return roles;
-        }
-
-        let response = match sidecar.infer_types(&requests, None) {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(
-                    "[FileOrchestrator] receiver classification unavailable ({} site(s)): {}",
-                    requests.len(),
-                    e
-                );
-                return roles;
-            }
-        };
-        let inferred = response.inferred_types.unwrap_or_default();
-        for entry in &inferred {
-            let Some((path_str, span)) = sites.get(&entry.alias) else {
-                continue;
-            };
-            match classify_receiver(
-                &entry.type_string,
-                entry.declaring_package.as_deref(),
-                &detection.frameworks,
-                &detection.data_fetchers,
-            ) {
-                Some(role) => {
-                    match role {
-                        ReceiverRole::Server => stats.receiver_classified_endpoints += 1,
-                        ReceiverRole::Client => stats.receiver_classified_calls += 1,
-                    }
-                    roles
-                        .entry(path_str.clone())
-                        .or_default()
-                        .insert(*span, role);
-                }
-                None => stats.receiver_unresolved += 1,
-            }
-        }
-        // A site the sidecar returned nothing at all for is unresolved too.
-        stats.receiver_unresolved += requests.len().saturating_sub(inferred.len());
-        debug!(
-            "Receiver classification: {} site(s) asked, {} route(s), {} call(s), {} unresolved",
-            requests.len(),
-            stats.receiver_classified_endpoints,
-            stats.receiver_classified_calls,
-            stats.receiver_unresolved
-        );
-        roles
     }
 
     /// Put the deterministic rows into the file's result, in source order.
@@ -19235,39 +18951,23 @@ export { routes };
         }
     }
 
+    /// A route row a structural source stated at a call, as the join sees it.
+    fn structural_registration(owner: &str, path: &str, start: u32, end: u32) -> EndpointResult {
+        let mut endpoint = synthetic_endpoint("GET", path);
+        endpoint.candidate_id = format!("{owner}-{path}");
+        endpoint.line_number = 12;
+        endpoint.owner_node = owner.to_string();
+        endpoint.handler_name = "get".to_string();
+        endpoint.registration_literal = None;
+        endpoint.call_expression_span_start = Some(start);
+        endpoint.call_expression_span_end = Some(end);
+        endpoint.resolution_source = Some(ResolutionSource::DescriptorRoute);
+        endpoint
+    }
+
     fn bare_literal_map(receiver: &str, path: &str) -> HashMap<String, CandidateTarget> {
         let candidate = bare_literal_candidate(receiver, path);
         HashMap::from([(candidate.candidate_id.clone(), candidate)])
-    }
-
-    #[test]
-    fn a_server_typed_receiver_emits_the_route_the_site_states() {
-        let candidates = bare_literal_map("app", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/app.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
-        );
-
-        assert_eq!(result.data_calls.len(), 0);
-        assert_eq!(result.endpoints.len(), 1);
-        let endpoint = &result.endpoints[0];
-        assert_eq!(endpoint.method, "GET");
-        assert_eq!(endpoint.path, "/widgets");
-        // The receiver owns the route, so a mount chain keyed on it resolves.
-        assert_eq!(endpoint.owner_node, "app");
-        assert_eq!(
-            endpoint.resolution_source,
-            Some(ResolutionSource::ReceiverType)
-        );
-        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     #[test]
@@ -19288,7 +18988,9 @@ export { routes };
         reported.response_expression_text = Some("formatTaskResponse(task)".to_string());
         reported.response_expression_line = Some(14);
 
-        let (result, stats) = emit_and_join_with_receivers(
+        let structural = structural_registration("router", "/:taskId", 100, 140);
+
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult {
                 endpoints: vec![reported],
                 ..Default::default()
@@ -19298,10 +19000,9 @@ export { routes };
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            &[],
+            &[structural],
             "src/api/tasks/tasks.router.ts",
             false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
         );
 
         assert_eq!(
@@ -19318,7 +19019,7 @@ export { routes };
         // The structural layer stated this route, so it keeps the claim.
         assert_eq!(
             endpoint.resolution_source,
-            Some(ResolutionSource::ReceiverType)
+            Some(ResolutionSource::DescriptorRoute)
         );
         // The model's reading of the path and the literal both survive: which
         // of them the mount chain serves is carrick#1145's question.
@@ -19356,7 +19057,7 @@ export { routes };
         reported.handler_name = "anonymous".to_string();
         reported.owner_node = "v2".to_string();
 
-        let (result, _) = emit_and_join_with_receivers(
+        let (result, _) = emit_and_join_with(
             FileAnalysisResult {
                 endpoints: vec![reported],
                 ..Default::default()
@@ -19366,10 +19067,12 @@ export { routes };
             &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            &[],
+            &[
+                structural_registration("v1", "/:taskId", 50, 90),
+                structural_registration("v2", "/:taskId", 100, 140),
+            ],
             "src/api/tasks/tasks.router.ts",
             false,
-            &HashMap::from([(50, ReceiverRole::Server), (100, ReceiverRole::Server)]),
         );
 
         let rows: Vec<_> = result
@@ -19390,31 +19093,6 @@ export { routes };
             )),
             "the model's row must fold onto its own registration: {rows:?}"
         );
-    }
-
-    #[test]
-    fn a_client_typed_receiver_emits_the_request_the_site_states() {
-        let candidates = bare_literal_map("api", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &HashMap::new(),
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/client.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Client)]),
-        );
-
-        assert_eq!(result.endpoints.len(), 0);
-        assert_eq!(result.data_calls.len(), 1);
-        let call = &result.data_calls[0];
-        assert_eq!(call.method.as_deref(), Some("GET"));
-        assert_eq!(call.target, "/widgets");
-        assert_eq!(call.resolution_source, Some(ResolutionSource::ReceiverType));
-        assert_eq!(stats.unemitted_literal_candidates, 0);
     }
 
     /// carrick-cloud#2373: the sites of an unreadable same-module request
@@ -19442,7 +19120,7 @@ export { routes };
                 .expect("the fixture holds the site")
         };
 
-        let (_, stats) = emit_and_join_with_receivers(
+        let (_, stats) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19452,7 +19130,6 @@ export { routes };
             &[],
             "src/client.ts",
             false,
-            &HashMap::new(),
         );
 
         let named = |needle: &str| format!("src/client.ts:{}", line(needle));
@@ -19473,7 +19150,7 @@ export { routes };
     #[test]
     fn an_unclassified_receiver_leaves_the_site_exactly_as_it_was() {
         let candidates = bare_literal_map("thing", "/widgets");
-        let (result, stats) = emit_and_join_with_receivers(
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19482,9 +19159,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/thing.ts",
-            // The bare-checkout case: no answer for this span.
             false,
-            &HashMap::new(),
         );
 
         assert_eq!(result.endpoints.len(), 0);
@@ -19504,7 +19179,7 @@ export { routes };
     #[test]
     fn a_quoted_word_that_is_not_a_path_is_not_an_unclassified_route_site() {
         let candidates = bare_literal_map("Deno.env", "LEDGER_URL");
-        let (result, stats) = emit_and_join_with_receivers(
+        let (result, stats) = emit_and_join_with(
             FileAnalysisResult::default(),
             &candidates,
             &HashMap::new(),
@@ -19514,52 +19189,12 @@ export { routes };
             &[],
             "src/config.ts",
             false,
-            &HashMap::new(),
         );
 
         assert_eq!(result.endpoints.len(), 0);
         assert_eq!(result.data_calls.len(), 0);
         assert_eq!(stats.unemitted_literal_candidates, 0);
         assert!(stats.unemitted_literal_sites.is_empty());
-    }
-
-    #[test]
-    fn a_source_that_states_the_target_outranks_the_receiver() {
-        // An imported request member knows the target as well as the role, so
-        // it must keep the span: the receiver arm knows only the role.
-        let candidates = bare_literal_map("api", "/widgets");
-        let resolved_members = HashMap::from([(
-            100u32,
-            ResolvedMember {
-                name: "fetchWidget".to_string(),
-                member: crate::imported_request_member::RequestMember {
-                    method: "POST".to_string(),
-                    target: "/v2/widgets".to_string(),
-                    request_line: 3,
-                    body: None,
-                },
-            },
-        )]);
-        let (result, _) = emit_and_join_with_receivers(
-            FileAnalysisResult::default(),
-            &candidates,
-            &resolved_members,
-            &[],
-            &EnvAliasMap::new(),
-            &WholeUrlFallbackMap::new(),
-            &[],
-            "src/consumer.ts",
-            false,
-            &HashMap::from([(100, ReceiverRole::Server)]),
-        );
-
-        assert_eq!(result.endpoints.len(), 0);
-        assert_eq!(result.data_calls.len(), 1);
-        assert_eq!(result.data_calls[0].target, "/v2/widgets");
-        assert_eq!(
-            result.data_calls[0].resolution_source,
-            Some(ResolutionSource::ImportedMember)
-        );
     }
 
     fn candidate_with_snippet(id: &str, snippet: Option<&str>) -> CandidateTarget {
@@ -19600,17 +19235,18 @@ export { routes };
         file_path: &str,
         route_module_claimed: bool,
     ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_with_receivers(
+        emit_and_join_core(
             model,
             candidate_map,
             resolved_members,
             local_wrapper_calls,
             aliases,
             whole_url_fallbacks,
+            &LiteralBaseMap::new(),
             route_endpoints,
             file_path,
             route_module_claimed,
-            &HashMap::new(),
+            None,
         )
     }
 
@@ -19632,7 +19268,6 @@ export { routes };
             &[],
             file_path,
             false,
-            &HashMap::new(),
             None,
         )
     }
@@ -19660,38 +19295,7 @@ export { routes };
             route_endpoints,
             file_path,
             route_module_claimed,
-            &HashMap::new(),
             Some(&path_literals),
-        )
-    }
-
-    /// The same seam with the carrick#695 receiver answers supplied.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_and_join_with_receivers(
-        model: FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        resolved_members: &HashMap<u32, ResolvedMember>,
-        local_wrapper_calls: &[LocalWrapperCall],
-        aliases: &EnvAliasMap,
-        whole_url_fallbacks: &WholeUrlFallbackMap,
-        route_endpoints: &[EndpointResult],
-        file_path: &str,
-        route_module_claimed: bool,
-        receiver_roles: &HashMap<u32, ReceiverRole>,
-    ) -> (FileAnalysisResult, ProcessingStats) {
-        emit_and_join_core(
-            model,
-            candidate_map,
-            resolved_members,
-            local_wrapper_calls,
-            aliases,
-            whole_url_fallbacks,
-            &LiteralBaseMap::new(),
-            route_endpoints,
-            file_path,
-            route_module_claimed,
-            receiver_roles,
-            None,
         )
     }
 
@@ -19709,7 +19313,6 @@ export { routes };
         route_endpoints: &[EndpointResult],
         file_path: &str,
         route_module_claimed: bool,
-        receiver_roles: &HashMap<u32, ReceiverRole>,
         path_literals: Option<&RouteLiteralWitness>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
@@ -19724,7 +19327,6 @@ export { routes };
             route_endpoints,
             &[],
             &[],
-            receiver_roles,
             &BTreeMap::new(),
             &EnvSchemaIndex::default(),
             true,

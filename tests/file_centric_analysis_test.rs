@@ -336,9 +336,6 @@ fn test_processing_stats_tracking() {
         unemitted_literal_candidates: 0,
         unemitted_literal_sites: Vec::new(),
         candidates_awaiting_model: 0,
-        receiver_classified_endpoints: 0,
-        receiver_classified_calls: 0,
-        receiver_unresolved: 0,
         wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
@@ -982,7 +979,6 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
-            None,
         )
         .await;
 
@@ -1028,7 +1024,6 @@ async fn test_file_orchestrator_handles_empty_files() {
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
             &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
-            None,
         )
         .await;
 
@@ -1076,7 +1071,6 @@ async fn test_file_orchestrator_handles_missing_files() {
                 empty_root.path(),
                 None,
             ),
-            None,
         )
         .await;
 
