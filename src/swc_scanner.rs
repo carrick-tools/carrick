@@ -272,18 +272,15 @@ pub struct ScanResult {
 /// once the fact layer selects its files without it (carrick#2613).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegisterSignal {
-    /// Signal 4: an awaited call with a string argument.
-    C2,
     /// Signal 5: the method-name and object-name lists.
     C3,
 }
 
 impl RegisterSignal {
-    pub const ALL: [Self; 2] = [Self::C2, Self::C3];
+    pub const ALL: [Self; 1] = [Self::C3];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::C2 => "C2",
             Self::C3 => "C3",
         }
     }
@@ -2027,10 +2024,6 @@ struct CandidateVisitor {
     /// Span ranges already emitted, so the broadened signals below don't push
     /// the same call site twice (candidate ids are span-based).
     seen_spans: HashSet<(u32, u32)>,
-    /// Depth of enclosing `await` expressions. An awaited call with a string
-    /// argument is a strong network-call signal even when the callee name is
-    /// unknown.
-    await_depth: usize,
     /// True when this file imports a package the cloud /framework-detect step
     /// flagged as a messaging client (NATS, Redis, Kafka, …). This is the gate
     /// for Signal 7 (pub/sub call-site surfacing): the publish/subscribe shape
@@ -2112,7 +2105,6 @@ impl CandidateVisitor {
             source_map,
             function_stack: Vec::new(),
             seen_spans: HashSet::new(),
-            await_depth: 0,
             file_imports_messaging_client,
             const_string_values,
             new_url_paths,
@@ -2281,20 +2273,6 @@ impl CandidateVisitor {
                 .unwrap_or(false),
             _ => false,
         }
-    }
-
-    // FROZEN (old path, 2026-10-21): Signal 4, the await gate. Deletions and
-    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
-    // call that reaches a labelled library export). Delete when discovery is
-    // on by default and the four-repo replay shows no site only this signal
-    // raised (carrick#2440, target 2).
-    /// Is the first argument a string or template literal? Combined with an
-    /// enclosing `await`, this flags awaited calls like `await load('/data')`.
-    fn first_arg_is_stringish(call: &CallExpr) -> bool {
-        matches!(
-            call.args.first().map(|a| &*a.expr),
-            Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_))
-        )
     }
 
     /// Signal-7 topic check: is the first argument a string/template literal, or
@@ -2955,7 +2933,7 @@ impl CandidateVisitor {
     /// Property name of a member-expression callee (`axios.post(...)` ->
     /// "post", `w['post'](...)` -> "post"). `None` for non-member callees and
     /// non-literal computed properties. Used by the structural signals (URL
-    /// scheme, awaited stringish call) so the candidate hint carries the full
+    /// scheme) so the candidate hint carries the full
     /// `object.property` callee.
     fn callee_member_prop(expr: &Expr) -> Option<String> {
         let Expr::Member(member) = expr else {
@@ -3103,18 +3081,6 @@ impl Visit for CandidateVisitor {
             self.push_candidate(call, name, None);
         }
         node.visit_children_with(self);
-    }
-
-    // FROZEN (old path, 2026-10-21): Signal 4, the await gate (this visitor
-    // only keeps `await_depth`). Deletions and safety fixes only. Fixes for
-    // wrong or missing rows go in discovery (a call that reaches a labelled
-    // library export). Delete when discovery is on by default and the
-    // four-repo replay shows no site only this signal raised (carrick#2440,
-    // target 2).
-    fn visit_await_expr(&mut self, node: &AwaitExpr) {
-        self.await_depth += 1;
-        node.visit_children_with(self);
-        self.await_depth -= 1;
     }
 
     fn visit_expr_stmt(&mut self, node: &ExprStmt) {
@@ -3335,25 +3301,6 @@ impl Visit for CandidateVisitor {
                     Self::callee_member_prop(e),
                 ),
                 _ => ("<url-call>".to_string(), None),
-            };
-            self.push_candidate(call, obj, prop);
-        }
-
-        self.register_signal = Some(RegisterSignal::C2);
-        // FROZEN (old path, 2026-10-21): Signal 4, the await gate, this block,
-        // `await_depth`, `visit_await_expr` and `first_arg_is_stringish`.
-        // Deletions and safety fixes only. Fixes for wrong or missing rows go
-        // in discovery (a call that reaches a labelled library export). Delete
-        // when discovery is on by default and the four-repo replay shows no
-        // site only this signal raised (carrick#2440, target 2).
-        // Signal 4: awaited call with a string/template argument.
-        if self.await_depth > 0 && Self::first_arg_is_stringish(call) {
-            let (obj, prop) = match &call.callee {
-                Callee::Expr(e) => (
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<awaited-call>".to_string()),
-                    Self::callee_member_prop(e),
-                ),
-                _ => ("<awaited-call>".to_string(), None),
             };
             self.push_candidate(call, obj, prop);
         }
@@ -3809,8 +3756,8 @@ mod tests {
             .expect("the register signals raised the axios call");
         assert_eq!(
             axios.iter().copied().collect::<Vec<_>>(),
-            vec![RegisterSignal::C2, RegisterSignal::C3],
-            "the await gate and the name lists both raised it"
+            vec![RegisterSignal::C3],
+            "the name lists raised it"
         );
         assert!(
             !result.register_signals.contains_key(&span_of("fetch(")),
@@ -4186,12 +4133,6 @@ export default function handler() {}
     }
 
     #[test]
-    fn detects_awaited_stringish_call() {
-        let content = r#"async function run() { return await loadData('/data.json'); }"#;
-        assert!(!scan_test_content(content).candidates.is_empty());
-    }
-
-    #[test]
     fn ignores_non_network_code() {
         let content = r#"
 function run() {
@@ -4206,7 +4147,7 @@ function run() {
     #[test]
     fn dedupes_candidate_spans_across_signals() {
         // `await axios.get('https://x.com/y')` matches the import-local,
-        // url-scheme, awaited-stringish, and name heuristics simultaneously,
+        // url-scheme, and name heuristics simultaneously,
         // but the single call site must yield exactly one candidate.
         let content = r#"
 import axios from 'axios';
