@@ -1,0 +1,10 @@
+{
+  "name": "caller-fold-disagree-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/query": "^1.0.0",
+    "@fixture/trace": "^1.0.0"
+  }
+}

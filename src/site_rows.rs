@@ -32,7 +32,11 @@
 //!   its chain (`await login(…)`, where `login` writes the path) is no
 //!   second request ([`crate::request_summary::decided_sites::Through`]): a
 //!   reader row there folds onto the site when a row standing at the site
-//!   after the fold agrees on its key ([`agrees`]).
+//!   after the fold agrees on its key ([`agrees`]). It folds as well when it
+//!   disagrees (RULED, carrick#2704) where every row at the sites the call
+//!   reaches is a fact and they state one operation: the reader misread
+//!   that request. A disagreeing row stands beside a candidate, or beside
+//!   facts that state several operations.
 //! - **The band** (amended by David, 2026-10-17). An answer is in band only
 //!   when every slot the model answered that the row depends on (kind, role,
 //!   name, method, namespace: the slots that feed the key and the side) is at
@@ -55,6 +59,7 @@
 //!   ([`SiteRows::enabled`]); with it off the blob is byte for byte as
 //!   before.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -744,8 +749,9 @@ pub struct SiteFold {
     /// (carrick#2539): the index states that site, so it is no possible call.
     pub lead_on_row_line: usize,
     /// Reader rows at a call above a decided site folded onto the row the
-    /// site holds (carrick#2614). Each is in `withdrawn` as well.
-    pub through_folded: usize,
+    /// site holds (carrick#2614), as `(file, line, key)`. Each is in
+    /// `withdrawn` as well.
+    pub through_folded: Vec<(String, u32, OperationKey)>,
 }
 
 /// `file` relative to `root`, `/`-separated, whichever form it is held in
@@ -769,7 +775,24 @@ pub fn fold(
     root: &Path,
     make: impl Fn(OperationKey, &Path, u32, RowSide) -> ApiEndpointDetails,
 ) -> SiteFold {
-    fold_rows(&mut data.calls, &mut data.endpoints, site, root, make)
+    let fold = fold_rows(&mut data.calls, &mut data.endpoints, site, root, make);
+    // A folded caller's row leaves the graph's calls too: the cross-service
+    // pass reads them (`call_through::settle`), and would read the folded
+    // row as a call of its own (carrick#2704).
+    if let Some(graph) = data.mount_graph.as_mut() {
+        graph.data_calls.retain(|call| {
+            !fold.through_folded.iter().any(|(file, line, key)| {
+                call.resolution_source == Some(ResolutionSource::Model)
+                    && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
+                        relative(root, f) == *file && l.parse::<u32>().ok() == Some(*line)
+                    })
+                    && key.as_http().is_some_and(|(method, path)| {
+                        call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
+                    })
+            })
+        });
+    }
+    fold
 }
 
 /// [`fold`] over a blob's calls and endpoints.
@@ -913,35 +936,62 @@ pub fn fold_rows(
     // A reader row at a call above a decided site, for an operation a row at
     // the site states, is that request read again at its caller
     // (carrick#2614). The site's row is whichever stands there after the
-    // fold above: the scan's, the site's, or the reader's. No row there, or
-    // none that agrees, and the caller's row stands.
+    // fold above: the scan's, the site's, or the reader's. A row that agrees
+    // with one of them folds. So does one that disagrees, where every row at
+    // the sites the call reaches is a fact and together they state one
+    // operation (carrick#2704): the call makes that request, and the
+    // reader's other key is a wrong reading of it, not a second request.
+    // No row there, a candidate, or several operations, and a disagreeing
+    // caller's row stands.
+    let at = |row: &ApiEndpointDetails, file: &str, line: u32| {
+        place(root, row).is_some_and(|(f, l)| f == file && l == line)
+    };
+    let mut callers: BTreeMap<(&str, u32), Vec<&Through>> = BTreeMap::new();
     for through in &site.through {
-        let at = |row: &ApiEndpointDetails, file: &str, line: u32| {
-            place(root, row).is_some_and(|(f, l)| f == file && l == line)
-        };
-        let stated: Vec<OperationKey> = calls
+        callers
+            .entry((through.file.as_str(), through.line))
+            .or_default()
+            .push(through);
+    }
+    for ((file, line), throughs) in callers {
+        let stated: Vec<&ApiEndpointDetails> = calls
             .iter()
-            .filter(|row| at(row, &through.site_file, through.site_line))
-            .map(|row| row.key.clone())
+            .filter(|row| {
+                throughs
+                    .iter()
+                    .any(|through| at(row, &through.site_file, through.site_line))
+            })
             .collect();
+        let keys: Vec<OperationKey> = stated.iter().map(|row| row.key.clone()).collect();
+        let one_fact = !stated.is_empty()
+            && stated.iter().all(|row| is_fact(row))
+            && keys.iter().all(|key| *key == keys[0]);
         let folds = |row: &ApiEndpointDetails| {
             is_reader(row)
-                && at(row, &through.file, through.line)
-                && stated.iter().any(|key| agrees(&row.key, key))
+                && at(row, file, line)
+                && (one_fact || keys.iter().any(|key| agrees(&row.key, key)))
         };
         let mut index = 0;
         while index < calls.len() {
             if folds(&calls[index]) {
                 let gone = calls.remove(index);
+                out.through_folded
+                    .push((file.to_string(), line, gone.key.clone()));
                 out.withdrawn
-                    .push((through.file.clone(), through.line, gone.key, RowSide::Call));
-                out.through_folded += 1;
+                    .push((file.to_string(), line, gone.key, RowSide::Call));
             } else {
                 index += 1;
             }
         }
     }
     out
+}
+
+/// A row a fact states: the scan's own, or a site row every slot of which
+/// the code decided. A site answer is the model's, a candidate.
+fn is_fact(row: &ApiEndpointDetails) -> bool {
+    row.resolution_source
+        .is_some_and(|source| source != ResolutionSource::Model)
 }
 
 /// A row the file reader stated, which no site answer has touched.

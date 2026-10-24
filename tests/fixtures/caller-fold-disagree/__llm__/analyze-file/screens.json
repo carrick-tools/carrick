@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/api/list",
+      "method": "GET",
+      "pattern_matched": "listItems(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/api/items/${item.id}",
+      "method": "PATCH",
+      "pattern_matched": "replaceItem(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "/api/save",
+      "method": "POST",
+      "pattern_matched": "saveItem(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/api/all",
+      "method": "GET",
+      "pattern_matched": "fetchPath(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

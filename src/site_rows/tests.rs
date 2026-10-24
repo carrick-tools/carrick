@@ -1106,7 +1106,9 @@ fn agreement_reads_written_values_as_parameters() {
 }
 
 /// carrick#2614: a reader row at a call above a decided site folds onto the
-/// row standing at the site when the two agree, and stands otherwise.
+/// row standing at the site when the two agree. carrick#2704: it folds as
+/// well when it disagrees with a fact there, and stands when it disagrees
+/// with the reader's own row.
 #[test]
 fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
     let through = |file: &str, line: u32, site_line: u32| Through {
@@ -1144,7 +1146,16 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
             6,
             model,
         ),
-        // Stands: another operation than the site states.
+        // Stands: another operation than the site states, where only the
+        // reader states it.
+        blob_row(
+            OperationKey::http("GET", "/api/other"),
+            "src/page.ts",
+            7,
+            model,
+        ),
+        // Folds: another operation than the site states, where a fact states
+        // it (carrick#2704).
         blob_row(
             OperationKey::http("DELETE", "/api/session"),
             "src/page.ts",
@@ -1178,6 +1189,7 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
         through: vec![
             through("src/page.ts", 4, 12),
             through("src/page.ts", 6, 20),
+            through("src/page.ts", 7, 20),
             through("src/page.ts", 9, 12),
             through("src/page.ts", 11, 30),
             through("src/page.ts", 13, 12),
@@ -1194,13 +1206,13 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
         [
             "src/client.ts:12",
             "src/client.ts:20",
-            "src/page.ts:9",
+            "src/page.ts:7",
             "src/page.ts:11",
             "src/page.ts:13",
             "src/page.ts:15",
         ]
     );
-    assert_eq!(fold.through_folded, 2);
+    assert_eq!(fold.through_folded.len(), 3);
     assert_eq!(
         fold.withdrawn,
         [
@@ -1214,6 +1226,12 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
                 "src/page.ts".to_string(),
                 6,
                 OperationKey::http("GET", "/api/me"),
+                RowSide::Call
+            ),
+            (
+                "src/page.ts".to_string(),
+                9,
+                OperationKey::http("DELETE", "/api/session"),
                 RowSide::Call
             ),
         ]

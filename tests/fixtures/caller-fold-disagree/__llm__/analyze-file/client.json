@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/api/items",
+      "method": "GET",
+      "pattern_matched": "http.get<Item[]>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "/api/items/${id}",
+      "method": "PUT",
+      "pattern_matched": "http.put<Item>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/api/items",
+      "method": "POST",
+      "pattern_matched": "http.post<Item>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "${path}",
+      "method": "GET",
+      "pattern_matched": "http.get<Item[]>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

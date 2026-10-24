@@ -754,6 +754,8 @@ pub struct Decided {
 
 /// A discovered call whose request is decided lower down its chain
 /// (carrick#2614): `await login(…)` where `login`'s own call writes the path.
+/// Also each call of the function whose body writes a decided site
+/// ([`callers_above`], carrick#2704).
 /// The call is not a second request; the site at `site_file:site_line` is.
 /// Recorded only where each hop from this call down to the site is the
 /// definition [`RequestSummaryInputs::reach`] reads off the compiler's `call`
@@ -797,6 +799,42 @@ fn through(
         site_file: relative(root, chain[to].file),
         site_line: chain[to].call.site.line,
     })
+}
+
+/// The calls of the function whose body writes each decided site, as
+/// [`Through`]s to that site (carrick#2704). A site decided where discovery
+/// listed no call above it (a walk up the callers, or a request written in a
+/// function handed to a package: `span(name, () => http.get(path))`) still
+/// has callers that make its request, and a reader row at one is that
+/// request read again. A site written in a function nested in its owner
+/// counts only where that function is an argument of a call: one the owner
+/// returns or stores is not run by calling the owner. Each hop is checked as
+/// [`through`] checks it.
+fn callers_above(
+    inputs: &RequestSummaryInputs,
+    root: &Path,
+    calls: &Calls<'_>,
+    sites: &[DecidedSite],
+) -> Vec<Through> {
+    let mut out = Vec::new();
+    for site in sites.iter().filter(|site| site.key.is_none()) {
+        let Some(placed) = calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
+        else {
+            continue;
+        };
+        let Some(key) = placed.key else {
+            continue;
+        };
+        if placed.depth > 0 && placed.host.is_none() {
+            continue;
+        }
+        for caller in calls.callers_of(placed.file, key) {
+            if let Some(through) = through(inputs, root, &[*caller, placed], 1) {
+                out.push(through);
+            }
+        }
+    }
+    out
 }
 
 /// One call, where it is written: its file, the definition key of the
@@ -1913,6 +1951,8 @@ fn decide(
             walk.up(&chain, &top, end, &mut Vec::new());
         }
     }
+    out.through
+        .extend(callers_above(inputs, root, &calls, &out.sites));
     let mounts = match (makers, &index) {
         (Some(makers), Some(index)) => {
             let mounts = composed::mount_edges(&calls, inputs, root, makers, scopes, index);

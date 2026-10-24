@@ -6280,7 +6280,7 @@ fn append_deterministic_protocol_operations(
             stated = site.stated.len(),
             withdrawn = site.withdrawn.len(),
             through = extractions.site.through.len(),
-            through_folded = site.through_folded,
+            through_folded = site.through_folded.len(),
             "site questions: fold"
         );
     }
@@ -23858,7 +23858,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             leads: Vec::new(),
             route_kept_reader: 0,
             lead_on_row_line: 0,
-            through_folded: 0,
+            through_folded: Vec::new(),
         };
         let mut entries = Vec::new();
         add_protocol_manifest_entry(

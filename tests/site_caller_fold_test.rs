@@ -58,11 +58,13 @@ fn run_git(dir: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-/// The fixture, copied and committed as a repo of its own.
-fn fixture_repo(tmp: &Path) -> PathBuf {
-    let repo = tmp.join("caller-fold");
+/// A fixture, copied and committed as a repo of its own.
+fn fixture_repo(tmp: &Path, name: &str) -> PathBuf {
+    let repo = tmp.join(name);
     copy_dir(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/caller-fold"),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name),
         &repo,
     );
     run_git(&repo, &["init", "-q"]);
@@ -159,7 +161,7 @@ fn at<'r>(rows: &'r [(String, String, String)], place: &str) -> Vec<&'r (String,
 #[test]
 fn a_reader_row_at_a_call_of_a_function_that_states_the_request_folds_onto_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = fixture_repo(tmp.path());
+    let repo = fixture_repo(tmp.path(), "caller-fold");
 
     // Off: every line holds a row, the caller's copy of `/api/login` among
     // them. This is the switch-off output that must not move, and the proof
@@ -199,4 +201,104 @@ fn a_reader_row_at_a_call_of_a_function_that_states_the_request_folds_onto_it() 
     assert_eq!(at(&on, "src/client.ts:16").len(), 1, "{on:#?}");
     assert_eq!(at(&on, "src/client.ts:17").len(), 1, "{on:#?}");
     assert_eq!(on.len(), places.len() - 1, "{on:#?}");
+}
+
+/// Every graph call row's `file:line`: the rows the cross-service pass reads.
+fn graph_calls(blob: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = blob["mount_graph"]["data_calls"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row["file_location"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// carrick#2704 (RULED): a reader row at a call of a function in the same
+/// service folds onto the fact the function's request is, whatever key the
+/// reader gave it.
+///
+/// `tests/fixtures/caller-fold-disagree/`: `src/client.ts` declares four
+/// functions, each writing its request inside a function it hands a
+/// tracing package (`span(name, () => http.get(…))`), so no discovered
+/// chain runs from their callers: `listItems` (`GET /api/items`),
+/// `replaceItem` (`PUT /api/items/${id}`), `saveItem` (`POST /api/items`)
+/// and `fetchPath(path)`, whose path is its caller's parameter. In
+/// `src/screens.ts` a hook calls `listItems` from a query package's
+/// callback, and three functions call the others. The reader's cassette
+/// names each caller's request wrongly: `GET /api/list`, `PATCH`, `POST
+/// /api/save`, and `GET /api/all`.
+///
+/// | line | reader states | switch on |
+/// |---|---|---|
+/// | `src/client.ts:9`, `:13`, `:17` | the request | the fact row |
+/// | `src/screens.ts:5` (hook, `listItems`) | `GET /api/list` | folded: no row |
+/// | `src/screens.ts:9` (`replaceItem`) | `PATCH /api/items/:id` | folded: no row |
+/// | `src/screens.ts:13` (`saveItem`) | `POST /api/save` | folded: no row |
+/// | `src/screens.ts:17` (`fetchPath`) | `GET /api/all` | the reader's row: no fact states the request |
+#[test]
+fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(tmp.path(), "caller-fold-disagree");
+
+    // Off: the reader's rows stand at the hook and at the unstated caller,
+    // the proof it states them. At the other two callers the old path's
+    // wrapper passes, where they still run, read the callee and drop the row
+    // as an echo; with them gone the reader's row stands there too.
+    let off = calls(&scan(&repo, false));
+    for place in ["src/screens.ts:9", "src/screens.ts:13"] {
+        assert!(
+            at(&off, place).iter().all(|row| row.2 == "model"),
+            "{place} off: {off:#?}"
+        );
+    }
+    for (place, operation) in [
+        ("src/screens.ts:5", "GET /api/list"),
+        ("src/screens.ts:17", "GET /api/all"),
+    ] {
+        let rows = at(&off, place);
+        assert_eq!(rows.len(), 1, "{place} off: {off:#?}");
+        assert_eq!(
+            (rows[0].1.as_str(), rows[0].2.as_str()),
+            (operation, "model"),
+            "{place} off: {off:#?}"
+        );
+    }
+
+    let blob = scan(&repo, true);
+    let on = calls(&blob);
+    // Each request stands once, at the call that writes it, as a fact.
+    for (place, operation) in [
+        ("src/client.ts:9", "GET /api/items"),
+        ("src/client.ts:13", "PUT /api/items/:id"),
+        ("src/client.ts:17", "POST /api/items"),
+    ] {
+        let rows = at(&on, place);
+        assert_eq!(rows.len(), 1, "{place}: {on:#?}");
+        assert_eq!(rows[0].1, operation, "{place}: {on:#?}");
+        assert_ne!(rows[0].2, "model", "{place}: {on:#?}");
+    }
+    // The callers' misreadings of those requests are gone, from the calls
+    // and from the graph the cross-service pass reads.
+    let graph = graph_calls(&blob);
+    for place in ["src/screens.ts:5", "src/screens.ts:9", "src/screens.ts:13"] {
+        assert!(at(&on, place).is_empty(), "{place}: {on:#?}");
+        assert!(!graph.contains(&place.to_string()), "{place}: {graph:#?}");
+    }
+    // A caller whose request no fact states keeps the reader's row.
+    let unstated = at(&on, "src/screens.ts:17");
+    assert_eq!(unstated.len(), 1, "{on:#?}");
+    assert_eq!(
+        (unstated[0].1.as_str(), unstated[0].2.as_str()),
+        ("GET /api/all", "model"),
+        "{on:#?}"
+    );
 }
