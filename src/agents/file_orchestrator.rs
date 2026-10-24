@@ -7598,6 +7598,20 @@ impl FileOrchestrator {
         // default-exports: a fact from the export list, not a guess.
         let view_module = exports.iter().any(|handler| handler.name == "default");
 
+        // The fact layer's reading of what each role-named export compares the
+        // request's method against, built only when the convention says where
+        // the handler holds the request and some export is a role name
+        // (carrick#2740).
+        let file_ir = route
+            .request_method
+            .as_ref()
+            .filter(|_| {
+                exports
+                    .iter()
+                    .any(|h| !is_http_method(&h.name) && route.method_exports.contains_key(&h.name))
+            })
+            .and_then(|_| crate::request_summary::file_ir_of(file_path, content));
+
         let endpoints = match route.method_source {
             // App-router style: one exported function per HTTP method. The export
             // name *is* the method (GET/POST/...), and its declaration span lets
@@ -7608,8 +7622,10 @@ impl FileOrchestrator {
                     // An export named for a method *is* that method; a
                     // convention whose route modules name their handlers for a
                     // role instead (a read export, a write export) maps those
-                    // names itself, and a method guard inside the body narrows
-                    // that default to the verbs actually served (carrick#601).
+                    // names itself, and the verbs the body compares the request
+                    // method against, read from the guard IR, narrow that
+                    // default to the verbs actually served (carrick#601,
+                    // carrick#2740).
                     // Either way the endpoint is anchored on the export's own
                     // span, so an exported binding initialized from a call — a
                     // handler built by a route-builder factory rather than
@@ -7617,11 +7633,14 @@ impl FileOrchestrator {
                     // declaration does (carrick#473). The anchor stays the
                     // export span, never the guard line: the sidecar's
                     // return-type lookup is keyed on it.
-                    let methods = route.http_methods_for_export(
-                        &h.name,
-                        &h.method_guards,
-                        &h.declared_methods,
-                    );
+                    let compared = match (&file_ir, &route.request_method) {
+                        (Some(ir), Some(at)) => crate::request_summary::compared_methods(
+                            ir, &h.binding, at.param, &at.path,
+                        ),
+                        _ => Vec::new(),
+                    };
+                    let methods =
+                        route.http_methods_for_export(&h.name, &compared, &h.declared_methods);
                     methods
                         .into_iter()
                         .map(|method| EndpointResult {

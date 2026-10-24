@@ -64,6 +64,16 @@ pub enum SegmentSource {
     },
 }
 
+/// Where a handler holds the request's method: its parameter by position and
+/// the members down from that parameter (`request.method` of a destructured
+/// `({ request })` is parameter 0, path `["request", "method"]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MethodMember {
+    pub param: usize,
+    pub path: Vec<String>,
+}
+
 /// A declarative description of a file-based routing scheme. Executed by
 /// [`derive_route`]; never branched on by framework name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +110,14 @@ pub struct RoutingConvention {
     /// endpoint.
     #[serde(default)]
     pub method_exports: BTreeMap<String, String>,
+    /// Where a handler under this convention holds the request's method: the
+    /// parameter by position and the members down from it. Plain data, so the
+    /// reader that narrows a role-named export to the verbs its body compares
+    /// the method against (`crate::request_summary::compared_methods`) reads
+    /// `params.method` or `context.method` as nothing. `None`: the handler's
+    /// signature says nowhere, so no export narrows.
+    #[serde(default)]
+    pub request_method: Option<MethodMember>,
     /// File stems that name the route module itself rather than a path
     /// segment, and so contribute nothing to the path: `index` in a scheme
     /// where a directory's index file IS the directory, and `route` in a
@@ -144,6 +162,8 @@ pub struct DerivedRoute {
     /// The matched convention's role-export -> method map (see
     /// [`RoutingConvention::method_exports`]).
     pub method_exports: BTreeMap<String, String>,
+    /// The matched convention's [`RoutingConvention::request_method`].
+    pub request_method: Option<MethodMember>,
 }
 
 /// Methods a handler may branch on without that branch being the verb it
@@ -160,8 +180,10 @@ impl DerivedRoute {
     /// names the conventional handler exports. Everything else — helpers,
     /// types, config objects a route module also exports — yields no endpoint.
     ///
-    /// `method_guards` are the HTTP-method literals the handler body compares
-    /// the request method against (carrick#601). They matter only for a
+    /// `compared` are the HTTP-method literals the handler body compares the
+    /// request method against (carrick#601), as
+    /// [`crate::request_summary::compared_methods`] reads them from the guard
+    /// IR (carrick#2740). They matter only for a
     /// role-named export, where the convention supplies a *default* verb rather
     /// than reading one from the source: a module that exports one generic
     /// write handler and narrows to PUT inside the body serves PUT and nothing
@@ -185,13 +207,13 @@ impl DerivedRoute {
     /// route offers, so neither displaces the convention's default, and a guard
     /// naming only them reads as no guard at all. Nor is a row emitted for
     /// them: preflight is not an operation a consumer calls. The rule lives
-    /// here rather than in the guard collector because the collector's answer
-    /// is a fact about the source, "these are the literals the body compares
+    /// here rather than in the guard reader because the reader's answer is a
+    /// fact about the source, "these are the literals the body compares
     /// the method against", and this is the routing judgement laid over it.
     pub fn http_methods_for_export(
         &self,
         export: &str,
-        method_guards: &[String],
+        compared: &[String],
         declared_methods: &[String],
     ) -> Vec<String> {
         if is_http_method(export) {
@@ -221,7 +243,7 @@ impl DerivedRoute {
         }
 
         let mut guarded: Vec<String> = Vec::new();
-        for guard in method_guards {
+        for guard in compared {
             if !is_http_method(guard) {
                 continue;
             }
@@ -263,6 +285,7 @@ impl RoutingConvention {
             group_close: ")".to_string(),
             method_source: MethodSource::ExportName,
             method_exports: BTreeMap::new(),
+            request_method: None,
             // A directory-chain source names its terminal file in
             // `terminal_files` above; neither field below is consulted.
             terminal_stems: Vec::new(),
@@ -293,6 +316,7 @@ impl RoutingConvention {
             group_close: ")".to_string(),
             method_source: MethodSource::DefaultExport,
             method_exports: BTreeMap::new(),
+            request_method: None,
             terminal_stems: vec!["index".to_string()],
             // `_app`, `_document`, `_middleware`: files the pages router
             // reserves for itself and never routes.
@@ -331,6 +355,7 @@ impl RoutingConvention {
             group_close: String::new(),
             method_source: MethodSource::ExportName,
             method_exports: BTreeMap::new(),
+            request_method: None,
             terminal_stems: vec!["index".to_string()],
             // Astro excludes `_`-prefixed files from routing outright.
             private_file_prefixes: vec!["_".to_string()],
@@ -386,6 +411,12 @@ impl RoutingConvention {
                 // serve.
                 ("action".to_string(), "POST".to_string()),
             ]),
+            // The route module API hands the handler one object whose `request`
+            // is a Fetch `Request`: its `method` is where a guard reads the verb.
+            request_method: Some(MethodMember {
+                param: 0,
+                path: vec!["request".to_string(), "method".to_string()],
+            }),
             // The flattened chain may also be written as a directory holding a
             // terminal module (`a.b.$id/route.ts`), and an index module names
             // its parent.
@@ -595,6 +626,7 @@ pub fn derive_route(rel_path: &Path, conventions: &[RoutingConvention]) -> Optio
             method_source: convention.method_source.clone(),
             convention: convention.name.clone(),
             method_exports: convention.method_exports.clone(),
+            request_method: convention.request_method.clone(),
         });
     }
     None

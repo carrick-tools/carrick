@@ -339,6 +339,10 @@ pub struct ExportedHandler {
     /// The exported binding name (`GET`, `POST`, …), or `"default"` for a
     /// default export.
     pub name: String,
+    /// The module-scope binding the export names: the declared name, the
+    /// local an export list renames (`export { run as action }` is `run`),
+    /// and `"default"` for a default export (carrick#2740).
+    pub binding: String,
     /// 1-based line number of the export.
     pub line_number: usize,
     /// Start byte offset of the exported declaration.
@@ -859,11 +863,13 @@ impl SwcScanner {
         let mut out = Vec::new();
         let mut reexports_all = false;
         let mut push = |name: String,
+                        binding: String,
                         span: swc_common::Span,
                         method_guards: Vec<String>,
                         declared_methods: Vec<String>| {
             out.push(ExportedHandler {
                 name,
+                binding,
                 line_number: sm.lookup_char_pos(span.lo).line,
                 span_start: span.lo.0,
                 span_end: span.hi.0,
@@ -892,11 +898,11 @@ impl SwcScanner {
                         let name = f.ident.sym.to_string();
                         let guards = guards_of(&name);
                         let declared = declared_of(&name);
-                        push(name, export.span(), guards, declared);
+                        push(name.clone(), name, export.span(), guards, declared);
                     }
                     Decl::Class(c) => {
                         let name = c.ident.sym.to_string();
-                        push(name, export.span(), Vec::new(), Vec::new());
+                        push(name.clone(), name, export.span(), Vec::new(), Vec::new());
                     }
                     Decl::Var(var) => {
                         for d in &var.decls {
@@ -907,7 +913,7 @@ impl SwcScanner {
                             for name in destructured_binding_names(&d.name) {
                                 let guards = guards_of(&name);
                                 let declared = declared_of(&name);
-                                push(name, export.span(), guards, declared);
+                                push(name.clone(), name, export.span(), guards, declared);
                             }
                         }
                     }
@@ -933,19 +939,35 @@ impl SwcScanner {
                                     (guards_of(&name), declared_of(&name))
                                 }
                             };
-                            push(name, n.span(), guards, declared);
+                            let binding = match &n.orig {
+                                ModuleExportName::Ident(id) => id.sym.to_string(),
+                                ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
+                            };
+                            push(name, binding, n.span(), guards, declared);
                         }
                     }
                 }
                 // `export default function () {}` / `export default expr`
                 ModuleDecl::ExportDefaultDecl(d) => {
                     let guards = collect_method_guards(&d.decl);
-                    push("default".to_string(), d.span(), guards, Vec::new());
+                    push(
+                        "default".to_string(),
+                        "default".to_string(),
+                        d.span(),
+                        guards,
+                        Vec::new(),
+                    );
                 }
                 ModuleDecl::ExportDefaultExpr(e) => {
                     let guards = collect_method_guards(&*e.expr);
                     let declared = call_declared_methods(&e.expr);
-                    push("default".to_string(), e.span(), guards, declared);
+                    push(
+                        "default".to_string(),
+                        "default".to_string(),
+                        e.span(),
+                        guards,
+                        declared,
+                    );
                 }
                 // `export * from "./x"`: the bindings are named in another
                 // module, so nothing is pushed and the list is recorded as
