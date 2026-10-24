@@ -3714,7 +3714,9 @@ async fn analyze_current_repo_incremental(
     )?;
     // The services this one's calls are declared in, read for the walks that
     // enter them (carrick#2618).
+    // Read only where the store is asked (`LibraryAsk::start`).
     let siblings = neighbours
+        .filter(|_| sidecar.is_some() && !crate::local_mode::no_model())
         .map(|neighbours| neighbours.reached(&request_inputs))
         .unwrap_or_default();
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
