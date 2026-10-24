@@ -17,9 +17,11 @@
 //! its name under a default-library key, wherever its types declare it. An
 //! optional call (`socket?.emit(…)`) is a call. A
 //! function handed to an in-repo callee that runs it is followed from the
-//! call that hands it over. A function handed to a library export is not:
-//! until the store says which exports run what they are handed, none is
-//! taken to.
+//! call that hands it over. A function written at a call into a library is
+//! followed when the compiler's row says the call returns what the function
+//! returns (`FLAG_RUNS_HANDED`, carrick#2634): a tracing runner, a retry
+//! helper, `then`. Other library calls are not: a listener registration or
+//! a store initialiser keeps what it is handed for later.
 //!
 //! A call into a function declared in a file of another service of the run
 //! (carrick#2618, [`discover_with`]) is followed in that file with that
@@ -74,7 +76,7 @@ use crate::library_claims::{ExportClaims, applies, runtime_packages_of};
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
-    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, Kind, Row,
+    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, Kind, Row,
 };
 use crate::services::type_sidecar::{
     ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
@@ -1548,24 +1550,9 @@ impl<'a> Walker<'a> {
                 let runs = callee
                     .map(|(_, callee)| callee.invoked_params.clone())
                     .unwrap_or_default();
-                for (index, arg) in call.args.iter().enumerate() {
-                    if let Value::Callback(nested) = arg
-                        && runs.contains(&index)
-                        && let Some(callback) = body.nested.get(*nested)
-                    {
-                        let written = ChainHop {
-                            function: "<callback>".to_string(),
-                            file: self.rel(file),
-                            line: callback
-                                .site
-                                .as_ref()
-                                .map_or(call.site.line, |site| site.line),
-                        };
-                        let inner = self.body(file, callback);
-                        let inner = self.lifted(inner).under(written).under(hop.clone());
-                        out.absorb(inner);
-                    }
-                }
+                out.absorb(
+                    self.handed(file, body, call, Some(&hop), |index| runs.contains(&index)),
+                );
                 if !out.ends.is_empty() {
                     out.stop = None;
                 }
@@ -1575,9 +1562,59 @@ impl<'a> Walker<'a> {
             Reach::NoFunction if self.interface_member(file, call) => {
                 Outcome::stopped("interface_member")
             }
+            // A call into a library whose declaration returns what the
+            // function it is handed returns (carrick#2634): the compiler's
+            // row says so, and the function written at the call is walked.
+            Reach::NoFunction
+                if self
+                    .row(file, call)
+                    .is_some_and(|row| !in_repo(row) && row.flags() & FLAG_RUNS_HANDED != 0) =>
+            {
+                let mut out = self.handed(file, body, call, None, |_| true);
+                if !out.ends.is_empty() {
+                    out.stop = None;
+                }
+                out
+            }
             Reach::NoFunction => Outcome::default(),
             Reach::Unknown(reason) => Outcome::stopped(super::row_calls::hole_key(reason)),
         }
+    }
+
+    /// What the functions written at `call` reach, each at an argument
+    /// position `runs` accepts, under a `<callback>` hop at its own line and
+    /// under `hop` (the callee) when the callee is code of the run.
+    fn handed(
+        &mut self,
+        file: &'a Path,
+        body: &'a FnIr,
+        call: &'a CallIr,
+        hop: Option<&ChainHop>,
+        runs: impl Fn(usize) -> bool,
+    ) -> Outcome<'a> {
+        let mut out = Outcome::default();
+        for (index, arg) in call.args.iter().enumerate() {
+            if let Value::Callback(nested) = arg
+                && runs(index)
+                && let Some(callback) = body.nested.get(*nested)
+            {
+                let written = ChainHop {
+                    function: "<callback>".to_string(),
+                    file: self.rel(file),
+                    line: callback
+                        .site
+                        .as_ref()
+                        .map_or(call.site.line, |site| site.line),
+                };
+                let inner = self.body(file, callback);
+                let mut inner = self.lifted(inner).under(written);
+                if let Some(hop) = hop {
+                    inner = inner.under(hop.clone());
+                }
+                out.absorb(inner);
+            }
+        }
+        out
     }
 
     /// What the definition `id` reaches, read once it is final.
@@ -2732,6 +2769,91 @@ mod tests {
                 .iter()
                 .any(|site| site.callee == "createStore"),
             "a closure a library only stores is not followed"
+        );
+    }
+
+    /// A package's declaration for the library calls that run, keep or
+    /// register what they are handed (carrick#2634).
+    const RUNNER_DECLARATIONS: &str = r#"export interface Ctx { readonly id: string }
+export interface Store<T> { get(): T }
+export declare function within<A extends unknown[], F extends (...args: A) => ReturnType<F>>(ctx: Ctx, fn: F, ...args: A): ReturnType<F>;
+export declare function keep<T>(init: () => T): Store<T>;
+export declare function on(event: string, listener: () => void): void;
+"#;
+
+    const RUNNER_SOURCE: &str = r#"import { within, keep, on } from "fixture-runner";
+const ctx = { id: "c" };
+export async function sendWithin(url: string): Promise<Response> {
+  return within(ctx, () => fetch(url));
+}
+export function loadWithin(): Promise<Response> {
+  return sendWithin("/within");
+}
+export function chained(): Promise<Response> {
+  return Promise.resolve("/then").then((path) => fetch(path));
+}
+export const kept = keep(() => fetch("/kept"));
+export function listen(): void {
+  on("ready", () => { void fetch("/ready"); });
+}
+"#;
+
+    /// carrick#2634: a function written at a call into a library whose
+    /// declaration returns what that function returns (a tracing runner, a
+    /// promise's `then`) is walked, under a `<callback>` hop and none for the
+    /// library; a function the library keeps or registers is not.
+    #[test]
+    fn a_function_a_library_call_runs_is_walked() {
+        let Some(on) = walked(
+            "discovery",
+            "services/web",
+            "web",
+            &[
+                (
+                    "node_modules/fixture-runner/package.json",
+                    r#"{ "name": "fixture-runner", "version": "1.0.0", "types": "index.d.ts" }"#,
+                ),
+                (
+                    "node_modules/fixture-runner/index.d.ts",
+                    RUNNER_DECLARATIONS,
+                ),
+                ("src/run-library.ts", RUNNER_SOURCE),
+            ],
+            true,
+        ) else {
+            return;
+        };
+        let exports = claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let here: Vec<(&str, Vec<&str>)> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("run-library.ts"))
+            .map(|site| {
+                (
+                    site.callee.as_str(),
+                    site.chain.iter().map(|hop| hop.function.as_str()).collect(),
+                )
+            })
+            .collect();
+        let at = |callee: &str| -> Vec<Vec<&str>> {
+            here.iter()
+                .filter(|(name, _)| name.rsplit('.').next() == Some(callee))
+                .map(|(_, chain)| chain.clone())
+                .collect()
+        };
+        assert_eq!(at("within"), vec![vec!["<callback>"]], "{here:?}");
+        assert_eq!(
+            at("sendWithin"),
+            vec![vec!["sendWithin", "<callback>"]],
+            "{here:?}"
+        );
+        assert_eq!(at("then"), vec![vec!["<callback>"]], "{here:?}");
+        assert!(at("keep").is_empty() && at("on").is_empty(), "{here:?}");
+        assert_eq!(
+            at("fetch").len(),
+            4,
+            "each fetch written inside a function is a site of its own: {here:?}"
         );
     }
 
