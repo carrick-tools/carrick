@@ -444,7 +444,11 @@ fn a_declared_method_option_replaces_the_convention_default_verb() {
 }
 
 #[test]
-fn method_guard_replaces_the_convention_default_verb() {
+/// carrick#601, carrick#2740: a role-named export whose body compares the
+/// request's method serves the verbs it compares, read from the fact layer's
+/// guard IR (`request_summary::compared_methods`), and the default verb of
+/// its role is not a row.
+fn a_compared_request_method_narrows_a_role_named_export() {
     let routes = synthesized_routes(
         "flat-routes-method-guard",
         &builtin_conventions(&["Remix".to_string()], &[]),
@@ -476,6 +480,16 @@ fn method_guard_replaces_the_convention_default_verb() {
         "POST /api/v1/items/:itemId/probe",
         // No guard: the convention's default for a write export stands.
         "POST /api/v1/items",
+        // carrick#2740: a switch on a local holding the folded method, in an
+        // arrow-const export.
+        "DELETE /api/v1/items/:itemId/notes",
+        "PUT /api/v1/items/:itemId/notes",
+        // A branch that returns, then a negated test that exits.
+        "DELETE /api/v1/items/:itemId/tags",
+        "PUT /api/v1/items/:itemId/tags",
+        // A declaration exported by an export list under a role name.
+        "DELETE /api/v1/items/:itemId/links",
+        "PATCH /api/v1/items/:itemId/links",
     ]
     .iter()
     .map(|s| s.to_string())

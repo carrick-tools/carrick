@@ -252,7 +252,7 @@ mod rows_census;
 pub use guards::{
     Branch, CallChain, CallFunction, CallName, CallStart, ChainEnd, ChainSite, Conjoined, Constant,
     GuardChain, GuardPosition, GuardShape, HoleReason, Hop, HopArg, LibraryReceiver, NameFrom,
-    NamedCall, Root, Within, guard_chains, named_calls,
+    NamedCall, Root, Within, compared_methods, guard_chains, named_calls,
 };
 
 #[allow(unused_imports)]
@@ -1597,6 +1597,15 @@ const INERT_GLOBALS: &[&str] = &[
     "console", "JSON", "Math", "Object", "Array", "Number", "String", "Boolean", "Date", "Symbol",
     "Reflect",
 ];
+
+/// The module-scope reading of one file's source, for a reader that has the
+/// text and no scan around it (carrick#2740: a file route's compared
+/// methods). `None` when the file does not parse. The empty key set names
+/// class static members only, which that reader does not look up.
+pub fn file_ir_of(file_path: &Path, content: &str) -> Option<FileIr> {
+    let (source_map, module) = crate::swc_scanner::parse_standalone_module(file_path, content)?;
+    Some(extract_file_ir(&module, &source_map, &HashSet::new()))
+}
 
 /// Read one parsed file. `definition_keys` is the extractor's key set for the
 /// same file, used to name a static member the way the extractor does when a

@@ -39,7 +39,7 @@ use super::Site;
 use super::decided_sites::{ArgSlot, DiscoverySite, LabelledEnd, SiteLabel};
 use super::guards::{
     ChainEnd, ChainFacts, Chains, EntryAt, GuardBranch, GuardChain, GuardIr, GuardPosition,
-    Handoff, Step,
+    Handoff, Step, key_steps, read_steps,
 };
 use crate::services::type_sidecar::RequestAt;
 use crate::site_questions::SubjectLabel;
@@ -112,21 +112,6 @@ fn end_kind(end: &ChainEnd) -> String {
         ChainEnd::Global { .. } => "global".to_string(),
         ChainEnd::ExternalImport { .. } => "external_import".to_string(),
     }
-}
-
-/// `steps` with the String methods after the last access dropped
-/// (`url.toLowerCase()` reads `url`).
-fn read_steps(steps: &[Step]) -> &[Step] {
-    let mut end = steps.len();
-    while end > 0 && matches!(steps[end - 1], Step::Call(_)) {
-        end -= 1;
-    }
-    &steps[..end]
-}
-
-/// A label's member path, as the steps a chain reads it with.
-fn key_steps(path: &[String]) -> Vec<Step> {
-    path.iter().map(|key| Step::Key(key.clone())).collect()
 }
 
 /// Whether `steps` read the request's path: its `path`, its `url`, or the

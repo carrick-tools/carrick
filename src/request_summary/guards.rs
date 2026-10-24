@@ -57,6 +57,7 @@ use crate::binding_scope::{BindingKey, Declarations, ident_key};
 use crate::env_alias::{env_get_call_name, env_member_name};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::swc_scanner::is_producer_route_path;
+use crate::type_manifest::is_http_method;
 use crate::visitor::FunctionDefinition;
 use crate::wrapper_request_shape::literal_string;
 
@@ -3101,6 +3102,90 @@ impl Ends {
     }
 }
 
+/// `steps` with the String methods after the last access dropped
+/// (`url.toLowerCase()` reads `url`).
+pub(super) fn read_steps(steps: &[Step]) -> &[Step] {
+    let mut end = steps.len();
+    while end > 0 && matches!(steps[end - 1], Step::Call(_)) {
+        end -= 1;
+    }
+    &steps[..end]
+}
+
+/// A label's member path, as the steps a chain reads it with.
+pub(super) fn key_steps(path: &[String]) -> Vec<Step> {
+    path.iter().map(|key| Step::Key(key.clone())).collect()
+}
+
+/// The HTTP methods the module-scope function `binding` compares the
+/// request's method against, in source order, each once (carrick#2740).
+///
+/// `param` and `path` say where the function's request method is: the
+/// parameter by position and the members down from it (`request.method` of a
+/// route module's `({ request })`). A guard counts when it is an equality
+/// test or a `case` against text naming an HTTP method, and its subject reads
+/// exactly that member (String methods after it, like `toUpperCase()`, read
+/// through). Polarity is not read: a file route has no path comparison, so
+/// `if (request.method !== "PUT") throw` is as much the narrowing as
+/// `=== "PUT"`.
+///
+/// The function's own guards count, and those of every function written
+/// inside it, where the subject is the parameter as that depth reads it (a
+/// function with a request parameter of its own compares another request).
+/// Callers and callees are not followed. A constant imported from another
+/// module reads nothing, and neither does a function built by a call
+/// (`withAuth(async ({ request }) => ...)`) or a method read through
+/// `String(request.method)`: the caller keeps the convention's default verb.
+pub fn compared_methods(
+    ir: &super::FileIr,
+    binding: &str,
+    param: usize,
+    path: &[String],
+) -> Vec<String> {
+    fn walk(f: &FnIr, depth: u8, param: usize, want: &[Step], out: &mut Vec<(u32, String)>) {
+        for guard in &f.guards {
+            if !matches!(
+                guard.position,
+                GuardPosition::Equality | GuardPosition::Case
+            ) {
+                continue;
+            }
+            let GuardLiteral::Text(text) = &guard.literal else {
+                continue;
+            };
+            if !is_http_method(text) {
+                continue;
+            }
+            let at_depth = match &guard.subject.root {
+                Root::Param(index, _) => depth == 0 && *index == param,
+                Root::Outer(d, index, _) => depth > 0 && *d == depth && *index == param,
+                _ => false,
+            };
+            if at_depth && read_steps(&guard.subject.steps) == want {
+                out.push((guard.site.lo, text.trim().to_uppercase()));
+            }
+        }
+        for inner in f.nested.iter().chain(&f.detached) {
+            walk(inner, depth.saturating_add(1), param, want, out);
+        }
+    }
+
+    let Some(function) = ir.functions.get(binding) else {
+        return Vec::new();
+    };
+    let want = key_steps(path);
+    let mut found = Vec::new();
+    walk(function, 0, param, &want, &mut found);
+    found.sort();
+    let mut methods: Vec<String> = Vec::new();
+    for (_, method) in found {
+        if !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+    methods
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4261,5 +4346,176 @@ export class Feed {
                 }
             }
         }
+    }
+
+    /// The methods `binding` of `src` compares `request.method` against,
+    /// the way a route module hands its handler `({ request })`.
+    fn compared(src: &str, binding: &str) -> Vec<String> {
+        let ir = crate::request_summary::file_ir_of(Path::new("app/routes/x.ts"), src)
+            .expect("the source parses");
+        compared_methods(
+            &ir,
+            binding,
+            0,
+            &["request".to_string(), "method".to_string()],
+        )
+    }
+
+    fn verbs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn compared_methods_reads_a_negated_comparison() {
+        // The probe: the subject of `({ request })` is Param(0) + [request, method].
+        let src = r#"export async function action({ request }) {
+            if (request.method !== "PUT") throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_both_polarities_in_source_order() {
+        let src = r#"export async function action({ request }) {
+            if (request.method === "DELETE") { return 1; }
+            if (request.method !== "PUT") throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["DELETE", "PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_a_destructured_local() {
+        let src = r#"export async function action({ request }) {
+            const { method } = request;
+            if (method !== "GET") throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["GET"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_a_local_holding_the_member() {
+        let src = r#"export async function action({ request }) {
+            const verb = request.method;
+            if (verb === "DELETE") return 1;
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["DELETE"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_through_string_methods_on_a_local() {
+        let src = r#"export async function action({ request }) {
+            const verb = request.method.toLowerCase().trim();
+            if (verb === "patch") return 1;
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PATCH"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_every_case_of_a_switch() {
+        let src = r#"export async function action({ request }) {
+            switch (request.method.toUpperCase()) {
+                case "PUT": return 1;
+                case "DELETE": return 2;
+                default: throw new Error("no");
+            }
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT", "DELETE"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_an_arrow_const_export() {
+        let src = r#"export const action = async ({ request }) => {
+            if (request.method !== "PUT") throw new Error("no");
+        };"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_a_closure_over_the_outer_request_in_source_order() {
+        let src = r#"export async function action({ request }) {
+            const check = () => { if (request.method === "PUT") return 1; };
+            if (request.method === "DELETE") return check();
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT", "DELETE"]));
+    }
+
+    #[test]
+    fn compared_methods_ignores_a_function_inside_with_its_own_request() {
+        let src = r#"export async function action({ request }) {
+            const other = ({ request }) => request.method === "PUT";
+            return other;
+        }"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_ignores_another_member_of_the_parameter() {
+        let src = r#"export async function action({ request, params }) {
+            if (params.method === "GET") return 1;
+        }"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_reads_a_same_file_text_constant() {
+        // Deliberate widening: the old collector read literals only.
+        let src = r#"const PUT = "PUT";
+        export async function action({ request }) {
+            if (request.method !== PUT) throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_ignores_what_is_not_the_request_method() {
+        for body in [
+            r#"const body = await request.json(); if (body.kind !== "PUT") return 1;"#,
+            r#"if (request.method !== "QUERY") return 1;"#,
+            r#"if (request.method.slice(0, 3) === "PUT") return 1;"#,
+        ] {
+            let src = format!("export async function action({{ request }}) {{ {body} }}");
+            assert_eq!(compared(&src, "action"), Vec::<String>::new(), "{body}");
+        }
+    }
+
+    #[test]
+    fn compared_methods_returns_options_for_the_router_to_drop() {
+        let src = r#"export async function action({ request }) {
+            if (request.method === "OPTIONS") return 1;
+        }"#;
+        assert_eq!(compared(src, "action"), verbs(&["OPTIONS"]));
+    }
+
+    #[test]
+    fn compared_methods_reads_each_binding_by_itself() {
+        let src = r#"export async function loader({ request }) { return 1; }
+        export async function action({ request }) {
+            if (request.method !== "PUT") throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "loader"), Vec::<String>::new());
+        assert_eq!(compared(src, "action"), verbs(&["PUT"]));
+    }
+
+    #[test]
+    fn compared_methods_abstains_on_a_built_export() {
+        let src = r#"export const action = withAuth(async ({ request }) => {
+            if (request.method !== "PATCH") throw new Error("no");
+        });"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_abstains_on_a_stringified_method() {
+        let src = r#"export async function action({ request }) {
+            if (String(request.method) !== "DELETE") throw new Error("no");
+        }"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn compared_methods_abstains_when_no_function_is_bound() {
+        let src = r#"export const action = 1;"#;
+        assert_eq!(compared(src, "action"), Vec::<String>::new());
+        assert_eq!(compared(src, "missing"), Vec::<String>::new());
     }
 }
