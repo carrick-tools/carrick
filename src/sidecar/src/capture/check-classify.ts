@@ -10,7 +10,9 @@
  *   surface import error (probe lines 1-2)-> unverifiable
  *   IsAny gate fired (TS2344)             -> gate_caught_baked_any
  *   IsUnknown/IsNever gate fired (TS2344) -> unverifiable
- *   IsVoid gate fired (TS2344)            -> unverifiable (no body read)
+ *   IsVoid gate fired (TS2344)            -> compatible with a note when the
+ *                                            consumer reads no response body;
+ *                                            else unverifiable (no body read)
  *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
  *   IsByteBody gate fired (TS2344)        -> unverifiable (bytes, even agreeing)
  *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
@@ -246,6 +248,21 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     .find((name) => name.endsWith(':void') || name.endsWith(':form'));
   if (shapeGate) {
     const { side, kind } = sideForGate(shapeGate, plan);
+    // A call site that reads no response body is compatible with whatever the
+    // producer answers: nothing it does depends on the body. Only the
+    // response direction (http, graphql), where the consumer is the expected
+    // side; a void producer, or a consumer that sends void (a request, a
+    // socket or pub/sub payload), still states no contract. The producer's
+    // own top-type gates fired above, and `factness` still reads the producer
+    // side, so a producer with an `any` inside stays not a fact.
+    if (kind === 'void' && side === 'consumer' && plan.direction.expected === 'consumer') {
+      return {
+        ...base,
+        bucket: 'compatible',
+        notes: [...base.notes, CONSUMER_READS_NO_BODY_NOTE],
+        ...factness(input),
+      };
+    }
     if (kind === 'void') {
       return {
         ...base,
@@ -463,6 +480,10 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
 export const CONSUMER_WIDER_NOTE =
   "the consumer's published request type is wider than what the call sends: " +
   'it widened a literal the call writes, and the values sent fit the producer';
+
+/** The note on a pair whose consumer reads no response body (carrick#1162). */
+export const CONSUMER_READS_NO_BODY_NOTE =
+  'the consumer reads no response body (its expected response is void), so the producer response is not compared with a read';
 
 function onUnwidenedLines(plan: ProbePlan, diagnostic: RawDiagnostic): boolean {
   return plan.unwidenedFromLine !== undefined && diagnostic.line >= plan.unwidenedFromLine;

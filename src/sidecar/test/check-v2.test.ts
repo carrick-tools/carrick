@@ -65,6 +65,7 @@ const PAIRS: CheckPairSpec[] = [
   // carrick#1162: a consumer that reads no body is not a contract to compare.
   mk('voidconsumer', 'V_Sent', 'V_Exp'),
   mk('undefinedconsumer', 'V_Sent', 'Ud_Exp'),
+  mk('voidconsumeruntyped', 'U_Sent', 'V_Exp'),
   // carrick#1162: a form-encoded body carries its fields as runtime appends.
   mk('formbody', 'Form_Expected', 'Form_Sent', { type_kind: 'request' }),
   // An `any` side keeps its top-type reason; it is not "reads no body".
@@ -286,14 +287,23 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.bucket, 'incompatible');
   });
 
-  it('a consumer response of void or undefined is not compared (carrick#1162)', () => {
+  it('a consumer response of void or undefined is compatible, with a note that it reads no body (carrick#1162)', () => {
     for (const key of ['voidconsumer', 'undefinedconsumer']) {
       const v = verdicts.get(key)!;
-      assert.strictEqual(v.bucket, 'unverifiable', key);
-      assert.strictEqual(v.gate, 'consumer:void', key);
-      assert.strictEqual(v.resolved, false, key);
-      assert.match(v.unresolved_reason!, /consumer/, key);
+      assert.strictEqual(v.bucket, 'compatible', key);
+      assert.strictEqual(v.gate, undefined, key);
+      assert.strictEqual(v.resolved, true, key);
+      assert.ok(
+        v.notes.some((n) => /consumer reads no response body/.test(n)),
+        `${key}: ${JSON.stringify(v.notes)}`
+      );
     }
+  });
+
+  it('an untyped producer read by a void consumer stays unverifiable', () => {
+    const v = verdicts.get('voidconsumeruntyped')!;
+    assert.strictEqual(v.bucket, 'unverifiable');
+    assert.strictEqual(v.gate, 'producer:unknown');
   });
 
   it('a form-encoded consumer body is not compared (carrick#1162)', () => {

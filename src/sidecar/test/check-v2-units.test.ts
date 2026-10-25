@@ -19,7 +19,11 @@ import {
   fnv1a,
   pairId,
 } from '../src/capture/check-probe.js';
-import { classifyPair, parseTscOutput } from '../src/capture/check-classify.js';
+import {
+  classifyPair,
+  parseTscOutput,
+  CONSUMER_READS_NO_BODY_NOTE,
+} from '../src/capture/check-classify.js';
 import { scrubPaths, rewriteAliases } from '../src/capture/check-scrub.js';
 import {
   assembleWorkspace,
@@ -411,7 +415,7 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(v.gate, 'producer:unknown');
   });
 
-  it('void gate -> unverifiable, below the unknown gate (carrick#1162)', () => {
+  it('a void consumer response is compatible with a note, below the unknown gate (carrick#1162)', () => {
     const voidLine = [...plan.gateLines].find(([, n]) => n === 'expected:void')![0];
     const unkLine = [...plan.gateLines].find(([, n]) => n === 'expected:unknown')![0];
     const voidOnly = classifyPair({
@@ -419,10 +423,47 @@ describe('four-bucket classifier precedence', () => {
       probeDiags: [diag(voidLine, 2344), diag(plan.assignmentLine, 2322)],
       poisonReason: noPoison,
       scrubCtx,
+      deepFindings: { sent: [], expected: [] },
     });
-    assert.strictEqual(voidOnly.bucket, 'unverifiable');
-    // http/response => expected is the consumer.
-    assert.strictEqual(voidOnly.gate, 'consumer:void');
+    // http/response => expected is the consumer, which reads no body.
+    assert.strictEqual(voidOnly.bucket, 'compatible');
+    assert.strictEqual(voidOnly.resolved, true);
+    assert.ok(voidOnly.notes.includes(CONSUMER_READS_NO_BODY_NOTE));
+    // A producer with any inside its response is still not a fact.
+    const deepAny = classifyPair({
+      plan,
+      probeDiags: [diag(voidLine, 2344)],
+      poisonReason: noPoison,
+      scrubCtx,
+      deepFindings: {
+        sent: [{ path: 'meta', kind: 'any' } as never],
+        expected: [],
+      },
+    });
+    assert.strictEqual(deepAny.bucket, 'compatible');
+    assert.strictEqual(deepAny.resolved, false);
+    // A void producer is the producer's gate, not the consumer's.
+    const sentVoidLine = [...plan.gateLines].find(([, n]) => n === 'sent:void')![0];
+    const bothVoid = classifyPair({
+      plan,
+      probeDiags: [diag(sentVoidLine, 2344), diag(voidLine, 2344)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(bothVoid.bucket, 'unverifiable');
+    assert.strictEqual(bothVoid.gate, 'producer:void');
+    // A consumer that SENDS void (a socket publisher) states no contract.
+    const socket = buildProbe(spec({ protocol: 'socket', type_kind: 'both' }), PKG);
+    const socketVoid = classifyPair({
+      plan: socket,
+      probeDiags: [
+        diag([...socket.gateLines].find(([, n]) => n === 'sent:void')![0], 2344),
+      ],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(socketVoid.bucket, 'unverifiable');
+    assert.strictEqual(socketVoid.gate, 'consumer:void');
     const both = classifyPair({
       plan,
       probeDiags: [diag(voidLine, 2344), diag(unkLine, 2344)],
