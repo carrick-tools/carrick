@@ -1085,11 +1085,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     } else {
         (Vec::new(), Vec::new())
     };
+    // The lane's own width, sized by a walk's memory (carrick#2560).
+    let walk_width = service_workers::walk_width(analysed.len());
+    if walking {
+        debug!(
+            "Walking services {} at a time: {}",
+            walk_width.count, walk_width.why
+        );
+    }
     let lane = walk_lane::walk_all(
         recipe.clone(),
         repo_path,
         if walking { &analysed } else { &[] },
-        width.count,
+        walk_width.count,
+        walk_lane::WalkCaps::for_run(crate::services::type_sidecar::heap_cap_mb()),
         walk_ends,
     );
     // Every service's detection and guidance, asked for from here on beside

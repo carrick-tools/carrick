@@ -122,7 +122,7 @@ writes nothing ends with `close-scan`, reason `no_change`, and exits 0.
 | `CARRICK_RUN_REPO_COUNT` | How many repositories the run covers, so the cloud waits for all of them before it mails. |
 | `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` | The type checker's V8 heap cap, in MB. `0` passes no cap. |
 | `CARRICK_FAIL_ON_TYPE_MEMORY` | Stop the scan at the first type-checker memory death and exit 3, instead of landing that service without types and exiting 0. |
-| `CARRICK_SERVICE_CONCURRENCY` | How many services are analysed at once. `1` is one at a time. Unset, the scan sizes it from free memory and cores, at most 8. A higher number is honoured even when memory would not allow it. |
+| `CARRICK_SERVICE_CONCURRENCY` | How many services are analysed at once, and how many position-row walks run at once. `1` is one at a time. Unset, the scan sizes each from free memory and cores, at most 8. A higher number is honoured even when memory would not allow it. |
 | `CARRICK_ALLOW_UNPREPARED` | Scan a checkout whose dependencies are not installed instead of refusing it. |
 | `CARRICK_PROMPT_ENDPOINT` | Where the four prompt routes (`/analyze-file`, `/generate-intent`, `/framework-detect`, `/framework-guidance`) are sent, instead of the build-time endpoint. `http://127.0.0.1:<port>` or `http://[::1]:<port>` only; anything else is a usage error (exit 2). `/library-claims` and `/types/check-or-upload` keep the build-time endpoint. Headers and bodies are unchanged. |
 | `CARRICK_PROMPT_TIMEOUT_SECS` | The per-request timeout of the four prompt routes, in whole seconds, 1 to 900; anything else is a usage error (exit 2). Unset: 60. Other routes keep 60. |

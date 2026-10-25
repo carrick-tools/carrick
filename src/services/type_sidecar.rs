@@ -2141,10 +2141,24 @@ pub fn heap_cap_mb() -> Option<u64> {
     }
 }
 
-/// The `--max-old-space-size` argument for this run, or `None` when the
-/// override disables it.
-fn max_old_space_arg() -> Option<String> {
-    heap_cap_mb().map(|mb| format!("--max-old-space-size={}", mb))
+/// What a record-only process's death was, when it was memory: set when the
+/// sidecar classifies the death (`note_death`), for the caller that started the
+/// process to read after the work failed (carrick#2560). A record-only death
+/// is recorded nowhere else.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryDeathNote(Arc<Mutex<Option<MemoryDeath>>>);
+
+impl MemoryDeathNote {
+    /// The memory death noted since the last take, if any.
+    pub fn take(&self) -> Option<MemoryDeath> {
+        self.0.lock().ok().and_then(|mut death| death.take())
+    }
+
+    fn set(&self, death: MemoryDeath) {
+        if let Ok(mut noted) = self.0.lock() {
+            *noted = Some(death);
+        }
+    }
 }
 
 // ============================================================================
@@ -2180,16 +2194,16 @@ struct StderrEvidence {
 }
 
 impl SidecarProcess {
-    /// Start `node <sidecar_path>` with the heap flag for this run and both
-    /// reader threads. Returns as soon as the process exists; nothing has
-    /// been asked of it yet.
-    fn spawn(sidecar_path: &Path) -> Result<Self, SidecarError> {
+    /// Start `node <sidecar_path>` with `heap_cap_mb` as its heap flag (none
+    /// when `None`) and both reader threads. Returns as soon as the process
+    /// exists; nothing has been asked of it yet.
+    fn spawn(sidecar_path: &Path, heap_cap_mb: Option<u64>) -> Result<Self, SidecarError> {
         debug!("[type_sidecar] Spawning sidecar from: {:?}", sidecar_path);
 
         // Spawn the Node.js process. V8 flags MUST precede the script path,
         // or node passes them to the script instead of applying them.
         let mut command = Command::new("node");
-        if let Some(heap_arg) = max_old_space_arg() {
+        if let Some(heap_arg) = heap_cap_mb.map(|mb| format!("--max-old-space-size={mb}")) {
             debug!("[type_sidecar] Sidecar heap flag: {}", heap_arg);
             command.arg(heap_arg);
         }
@@ -2427,6 +2441,13 @@ pub struct TypeSidecar {
     /// Nothing is recorded for the run and nothing is restarted
     /// ([`Self::record_only`]).
     record_only: bool,
+    /// The V8 old-space cap this sidecar's processes start with, in MB:
+    /// [`heap_cap_mb`] unless its recipe set another
+    /// ([`SidecarRecipe::with_heap_cap_mb`]). `None` starts them with V8's own.
+    heap_cap_mb: Option<u64>,
+    /// Where a record-only process's memory death is noted for the caller
+    /// ([`SidecarRecipe::noting_memory_deaths`]).
+    memory_death_note: Option<MemoryDeathNote>,
 }
 
 /// How a sidecar process that is gone came to an end, with what it left to
@@ -2456,9 +2477,26 @@ pub struct SidecarRecipe {
     sidecar_path: PathBuf,
     operation_timeout: Duration,
     scan_root: Option<PathBuf>,
+    heap_cap_mb: Option<u64>,
+    memory_death_note: Option<MemoryDeathNote>,
 }
 
 impl SidecarRecipe {
+    /// This recipe, starting its processes with `heap_cap_mb` as their V8
+    /// old-space cap (V8's own when `None`) instead of the run's
+    /// (carrick#2560: a position-row walk is started below the analysis cap).
+    pub fn with_heap_cap_mb(mut self, heap_cap_mb: Option<u64>) -> Self {
+        self.heap_cap_mb = heap_cap_mb;
+        self
+    }
+
+    /// This recipe, noting a record-only process's memory death in `note`
+    /// (carrick#2560).
+    pub fn noting_memory_deaths(mut self, note: &MemoryDeathNote) -> Self {
+        self.memory_death_note = Some(note.clone());
+        self
+    }
+
     /// A process from this recipe, initialised to `repo_root` and ready. Its
     /// program is built by its first request.
     pub fn spawn_scoped(
@@ -2486,8 +2524,9 @@ impl SidecarRecipe {
         tsconfig_path: Option<&str>,
         record_only: bool,
     ) -> Result<TypeSidecar, SidecarError> {
-        let mut sidecar =
-            TypeSidecar::spawn(&self.sidecar_path)?.with_operation_timeout(self.operation_timeout);
+        let mut sidecar = TypeSidecar::spawn_with_heap_cap(&self.sidecar_path, self.heap_cap_mb)?
+            .with_operation_timeout(self.operation_timeout);
+        sidecar.memory_death_note = self.memory_death_note.clone();
         if record_only {
             sidecar = sidecar.record_only();
         }
@@ -2513,13 +2552,22 @@ impl TypeSidecar {
     /// # Returns
     /// A new `TypeSidecar` instance in the `Spawning` state.
     pub fn spawn(sidecar_path: &Path) -> Result<Self, SidecarError> {
+        Self::spawn_with_heap_cap(sidecar_path, heap_cap_mb())
+    }
+
+    /// [`Self::spawn`], its processes started with `heap_cap_mb` as their V8
+    /// old-space cap (V8's own when `None`) instead of the run's.
+    fn spawn_with_heap_cap(
+        sidecar_path: &Path,
+        heap_cap_mb: Option<u64>,
+    ) -> Result<Self, SidecarError> {
         let spawn_time = Instant::now();
         let SidecarProcess {
             child,
             stdin,
             responses,
             evidence,
-        } = SidecarProcess::spawn(sidecar_path)?;
+        } = SidecarProcess::spawn(sidecar_path, heap_cap_mb)?;
 
         debug!(
             "[type_sidecar] Sidecar spawned in {:?}",
@@ -2543,6 +2591,8 @@ impl TypeSidecar {
             death_noted: AtomicBool::new(false),
             replaced_peak: AtomicU64::new(0),
             record_only: false,
+            heap_cap_mb,
+            memory_death_note: None,
         })
     }
 
@@ -2620,6 +2670,9 @@ impl TypeSidecar {
                  kills rose: {}); nothing is recorded for the run",
                 death.end, death.heap_line, death.oom_kills_rose
             );
+            if let (Some(note), Some(kind)) = (&self.memory_death_note, death.memory_death()) {
+                note.set(kind);
+            }
             return;
         }
         match death.memory_death() {
@@ -2688,6 +2741,8 @@ impl TypeSidecar {
             sidecar_path: self.sidecar_path.clone(),
             operation_timeout: self.operation_timeout,
             scan_root: self.scan_root.lock().unwrap().clone(),
+            heap_cap_mb: self.heap_cap_mb,
+            memory_death_note: None,
         }
     }
 
@@ -2955,7 +3010,7 @@ impl TypeSidecar {
             Err(SidecarError::NotReady(reason))
         };
 
-        let process = match SidecarProcess::spawn(&self.sidecar_path) {
+        let process = match SidecarProcess::spawn(&self.sidecar_path, self.heap_cap_mb) {
             Ok(process) => process,
             Err(e) => return failed(e.to_string()),
         };

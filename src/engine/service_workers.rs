@@ -70,25 +70,29 @@ const SERVICES: machine::Sizing = machine::Sizing {
 /// has collected any prompt yet, a run-level fact that services side by side
 /// would race for.
 pub fn width(services: usize, dispatching: bool) -> machine::Size {
-    let forced = std::env::var(SERVICE_CONCURRENCY_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0);
     width_for(
         services,
         dispatching,
         machine::available_memory_mb(),
         machine::cores(),
         crate::services::type_sidecar::heap_cap_mb(),
-        forced,
+        forced_width(),
     )
+}
+
+/// The width [`SERVICE_CONCURRENCY_ENV`] forces, when it is set above zero.
+fn forced_width() -> Option<usize> {
+    std::env::var(SERVICE_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
 }
 
 /// [`width`] with its inputs given: min(services, [`MAX_SERVICES_AT_ONCE`],
 /// max(2, cores - 1), the services the free memory holds after
 /// [`machine::HEADROOM_MB`] at the heap cap and [`SERVICE_OVERHEAD_MB`] each).
 /// `forced` replaces everything but the service count.
-fn width_for(
+pub(super) fn width_for(
     services: usize,
     dispatching: bool,
     available_mb: Option<u64>,
@@ -111,6 +115,51 @@ fn width_for(
     machine::Size {
         count,
         why: format!("{count} service(s): the pass has {services}; {}", size.why),
+    }
+}
+
+const WALKS: machine::Sizing = machine::Sizing {
+    noun: "walk(s)",
+    knob: SERVICE_CONCURRENCY_ENV,
+    cap: MAX_SERVICES_AT_ONCE,
+    cores_floor: 2,
+    running: 0,
+    knob_capped_by_memory: false,
+};
+
+/// How many of the position-row walk lane's `services` are walked at once,
+/// and why (carrick#2560). Sized by a walk's memory, not an analysis
+/// sidecar's: see [`walk_width_for`]. A dispatched run's one-at-a-time rule
+/// is the analysis's and does not apply: a walk collects no prompt.
+pub fn walk_width(services: usize) -> machine::Size {
+    walk_width_for(
+        services,
+        machine::available_memory_mb(),
+        machine::cores(),
+        forced_width(),
+    )
+}
+
+/// [`walk_width`] with its inputs given: min(services, [`MAX_SERVICES_AT_ONCE`],
+/// max(2, cores - 1), the walks the free memory holds after
+/// [`machine::HEADROOM_MB`] at [`super::walk_lane::WALK_HEAP_CAP_MB`] and
+/// [`SERVICE_OVERHEAD_MB`] each). `forced` replaces everything but the
+/// service count, as it does for the analysis.
+pub(super) fn walk_width_for(
+    services: usize,
+    available_mb: Option<u64>,
+    cores: usize,
+    forced: Option<usize>,
+) -> machine::Size {
+    let per_mb = super::walk_lane::WALK_HEAP_CAP_MB + SERVICE_OVERHEAD_MB;
+    let size = machine::size_for(&WALKS, available_mb, per_mb, cores, forced);
+    let count = size.count.min(services.max(1));
+    if count == size.count {
+        return size;
+    }
+    machine::Size {
+        count,
+        why: format!("{count} walk(s): the lane has {services}; {}", size.why),
     }
 }
 
