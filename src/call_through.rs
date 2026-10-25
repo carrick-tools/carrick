@@ -600,14 +600,24 @@ fn pending_span(key: &OperationKey) -> Option<(u32, u32)> {
 /// a corrected row's callback or spread, so it can adopt what is asked here.
 /// The type pass runs before [`settle`], when no row exists to anchor a type
 /// at, so the call is asked for its own.
+///
+/// A call into a function no service of the run owns (`owned_elsewhere`
+/// says no, for a repository-relative file) is no candidate: [`settle`]
+/// states nothing there, and a question asked there would leave an alias no
+/// row adopts in the service's bundle and stub.
 pub(crate) fn leaf_candidates<'a>(
     leaves: &'a [LeafCall],
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
     root: &str,
+    owned_elsewhere: &dyn Fn(&str) -> bool,
 ) -> Vec<&'a LeafCall> {
+    let sibling_asked = |leaf: &LeafCall| match &leaf.callee {
+        LeafCallee::Sibling { file, .. } => owned_elsewhere(file),
+        LeafCallee::Own(_) => false,
+    };
     let boundary: Vec<(&str, u32)> = leaves
         .iter()
-        .filter(|leaf| matches!(leaf.callee, LeafCallee::Sibling { .. }))
+        .filter(|leaf| sibling_asked(leaf))
         .map(|leaf| (leaf.file.as_str(), leaf.line))
         .collect();
     let ends: HashMap<DefinitionSite, u32> = definitions
@@ -629,7 +639,7 @@ pub(crate) fn leaf_candidates<'a>(
     leaves
         .iter()
         .filter(|leaf| match &leaf.callee {
-            LeafCallee::Sibling { .. } => true,
+            LeafCallee::Sibling { .. } => sibling_asked(leaf),
             LeafCallee::Own(callee) => ends.get(callee).is_some_and(|end| {
                 boundary
                     .iter()
@@ -3910,12 +3920,16 @@ mod tests {
             own_leaf(5, definition("web/b.ts", 1)),
             own_leaf(6, definition("web/b.ts", 11)),
         ];
-        let asked = leaf_candidates(&leaves, &definitions, "/repo");
+        let asked = leaf_candidates(&leaves, &definitions, "/repo", &|file| file == "lib/q.ts");
         assert_eq!(
             asked.iter().map(|leaf| leaf.line).collect::<Vec<_>>(),
             [3, 5],
             "the boundary call and the call of the function that holds it"
         );
+        // No service of the run owns the function called: nothing is asked,
+        // at the call or at the calls of the function that holds it.
+        let asked = leaf_candidates(&leaves, &definitions, "/repo", &|_| false);
+        assert!(asked.is_empty(), "{asked:?}");
     }
 
     fn put_in(

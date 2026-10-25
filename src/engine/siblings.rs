@@ -93,6 +93,16 @@ pub(super) struct Neighbours<'a> {
 }
 
 impl Neighbours<'_> {
+    /// Whether a service of the run other than this one owns `file` (an
+    /// absolute path under the run's repository). A call into a function
+    /// nothing in the run owns reaches no sibling's request.
+    pub(super) fn owned_elsewhere(&self, file: &Path) -> bool {
+        self.registry
+            .owners()
+            .get(file)
+            .is_some_and(|owner| *owner != self.own)
+    }
+
     /// The siblings the service whose read is `inputs` may walk into.
     pub(super) fn reached(&self, inputs: &RequestSummaryInputs) -> Siblings {
         // Nothing reads a walk into a sibling unless the site questions run.

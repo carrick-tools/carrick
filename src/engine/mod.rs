@@ -4357,6 +4357,11 @@ async fn analyze_current_repo_incremental(
                     &leaves,
                     &cloud_data.function_definitions,
                     repo_path,
+                    &|file| {
+                        neighbours.is_some_and(|run| {
+                            run.owned_elsewhere(&Path::new(repo_path).join(file))
+                        })
+                    },
                 ),
                 repo_path,
             ));
@@ -4503,6 +4508,7 @@ async fn analyze_current_repo_incremental(
         run_intents,
         graphql_schemas,
         &siblings,
+        neighbours,
     )
     .await?;
 
@@ -11177,6 +11183,7 @@ async fn analyze_current_repo(
     run_intents: &RunIntentMemo,
     graphql_schemas: &crate::graphql::SchemaCatalogue,
     siblings: &siblings::Siblings,
+    neighbours: Option<siblings::Neighbours<'_>>,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
@@ -11563,7 +11570,14 @@ async fn analyze_current_repo(
     );
     protocol_infer.extend(append_leaf_capture(
         &mut cloud_data.type_manifest,
-        &crate::call_through::leaf_candidates(&leaves, &cloud_data.function_definitions, repo_path),
+        &crate::call_through::leaf_candidates(
+            &leaves,
+            &cloud_data.function_definitions,
+            repo_path,
+            &|file| {
+                neighbours.is_some_and(|run| run.owned_elsewhere(&Path::new(repo_path).join(file)))
+            },
+        ),
         repo_path,
     ));
 
