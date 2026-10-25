@@ -3301,6 +3301,47 @@ impl FileOrchestrator {
                 );
                 pf.list(sites.candidates);
             }
+            for pf in &pending {
+                let shorts: BTreeSet<(u32, u32)> = facts
+                    .calls
+                    .range(
+                        (pf.prompt_path.clone(), 0, 0)
+                            ..(pf.prompt_path.clone(), u32::MAX, u32::MAX),
+                    )
+                    .filter(|(_, followed)| followed.short())
+                    .map(|((_, lo, hi), _)| (*lo, *hi))
+                    .filter(|span| {
+                        !pf.listed
+                            .iter()
+                            .any(|listed| (listed.span_start, listed.span_end) == *span)
+                    })
+                    .collect();
+                if shorts.is_empty() {
+                    continue;
+                }
+                let made: BTreeSet<(u32, u32)> = self
+                    .swc_scanner
+                    .scan_sites(Path::new(&pf.path_str), &pf.content, &shorts)
+                    .candidates
+                    .iter()
+                    .map(|c| (c.span_start, c.span_end))
+                    .collect();
+                for span in &shorts {
+                    debug!(
+                        "DIAG2813B {} {}-{} {:?} {} cand={}",
+                        pf.prompt_path,
+                        span.0,
+                        span.1,
+                        facts.followed(&pf.prompt_path, *span),
+                        facts
+                            .diag
+                            .get(&(pf.prompt_path.clone(), span.0, span.1))
+                            .cloned()
+                            .unwrap_or_else(|| "top".to_string()),
+                        made.contains(span)
+                    );
+                }
+            }
             // Rules 2-4: a file no signal raised a candidate in is read when
             // the fact layer found a site, a lead or an unanswered-package
             // call in it, with those calls listed.

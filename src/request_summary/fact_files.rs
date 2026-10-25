@@ -99,6 +99,7 @@ pub struct FactFiles {
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
     pub ask_failed: bool,
+    pub diag: BTreeMap<(String, u32, u32), String>,
 }
 
 /// Whether a call reaching an export of `role` is listed for the HTTP
@@ -130,6 +131,19 @@ impl FactFiles {
                 (None, Some(stop)) => Followed::Stopped(stop.clone()),
                 (None, None) => continue,
             };
+            if site.end.is_none() {
+                facts.diag.insert(
+                    (site.file.clone(), site.span_start, site.span_end),
+                    format!(
+                        "chain={} last={}",
+                        site.chain.len(),
+                        site.chain
+                            .last()
+                            .map(|h| h.file.clone())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
             facts.record(&site.file, (site.span_start, site.span_end), followed);
             if let Some(end) = &site.end {
                 if end.role == LibraryRole::GraphqlClient {
@@ -155,6 +169,10 @@ impl FactFiles {
             );
         }
         for missed in &discovery.missed_inside {
+            facts.diag.insert(
+                (missed.file.clone(), missed.span_start, missed.span_end),
+                format!("inner={}", missed.reason),
+            );
             facts.record(
                 &missed.file,
                 (missed.span_start, missed.span_end),
