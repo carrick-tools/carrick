@@ -34,7 +34,9 @@ pub const SCHEMA: &str = "carrick.check-changed/0";
 /// finish. A ceiling, not the target: a typical branch is meant to finish in
 /// well under half of it. Overridable so a test can force the miss.
 pub const BUDGET_ENV: &str = "CARRICK_CHECK_BUDGET_MS";
-const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
+// Five minutes: a 35-service monorepo measured 148 s on a release build
+// (carrick#2826), and a check that stops short answers nothing.
+const DEFAULT_BUDGET: Duration = Duration::from_secs(300);
 
 /// One answer of `check --changed`.
 #[derive(Serialize, Debug, Clone)]
@@ -102,6 +104,13 @@ pub struct Problem {
     /// `fact`, `candidate` or `not_stated`: whether the rows behind this are
     /// ones the source states.
     pub source: String,
+    /// The index held this problem before the change began: same file, same
+    /// operation. Printed, and never fails the run.
+    pub already_indexed: bool,
+    /// A call whose base is set at run time, so the check cannot tell a
+    /// service of this workspace from an outside API. Printed, and never
+    /// fails the run.
+    pub unconfirmed: bool,
     pub fails: bool,
 }
 
@@ -338,9 +347,19 @@ fn judge(
         // reached or needs none: the rule the cloud enforces on (cloud#599).
         // A verdict drawn from an edge with no finding behind it states no
         // source, so it is reported and does not fail the run.
-        let fails = finding.is_some_and(|finding| {
+        let fact = finding.is_some_and(|finding| {
             finding.edge_source.as_deref() == Some("fact")
                 && finding.verdict_state.as_deref() != Some("unresolved")
+        });
+        // Not this work's when the index already held the same row of this
+        // file with a mismatch: it was there before the change began.
+        let already = indexed_rows(before, repo, &operation.file).any(|old| {
+            old.key == operation.key
+                && old
+                    .verdict
+                    .as_ref()
+                    .and_then(|verdict| verdict.result.as_deref())
+                    .is_some_and(|result| matches!(result, "type_mismatch" | "method_mismatch"))
         });
         let named: Vec<&String> = finding
             .map(|f| f.call_sites.iter().collect())
@@ -374,7 +393,9 @@ fn judge(
             source: finding
                 .and_then(|finding| finding.edge_source.clone())
                 .unwrap_or_else(|| "not_stated".to_string()),
-            fails,
+            already_indexed: already,
+            unconfirmed: false,
+            fails: fact && !already,
         });
     }
 
@@ -393,6 +414,21 @@ fn judge(
                     continue;
                 }
                 let source = Source::of(operation.resolution_source);
+                // Already unmatched in the index: the same call in the same
+                // file had no producer before the change began. Its line may
+                // have moved, so the key and the file decide.
+                let already = indexed_rows(before, repo, &file).any(|old| {
+                    old.kind == super::read_model::ItemKind::Call
+                        && old.key == operation.key
+                        && old.counterparts.is_empty()
+                });
+                // A base set at run time could be one of this workspace's
+                // services or an outside API, and the scanner sees only the
+                // expression: printed, never failing, new or not. Unless the
+                // index matched this call: a workspace route served it, so
+                // the base is the workspace's and losing it is a fact.
+                let unconfirmed = unmatched.injected.iter().any(|at| at == site)
+                    && !was_matched(before, repo, operation);
                 judged.problems.push(Problem {
                     kind: ProblemKind::NoRoute,
                     file: shown(root, repo_path, &file),
@@ -407,7 +443,9 @@ fn judge(
                         "the index matched this call, and no service serves it now".to_string()
                     },
                     source: source.as_str().to_string(),
-                    fails: source == Source::Fact,
+                    already_indexed: already,
+                    unconfirmed,
+                    fails: source == Source::Fact && !already && !unconfirmed,
                 });
             }
         }
@@ -415,6 +453,21 @@ fn judge(
     judged.problems.sort();
     judged.problems.dedup();
     judged
+}
+
+/// The rows the index, before this pass, held for one file of one repo.
+fn indexed_rows<'a>(
+    before: &'a LocalIndex,
+    repo: &str,
+    file: &str,
+) -> impl Iterator<Item = &'a IndexedItem> {
+    before
+        .repos
+        .iter()
+        .find(|indexed| indexed.name == repo)
+        .and_then(|indexed| indexed.files.get(file))
+        .into_iter()
+        .flatten()
 }
 
 /// Whether the index, before this pass, matched this call to a producer.
@@ -479,7 +532,7 @@ impl ChangedOutput {
         let advisory = self.problems.len() - self.failing;
         if advisory > 0 {
             out.push_str(&format!(
-                " ({advisory} of them rest on rows that are not facts and do not fail the check)"
+                " ({advisory} of them do not fail the check: already in the index, unconfirmed, or not resting on facts)"
             ));
         }
         out.push('\n');
@@ -499,6 +552,10 @@ impl ChangedOutput {
             };
             let note = match (problem.fails, problem.source.as_str()) {
                 (true, _) => "",
+                _ if problem.already_indexed => " [already in the index, does not fail]",
+                _ if problem.unconfirmed => {
+                    " [unconfirmed: the base is set at run time, does not fail]"
+                }
                 (false, "candidate") => " [model candidate, does not fail]",
                 (false, _) => " [source not stated, does not fail]",
             };
@@ -535,6 +592,8 @@ mod tests {
             other: Vec::new(),
             reason: "no service in this workspace serves it".to_string(),
             source: if fails { "fact" } else { "candidate" }.to_string(),
+            already_indexed: false,
+            unconfirmed: false,
             fails,
         }
     }
@@ -559,8 +618,8 @@ mod tests {
         assert_eq!(
             first,
             "carrick check: checked 1 route and 2 calls in 3 changed files against 2 services: \
-             1 incompatible, 1 reaches no route (1 of them rest on rows that are not facts and \
-             do not fail the check)"
+             1 incompatible, 1 reaches no route (1 of them do not fail the check: already in \
+             the index, unconfirmed, or not resting on facts)"
         );
         assert!(text.contains("web/src/a.ts:4  no route  call GET /a: no service"));
         assert!(text.contains("[model candidate, does not fail]"));

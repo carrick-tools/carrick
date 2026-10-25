@@ -2454,14 +2454,21 @@ fn commit_all(repo: &Path, message: &str) {
     );
 }
 
+/// Where a test's new call sends its request: a bare path, which goes to the
+/// origin the client already holds, or a base set at run time.
+const RELATIVE: &str = "";
+const INJECTED: &str = "${this.baseUrl}";
+
 /// The consumer gains a member that calls a route no service serves, and a
 /// caller that makes it a member the repo uses.
-fn add_a_call_to_no_route(root: &Path) {
+fn add_a_call_to_no_route(root: &Path, base: &str) {
     let client = root.join("inventory-svc/src/client.ts");
     edit(
         &client,
         "  readWidget(widgetId: string)",
-        "  readGadget(gadgetId: string): Promise<Widget> {\n    return send<Widget>(`${this.baseUrl}/api/v1/gadgets/${gadgetId}`, {\n      method: \"GET\",\n    });\n  }\n\n  readWidget(widgetId: string)",
+        &format!(
+            "  readGadget(gadgetId: string): Promise<Widget> {{\n    return send<Widget>(`{base}/api/v1/gadgets/${{gadgetId}}`, {{\n      method: \"GET\",\n    }});\n  }}\n\n  readWidget(widgetId: string)"
+        ),
     );
     let caller = root.join("inventory-svc/src/inventory.ts");
     let mut text = std::fs::read_to_string(&caller).expect("read the caller");
@@ -2515,13 +2522,14 @@ fn check_changed_fails_when_a_changed_handler_drops_a_field_a_consumer_reads() {
 }
 
 /// A new call, uncommitted, to a route no service in the workspace serves.
+/// Its path is bare, so it goes to the origin the client already talks to.
 #[test]
 #[serial]
 fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
     index(root);
-    add_a_call_to_no_route(root);
+    add_a_call_to_no_route(root, RELATIVE);
 
     let (code, text) = check_changed(root, false);
     let problem = text
@@ -2541,6 +2549,63 @@ fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// The same new call through a base set at run time: it could be a service
+/// of this workspace or an outside API, so it is printed as unconfirmed and
+/// does not fail the run.
+#[test]
+#[serial]
+fn check_changed_prints_a_new_call_through_a_runtime_base_as_unconfirmed() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, INJECTED);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the new call is still printed:\n{text}"));
+    assert!(
+        problem.contains("[unconfirmed: the base is set at run time, does not fail]"),
+        "as unconfirmed:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// A call the index already held with no route, in a file the work touched,
+/// is printed and was there before the work: it does not fail the run.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    add_a_call_to_no_route(root, RELATIVE);
+    let consumer = root.join("inventory-svc");
+    commit_all(&consumer, "a call to no route, on main");
+    index(root);
+    git(&consumer, &["checkout", "-qb", "feature"]);
+    edit(
+        &consumer.join("src/client.ts"),
+        "import { send }",
+        "// The catalog's client.\nimport { send }",
+    );
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the old call is printed:\n{text}"));
+    assert!(
+        problem.contains("[already in the index, does not fail]"),
+        "as one the index held:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
 /// A problem that was already on main, in a file the work did not touch, is
 /// not this work's: only the changed file is reported and counted.
 #[test]
@@ -2549,7 +2614,7 @@ fn check_changed_does_not_re_check_a_file_the_work_did_not_touch() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
     // The unmatched call is committed on main before the index is built.
-    add_a_call_to_no_route(root);
+    add_a_call_to_no_route(root, RELATIVE);
     commit_all(&root.join("inventory-svc"), "a call to no route, on main");
     index(root);
 
@@ -2593,4 +2658,67 @@ fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route(
         "the consumer the deletion broke is named:\n{text}"
     );
     assert_eq!(code, Some(1), "{text}");
+}
+
+/// The two fixture repos as two services of one monorepo, committed and
+/// listed as the workspace's one repo.
+fn monorepo_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = repo_root().join("tests/fixtures/local-mode-workspace");
+    let mono = dir.path().join("mono");
+    for service in ["catalog-web", "inventory-svc"] {
+        copy_tree(&source.join(service), &mono.join(service));
+    }
+    std::fs::write(
+        mono.join("carrick.json"),
+        r#"{ "services": [
+  { "name": "catalog-web", "directory": "catalog-web" },
+  { "name": "inventory-svc", "directory": "inventory-svc" }
+] }
+"#,
+    )
+    .expect("write carrick.json");
+    git(&mono, &["init", "-q", "."]);
+    commit_all(&mono, "fixture");
+    std::fs::write(
+        dir.path().join("carrick-workspace.json"),
+        "{ \"repos\": [\"./mono\"] }\n",
+    )
+    .expect("write the workspace file");
+    dir
+}
+
+/// carrick#2826: only the services that own a changed file are re-extracted;
+/// every other service of the same repo stands in from the index, and is
+/// still judged against. Which service is carried is the change scope's
+/// decision, unit-tested in `change_scope` (a run that asks no model carries
+/// a service whose stored blob owes only model work); this proves the carried
+/// consumer still reaches the join and fails the run as a fact.
+#[test]
+#[serial]
+fn check_changed_re_extracts_only_the_services_that_own_a_changed_file() {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    index(root);
+    let route = root.join("mono/catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+
+    let (code, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert!(
+        json["problems"]
+            .as_array()
+            .is_some_and(|problems| problems.iter().any(|p| {
+                p["kind"] == "incompatible"
+                    && p["other"].as_array().is_some_and(|other| {
+                        other
+                            .iter()
+                            .any(|o| o == "inventory-svc inventory-svc/src/client.ts:14")
+                    })
+                    && p["fails"] == true
+            })),
+        "the carried consumer is still judged against, as a fact:\n{json:#}"
+    );
+    assert_eq!(code, Some(1), "{json:#}");
 }

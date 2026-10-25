@@ -401,6 +401,12 @@ fn owed_work(stored: &CloudRepoData, this_run: ThisRun<'_>) -> Option<String> {
     {
         return Some("the stored index was written without its extraction config".to_string());
     }
+    // What remains is model work: files and candidates no model answered. A
+    // run that asks no model would leave the same owed, so it is no reason to
+    // analyse the service again (`check --changed`, carrick#2826).
+    if !this_run.asks_model {
+        return None;
+    }
     let boundary = stored.boundary.as_ref()?;
     // A file whose answer was final is lost the same way by every scan of
     // its bytes, so it is not owed (carrick#2488): a changed file is
@@ -1240,6 +1246,26 @@ mod tests {
         };
         let carried = decide(
             Some(&wrapped),
+            no_model,
+            Some("{\"serviceName\":\"api\"}"),
+            Ok(&changes),
+            |_| false,
+            api_inputs,
+        );
+        assert_eq!(reason(&carried), None);
+        // Candidates no model answered are owed to a run that asks one; a
+        // run that asks none would owe them too (carrick#2826).
+        let mut awaiting = stored("abcdef1234");
+        awaiting.boundary = Some(crate::boundary::ServiceBoundary {
+            candidates_awaiting_model: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(
+            reason(&decide_with(Some(&awaiting), Ok(&changes), api_inputs())),
+            Some(Reason::StoredIncomplete)
+        );
+        let carried = decide(
+            Some(&awaiting),
             no_model,
             Some("{\"serviceName\":\"api\"}"),
             Ok(&changes),

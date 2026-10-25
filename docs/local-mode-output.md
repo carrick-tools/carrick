@@ -466,10 +466,12 @@ Implemented in `src/local_mode/changed.rs`. Takes no file. For each repo of
 the workspace it finds the merge base of `HEAD` and the main branch
 (`origin/HEAD`, else `origin/main`, `origin/master`, `main`, `master`), and
 checks every source file the scan reads that differs from it: committed on the
-branch, uncommitted, or untracked. Each repo with such a file is re-scanned
-once over its working tree, with no model and nothing on the wire, and one join
-runs over those blobs and every blob the index already holds — the same two
-phases as `check --recheck`, once for all files. Untouched files are
+branch, uncommitted, or untracked. Each repo with such a file is scanned once
+with `--changed-only`, with no model and nothing on the wire: only the services
+whose inputs changed are re-extracted, and every other service is carried from
+the blob the index holds for it (carrick#2826). One join then runs over those
+blobs and every blob the index already holds — the same two phases as
+`check --recheck`, once for all files. Untouched files are
 re-extracted with their repo but not reported, except a call the index matched
 that now reaches no route (the work removed or moved its route).
 
@@ -484,17 +486,25 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 `--json` prints `carrick.check-changed/0`: `files`, `routes`, `calls`,
 `services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
-`method`, `path`, `other`, `reason`, `source`, `fails`), `failing`,
+`method`, `path`, `other`, `reason`, `source`, `already_indexed`,
+`unconfirmed`, `fails`), `failing`,
 `elapsed_ms`, and `not_checked` when nothing could be checked.
 
 **Exit code.** The one read a verdict moves: 1 when any problem `fails`, else
 0. An incompatible pair fails when its finding's edge source is `fact` and its
 verdict state is not `unresolved` (the cloud's enforcement rule, cloud#599); a
-call that reaches no route fails when its row is a fact. A problem resting on a
+call that reaches no route fails when its row is a fact. Either one fails only
+when it is new since the index: the same operation in the same file did not
+already carry it (`already_indexed`), so a file the work touched never fails
+on what was there before. A call whose base is set at run time (an injected
+base: a parameter, a field, a config value that reads no environment variable)
+is `unconfirmed` and never fails, because the check cannot tell a service of
+this workspace from an outside API there; the exception is a call the index
+matched to a workspace route, whose loss is a fact. A problem resting on a
 model candidate, or on rows that state no source, is printed and exits 0. A
 check that could not run (no index, no main branch, budget spent) says why on
 its summary line and exits 0, so a test run never fails on a missing index.
-The budget is two minutes, `CARRICK_CHECK_BUDGET_MS`.
+The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
 
 ## `carrick status` — the workspace, with no file in the question
 

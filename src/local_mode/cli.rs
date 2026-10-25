@@ -1834,10 +1834,12 @@ USAGE:
                each repo's main branch (committed on the branch, uncommitted
                and untracked), re-extracted in one pass, and prints one
                summary line plus one line per problem. It exits 1 only when a
-               problem is a fact (an incompatible pair, or a call that reaches
-               no route); one resting on a model candidate is printed and
-               exits 0, as does a check that could not run. Two minutes at
-               most (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
+               problem is a fact and new since the index (an incompatible
+               pair, or a call that reaches no route); one that was already
+               in the index, rests on a model candidate, or calls through a
+               base set at run time is printed and exits 0, as does a check
+               that could not run. Five minutes at most
+               (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
     refresh    Re-scan one service (or every repo) and re-join.
 
 On macOS, index, resume and refresh keep this machine from idle-sleeping until

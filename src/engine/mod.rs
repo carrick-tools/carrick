@@ -955,7 +955,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         let (analyzer, type_check) =
             build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
         let results = analyzer.get_results();
-        crate::local_mode::LocalJoin::from_results(&results, type_check).write(&out_path)?;
+        crate::local_mode::LocalJoin::from_results(&results, type_check, &analyzer.call_bases())
+            .write(&out_path)?;
         logging::finish_spinner(
             &sp,
             &format!(

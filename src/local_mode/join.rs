@@ -120,6 +120,9 @@ pub struct JoinedUnmatched {
     pub path: String,
     /// `"file:line"` of each call site, repo-relative.
     pub call_sites: Vec<String>,
+    /// Those of `call_sites` whose base is set at run time
+    /// ([`crate::call_base::CallBaseKind::Injected`]).
+    pub injected: Vec<String>,
 }
 
 /// Everything the join learned, in the shape the indexer reads it.
@@ -147,7 +150,22 @@ pub enum JoinTypeCheck {
 
 impl LocalJoin {
     /// Project a finished cross-repo analysis.
-    pub fn from_results(results: &ApiAnalysisResult, type_check: JoinTypeCheck) -> Self {
+    pub fn from_results(
+        results: &ApiAnalysisResult,
+        type_check: JoinTypeCheck,
+        call_bases: &std::collections::HashMap<
+            (String, String),
+            crate::call_base::CallBaseResolution,
+        >,
+    ) -> Self {
+        // The call sites whose base is set at run time (carrick#649's
+        // `injected`): the scanner sees the expression and not the value, so
+        // it cannot tell a service in this workspace from an outside API.
+        let injected: std::collections::BTreeSet<&str> = call_bases
+            .iter()
+            .filter(|(_, base)| base.kind == crate::call_base::CallBaseKind::Injected)
+            .map(|((_, location), _)| location.as_str())
+            .collect();
         let mut operations: Vec<JoinedOperation> = results
             .endpoints
             .iter()
@@ -233,6 +251,11 @@ impl LocalJoin {
                     method: method.clone(),
                     path: path.clone(),
                     call_sites: call_sites.clone(),
+                    injected: call_sites
+                        .iter()
+                        .filter(|site| injected.contains(site.as_str()))
+                        .cloned()
+                        .collect(),
                 }),
                 _ => None,
             })

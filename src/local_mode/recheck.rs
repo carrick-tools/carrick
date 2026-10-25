@@ -246,19 +246,34 @@ pub(super) fn rejoin(
         write_blob(&blobs.join(format!("hosted-{position}.json")), &blob)?;
     }
 
-    // Phase 1, one scan per repo. `previous_data` is what the last index held
-    // for that repo, so an unchanged file replays its hosted answers instead
-    // of losing them.
+    // Phase 1, one scan per repo, analysing only the services whose inputs
+    // changed (`--changed-only`, carrick#2826). `previous` is what the last
+    // index held for that repo: the hosted snapshot's copy of each service,
+    // and the local blob of every service the snapshot does not hold. It is
+    // what an unchanged file replays its hosted answers from, and what the
+    // change scope carries an untouched service from.
     let mut rescanned = Vec::new();
     for (position, repo) in repos.iter().enumerate() {
-        let previous_data = hosted.local_blobs(repo);
+        let name = repo_label(repo);
+        let mut previous_data = hosted.local_blobs(repo);
+        let hosted_ids: std::collections::BTreeSet<String> =
+            previous_data.iter().map(service_id).collect();
+        let local: Vec<&crate::cloud_storage::CloudRepoData> = indexed
+            .iter()
+            .filter(|blob| blob.repo_name == name)
+            .collect();
+        previous_data.extend(
+            local
+                .iter()
+                .filter(|blob| !hosted_ids.contains(&service_id(blob)))
+                .map(|blob| (*blob).clone()),
+        );
         let previous = generation.join(format!("previous-{position}.json"));
         std::fs::write(
             &previous,
             serde_json::to_vec(&previous_data).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        indexed.extend(previous_data);
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = scan_command(
             &exe,
@@ -268,17 +283,30 @@ pub(super) fn rejoin(
             None,
             &super::index::Pass::Facts,
         );
-        scan.env(super::SKIP_SIGNATURES_ENV, "1")
+        scan.arg("--changed-only")
+            .env(super::SKIP_SIGNATURES_ENV, "1")
             .env_remove(crate::progress::PROGRESS_ENV);
         bounded(scan, "re-scan", deadline)?;
-        for (offset, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
-            services.insert(service_id(&blob));
-            write_blob(
-                &blobs.join(format!("local-{position}-{offset}.json")),
-                &blob,
-            )?;
-            rescanned.push(blob);
+        let mut fresh = read_blobs(&scan_dir)?;
+        // A carried service is written by the scan only when the join moved
+        // something it holds, so every other one stands in from what the
+        // index already held for it.
+        let written: std::collections::BTreeSet<String> = fresh.iter().map(service_id).collect();
+        let carried: Vec<crate::cloud_storage::CloudRepoData> = previous_data
+            .iter()
+            .filter(|blob| !written.contains(&service_id(blob)))
+            .cloned()
+            .collect();
+        for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
+            services.insert(service_id(blob));
+            write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;
         }
+        rescanned.append(&mut fresh);
+        indexed.extend(
+            previous_data
+                .into_iter()
+                .filter(|blob| hosted_ids.contains(&service_id(blob))),
+        );
     }
 
     // Phase 2. The join reads the blobs back and runs the type check over
