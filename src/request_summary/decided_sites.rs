@@ -965,15 +965,22 @@ impl<'a> Calls<'a> {
             own: bool,
             target: &'s dyn Fn(&RequestSummaryInputs, &Path, &CallIr) -> Target,
         }
-        fn walk<'a>(
-            at: &Source<'_, 'a>,
+        /// The file a walk reads, with the definitions the extractor keyed in
+        /// it by where their function node starts.
+        struct InFile<'s, 'a> {
+            source: &'s Source<'s, 'a>,
             file: &'a Path,
+            by_start: &'s HashMap<u32, &'a str>,
+        }
+        fn walk<'a>(
+            in_file: &InFile<'_, 'a>,
             key: Option<&'a str>,
             depth: u8,
             ir: &'a FnIr,
             host: Option<&'a CallIr>,
             out: &mut Calls<'a>,
         ) {
+            let (at, file) = (in_file.source, in_file.file);
             let written_in = if depth == 0 {
                 None
             } else {
@@ -1007,10 +1014,25 @@ impl<'a> Calls<'a> {
                         .iter()
                         .any(|arg| matches!(arg, Value::Callback(at) if *at == index))
                 });
-                walk(at, file, key, depth.saturating_add(1), inner, host, out);
+                walk(in_file, key, depth.saturating_add(1), inner, host, out);
             }
             for inner in &ir.detached {
-                walk(at, file, key, depth.saturating_add(1), inner, None, out);
+                // A function module-level code writes outside any call that
+                // the extractor keys itself (a member of an exported object
+                // literal, `itemsApi.replace`, carrick#2793) is read under its
+                // own key, as a declaration is: its callers are the calls the
+                // call graph resolves to that key, and its parameters are its
+                // own. The chains key it the same way (`guards`,
+                // carrick#2386). A function handed to a call stays its
+                // caller's, whatever the extractor names it.
+                let own = (key.is_none() && depth == 0)
+                    .then(|| inner.site.as_ref())
+                    .flatten()
+                    .and_then(|site| in_file.by_start.get(&site.lo).copied());
+                match own {
+                    Some(own) => walk(in_file, Some(own), 0, inner, None, out),
+                    None => walk(in_file, key, depth.saturating_add(1), inner, None, out),
+                }
             }
         }
         let mut calls = Calls {
@@ -1035,12 +1057,21 @@ impl<'a> Calls<'a> {
             paths.sort();
             for path in paths {
                 let file = &source.files[path];
+                let by_start: HashMap<u32, &str> = file
+                    .definitions
+                    .iter()
+                    .filter_map(|(key, (start, _))| Some(((*start)?, key.as_str())))
+                    .collect();
+                let in_file = InFile {
+                    source: &at,
+                    file: path,
+                    by_start: &by_start,
+                };
                 let mut keys: Vec<&String> = file.functions.keys().collect();
                 keys.sort();
                 for key in keys {
                     walk(
-                        &at,
-                        path,
+                        &in_file,
                         Some(key.as_str()),
                         0,
                         &file.functions[key],
@@ -1048,7 +1079,7 @@ impl<'a> Calls<'a> {
                         &mut calls,
                     );
                 }
-                walk(&at, path, None, 0, &file.module_level, None, &mut calls);
+                walk(&in_file, None, 0, &file.module_level, None, &mut calls);
             }
         }
         calls
