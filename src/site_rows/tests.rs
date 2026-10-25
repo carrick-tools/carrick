@@ -1105,6 +1105,48 @@ fn agreement_reads_written_values_as_parameters() {
     ));
 }
 
+/// carrick#2704: where the caller's line holds a second call, a disagreeing
+/// reader row there may be that call's, so only the agreeing row folds.
+#[test]
+fn a_second_call_on_the_callers_line_keeps_its_row() {
+    let model = Some(ResolutionSource::Model);
+    let mut calls = vec![
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/client.ts",
+            12,
+            Some(ResolutionSource::RequestSummary),
+        ),
+        blob_row(
+            OperationKey::http("POST", "/api/login"),
+            "src/page.ts",
+            4,
+            model,
+        ),
+        blob_row(
+            OperationKey::http("GET", "/api/user"),
+            "src/page.ts",
+            4,
+            model,
+        ),
+    ];
+    let site = SiteRows {
+        enabled: true,
+        through: vec![Through {
+            file: "src/page.ts".to_string(),
+            line: 4,
+            site_file: "src/client.ts".to_string(),
+            site_line: 12,
+            other_call: true,
+        }],
+        ..SiteRows::default()
+    };
+    fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), make);
+    let left: Vec<String> = calls.iter().map(|row| format!("{:?}", row.key)).collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left[1].contains("/api/user"));
+}
+
 /// carrick#2614: a reader row at a call above a decided site folds onto the
 /// row standing at the site when the two agree. carrick#2704: it folds as
 /// well when it disagrees with a fact there, and stands when it disagrees
@@ -1116,6 +1158,7 @@ fn a_reader_row_above_a_decided_site_folds_onto_the_sites_row() {
         line,
         site_file: "src/client.ts".to_string(),
         site_line,
+        other_call: false,
     };
     let model = Some(ResolutionSource::Model);
     let mut calls = vec![

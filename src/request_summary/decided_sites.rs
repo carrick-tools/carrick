@@ -770,6 +770,10 @@ pub struct Through {
     pub line: u32,
     pub site_file: String,
     pub site_line: u32,
+    /// The caller's line holds a call besides the through call and the calls
+    /// written around it (carrick#2704): a reader row there may be that
+    /// other call's, so a disagreeing one is not folded.
+    pub other_call: bool,
 }
 
 /// The [`Through`] from `chain[0]` to the site at `chain[to]`, when `to` is
@@ -798,6 +802,7 @@ fn through(
         line: chain[0].call.site.line,
         site_file: relative(root, chain[to].file),
         site_line: chain[to].call.site.line,
+        other_call: false,
     })
 }
 
@@ -829,7 +834,8 @@ fn callers_above(
             continue;
         }
         for caller in calls.callers_of(placed.file, key) {
-            if let Some(through) = through(inputs, root, &[*caller, placed], 1) {
+            if let Some(mut through) = through(inputs, root, &[*caller, placed], 1) {
+                through.other_call = calls.other_call_on_line(caller);
                 out.push(through);
             }
         }
@@ -969,6 +975,18 @@ impl<'a> Calls<'a> {
 
     fn at_span(&self, file: &Path, span_start: u32, span_end: u32) -> Option<Placed<'a>> {
         self.by_span.get(&(file, span_start, span_end)).copied()
+    }
+
+    /// Whether a call besides `placed` and the calls written around it sits
+    /// on `placed`'s line in its file.
+    fn other_call_on_line(&self, placed: &Placed<'a>) -> bool {
+        let (start, end) = (placed.call.site.span_start, placed.call.site.span_end);
+        self.by_span.values().any(|other| {
+            other.file == placed.file
+                && other.call.site.line == placed.call.site.line
+                && (other.call.site.span_start, other.call.site.span_end) != (start, end)
+                && !(other.call.site.span_start <= start && end <= other.call.site.span_end)
+        })
     }
 
     fn target(&self, placed: &Placed<'a>) -> Option<&(PathBuf, String)> {

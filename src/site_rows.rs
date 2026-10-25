@@ -963,7 +963,9 @@ pub fn fold_rows(
             })
             .collect();
         let keys: Vec<OperationKey> = stated.iter().map(|row| row.key.clone()).collect();
+        // A second call on the caller's line may be the reader row's own.
         let one_fact = !stated.is_empty()
+            && !throughs.iter().any(|through| through.other_call)
             && stated.iter().all(|row| is_fact(row))
             && keys.iter().all(|key| *key == keys[0]);
         let folds = |row: &ApiEndpointDetails| {
