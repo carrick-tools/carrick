@@ -142,14 +142,34 @@ const SCAFFOLD_CONFIG: &str = "carrick.json";
 /// to write it: the root of the repo it scanned. Paths are matched at the top
 /// level and at that prefix, and `.carrick/` anywhere, which is the ignored
 /// directory `carrick init` and `carrick index` write.
+///
+/// And only a change to a file a scan reads (carrick#2826, David's ruling
+/// 2026-10-25): a source file the walk collects, a repo input, or a
+/// TypeScript or JavaScript config. A tree whose only changes are an editor's
+/// settings, a README or a workflow holds what the commit holds for every
+/// file the index was read from, so its blob is clean and a later
+/// `--changed-only` run can carry it. The same filter `carrick status` counts
+/// drift by (carrick#1007 item 5), plus the repo inputs and configs a scan
+/// also reads.
 fn carries_changes_beyond_the_scaffold(porcelain: &str, prefix: &str) -> bool {
     porcelain
         .split('\0')
         .filter(|entry| entry.len() > 3)
         .any(|entry| {
             let (status, path) = entry.split_at(3);
-            !is_scaffold_change(status.trim_end(), path, prefix)
+            !is_scaffold_change(status.trim_end(), path, prefix) && a_scan_reads(path)
         })
+}
+
+/// Whether a scan reads the file at `path`, top-relative: a source file the
+/// walk collects, a repo input every service reads
+/// ([`crate::change_scope::is_repo_input`]), or a `tsconfig`/`jsconfig`.
+fn a_scan_reads(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    crate::file_finder::is_scanned_source(Path::new(path), Path::new(""))
+        || crate::change_scope::is_repo_input(path)
+        || ((name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && (name.ends_with(".json") || name.ends_with(".jsonc")))
 }
 
 fn is_scaffold_change(status: &str, path: &str, prefix: &str) -> bool {
@@ -948,15 +968,56 @@ pub(crate) mod tests {
         // No remote in this repository, so the comparison cannot be made.
         assert_eq!(clean.at_origin_main, None);
 
+        // carrick#2826: a file no scan reads leaves the tree clean.
         std::fs::write(dir.join("a.txt"), "two").unwrap();
-        assert!(inspect(&dir.to_string_lossy()).dirty);
-
-        // An untracked file is a change the commit does not describe, so it
-        // counts: its analysis would be cached against a commit it is not in.
-        git_in(dir, &["checkout", "-q", "--", "a.txt"]);
         assert!(!inspect(&dir.to_string_lossy()).dirty);
-        std::fs::write(dir.join("b.txt"), "new").unwrap();
+        git_in(dir, &["checkout", "-q", "--", "a.txt"]);
+
+        // A source file does not, edited or new.
+        std::fs::write(dir.join("b.ts"), "export {};\n").unwrap();
         assert!(inspect(&dir.to_string_lossy()).dirty);
+        git_in(dir, &["add", "b.ts"]);
+        git_in(
+            dir,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "b",
+            ],
+        );
+        assert!(!inspect(&dir.to_string_lossy()).dirty);
+        std::fs::write(dir.join("b.ts"), "export const b = 1;\n").unwrap();
+        assert!(inspect(&dir.to_string_lossy()).dirty);
+    }
+
+    /// carrick#2826: dirty means a change to a file a scan reads. A test file,
+    /// a README or an editor's settings is no such change; a manifest, a
+    /// lockfile or a tsconfig is.
+    #[test]
+    fn only_a_change_to_a_file_a_scan_reads_is_dirty() {
+        let (repo, _head) = committed_repo(&[("src/a.ts", "export {};\n")]);
+        let dir = repo.path();
+        let root = dir.to_string_lossy().into_owned();
+        for file in [
+            "README.md",
+            ".vscode/settings.json",
+            "src/a.test.ts",
+            "docs/x.json",
+        ] {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        assert!(!inspect(&root).dirty, "nothing a scan reads changed");
+        for file in ["package.json", "pnpm-lock.yaml", "tsconfig.base.json"] {
+            std::fs::write(dir.join(file), "{}").unwrap();
+            assert!(inspect(&root).dirty, "{file} is read by a scan");
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
     }
 
     /// What changed since a commit is listed from the top level whatever
@@ -1107,7 +1168,7 @@ pub(crate) mod tests {
 
     /// An edit to a committed `carrick.json` changes what the scan reads, so
     /// it is a change; an untracked file that merely shares a scaffold name
-    /// somewhere else is too.
+    /// somewhere else is one only when a scan reads it.
     #[test]
     fn an_edited_committed_config_and_a_lookalike_path_still_count() {
         let (repo, _head) = committed_repo(&[
@@ -1125,12 +1186,14 @@ pub(crate) mod tests {
         assert!(inspect(&root).dirty, "an edited committed carrick.json");
         git_in(dir, &["checkout", "-q", "--", "carrick.json"]);
 
+        // carrick#2826: a lookalike no scan reads is no change either way;
+        // a lookalike that is source is.
         std::fs::create_dir_all(dir.join("docs")).unwrap();
         std::fs::write(dir.join("docs").join("CLAUDE.md"), "x").unwrap();
-        assert!(
-            inspect(&root).dirty,
-            "a CLAUDE.md that is not the scaffold's"
-        );
+        assert!(!inspect(&root).dirty, "a CLAUDE.md is not read by a scan");
+        std::fs::create_dir_all(dir.join("sub/.claude")).unwrap();
+        std::fs::write(dir.join("sub/.claude/settings.ts"), "export {};\n").unwrap();
+        assert!(inspect(&root).dirty, "a source file under any name is read");
     }
 
     /// A scan root below the top level: git names the scaffold from the top
