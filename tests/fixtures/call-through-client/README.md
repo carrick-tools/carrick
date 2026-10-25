@@ -174,4 +174,19 @@ the pass states are `hooks.ts` lines 9, 14, 19 and 24 and `commands.ts`
 lines 145, 151, 157 and 171; `commands.ts` lines 76, 82 and 94 stay empty, for
 the reasons in the table above.
 
+A method called on a call's value (carrick#2822, #2823) is followed only
+through the compiler's `call` rows, so these rows are asserted on a scan with
+`CARRICK_POSITION_ROWS=1`:
+
+- `packages/cli/src/inline-commands.ts:9` (`getClient().getRun(id)`) and `:13`
+  (`createClient().getStatus()`): the model's path is made from names; each
+  row takes the request the client method sends.
+- `inline-commands.ts:22`: a command table's `run:` calls `showToken`, whose
+  body is `createClient().getToken()`; the row takes `GET /api/v1/token`.
+- `apps/web/src/inline-hooks.ts:6`: a hook's one callback calls
+  `createApi().status()` on the app's own client (`apps/web/src/api.ts`); the
+  row takes `GET /api/v1/status`.
+
+Without the rows these four stay as the model stated them.
+
 Driven by `tests/call_through_rows_test.rs`.

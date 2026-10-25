@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "model:6",
+      "line_number": 6,
+      "target": "/api/v1/use-status",
+      "method": "GET",
+      "pattern_matched": "useQuery(",
+      "call_expression_text": "useQuery({ queryKey: [\"status\"], queryFn: () => createApi().status() })",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

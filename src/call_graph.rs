@@ -539,8 +539,12 @@ pub fn add_row_edges(
         for caller_key in callers {
             let mut edges: Vec<FunctionCallRef> = Vec::new();
             for callee in &index.callees[caller_key] {
-                if !matches!(callee.shape, CalleeShape::Member(_))
-                    || !callee.receiver.call_bound
+                let compiler_only = match callee.shape {
+                    CalleeShape::Member(_) => callee.receiver.call_bound,
+                    CalleeShape::CallResult => true,
+                    _ => false,
+                };
+                if !compiler_only
                     || callee.span.is_dummy()
                     || sites
                         .target_at(&index.path, callee.span.lo.0, callee.span.hi.0)
@@ -1082,6 +1086,8 @@ impl<'a> CallResolver<'a> {
                 self.resolve_class_member(index, &declared, &callee.name)
             }
             CalleeShape::Member(_) => self.resolve_member(index, callee),
+            // What the inner call returns is the compiler's to say.
+            CalleeShape::CallResult => None,
         }
     }
 

@@ -1,0 +1,46 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "model:9",
+      "line_number": 9,
+      "target": "/inspect-run/${id}",
+      "method": "GET",
+      "pattern_matched": "getClient().getRun(",
+      "call_expression_text": "getClient().getRun(id)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:13",
+      "line_number": 13,
+      "target": "/getStatus",
+      "method": "GET",
+      "pattern_matched": "createClient().getStatus(",
+      "call_expression_text": "createClient().getStatus()",
+      "call_expression_line": 13,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:22",
+      "line_number": 22,
+      "target": "/token/show",
+      "method": "GET",
+      "pattern_matched": "showToken(",
+      "call_expression_text": "showToken()",
+      "call_expression_line": 22,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

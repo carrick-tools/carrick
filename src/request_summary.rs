@@ -212,7 +212,7 @@ mod row_links;
 // The definition each call reaches, read from the compiler's per-position
 // rows when the run walks them (carrick#2413 slice D).
 mod row_calls;
-pub(crate) use row_calls::CallIntoFile;
+pub(crate) use row_calls::{CallIntoFile, Reach as CallReach};
 
 // What binding the rows costs, and the budget that bounds it (carrick#2564).
 mod rows_join;

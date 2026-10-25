@@ -56,7 +56,7 @@ use crate::graphql_document_sites::unwrap_expression;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
 use crate::parser::{parse_file, parse_source};
-use crate::request_summary::RequestSummaryInputs;
+use crate::request_summary::{CallReach, RequestSummaryInputs};
 use crate::return_flow::ShapeKind;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::normalize_manifest_method;
@@ -306,7 +306,8 @@ pub fn read_sites(
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
     let (side_calls, return_shapes) = read_function_facts(file_results, inputs, root, definitions);
-    let leaves = read_leaves(inputs, root, definitions);
+    let lines = definition_lines(definitions, root);
+    let leaves = read_leaves(inputs, root, &lines);
     let mut keys: Vec<&String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
@@ -355,8 +356,12 @@ pub fn read_sites(
             continue;
         };
         // Span start and end, in the units a row's span carries -> the
-        // definition the call reaches.
-        let resolved: HashMap<(u32, u32), DefinitionSite> = inputs
+        // definition the call reaches, as the compiler's `call` row names it
+        // (carrick#2822): a member called on a call's value
+        // (`createClient().getRun(id)`) included, which the call graph's
+        // name join cannot follow. Where the rows do not say, the call
+        // graph's answer stands, as before.
+        let graph: HashMap<(u32, u32), DefinitionSite> = inputs
             .sites
             .sites_in(discovered)
             .map(|(lo, hi, file, line)| {
@@ -369,6 +374,27 @@ pub fn read_sites(
                 )
             })
             .collect();
+        let mut resolved: HashMap<(u32, u32), DefinitionSite> = HashMap::new();
+        for (span, reach) in inputs.reaches_in(discovered) {
+            let definition = match reach {
+                CallReach::Function(file, key) | CallReach::OutsideService(file, key) => {
+                    let file = crate::engine::repo_relative(&file.to_string_lossy(), root);
+                    let name = key.split('@').next().unwrap_or(&key);
+                    match lines.get(&(file.clone(), name)).map(Vec::as_slice) {
+                        Some([line]) => Some(DefinitionSite { file, line: *line }),
+                        // A definition this service's table does not name
+                        // once: the call graph's line, when it names the
+                        // same file.
+                        _ => graph.get(&span).filter(|site| site.file == file).cloned(),
+                    }
+                }
+                CallReach::NoFunction => None,
+                CallReach::Unknown(_) => graph.get(&span).cloned(),
+            };
+            if let Some(definition) = definition {
+                resolved.insert(span, definition);
+            }
+        }
         let relative = crate::engine::repo_relative(key, root);
         rows.extend(read_file_sites(
             &absolute,
@@ -385,18 +411,16 @@ pub fn read_sites(
     }
 }
 
-/// Every call of the service into a function another of its files declares
-/// ([`LeafCall`]), with the line that function opens on as every service
-/// names a definition, and every call into a function another service
-/// declares, by file and name. A callee of the service whose file and name
-/// more than one definition share names no one definition, and its calls are
-/// left out.
-fn read_leaves(
-    inputs: &RequestSummaryInputs,
+/// The lines each definition of the service opens on, by repository-relative
+/// file and definition name. A file and name more than one definition share
+/// lists each line.
+type DefinitionLines<'d> = HashMap<(String, &'d str), Vec<u32>>;
+
+fn definition_lines<'d>(
+    definitions: &'d HashMap<String, crate::visitor::FunctionDefinition>,
     root: &str,
-    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
-) -> Vec<LeafCall> {
-    let mut lines: HashMap<(String, &str), Vec<u32>> = HashMap::new();
+) -> DefinitionLines<'d> {
+    let mut lines: DefinitionLines<'d> = HashMap::new();
     for definition in definitions
         .values()
         .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
@@ -411,7 +435,20 @@ fn read_leaves(
         at.sort_unstable();
         at.dedup();
     }
+    lines
+}
 
+/// Every call of the service into a function another of its files declares
+/// ([`LeafCall`]), with the line that function opens on as every service
+/// names a definition, and every call into a function another service
+/// declares, by file and name. A callee of the service whose file and name
+/// more than one definition share names no one definition, and its calls are
+/// left out.
+fn read_leaves(
+    inputs: &RequestSummaryInputs,
+    root: &str,
+    lines: &DefinitionLines<'_>,
+) -> Vec<LeafCall> {
     let mut by_file: BTreeMap<PathBuf, Vec<crate::request_summary::CallIntoFile>> = BTreeMap::new();
     for call in inputs.calls_into_other_files() {
         by_file.entry(call.file.clone()).or_default().push(call);

@@ -298,6 +298,10 @@ pub enum CalleeShape {
     },
     /// `obj.foo(...)`, where `obj` is a plain identifier.
     Member(String),
+    /// `make().foo(...)`: a member called on a call's value. Only the
+    /// compiler's `call` row says which definition it reaches
+    /// ([`crate::call_graph::add_row_edges`], carrick#2822).
+    CallResult,
 }
 
 /// One call site inside a function body, as written in the AST.
@@ -898,6 +902,16 @@ impl CalleeCollector<'_> {
                             receiver: ReceiverBinding::default(),
                         });
                     }
+                    // `make().foo()`: no name join can say what `make()`
+                    // returns, so resolution states no edge; the compiler's
+                    // `call` row for the site does (carrick#2822).
+                    Expr::Call(_) => self.out.push(CalleeRef {
+                        name,
+                        shape: CalleeShape::CallResult,
+                        line,
+                        span,
+                        receiver: ReceiverBinding::default(),
+                    }),
                     _ => {}
                 }
             }

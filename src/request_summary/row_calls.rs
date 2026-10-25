@@ -552,6 +552,32 @@ impl RequestSummaryInputs {
         });
         out
     }
+
+    /// What [`Self::reach`] says each call of `file` (as walked) reaches, by
+    /// the call's span start and end in SWC numbering, the key a row's span
+    /// carries (carrick#2822). Constructions and JSX elements are left out,
+    /// as in [`Self::calls_into_other_files`].
+    pub(crate) fn reaches_in(&self, file: &Path) -> HashMap<(u32, u32), Reach> {
+        let Some((path, ir)) = self.files.get_key_value(file) else {
+            return HashMap::new();
+        };
+        let mut out = HashMap::new();
+        let mut functions: Vec<&FnIr> = ir.functions.values().collect();
+        functions.push(&ir.module_level);
+        while let Some(function) = functions.pop() {
+            for (call, construction) in function.read_calls() {
+                if construction || call.jsx {
+                    continue;
+                }
+                out.insert(
+                    (call.site.span_start, call.site.span_end),
+                    self.reach(path, call.site.lo, call.site.hi),
+                );
+            }
+            functions.extend(function.nested.iter().chain(&function.detached));
+        }
+        out
+    }
 }
 
 impl RequestSummaryInputs {

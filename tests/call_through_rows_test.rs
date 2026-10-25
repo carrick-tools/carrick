@@ -288,6 +288,98 @@ fn as_stated(method: &str, target: &str, path: &str) -> Row {
     }
 }
 
+const INLINE_COMMANDS: &str = "packages/cli/src/inline-commands.ts";
+const INLINE_HOOKS: &str = "apps/web/src/inline-hooks.ts";
+
+/// Whether the live sidecar can run, for the scans that walk the compiler's
+/// rows. CI builds it before the Rust tests, so a skip there would make a
+/// green tick mean nothing.
+fn sidecar_available() -> bool {
+    let node = Command::new("node").arg("--version").output().is_ok();
+    let built = std::env::var_os("CARRICK_SIDECAR_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"))
+        .join("dist/src/index.js")
+        .exists();
+    assert!(
+        (node && built) || std::env::var("CI").is_err(),
+        "node or the built sidecar is missing in CI, so this test would silently not run"
+    );
+    node && built
+}
+
+/// The fixture scanned as a fact-layer scan runs, with the compiler's
+/// per-position rows (`CARRICK_POSITION_ROWS=1`), once for the whole binary.
+fn blobs_with_rows() -> &'static Blobs {
+    static SCAN: OnceLock<Blobs> = OnceLock::new();
+    SCAN.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = committed_copy(tmp.path());
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = scan_command(&repo, &storage);
+        cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("CARRICK_POSITION_ROWS", "1")
+            .env("HOME", &home);
+        run(cmd);
+        read_blobs(&storage)
+            .into_iter()
+            .map(|(service, (_, blob))| (service, blob))
+            .collect()
+    })
+}
+
+/// carrick#2822: a method called on a call's value (`getClient().getRun(id)`,
+/// `createClient().getStatus()`) reaches the client method the compiler's
+/// `call` row names, so the model's row, a path made from the names in
+/// sight, takes the request that method sends.
+#[test]
+fn a_method_called_on_a_factorys_value_takes_the_request_the_method_reaches() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blobs = blobs_with_rows();
+    assert_eq!(
+        rows_in(blobs, "cli", INLINE_COMMANDS, 9),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+    assert_eq!(
+        rows_in(blobs, "cli", INLINE_COMMANDS, 13),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
+    // A hook's one callback calls a method on the app client a factory
+    // returns.
+    assert_eq!(
+        rows_in(blobs, "web", INLINE_HOOKS, 6),
+        [corrected("GET", "/api/v1/status", 23)]
+    );
+    // The binding form, `const client = createClient(); client.getRun(id)`,
+    // is unchanged.
+    assert_eq!(
+        rows_in(blobs, "cli", COMMANDS, 9),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+}
+
+/// carrick#2823: a command table's `run:` calls a wrapper whose body calls a
+/// method on a factory's value. The walk passes through that call, so the
+/// model's row, made from the command's `path`, takes the request.
+#[test]
+fn a_wrapper_over_a_factorys_value_passes_the_walk_to_the_request() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        rows_in(blobs_with_rows(), "cli", INLINE_COMMANDS, 22),
+        [corrected("GET", "/api/v1/token", 14)]
+    );
+}
+
 /// The consumer type entries the manifest holds at `file:line`.
 fn consumer_entries_at(service: &str, file: &str, line: u32) -> Vec<serde_json::Value> {
     blobs()[service]["type_manifest"]
