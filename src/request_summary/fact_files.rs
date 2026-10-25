@@ -89,8 +89,8 @@ pub struct FactFiles {
     /// them apart. The orchestrator keeps these calls out of the request
     /// members it joins to callers.
     pub server_framework_calls: BTreeMap<String, BTreeSet<u32>>,
-    /// The spans of the calls whose labelled export is a GraphQL client, by
-    /// file (carrick#2763). A hook that hands a document to a client executes
+    /// The spans of the calls whose labelled export is a GraphQL client and
+    /// which carry no listed end, by file (carrick#2763). A hook that hands a document to a client executes
     /// an operation; the HTTP reader is never asked about it, so a row the
     /// reader states there is not a request the call makes. The site selects
     /// its file and lists nothing.
@@ -198,6 +198,15 @@ impl FactFiles {
                 facts.files.entry(file).or_default().unanswered_package = true;
             }
         }
+        // A call can carry several ends, one site each at the same span. When
+        // any of them is listed for the reader (an HTTP client or a server
+        // framework), the call makes a real request as well, and the reader's
+        // row there is not the GraphQL operation's.
+        let listed = &facts.listed;
+        facts.graphql_client_calls.retain(|file, spans| {
+            spans.retain(|span| !listed.get(file).is_some_and(|l| l.contains(span)));
+            !spans.is_empty()
+        });
         facts
     }
 
@@ -305,6 +314,45 @@ mod tests {
             span_end: 9,
             new: false,
         }
+    }
+
+    /// A call with a GraphQL-client end and an HTTP-client end at the same
+    /// span makes a real request too: it is no GraphQL-client call, so the
+    /// reader's row there is kept. A call with only the GraphQL end stays.
+    #[test]
+    fn a_call_with_a_listed_end_is_no_graphql_client_call() {
+        let discovery = Discovery {
+            sites: vec![
+                site(
+                    "a.ts",
+                    (1, 4),
+                    Some(end("b.ts", LibraryRole::GraphqlClient)),
+                    None,
+                ),
+                site(
+                    "a.ts",
+                    (1, 4),
+                    Some(end("c.ts", LibraryRole::HttpClient)),
+                    None,
+                ),
+                site(
+                    "a.ts",
+                    (6, 9),
+                    Some(end("b.ts", LibraryRole::GraphqlClient)),
+                    None,
+                ),
+            ],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        );
+        assert!(!facts.graphql_client_call(Path::new("/repo/a.ts"), (1, 4)));
+        assert!(facts.graphql_client_call(Path::new("/repo/a.ts"), (6, 9)));
     }
 
     /// A site puts its own file and its labelled call's file in the set; a

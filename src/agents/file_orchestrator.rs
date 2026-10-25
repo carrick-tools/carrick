@@ -4688,7 +4688,7 @@ impl FileOrchestrator {
             );
         }
 
-        // PHASE 5c2 (carrick#2763): the same withdrawal, decided by the role
+        // PHASE 5c3 (carrick#2763): the same withdrawal, decided by the role
         // the store gives the export instead of by reading the document. A
         // call into a GraphQL client lists no HTTP candidate, so the reader's
         // answer for the file (replayed from the cache or not) can hold a row

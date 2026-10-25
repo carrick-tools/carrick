@@ -121,6 +121,10 @@ const HELPER: &str = "import relay from \"@fixture/relay\";\n\nfunction withPath
 
 const UI: &str = "import { useQuery } from \"@fixture/gql\";\n\nconst ItemsDocument = \"query Items { items { id } }\";\n\nexport async function load(): Promise<unknown> {\n  useQuery(ItemsDocument, {});\n  return fetch(\"/api/items\");\n}\n";
 
+const MIXED_LOAD: &str = "import { useQuery } from \"@fixture/gql\";\nimport send from \"@fixture/http\";\n\nconst ItemsDocument = \"query Items { items { id } }\";\n\nexport async function loadBoth(path: string): Promise<unknown> {\n  useQuery(ItemsDocument, {});\n  return send(path, { method: \"GET\" });\n}\n";
+
+const MIXED_PAGE: &str = "import { loadBoth } from \"./mixed_load\";\n\nexport async function mixedPage(path: string): Promise<unknown> {\n  return loadBoth(path);\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -183,6 +187,24 @@ fn repo(tmp: &Path) -> PathBuf {
         "export declare function useQuery(document: string, variables: object): unknown;\n",
     );
     fs::write(repo.join("src/ui.ts"), UI).unwrap();
+    fs::write(repo.join("src/mixed_load.ts"), MIXED_LOAD).unwrap();
+    fs::write(repo.join("src/mixed_page.ts"), MIXED_PAGE).unwrap();
+    // The call into `loadBoth` reaches a GraphQL client and an HTTP client at
+    // once; the reader's row there is a real request.
+    canned_answer(
+        &repo,
+        "mixed_page",
+        serde_json::json!({
+            "mounts": [], "endpoints": [],
+            "data_calls": [{
+                "candidate_id": "@line:4", "line_number": 4, "target": "/api/mixed",
+                "method": "GET", "pattern_matched": "loadBoth(",
+                "call_expression_text": null, "call_expression_line": null,
+                "payload_expression_text": null, "payload_expression_line": null,
+                "primary_type_symbol": null, "type_import_source": null
+            }]
+        }),
+    );
     // The reader answers a `POST /graphql` row for the hook call, which no
     // signal lists, under the span id discovery gave the site (a `@line:N`
     // id is rewritten only for a listed candidate).
@@ -767,6 +789,25 @@ fn a_row_at_a_call_into_a_graphql_client_is_withdrawn() {
     assert!(
         on.log_has(&["Withdrawing HTTP row", "/graphql", "GraphQL client"]),
         "the withdrawal is logged: {}",
+        on.log
+    );
+}
+
+/// A call can reach a GraphQL client and an HTTP client at once (a helper that
+/// runs a hook and a fetch). It makes a real request, so the reader's row there
+/// is kept and no GraphQL withdrawal is logged for it.
+#[test]
+fn a_row_at_a_call_with_a_graphql_end_and_an_http_end_is_kept() {
+    let on = choosing();
+    let kept: Vec<_> = on
+        .calls
+        .iter()
+        .filter(|call| call["path"] == "/api/mixed")
+        .collect();
+    assert_eq!(kept.len(), 1, "the HTTP row is kept: {:#?}", on.calls);
+    assert!(
+        !on.log_has(&["Withdrawing HTTP row", "/api/mixed"]),
+        "no withdrawal at a call with an HTTP end: {}",
         on.log
     );
 }
