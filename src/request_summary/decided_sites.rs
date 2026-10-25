@@ -736,10 +736,6 @@ pub struct Decided {
     /// Sites that state no row because their name is one the library emits
     /// itself (carrick#2426), by `file:line`.
     pub reserved: Vec<String>,
-    /// Sites at a call into a sibling service that state no row because the
-    /// calls of the wrapper they sit in state the request (carrick#2618), by
-    /// `file:line`.
-    pub wrapped: Vec<String>,
     /// Calls above a decided site on its chain (carrick#2614).
     pub through: Vec<Through>,
     /// With the receiver trace on, where the service's route chains leave
@@ -1562,9 +1558,6 @@ struct Walk<'a, 'i> {
     index: Option<&'i instances::WalkIndex<'a>>,
     out: &'i mut Decided,
     seen: HashSet<(String, u32, Option<String>, String)>,
-    /// The client wrappers of this service ([`leaf_wrappers`]); empty without
-    /// siblings (carrick#2618).
-    leaf_wrappers: HashSet<(PathBuf, String)>,
     /// The label of the labelled call being walked.
     label: Option<&'i SiteLabel>,
     /// The receiver of the labelled call being walked, and how discovery
@@ -1594,16 +1587,11 @@ impl<'a> Walk<'a, '_> {
         if !self.seen.insert(id) {
             return;
         }
-        // A call into a sibling inside a wrapper whose callers, in other
-        // files of this service, state the request at their own call
-        // (carrick#1146's leaf rows): no second row per operation at the
-        // wrapper's line.
-        if self.in_a_leaf_wrapper(down) {
-            self.out
-                .wrapped
-                .push(format!("{}:{}", file, placed.call.site.line));
-            return;
-        }
+        // A call into a sibling inside a client wrapper is a site like any
+        // other: whether a caller of the wrapper states the request instead
+        // is known only once call-through has stated that caller's row, at
+        // the join point, which withdraws this one then (carrick#2618,
+        // `call_through::state_leaves`).
         let label = self.label;
         if let Some(text) = literal_name(&name)
             && label.is_some_and(|label| label.reserved.contains(&text))
@@ -1648,18 +1636,6 @@ impl<'a> Walk<'a, '_> {
             composed_trimmed: false,
             procedure: None,
         });
-    }
-
-    /// Whether the site whose calls are `down` is a call into a sibling
-    /// service written in a client wrapper ([`leaf_wrappers`]), so the leaf
-    /// call states the request instead.
-    fn in_a_leaf_wrapper(&self, down: &[Placed<'a>]) -> bool {
-        let placed = &down[0];
-        down.iter().skip(1).any(|hop| !self.calls.is_own(hop.file))
-            && placed.key.is_some_and(|key| {
-                self.leaf_wrappers
-                    .contains(&(placed.file.to_path_buf(), key.to_string()))
-            })
     }
 
     /// With the receiver trace on, the instance ends of the site whose
@@ -1871,52 +1847,6 @@ fn supplies(call: &CallIr, slot: &ArgSlot) -> bool {
     }
 }
 
-/// The client wrappers of the service: functions that a call from another
-/// file of the service reaches
-/// ([`RequestSummaryInputs::calls_into_other_files`], the calls that state a
-/// leaf row, carrick#2698) and that make exactly one call into a sibling
-/// that reaches a labelled call. Their callers state the request at their own
-/// call, so the wrapper's call into the sibling states none (carrick#2618;
-/// ruled on carrick#2448). A wrapper with two such calls reaches more than
-/// one request, no leaf call states one, and each stays a site.
-fn leaf_wrappers(
-    inputs: &RequestSummaryInputs,
-    siblings: &[&RequestSummaryInputs],
-    root: &Path,
-    discovered: &[DiscoverySite],
-    calls: &Calls<'_>,
-) -> HashSet<(PathBuf, String)> {
-    if siblings.is_empty() {
-        return HashSet::new();
-    }
-    let outside = |file: &str| !inputs.files.contains_key(&root.join(file));
-    let mut crossing: HashMap<(PathBuf, String), HashSet<(u32, u32)>> = HashMap::new();
-    for site in discovered {
-        let Some(end) = &site.end else {
-            continue;
-        };
-        if site.stop.is_some()
-            || !(outside(&end.file) || site.chain.iter().any(|hop| outside(&hop.file)))
-        {
-            continue;
-        }
-        if let Some(placed) = calls.at_span(&root.join(&site.file), site.span_start, site.span_end)
-            && let Some(key) = placed.key
-        {
-            crossing
-                .entry((placed.file.to_path_buf(), key.to_string()))
-                .or_default()
-                .insert((site.span_start, site.span_end));
-        }
-    }
-    inputs
-        .calls_into_other_files()
-        .into_iter()
-        .map(|call| (call.target, call.key))
-        .filter(|wrapper| crossing.get(wrapper).is_some_and(|spans| spans.len() == 1))
-        .collect()
-}
-
 /// Each call below the first in `down`: its `file:line` and its callee as
 /// written.
 fn via_of(root: &Path, down: &[Placed<'_>]) -> Vec<Via> {
@@ -2055,7 +1985,6 @@ fn decide(
     } else {
         Calls::index_with(inputs, siblings, &entered_files)
     };
-    let leaf_wrappers = leaf_wrappers(inputs, siblings, root, discovered, &calls);
     let index = makers.map(|_| instances::WalkIndex::of(&calls, inputs, scopes));
     let mut out = Decided::default();
     // The functions some listed site's chain enters: a site whose value
@@ -2078,7 +2007,6 @@ fn decide(
         index: index.as_ref(),
         out: &mut out,
         seen: HashSet::new(),
-        leaf_wrappers,
         label: None,
         receiver: None,
         reached: None,
@@ -2282,8 +2210,6 @@ fn decide(
     out.unplaced = unplaced;
     out.ran.sort();
     out.reserved.sort();
-    out.wrapped.sort();
-    out.wrapped.dedup();
     out.through.sort();
     out.through.dedup();
     out.sites.sort_by(|a, b| {
@@ -4447,15 +4373,16 @@ pub(crate) mod tests {
         assert_eq!(alone.unplaced.len(), 3, "{:?}", alone.unplaced);
     }
 
-    /// carrick#2618, the amendment ruled on #2448: a call into a sibling
-    /// inside a client wrapper whose methods other files of the service
-    /// call states nothing (the leaf calls state the request, #2698), a
-    /// command that calls the sibling itself is a site, and a wrapper that
-    /// makes two calls into a sibling leaves each a site (no leaf call
-    /// states one request for it). The answer key is
-    /// `tests/fixtures/sibling-wrapper/README.md`.
+    /// carrick#2618: a call into a sibling inside a client wrapper is a site
+    /// like any other. Whether a caller of the wrapper states the request
+    /// instead (the amendment ruled on #2448) is known only once
+    /// call-through states that caller's row at the join point, which then
+    /// withdraws the wrapper's (`call_through::state_leaves`); this pass
+    /// never withholds it. A command that calls the sibling itself is a
+    /// site, and so is each call of a wrapper that makes two. The answer key
+    /// is `tests/fixtures/sibling-wrapper/README.md`.
     #[test]
-    fn a_call_into_a_sibling_inside_a_client_wrapper_states_no_site() {
+    fn a_call_into_a_sibling_inside_a_client_wrapper_is_a_site() {
         let Some((on, sites, labels)) = sibling_sites("sibling-wrapper") else {
             return;
         };
@@ -4479,6 +4406,12 @@ pub(crate) mod tests {
         assert_eq!(
             found,
             vec![
+                (
+                    "api.ts".to_string(),
+                    6,
+                    Some("/api/items/${id}".to_string())
+                ),
+                ("api.ts".to_string(), 10, Some("/api/status".to_string())),
                 ("api.ts".to_string(), 14, Some("/api/version".to_string())),
                 ("api.ts".to_string(), 15, Some("/api/items/1".to_string())),
                 (
@@ -4489,14 +4422,6 @@ pub(crate) mod tests {
             ],
             "{:?}",
             decided.sites
-        );
-        assert_eq!(
-            decided.wrapped,
-            vec![
-                "services/app/src/api.ts:10".to_string(),
-                "services/app/src/api.ts:6".to_string()
-            ],
-            "the wrappers' calls state no site"
         );
     }
 }

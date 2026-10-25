@@ -1094,6 +1094,9 @@ pub struct Settled {
     /// Boundary calls left alone because no one definition of any service
     /// is the function called.
     pub boundary_unresolved: usize,
+    /// Rows withdrawn at a client wrapper's call once a leaf row states the
+    /// request at its caller ([`withdraw_wrapped`]).
+    pub wrapper_rows_withdrawn: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1182,6 +1185,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_in_wrapper += stated.in_wrapper;
         settled.boundary_third_service += stated.third_service;
         settled.boundary_unresolved += stated.unresolved;
+        settled.wrapper_rows_withdrawn += stated.withdrawn;
         if (corrected > 0 || stated.own + stated.boundary > 0)
             && let Some(mut boundary) = service.data.boundary.take()
         {
@@ -1206,6 +1210,10 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_in_wrapper,
         settled.boundary_third_service,
         settled.boundary_unresolved
+    );
+    debug!(
+        "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618)",
+        settled.wrapper_rows_withdrawn
     );
     settled
 }
@@ -1292,6 +1300,8 @@ struct LeafOutcome {
     in_wrapper: usize,
     third_service: usize,
     unresolved: usize,
+    /// Fact rows withdrawn at a client wrapper's call ([`withdraw_wrapped`]).
+    withdrawn: usize,
 }
 
 /// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
@@ -1333,7 +1343,9 @@ struct LeafOutcome {
 /// The row is the reached request's operation (method, target, base,
 /// dispatch) as a call through, `wrapper_call` with `reaches_request`, from
 /// `request_summary`. It carries no type entry: no capture anchored one at
-/// the call.
+/// the call. A fact row the service's site questions stated inside a pass 1
+/// callee for the operation a leaf row was stated through, the wrapper's own
+/// call into the other service, is then withdrawn ([`withdraw_wrapped`]).
 fn state_leaves<'g>(
     service: &mut ServiceRows<'_>,
     index: usize,
@@ -1364,6 +1376,11 @@ fn state_leaves<'g>(
     let mut written: HashSet<(String, Operation)> = HashSet::new();
     let mut outcome = LeafOutcome::default();
     let mut wrappers: HashSet<DefinitionSite> = HashSet::new();
+    // The callees a leaf row was stated through, with the operation stated.
+    let mut through: Vec<(DefinitionSite, OperationKey)> = Vec::new();
+    // The rows held before any leaf row is written: only those can be a
+    // wrapper's own.
+    let held = service.data.calls.len();
     for leaf in &service.sites.leaves {
         let LeafCallee::Own(callee) = &leaf.callee else {
             continue;
@@ -1400,6 +1417,10 @@ fn state_leaves<'g>(
         }
         if state_leaf(service.data, leaf, request) {
             outcome.own += 1;
+            through.push((
+                callee.clone(),
+                OperationKey::http(&request.method, request.canonical_path.clone()),
+            ));
         }
     }
     // The lines each wrapper opens and closes on, per file.
@@ -1487,7 +1508,73 @@ fn state_leaves<'g>(
             outcome.boundary += 1;
         }
     }
+    outcome.withdrawn = withdraw_wrapped(service.data, held, &through);
     outcome
+}
+
+/// Withdraw each fact row a service's site questions stated inside a callee
+/// a leaf row was just stated through, for the operation that leaf row
+/// states (carrick#2618, ruled on carrick#2448): the client wrapper's call
+/// into the sibling, whose request its caller in another file now states.
+/// A wrapper no leaf row was stated through keeps its row, so each request
+/// keeps one fact row whichever call states it. Only the first `held` rows,
+/// those held before any leaf row was written, are read. Returns how many
+/// rows went.
+fn withdraw_wrapped(
+    data: &mut CloudRepoData,
+    held: usize,
+    through: &[(DefinitionSite, OperationKey)],
+) -> usize {
+    if through.is_empty() {
+        return 0;
+    }
+    // Each callee's lines, from the service's own definitions.
+    let spans: Vec<(&str, u32, u32, &OperationKey)> = through
+        .iter()
+        .filter_map(|(callee, key)| {
+            let definition = data.function_definitions.values().find(|definition| {
+                definition.line_number == callee.line
+                    && definition.file_path.to_string_lossy() == callee.file
+            })?;
+            Some((
+                callee.file.as_str(),
+                callee.line,
+                definition.end_line.max(callee.line),
+                key,
+            ))
+        })
+        .collect();
+    let wrapped = |call: &crate::analyzer::ApiEndpointDetails| {
+        call.resolution_source == Some(ResolutionSource::RequestSummary)
+            && call
+                .file_path
+                .to_str()
+                .and_then(|text| text.rsplit_once(':'))
+                .and_then(|(file, line)| Some((file, line.parse::<u32>().ok()?)))
+                .is_some_and(|(file, line)| {
+                    spans.iter().any(|(at, first, last, key)| {
+                        *at == file
+                            && (*first..=*last).contains(&line)
+                            && crate::site_rows::agrees(&call.key, key)
+                    })
+                })
+    };
+    let mut withdrawn = 0;
+    let mut index = 0;
+    data.calls.retain(|call| {
+        let keep = index >= held || !wrapped(call);
+        index += 1;
+        if !keep {
+            debug!(
+                "  - {}: withdrawn, {:?} is stated at the call into the wrapper",
+                call.file_path.display(),
+                call.key
+            );
+            withdrawn += 1;
+        }
+        keep
+    });
+    withdrawn
 }
 
 /// Whether a call site of the function `leaf` is written in holds a row of
@@ -2782,6 +2869,200 @@ mod tests {
             (settled.boundary_rows, settled.boundary_unresolved, rows),
             (0, 1, 0),
             "{settled:?}"
+        );
+    }
+
+    /// A blob of `service` with these definitions, calls and graph rows.
+    fn wrapper_blob(
+        service: &str,
+        function_definitions: serde_json::Value,
+        calls: serde_json::Value,
+        data_calls: serde_json::Value,
+    ) -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "acme/repo",
+            "service_name": service,
+            "endpoints": [], "calls": calls, "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": function_definitions,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc1234",
+            "mount_graph": {"nodes": {}, "mounts": [], "endpoints": [], "data_calls": data_calls}
+        }))
+        .expect("the blob reads")
+    }
+
+    fn definition_json(
+        name: &str,
+        file: &str,
+        first: u32,
+        last: u32,
+        calls: serde_json::Value,
+    ) -> (String, serde_json::Value) {
+        (
+            name.to_string(),
+            serde_json::json!({
+                "name": name, "file_path": file, "node_type": "FunctionDeclaration",
+                "arguments": [], "is_exported": true, "line_number": first, "end_line": last,
+                "calls": calls
+            }),
+        )
+    }
+
+    fn summary_call(method: &str, path: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "owner": null, "key": {"protocol": "http", "method": method, "path": path},
+            "params": [], "request_body": null, "response_body": null, "handler_name": null,
+            "request_type": null, "response_type": null, "file_path": at,
+            "resolution_source": "request_summary"
+        })
+    }
+
+    /// The `sibling-wrapper` fixture's shape (carrick#2618): the app's
+    /// `ItemsApi.get` and `ItemsApi.status` each call one function of the
+    /// client, and the site questions stated a row at each wrapper's call;
+    /// `commands.ts` calls each wrapper. The client's `getItem` request is a
+    /// fact in its graph, `getStatus` is only the model's. Settled, with
+    /// the client's request for `getItem` stated as `stated_items`.
+    fn settle_wrappers(stated_items: &str) -> (Vec<(String, String)>, Settled) {
+        let app_definitions: serde_json::Map<String, serde_json::Value> = [
+            definition_json(
+                "ItemsApi.get",
+                "services/app/src/api.ts",
+                5,
+                7,
+                serde_json::json!([{"name": "getItem", "file_path": "packages/client/src/http.ts", "line_number": 1, "call_site_line": 6}]),
+            ),
+            definition_json(
+                "ItemsApi.status",
+                "services/app/src/api.ts",
+                9,
+                11,
+                serde_json::json!([{"name": "getStatus", "file_path": "packages/client/src/http.ts", "line_number": 11, "call_site_line": 10}]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut app = wrapper_blob(
+            "app",
+            serde_json::Value::Object(app_definitions),
+            serde_json::json!([
+                summary_call("GET", "/api/items/${id}", "services/app/src/api.ts:6"),
+                summary_call("GET", "/api/status", "services/app/src/api.ts:10"),
+            ]),
+            serde_json::json!([]),
+        );
+        let client_definitions: serde_json::Map<String, serde_json::Value> = [
+            definition_json(
+                "getItem",
+                "packages/client/src/http.ts",
+                1,
+                4,
+                serde_json::json!([]),
+            ),
+            definition_json(
+                "getStatus",
+                "packages/client/src/http.ts",
+                11,
+                14,
+                serde_json::json!([]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let graph_row = |target: &str, canonical: &str, line: u32, source: &str| {
+            serde_json::json!({
+                "method": "GET", "target_url": target, "canonical_path": canonical,
+                "client": "fetch", "file_location": format!("packages/client/src/http.ts:{line}"),
+                "line": line, "resolution_source": source
+            })
+        };
+        let mut client = wrapper_blob(
+            "client",
+            serde_json::Value::Object(client_definitions),
+            serde_json::json!([]),
+            serde_json::json!([
+                graph_row("/api/items/${id}", "/api/items/:id", 2, stated_items),
+                graph_row("/api/status", "/api/status", 12, "model"),
+            ]),
+        );
+        let leaf = |line: u32, callee: u32, client: &str| LeafCall {
+            file: "services/app/src/commands.ts".to_string(),
+            line,
+            last_line: line,
+            enclosing_lines: Vec::new(),
+            client: client.to_string(),
+            callee: LeafCallee::Own(definition("services/app/src/api.ts", callee)),
+        };
+        let app_sites = CallThroughSites {
+            leaves: vec![leaf(6, 5, "api.get"), leaf(11, 9, "api.status")],
+            ..Default::default()
+        };
+        let client_sites = CallThroughSites::default();
+        let settled = settle(&mut [
+            ServiceRows {
+                data: &mut app,
+                sites: &app_sites,
+                writable: true,
+            },
+            ServiceRows {
+                data: &mut client,
+                sites: &client_sites,
+                writable: true,
+            },
+        ]);
+        let mut facts: Vec<(String, String)> = app
+            .calls
+            .iter()
+            .filter(|call| call.resolution_source == Some(ResolutionSource::RequestSummary))
+            .map(|call| (call.file_path.display().to_string(), call.key.canonical()))
+            .collect();
+        facts.sort();
+        (facts, settled)
+    }
+
+    /// carrick#2618, the stated side: once call-through states the leaf row
+    /// at the wrapper's caller, the wrapper's own row for that operation is
+    /// withdrawn, so the request keeps one fact row. A wrapper whose request
+    /// no leaf row states keeps its row.
+    #[test]
+    fn a_wrapper_s_row_goes_once_its_caller_states_the_request() {
+        let (facts, settled) = settle_wrappers("request_summary");
+        assert_eq!(settled.leaf_rows, 1, "{facts:?}");
+        assert_eq!(settled.wrapper_rows_withdrawn, 1, "{facts:?}");
+        assert_eq!(
+            facts,
+            vec![
+                (
+                    "services/app/src/api.ts:10".to_string(),
+                    OperationKey::http("GET", "/api/status").canonical()
+                ),
+                (
+                    "services/app/src/commands.ts:6".to_string(),
+                    OperationKey::http("GET", "/api/items/:id").canonical()
+                ),
+            ]
+        );
+    }
+
+    /// carrick#2618: with no leaf row stated (the client's request is only
+    /// the model's), every wrapper keeps its row.
+    #[test]
+    fn a_wrapper_keeps_its_row_when_no_caller_states_the_request() {
+        let (facts, settled) = settle_wrappers("model");
+        assert_eq!(settled.leaf_rows, 0, "{facts:?}");
+        assert_eq!(settled.wrapper_rows_withdrawn, 0, "{facts:?}");
+        assert_eq!(
+            facts,
+            vec![
+                (
+                    "services/app/src/api.ts:10".to_string(),
+                    OperationKey::http("GET", "/api/status").canonical()
+                ),
+                (
+                    "services/app/src/api.ts:6".to_string(),
+                    OperationKey::http("GET", "/api/items/${id}").canonical()
+                ),
+            ]
         );
     }
 }

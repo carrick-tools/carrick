@@ -560,7 +560,7 @@ fn route_shape(path: &str) -> String {
 /// for HTTP the same method and paths ([`route_shape`]) that match with at
 /// least one literal segment in common ([`carrick_match::match_agreement`]),
 /// either way round.
-fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
+pub(crate) fn agrees(reader: &OperationKey, site: &OperationKey) -> bool {
     match (reader, site) {
         (
             OperationKey::Http {
