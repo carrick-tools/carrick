@@ -23,8 +23,7 @@ use crate::{
     packages::Packages,
     url_normalizer::UrlNormalizer,
 };
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use swc_common::{SourceMap, sync::Lrc};
 use tracing::debug;
 
@@ -44,8 +43,6 @@ pub struct MultiAgentAnalysisResult {
     /// Processing statistics
     #[allow(dead_code)]
     pub stats: ProcessingStats,
-    /// See [`FileCentricAnalysisResult::passes_body`].
-    pub passes_body: HashSet<(PathBuf, String)>,
 }
 
 /// Orchestrates the complete multi-agent workflow using AST-Gated File-Centric analysis.
@@ -177,7 +174,6 @@ impl MultiAgentOrchestrator {
             file_results: file_centric_result.file_results,
             raw_model_results: file_centric_result.raw_model_results,
             stats: file_centric_result.stats,
-            passes_body: file_centric_result.passes_body,
         })
     }
 

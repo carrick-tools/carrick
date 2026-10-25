@@ -4393,11 +4393,6 @@ async fn analyze_current_repo_incremental(
                 &request_inputs,
                 repo_path,
                 &cloud_data.function_definitions,
-                &|file, function| {
-                    analysis
-                        .passes_body
-                        .contains(&(file.to_path_buf(), function.to_string()))
-                },
             );
             return Ok(ServiceAnalysis {
                 data: cloud_data,
@@ -11516,11 +11511,6 @@ async fn analyze_current_repo(
         &request_inputs,
         repo_path,
         &cloud_data.function_definitions,
-        &|file, function| {
-            analysis_result
-                .passes_body
-                .contains(&(file.to_path_buf(), function.to_string()))
-        },
     );
     Ok(ServiceAnalysis {
         data: cloud_data,

@@ -8596,11 +8596,6 @@ impl RequestSummaryIndex {
             .contains(&(file.to_path_buf(), function.to_string()))
     }
 
-    /// Every function [`Self::passes_body`] answers yes for.
-    pub fn passes_body_set(&self) -> &HashSet<(PathBuf, String)> {
-        &self.passes_body
-    }
-
     /// Rows read through library semantics (carrick#1564).
     pub fn library_row_count(&self) -> usize {
         self.rows

@@ -1,0 +1,59 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "model:8",
+      "line_number": 8,
+      "target": "/saveRun",
+      "method": "PUT",
+      "pattern_matched": "client.saveRun(",
+      "call_expression_text": "client.saveRun(id, \"done\")",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "SavedRun",
+      "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "model:15",
+      "line_number": 15,
+      "target": "/read",
+      "method": "GET",
+      "pattern_matched": "client.read(",
+      "call_expression_text": "client.read(id)",
+      "call_expression_line": 15,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Run",
+      "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "model:22",
+      "line_number": 22,
+      "target": "/getRunView",
+      "method": "GET",
+      "pattern_matched": "client.getRunView(",
+      "call_expression_text": "client.getRunView(id)",
+      "call_expression_line": 22,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "RunView",
+      "type_import_source": "./typed-client"
+    },
+    {
+      "candidate_id": "model:29",
+      "line_number": 29,
+      "target": "/getRunState",
+      "method": "GET",
+      "pattern_matched": "client.getRunState(",
+      "call_expression_text": "client.getRunState(id)",
+      "call_expression_line": 29,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "RunState",
+      "type_import_source": "./typed-client"
+    }
+  ],
+  "pubsub_operations": []
+}

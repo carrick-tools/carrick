@@ -57,6 +57,7 @@ use crate::mount_graph::{ConsumerRole, DataFetchingCall};
 use crate::operation::OperationKey;
 use crate::parser::{parse_file, parse_source};
 use crate::request_summary::RequestSummaryInputs;
+use crate::return_flow::ShapeKind;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::type_manifest::normalize_manifest_method;
 use crate::wrapper_request_shape::{RequestShapeSignal, call_request_verb};
@@ -96,11 +97,10 @@ pub struct SiteRow {
 #[derive(Debug, Default, Clone)]
 pub struct CallThroughSites {
     pub rows: Vec<SiteRow>,
-    /// The service's definitions whose call is worth their request's parsed
-    /// body unchanged ([`crate::request_summary::RequestSummaryIndex::passes_body`],
-    /// carrick#1601): every `return` hands back the body one request answers
-    /// with, or a call of a function that does.
-    pub hands_back_body: HashSet<DefinitionSite>,
+    /// What each of the service's functions returns when that is one call's
+    /// value read one way ([`BodyShape`], carrick#2377), by the definition.
+    /// A definition not listed returns something else, or nothing.
+    pub return_shapes: HashMap<DefinitionSite, BodyShape>,
     /// The service's resolved calls whose value never reaches the return of
     /// the function they are written in, or reaches it only as another
     /// call's argument ([`crate::return_flow`]), by file, line and the
@@ -116,8 +116,19 @@ pub struct CallThroughSites {
 impl CallThroughSites {
     /// Whether there is nothing to store. The leaf calls are never stored.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.hands_back_body.is_empty() && self.side_calls.is_empty()
+        self.rows.is_empty() && self.return_shapes.is_empty() && self.side_calls.is_empty()
     }
+}
+
+/// What a function returns when that is the value of one call, read one way
+/// ([`crate::return_flow::return_shapes`]), and the lines that call is written
+/// on. A call edge counts as the one whose value is returned only when it is
+/// written on those lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyShape {
+    pub kind: ShapeKind,
+    pub first_line: u32,
+    pub last_line: u32,
 }
 
 /// A call in one file of a service whose callee, as the compiler resolves it
@@ -169,9 +180,16 @@ pub struct StoredCallThrough {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<SiteRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hands_back_body: Vec<DefinitionSite>,
+    pub return_shapes: Vec<StoredReturnShape>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_calls: Vec<StoredSideCall>,
+}
+
+/// One entry of [`CallThroughSites::return_shapes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReturnShape {
+    pub definition: DefinitionSite,
+    pub shape: BodyShape,
 }
 
 /// One entry of [`CallThroughSites::side_calls`].
@@ -189,9 +207,15 @@ impl StoredCallThrough {
         if sites.is_empty() {
             return None;
         }
-        let mut hands_back_body: Vec<DefinitionSite> =
-            sites.hands_back_body.iter().cloned().collect();
-        hands_back_body.sort();
+        let mut return_shapes: Vec<StoredReturnShape> = sites
+            .return_shapes
+            .iter()
+            .map(|(definition, shape)| StoredReturnShape {
+                definition: definition.clone(),
+                shape: *shape,
+            })
+            .collect();
+        return_shapes.sort_by(|a, b| a.definition.cmp(&b.definition));
         let mut side_calls: Vec<StoredSideCall> = sites
             .side_calls
             .iter()
@@ -207,7 +231,7 @@ impl StoredCallThrough {
         });
         Some(Self {
             rows: sites.rows.clone(),
-            hands_back_body,
+            return_shapes,
             side_calls,
         })
     }
@@ -216,7 +240,11 @@ impl StoredCallThrough {
         CallThroughSites {
             leaves: Vec::new(),
             rows: self.rows.clone(),
-            hands_back_body: self.hands_back_body.iter().cloned().collect(),
+            return_shapes: self
+                .return_shapes
+                .iter()
+                .map(|entry| (entry.definition.clone(), entry.shape))
+                .collect(),
             side_calls: self
                 .side_calls
                 .iter()
@@ -268,19 +296,16 @@ pub enum Outer {
 /// sits inside it. A row whose call cannot be placed is not read either.
 ///
 /// `file_results` is the service's joined rows, keyed absolute or relative to
-/// `repo_path`. `passes_body` answers, for a declaring module's canonical
-/// path and a function's name, whether a call of it is worth its request's
-/// parsed body; it is read for the service's own `definitions`.
+/// `repo_path`. `definitions` are the service's own: what each returns is read
+/// off its file ([`BodyShape`]).
 pub fn read_sites(
     file_results: &HashMap<String, FileAnalysisResult>,
     inputs: &RequestSummaryInputs,
     repo_path: &str,
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
-    passes_body: &dyn Fn(&Path, &str) -> bool,
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
-    let hands_back_body = hands_back_body(definitions, root, passes_body);
-    let side_calls = read_side_calls(file_results, inputs, root);
+    let (side_calls, return_shapes) = read_function_facts(file_results, inputs, root, definitions);
     let leaves = read_leaves(inputs, root, definitions);
     let mut keys: Vec<&String> = file_results
         .iter()
@@ -291,7 +316,7 @@ pub fn read_sites(
     if keys.is_empty() {
         return CallThroughSites {
             rows: Vec::new(),
-            hands_back_body,
+            return_shapes,
             side_calls,
             leaves,
         };
@@ -354,7 +379,7 @@ pub fn read_sites(
     }
     CallThroughSites {
         rows,
-        hands_back_body,
+        return_shapes,
         side_calls,
         leaves,
     }
@@ -460,12 +485,28 @@ fn read_leaves(
 }
 
 /// Every resolved call of the service whose value is not handed back by the
-/// function it is written in ([`SideCall`]).
-fn read_side_calls(
+/// function it is written in ([`SideCall`]), and what each of the service's
+/// definitions returns ([`BodyShape`]). Each file is parsed once; a file with
+/// no resolved call (a generated client) is read for its definitions alone.
+fn read_function_facts(
     file_results: &HashMap<String, FileAnalysisResult>,
     inputs: &RequestSummaryInputs,
     root: &str,
-) -> HashMap<SideKey, SideCall> {
+    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+) -> (
+    HashMap<SideKey, SideCall>,
+    HashMap<DefinitionSite, BodyShape>,
+) {
+    let defined: HashSet<DefinitionSite> = definitions
+        .values()
+        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
+        .map(|definition| DefinitionSite {
+            file: crate::engine::repo_relative(&definition.file_path.to_string_lossy(), root),
+            line: definition.line_number,
+        })
+        .collect();
+    let defining: HashSet<&str> = defined.iter().map(|site| site.file.as_str()).collect();
+    let mut return_shapes: HashMap<DefinitionSite, BodyShape> = HashMap::new();
     // Lines a row of the service is written on, per file.
     let mut row_lines: HashMap<String, HashSet<u32>> = HashMap::new();
     for (key, result) in file_results {
@@ -497,7 +538,8 @@ fn read_side_calls(
                 )
             })
             .collect();
-        if resolved.is_empty() {
+        let relative = crate::engine::repo_relative(&path.to_string_lossy(), root);
+        if resolved.is_empty() && !defining.contains(relative.as_str()) {
             continue;
         }
         let cm: Lrc<SourceMap> = Default::default();
@@ -506,7 +548,46 @@ fn read_side_calls(
             continue;
         };
         let positions = Positions { cm: &cm };
-        let relative = crate::engine::repo_relative(&path.to_string_lossy(), root);
+        // The function node that opens a definition's line is the definition
+        // (every kind takes its line from its node); where two open on one
+        // line, the outer one.
+        let mut opening: HashMap<u32, (CallExtent, Option<crate::return_flow::ReturnShape>)> =
+            HashMap::new();
+        for (node, shape) in crate::return_flow::return_shapes(&module) {
+            let extent = positions.extent(node);
+            if opening
+                .get(&extent.line)
+                .is_none_or(|(known, _)| extent.contains(known))
+            {
+                opening.insert(extent.line, (extent, shape));
+            }
+        }
+        for (line, (_, shape)) in opening {
+            let Some(shape) = shape else {
+                continue;
+            };
+            if !defined.contains(&DefinitionSite {
+                file: relative.clone(),
+                line,
+            }) {
+                continue;
+            }
+            let base = positions.extent(shape.base);
+            return_shapes.insert(
+                DefinitionSite {
+                    file: relative.clone(),
+                    line,
+                },
+                BodyShape {
+                    kind: shape.kind,
+                    first_line: base.line,
+                    last_line: base.last_line,
+                },
+            );
+        }
+        if resolved.is_empty() {
+            continue;
+        }
         let rows_here = row_lines.get(&relative);
         let flows = crate::return_flow::call_flows(&module);
         for (span, flow) in &flows {
@@ -536,33 +617,7 @@ fn read_side_calls(
             side_calls.insert((relative.clone(), extent.line, target.clone()), side);
         }
     }
-    side_calls
-}
-
-/// The service's definitions a call of which is worth the request's parsed
-/// body unchanged, named as every service names a definition.
-fn hands_back_body(
-    definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
-    root: &str,
-    passes_body: &dyn Fn(&Path, &str) -> bool,
-) -> HashSet<DefinitionSite> {
-    definitions
-        .values()
-        .filter(|definition| definition.name != crate::visitor::MODULE_SCOPE_KEY)
-        .filter_map(|definition| {
-            let file = definition.file_path.to_string_lossy();
-            let absolute = if definition.file_path.is_absolute() {
-                definition.file_path.clone()
-            } else {
-                Path::new(root).join(&definition.file_path)
-            };
-            let canonical = absolute.canonicalize().unwrap_or(absolute);
-            passes_body(&canonical, &definition.name).then(|| DefinitionSite {
-                file: crate::engine::repo_relative(&file, root),
-                line: definition.line_number,
-            })
-        })
-        .collect()
+    (side_calls, return_shapes)
 }
 
 /// A row this pass may settle: the model's own reading, with nothing linking
@@ -1076,6 +1131,11 @@ pub struct Settled {
     /// row's call is not the call that reaches the request: what it returns
     /// is another function's result.
     pub types_not_carried: usize,
+    /// Corrected rows whose chain hands back the request's body, and whose
+    /// captured response type is a bare top type (`unknown`, `any`): the
+    /// entry is dropped, since an entry left at `unknown` makes its pair
+    /// unverifiable.
+    pub types_unknown: usize,
     /// Corrected rows that kept their response entry and lost their request
     /// entry: the call's arguments are the called function's parameters.
     pub requests_not_carried: usize,
@@ -1110,15 +1170,16 @@ pub struct Settled {
 ///
 /// A corrected row keeps the RESPONSE type anchored at it only where the
 /// row's call is itself the call that reaches the request (its own callee
-/// decided) and that callee hands back the request's parsed body unchanged
-/// (the service's request summaries say so, carrick#1601): only then is what
-/// the call returns what the caller reads of the request, so the pair is
-/// judged against the reached operation's producer. Its request entry always
-/// goes: the call's arguments are the called function's parameters, not a
-/// request body. Anywhere else (a spread call or a callback decided, or the
-/// callee returns an envelope, a mapped object, or a value nothing here
-/// reads) the anchor names a function's own result, and the entries are
-/// dropped and counted.
+/// decided) and the chain of functions from that callee to the request hands
+/// back the request's body, read exactly one step off the transport's value
+/// ([`ReachGraph::hands_back_body`], carrick#2377): only then is what the
+/// call returns what the caller reads of the request, so the pair is judged
+/// against the reached operation's producer. Its request entry always goes:
+/// the call's arguments are the called function's parameters, not a request
+/// body. Anywhere else (a spread call or a callback decided, or the chain
+/// builds a value around the body, reads it twice, or passes it through
+/// another function) the anchor names a function's own result, and the
+/// entries are dropped and counted.
 pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     let mut graph = ReachGraph::of(services.iter().map(|service| &*service.data));
     let sites: Vec<&CallThroughSites> = services.iter().map(|service| service.sites).collect();
@@ -1127,9 +1188,10 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         .flat_map(|sites| sites.side_calls.iter())
         .map(|(key, side)| (key.clone(), side.clone()))
         .collect();
-    let hands_back_body: HashSet<&DefinitionSite> = sites
+    graph.shapes = sites
         .iter()
-        .flat_map(|sites| &sites.hands_back_body)
+        .flat_map(|sites| sites.return_shapes.iter())
+        .map(|(definition, shape)| (definition.clone(), *shape))
         .collect();
     let owners = file_owners(services.iter().map(|service| &*service.data));
     let siblings = SiblingLines::of(services.iter().map(|service| &*service.data));
@@ -1146,32 +1208,32 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                 Reach::None => settled.reaches_none += 1,
                 Reach::Several => settled.reaches_several += 1,
                 Reach::Unstated => settled.reaches_unstated += 1,
-                Reach::One {
-                    request,
-                    by_own_callee,
-                } => match apply(
+                Reach::One { request, step } => match apply(
                     service.data,
                     row,
                     request,
-                    // What the row's call returns is the request's parsed
-                    // body only where its own callee decided and every
-                    // definition that callee goes through hands that body
-                    // back unchanged (carrick#1601).
-                    by_own_callee
+                    // What the row's call returns is the request's body only
+                    // where its own callee decided and every definition that
+                    // callee goes through hands back that body, read one way
+                    // (carrick#2377).
+                    step == 0
                         && row.steps.first().is_some_and(|callee| {
+                            let operation = operation_of(request);
                             !callee.is_empty()
                                 && callee
                                     .iter()
-                                    .all(|definition| hands_back_body.contains(definition))
+                                    .all(|definition| graph.hands_back_body(definition, &operation))
                         }),
                 ) {
                     Some(Change::Relabelled) => settled.relabelled += 1,
                     Some(Change::Corrected {
                         types_dropped,
+                        types_unknown,
                         request_dropped,
                     }) => {
                         corrected += 1;
                         settled.types_not_carried += usize::from(types_dropped);
+                        settled.types_unknown += usize::from(types_unknown);
                         settled.requests_not_carried += usize::from(request_dropped);
                     }
                     None => {}
@@ -1194,10 +1256,11 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
     }
     debug!(
-        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
+        "Call-through rows settled: {} confirmed, {} corrected ({} lost the types anchored at a call that is not the request's, {} lost an unknown type the chain hands back, {} kept the response type and lost the request type); left alone: {} reach no request row, {} reach several operations, {} reach a request only the model states (carrick#1146)",
         settled.relabelled,
         settled.corrected,
         settled.types_not_carried,
+        settled.types_unknown,
         settled.requests_not_carried,
         settled.reaches_none,
         settled.reaches_several,
@@ -1726,6 +1789,12 @@ struct Reached {
     dispatch: Option<crate::dispatch::Dispatch>,
     /// `"<file>:<line>"`, the row's own `file_location`.
     site: String,
+    /// The line the row is written on.
+    line: u32,
+    /// The request is made through a library's client, whose result holds
+    /// the body in a member the library names: a request spec, or a row the
+    /// library store states.
+    library: bool,
 }
 
 enum Reach<'g> {
@@ -1735,8 +1804,9 @@ enum Reach<'g> {
     Unstated,
     One {
         request: &'g Reached,
-        /// The row's own callee reached it, not a spread call or a callback.
-        by_own_callee: bool,
+        /// The step of the row that reached it: 0 is the row's own callee, 1
+        /// a call spread into an argument, 2 a callback among the arguments.
+        step: usize,
     },
 }
 
@@ -1803,6 +1873,8 @@ struct ReachGraph {
     side_calls: HashMap<SideKey, SideCall>,
     /// Whether a definition makes a request, as far as it has been asked.
     makes_request: std::cell::RefCell<HashMap<DefinitionSite, bool>>,
+    /// Every service's return shapes ([`CallThroughSites::return_shapes`]).
+    shapes: HashMap<DefinitionSite, BodyShape>,
 }
 
 impl ReachGraph {
@@ -1934,6 +2006,9 @@ impl ReachGraph {
                             base: call.base.clone(),
                             dispatch: call.dispatch.clone(),
                             site: call.file_location.clone(),
+                            line,
+                            library: call.resolution_source == Some(ResolutionSource::RequestSpec)
+                                || !call.library_semantics.is_empty(),
                         });
                     } else {
                         graph
@@ -2034,6 +2109,99 @@ impl ReachGraph {
                         Outer::Unknown => false,
                     })
             }
+        }
+    }
+
+    /// Whether a call of `start` is worth the body of a request of
+    /// `operation` (carrick#2377): the value each function on the way returns
+    /// is the value of the call that leads on, and exactly one of them reads
+    /// one step off it.
+    ///
+    /// From `start`, each definition is read through its return shape
+    /// ([`BodyShape`]); a definition with none, or one that returns anything
+    /// else, leaves the chain unproven. A parse (`.json()`) or one member
+    /// read counts a step, a value passed whole counts none. Where the
+    /// definition writes a request of `operation` inside the lines of the call
+    /// it returns, the request is reached and the walk goes no further from
+    /// it. Elsewhere it follows only the calls written inside those lines
+    /// (the helper called, and the calls in its arguments, such as a callback
+    /// handed to it), never a call written outside them (a client's factory):
+    /// that call's value is not what is returned. A call whose value is
+    /// dropped, or goes only into a request's arguments, is skipped; a call
+    /// whose value goes into another function that makes no request is
+    /// unproven, since the value passes through that function.
+    ///
+    /// Proven means the request is reached, nothing is unproven, the steps
+    /// total one, and that step is a parse, or a member read of a request made
+    /// through a library, whose result holds its body in a member the library
+    /// names. A member read of a `fetch` is the response's own member
+    /// (`response.ok`), not its body.
+    fn hands_back_body(&self, start: &DefinitionSite, operation: &Operation) -> bool {
+        let Some((start, _)) = self.calls.get_key_value(start) else {
+            return false;
+        };
+        let mut seen: HashSet<&DefinitionSite> = HashSet::from([start]);
+        let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::from([(start, 0)]);
+        let mut steps: Vec<ShapeKind> = Vec::new();
+        let mut reached = false;
+        let mut library = true;
+        while let Some((definition, depth)) = queue.pop_front() {
+            let Some(shape) = self.shapes.get(definition) else {
+                return false;
+            };
+            if shape.kind != ShapeKind::Value {
+                steps.push(shape.kind);
+            }
+            let written_in_base = |line: u32| shape.first_line <= line && line <= shape.last_line;
+            let mut holds = false;
+            for request in self
+                .requests
+                .get(definition)
+                .into_iter()
+                .flatten()
+                .filter(|request| written_in_base(request.line))
+                .filter(|request| operation_of(request) == *operation)
+            {
+                holds = true;
+                library &= request.library;
+            }
+            if holds {
+                reached = true;
+                continue;
+            }
+            if depth == MAX_EDGE_DEPTH {
+                return false;
+            }
+            for edge in self.calls.get(definition).into_iter().flatten() {
+                if edge.line == 0 {
+                    return false;
+                }
+                if !written_in_base(edge.line) {
+                    continue;
+                }
+                if edge.count == 1 {
+                    let side =
+                        self.side_calls
+                            .get(&(definition.file.clone(), edge.line, edge.to.clone()));
+                    if side.is_some() {
+                        if self.side_edge(definition, edge) {
+                            continue;
+                        }
+                        return false;
+                    }
+                }
+                let Some((callee, _)) = self.calls.get_key_value(&edge.to) else {
+                    return false;
+                };
+                if seen.insert(callee) {
+                    queue.push_back((callee, depth + 1));
+                }
+            }
+        }
+        match steps.as_slice() {
+            [ShapeKind::Parsed] => reached,
+            [ShapeKind::Member] => reached && library,
+            _ => false,
         }
     }
 
@@ -2148,12 +2316,12 @@ impl<'g> Decider<'g> {
         Reach::None
     }
 
-    /// `reach` with whether the row's own callee decided.
+    /// `reach` with the step of the row that decided.
     fn placed(&self, reach: Reach<'g>, position: usize) -> Reach<'g> {
         match reach {
             Reach::One { request, .. } => Reach::One {
                 request,
-                by_own_callee: position == 0,
+                step: position,
             },
             other => other,
         }
@@ -2201,7 +2369,7 @@ impl<'g> Decider<'g> {
         }
         Reach::One {
             request: first,
-            by_own_callee: false,
+            step: 0,
         }
     }
 
@@ -2261,6 +2429,9 @@ enum Change {
         /// The row held consumer type entries and they were dropped, because
         /// the row's call is not the call that reaches the request.
         types_dropped: bool,
+        /// The chain hands back the request's body but the type captured at
+        /// the row is a bare top type: the entries were dropped.
+        types_unknown: bool,
         /// The row kept its response entry and its request entry was
         /// dropped: a call's arguments are not a request body.
         request_dropped: bool,
@@ -2268,8 +2439,9 @@ enum Change {
 }
 
 /// Change the one row of `data` that `row` names to what `reached` states.
-/// `carries_response`: the row's call is worth the request's parsed body
-/// unchanged, so the response type anchored there is the request's. `None`
+/// `carries_response`: the chain from the row's call hands back the request's
+/// body ([`ReachGraph::hands_back_body`]), so the response type anchored there
+/// is the request's. `None`
 /// when the blob holds no such row: the graph build keeps fewer rows than the
 /// analysis stated.
 fn apply(
@@ -2319,6 +2491,34 @@ fn apply(
             && call.dispatch == reached.dispatch
     });
     let own_route = serves_own_route(graph, reached);
+    // The entries anchored at the site were captured under the operation the
+    // model stated.
+    let at_the_row = |entry: &crate::cloud_storage::TypeManifestEntry| {
+        entry.role == ManifestRole::Consumer
+            && entry.file_path == row.file
+            && entry.line_number == row.line
+            && before.as_http().is_some_and(|(method, path)| {
+                entry
+                    .key
+                    .as_http()
+                    .is_some_and(|(entry_method, entry_path)| {
+                        entry_method == normalize_manifest_method(method) && entry_path == path
+                    })
+            })
+    };
+    // A chain that hands back the body but whose type the compiler could not
+    // say (the helper's `T` is never given) is a bare top type: judged, it
+    // makes its pair unverifiable, so the entry goes (carrick#2377).
+    let types_unknown = carries_response && !twin && {
+        let responses: Vec<&crate::cloud_storage::TypeManifestEntry> = data
+            .type_manifest
+            .iter()
+            .flatten()
+            .filter(|entry| at_the_row(entry) && entry.type_kind == ManifestTypeKind::Response)
+            .collect();
+        !responses.is_empty() && responses.iter().all(|entry| is_bare_top_type(entry))
+    };
+    let carries_response = carries_response && !types_unknown;
     if twin {
         graph.data_calls.remove(index);
     } else {
@@ -2357,31 +2557,18 @@ fn apply(
         }
     }
 
-    // The types anchored at the site were captured under the operation the
-    // model stated. Where the row's call hands back the request's parsed body
-    // unchanged, what it returns is what the caller reads of that request:
-    // the entries keep their captured types (the alias names the site, not
-    // the operation) and take the reached operation's key, so the
-    // cross-service check judges them against its producer. Anywhere else
-    // the call's value is a function's own result (an envelope, a mapped
-    // object, a hook's state), as at any call #1601 restates at a caller, or
-    // the site already holds a row for the reached operation: they go.
+    // Where the row's call hands back the request's body (the chain from its
+    // callee reads one step off the transport's value), what it returns is
+    // what the caller reads of that request: the entries keep their captured
+    // types (the alias names the site, not the operation) and take the
+    // reached operation's key, so the cross-service check judges them against
+    // its producer. Anywhere else the call's value is a function's own result
+    // (an envelope, a mapped object, a hook's state), or the site already
+    // holds a row for the reached operation, or the type is a bare top type:
+    // they go.
     let mut types_dropped = false;
     let mut request_dropped = false;
-    if let (Some(manifest), Some((method, path))) = (data.type_manifest.as_mut(), before.as_http())
-    {
-        let method = normalize_manifest_method(method);
-        let at_the_row = |entry: &crate::cloud_storage::TypeManifestEntry| {
-            entry.role == ManifestRole::Consumer
-                && entry.file_path == row.file
-                && entry.line_number == row.line
-                && entry
-                    .key
-                    .as_http()
-                    .is_some_and(|(entry_method, entry_path)| {
-                        entry_method == method && entry_path == path
-                    })
-        };
+    if let Some(manifest) = data.type_manifest.as_mut() {
         if carries_response && !twin {
             let carried = OperationKey::http(
                 &normalize_manifest_method(&reached.method),
@@ -2403,13 +2590,38 @@ fn apply(
         } else {
             let before = manifest.len();
             manifest.retain(|entry| !at_the_row(entry));
-            types_dropped = !twin && manifest.len() < before;
+            types_dropped = !twin && !types_unknown && manifest.len() < before;
         }
     }
+    debug!(
+        "  - {location}: consumer types {}",
+        if types_unknown {
+            "dropped, the chain hands back the body but the type is unknown"
+        } else if carries_response && !twin {
+            "kept, the chain hands back the request's body"
+        } else if types_dropped {
+            "dropped, the chain does not hand back the request's body"
+        } else {
+            "none to carry"
+        }
+    );
     Some(Change::Corrected {
         types_dropped,
+        types_unknown,
         request_dropped,
     })
+}
+
+/// Whether a captured type says nothing: the compiler could not state it, or
+/// it is `unknown` or `any` as written.
+fn is_bare_top_type(entry: &crate::cloud_storage::TypeManifestEntry) -> bool {
+    let bare = |text: &Option<String>| {
+        text.as_deref()
+            .is_some_and(|text| matches!(text.trim(), "unknown" | "any"))
+    };
+    entry.type_state == crate::cloud_storage::ManifestTypeState::Unknown
+        || bare(&entry.resolved_definition)
+        || bare(&entry.expanded_definition)
 }
 
 #[cfg(test)]
@@ -2465,7 +2677,24 @@ mod tests {
                     ]),
                 ),
             ];
-            let bodies = [definition("b.ts", 9), definition("b.ts", 1)];
+            let shapes = [
+                (
+                    definition("b.ts", 9),
+                    BodyShape {
+                        kind: ShapeKind::Member,
+                        first_line: 10,
+                        last_line: 12,
+                    },
+                ),
+                (
+                    definition("b.ts", 1),
+                    BodyShape {
+                        kind: ShapeKind::Value,
+                        first_line: 2,
+                        last_line: 2,
+                    },
+                ),
+            ];
             CallThroughSites {
                 rows: vec![SiteRow {
                     file: "a.ts".to_string(),
@@ -2474,7 +2703,7 @@ mod tests {
                     target: "/getRun".to_string(),
                     steps: vec![vec![definition("b.ts", 9)], vec![]],
                 }],
-                hands_back_body: order.iter().map(|&i| bodies[i].clone()).collect(),
+                return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
             }
@@ -2485,13 +2714,34 @@ mod tests {
         let read: StoredCallThrough = serde_json::from_str(&written).unwrap();
         let back = read.sites();
         assert_eq!(back.rows, sites.rows);
-        assert_eq!(back.hands_back_body, sites.hands_back_body);
+        assert_eq!(back.return_shapes, sites.return_shapes);
         assert_eq!(back.side_calls, sites.side_calls);
         assert_eq!(
             serde_json::to_string(&StoredCallThrough::of(&facts(&[1, 0])).unwrap()).unwrap(),
             written
         );
         assert_eq!(StoredCallThrough::of(&CallThroughSites::default()), None);
+        // A service with return shapes and nothing else is still stored.
+        let only_shapes = CallThroughSites {
+            return_shapes: sites.return_shapes.clone(),
+            ..CallThroughSites::default()
+        };
+        assert!(StoredCallThrough::of(&only_shapes).is_some());
+    }
+
+    /// A blob written before the return shapes carries the list of definitions
+    /// whose call was worth the request's parsed body; it loads, reading as a
+    /// service whose chains are unproven until it is rescanned.
+    #[test]
+    fn a_blob_written_with_the_old_body_list_still_loads() {
+        let written = r#"{
+            "rows": [{"file": "a.ts", "line": 7, "method": "GET", "target": "/getRun", "steps": [[{"file": "b.ts", "line": 9}]]}],
+            "hands_back_body": [{"file": "b.ts", "line": 9}],
+            "side_calls": []
+        }"#;
+        let read: StoredCallThrough = serde_json::from_str(written).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert!(read.sites().return_shapes.is_empty());
     }
 
     /// A model row on `line` that no candidate joined: it has no span.
@@ -2870,6 +3120,224 @@ mod tests {
             (0, 1, 0),
             "{settled:?}"
         );
+    }
+
+    /// A definition of `file` between `first` and `last` that calls these
+    /// definitions, each as (file, line it opens on, line the call is on).
+    fn calling(
+        name: &str,
+        file: &str,
+        first: u32,
+        last: u32,
+        calls: &[(&str, u32, u32)],
+    ) -> crate::visitor::FunctionDefinition {
+        let mut definition = function(name, file, first, last, None);
+        definition.calls = calls
+            .iter()
+            .map(|(to, line, at)| crate::visitor::FunctionCallRef {
+                name: String::new(),
+                file_path: to.to_string(),
+                line_number: *line,
+                call_site_line: *at,
+                call_count: 1,
+            })
+            .collect();
+        definition
+    }
+
+    fn shaped(
+        definition: (&str, u32),
+        kind: ShapeKind,
+        first_line: u32,
+        last_line: u32,
+    ) -> (DefinitionSite, BodyShape) {
+        (
+            self::definition(definition.0, definition.1),
+            BodyShape {
+                kind,
+                first_line,
+                last_line,
+            },
+        )
+    }
+
+    /// The graph of one service with these definitions, return shapes and
+    /// request rows (file, line, written through a library).
+    fn chain(
+        definitions: Vec<crate::visitor::FunctionDefinition>,
+        shapes: Vec<(DefinitionSite, BodyShape)>,
+        requests: &[(&str, u32, bool)],
+    ) -> ReachGraph {
+        let mut data = blob("app");
+        for definition in definitions {
+            put(&mut data, definition);
+        }
+        for (file, line, library) in requests {
+            let mut call = request_at(file, *line);
+            if *library {
+                call.resolution_source = Some(ResolutionSource::RequestSpec);
+            }
+            data.mount_graph.as_mut().unwrap().data_calls.push(call);
+        }
+        let mut graph = ReachGraph::of(std::iter::once(&data));
+        graph.shapes = shapes.into_iter().collect();
+        graph
+    }
+
+    fn things() -> Operation {
+        ("GET".to_string(), "/things".to_string(), String::new())
+    }
+
+    /// Value, then a helper that reads one member, then a spec: one step, off
+    /// a library request.
+    fn value_member_spec(helper: ShapeKind) -> bool {
+        let graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("b.ts", 10, 2), ("c.ts", 1, 3)]),
+                function("helper", "b.ts", 10, 14, None),
+                function("spec", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 2, 4),
+                shaped(("b.ts", 10), helper, 12, 12),
+                shaped(("c.ts", 1), ShapeKind::Value, 2, 3),
+            ],
+            &[("c.ts", 3, true)],
+        );
+        graph.hands_back_body(&definition("a.ts", 1), &things())
+    }
+
+    #[test]
+    fn a_member_read_by_a_helper_over_a_library_request_hands_back_its_body() {
+        assert!(value_member_spec(ShapeKind::Member));
+    }
+
+    #[test]
+    fn a_chain_with_no_step_or_two_steps_hands_back_nothing() {
+        assert!(!value_member_spec(ShapeKind::Value));
+        // The spec itself reading a member makes it the second step.
+        let graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                function("spec", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Member, 2, 2),
+                shaped(("c.ts", 1), ShapeKind::Member, 2, 3),
+            ],
+            &[("c.ts", 3, true)],
+        );
+        assert!(!graph.hands_back_body(&definition("a.ts", 1), &things()));
+    }
+
+    #[test]
+    fn a_parse_hands_back_the_body_of_any_request_and_a_member_only_of_a_librarys() {
+        for (kind, library, proven) in [
+            (ShapeKind::Parsed, false, true),
+            (ShapeKind::Parsed, true, true),
+            (ShapeKind::Member, true, true),
+            (ShapeKind::Member, false, false),
+        ] {
+            let graph = chain(
+                vec![
+                    calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                    function("reader", "c.ts", 1, 4, None),
+                ],
+                vec![
+                    shaped(("a.ts", 1), ShapeKind::Value, 2, 2),
+                    shaped(("c.ts", 1), kind, 2, 3),
+                ],
+                &[("c.ts", 3, library)],
+            );
+            assert_eq!(
+                graph.hands_back_body(&definition("a.ts", 1), &things()),
+                proven,
+                "{kind:?} over a library request: {library}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_definition_with_no_return_shape_leaves_the_chain_unproven() {
+        let graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![shaped(("c.ts", 1), ShapeKind::Parsed, 2, 3)],
+            &[("c.ts", 3, false)],
+        );
+        assert!(!graph.hands_back_body(&definition("a.ts", 1), &things()));
+    }
+
+    #[test]
+    fn a_value_that_goes_into_a_function_making_no_request_leaves_the_chain_unproven() {
+        let mut graph = chain(
+            vec![
+                calling(
+                    "method",
+                    "a.ts",
+                    1,
+                    5,
+                    &[("b.ts", 10, 2), ("d.ts", 1, 2), ("c.ts", 1, 3)],
+                ),
+                function("helper", "b.ts", 10, 14, None),
+                function("mapper", "d.ts", 1, 3, None),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 2, 4),
+                shaped(("b.ts", 10), ShapeKind::Member, 12, 12),
+                shaped(("d.ts", 1), ShapeKind::Value, 2, 2),
+                shaped(("c.ts", 1), ShapeKind::Value, 2, 3),
+            ],
+            &[("c.ts", 3, true)],
+        );
+        let call = ("a.ts".to_string(), 2, definition("d.ts", 1));
+        // Dropped: a side call, skipped.
+        graph.side_calls.insert(call.clone(), SideCall::Discarded);
+        assert!(graph.hands_back_body(&definition("a.ts", 1), &things()));
+        // Handed to a mapper that makes no request: the value passes through it.
+        graph.side_calls.insert(
+            call,
+            SideCall::InputTo(vec![Outer::Calls(definition("d.ts", 1))]),
+        );
+        assert!(!graph.hands_back_body(&definition("a.ts", 1), &things()));
+    }
+
+    #[test]
+    fn a_call_written_outside_the_returned_calls_lines_is_not_followed() {
+        // The factory on line 2 has no shape; it is not the call returned.
+        let graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 6, &[("b.ts", 1, 2), ("c.ts", 1, 4)]),
+                function("factory", "b.ts", 1, 3, None),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 4, 5),
+                shaped(("c.ts", 1), ShapeKind::Parsed, 2, 3),
+            ],
+            &[("c.ts", 3, false)],
+        );
+        assert!(graph.hands_back_body(&definition("a.ts", 1), &things()));
+    }
+
+    #[test]
+    fn a_chain_to_another_operation_is_not_proven() {
+        let graph = chain(
+            vec![
+                calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
+                function("reader", "c.ts", 1, 4, None),
+            ],
+            vec![
+                shaped(("a.ts", 1), ShapeKind::Value, 2, 2),
+                shaped(("c.ts", 1), ShapeKind::Parsed, 2, 3),
+            ],
+            &[("c.ts", 3, false)],
+        );
+        let other = ("GET".to_string(), "/other".to_string(), String::new());
+        assert!(!graph.hands_back_body(&definition("a.ts", 1), &other));
     }
 
     /// A blob of `service` with these definitions, calls and graph rows.
