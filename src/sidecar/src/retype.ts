@@ -264,6 +264,14 @@ export class Retyper {
     }
 
     if (declaresTypeParameters(call)) {
+      const inferred = inferredTypeParameterOf(call);
+      if (inferred) {
+        return (
+          `the callee declares several type parameters and '${inferred}' is ` +
+          `inferred from the arguments, so writing one type argument would turn ` +
+          `its inference off`
+        );
+      }
       const open = call.getFirstChildByKind(SyntaxKind.OpenParenToken);
       if (!open) return 'the consumer call has no argument list to retype';
       const at = open.getStart();
@@ -1066,6 +1074,44 @@ function bodyReadEdit(read: CallExpression): (stated: string) => Edit[] {
     { start, end: start, text: '(' },
     { start: end, end, text: ` as Promise<${stated}>)`, statedAt: ' as Promise<'.length },
   ];
+}
+
+/**
+ * The name of a type parameter after the first that the call's arguments
+ * infer and whose default would change the call if inference were off, or
+ * `undefined`.
+ *
+ * Writing one type argument makes every other parameter take its default
+ * instead of its inferred type. A parameter the argument list mentions
+ * (`TVariables` in `options: Options<TData, TError, TVariables>`) and whose
+ * default is not `any` or `unknown` then types the argument against the
+ * default (`void`), and the call reports a diagnostic about the written
+ * argument, not about anything the consumer reads. A parameter nothing in the
+ * argument list mentions, or one defaulting to `any`, is unaffected.
+ */
+function inferredTypeParameterOf(call: CallExpression): string | undefined {
+  const declaration = resolvedDeclaration(call);
+  const typeParameters = declaration?.typeParameters;
+  if (!declaration || !typeParameters || typeParameters.length < 2) return undefined;
+  for (const parameter of typeParameters.slice(1)) {
+    const fallback = parameter.default;
+    if (
+      fallback &&
+      (fallback.kind === ts.SyntaxKind.AnyKeyword || fallback.kind === ts.SyntaxKind.UnknownKeyword)
+    ) {
+      continue;
+    }
+    const name = parameter.name.text;
+    if (declaration.parameters.some((p) => p.type && mentionsTypeName(p.type, name))) return name;
+  }
+  return undefined;
+}
+
+function mentionsTypeName(node: ts.Node, name: string): boolean {
+  if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && node.typeName.text === name) {
+    return true;
+  }
+  return ts.forEachChild(node, (child) => (mentionsTypeName(child, name) ? true : undefined)) ?? false;
 }
 
 function declaresTypeParameters(call: CallExpression): boolean {
