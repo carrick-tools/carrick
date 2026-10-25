@@ -437,43 +437,48 @@ fn a_corrected_row_whose_call_returns_another_shape_carries_no_type() {
 }
 
 /// carrick#2377: the chain from the call's callee to the request reads
-/// exactly one step off the transport's value: a client method hands the
-/// request to a helper that reads `.data` of a request spec's result
-/// (`Client.send`), or a class member returns a function's parsed `fetch`.
-/// The type the caller declared is the request's body, so it is kept under
-/// the reached operation and judged against its producer.
+/// exactly one step off the transport's value, and that step is the Fetch
+/// standard's `Response.json()`: a class member returns a function's parsed
+/// `fetch`. The type the caller declared is the request's body, so it is kept
+/// under the reached operation and judged against its producer.
 #[test]
-fn a_call_through_a_client_helper_that_reads_the_body_member_keeps_its_type() {
-    for (file, line, symbol, path) in [
-        (COMMANDS, 9, "Run", "/api/v1/runs/:id"),
-        (COMMANDS, 46, "SavedRun", "/api/v1/runs/:id"),
-        (TYPED_COMMANDS, 8, "SavedRun", "/api/v1/runs/:id"),
-        (TYPED_COMMANDS, 15, "Run", "/api/v1/runs/:id"),
-    ] {
+fn a_call_through_a_function_that_parses_a_fetch_keeps_its_type() {
+    let entries = consumer_entries_at("cli", TYPED_COMMANDS, 15);
+    assert!(
+        entries.iter().any(|entry| {
+            entry["type_kind"] == "response"
+                && entry["path"] == "/api/v1/runs/:id"
+                && entry["primary_type_symbol"] == "Run"
+        }),
+        "{TYPED_COMMANDS}:15 keeps its Run: {entries:#?}"
+    );
+    assert_eq!(
+        response_verdicts_at(TYPED_COMMANDS, 15),
+        [(
+            "http|GET|/api/v1/runs/:id".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// carrick#2377: a client wrapper that reads a member of a library client's
+/// result (`.data` here, `.status` in another) is not taken as handing back
+/// the body: which member holds it is the library store's to state
+/// (carrick-cloud#2639). The row still takes the operation, keeps no type,
+/// and so gets no verdict, where a guess would give a false one.
+#[test]
+fn a_wrapper_that_reads_a_member_of_a_library_clients_result_abstains() {
+    for (file, line) in [(COMMANDS, 9), (COMMANDS, 46), (TYPED_COMMANDS, 8)] {
+        assert!(
+            row_at("cli", file, line).reaches.is_some(),
+            "{file}:{line} still takes the request it reaches"
+        );
         let entries = consumer_entries_at("cli", file, line);
         assert!(
-            entries.iter().any(|entry| {
-                entry["type_kind"] == "response"
-                    && entry["path"] == path
-                    && entry["primary_type_symbol"] == symbol
-            }),
-            "{file}:{line} keeps its {symbol}: {entries:#?}"
+            entries.is_empty(),
+            "{file}:{line} carries no type: {entries:#?}"
         );
-    }
-    for (file, line, method, verdict) in [
-        (COMMANDS, 9, "GET", "compatible"),
-        (COMMANDS, 46, "PUT", "incompatible"),
-        (TYPED_COMMANDS, 8, "PUT", "incompatible"),
-        (TYPED_COMMANDS, 15, "GET", "compatible"),
-    ] {
-        assert_eq!(
-            response_verdicts_at(file, line),
-            [(
-                format!("http|{method}|/api/v1/runs/:id"),
-                verdict.to_string()
-            )],
-            "{file}:{line}"
-        );
+        assert_eq!(response_verdicts_at(file, line), []);
     }
 }
 
@@ -497,24 +502,20 @@ fn a_chain_that_builds_reads_twice_or_passes_through_another_function_drops_its_
     }
 }
 
-/// carrick#2377: a chain that does hand back the body, whose type the
-/// compiler could not state (the helper's `T` is never given), carries an
-/// entry that would make its pair unverifiable. It is dropped and counted
-/// apart from the chains that are not the body.
+/// The client methods whose helper never gets its `T` read a member of a
+/// library client's result, so they abstain like the others; no unknown type
+/// reaches a verdict. (A proven chain with a bare top type is dropped and
+/// counted apart: unit test `a_bare_top_type_is_no_type_to_carry`.)
 #[test]
-fn a_proven_chain_with_an_unknown_type_drops_it_and_counts_it() {
+fn a_client_method_with_a_helper_that_is_never_given_its_type_carries_nothing() {
     for line in [21, 64, 101, 164] {
         let entries = consumer_entries_at("cli", COMMANDS, line);
         assert!(
             entries.is_empty(),
-            "an unknown type is not carried ({COMMANDS}:{line}): {entries:#?}"
+            "no type is carried ({COMMANDS}:{line}): {entries:#?}"
         );
+        assert_eq!(response_verdicts_at(COMMANDS, line), []);
     }
-    assert!(
-        settled_line().contains("4 lost an unknown type the chain hands back"),
-        "{}",
-        settled_line()
-    );
 }
 
 /// Every method of the client makes a request of its own before the one it
@@ -573,7 +574,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(8 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(15 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -606,10 +607,10 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 9, 46, 145 and 157 of `commands.ts` and lines 8 and 15 of
-    // `typed-commands.ts` keep their response entry.
+    // Lines 145 and 157 of `commands.ts` and line 15 of `typed-commands.ts`
+    // keep their response entry.
     assert!(
-        settled_line().contains("6 kept the response type and lost the request type)"),
+        settled_line().contains("3 kept the response type and lost the request type)"),
         "{}",
         settled_line()
     );

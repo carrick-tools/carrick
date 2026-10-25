@@ -1791,10 +1791,6 @@ struct Reached {
     site: String,
     /// The line the row is written on.
     line: u32,
-    /// The request is made through a library's client, whose result holds
-    /// the body in a member the library names: a request spec, or a row the
-    /// library store states.
-    library: bool,
 }
 
 enum Reach<'g> {
@@ -2007,8 +2003,6 @@ impl ReachGraph {
                             dispatch: call.dispatch.clone(),
                             site: call.file_location.clone(),
                             line,
-                            library: call.resolution_source == Some(ResolutionSource::RequestSpec)
-                                || !call.library_semantics.is_empty(),
                         });
                     } else {
                         graph
@@ -2114,8 +2108,8 @@ impl ReachGraph {
 
     /// Whether a call of `start` is worth the body of a request of
     /// `operation` (carrick#2377): the value each function on the way returns
-    /// is the value of the call that leads on, and exactly one of them reads
-    /// one step off it.
+    /// is the value of the call that leads on, and exactly one of them parses
+    /// it.
     ///
     /// From `start`, each definition is read through its return shape
     /// ([`BodyShape`]); a definition with none, or one that returns anything
@@ -2132,10 +2126,11 @@ impl ReachGraph {
     /// unproven, since the value passes through that function.
     ///
     /// Proven means the request is reached, nothing is unproven, the steps
-    /// total one, and that step is a parse, or a member read of a request made
-    /// through a library, whose result holds its body in a member the library
-    /// names. A member read of a `fetch` is the response's own member
-    /// (`response.ok`), not its body.
+    /// total one, and that step is the Fetch standard's `Response.json()`. A
+    /// member read (`.data`, `.status`) is never taken as the body: which
+    /// member of a library client's result holds it is the library store's to
+    /// state (carrick-cloud#2639), so such a chain abstains and the row keeps
+    /// no type.
     fn hands_back_body(&self, start: &DefinitionSite, operation: &Operation) -> bool {
         let Some((start, _)) = self.calls.get_key_value(start) else {
             return false;
@@ -2144,7 +2139,6 @@ impl ReachGraph {
         let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::from([(start, 0)]);
         let mut steps: Vec<ShapeKind> = Vec::new();
         let mut reached = false;
-        let mut library = true;
         while let Some((definition, depth)) = queue.pop_front() {
             let Some(shape) = self.shapes.get(definition) else {
                 return false;
@@ -2153,18 +2147,14 @@ impl ReachGraph {
                 steps.push(shape.kind);
             }
             let written_in_base = |line: u32| shape.first_line <= line && line <= shape.last_line;
-            let mut holds = false;
-            for request in self
+            let holds = self
                 .requests
                 .get(definition)
                 .into_iter()
                 .flatten()
-                .filter(|request| written_in_base(request.line))
-                .filter(|request| operation_of(request) == *operation)
-            {
-                holds = true;
-                library &= request.library;
-            }
+                .any(|request| {
+                    written_in_base(request.line) && operation_of(request) == *operation
+                });
             if holds {
                 reached = true;
                 continue;
@@ -2198,11 +2188,7 @@ impl ReachGraph {
                 }
             }
         }
-        match steps.as_slice() {
-            [ShapeKind::Parsed] => reached,
-            [ShapeKind::Member] => reached && library,
-            _ => false,
-        }
+        reached && steps == [ShapeKind::Parsed]
     }
 
     /// Whether `start`, or a definition it reaches within [`MAX_EDGE_DEPTH`]
@@ -3207,23 +3193,62 @@ mod tests {
         graph.hands_back_body(&definition("a.ts", 1), &things())
     }
 
+    /// A manifest entry with this state and definition.
+    fn entry_typed(
+        state: &str,
+        definition: Option<&str>,
+    ) -> crate::cloud_storage::TypeManifestEntry {
+        serde_json::from_value(serde_json::json!({
+            "protocol": "http", "method": "GET", "path": "/things",
+            "role": "consumer", "type_kind": "response", "type_alias": "A",
+            "file_path": "a.ts", "line_number": 3, "is_explicit": false,
+            "type_state": state, "resolved_definition": definition,
+            "evidence": {
+                "file_path": "a.ts", "span_start": null, "span_end": null,
+                "line_number": 3, "infer_kind": "request_body",
+                "is_explicit": false, "type_state": state
+            }
+        }))
+        .expect("an entry")
+    }
+
     #[test]
-    fn a_member_read_by_a_helper_over_a_library_request_hands_back_its_body() {
-        assert!(value_member_spec(ShapeKind::Member));
+    fn a_bare_top_type_is_no_type_to_carry() {
+        assert!(is_bare_top_type(&entry_typed("unknown", None)));
+        assert!(is_bare_top_type(&entry_typed("implicit", Some("unknown"))));
+        assert!(is_bare_top_type(&entry_typed("implicit", Some(" any "))));
+        assert!(!is_bare_top_type(&entry_typed("explicit", Some("Run"))));
+        assert!(!is_bare_top_type(&entry_typed(
+            "implicit",
+            Some("unknown[]")
+        )));
+    }
+
+    #[test]
+    fn a_parse_by_a_helper_hands_back_the_body() {
+        assert!(value_member_spec(ShapeKind::Parsed));
+    }
+
+    /// carrick#2377: a made-up client's wrapper returns `res.status`, or `.data`
+    /// of a library's result. Which member holds the body is the library
+    /// store's to state, so a member read is never taken as the body.
+    #[test]
+    fn a_member_read_by_a_helper_over_a_library_request_abstains() {
+        assert!(!value_member_spec(ShapeKind::Member));
     }
 
     #[test]
     fn a_chain_with_no_step_or_two_steps_hands_back_nothing() {
         assert!(!value_member_spec(ShapeKind::Value));
-        // The spec itself reading a member makes it the second step.
+        // Two parses are two steps.
         let graph = chain(
             vec![
                 calling("method", "a.ts", 1, 5, &[("c.ts", 1, 2)]),
                 function("spec", "c.ts", 1, 4, None),
             ],
             vec![
-                shaped(("a.ts", 1), ShapeKind::Member, 2, 2),
-                shaped(("c.ts", 1), ShapeKind::Member, 2, 3),
+                shaped(("a.ts", 1), ShapeKind::Parsed, 2, 2),
+                shaped(("c.ts", 1), ShapeKind::Parsed, 2, 3),
             ],
             &[("c.ts", 3, true)],
         );
@@ -3231,11 +3256,11 @@ mod tests {
     }
 
     #[test]
-    fn a_parse_hands_back_the_body_of_any_request_and_a_member_only_of_a_librarys() {
+    fn a_parse_hands_back_the_body_and_a_member_read_never_does() {
         for (kind, library, proven) in [
             (ShapeKind::Parsed, false, true),
             (ShapeKind::Parsed, true, true),
-            (ShapeKind::Member, true, true),
+            (ShapeKind::Member, true, false),
             (ShapeKind::Member, false, false),
         ] {
             let graph = chain(
@@ -3287,7 +3312,7 @@ mod tests {
             ],
             vec![
                 shaped(("a.ts", 1), ShapeKind::Value, 2, 4),
-                shaped(("b.ts", 10), ShapeKind::Member, 12, 12),
+                shaped(("b.ts", 10), ShapeKind::Parsed, 12, 12),
                 shaped(("d.ts", 1), ShapeKind::Value, 2, 2),
                 shaped(("c.ts", 1), ShapeKind::Value, 2, 3),
             ],

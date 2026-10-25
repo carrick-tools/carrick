@@ -34,18 +34,19 @@ Types at the corrected rows:
 |---|---|
 | `commands.ts:145` | `Run`, which matches what the API sends; the function called hands back the parsed body: kept under the reached operation and judged compatible |
 | `commands.ts:157` | `SavedRun`, a stale copy that requires a field the API no longer sends: kept and judged incompatible |
-| `commands.ts:9` | `Run`: the client method hands the request to a helper that reads `.data` of a request spec's result, one step: kept and judged compatible |
-| `commands.ts:46` | `SavedRun`, the same chain through `save`, whose request the API answers without `savedBy`: kept and judged incompatible |
+| `commands.ts:9`, `:46` | the client method hands the request to a helper that reads `.data` of a library client's result: a member read is never taken as the body, so the type is dropped (the library store will state the member, carrick-cloud#2639) |
 | `commands.ts:15` | no entry exists at the call (the caller declares no type), so none is kept |
-| `commands.ts:21`, `:64`, `:101`, `:164` | the chain hands back the body, but the helper's `T` is never given, so the type is `unknown`: dropped and counted apart |
+| `commands.ts:21`, `:64`, `:101`, `:164` | the same helper chain: dropped |
 | `commands.ts:151` | anchored at a call whose function wraps the body in an envelope: dropped and counted |
 | `commands.ts:176`, `:186` | the function called returns the transport's result whole, with no step read off it: dropped and counted |
 | `hooks.ts:9`, `:14`, `:19` | anchored at a hook's or a runner's call, whose result is not what the request returns: dropped and counted |
 
 A type is kept only where the chain of functions from the call's callee to the
-request reads exactly one step off the transport's value: the platform's
-`.json()` parse of a `fetch`, or one member read of a library client's result
-(carrick#2377, `ReachGraph::hands_back_body` in `src/call_through.rs`). The
+request reads exactly one step off the transport's value, and that step is the
+Fetch standard's `Response.json()` (carrick#2377, `ReachGraph::hands_back_body`
+in `src/call_through.rs`). A member read of a library client's result is never
+taken as the body; those wrappers abstain until the library store states the
+member (carrick-cloud#2639). The
 steps are counted over every function on the chain; a function whose value is
 built into an object, passed through another function, or read twice leaves
 the chain unproven.
@@ -55,7 +56,7 @@ the chain unproven.
 
 | Site | Outcome |
 |---|---|
-| `typed-commands.ts:8` (`saveRun`) | `SavedRun` kept, incompatible: the helper chain of `commands.ts:46` |
+| `typed-commands.ts:8` (`saveRun`) | dropped: the helper chain of `commands.ts:46` reads a member |
 | `typed-commands.ts:15` (`read`) | `Run` kept, compatible: a class member returning a function's parsed `fetch` |
 | `typed-commands.ts:22` (`getRunView`) | dropped: the value goes through `toView` before it is returned |
 | `typed-commands.ts:29` (`getRunState`) | dropped: two reads, the helper's member and then the run's own |
