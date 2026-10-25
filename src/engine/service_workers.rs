@@ -114,6 +114,18 @@ fn width_for(
     }
 }
 
+/// [`width_for`]'s count for a non-dispatched pass, for a test elsewhere in
+/// the crate that sets a sidecar heap cap and reads what width it buys.
+#[cfg(test)]
+pub(crate) fn width_with(
+    services: usize,
+    available_mb: Option<u64>,
+    cores: usize,
+    heap_cap_mb: Option<u64>,
+) -> usize {
+    width_for(services, false, available_mb, cores, heap_cap_mb, None).count
+}
+
 /// How one pass of services was scheduled, for a test to read: proof that
 /// services really ran side by side and finished out of order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -275,17 +275,7 @@ pub(super) fn rejoin(
         )
         .map_err(|e| e.to_string())?;
         let scan_dir = generation.join(format!("scan-{position}"));
-        let mut scan = scan_command(
-            &exe,
-            repo,
-            &scan_dir,
-            &previous,
-            None,
-            &super::index::Pass::Facts,
-        );
-        scan.arg("--changed-only")
-            .env(super::SKIP_SIGNATURES_ENV, "1")
-            .env_remove(crate::progress::PROGRESS_ENV);
+        let scan = rescan_command(&exe, repo, &scan_dir, &previous);
         bounded(scan, "re-scan", deadline)?;
         let mut fresh = read_blobs(&scan_dir)?;
         // A carried service is written by the scan only when the join moved
@@ -332,6 +322,49 @@ pub(super) fn rejoin(
         indexed,
         services: services.len(),
     })
+}
+
+/// The V8 heap each of a re-scan's sidecars may grow to, in MB, unless the
+/// caller set [`crate::services::type_sidecar::MAX_OLD_SPACE_ENV`] itself.
+///
+/// The scan sizes how many services it analyses at once from the free memory
+/// and this cap ([`crate::engine::service_workers`]), so the cap is what lets
+/// a re-scan run its services side by side without asking for more memory
+/// than the machine has: every sidecar is held to it. The default cap is for
+/// the inferred scan of a whole repo; a no-model re-scan of the services a
+/// change reaches peaked at 2.0 GB resident for its largest process on a
+/// 35-service monorepo (carrick#2826), so 3 GB leaves room and lets two to
+/// four services run at once on a laptop.
+const RESCAN_HEAP_CAP_MB: u64 = 3072;
+
+/// The subprocess one repo's re-scan runs as: the facts-only scan, analysing
+/// only the services whose inputs changed (`--changed-only`), with no
+/// signatures, no progress lines and the re-scan's heap cap.
+fn rescan_command(exe: &Path, repo: &Path, scan_dir: &Path, previous: &Path) -> Command {
+    let mut scan = scan_command(
+        exe,
+        repo,
+        scan_dir,
+        previous,
+        None,
+        &super::index::Pass::Facts,
+    );
+    scan.arg("--changed-only")
+        .env(super::SKIP_SIGNATURES_ENV, "1")
+        .env_remove(crate::progress::PROGRESS_ENV);
+    if let Some(cap) = rescan_heap_cap(
+        std::env::var_os(crate::services::type_sidecar::MAX_OLD_SPACE_ENV).as_deref(),
+    ) {
+        scan.env(crate::services::type_sidecar::MAX_OLD_SPACE_ENV, cap);
+    }
+    scan
+}
+
+/// The heap cap a re-scan sets, given what the caller's environment holds:
+/// [`RESCAN_HEAP_CAP_MB`], or nothing when the caller chose a cap (or turned
+/// it off) itself.
+fn rescan_heap_cap(caller: Option<&std::ffi::OsStr>) -> Option<String> {
+    caller.is_none().then(|| RESCAN_HEAP_CAP_MB.to_string())
 }
 
 /// Whether a blob's record of a function is about the file being re-checked.
@@ -450,6 +483,39 @@ fn bounded(mut command: Command, what: &str, deadline: Instant) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// carrick#2826: a re-scan holds every sidecar to its own heap cap, which
+    /// is what the scan sizes its width from, so the services a change
+    /// reaches run side by side within the memory the machine has. A cap the
+    /// caller chose is left alone.
+    #[test]
+    fn a_re_scan_caps_each_sidecar_unless_the_caller_chose_a_cap() {
+        assert_eq!(rescan_heap_cap(None), Some("3072".to_string()));
+        assert_eq!(rescan_heap_cap(Some(std::ffi::OsStr::new("8192"))), None);
+        assert_eq!(rescan_heap_cap(Some(std::ffi::OsStr::new("0"))), None);
+        let command = rescan_command(
+            Path::new("carrick"),
+            Path::new("/repo"),
+            Path::new("/out"),
+            Path::new("/previous.json"),
+        );
+        assert!(
+            command.get_args().any(|arg| arg == "--changed-only"),
+            "only the services a change reaches are analysed"
+        );
+        if std::env::var_os(crate::services::type_sidecar::MAX_OLD_SPACE_ENV).is_none() {
+            assert!(command.get_envs().any(|(key, value)| {
+                key == crate::services::type_sidecar::MAX_OLD_SPACE_ENV
+                    && value == Some(std::ffi::OsStr::new("3072"))
+            }));
+        }
+        // What that cap buys on a laptop with 12 GB free: two services at
+        // once where the default cap allows one.
+        assert_eq!(
+            crate::engine::service_workers::width_with(5, Some(12_452), 12, Some(3072)),
+            2
+        );
+    }
 
     #[test]
     fn the_budget_is_ten_seconds_unless_a_caller_says_otherwise() {
