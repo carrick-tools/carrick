@@ -102,6 +102,15 @@ const VALUES_OVER_CAP: &str = "values_over_cap";
 const VALUE_NEVER_BOUND: &str = "value_never_bound";
 const INJECTED_CALLEE: &str = "injected_callee";
 
+/// What a walk that found no site passed and could not read
+/// ([`MissedInside::reason`]), besides a call inside it could not follow: a
+/// sibling service's code, read without the instances its makers build
+/// (carrick#2618); a function handed to a package's function that no walk
+/// entered; routes registered in a sibling's code.
+pub const SIBLING_CODE: &str = "sibling_code";
+pub const HANDED_UNREAD: &str = "handed_unread";
+pub const SIBLING_ROUTES: &str = "sibling_routes";
+
 /// How many values a callee may hold before the walk stops reading them.
 const MAX_VALUES: usize = 16;
 
@@ -180,8 +189,22 @@ pub struct Discovery {
     pub finished: Vec<(String, u32, u32)>,
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
-    pub missed_inside: Vec<(String, u32, u32)>,
+    pub missed_inside: Vec<MissedInside>,
     pub counts: BTreeMap<String, usize>,
+}
+
+/// A call whose walk found no site and passed something it could not read
+/// on the way ([`Discovery::missed_inside`]), by file and SWC span, with
+/// the first thing it passed: one of [`Discovery::unfollowed`]'s reasons
+/// for a call inside, [`SIBLING_CODE`] for a walk into a sibling service's
+/// code, [`HANDED_UNREAD`] for a function handed to a package that no walk
+/// entered, or [`SIBLING_ROUTES`] for routes registered in a sibling's code.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct MissedInside {
+    pub file: String,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub reason: &'static str,
 }
 
 /// The labelled exports of the store's answer, by the store's package key
@@ -851,8 +874,9 @@ struct Outcome<'a> {
     cycle_at: Option<usize>,
     /// Somewhere in the code the walk read, a call could not be followed
     /// (one of [`Discovery::unfollowed`]'s reasons): a walk that found no
-    /// site has not read everything the call runs (carrick#2613).
-    missed: bool,
+    /// site has not read everything the call runs (carrick#2613). The first
+    /// such thing it passed ([`MissedInside::reason`]).
+    missed: Option<&'static str>,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
 }
@@ -948,7 +972,9 @@ impl<'a> Outcome<'a> {
         if self.stop.is_none() {
             self.stop = other.stop;
         }
-        self.missed |= other.missed;
+        if self.missed.is_none() {
+            self.missed = other.missed;
+        }
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1544,7 +1570,7 @@ impl<'a> Walker<'a> {
                 // the candidate there, as it did when the call was outside
                 // the service.
                 if !self.inputs.files.contains_key(&id.0) {
-                    out.missed = true;
+                    out.missed.get_or_insert(SIBLING_CODE);
                 }
                 // A function written at the call that the callee runs.
                 let runs = callee
@@ -1657,8 +1683,8 @@ impl<'a> Walker<'a> {
         let mut out = Outcome::default();
         for (call, construction) in body.read_calls() {
             let mut inner = self.call(file, body, call, construction);
-            if self.misses(file, body, call, construction, &inner) {
-                inner.missed = true;
+            if let Some(reason) = self.misses(file, body, call, construction, &inner) {
+                inner.missed.get_or_insert(reason);
             }
             out.absorb(inner);
         }
@@ -1672,7 +1698,8 @@ impl<'a> Walker<'a> {
     /// something it did not read (carrick#2613): a call it could not follow,
     /// or a function written at the call that no walk entered from it (a
     /// callback handed to a package's function) and that itself reaches a
-    /// labelled export or stops short.
+    /// labelled export or stops short. The first such thing
+    /// ([`MissedInside::reason`]), `None` when it passed nothing.
     fn misses(
         &mut self,
         file: &'a Path,
@@ -1680,23 +1707,29 @@ impl<'a> Walker<'a> {
         call: &CallIr,
         construction: bool,
         outcome: &Outcome,
-    ) -> bool {
+    ) -> Option<&'static str> {
         if !outcome.ends.is_empty() || outcome.stop.is_some() {
-            return false;
+            return None;
         }
-        if outcome.missed || self.unfollowed(file, call, construction).is_some() {
-            return true;
+        if let Some(reason) = outcome
+            .missed
+            .or_else(|| self.unfollowed(file, call, construction))
+        {
+            return Some(reason);
         }
-        call.args.iter().any(|arg| {
-            let Value::Callback(nested) = arg else {
-                return false;
-            };
-            let Some(callback) = body.nested.get(*nested) else {
-                return false;
-            };
-            let read = self.body(file, callback);
-            !read.ends.is_empty() || read.stop.is_some() || read.missed
-        })
+        call.args
+            .iter()
+            .any(|arg| {
+                let Value::Callback(nested) = arg else {
+                    return false;
+                };
+                let Some(callback) = body.nested.get(*nested) else {
+                    return false;
+                };
+                let read = self.body(file, callback);
+                !read.ends.is_empty() || read.stop.is_some() || read.missed.is_some()
+            })
+            .then_some(HANDED_UNREAD)
     }
 
     /// The records for every call `body` and the functions written in it
@@ -1748,10 +1781,14 @@ impl<'a> Walker<'a> {
                         None => {
                             *discovery.counts.entry("no_site".to_string()).or_default() += 1;
                             let at = (self.rel(file), call.site.span_start, call.site.span_end);
-                            if missed {
-                                discovery.missed_inside.push(at);
-                            } else {
-                                discovery.finished.push(at);
+                            match missed {
+                                Some(reason) => discovery.missed_inside.push(MissedInside {
+                                    file: at.0,
+                                    span_start: at.1,
+                                    span_end: at.2,
+                                    reason,
+                                }),
+                                None => discovery.finished.push(at),
                             }
                         }
                     }
@@ -1813,13 +1850,18 @@ impl<'a> Walker<'a> {
             if sibling_routes > 0 {
                 *discovery
                     .counts
-                    .entry("sibling_routes".to_string())
+                    .entry(SIBLING_ROUTES.to_string())
                     .or_default() += sibling_routes;
                 let at = (self.rel(file), call.site.span_start, call.site.span_end);
                 if !discovery.sites.iter().any(|site| {
                     site.file == at.0 && site.span_start == at.1 && site.span_end == at.2
                 }) {
-                    discovery.missed_inside.push(at);
+                    discovery.missed_inside.push(MissedInside {
+                        file: at.0,
+                        span_start: at.1,
+                        span_end: at.2,
+                        reason: SIBLING_ROUTES,
+                    });
                 }
             }
         }
@@ -3339,7 +3381,16 @@ export function listen(): void {
             let lo = text.find(needle).unwrap() as u32 + 1;
             (file.to_string(), lo, lo + needle.len() as u32)
         };
-        assert_eq!(with.missed_inside, vec![at("format(n)")]);
+        let (file_, span_start, span_end) = at("format(n)");
+        assert_eq!(
+            with.missed_inside,
+            vec![MissedInside {
+                file: file_,
+                span_start,
+                span_end,
+                reason: SIBLING_CODE,
+            }]
+        );
         // The construction reads a class with no constructor: nothing to miss.
         assert_eq!(with.finished, vec![at("new ItemsClient()")]);
         let unfollowed: Vec<(u32, Option<&str>)> = with
@@ -3411,8 +3462,14 @@ export function listen(): void {
             "postTo(\"/api/events\", { at: 1 })",
             "items.remove(id)",
         ] {
+            let (file_, span_start, span_end) = at(needle);
             assert!(
-                with.missed_inside.contains(&at(needle)),
+                with.missed_inside.contains(&MissedInside {
+                    file: file_,
+                    span_start,
+                    span_end,
+                    reason: SIBLING_ROUTES,
+                }),
                 "{needle}: {:?}",
                 with.missed_inside
             );
@@ -4873,7 +4930,7 @@ export function listen(): void {
             let mut sites: Vec<DiscoverySite> = Vec::new();
             let mut unfollowed: Vec<DiscoverySite> = Vec::new();
             let mut finished: Vec<(String, u32, u32)> = Vec::new();
-            let mut missed_inside: Vec<(String, u32, u32)> = Vec::new();
+            let mut missed_inside: Vec<MissedInside> = Vec::new();
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             // Every service's inputs are kept: each walk reads the others'
             // files with their own IR and rows (carrick#2618).
