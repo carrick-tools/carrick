@@ -933,9 +933,10 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Eleven rows in `commands.ts` the model alone states, and the one at
-    // `nested.ts:7`.
-    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
+    // Eleven rows in `commands.ts` the model alone states, the one at
+    // `nested.ts:7`, and the three in `inline-commands.ts`, which only a scan
+    // with the compiler's rows follows (carrick#2822).
+    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
