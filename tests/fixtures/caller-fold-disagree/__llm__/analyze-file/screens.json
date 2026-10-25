@@ -53,6 +53,32 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:25",
+      "line_number": 25,
+      "target": "/api/list",
+      "method": "GET",
+      "pattern_matched": "listItems(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:25",
+      "line_number": 25,
+      "target": "/api/tag",
+      "method": "GET",
+      "pattern_matched": "tag(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

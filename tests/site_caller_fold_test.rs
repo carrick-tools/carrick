@@ -244,6 +244,7 @@ fn graph_calls(blob: &serde_json::Value) -> Vec<String> {
 /// | `src/screens.ts:9` (`replaceItem`) | `PATCH /api/items/:id` | folded: no row |
 /// | `src/screens.ts:13` (`saveItem`) | `POST /api/save` | folded: no row |
 /// | `src/screens.ts:17` (`fetchPath`) | `GET /api/all` | the reader's row: no fact states the request |
+/// | `src/screens.ts:25` (`listItems` and `tag` on one line) | `GET /api/list`, `GET /api/tag` | the `tag` row stands |
 #[test]
 fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -301,4 +302,9 @@ fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
         ("GET /api/all", "model"),
         "{on:#?}"
     );
+    // A caller line that holds a second call (`src/screens.ts:25` calls
+    // `listItems` and the unrelated `tag`) is not the callee's request alone:
+    // the reader's row for the other call stands.
+    let shared = at(&on, "src/screens.ts:25");
+    assert!(shared.iter().any(|row| row.1 == "GET /api/tag"), "{on:#?}");
 }

@@ -16,3 +16,11 @@ export async function create(item: Item): Promise<Item> {
 export async function loadAll(path: string): Promise<Item[]> {
   return fetchPath(path);
 }
+
+function tag(id: string): string {
+  return id.trim();
+}
+
+export async function both(item: Item) {
+  const items = await listItems(); return [items, tag(item.id)];
+}
