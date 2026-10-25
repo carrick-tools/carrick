@@ -61,6 +61,12 @@ export interface SymbolAnchorRequest {
    * table keyed by status code captures as its 2xx body, not as the table.
    */
   consumer_response?: boolean;
+  /**
+   * carrick#2814: the symbol is a request body or payload whose handler works
+   * when none is sent (the inferrer's mark for the alias). Copied onto the
+   * alias's record, where the check phase reads it.
+   */
+  absent_body_tolerated?: true;
 }
 
 /**

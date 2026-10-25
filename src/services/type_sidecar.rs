@@ -234,6 +234,11 @@ pub enum CaptureAnchor {
         /// Carried from [`SymbolRequest::consumer_response`] (carrick#1841).
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         consumer_response: bool,
+        /// carrick#2814: the symbol is a request body or payload whose
+        /// handler works when none is sent, marked by the inference for the
+        /// alias. The capture copies it onto the alias's record.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        absent_body_tolerated: bool,
     },
     /// Addressable handler: `Awaited<ReturnType<typeof import('./m').fn>>`.
     HandlerReturn {
@@ -4944,6 +4949,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: Some(2),
             consumer_response: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&symbol).unwrap();
         assert!(json.contains(r#""kind":"symbol""#));
@@ -4956,6 +4962,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: true,
+            absent_body_tolerated: false,
         };
         let consumer_json = serde_json::to_string(&consumer).unwrap();
         assert!(
@@ -5192,6 +5199,7 @@ mod tests {
                         anchor_origin: AnchorOrigin::LlmSymbol,
                         array_depth: Some(1),
                         consumer_response: false,
+                        absent_body_tolerated: false,
                     },
                     CaptureAnchor::HandlerReturn {
                         alias: "B".into(),

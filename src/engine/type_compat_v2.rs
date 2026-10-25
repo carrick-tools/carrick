@@ -623,6 +623,7 @@ pub(crate) fn derive_capture_anchors(
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: request.array_depth.filter(|d| *d > 0),
             consumer_response: request.consumer_response,
+            absent_body_tolerated: absent_body.contains(alias),
         });
     }
 
@@ -4720,6 +4721,48 @@ mod tests {
         );
     }
 
+    /// carrick#2814: a route whose body type the model named is published by
+    /// a symbol anchor. The inferrer's absent-body mark for its alias rides
+    /// that anchor too; an alias the inferrer did not mark carries none.
+    #[test]
+    fn an_absent_body_tolerated_mark_rides_the_symbol_anchor_that_publishes_it() {
+        let explicit = vec![
+            order_explicit("Endpoint_a_Request"),
+            order_explicit("Endpoint_b_Request"),
+        ];
+        let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
+        tolerant.infer_kind = InferKind::RequestBody;
+        tolerant.absent_body_tolerated = true;
+        let mut strict = inferred("Endpoint_b_Request", "{ limit?: number }", None, None);
+        strict.infer_kind = InferKind::RequestBody;
+
+        let anchors =
+            derive_capture_anchors(&explicit, &[], &[], &[tolerant, strict], &[], "/repo");
+
+        let marks: Vec<(&str, bool)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Symbol {
+                    alias,
+                    absent_body_tolerated,
+                    ..
+                } => (alias.as_str(), *absent_body_tolerated),
+                other => panic!("expected symbol anchors, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("Endpoint_a_Request", true), ("Endpoint_b_Request", false)]
+        );
+        let wire = serde_json::to_value(&anchors[0]).unwrap();
+        assert_eq!(wire["absent_body_tolerated"], serde_json::json!(true));
+        let unmarked = serde_json::to_value(&anchors[1]).unwrap();
+        assert!(
+            unmarked.get("absent_body_tolerated").is_none(),
+            "{unmarked}"
+        );
+    }
+
     /// A manifest alias no type request reached still has to reach the
     /// surface, or the check's probe import fails and the pair reads "the
     /// surface export is missing or renamed" — a false statement that sends a
@@ -6156,6 +6199,7 @@ mod tests {
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }
     }
 
@@ -8077,6 +8121,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }];
         let mut billing_anchors = vec![CaptureAnchor::Symbol {
             alias: consumer_alias.clone(),
@@ -8085,6 +8130,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         }];
         let mut orders_manifest = vec![entry(
             key.clone(),
@@ -9788,6 +9834,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             anchor_origin: AnchorOrigin::LlmSymbol,
             array_depth: None,
             consumer_response: false,
+            absent_body_tolerated: false,
         });
         let backfill = HashMap::from([("Missing".to_string(), "{ count: number }".to_string())]);
         let (dir, artifact) = run_capture(
@@ -9868,6 +9915,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             },
             CaptureAnchor::Symbol {
                 alias: "Pub_OrderPlacedEvent".to_string(),
@@ -9876,6 +9924,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             },
         ];
         // The scanner-side literal text for the operation (what v1 resolution
@@ -9945,6 +9994,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 anchor_origin: AnchorOrigin::LlmSymbol,
                 array_depth: None,
                 consumer_response: false,
+                absent_body_tolerated: false,
             }],
             &HashMap::new(),
             None,
