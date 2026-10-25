@@ -185,6 +185,11 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     hosted["cached_guidance"]["http"]["triage_hints"] = json!("hosted guidance marker");
     hosted["cached_extraction_config"] = json!({"rules":[]});
     let original = snapshot(root, "orders", &[hosted]);
+    // One file ahead of the hosted commit, so the refresh scans and replays
+    // the hosted answers: a tree still at that commit is read in from the
+    // hosted blob as it is, and this blob's answers were never turned into
+    // rows (carrick#985).
+    std::fs::write(repo.join("ahead.ts"), "export const ahead = 1;\n").unwrap();
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let enriched = check(root, "orders/app.ts");
     assert_eq!(enriched["hosted_state"], "enriched", "{enriched:#}");
@@ -443,10 +448,13 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     );
     let url = "https://github.com/example/orders.git";
     git(&repo, &["remote", "set-url", "origin", url]);
-    // The commit the hosted index is built at touches no source file, so every
-    // row it holds for `app.ts` applies to this clone once the commit is here.
-    std::fs::write(upstream.join("README.md"), "orders\n").unwrap();
-    git(&upstream, &["add", "README.md"]);
+    // The commit the hosted index is built at touches no file `app.ts` reads,
+    // so every row it holds for `app.ts` applies to this clone once the commit
+    // is here. It adds a source file, so the clone is not at the hosted tree
+    // and the refresh replays the answers rather than reading the hosted blob
+    // in as it is (carrick#985), which this blob's answers would not survive.
+    std::fs::write(upstream.join("notes.ts"), "export const notes = 1;\n").unwrap();
+    git(&upstream, &["add", "notes.ts"]);
     git(&upstream, &["commit", "-qm", "second"]);
     let hosted_commit = git(&upstream, &["rev-parse", "HEAD"]);
     std::fs::write(
@@ -775,6 +783,14 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     stored["resolution"]["project_repos"][0]["repos"] = json!(["example/shop"]);
     save_snapshot(root, &stored);
     std::fs::remove_file(&config).unwrap();
+    // One file ahead of the hosted commit, so the refresh scans with the
+    // hosted configs and replays the answers rather than reading the hosted
+    // blobs in as they are (carrick#985).
+    std::fs::write(
+        repo.join("packages/b/ahead.ts"),
+        "export const ahead = 1;\n",
+    )
+    .unwrap();
 
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
