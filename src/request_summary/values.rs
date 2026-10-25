@@ -90,6 +90,16 @@ impl ValueAt {
                     .collect(),
                 open: *open,
             },
+            Self::Returned { lo, hi, member } => Self::Returned {
+                lo: *lo,
+                hi: *hi,
+                member: member.as_ref().map(|call| {
+                    Box::new(MemberCall {
+                        object: call.object.iter().map(Self::enclosed).collect(),
+                        ..(**call).clone()
+                    })
+                }),
+            },
             other => other.clone(),
         }
     }

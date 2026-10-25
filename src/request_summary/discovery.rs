@@ -2638,6 +2638,17 @@ mod tests {
             at("plain.ts", 10).iter().all(|site| site.end.is_none()),
             "a factory's function that sends nothing is no site"
         );
+        // `options.fetch.bind(options)` holds the factory's parameter. The
+        // closure that reads it is one function further in, so the parameter
+        // is not the closure's own first one, which the caller fills with the
+        // global `fetch`: the call reaches no labelled export.
+        assert!(
+            at("bound_items.ts", 9)
+                .iter()
+                .all(|site| site.end.is_none()),
+            "a captured parameter inside a bound object is read one function out: {:?}",
+            discovery.sites
+        );
     }
 
     /// The seven-hop site has seven hops, and no site sits at the store
