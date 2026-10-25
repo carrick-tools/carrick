@@ -901,6 +901,40 @@ fn an_unresolved_import_analyses_its_service_only_when_it_could_name_a_change() 
     assert_analysed(&scan, &["worker"]);
 }
 
+/// carrick#2826 review: a workspace package whose entry is not built (its
+/// `main` names a `dist/` file nobody generated) is an import the resolver
+/// cannot follow, and a change anywhere in that package still analyses every
+/// service importing it: the package's whole directory is an input of its
+/// importers, whatever its entry resolves to.
+#[test]
+fn an_unbuilt_workspace_package_is_still_an_input_of_its_importers() {
+    let workspace = case();
+    // The entry names a build output that is not there, and no source sits
+    // where a resolver would fall back to: `@fixture/shared` resolves to
+    // nothing on this tree.
+    workspace.edit(
+        "packages/shared/package.json",
+        "{ \"name\": \"@fixture/shared\", \"version\": \"0.0.0\", \"main\": \"dist/index.js\" }\n",
+    );
+    for file in ["packages/shared/src/index.ts", "packages/shared/src/x.ts"] {
+        std::fs::remove_file(workspace.repo.join(file)).expect("remove a source file");
+    }
+    workspace.edit(
+        "packages/shared/lib/x.ts",
+        "export function label(n: number): string {\n  return \"n\" + n;\n}\n",
+    );
+    workspace.commit("B");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_eq!(scan.code, Some(0), "{}", scan.output);
+    workspace.edit(
+        "packages/shared/lib/x.ts",
+        "export function label(n: number): string {\n  return \"#\" + n;\n}\n",
+    );
+    workspace.commit("C");
+    let scan = workspace.scan(&["--changed-only"]);
+    assert_analysed(&scan, &["api", "worker"]);
+}
+
 /// The services `--changed-only` analyses write the bytes a scan without it
 /// writes for them.
 #[test]
