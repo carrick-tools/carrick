@@ -154,10 +154,10 @@ impl FactFiles {
                 Followed::Unfollowed(reason),
             );
         }
-        for (file, start, end) in &discovery.missed_inside {
+        for missed in &discovery.missed_inside {
             facts.record(
-                file,
-                (*start, *end),
+                &missed.file,
+                (missed.span_start, missed.span_end),
                 Followed::Unfollowed(MISSED_INSIDE.to_string()),
             );
         }
