@@ -1385,6 +1385,14 @@ export interface InferredType {
    */
   raw_text_read?: true;
   /**
+   * carrick#2814, a route's request body or a subscriber's payload: the
+   * handler is in reach and works when nothing is sent, because it defaults
+   * the body or reads it only in ways `undefined` survives (`?.`, `?? {}`).
+   * Absent when the handler dereferences it, reads it through something not
+   * seen, or was not found.
+   */
+  absent_body_tolerated?: true;
+  /**
    * carrick#2054, a response joined from two or more success bodies: the
    * request fields whose values pick among them (`reads`), and, for one
    * query parameter or body field whose every test the reading follows, the

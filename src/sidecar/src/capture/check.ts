@@ -274,7 +274,9 @@ export async function runCheck(
   const unresolved: CheckVerdict[] = [];
   for (const spec of opts.pairs) {
     try {
-      plans.push(buildProbe(spec, ws.packageOf, unwidenedAliasIn(aliasRecords)));
+      plans.push(
+        buildProbe(spec, ws.packageOf, unwidenedAliasIn(aliasRecords), absenceToleratedIn(aliasRecords))
+      );
     } catch {
       unresolved.push({
         pair_id: '',
@@ -520,6 +522,17 @@ function unwidenedAliasIn(
     if (!record || record.any_provenance?.length) return undefined;
     return record.alias;
   };
+}
+
+/**
+ * carrick#2814: whether the receiving side's capture record marks a handler
+ * that works when no body is sent.
+ */
+function absenceToleratedIn(
+  aliasRecords: Map<string, Map<string, CaptureAliasRecord>>
+): (expected: CheckPairEndpoint) => boolean {
+  return (expected) =>
+    aliasRecords.get(expected.service_name)?.get(expected.alias)?.absent_body_tolerated === true;
 }
 
 interface DeepDecayHit {

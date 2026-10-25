@@ -69,6 +69,7 @@ import { endLineOf, startLineOf } from './line-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import type { LabelledMembers } from './library-claims.js';
 import { StatedParams } from './stated-params.js';
+import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import {
   classifyStatusCodes,
   constituents,
@@ -1247,7 +1248,11 @@ export class TypeInferrer {
       case 'expression':
         return this.inferExpression(sourceFile, request, extractionConfig);
       case 'request_body':
-        return this.inferRequestBody(sourceFile, request, extractionConfig);
+        return this.withAbsentBodyMark(
+          sourceFile,
+          request,
+          this.inferRequestBody(sourceFile, request, extractionConfig)
+        );
       case 'signature_return':
         return this.inferSignatureReturn(sourceFile, request);
       case 'function_param':
@@ -1612,7 +1617,7 @@ export class TypeInferrer {
     // scanner re-aims the explicit bundle at the root symbol instead of
     // pasting this string, so the alias's definition stays self-contained.
     const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(paramType));
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -1622,6 +1627,52 @@ export class TypeInferrer {
       anchor.depth,
       this.primaryTypeSymbolSource(anchor.element)
     );
+    // carrick#2814: a subscriber that defaults its payload, or reads it only
+    // in ways `undefined` survives, still works when none is sent.
+    const binding = Node.isBindingElement(target.node) ? target.node : target.param;
+    if (bindingToleratesAbsence(binding)) {
+      inferred.absent_body_tolerated = true;
+    }
+    return inferred;
+  }
+
+  /**
+   * carrick#2814: mark a route's request body as one its handler tolerates
+   * going unsent, when the handler is in reach and every read of the body
+   * survives `undefined` (`absent-body.ts`). The check then lets a caller that
+   * may send nothing call a route whose body type has no required member.
+   *
+   * No mark where the handler cannot be found, where a validator the
+   * registration declares reads the body first (a schema, or another function
+   * handed in beside the handler), or where the handler reads no body it can
+   * see: the check keeps the reading it had.
+   */
+  private withAbsentBodyMark(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    inferred: InferredType | null
+  ): InferredType | null {
+    if (!inferred) return inferred;
+    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    let registration: Node | undefined = atLine?.registration;
+    let handler: FunctionLike | undefined = atLine?.handler;
+    if (!handler) {
+      const located = this.resolveTargetNode(sourceFile, request);
+      handler = located ? this.registrationHandlerAt(located) : undefined;
+      registration = handler && located ? this.unwrapExpressionNode(located) : undefined;
+    }
+    handler ??= this.exportedFunctionOpeningOn(sourceFile, request.line_number);
+    if (!handler) return inferred;
+    if (registration) {
+      if (this.routeSchemaContract(registration, 'body') ?? this.validatedBodyContract(registration)) {
+        return inferred;
+      }
+      if (this.statedParams.handsInAnotherFunction(registration, handler)) return inferred;
+    }
+    if (handlerToleratesAbsentBody(handler)) {
+      inferred.absent_body_tolerated = true;
+    }
+    return inferred;
   }
 
   /**

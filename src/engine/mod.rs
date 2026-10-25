@@ -20483,6 +20483,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         });
@@ -20554,6 +20555,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         });
@@ -20593,6 +20595,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         }

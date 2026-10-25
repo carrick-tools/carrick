@@ -217,11 +217,16 @@ export function decisiveAssignmentLine(plan: ProbePlan): number {
  * probe of an `http` pair then ends with a second assignment of that reading,
  * in the wire form. Without an answer the probe is what it always was, byte
  * for byte.
+ *
+ * `expectedToleratesAbsence` answers, for the receiving side, whether its
+ * capture record marks a handler that works when no body is sent
+ * (carrick#2814).
  */
 export function buildProbe(
   spec: CheckPairSpec,
   packageOf: (serviceName: string) => string,
-  unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined
+  unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined,
+  expectedToleratesAbsence?: (expected: CheckPairEndpoint) => boolean
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -334,17 +339,29 @@ export function buildProbe(
       'expected:envelope'
     );
   }
-  // carrick#2814: a request body the caller may omit (`T | undefined`,
-  // `T | void`) is compatible with a route whose request type has no required
-  // member: the empty body is a value of that type, so the route accepts the
-  // call with nothing sent. The absent members are dropped from the sent side
-  // only then (`{} extends Expected`), and what remains is compared as before.
-  // A route that requires a member, or a scalar, keeps today's reading. Only
-  // the HTTP request direction: a socket or pub/sub payload and a GraphQL
-  // request are not read this way.
-  const absentBodyAllowed = spec.protocol === 'http' && spec.type_kind === 'request';
-  const sentBodyType = (sent: string): string =>
-    `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? Exclude<${sent}, undefined | void> : ${sent}`;
+  // carrick#2814: a body the sender may omit (`T | undefined`, `T | void`) is
+  // compatible with a receiver that requires none. A receiver requires none
+  // when its type has no required member (`{} extends Expected`) AND either
+  // its type admits absence (`Expected` holds `undefined` or `void`), or its
+  // handler works with nothing sent: the capture record says so
+  // (`absent_body_tolerated`), from a handler that defaults the body or reads
+  // it only through `?.` / `?? {}`. A handler that destructures or
+  // dereferences the body throws on `undefined`, whatever its type says, so
+  // without the mark the absent body keeps today's incompatible reading. When
+  // it holds, the absent members are dropped from the sent side and what
+  // remains is compared as before. The request direction of HTTP, and socket
+  // and pub/sub payloads (the subscriber is `expected`); a GraphQL request is
+  // not read this way.
+  const absentBodyAllowed =
+    (spec.protocol === 'http' && spec.type_kind === 'request') ||
+    spec.protocol === 'socket' ||
+    spec.protocol === 'pubsub';
+  const toleratesAbsence = expectedToleratesAbsence?.(expectedEndpoint) === true;
+  const sentBodyType = (sent: string): string => {
+    const dropped = `Exclude<${sent}, undefined | void>`;
+    const byHandler = toleratesAbsence ? dropped : sent;
+    return `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? ([Extract<Expected, undefined | void>] extends [never] ? ${byHandler} : ${dropped}) : ${sent}`;
+  };
   if (absentBodyAllowed) push(`type SentBody = ${sentBodyType('Sent')};`);
   const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
   push(`declare const sent: ${sentBody};`);

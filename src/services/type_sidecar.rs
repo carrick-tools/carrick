@@ -285,6 +285,11 @@ pub enum CaptureAnchor {
         /// phase reads from every stored stub.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         raw_text_read: bool,
+        /// carrick#2814: the text is a request body or payload whose handler
+        /// works when none is sent. The capture copies it onto the alias's
+        /// record, which the check phase reads from every stored stub.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        absent_body_tolerated: bool,
     },
 }
 
@@ -1512,6 +1517,13 @@ pub struct InferredType {
     /// the check phase reads the pair unverifiable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw_text_read: bool,
+    /// carrick#2814, a route's request body or a subscriber's payload: the
+    /// handler is in reach and works when nothing is sent (it defaults the
+    /// body or reads it only through `?.` / `?? {}`). `derive_capture_anchors`
+    /// carries the mark onto the literal anchor, and the check lets a sender
+    /// that may send nothing pass against a body type with no required member.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent_body_tolerated: bool,
     /// carrick#2054, response inferences only: which fields of the incoming
     /// message the handler's branches test to choose among the success bodies
     /// `type_string` joins, and, when one placed field decides it, the union
@@ -4975,6 +4987,7 @@ mod tests {
             source_file: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
@@ -4993,6 +5006,7 @@ mod tests {
                 export_path: vec!["Status".into()],
             }],
             raw_text_read: false,
+            absent_body_tolerated: false,
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
@@ -5206,6 +5220,7 @@ mod tests {
                             export_path: vec!["Status".into()],
                         }],
                         raw_text_read: true,
+                        absent_body_tolerated: true,
                     },
                 ],
                 out_dir: "/tmp/stub".into(),
@@ -6442,6 +6457,7 @@ mod tests {
             stated_body: None,
             printed_names: Vec::new(),
             raw_text_read: false,
+            absent_body_tolerated: false,
             response_modes: None,
             model_symbol_relation: None,
         }

@@ -236,6 +236,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
       )
       .optional(),
     raw_text_read: z.literal(true).optional(),
+    absent_body_tolerated: z.literal(true).optional(),
   }),
 ]);
 

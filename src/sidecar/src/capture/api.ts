@@ -95,6 +95,12 @@ export interface LiteralAnchorRequest {
    * onto the alias's record, where the check phase reads it.
    */
   raw_text_read?: true;
+  /**
+   * carrick#2814: the text is a request body or payload whose handler works
+   * when none is sent. Copied onto the alias's record, where the check phase
+   * reads it.
+   */
+  absent_body_tolerated?: true;
 }
 
 /**
@@ -356,6 +362,14 @@ export interface CaptureAliasRecord {
    * otherwise, and absent on every record a release before this one stored.
    */
   raw_text_read?: true;
+  /**
+   * carrick#2814: the alias is a route's request body, or a subscriber's
+   * payload, whose handler works when none is sent. The check phase lets a
+   * sender that may send nothing pass against it when its type has no
+   * required member. Absent otherwise: the absent body is then judged by the
+   * type alone.
+   */
+  absent_body_tolerated?: true;
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */

@@ -143,7 +143,7 @@ export class StatedParams {
    * reference, a second callable argument or property there. What such a
    * function (a middleware) does with the request is not read here.
    */
-  private handsInAnotherFunction(registration: Node, handler: HandlerFunction): boolean {
+  handsInAnotherFunction(registration: Node, handler: HandlerFunction): boolean {
     const callable = (node: Node): boolean => {
       let type: Type;
       try {

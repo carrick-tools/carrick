@@ -326,11 +326,18 @@ function buildSurfaceSpanIndex(
 }
 
 /**
- * carrick#1842: a literal anchor whose text is a body read as raw text passes
- * that mark to its record, where the check phase reads it.
+ * A literal anchor passes the inferrer's marks to its record, where the check
+ * phase reads them: a body read as raw text (carrick#1842), and a body whose
+ * handler works when none is sent (carrick#2814).
  */
-function rawTextMark(request: CaptureAnchorRequest): Pick<CaptureAliasRecord, 'raw_text_read'> {
-  return request.kind === 'literal' && request.raw_text_read ? { raw_text_read: true } : {};
+function literalMarks(
+  request: CaptureAnchorRequest
+): Pick<CaptureAliasRecord, 'raw_text_read' | 'absent_body_tolerated'> {
+  if (request.kind !== 'literal') return {};
+  return {
+    ...(request.raw_text_read ? { raw_text_read: true } : {}),
+    ...(request.absent_body_tolerated ? { absent_body_tolerated: true } : {}),
+  };
 }
 
 /** An alias that never reached a capture-native tier: the failure reason was
@@ -353,7 +360,7 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
     ...(anchor.request.kind === 'literal' && anchor.namesUnemittedModule
       ? { unresolved_in_tree: [unemittedModuleProvenance()] }
       : {}),
-    ...rawTextMark(anchor.request),
+    ...literalMarks(anchor.request),
   };
 }
 
@@ -548,7 +555,7 @@ function checkedRecord(
             .map((p) => unresolvedInTreeProvenance(p, [...unfoundNames].sort())),
         }
       : {}),
-    ...rawTextMark(anchor.request),
+    ...literalMarks(anchor.request),
   };
 }
 
