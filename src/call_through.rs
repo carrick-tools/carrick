@@ -1465,6 +1465,15 @@ fn state_leaves<'g>(
         if occupied.holds(leaf, &operation) {
             continue;
         }
+        // A helper only its own file calls has no leaf call to make it a
+        // wrapper: its callers' rows, corrected above, are the sites.
+        if callers_hold(service.data, &occupied, leaf, &operation) {
+            outcome.in_wrapper += 1;
+            debug!(
+                "  - {at}: a call into another service states nothing: a call of the function around it holds the row"
+            );
+            continue;
+        }
         if !written.insert((at, operation)) {
             continue;
         }
@@ -1473,6 +1482,40 @@ fn state_leaves<'g>(
         }
     }
     outcome
+}
+
+/// Whether a call site of the function `leaf` is written in holds a row of
+/// `operation`: the function's own callers already state the request.
+fn callers_hold(
+    data: &CloudRepoData,
+    occupied: &Occupied,
+    leaf: &LeafCall,
+    operation: &Operation,
+) -> bool {
+    let Some(enclosing) = data
+        .function_definitions
+        .values()
+        .filter(|definition| {
+            definition.file_path.to_string_lossy() == leaf.file.as_str()
+                && definition.line_number <= leaf.line
+                && leaf.line <= definition.end_line.max(definition.line_number)
+        })
+        .max_by_key(|definition| definition.line_number)
+    else {
+        return false;
+    };
+    data.function_definitions.values().any(|caller| {
+        caller.calls.iter().any(|call| {
+            call.file_path == leaf.file
+                && call.line_number == enclosing.line_number
+                && call.call_site_line > 0
+                && occupied.holds_operation(
+                    &caller.file_path.to_string_lossy(),
+                    call.call_site_line,
+                    operation,
+                )
+        })
+    })
 }
 
 /// The rows a service already holds, before any leaf row is written.
@@ -1508,6 +1551,13 @@ impl Occupied {
             lines: operations.keys().cloned().chain(in_calls).collect(),
             operations,
         }
+    }
+
+    /// Whether a row of `operation` sits at `file:line`.
+    fn holds_operation(&self, file: &str, line: u32, operation: &Operation) -> bool {
+        self.operations
+            .get(&(file.to_string(), line))
+            .is_some_and(|stated| stated.contains(operation))
     }
 
     /// Whether a row already stands for `leaf`: one on its own lines, or one

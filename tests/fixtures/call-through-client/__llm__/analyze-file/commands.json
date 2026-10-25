@@ -300,6 +300,19 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "model:186",
+      "line_number": 186,
+      "target": "/wrong-run",
+      "method": "GET",
+      "pattern_matched": "runOf(",
+      "call_expression_text": "runOf(id)",
+      "call_expression_line": 186,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

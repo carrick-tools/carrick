@@ -492,7 +492,7 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         assert_eq!(response_verdicts_at(file, line), []);
     }
     assert!(
-        settled_line().contains("(11 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(12 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -948,6 +948,23 @@ fn a_boundary_call_in_a_function_no_other_call_reaches_one_request_through_state
             [corrected("GET", "/health", 20)]
         );
     }
+}
+
+/// A helper only its own file calls gets no row beside the one its caller
+/// holds: the model's wrong route at the caller is corrected to the request,
+/// and the call inside the helper states nothing more.
+#[test]
+fn a_boundary_call_in_a_same_file_helper_whose_caller_holds_the_row_states_nothing() {
+    assert_eq!(
+        rows_in(blobs(), "cli", COMMANDS, 186),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
+    assert_eq!(rows_in(blobs(), "cli", COMMANDS, 182), []);
+    // With no row at the caller, the helper's call is the site.
+    assert_eq!(
+        rows_in(unanswered(), "cli", COMMANDS, 182),
+        [corrected("GET", "/api/v1/runs/:id", 5)]
+    );
 }
 
 /// A boundary call inside a function whose callers state the row states

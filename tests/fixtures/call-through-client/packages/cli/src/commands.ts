@@ -176,3 +176,13 @@ export async function showAuthorized(id: string) {
   const run = await authorizedRun(id);
   return run;
 }
+
+/** Reads one run; only this file calls it, and the call below holds the row. */
+async function runOf(id: string) {
+  return getRun({ client: transport, path: { id } });
+}
+
+export async function showRunOf(id: string) {
+  const run = await runOf(id);
+  return run;
+}
