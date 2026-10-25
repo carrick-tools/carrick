@@ -24,3 +24,9 @@ export async function runExists(id: string): Promise<boolean> {
   const response = await fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`, { method: "GET" });
   return response.ok;
 }
+
+/** A `fetch` whose parsed body is handed back, with the type this package declares for it. */
+export async function readRunTyped(id: string): Promise<RunReply> {
+  const response = await fetch(`${RUNS_ORIGIN}/api/v1/runs/${id}`, { method: "GET" });
+  return response.json();
+}

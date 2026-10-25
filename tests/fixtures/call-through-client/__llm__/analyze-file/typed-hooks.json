@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "/api/run",
+      "method": "GET",
+      "pattern_matched": "useQuery(",
+      "call_expression_text": "useQuery({ queryKey: [\"run\", id], queryFn: () => readRunTyped(id) })",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}
