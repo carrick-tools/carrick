@@ -96,10 +96,10 @@ A service is analysed, and the run logs why, when:
 | `no_stored` | No stored blob for this repository and service. |
 | `other_scanner` | The stored blob's scanner version or cache version is not this run's. |
 | `stored_dirty` | The stored blob was read from uncommitted changes. |
-| `stored_incomplete` | The stored blob records degraded types, files the model never answered, or candidates no model was asked about. |
+| `stored_incomplete` | The stored blob records degraded types, or (on a run that asks the model) files the model never answered or candidates no model was asked about. |
 | `config_changed` | Its `carrick.json` entry differs from the stored one. |
 | `commit_missing` | git cannot compare the stored commit, for example because the clone lacks it. |
-| `unresolved_import` | An import in it or in its closure resolves to nothing, and is neither a declared dependency nor a runtime builtin. |
+| `unresolved_import` | An import in it or in its closure resolves to nothing, is neither a declared dependency nor a runtime builtin, and could name a changed path: for a relative specifier, that path with any extension or a directory index under it; for an alias whose target is missing, anything under the target; for any other bare specifier, a file whose path without its extension ends with the specifier. An unresolved import that could name no changed path is not a reason (carrick#2826): a package that changed shows as a `repo_input_changed`. |
 | `extends_unfollowed` | A tsconfig `extends` it reads could not be followed. |
 | `repo_input_changed` | A lockfile, any `package.json`, `pnpm-workspace.yaml`, any `deno.json` or `deno.jsonc`, any `.gitignore`, `.gitattributes` or `.gitmodules`, any `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `bunfig.toml`, any `*.graphql`, `*.gql` or `*.graphqls`, or `carrick.json` changed. Every service is analysed. Two changes are not one: a `carrick.json` the tree holds untracked that names exactly the stored services, and a `package.json` that differs from the stored copy only in its top-level `version` (that one is read only by the services that import its package). |
 | `inputs_changed` | A changed path is under a root, in the closure, or under an input directory, or a path was added or deleted in a directory where one of its imports is looked up. |

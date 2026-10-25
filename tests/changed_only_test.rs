@@ -875,14 +875,18 @@ fn a_stored_status_beside_an_extraction_config_is_carried() {
     assert_analysed(&scan, &["web"]);
 }
 
-/// Case 13: an import nothing accounts for analyses its service on every
-/// run, even one that changed nothing it reads.
+/// Case 13 (carrick#2826): an import nothing accounts for analyses its
+/// service only when a changed path is one it could name. A run that changed
+/// nothing it could name carries the service; a run that adds the file a
+/// relative import was looking for analyses it.
 #[test]
-fn an_unresolved_import_analyses_its_service_every_run() {
+fn an_unresolved_import_analyses_its_service_only_when_it_could_name_a_change() {
     let workspace = case();
     workspace.edit(
         "apps/worker/src/job.ts",
-        &format!("import \"undeclared-module\";\n{JOB_AT_A}"),
+        &format!(
+            "import \"undeclared-module\";\nimport \"../../../build/shared/log\";\n{JOB_AT_A}"
+        ),
     );
     workspace.commit("B");
     let scan = workspace.scan(&["--changed-only"]);
@@ -890,8 +894,11 @@ fn an_unresolved_import_analyses_its_service_every_run() {
     workspace.edit("README.md", "Changed.\n");
     workspace.commit("C");
     let scan = workspace.scan(&["--changed-only"]);
+    assert_analysed(&scan, &[]);
+    workspace.edit("build/shared/log.ts", "export const log = 1;\n");
+    workspace.commit("D");
+    let scan = workspace.scan(&["--changed-only"]);
     assert_analysed(&scan, &["worker"]);
-    assert!(scan.output.contains("unresolved_import"), "{}", scan.output);
 }
 
 /// The services `--changed-only` analyses write the bytes a scan without it

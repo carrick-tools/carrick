@@ -140,10 +140,61 @@ pub struct ServiceInputs {
     /// unchanged import resolves to: each holds a closure file, or is where a
     /// relative specifier was looked up.
     pub lookup_dirs: BTreeSet<String>,
-    /// The first import nothing accounts for, as `<file> imports <specifier>`.
-    pub unresolved: Option<String>,
+    /// Every import nothing accounts for, with what it could resolve to.
+    pub unresolved: Vec<UnresolvedImport>,
     /// `extends` values a config it reads could not follow.
     pub unfollowed_extends: Vec<String>,
+}
+
+/// An import the resolver could not follow, and the files it could name.
+///
+/// It keeps a service from being carried only when a changed path is one of
+/// them (carrick#2826): an import that cannot reach a changed file cannot
+/// have changed what the service reads. A build-time copy that is not on disk
+/// (`./shared/log`) or a package that is not installed is the ordinary case on
+/// a checkout nobody built, and it used to analyse every service in the repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedImport {
+    /// `<file> imports <specifier>`.
+    pub at: String,
+    pub could_be: CouldBe,
+}
+
+/// The repo paths an unresolved import could name, top-relative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CouldBe {
+    /// Nothing narrows it: any change could be it.
+    Anything,
+    /// A relative specifier, or an internal path with no file: the path
+    /// itself, with any extension, or a directory index under it.
+    Path(String),
+    /// A config mapping whose target is missing: anything under its root.
+    Under(String),
+    /// A bare specifier no manifest declares: a file whose path, extension
+    /// dropped, ends with it (a `baseUrl` import the resolver missed). A
+    /// package changes through its manifest or lockfile, which is a repo
+    /// input of every service already.
+    Named(String),
+}
+
+impl CouldBe {
+    fn names(&self, path: &str) -> bool {
+        match self {
+            CouldBe::Anything => true,
+            CouldBe::Path(base) => {
+                path == base
+                    || path
+                        .strip_prefix(base.as_str())
+                        .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
+            }
+            CouldBe::Under(root) => under(path, root.trim_end_matches('/')),
+            CouldBe::Named(specifier) => {
+                let stem = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
+                let stem = stem.strip_suffix("/index").unwrap_or(stem);
+                stem == specifier || stem.ends_with(&format!("/{specifier}"))
+            }
+        }
+    }
 }
 
 impl ServiceInputs {
@@ -340,15 +391,37 @@ pub fn decide(
         }
     };
     let inputs = inputs();
-    if let Some(unresolved) = inputs.unresolved {
-        return Scope::analysed(Reason::UnresolvedImport, unresolved);
+    for unresolved in &inputs.unresolved {
+        if let Some(change) = changed
+            .iter()
+            .find(|change| unresolved.could_be.names(&change.path))
+        {
+            return Scope::analysed(
+                Reason::UnresolvedImport,
+                format!("{}, which could be {}", unresolved.at, change.path),
+            );
+        }
     }
-    if !inputs.unfollowed_extends.is_empty() {
+    // The same rule for an `extends` nothing could follow: it keeps the
+    // service from being carried only when a changed file is one it could
+    // name. The specifier is all a config's `extends` leaves, so the file
+    // name is what is compared.
+    let blocking: Vec<&str> = inputs
+        .unfollowed_extends
+        .iter()
+        .map(String::as_str)
+        .filter(|spec| {
+            changed
+                .iter()
+                .any(|change| extends_could_name(spec, &change.path))
+        })
+        .collect();
+    if !blocking.is_empty() {
         return Scope::analysed(
             Reason::ExtendsUnfollowed,
             format!(
                 "tsconfig extends {} could not be followed",
-                inputs.unfollowed_extends.join(", ")
+                blocking.join(", ")
             ),
         );
     }
@@ -375,6 +448,22 @@ pub fn decide(
     Scope::Carried {
         commit: stored.commit_hash.clone(),
     }
+}
+
+/// Whether a config `extends` nothing could follow could name `path`: the
+/// file its last segment names, with `.json` when it states no extension. A
+/// package that changed shows as a `repo_input_changed` too.
+fn extends_could_name(spec: &str, path: &str) -> bool {
+    let last = spec.rsplit('/').next().unwrap_or(spec);
+    if last.is_empty() || last == "." || last == ".." {
+        return true;
+    }
+    let file = if last.contains('.') {
+        last.to_string()
+    } else {
+        format!("{last}.json")
+    };
+    path.rsplit('/').next() == Some(file.as_str())
 }
 
 /// What a stored blob says it still owed when it was written: degraded types,
@@ -498,9 +587,10 @@ pub fn plan<'a>(
                         Some(top) => service_inputs(repo_path, top, service),
                         // No top level, no paths to compare: nothing vouches.
                         None => ServiceInputs {
-                            unresolved: Some(
-                                "git named no top level for this checkout".to_string(),
-                            ),
+                            unresolved: vec![UnresolvedImport {
+                                at: "git named no top level for this checkout".to_string(),
+                                could_be: CouldBe::Anything,
+                            }],
                             ..ServiceInputs::default()
                         },
                     };
@@ -606,7 +696,7 @@ pub fn service_inputs(repo_path: &str, top: &Path, service: &Config) -> ServiceI
     let top = top.canonicalize().unwrap_or_else(|_| top.to_path_buf());
     let relative = |path: &Path| -> Option<String> { top_relative(&top, path) };
     let mut roots: Vec<Root> = Vec::new();
-    let mut unresolved: Option<String> = None;
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
 
     // Its roots, as the walk reads them.
     let service_root = match &service.directory {
@@ -682,14 +772,39 @@ pub fn service_inputs(repo_path: &str, top: &Path, service: &Config) -> ServiceI
                     .filter(|file| file.is_file());
                 if let Some(asset) = asset {
                     files.extend(relative(&asset));
-                } else if unresolved.is_none()
-                    && index.names_an_unknown_module(&importer, &specifier)
+                } else if index.names_an_unknown_module(&importer, &specifier)
                     && !index.declares_types_for(&specifier)
                 {
-                    unresolved = Some(format!(
-                        "{} imports {specifier}",
-                        relative(&importer).unwrap_or_else(|| importer.display().to_string())
-                    ));
+                    let bare = specifier.split(['?', '#']).next().unwrap_or("");
+                    let could_be = if relative_specifier {
+                        // `./x.js` names `./x.ts` too, so the base drops it.
+                        let base = [".js", ".jsx", ".mjs", ".cjs"]
+                            .iter()
+                            .find_map(|ext| bare.strip_suffix(ext))
+                            .unwrap_or(bare);
+                        importer
+                            .parent()
+                            .and_then(|parent| relative(&parent.join(base)))
+                            .map_or(CouldBe::Anything, CouldBe::Path)
+                    } else {
+                        match index.resolve(&importer, bare) {
+                            crate::workspace_resolver::Resolution::Internal(path) => {
+                                relative(&root.join(path)).map_or(CouldBe::Anything, CouldBe::Path)
+                            }
+                            crate::workspace_resolver::Resolution::AliasTargetMissing(missing) => {
+                                relative(&root.join(&missing.target_root))
+                                    .map_or(CouldBe::Anything, CouldBe::Under)
+                            }
+                            _ => CouldBe::Named(bare.to_string()),
+                        }
+                    };
+                    unresolved.push(UnresolvedImport {
+                        at: format!(
+                            "{} imports {specifier}",
+                            relative(&importer).unwrap_or_else(|| importer.display().to_string())
+                        ),
+                        could_be,
+                    });
                 }
                 continue;
             };
@@ -869,7 +984,7 @@ impl<'a> CopyJudge<'a> {
             return whole_tree();
         };
         let inputs = service_inputs(self.repo_path, top, service);
-        if inputs.unresolved.is_some() || !inputs.unfollowed_extends.is_empty() {
+        if !inputs.unresolved.is_empty() || !inputs.unfollowed_extends.is_empty() {
             return whole_tree();
         }
         let pr_changes = self
@@ -1338,22 +1453,105 @@ mod tests {
     #[test]
     fn inputs_that_cannot_be_read_whole_analyse_the_service() {
         let blob = stored("abcdef1234");
-        let changes: Vec<ChangedPath> = Vec::new();
+        let changes = changed(&[('M', "tools/other/x.ts")]);
         let unresolved = ServiceInputs {
-            unresolved: Some("apps/api/src/a.ts imports nowhere".to_string()),
+            unresolved: vec![UnresolvedImport {
+                at: "apps/api/src/a.ts imports nowhere".to_string(),
+                could_be: CouldBe::Anything,
+            }],
             ..api_inputs()
         };
         assert_eq!(
             reason(&decide_with(Some(&blob), Ok(&changes), unresolved)),
             Some(Reason::UnresolvedImport)
         );
-        let unfollowed = ServiceInputs {
-            unfollowed_extends: vec!["@tsconfig/missing".to_string()],
+        let unfollowed = || ServiceInputs {
+            unfollowed_extends: vec![
+                "@tsconfig/missing".to_string(),
+                "../../tsconfig.base.json".to_string(),
+            ],
             ..api_inputs()
         };
+        // carrick#2826: only when a changed file is one it could name.
+        for path in ["tools/missing.json", "tsconfig.base.json"] {
+            assert_eq!(
+                reason(&decide_with(
+                    Some(&blob),
+                    Ok(&changed(&[('A', path)])),
+                    unfollowed()
+                )),
+                Some(Reason::ExtendsUnfollowed),
+                "{path}"
+            );
+        }
         assert_eq!(
-            reason(&decide_with(Some(&blob), Ok(&changes), unfollowed)),
-            Some(Reason::ExtendsUnfollowed)
+            reason(&decide_with(
+                Some(&blob),
+                Ok(&changed(&[('M', "tools/other/x.ts")])),
+                unfollowed()
+            )),
+            None
+        );
+    }
+
+    /// carrick#2826: an import nothing resolves keeps a service from being
+    /// carried only when a changed path is one it could name.
+    #[test]
+    fn an_unresolved_import_analyses_only_when_it_could_name_a_change() {
+        let blob = stored("abcdef1234");
+        let inputs = |could_be: CouldBe| ServiceInputs {
+            unresolved: vec![UnresolvedImport {
+                at: "apps/api/src/a.ts imports ./shared/log".to_string(),
+                could_be,
+            }],
+            ..api_inputs()
+        };
+        let elsewhere = changed(&[('M', "tools/other/log.ts")]);
+        // Outside the roots, so only this rule can analyse the service.
+        let copy = || CouldBe::Path("build/shared/log".to_string());
+        assert_eq!(
+            reason(&decide_with(Some(&blob), Ok(&elsewhere), inputs(copy()))),
+            None,
+            "a build-time copy that is not on disk names no changed file"
+        );
+        for path in ["build/shared/log.ts", "build/shared/log/index.ts"] {
+            assert_eq!(
+                reason(&decide_with(
+                    Some(&blob),
+                    Ok(&changed(&[('A', path)])),
+                    inputs(copy())
+                )),
+                Some(Reason::UnresolvedImport),
+                "{path} is what the import would name"
+            );
+        }
+        assert!(!copy().names("build/shared/logger.ts"));
+        assert_eq!(
+            reason(&decide_with(
+                Some(&blob),
+                Ok(&elsewhere),
+                inputs(CouldBe::Named("vite".to_string()))
+            )),
+            None,
+            "a package that is not installed changes through its manifest"
+        );
+        assert_eq!(
+            reason(&decide_with(
+                Some(&blob),
+                Ok(&changed(&[('M', "tools/other/components/Button.tsx")])),
+                inputs(CouldBe::Named("components/Button".to_string()))
+            )),
+            Some(Reason::UnresolvedImport),
+            "a bare specifier a baseUrl could map onto a changed file"
+        );
+        assert_eq!(
+            reason(&decide_with(
+                Some(&blob),
+                Ok(&changed(&[('A', "tools/gen/client/index.ts")])),
+                inputs(CouldBe::Under("tools/gen/client/".to_string()))
+            )),
+            Some(Reason::UnresolvedImport),
+            "a missing alias target that has appeared"
         );
     }
 
