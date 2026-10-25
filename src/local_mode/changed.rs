@@ -15,9 +15,13 @@
 //!
 //! The exit code is the one read in local mode that a verdict moves (see
 //! `docs/local-mode-output.md`, "check --changed"): 1 when a problem is a fact,
-//! 0 otherwise. A problem resting on a model candidate is printed and does not
-//! fail the run, and neither does a check that could not run: it says why on
-//! its summary line, because a test run must not fail on a missing index.
+//! 0 otherwise. A problem resting on a model candidate does not fail the run
+//! and is counted on the summary line, listed only with `--all`. Neither does
+//! a check that could not run: it says why on its summary line, because a
+//! test run must not fail on a missing index.
+//!
+//! `carrick check a.ts b.ts` runs the same pass over the files named instead
+//! of the files changed ([`Selection::Named`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -123,10 +127,22 @@ fn budget() -> Duration {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
-/// Run the pass and print it. Returns the exit code.
-pub fn run(root: Option<&Path>, json: bool) -> i32 {
+/// Which files the pass checks: every one the work changed since the main
+/// branch, or the ones the caller named (`carrick check a.ts b.ts`). Either
+/// way the files are grouped by repo, each repo is re-scanned once and one
+/// join judges them all.
+#[derive(Clone, Copy)]
+pub enum Selection<'a> {
+    Changed,
+    Named(&'a [PathBuf]),
+}
+
+/// Run the pass and print it. Returns the exit code. `all` lists the problems
+/// that rest on rows that are not facts; without it they are only counted.
+/// `--json` always lists every problem, each with its `source` and `fails`.
+pub fn run(root: Option<&Path>, selection: Selection, json: bool, all: bool) -> i32 {
     let started = Instant::now();
-    let mut output = answer(root, started);
+    let mut output = answer(root, started, selection);
     output.elapsed_ms = started.elapsed().as_millis() as u64;
     if json {
         match serde_json::to_string_pretty(&output) {
@@ -134,7 +150,7 @@ pub fn run(root: Option<&Path>, json: bool) -> i32 {
             Err(e) => crate::errln!("carrick: could not serialize the answer: {e}"),
         }
     } else {
-        crate::out!("{}", output.render());
+        crate::out!("{}", output.render(all));
     }
     if output.failing > 0 { 1 } else { 0 }
 }
@@ -155,8 +171,12 @@ fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
     }
 }
 
-fn answer(root: Option<&Path>, started: Instant) -> ChangedOutput {
-    let Some(root) = super::workspace::locate(root, None) else {
+fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> ChangedOutput {
+    let first = match selection {
+        Selection::Named(files) => files.first().map(PathBuf::as_path),
+        Selection::Changed => None,
+    };
+    let Some(root) = super::workspace::locate(root, first) else {
         return not_checked(
             "",
             "no Carrick index above this directory. Run `carrick init` in the folder holding \
@@ -173,7 +193,10 @@ fn answer(root: Option<&Path>, started: Instant) -> ChangedOutput {
         Err(e) => return not_checked(&shown, e),
     };
 
-    let (repos, changed) = changed_files(&workspace, &index);
+    let (repos, changed) = match selection {
+        Selection::Changed => changed_files(&workspace, &index),
+        Selection::Named(files) => named_files(&root, &index, files),
+    };
     let files: usize = changed.values().map(|(_, files)| files.len()).sum();
     let mut output = ChangedOutput {
         repos,
@@ -273,6 +296,60 @@ fn changed_files(
         listed.push(entry);
     }
     (listed, changed)
+}
+
+/// The files the caller named, grouped by the repo the index holds them in,
+/// as [`changed_files`] groups the changed ones. A file no repo of the
+/// workspace holds, or that the scan does not read, is listed as skipped and
+/// the rest are still checked.
+fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<ChangedRepo>, Changed) {
+    let mut listed: Vec<ChangedRepo> = Vec::new();
+    let mut changed = Changed::new();
+    let skip = |listed: &mut Vec<ChangedRepo>, file: &Path, reason: &str| {
+        listed.push(ChangedRepo {
+            repo: file.display().to_string(),
+            main_branch: None,
+            base: None,
+            files: Vec::new(),
+            skipped: Some(reason.to_string()),
+        });
+    };
+    for file in files {
+        let Some((repo, relative)) = index.locate_file(file) else {
+            skip(&mut listed, file, "not in a repo of this workspace");
+            continue;
+        };
+        let repo_path = PathBuf::from(&repo.path);
+        if super::workspace::excluded_repo(root, &repo_path) {
+            skip(&mut listed, file, "not in a repo of this workspace");
+            continue;
+        }
+        if !crate::file_finder::is_scanned_source(&repo_path.join(&relative), &repo_path) {
+            skip(&mut listed, file, "not a source file the scan reads");
+            continue;
+        }
+        if !repo.services.is_empty() && !repo.services.iter().any(|s| s.covers(&relative)) {
+            skip(&mut listed, file, "no indexed service covers it");
+            continue;
+        }
+        changed
+            .entry(repo.name.clone())
+            .or_insert_with(|| (repo_path, BTreeSet::new()))
+            .1
+            .insert(relative);
+    }
+    let mut repos: Vec<ChangedRepo> = changed
+        .iter()
+        .map(|(_, (path, files))| ChangedRepo {
+            repo: path.to_string_lossy().to_string(),
+            main_branch: None,
+            base: None,
+            files: files.iter().cloned().collect(),
+            skipped: None,
+        })
+        .collect();
+    repos.extend(listed);
+    (repos, changed)
 }
 
 struct Judged {
@@ -506,17 +583,24 @@ fn one_line(text: &str) -> String {
 }
 
 impl ChangedOutput {
-    /// The summary line, then one line per problem.
-    pub fn render(&self) -> String {
+    /// The summary line, then one line per problem. A problem that rests on
+    /// rows that are not facts does not fail the run; unless `all` is set it
+    /// is counted on the summary line ("plus N unconfirmed") and not listed.
+    pub fn render(&self, all: bool) -> String {
         if let Some(reason) = &self.not_checked {
             return format!("carrick check: not checked: {reason}\n");
         }
-        let incompatible = self
+        let listed: Vec<&Problem> = self
             .problems
+            .iter()
+            .filter(|problem| all || problem.fails)
+            .collect();
+        let unconfirmed = self.problems.len() - listed.len();
+        let incompatible = listed
             .iter()
             .filter(|p| p.kind == ProblemKind::Incompatible)
             .count();
-        let no_route = self.problems.len() - incompatible;
+        let no_route = listed.len() - incompatible;
         let mut out = format!(
             "carrick check: checked {} and {} in {} against {}: {incompatible} incompatible, {no_route} {}",
             plural(self.routes, "route", "routes"),
@@ -529,14 +613,17 @@ impl ChangedOutput {
                 "reach no route"
             },
         );
-        let advisory = self.problems.len() - self.failing;
+        let advisory = listed.len() - self.failing;
         if advisory > 0 {
+            out.push_str(&format!(" ({advisory} of them do not fail the check)"));
+        }
+        if unconfirmed > 0 {
             out.push_str(&format!(
-                " ({advisory} of them do not fail the check: already in the index, unconfirmed, or not resting on facts)"
+                ", plus {unconfirmed} unconfirmed, run with --all to list them"
             ));
         }
         out.push('\n');
-        for problem in &self.problems {
+        for problem in listed {
             let at = match problem.line {
                 Some(line) => format!("{}:{line}", problem.file),
                 None => problem.file.clone(),
@@ -613,21 +700,50 @@ mod tests {
             not_checked: None,
             ..not_checked("/w", "")
         };
-        let text = output.render();
+        let text = output.render(true);
         let first = text.lines().next().unwrap();
         assert_eq!(
             first,
             "carrick check: checked 1 route and 2 calls in 3 changed files against 2 services: \
-             1 incompatible, 1 reaches no route (1 of them do not fail the check: already in \
-             the index, unconfirmed, or not resting on facts)"
+             1 incompatible, 1 reaches no route (1 of them do not fail the check)"
         );
         assert!(text.contains("web/src/a.ts:4  no route  call GET /a: no service"));
         assert!(text.contains("[model candidate, does not fail]"));
     }
 
     #[test]
+    fn problems_that_are_not_facts_are_counted_and_listed_only_with_all() {
+        let mut candidate = problem(ProblemKind::NoRoute, false);
+        candidate.path = "/b".to_string();
+        let output = ChangedOutput {
+            routes: 0,
+            calls: 2,
+            files: 1,
+            services: 2,
+            problems: vec![problem(ProblemKind::Incompatible, true), candidate],
+            failing: 1,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        let quiet = output.render(false);
+        assert_eq!(
+            quiet.lines().next().unwrap(),
+            "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
+             1 incompatible, 0 reach no route, plus 1 unconfirmed, run with --all to list them"
+        );
+        assert_eq!(quiet.lines().count(), 2, "the fact only:\n{quiet}");
+        assert!(!quiet.contains("GET /b"), "{quiet}");
+        let everything = output.render(true);
+        assert!(everything.contains("GET /b"), "{everything}");
+        assert!(
+            !everything.contains("unconfirmed"),
+            "nothing is hidden, so nothing is counted as hidden:\n{everything}"
+        );
+    }
+
+    #[test]
     fn a_check_that_could_not_run_says_so_on_one_line() {
-        let text = not_checked("/w", "no index").render();
+        let text = not_checked("/w", "no index").render(false);
         assert_eq!(text, "carrick check: not checked: no index\n");
     }
 

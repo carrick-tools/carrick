@@ -2438,6 +2438,41 @@ fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
     )
 }
 
+/// The same with `--all`: the problems that do not fail the run are listed
+/// too, each with why.
+fn check_changed_all(workspace: &Path) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .args(["check", "--changed", "--all", "--workspace", "."])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick check --changed --all: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// `carrick check <file>...`, with its exit code and its stdout.
+fn check_files(workspace: &Path, files: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .arg("check")
+        .args(files)
+        .args(["--workspace", "."])
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick check {files:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
 fn commit_all(repo: &Path, message: &str) {
     git(repo, &["add", "-A"]);
     git(
@@ -2560,7 +2595,14 @@ fn check_changed_prints_a_new_call_through_a_runtime_base_as_unconfirmed() {
     index(root);
     add_a_call_to_no_route(root, INJECTED);
 
-    let (code, text) = check_changed(root, false);
+    // The member and its caller: two call sites through the runtime base.
+    let (code, quiet) = check_changed(root, false);
+    assert!(
+        quiet.contains(": 0 incompatible, 0 reach no route, plus 2 unconfirmed, run with --all"),
+        "counted, not listed:\n{quiet}"
+    );
+    assert_eq!(code, Some(0), "{quiet}");
+    let (code, text) = check_changed_all(root);
     let problem = text
         .lines()
         .find(|line| {
@@ -2592,7 +2634,13 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
         "// The catalog's client.\nimport { send }",
     );
 
-    let (code, text) = check_changed(root, false);
+    let (code, quiet) = check_changed(root, false);
+    assert!(
+        quiet.contains("plus 1 unconfirmed, run with --all to list them"),
+        "counted, not listed:\n{quiet}"
+    );
+    assert_eq!(code, Some(0), "{quiet}");
+    let (code, text) = check_changed_all(root);
     let problem = text
         .lines()
         .find(|line| {
@@ -2721,4 +2769,72 @@ fn check_changed_re_extracts_only_the_services_that_own_a_changed_file() {
         "the carried consumer is still judged against, as a fact:\n{json:#}"
     );
     assert_eq!(code, Some(1), "{json:#}");
+}
+
+/// carrick#2827: several named files are one pass across repos, with the
+/// summary line and the exit code `--changed` gives. The handler edit is
+/// uncommitted and on no branch: the files are named, not found by git.
+#[test]
+#[serial]
+fn check_several_files_judges_them_in_one_pass_and_fails_on_a_fact() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let route = root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&root.join("catalog-web"), "drop activeCount");
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_files(
+        root,
+        &[
+            "catalog-web/app/routes/api.v1.widgets.$widgetId.ts",
+            "inventory-svc/src/client.ts",
+            "/not/in/the/workspace/x.ts",
+        ],
+    );
+    let summary = text.lines().next().unwrap_or_default();
+    assert!(
+        summary.starts_with("carrick check: checked 1 route and ")
+            && summary.contains("in 2 changed files"),
+        "one summary line for the two files found:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("  incompatible  route GET")),
+        "the handler's break is named:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")),
+        "and the consumer's new call:\n{text}"
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts: not in a repo of this workspace"),
+        "a file outside the workspace is named, not fatal:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+}
+
+/// Naming only files that hold no problem exits 0.
+#[test]
+#[serial]
+fn check_several_files_exits_zero_when_none_is_a_problem() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &[
+            "catalog-web/app/routes/api.v1.health.ts",
+            "inventory-svc/src/inventory.ts",
+        ],
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
 }

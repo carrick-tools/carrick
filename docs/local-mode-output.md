@@ -462,7 +462,8 @@ The workspace question has its own command and its own schema, below.
 
 ## `carrick check --changed` — every changed file, with the tests
 
-Implemented in `src/local_mode/changed.rs`. Takes no file. For each repo of
+Implemented in `src/local_mode/changed.rs`. Takes no file (to name the files
+yourself, see "Several files" below). For each repo of
 the workspace it finds the merge base of `HEAD` and the main branch
 (`origin/HEAD`, else `origin/main`, `origin/master`, `main`, `master`), and
 checks every source file the scan reads that differs from it: committed on the
@@ -504,10 +505,26 @@ base: a parameter, a field, a config value that reads no environment variable)
 is `unconfirmed` and never fails, because the check cannot tell a service of
 this workspace from an outside API there; the exception is a call the index
 matched to a workspace route, whose loss is a fact. A problem resting on a
-model candidate, or on rows that state no source, is printed and exits 0. A
+model candidate, or on rows that state no source, exits 0 too. A
 check that could not run (no index, no main branch, budget spent) says why on
 its summary line and exits 0, so a test run never fails on a missing index.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
+
+**Quiet by default.** Only problems that fail the run are listed. The rest
+are counted on the summary line, `..., plus 2 unconfirmed, run with --all to
+list them`, and `--all` lists them, each marked with why: `[already in the
+index, does not fail]`, `[unconfirmed: the base is set at run time, does not
+fail]`, `[model candidate, does not fail]` or `[source not stated, does not
+fail]`. `--json` always lists every problem, with its `source`,
+`already_indexed`, `unconfirmed` and `fails`.
+
+**Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
+pass over the files named, in any repos of the workspace, instead of the
+files git says changed: always re-extracted (`--recheck` is accepted and
+changes nothing), each repo scanned once, one join, the same summary line,
+output and exit code. A file outside the workspace, or one the scan does not
+read, is listed as `not checked: <file>: <reason>` and the others are still
+checked. One file keeps the single-file read above.
 
 ## `carrick status` — the workspace, with no file in the question
 

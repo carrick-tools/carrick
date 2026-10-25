@@ -81,6 +81,15 @@ pub enum LocalCommand {
     CheckChanged {
         workspace: Option<PathBuf>,
         json: bool,
+        all: bool,
+    },
+    /// Several named files, re-extracted and judged in the same single pass
+    /// and answered with the same summary line and exit code.
+    CheckFiles {
+        files: Vec<PathBuf>,
+        workspace: Option<PathBuf>,
+        json: bool,
+        all: bool,
     },
     /// Collect a dispatched job's analysis and finish the index.
     ///
@@ -138,6 +147,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut dispatch = false;
     let mut recheck = false;
     let mut changed = false;
+    let mut all = false;
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
     let mut candidates = false;
@@ -164,6 +174,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--candidates" => candidates = true,
             "--recheck" => recheck = true,
             "--changed" => changed = true,
+            "--all" => all = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
             // Accepting the flag and ignoring it would hand a scaffold that
@@ -227,8 +238,29 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 .to_string(),
         );
     }
+    // `--all` widens the list of the two passes that quiet their output: the
+    // changed pass and the several-file pass.
+    let several = name == "check" && positional.len() > 1;
+    if all && !(changed || several) {
+        return Err(format!(
+            "unknown option for `carrick {name}`: --all (it lists every problem of \
+             `carrick check --changed` or of `carrick check` with several files)"
+        ));
+    }
     if changed {
-        return Ok(LocalCommand::CheckChanged { workspace, json });
+        return Ok(LocalCommand::CheckChanged {
+            workspace,
+            json,
+            all,
+        });
+    }
+    if several {
+        return Ok(LocalCommand::CheckFiles {
+            files: positional.iter().map(PathBuf::from).collect(),
+            workspace,
+            json,
+            all,
+        });
     }
     // Only the proposal has services to list candidates for.
     if candidates && name != "derive" {
@@ -427,9 +459,27 @@ pub fn run(command: LocalCommand) -> i32 {
                 Freshness::Indexed
             },
         ),
-        LocalCommand::CheckChanged { workspace, json } => {
-            super::changed::run(workspace.as_deref(), json)
-        }
+        LocalCommand::CheckChanged {
+            workspace,
+            json,
+            all,
+        } => super::changed::run(
+            workspace.as_deref(),
+            super::changed::Selection::Changed,
+            json,
+            all,
+        ),
+        LocalCommand::CheckFiles {
+            files,
+            workspace,
+            json,
+            all,
+        } => super::changed::run(
+            workspace.as_deref(),
+            super::changed::Selection::Named(&files),
+            json,
+            all,
+        ),
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
     }
 }
@@ -1788,7 +1838,8 @@ USAGE:
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json] [--recheck]
-    carrick check   --changed [--workspace <dir>] [--json]
+    carrick check   <file> <file>... [--workspace <dir>] [--json] [--all]
+    carrick check   --changed [--workspace <dir>] [--json] [--all]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     derive     Print the workspace and service proposal without writing files.
@@ -1837,9 +1888,13 @@ USAGE:
                problem is a fact and new since the index (an incompatible
                pair, or a call that reaches no route); one that was already
                in the index, rests on a model candidate, or calls through a
-               base set at run time is printed and exits 0, as does a check
-               that could not run. Five minutes at most
+               base set at run time is counted on the summary line ("plus N
+               unconfirmed") and exits 0, as does a check that could not run.
+               --all lists the unconfirmed ones too. Five minutes at most
                (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
+               Several files (`check a.ts b.ts`) are checked the same way:
+               the named files, always re-extracted, each repo scanned once,
+               the same summary line and exit code as --changed.
     refresh    Re-scan one service (or every repo) and re-join.
 
 On macOS, index, resume and refresh keep this machine from idle-sleeping until
@@ -1895,6 +1950,33 @@ mod tests {
             "Nothing was handed over for web: nothing in it needed the analyzer. `carrick resume` \
              indexes it with the rest."
         );
+    }
+
+    /// carrick#2827: several files are one pass, `--all` belongs to the passes
+    /// that quiet their output, and one file stays the single-file read.
+    #[test]
+    fn several_files_parse_to_one_pass_and_all_is_refused_elsewhere() {
+        let several = parse(&args(&["check", "a.ts", "b.ts", "--all", "--recheck"]));
+        assert!(matches!(
+            several,
+            Some(Ok(LocalCommand::CheckFiles { ref files, all: true, .. })) if files.len() == 2
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "a.ts"])),
+            Some(Ok(LocalCommand::Check { .. }))
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "--changed", "--all"])),
+            Some(Ok(LocalCommand::CheckChanged { all: true, .. }))
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "a.ts", "--all"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse(&args(&["touch", "a.ts", "--all"])),
+            Some(Err(_))
+        ));
     }
 
     fn dispatched_job(repo: &str, id: &str) -> crate::local_mode::jobs::Job {
