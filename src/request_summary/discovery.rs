@@ -2769,19 +2769,17 @@ mod tests {
                 ("lib.dom", "fetch")
             );
         }
-        for line in [13] {
-            let [site] = at("events.ts", line)[..] else {
-                panic!(
-                    "a site at events.ts:{line}: {:?} {:?}",
-                    discovery.sites, discovery.unfollowed
-                );
-            };
-            let end = site.end.as_ref().expect("the call reaches publish");
-            assert_eq!(
-                (end.package.as_str(), end.export.as_str()),
-                ("fixture-bus", "publish")
+        let [site] = at("events.ts", 13)[..] else {
+            panic!(
+                "a site at events.ts:13: {:?} {:?}",
+                discovery.sites, discovery.unfollowed
             );
-        }
+        };
+        let end = site.end.as_ref().expect("the call reaches publish");
+        assert_eq!(
+            (end.package.as_str(), end.export.as_str()),
+            ("fixture-bus", "publish")
+        );
         assert!(
             at("bare.ts", 11).iter().all(|site| site.end.is_none()),
             "a field with no fallback holds nothing"
