@@ -736,6 +736,11 @@ pub struct StatusService {
     pub hosted: Option<super::hosted::HostedProvenance>,
     #[serde(default)]
     pub hosted_state: super::hosted::HostedState,
+    /// Why the hosted rows were not replayed onto this service, when the read
+    /// recorded a reason. Printed once per reason above the boundary lines,
+    /// so a refused replay is not one clause at the end of a long sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_failure: Option<String>,
     pub service: String,
     /// Absolute path of the repo this service belongs to. Services of one repo
     /// share a commit and a changed-file count, and this is what says so.
@@ -914,6 +919,25 @@ impl StatusOutput {
         }
         for line in self.type_check.iter().flat_map(|check| check.lines()) {
             out.push_str(&format!("  {line}\n"));
+        }
+        // Once per reason: a monorepo whose replay was refused for one cause
+        // used to say it at the end of every service's boundary sentence.
+        let mut refused: Vec<(&str, usize)> = Vec::new();
+        for reason in self
+            .services
+            .iter()
+            .filter(|service| service.hosted_state != super::hosted::HostedState::Enriched)
+            .filter_map(|service| service.hosted_failure.as_deref())
+        {
+            match refused.iter_mut().find(|(seen, _)| *seen == reason) {
+                Some((_, count)) => *count += 1,
+                None => refused.push((reason, 1)),
+            }
+        }
+        for (reason, count) in refused {
+            out.push_str(&format!(
+                "  hosted rows not replayed onto {count} service(s): {reason}\n"
+            ));
         }
         out.push('\n');
         for service in &self.services {
@@ -1532,6 +1556,7 @@ mod hosted_wire_tests {
             services: vec![StatusService {
                 hosted: None,
                 hosted_state: Default::default(),
+                hosted_failure: None,
                 service: "gateway".to_string(),
                 repo: "/repos/monorepo".to_string(),
                 index_commit: "abc1234".to_string(),
@@ -1568,6 +1593,28 @@ mod hosted_wire_tests {
             "{text}"
         );
         assert!(text.contains("changed  tools/release.ts"), "{text}");
+    }
+
+    /// A refused replay is stated once per reason, with how many services it
+    /// covers, before the per-service boundary lines (carrick#985).
+    #[test]
+    fn the_status_render_says_once_why_the_hosted_rows_were_not_replayed() {
+        let mut output = status_output();
+        let mut second = output.services[0].clone();
+        second.service = "billing".to_string();
+        for service in [&mut output.services[0], &mut second] {
+            service.hosted_state = super::super::hosted::HostedState::ReadFailed;
+            service.hosted_failure = Some("the reason".to_string());
+        }
+        output.services.push(second);
+        let text = output.render();
+        assert_eq!(
+            text.matches("hosted rows not replayed onto 2 service(s): the reason")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(!status_output().render().contains("not replayed"));
     }
 
     /// A spend on the output changes nothing a person reads. What a run costs

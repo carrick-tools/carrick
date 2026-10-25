@@ -19,7 +19,9 @@
 // hosted read this machine has not yet made signed in and connected. On a
 // workspace `carrick index` has just indexed, nothing is re-read.
 // carrick#985 is the other half of that saving, inside `refresh`: a repo whose
-// local blob is already current should be fetched for rather than scanned.
+// tree has not moved under any file a scan reads since the hosted commit is
+// read in from the hosted index rather than re-read (`current_hosted_blobs`
+// in `src/local_mode/index.rs`), so a fresh clone of main costs the download.
 //
 // What it reports is read back from `carrick status`, not assumed from an
 // exit code: a refresh that scanned fine can still have been refused the

@@ -299,6 +299,8 @@ fn run_generation(
     // counting its own services, as they did.
     let service_counts = workspace_service_counts(targets, hosted, pass);
     let mut services_done = 0usize;
+    // The repos whose hosted index stood in for their scan (carrick#985).
+    let mut fetched: Vec<String> = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let workspace_position = service_counts
@@ -307,10 +309,27 @@ fn run_generation(
         if let Some(counts) = &service_counts {
             services_done += counts.get(position).copied().unwrap_or(0);
         }
+        let hosted_blobs = hosted.local_blobs(repo);
+        // A facts-only pass over a tree the hosted index already describes
+        // would re-read every file to write what it downloaded: fetched, not
+        // re-read (carrick#985).
+        if matches!(pass, Pass::Facts)
+            && let Some(current) = current_hosted_blobs(repo, &hosted_blobs)
+        {
+            for (service, blob) in current.iter().enumerate() {
+                let file = format!("local-{position}-{service}.json");
+                write_blob(&blobs.join(&file), blob)?;
+                write_blob(&peers.join(&file), blob)?;
+                positions.insert(service_id(blob), position);
+            }
+            fetched.push(name.clone());
+            scanned.push(name);
+            continue;
+        }
         let previous = generation.join("previous.json");
         std::fs::write(
             &previous,
-            serde_json::to_vec(&hosted.local_blobs(repo)).map_err(|e| e.to_string())?,
+            serde_json::to_vec(&hosted_blobs).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
         // Scanner cache filenames derive from repo/service labels. Keep each
@@ -513,11 +532,83 @@ fn run_generation(
         index,
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        hosted_download: hosted.download_line(),
+        hosted_download: download_line(hosted.download_line(), &fetched),
         not_dispatched,
         pending,
         timing: pass.measured_wait(timing),
     })))
+}
+
+/// The hosted blobs of `repo` when they are what a facts-only scan of this
+/// checkout would write, so the build reads them in instead of re-reading
+/// every file (carrick#985). `None` sends the repo to the scan, which still
+/// replays the hosted answers for every file that did not change.
+///
+/// All or nothing per repo, as the hosted configs are taken
+/// (`service_derivation::hosted_services`): every blob is one generation (one
+/// commit, this build's cache format, read from a clean tree), the tree holds
+/// that commit and has not moved under any file a scan reads since, and the
+/// services this checkout resolves to are exactly the blobs' services.
+///
+/// "A file a scan reads" is a source file the walk keeps, a repository input
+/// (manifests, lockfiles, `carrick.json`, GraphQL schemas) or a tsconfig. A
+/// change anywhere else — the hooks, skills and settings `carrick init` writes
+/// just before this runs — leaves the hosted index current (carrick#1007 item
+/// 5). A JSON module a service imports by name is not checked: a tree whose
+/// only change is one is read in as the hosted index has it.
+pub(super) fn current_hosted_blobs(
+    repo: &Path,
+    blobs: &[CloudRepoData],
+) -> Option<Vec<CloudRepoData>> {
+    let commit = &blobs.first()?.commit_hash;
+    if blobs.iter().any(|blob| {
+        &blob.commit_hash != commit
+            || blob.cache_version != Some(crate::engine::CACHE_VERSION)
+            || blob.dirty == Some(true)
+    }) {
+        return None;
+    }
+    let changed = super::query::changed_since(repo, commit)?;
+    if changed.iter().any(|file| is_scan_input(repo, file)) {
+        return None;
+    }
+    let services = crate::service_derivation::resolve_with_hosted(repo, Some(blobs)).ok()?;
+    let mut resolved: Vec<Option<&str>> = services
+        .iter()
+        .map(|service| service.service_name.as_deref())
+        .collect();
+    let mut held: Vec<Option<&str>> = blobs
+        .iter()
+        .map(|blob| blob.service_name.as_deref())
+        .collect();
+    resolved.sort();
+    held.sort();
+    (resolved == held).then(|| blobs.to_vec())
+}
+
+/// Whether a change to `file` (repo-relative) can change what a scan writes.
+fn is_scan_input(repo: &Path, file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    crate::file_finder::is_scanned_source(&repo.join(file), repo)
+        || crate::change_scope::is_repo_input(file)
+        || ((name.starts_with("tsconfig") || name.starts_with("jsconfig"))
+            && name.ends_with(".json"))
+}
+
+/// The hosted read's line, and which repos it stood in for a scan of.
+fn download_line(hosted: Option<String>, fetched: &[String]) -> Option<String> {
+    if fetched.is_empty() {
+        return hosted;
+    }
+    let fetched = format!(
+        "read in from the hosted index without re-reading the source (current for this \
+         checkout): {}",
+        fetched.join(", ")
+    );
+    Some(match hosted {
+        Some(line) => format!("{line}; {fetched}"),
+        None => fetched,
+    })
 }
 
 /// The repo holding a named service, for `refresh --service`. The blobs know
@@ -2245,6 +2336,118 @@ mod tests {
             type_verdict: verdict,
             mismatch_reason: None,
         }
+    }
+
+    /// A two-service monorepo with no carrick.json, committed, and the hosted
+    /// blobs a CI scan of that commit wrote for it.
+    fn hosted_monorepo() -> (tempfile::TempDir, String, Vec<CloudRepoData>) {
+        let (dir, head) = crate::git_state::tests::committed_repo(&[
+            ("package.json", r#"{"name":"root","private":true}"#),
+            ("services/orders/package.json", r#"{"name":"@acme/orders"}"#),
+            (
+                "services/orders/src/app.ts",
+                "export const route = '/orders';",
+            ),
+            ("services/web/package.json", r#"{"name":"@acme/web"}"#),
+            ("services/web/src/client.ts", "export const page = 1;"),
+        ]);
+        let blob = |name: &str, directory: &str| -> CloudRepoData {
+            let config = serde_json::json!({"serviceName": name, "directory": directory});
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "shop", "service_name": name,
+                "config_json": config.to_string(),
+                "endpoints": [], "calls": [], "mounts": [], "apps": {},
+                "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-10-01T00:00:00Z", "commit_hash": head,
+                "cache_version": crate::engine::CACHE_VERSION
+            }))
+            .unwrap()
+        };
+        let blobs = vec![
+            blob("@acme/orders", "services/orders"),
+            blob("@acme/web", "services/web"),
+        ];
+        (dir, head, blobs)
+    }
+
+    /// carrick#985: a checkout at the hosted commit is read in from the
+    /// hosted index, whatever `carrick init` wrote beside it first.
+    #[test]
+    fn a_checkout_at_the_hosted_commit_takes_the_hosted_blobs() {
+        let (dir, _, blobs) = hosted_monorepo();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "# notes").unwrap();
+        let current = current_hosted_blobs(repo, &blobs).expect("current");
+        assert_eq!(current.len(), 2);
+    }
+
+    /// Any file a scan reads that moved since the hosted commit sends the
+    /// repo to the scan, which replays the hosted answers for the rest.
+    #[test]
+    fn a_moved_input_sends_the_repo_to_the_scan() {
+        for (file, contents) in [
+            ("services/web/src/client.ts", "export const page = 2;"),
+            ("services/web/src/new.ts", "export const added = 1;"),
+            ("pnpm-lock.yaml", "lockfileVersion: 9"),
+            ("services/orders/tsconfig.json", "{}"),
+            ("carrick.json", r#"{"serviceName":"shop"}"#),
+        ] {
+            let (dir, _, blobs) = hosted_monorepo();
+            std::fs::write(dir.path().join(file), contents).unwrap();
+            assert!(
+                current_hosted_blobs(dir.path(), &blobs).is_none(),
+                "{file} moved"
+            );
+        }
+    }
+
+    /// A checkout a commit ahead of the hosted index is not current.
+    #[test]
+    fn a_checkout_a_commit_ahead_is_not_current() {
+        let (dir, _, blobs) = hosted_monorepo();
+        let repo = dir.path();
+        std::fs::write(
+            repo.join("services/orders/src/app.ts"),
+            "export const x = 2;",
+        )
+        .unwrap();
+        crate::git_state::tests::git_in(repo, &["commit", "-qam", "two"]);
+        assert!(current_hosted_blobs(repo, &blobs).is_none());
+    }
+
+    /// The blobs themselves have to be one clean generation in this build's
+    /// cache format, at a commit this clone holds.
+    #[test]
+    fn a_generation_this_build_cannot_stand_behind_is_not_current() {
+        type Spoil = fn(&mut CloudRepoData);
+        let spoilers: [(&str, Spoil); 4] = [
+            ("older cache", |b| b.cache_version = Some(0)),
+            ("dirty", |b| b.dirty = Some(true)),
+            ("missing commit", |b| {
+                b.commit_hash = "0123456789abcdef".into()
+            }),
+            ("renamed", |b| b.service_name = Some("@acme/shop".into())),
+        ];
+        for (what, spoil) in spoilers {
+            let (dir, _, mut blobs) = hosted_monorepo();
+            blobs.iter_mut().for_each(spoil);
+            assert!(current_hosted_blobs(dir.path(), &blobs).is_none(), "{what}");
+        }
+        let (dir, _, _) = hosted_monorepo();
+        assert!(current_hosted_blobs(dir.path(), &[]).is_none(), "no blobs");
+    }
+
+    #[test]
+    fn the_download_line_names_the_repos_read_in_without_a_scan() {
+        assert_eq!(download_line(Some("x".into()), &[]), Some("x".into()));
+        let line = download_line(Some("x".into()), &["shop".into()]).unwrap();
+        assert!(
+            line.starts_with("x; read in from the hosted index"),
+            "{line}"
+        );
+        assert!(line.ends_with(": shop"), "{line}");
     }
 
     fn consumer_blob(repo: &str) -> CloudRepoData {

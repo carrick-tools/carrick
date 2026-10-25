@@ -595,12 +595,23 @@ fn service_rows<'a>(
         })
 }
 
-/// The service a blob is stored under: its `service_name`, or the repo name
-/// for a single-service repo.
+/// The key a blob's row is stored under: the slug of its `service_name`, or
+/// the repo name for a single-service repo.
+///
+/// The cloud keys every row by `sanitizeService` (carrick-cloud
+/// `lambdas/_shared/service_slug.ts`), so `resolve-repos` answers
+/// `ainyc-canonry-api` for a blob whose `service_name` is
+/// `@ainyc/canonry-api`. Compared raw, every scoped or punctuated name missed
+/// its own row: no hosted blob was replayed and every read downloaded the
+/// whole project again.
 fn service_of(blob: &CloudRepoData) -> String {
-    blob.service_name
-        .clone()
-        .unwrap_or_else(|| blob.repo_name.clone())
+    stored_service(blob.service_name.as_deref(), &blob.repo_name)
+}
+
+/// [`service_of`] for a blob whose `repo_name` is no longer the hosted
+/// basename (`local_blobs` relabels it to the local directory).
+fn stored_service(service_name: Option<&str>, repo_basename: &str) -> String {
+    crate::cloud_storage::indexed_service_slug(service_name, repo_basename)
 }
 
 /// Whether the blobs already cached for one project are still the generation
@@ -908,10 +919,10 @@ impl HostedInput {
                     .is_some_and(|n| n.eq_ignore_ascii_case(&b.repo_name))
             })
             .filter(|b| {
-                repo.services.as_ref().is_some_and(|ss| {
-                    ss.iter()
-                        .any(|s| s.service == b.service_name.as_deref().unwrap_or(&b.repo_name))
-                })
+                let key = service_of(b);
+                repo.services
+                    .as_ref()
+                    .is_some_and(|ss| ss.iter().any(|s| s.service == key))
             })
             .cloned()
             .map(|mut b| {
@@ -956,29 +967,43 @@ impl HostedInput {
                 HostedState::NoIndexYet
             } else if self.failure.is_some() {
                 HostedState::ReadFailed
-            } else if let Some(hosted_names) = repo
+            } else if repo
                 .services
                 .as_ref()
-                .filter(|services| !services.is_empty())
+                .is_some_and(|services| !services.is_empty())
             {
-                // Name both sides. The index is keyed on the service NAME, and
-                // the name a hosted row carries is the one that was in
-                // `carrick.json` when the row was written — so a local
-                // `@scope/thing`, which is what a workspace member's manifest
-                // derives, matches a hosted `thing` nowhere, and the symptom
-                // ("candidates not replayed") says nothing about the cause
-                // (carrick#1023 item 12).
+                // Name both sides, in the names a reader wrote: the hosted
+                // blobs' own `service_name`s, not the row slugs. The index is
+                // keyed on the service name, so a package renamed since the
+                // hosted commit, or a `serviceName` other than the one the
+                // hosted scan read, matches nothing (carrick#1023 item 12).
                 let local = blob.service_name.as_deref().unwrap_or(&blob.repo_name);
-                let hosted = hosted_names
+                let mut hosted = self
+                    .local_blobs(path)
                     .iter()
-                    .map(|service| service.service.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                    .map(|b| {
+                        b.service_name
+                            .clone()
+                            .unwrap_or_else(|| b.repo_name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if hosted.is_empty() {
+                    // Rows with no blob behind them: the row keys are all
+                    // there is to name.
+                    hosted = repo
+                        .services
+                        .iter()
+                        .flatten()
+                        .map(|service| service.service.clone())
+                        .collect();
+                }
+                hosted.sort();
                 result.failure = Some(format!(
-                    "local service `{local}` has no hosted match; the hosted index holds \
-                     [{hosted}]. `serviceName` in carrick.json is the key the index is written \
-                     under, and a scoped package name is not one of the names these hosted rows \
-                     carry."
+                    "local service `{local}` has no hosted match; the hosted index holds [{}]. \
+                     The index matches services by name, and this checkout names this one \
+                     differently from the scan that wrote the hosted index (a renamed package, \
+                     or a different `serviceName` in carrick.json)",
+                    hosted.join(", ")
                 ));
                 HostedState::ReadFailed
             } else {
@@ -991,16 +1016,16 @@ impl HostedInput {
         // cloud derives `source` and `uploaded_by` from the credential that
         // wrote the row and never echoes what a client claimed, so the row is
         // the only place they can be read honestly (§1.4).
-        let row = previous
-            .service_name
-            .as_deref()
-            .or(Some(previous.repo_name.as_str()))
-            .and_then(|name| {
-                repo.services
-                    .as_ref()?
-                    .iter()
-                    .find(|service| service.service == name)
-            });
+        // `previous` was relabelled to the local directory, so the fallback
+        // key is the hosted repo's basename, as the cloud stored it.
+        let key = stored_service(
+            previous.service_name.as_deref(),
+            repo.full_name.rsplit('/').next().unwrap_or_default(),
+        );
+        let row = repo
+            .services
+            .as_ref()
+            .and_then(|services| services.iter().find(|service| service.service == key));
         result.hosted = Some(HostedProvenance {
             commit: previous.commit_hash.clone(),
             indexed_at: previous.last_updated.to_rfc3339(),
@@ -2266,6 +2291,98 @@ mod tests {
             .push("another/api".into());
         assert!(input.local_blobs(Path::new("/w/api")).is_empty());
         assert!(input.remote_blobs().is_empty());
+    }
+
+    /// A hosted input holding `stored` for `repo` (remote `example/api`) under
+    /// one row whose key is `row_service`.
+    fn scoped_input(repo: &Path, row_service: &str, stored: CloudRepoData) -> HostedInput {
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": row_service, "hash": stored.commit_hash, "updated_at": null,
+            "scanner_version": null, "source": "ci", "uploaded_by": "ci-bot", "dirty": false
+        }]);
+        HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([("p".into(), vec![stored])]),
+                stored_rows: BTreeMap::new(),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
+            unnamed: BTreeMap::new(),
+            downloads: None,
+        }
+    }
+
+    /// The cloud keys a row by the slug of its service name and the blob keeps
+    /// the name it was scanned under, so `@acme/orders-api` is stored as
+    /// `acme-orders-api`. Compared raw, no scoped name found its row and no
+    /// hosted answer was replayed onto any checkout.
+    #[test]
+    fn a_scoped_service_name_finds_the_row_stored_under_its_slug() {
+        let (dir, head) = committed_repo(&[("app.ts", "export const value = 1;")]);
+        let repo = dir.path();
+        let input = scoped_input(
+            repo,
+            "acme-orders-api",
+            named_blob("api", "@acme/orders-api", &head),
+        );
+        assert_eq!(input.local_blobs(repo).len(), 1);
+        let mut local = blob();
+        local.service_name = Some("@acme/orders-api".into());
+        let answer = input.service(repo, &local);
+        assert_eq!(answer.hosted_state, HostedState::Enriched, "{answer:?}");
+        assert_eq!(
+            answer.hosted.as_ref().and_then(|h| h.source.as_deref()),
+            Some("ci")
+        );
+    }
+
+    /// A package renamed since the hosted scan has no hosted match, and the
+    /// reason names both sides in the names a reader wrote, never the slugs.
+    #[test]
+    fn a_renamed_service_names_both_sides_in_their_own_names() {
+        let (dir, head) = committed_repo(&[("app.ts", "export const value = 1;")]);
+        let repo = dir.path();
+        let input = scoped_input(
+            repo,
+            "acme-orders-api",
+            named_blob("api", "@acme/orders-api", &head),
+        );
+        let mut local = blob();
+        local.service_name = Some("@shop/orders-api".into());
+        let answer = input.service(repo, &local);
+        assert_eq!(answer.hosted_state, HostedState::ReadFailed);
+        let failure = answer.failure.expect("the reason is stated");
+        assert!(failure.contains("`@shop/orders-api`"), "{failure}");
+        assert!(failure.contains("[@acme/orders-api]"), "{failure}");
+        assert!(failure.contains("renamed package"), "{failure}");
+    }
+
+    /// The held blobs of a project whose rows are slugs are the generation
+    /// the cloud stores, so the read reuses them instead of downloading the
+    /// whole project again on every refresh.
+    #[test]
+    fn a_held_scoped_blob_is_unchanged_against_its_slugged_row() {
+        let metadata = json!({"schema":"carrick.resolve-repos/0",
+            "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+            "allowance_sentence":null,
+            "repos":[{"full_name":"example/api","connected":true,"project_id":"pa",
+                "project_slug":"sa","services":[service_row("acme-orders-api","abcdef")]}],
+            "project_repos":[{"project_slug":"sa","repos":["example/api"]}]});
+        let resolution = Resolution::parse(metadata).unwrap();
+        let cached = vec![named_blob("api", "@acme/orders-api", "abcdef")];
+        let held_as = read_as(&cached, STORED_AT);
+        let requested = std::collections::BTreeSet::from(["example/api".to_string()]);
+        assert!(project_is_unchanged(
+            &resolution,
+            "pa",
+            &cached,
+            &held_as,
+            &requested
+        ));
     }
 
     /// The first paid run's own output used to tell the user to go and run the

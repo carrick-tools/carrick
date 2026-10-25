@@ -271,6 +271,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
             services.push(StatusService {
                 hosted: service.enrichment.hosted.clone(),
                 hosted_state: service.enrichment.hosted_state.clone(),
+                hosted_failure: replay_refusal(&service.enrichment),
                 service: service.name.clone(),
                 repo: repo.path.clone(),
                 index_commit: service.commit.clone(),
@@ -666,6 +667,28 @@ fn scanned_changes<'a>(repo_root: &Path, changed: impl Iterator<Item = &'a Strin
     changed
         .filter(|file| crate::file_finder::is_scanned_source(&repo_root.join(file), repo_root))
         .count()
+}
+
+/// Why the hosted rows were not replayed onto a service, for the one line
+/// `carrick status` states per reason. `None` when they were, and for the
+/// states whose own sentence is the boundary note's (not signed in, not
+/// connected, no index yet).
+fn replay_refusal(enrichment: &super::hosted::ServiceEnrichment) -> Option<String> {
+    use super::hosted::HostedState;
+    match enrichment.hosted_state {
+        HostedState::Enriched => None,
+        HostedState::CommitMissing => enrichment.hosted.as_ref().map(|hosted| {
+            format!(
+                "the hosted index was built at commit {}, which this clone does not have, so no \
+                 file can be compared with it",
+                &hosted.commit[..hosted.commit.len().min(7)]
+            )
+        }),
+        HostedState::VersionMismatch => {
+            Some("the hosted index was written in an older index format than this CLI reads".into())
+        }
+        _ => enrichment.failure.clone(),
+    }
 }
 
 pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
