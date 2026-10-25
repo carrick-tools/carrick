@@ -15,6 +15,10 @@
 //! module reads its name as a value (`register(Api)`, `[Api]`): a class
 //! handed on may be built where no `new` names it.
 //!
+//! A class no file of the service constructs, and that none of those rules
+//! refused, is read through its constructor alone (carrick#2808): each
+//! parameter holds its default.
+//!
 //! - Text ([`RequestSummaryInputs::read_fields`]): a field's piece
 //!   (`this.base`) takes the value every construction passes there when they
 //!   agree, and the value is text the source states: literals, or an
@@ -422,11 +426,35 @@ fn named_by<'r>(
     Some((declaring, symbol, row.decl_line()?))
 }
 
+/// The classes of the service read through their constructions, and the
+/// ones that were refused (carrick#2808).
+pub(super) struct Constructed<'a> {
+    /// Each class read through its constructions, by its file and span
+    /// start, with every construction of it.
+    pub(super) built: HashMap<(&'a Path, u32), Vec<Placed<'a>>>,
+    /// Each class the rules above turned away, or that cannot be told from
+    /// one (no compiler rows). A class in neither map is one no file of the
+    /// service constructs: nothing refused it, and its constructor's own
+    /// values are all there is to read.
+    pub(super) refused: HashSet<(&'a Path, u32)>,
+}
+
 /// Each class of the service read through its constructions, by its file
-/// and span start, with every construction of it.
-pub(super) fn constructed(inputs: &RequestSummaryInputs) -> HashMap<(&Path, u32), Vec<Placed<'_>>> {
+/// and span start, with every construction of it; and the classes refused.
+pub(super) fn constructed(inputs: &RequestSummaryInputs) -> Constructed<'_> {
     let Some(positions) = &inputs.positions else {
-        return HashMap::new();
+        return Constructed {
+            built: HashMap::new(),
+            refused: inputs
+                .files
+                .iter()
+                .flat_map(|(file, ir)| {
+                    ir.class_origins
+                        .keys()
+                        .map(move |class| (file.as_path(), *class))
+                })
+                .collect(),
+        };
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
@@ -530,15 +558,37 @@ pub(super) fn constructed(inputs: &RequestSummaryInputs) -> HashMap<(&Path, u32)
             }
         }
     }
+    let turned_away = |file: &Path, class: u32, name: &str| {
+        refused.contains(&(file, class))
+            || refused_names.contains(name)
+            || bases.contains(name)
+            || handed.contains(name)
+    };
+    // A class a `new` named but a rule turned away, or one a name rule
+    // turns away whether or not a `new` named it.
+    let mut refusals: HashSet<(&Path, u32)> = HashSet::new();
+    for (file, ir) in &inputs.files {
+        for (class, origin) in &ir.class_origins {
+            if turned_away(file, *class, origin.name.as_str()) {
+                refusals.insert((file.as_path(), *class));
+            }
+        }
+    }
     found.retain(|(file, class), built| {
-        let name = inputs.files[*file].class_origins[class].name.as_str();
-        !refused.contains(&(*file, *class))
-            && !refused_names.contains(name)
-            && !bases.contains(name)
-            && !handed.contains(name)
-            && built.iter().all(|placed| placed.call.site_args.is_some())
+        let keep = !turned_away(
+            file,
+            *class,
+            inputs.files[*file].class_origins[class].name.as_str(),
+        ) && built.iter().all(|placed| placed.call.site_args.is_some());
+        if !keep {
+            refusals.insert((*file, *class));
+        }
+        keep
     });
-    found
+    Constructed {
+        built: found,
+        refused: refusals,
+    }
 }
 
 impl RequestSummaryInputs {
@@ -547,7 +597,7 @@ impl RequestSummaryInputs {
     pub(super) fn read_fields(&mut self) {
         let table: HashMap<(PathBuf, u32, String), Value> = {
             let mut table = HashMap::new();
-            for ((file, class), built) in constructed(self) {
+            for ((file, class), built) in constructed(self).built {
                 let origin = &self.files[file].class_origins[&class];
                 for (field, from) in &origin.fields {
                     if let Some(value) = from.text.as_ref().and_then(|text| text.agreed(&built)) {
