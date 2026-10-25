@@ -57,11 +57,18 @@ fn sidecar_built() -> bool {
 
 /// A committed copy of the fixture's repo under `tmp`.
 fn committed_copy(tmp: &Path) -> PathBuf {
+    committed_copy_of(tmp, "discovery-siblings", |_| {})
+}
+
+/// A committed copy of `fixture`'s repo under `tmp`, `edit`ed before the
+/// commit.
+fn committed_copy_of(tmp: &Path, fixture: &str, edit: impl FnOnce(&Path)) -> PathBuf {
     let repo = tmp.join("sibling-sites");
     copy_dir(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-siblings/repo"),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{fixture}/repo")),
         &repo,
     );
+    edit(&repo);
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A", "-f"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
@@ -238,4 +245,64 @@ fn a_changed_only_scan_reads_a_carried_sibling_for_the_same_rows() {
         "the app is analysed"
     );
     assert_app_rows(&scoped);
+}
+
+/// Each call row of a blob as `file:line METHOD path source`.
+fn sourced_call_rows(blob: &serde_json::Value) -> Vec<String> {
+    let mut rows: Vec<String> = blob["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|call| {
+            format!(
+                "{} {} {} {}",
+                call["file_path"].as_str().unwrap_or_default(),
+                call["key"]["method"].as_str().unwrap_or_default(),
+                call["key"]["path"].as_str().unwrap_or_default(),
+                call["resolution_source"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// carrick#2618, `tests/fixtures/sibling-wrapper/README.md`: every
+/// operation the app reaches through the client ends with exactly one fact
+/// row, at a wrapper's call into the client while no leaf row states it at
+/// the wrapper's caller. Scanned once with no reader answer for `api.ts`
+/// (the reader states nothing there) and once with the reader stating the
+/// wrappers' lines (`reader/analyze-file/api.json`): a site row replaces
+/// the reader's, and no model row is left.
+#[test]
+fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
+    if !sidecar_built() {
+        return;
+    }
+    const WRAPPER_ROWS: [&str; 5] = [
+        "services/app/src/api.ts:10 GET /api/status request_summary",
+        "services/app/src/api.ts:14 GET /api/version request_summary",
+        "services/app/src/api.ts:15 GET /api/items/1 request_summary",
+        "services/app/src/api.ts:6 GET /api/items/:id request_summary",
+        "services/app/src/commands.ts:21 GET /api/health request_summary",
+    ];
+    let reader = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sibling-wrapper/reader/analyze-file/api.json");
+    for answered in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = committed_copy_of(tmp.path(), "sibling-wrapper", |repo| {
+            if answered {
+                let dir = repo.join("__llm__/analyze-file");
+                fs::create_dir_all(&dir).unwrap();
+                fs::copy(&reader, dir.join("api.json")).unwrap();
+            }
+        });
+        let store = tempfile::tempdir().unwrap();
+        let blobs = scan(&repo, store.path(), &[], true);
+        assert_eq!(
+            sourced_call_rows(blob_of(&blobs, "app")),
+            WRAPPER_ROWS,
+            "reader answer for api.ts: {answered}"
+        );
+    }
 }

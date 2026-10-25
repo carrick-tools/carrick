@@ -20,3 +20,10 @@ only at a call of its own service's files.
 Call-through reads the requests from each service's mount graph, and the
 rows the site questions state sit in the blob's `calls` only, so on this
 fixture it states no leaf row and both wrappers keep theirs.
+
+`tests/sibling_sites_test.rs` scans `repo/` as the Action does, with the
+store's answer in `repo/__llm__/library-claims/`, once as it is (the reader
+states nothing in `api.ts`) and once with `reader/analyze-file/api.json`
+copied in (the reader states model rows at `api.ts:6` and `api.ts:10`). Both
+times the app's blob holds exactly the five rows above, each
+`request_summary`.
