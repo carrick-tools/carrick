@@ -56,6 +56,7 @@ import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
+import { AGENTS_FILE, writeAgentsSection } from "./agents-section.ts";
 import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
 import { findCarrick, offerGlobalInstall } from "../global-install.ts";
@@ -267,8 +268,8 @@ function help(): string {
     "or a folder of repos: which repos this install covers, the project, the repo",
     "connection, the agent hooks, the MCP connection, and the service proposal",
     "your agent turns into carrick.json. It writes nothing into the repository but",
-    "the ignored .carrick directory, the hook settings, and the four task skills",
-    "your agent loads. No model runs and nothing is uploaded. Where Carrick already",
+    "the ignored .carrick directory, the hook settings, the four task skills",
+    "your agent loads, and a short \"Carrick check\" section in AGENTS.md. No model runs and nothing is uploaded. Where Carrick already",
     "holds an index for these repos, it reads that index into .carrick so this",
     "machine can answer from it. That read re-reads your source here first, which",
     "takes minutes on a large workspace. It skips the re-read when .carrick already",
@@ -1574,6 +1575,14 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     }
   } catch (error) {
     out.refuse(`Could not write the task skills: ${(error as Error).message}`);
+  }
+
+  // The check block in AGENTS.md (carrick#2828): only our marked section is
+  // written, and every other line of the file is left as it is.
+  try {
+    writeAgentsSection(workspace);
+  } catch (error) {
+    out.refuse(`Could not write the Carrick check section in ${AGENTS_FILE}: ${(error as Error).message}`);
   }
 
   // The same hooks and skills inside each repo of a folder, because an agent

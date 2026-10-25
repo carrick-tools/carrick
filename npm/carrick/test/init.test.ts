@@ -1385,7 +1385,7 @@ function pathsUnder(root: string): string[] {
 // the task skills the two harnesses read: carrick.json is the agent's to write,
 // after someone has read it, and before the one paid scan
 // (carrick-cloud#799). A change to this set is a deliberate diff in this list.
-test("a first init writes the proposal, its ignore file, the hook settings and the task skills, and nothing else", posixNativeFixture, () => {
+test("a first init writes the proposal, its ignore file, the hook settings, the task skills and the AGENTS.md check section, and nothing else",posixNativeFixture, () => {
   const fixture = executableInitFixture("payments", "absent", "monorepo");
   try {
     const result = spawnSync(
@@ -1414,8 +1414,14 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
         // The same two-part nudge, for the other host (carrick#1335).
         CODEX_HOOKS_FILE,
+        // The check section for agents (carrick#2828).
+        "AGENTS.md",
         ...taskSkillPaths(),
       ].sort(),
+    );
+    assert.equal(
+      fs.readFileSync(path.join(fixture.repo, "AGENTS.md"), "utf8").includes("run `carrick check --changed`"),
+      true,
     );
 
     // The proposal is the whole derivation, including the config it would once
@@ -1425,7 +1431,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     // the Codex hooks and the skills and are meant to be committed.
     assert.equal(
       execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
-      "?? .agents/\n?? .claude/\n?? .codex/\n",
+      "?? .agents/\n?? .claude/\n?? .codex/\n?? AGENTS.md\n",
     );
 
     const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));

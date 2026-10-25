@@ -27,6 +27,7 @@ import {
   mcpRemovalLines,
   SCAFFOLD_FILES,
 } from "../src/init/remove.ts";
+import { writeAgentsSection } from "../src/init/agents-section.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
@@ -697,4 +698,18 @@ test("remove run inside a repo takes its copy back whole, and git sees nothing l
   assert.equal(fs.existsSync(path.join(repo, ".claude")), false, result.stdout);
   assert.equal(fs.readFileSync(excludeFile(repo)!, "utf8"), exclude);
   assert.equal(status(), before);
+});
+
+test("the folder plan lists our AGENTS.md check section, and a file without it lists nothing (carrick#2828)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-remove-agents-"));
+  try {
+    fs.writeFileSync(path.join(dir, "AGENTS.md"), "# Repo\n\n## Carrick check\n\nMine, no markers.\n");
+    assert.equal(folderPlan(dir).agents, false);
+    writeAgentsSection(dir);
+    const plan = folderPlan(dir);
+    assert.equal(plan.agents, true);
+    assert.ok(folderLines(plan).includes('The "Carrick check" section in AGENTS.md'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
