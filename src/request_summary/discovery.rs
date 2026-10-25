@@ -1061,7 +1061,7 @@ struct Walker<'a> {
     /// Each class of the service read through its constructions, with them
     /// (carrick#2452): what fills a field its constructor sets from a
     /// parameter.
-    constructed: HashMap<(&'a Path, u32), Vec<super::decided_sites::Placed<'a>>>,
+    constructed: super::constructions::Constructed<'a>,
     memo: HashMap<(PathBuf, String), Outcome<'a>>,
     /// The definitions being read, by how deep.
     reading: HashMap<(PathBuf, String), usize>,
@@ -2054,7 +2054,9 @@ impl<'a> Walker<'a> {
 
     /// The constructions of the class whose span starts at `class` in
     /// `file`, and where its constructor sets `field` from, when the class
-    /// is read through its constructions (carrick#2452).
+    /// is read through its constructions (carrick#2452). A class no file of
+    /// the service constructs, and that nothing refused, comes back with no
+    /// constructions: its constructor alone is read (carrick#2808).
     fn field_origin(
         &self,
         file: &'a Path,
@@ -2065,10 +2067,14 @@ impl<'a> Walker<'a> {
         &'a super::constructions::FieldOrigin,
         Vec<super::decided_sites::Placed<'a>>,
     )> {
-        let built = self.constructed.get(&(file, class))?;
+        let built = match self.constructed.built.get(&(file, class)) {
+            Some(built) => built.clone(),
+            None if self.constructed.refused.contains(&(file, class)) => return None,
+            None => Vec::new(),
+        };
         let origin = self.inputs.files.get(file)?.class_origins.get(&class)?;
         let from = origin.fields.get(field)?;
-        Some((origin, from, built.clone()))
+        Some((origin, from, built))
     }
 
     /// What `field` of the class whose span starts at `class` in `file` may
@@ -2098,6 +2104,12 @@ impl<'a> Walker<'a> {
                     index,
                     keys,
                 } => {
+                    // No construction in the service (carrick#2808): the
+                    // parameter holds its default, as a function nothing
+                    // calls does.
+                    if built.is_empty() {
+                        out.extend(self.passed(None, *index, keys, Some(defaults), invoke));
+                    }
                     for placed in &built {
                         let at = Invoke {
                             file: placed.file,
@@ -2745,6 +2757,82 @@ mod tests {
                 .all(|site| site.end.is_none()),
             "a captured parameter inside a bound object is read one function out: {:?}",
             discovery.sites
+        );
+    }
+
+    /// carrick#2808: a class no file of its service constructs, and that
+    /// `constructed` did not refuse, is read through its constructor alone:
+    /// a parameter holds its default, and a `??` fallback is the global
+    /// `fetch` or the package's `publish`. A field with no fallback holds
+    /// nothing, and a class the service constructs is still read through its
+    /// constructions. The answer key is
+    /// `tests/fixtures/discovery-unconstructed-class/README.md`.
+    #[test]
+    fn a_class_its_service_never_constructs_reads_its_fields_from_the_constructor() {
+        let Some(on) = walked(
+            "discovery-unconstructed-class",
+            "services/client",
+            "client",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-unconstructed-class/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        for line in [13, 17] {
+            let [site] = at("items.ts", line)[..] else {
+                panic!(
+                    "a site at items.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib.dom", "fetch")
+            );
+        }
+        for line in [13] {
+            let [site] = at("events.ts", line)[..] else {
+                panic!(
+                    "a site at events.ts:{line}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches publish");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("fixture-bus", "publish")
+            );
+        }
+        assert!(
+            at("bare.ts", 11).iter().all(|site| site.end.is_none()),
+            "a field with no fallback holds nothing"
+        );
+        // The control: the service constructs this class with a function
+        // that sends nothing, so it is read through that construction, as
+        // before: two values, the stub and the default `fetch`.
+        let [local] = at("local.ts", 11)[..] else {
+            panic!("a site at local.ts:11: {:?}", discovery.sites);
+        };
+        assert_eq!(local.stop.as_deref(), Some("several_values"));
+        assert_eq!(
+            local.end.as_ref().map(|end| end.export.as_str()),
+            Some("fetch")
         );
     }
 
