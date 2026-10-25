@@ -139,40 +139,8 @@ fn inside(
     generation: &Path,
     deadline: Instant,
 ) -> Result<Fresh, String> {
-    let exe =
-        std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
-    let blobs = generation.join("repos");
-    std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
-
-    // Everything except the edited repo, exactly as the last index left it.
     let name = repo_label(repo);
-    let retained = read_blobs(&workspace.blobs_dir())?;
-    for (position, blob) in retained
-        .iter()
-        .filter(|blob| blob.repo_name != name)
-        .enumerate()
-    {
-        write_blob(&blobs.join(format!("retained-{position}.json")), blob)?;
-    }
-    // The hosted services, from the snapshot on disk. No request is made: a
-    // re-check that waited on the network would miss its budget on the wire
-    // rather than on the work.
-    let hosted = super::hosted::cached(workspace);
-    let mut remote_services = std::collections::BTreeMap::new();
-    for (position, (remote, blob)) in hosted.remote_blobs().into_iter().enumerate() {
-        remote_services.insert(service_id(&blob), remote);
-        write_blob(&blobs.join(format!("hosted-{position}.json")), &blob)?;
-    }
-
-    // Phase 1. `previous_data` is what the last index held for this repo, so
-    // an unchanged file replays its hosted answers instead of losing them.
-    let previous_data = hosted.local_blobs(repo);
-    let previous = generation.join("previous.json");
-    std::fs::write(
-        &previous,
-        serde_json::to_vec(&previous_data).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let rejoined = rejoin(workspace, &[repo], generation, deadline)?;
 
     // What the index holds for THIS file, before the re-scan answers the same
     // question about the working tree. BOTH records of it, because neither is
@@ -184,46 +152,13 @@ fn inside(
     // is what a nudge built on this tells the agent it was compared against.
     // Either one alone would report every function in an edited file as new on
     // the install the other covers.
-    let mut indexed_functions = functions_in(
-        retained.iter().filter(|blob| blob.repo_name == name),
-        relative,
-    );
-    indexed_functions.extend(functions_in(previous_data.iter(), relative));
-    let scan_dir = generation.join("scan");
-    let mut scan = scan_command(
-        &exe,
-        repo,
-        &scan_dir,
-        &previous,
-        None,
-        &super::index::Pass::Facts,
-    );
-    scan.env(super::SKIP_SIGNATURES_ENV, "1")
-        .env_remove(crate::progress::PROGRESS_ENV);
-    bounded(scan, "re-scan", deadline)?;
-    let rescanned = read_blobs(&scan_dir)?;
+    let indexed_functions = functions_in(rejoined.indexed.iter(), relative);
     // One set difference over work already done: the re-scan walked this
     // file's AST to re-extract its rows, and its functions came back with them.
-    let new_functions = new_functions(&indexed_functions, rescanned.iter(), relative);
-    for (position, blob) in rescanned.iter().enumerate() {
-        write_blob(&blobs.join(format!("local-{position}.json")), blob)?;
-    }
+    let new_functions = new_functions(&indexed_functions, rejoined.rescanned.iter(), relative);
 
-    // Phase 2. The join reads the blobs back and runs the type check over
-    // them; it analyses no source, so its cost is the workspace's pairs.
-    let out = generation.join("join.json");
-    let mut join = join_command(&exe, repo, &blobs, &out);
-    join.env_remove(crate::progress::PROGRESS_ENV);
-    bounded(join, "re-join", deadline)?;
-    let text = std::fs::read_to_string(&out)
-        .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
-    let joined: super::LocalJoin =
-        serde_json::from_str(&text).map_err(|e| format!("could not read the re-join: {e}"))?;
-
-    // The same fold the indexer performs, over the same shapes, so a re-checked
-    // row and an indexed row can never be built two different ways.
-    let rebuilt = build(workspace, &blobs, &joined, &remote_services)?;
-    let items = rebuilt
+    let items = rejoined
+        .index
         .repos
         .iter()
         .find(|rebuilt| rebuilt.name == name)
@@ -243,6 +178,131 @@ fn inside(
         new_functions,
         ran,
         elapsed: Duration::default(),
+    })
+}
+
+/// What one re-extraction of some repos produced, joined against everything
+/// else the index already holds.
+pub(super) struct Rejoined {
+    /// The read model the indexer would write for this working tree.
+    pub index: super::read_model::LocalIndex,
+    /// The join it was folded from, for a reader that needs what the read
+    /// model does not carry (an edge's source, the calls that reach no route).
+    pub join: super::LocalJoin,
+    /// The blobs the re-scans wrote, every re-scanned repo's.
+    pub rescanned: Vec<crate::cloud_storage::CloudRepoData>,
+    /// What the index held for the re-scanned repos before: the local blobs
+    /// and the hosted snapshot's copy, both, for the reason [`inside`] gives.
+    pub indexed: Vec<crate::cloud_storage::CloudRepoData>,
+    /// How many distinct services the join read, re-scanned and retained.
+    pub services: usize,
+}
+
+/// Re-scan each of `repos` over its working tree, and join the result against
+/// every other blob the index holds: one scan per repo and ONE join, however
+/// many files changed. `check --recheck` asks for one repo; `check --changed`
+/// asks for every repo with a changed file.
+///
+/// Two phases, both bounded by `deadline`:
+///
+/// 1. Each repo re-scanned, with no model, no upload and no network. The blob
+///    the last index wrote for it is handed in as `previous_data`, so the
+///    hosted answers for files the edit did not touch replay as they do on an
+///    incremental scan.
+/// 2. The join over every blob, re-scanned and retained, with the type check.
+pub(super) fn rejoin(
+    workspace: &Workspace,
+    repos: &[&Path],
+    generation: &Path,
+    deadline: Instant,
+) -> Result<Rejoined, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
+    let blobs = generation.join("repos");
+    std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
+    let names: std::collections::BTreeSet<String> =
+        repos.iter().map(|repo| repo_label(repo)).collect();
+    let mut services = std::collections::BTreeSet::new();
+
+    // Everything except the re-scanned repos, exactly as the last index left it.
+    let retained = read_blobs(&workspace.blobs_dir())?;
+    let mut indexed = Vec::new();
+    for (position, blob) in retained.into_iter().enumerate() {
+        if names.contains(&blob.repo_name) {
+            indexed.push(blob);
+            continue;
+        }
+        services.insert(service_id(&blob));
+        write_blob(&blobs.join(format!("retained-{position}.json")), &blob)?;
+    }
+    // The hosted services, from the snapshot on disk. No request is made: a
+    // re-check that waited on the network would miss its budget on the wire
+    // rather than on the work.
+    let hosted = super::hosted::cached(workspace);
+    let mut remote_services = std::collections::BTreeMap::new();
+    for (position, (remote, blob)) in hosted.remote_blobs().into_iter().enumerate() {
+        services.insert(service_id(&blob));
+        remote_services.insert(service_id(&blob), remote);
+        write_blob(&blobs.join(format!("hosted-{position}.json")), &blob)?;
+    }
+
+    // Phase 1, one scan per repo. `previous_data` is what the last index held
+    // for that repo, so an unchanged file replays its hosted answers instead
+    // of losing them.
+    let mut rescanned = Vec::new();
+    for (position, repo) in repos.iter().enumerate() {
+        let previous_data = hosted.local_blobs(repo);
+        let previous = generation.join(format!("previous-{position}.json"));
+        std::fs::write(
+            &previous,
+            serde_json::to_vec(&previous_data).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        indexed.extend(previous_data);
+        let scan_dir = generation.join(format!("scan-{position}"));
+        let mut scan = scan_command(
+            &exe,
+            repo,
+            &scan_dir,
+            &previous,
+            None,
+            &super::index::Pass::Facts,
+        );
+        scan.env(super::SKIP_SIGNATURES_ENV, "1")
+            .env_remove(crate::progress::PROGRESS_ENV);
+        bounded(scan, "re-scan", deadline)?;
+        for (offset, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
+            services.insert(service_id(&blob));
+            write_blob(
+                &blobs.join(format!("local-{position}-{offset}.json")),
+                &blob,
+            )?;
+            rescanned.push(blob);
+        }
+    }
+
+    // Phase 2. The join reads the blobs back and runs the type check over
+    // them; it analyses no source, so its cost is the workspace's pairs. The
+    // repo it is pointed at only names the run: every blob is in `blobs`.
+    let anchor = repos.first().copied().unwrap_or(&workspace.root);
+    let out = generation.join("join.json");
+    let mut join = join_command(&exe, anchor, &blobs, &out);
+    join.env_remove(crate::progress::PROGRESS_ENV);
+    bounded(join, "re-join", deadline)?;
+    let text = std::fs::read_to_string(&out)
+        .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
+    let joined: super::LocalJoin =
+        serde_json::from_str(&text).map_err(|e| format!("could not read the re-join: {e}"))?;
+
+    // The same fold the indexer performs, over the same shapes, so a re-checked
+    // row and an indexed row can never be built two different ways.
+    let index = build(workspace, &blobs, &joined, &remote_services)?;
+    Ok(Rejoined {
+        index,
+        join: joined,
+        rescanned,
+        indexed,
+        services: services.len(),
     })
 }
 

@@ -18,6 +18,7 @@
 
 use std::path::Path;
 
+mod changed;
 pub mod cli;
 mod contract;
 pub(crate) mod hosted;

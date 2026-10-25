@@ -460,6 +460,42 @@ response that does not.
 
 The workspace question has its own command and its own schema, below.
 
+## `carrick check --changed` — every changed file, with the tests
+
+Implemented in `src/local_mode/changed.rs`. Takes no file. For each repo of
+the workspace it finds the merge base of `HEAD` and the main branch
+(`origin/HEAD`, else `origin/main`, `origin/master`, `main`, `master`), and
+checks every source file the scan reads that differs from it: committed on the
+branch, uncommitted, or untracked. Each repo with such a file is re-scanned
+once over its working tree, with no model and nothing on the wire, and one join
+runs over those blobs and every blob the index already holds — the same two
+phases as `check --recheck`, once for all files. Untouched files are
+re-extracted with their repo but not reported, except a call the index matched
+that now reaches no route (the work removed or moved its route).
+
+Human output is one summary line, then one line per problem:
+
+```
+carrick check: checked 1 route and 2 calls in 2 changed files against 2 services: 1 incompatible, 1 reaches no route
+catalog-web/app/routes/api.v1.widgets.$widgetId.ts:10  incompatible  route GET /api/v1/widgets/:widgetId with inventory-svc src/client.ts:20: Property 'activeCount' is missing ...
+inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no service in this workspace serves it
+```
+
+`--json` prints `carrick.check-changed/0`: `files`, `routes`, `calls`,
+`services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
+`problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
+`method`, `path`, `other`, `reason`, `source`, `fails`), `failing`,
+`elapsed_ms`, and `not_checked` when nothing could be checked.
+
+**Exit code.** The one read a verdict moves: 1 when any problem `fails`, else
+0. An incompatible pair fails when its finding's edge source is `fact` and its
+verdict state is not `unresolved` (the cloud's enforcement rule, cloud#599); a
+call that reaches no route fails when its row is a fact. A problem resting on a
+model candidate, or on rows that state no source, is printed and exits 0. A
+check that could not run (no index, no main branch, budget spent) says why on
+its summary line and exits 0, so a test run never fails on a missing index.
+The budget is two minutes, `CARRICK_CHECK_BUDGET_MS`.
+
 ## `carrick status` — the workspace, with no file in the question
 
 What a surface opening a session asks: what is indexed, at which commit, how

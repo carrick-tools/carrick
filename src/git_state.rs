@@ -476,6 +476,55 @@ pub fn merge_base(repo_path: &str, a: &str, b: &str) -> Result<String, String> {
     Ok(base)
 }
 
+/// The repo's main branch, as a ref this clone can resolve: the remote's
+/// default (`origin/HEAD`) where the clone recorded one, and otherwise the
+/// first of `origin/main`, `origin/master`, `main`, `master` that exists.
+/// `None` when none does.
+pub fn main_branch(repo_path: &str) -> Option<String> {
+    if let Ok(text) = run_git(
+        repo_path,
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let name = text.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    ["origin/main", "origin/master", "main", "master"]
+        .into_iter()
+        .find(|name| {
+            run_git(
+                repo_path,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{name}^{{commit}}"),
+                ],
+            )
+            .is_ok()
+        })
+        .map(str::to_string)
+}
+
+/// Where the checked-out work left the repo's main branch: the merge base of
+/// `HEAD` and [`main_branch`], with the branch's name. Everything committed on
+/// the branch since, plus whatever is uncommitted, is the work in hand.
+pub fn main_base(repo_path: &str) -> Result<(String, String), String> {
+    let branch = main_branch(repo_path).ok_or(
+        "no main branch to compare against (looked for origin/HEAD, origin/main, \
+         origin/master, main and master)",
+    )?;
+    let tip = run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("{branch}^{{commit}}")],
+    )?
+    .trim()
+    .to_string();
+    let head = head_commit(repo_path)?;
+    Ok((branch, merge_base(repo_path, &head, &tip)?))
+}
+
 /// Every file that differs between commits `from` and `to`, as
 /// [`changed_paths`] lists them but with a renamed file paired to its old
 /// path (carrick#2285), for a reader that compares a file's two copies. Kept

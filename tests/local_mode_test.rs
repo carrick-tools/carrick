@@ -2415,3 +2415,182 @@ fn a_verdict_the_upload_missed_is_named_by_the_build_and_by_status() {
         "{json:#}"
     );
 }
+
+/// `carrick check --changed`, with its exit code and its stdout. The budget is
+/// generous for the same reason the re-check tests' is: this binary is built
+/// without optimisation on a shared runner.
+fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
+    let mut args = vec!["check", "--changed", "--workspace", "."];
+    if json {
+        args.push("--json");
+    }
+    let output = Command::new(carrick())
+        .args(&args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+fn commit_all(repo: &Path, message: &str) {
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=fixture@carrick.test",
+            "-c",
+            "user.name=fixture",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+/// The consumer gains a member that calls a route no service serves, and a
+/// caller that makes it a member the repo uses.
+fn add_a_call_to_no_route(root: &Path) {
+    let client = root.join("inventory-svc/src/client.ts");
+    edit(
+        &client,
+        "  readWidget(widgetId: string)",
+        "  readGadget(gadgetId: string): Promise<Widget> {\n    return send<Widget>(`${this.baseUrl}/api/v1/gadgets/${gadgetId}`, {\n      method: \"GET\",\n    });\n  }\n\n  readWidget(widgetId: string)",
+    );
+    let caller = root.join("inventory-svc/src/inventory.ts");
+    let mut text = std::fs::read_to_string(&caller).expect("read the caller");
+    text.push_str(
+        "\nexport async function gadgetName(\n  gadgetId: string,\n  client: CatalogClient\n): Promise<string> {\n  const gadget = await client.readGadget(gadgetId);\n  return gadget.name;\n}\n",
+    );
+    std::fs::write(&caller, text).expect("write the caller");
+}
+
+/// A handler committed on a branch stops sending a field the consumer reads.
+/// The consumer is untouched, so only a pass that re-extracts the producer and
+/// re-judges it against the index can see it, and it is a fact on both sides.
+#[test]
+#[serial]
+fn check_changed_fails_when_a_changed_handler_drops_a_field_a_consumer_reads() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    commit_all(&producer, "drop activeCount");
+
+    let (code, text) = check_changed(root, false);
+    let summary = text.lines().next().unwrap_or_default();
+    assert!(
+        summary.starts_with("carrick check: checked 1 route and 0 calls in 1 changed file"),
+        "one summary line, about the one file the branch changed:\n{text}"
+    );
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("catalog-web/app/routes/api.v1.widgets.$widgetId.ts:")
+                && line.contains("  incompatible  ")
+        })
+        .unwrap_or_else(|| panic!("the route is named at its line:\n{text}"));
+    assert!(
+        problem.contains("with inventory-svc src/client.ts:") && problem.contains("activeCount"),
+        "with the other side and the reason:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["schema"], "carrick.check-changed/0");
+    assert_eq!(json["files"], 1, "{json:#}");
+    assert_eq!(json["problems"][0]["kind"], "incompatible", "{json:#}");
+    assert_eq!(json["problems"][0]["fails"], true, "{json:#}");
+}
+
+/// A new call, uncommitted, to a route no service in the workspace serves.
+#[test]
+#[serial]
+fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the new call is named at its line:\n{text}"));
+    assert!(
+        problem.contains("GET /api/v1/gadgets/:gadgetId"),
+        "with the operation it calls:\n{text}"
+    );
+    assert!(
+        !text.contains("api.v1.widgets"),
+        "the untouched producer is not reported:\n{text}"
+    );
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+}
+
+/// A problem that was already on main, in a file the work did not touch, is
+/// not this work's: only the changed file is reported and counted.
+#[test]
+#[serial]
+fn check_changed_does_not_re_check_a_file_the_work_did_not_touch() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    // The unmatched call is committed on main before the index is built.
+    add_a_call_to_no_route(root);
+    commit_all(&root.join("inventory-svc"), "a call to no route, on main");
+    index(root);
+
+    let producer = root.join("catalog-web");
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(
+        &producer.join("app/routes/api.v1.health.ts"),
+        "// A second route",
+        "// Health.\n// A second route",
+    );
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.starts_with("carrick check: checked 1 route and 0 calls in 1 changed file"),
+        "only the changed file is counted:\n{text}"
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "and nothing outside it is reported:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// The one exception: a call in an untouched file that the index matched, and
+/// that the work left with no route by deleting the route it called.
+#[test]
+#[serial]
+fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    std::fs::remove_file(root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"))
+        .expect("delete the route");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")
+                && line.contains("the index matched this call")),
+        "the consumer the deletion broke is named:\n{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}

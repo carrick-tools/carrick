@@ -611,7 +611,7 @@ fn verdict_for(
 }
 
 /// The read model, or why there is no answer.
-fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
+pub(super) fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
     let index_file = workspace_root
         .join(super::workspace::INDEX_DIR)
         .join("index.json");

@@ -75,6 +75,13 @@ pub enum LocalCommand {
         /// The post-edit hook asks for this; nothing else does.
         recheck: bool,
     },
+    /// Every file changed since the repo's main branch, re-extracted and
+    /// judged against the index in one pass. The one read whose exit code a
+    /// verdict moves: an agent runs it with its tests.
+    CheckChanged {
+        workspace: Option<PathBuf>,
+        json: bool,
+    },
     /// Collect a dispatched job's analysis and finish the index.
     ///
     /// Reads the answers, rebuilds each file's prompt locally and takes the
@@ -130,6 +137,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut detach = false;
     let mut dispatch = false;
     let mut recheck = false;
+    let mut changed = false;
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
     let mut candidates = false;
@@ -155,6 +163,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--json" => json = true,
             "--candidates" => candidates = true,
             "--recheck" => recheck = true,
+            "--changed" => changed = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
             // Accepting the flag and ignoring it would hand a scaffold that
@@ -206,6 +215,20 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     // print nothing new.
     if recheck && name != "check" {
         return Err(format!("unknown option for `carrick {name}`: --recheck"));
+    }
+    if changed && name != "check" {
+        return Err(format!("unknown option for `carrick {name}`: --changed"));
+    }
+    // `--changed` names its own files and always re-extracts them.
+    if changed && (recheck || !positional.is_empty()) {
+        return Err(
+            "`carrick check --changed` takes no file and no --recheck: it checks every file \
+             changed since the main branch, re-extracted."
+                .to_string(),
+        );
+    }
+    if changed {
+        return Ok(LocalCommand::CheckChanged { workspace, json });
     }
     // Only the proposal has services to list candidates for.
     if candidates && name != "derive" {
@@ -299,7 +322,9 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
 /// read-only command FOUND never moves it — nothing local mode says blocks
 /// anything — and the one exception is `check` refusing to answer at all,
 /// which a script has to be able to tell from a clean verdict (carrick#1023
-/// item 2, [`read`]).
+/// item 2, [`read`]). `check --changed` is the other: it is the command an
+/// agent runs with its tests, so a problem that is a fact exits 1
+/// ([`super::changed`]).
 pub fn run(command: LocalCommand) -> i32 {
     match command {
         LocalCommand::Derive {
@@ -402,6 +427,9 @@ pub fn run(command: LocalCommand) -> i32 {
                 Freshness::Indexed
             },
         ),
+        LocalCommand::CheckChanged { workspace, json } => {
+            super::changed::run(workspace.as_deref(), json)
+        }
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
     }
 }
@@ -1760,6 +1788,7 @@ USAGE:
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json] [--recheck]
+    carrick check   --changed [--workspace <dir>] [--json]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     derive     Print the workspace and service proposal without writing files.
@@ -1801,6 +1830,14 @@ USAGE:
                disk, with no model and nothing on the wire. It has ten seconds
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
                one and says so.
+               --changed takes no file: it checks every file changed since
+               each repo's main branch (committed on the branch, uncommitted
+               and untracked), re-extracted in one pass, and prints one
+               summary line plus one line per problem. It exits 1 only when a
+               problem is a fact (an incompatible pair, or a call that reaches
+               no route); one resting on a model candidate is printed and
+               exits 0, as does a check that could not run. Two minutes at
+               most (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
     refresh    Re-scan one service (or every repo) and re-join.
 
 On macOS, index, resume and refresh keep this machine from idle-sleeping until

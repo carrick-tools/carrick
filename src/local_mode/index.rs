@@ -1784,7 +1784,7 @@ fn verdict_for(
 ///
 /// One selector, used by both: a row that took its verdict from one finding
 /// and its types from another would state a pair that was never compared.
-fn finding_for<'a>(
+pub(super) fn finding_for<'a>(
     operation: &JoinedOperation,
     findings: &'a [JoinedFinding],
 ) -> Option<&'a JoinedFinding> {
@@ -2269,6 +2269,7 @@ mod tests {
             operations: Vec::new(),
             matches: vec![joined_pair("web", None)],
             findings: Vec::new(),
+            unmatched: Vec::new(),
             type_check: super::super::JoinTypeCheck::Skipped {
                 reason: "sidecar not found".to_string(),
             },
