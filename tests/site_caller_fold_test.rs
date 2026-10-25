@@ -308,3 +308,61 @@ fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
     let shared = at(&on, "src/screens.ts:25");
     assert!(shared.iter().any(|row| row.1 == "GET /api/tag"), "{on:#?}");
 }
+
+/// carrick#2793: a request written in a member of an exported object literal
+/// folds its callers' rows exactly as one written in a function declaration
+/// does.
+///
+/// `tests/fixtures/caller-fold-object/`: `src/client.ts` exports `itemsApi`,
+/// an object literal whose members each write their request inside a
+/// function handed to a tracing package: `replace` is an arrow
+/// (`PUT /api/items/${id}`), `save` a method (`POST /api/items`). The call
+/// graph keys them `itemsApi.replace` and `itemsApi.save`. `src/screens.ts`
+/// calls each; the reader's cassette names each caller's request wrongly.
+///
+/// | line | reader states | switch on |
+/// |---|---|---|
+/// | `src/client.ts:10`, `:13` | the request | the fact row |
+/// | `src/screens.ts:4` (`itemsApi.replace`) | `PATCH /api/items/:id` | folded: no row |
+/// | `src/screens.ts:8` (`itemsApi.save`) | `POST /api/save` | folded: no row |
+#[test]
+fn a_reader_row_at_a_call_of_an_object_literal_member_folds_onto_its_fact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(tmp.path(), "caller-fold-object");
+
+    // Off: a reader's row stands at each caller, the proof it states them.
+    // The old path's method re-key may restate the `replace` caller's verb
+    // from its callee; the row is still the reader's.
+    let off = calls(&scan(&repo, false));
+    for place in ["src/screens.ts:4", "src/screens.ts:8"] {
+        let rows = at(&off, place);
+        assert_eq!(rows.len(), 1, "{place} off: {off:#?}");
+        assert_eq!(rows[0].2, "model", "{place} off: {off:#?}");
+    }
+    assert_eq!(
+        at(&off, "src/screens.ts:8")[0].1,
+        "POST /api/save",
+        "{off:#?}"
+    );
+
+    let blob = scan(&repo, true);
+    let on = calls(&blob);
+    // Each request stands once, at the call that writes it, as a fact.
+    for (place, operation) in [
+        ("src/client.ts:10", "PUT /api/items/:id"),
+        ("src/client.ts:13", "POST /api/items"),
+    ] {
+        let rows = at(&on, place);
+        assert_eq!(rows.len(), 1, "{place}: {on:#?}");
+        assert_eq!(rows[0].1, operation, "{place}: {on:#?}");
+        assert_ne!(rows[0].2, "model", "{place}: {on:#?}");
+    }
+    // The callers' misreadings are gone, from the calls and from the graph
+    // the cross-service pass reads.
+    let graph = graph_calls(&blob);
+    for place in ["src/screens.ts:4", "src/screens.ts:8"] {
+        assert!(at(&on, place).is_empty(), "{place}: {on:#?}");
+        assert!(!graph.contains(&place.to_string()), "{place}: {graph:#?}");
+    }
+    assert_eq!(on.len(), 2, "{on:#?}");
+}
