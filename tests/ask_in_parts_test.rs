@@ -36,7 +36,7 @@ use carrick::agents::file_orchestrator::{
 use carrick::agents::framework_guidance_agent::{
     FrameworkGuidance, PatternExample, ProtocolGuidance,
 };
-use carrick::agents::source_parts::{Limits, SourcePart, source_parts};
+use carrick::agents::source_parts::{Limits, ShownLines, SourcePart, source_parts};
 use carrick::framework_detector::DetectionResult;
 use carrick::graphql::GraphqlConsumerHints;
 use carrick::operation::Protocol;
@@ -128,11 +128,23 @@ struct Fixture {
 impl Fixture {
     /// The 70-candidate table and its four handler modules.
     fn table(tag: &str) -> Self {
+        Self::table_from(tag, table_source(tag))
+    }
+
+    /// The table written as `source` says, and its four handler modules.
+    fn table_from(tag: &str, source: String) -> Self {
         let mut modules: Vec<(String, String)> = (0..HANDLER_MODULES)
             .map(|n| (format!("src/handlers/h{n}.ts"), handler_source(n)))
             .collect();
-        modules.push((format!("src/{tag}_table.ts"), table_source(tag)));
+        modules.push((format!("src/{tag}_table.ts"), source));
         Self::of(&modules, &format!("src/{tag}_table.ts"))
+    }
+
+    /// Only the table, with no module to import: the route table of
+    /// [`function_table_source`].
+    fn lone_table(tag: &str, source: String) -> Self {
+        let subject = format!("src/{tag}_table.ts");
+        Self::of(&[(subject.clone(), source)], &subject)
     }
 
     /// `modules` written under a fresh root, with `subject` the file the test
@@ -212,6 +224,7 @@ impl Fixture {
         let stem = self.table_prompt_path.replace('/', "_");
         let mut whole = None;
         let mut parts = BTreeMap::new();
+        let mut terms = BTreeMap::new();
         for entry in std::fs::read_dir(dump).expect("the dump dir") {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -233,9 +246,35 @@ impl Fixture {
             {
                 assert_eq!(payload["part"], label, "a part dump names its part");
                 parts.insert(label.to_string(), prompt);
+                // A dump that states no terms is read as a part of no candidates;
+                // a test that needs them says so when it looks one up.
+                let Some(ids) = payload["candidate_ids"].as_object() else {
+                    continue;
+                };
+                let ids = ids
+                    .iter()
+                    .map(|(local, file)| (local.clone(), file.as_str().unwrap().to_string()))
+                    .collect();
+                let runs: Vec<(u32, u32)> = serde_json::from_value(payload["shown_runs"].clone())
+                    .expect("a part dump names the lines it shows");
+                terms.insert(
+                    label.to_string(),
+                    PartTerms {
+                        ids,
+                        shown: ShownLines {
+                            window: runs[0],
+                            runs,
+                            markers: false,
+                        },
+                    },
+                );
             }
         }
-        Dumps { whole, parts }
+        Dumps {
+            whole,
+            parts,
+            terms,
+        }
     }
 
     /// The subject's whole prompt, from a run in which every file answers.
@@ -258,6 +297,84 @@ impl Fixture {
 struct Dumps {
     whole: Option<String>,
     parts: BTreeMap<String, String>,
+    /// What each part's dump says of its own terms, by part label.
+    terms: BTreeMap<String, PartTerms>,
+}
+
+/// What a part's dump states beside its prompt (carrick#2794): the file id
+/// each of its local candidate ids stands for, and the file lines it shows.
+/// Enough to write the answer a model gives to that prompt, and to say what
+/// the scanner should read it as.
+#[derive(Debug, Clone)]
+struct PartTerms {
+    /// (the id the part's prompt gives, the file's id), in the order the part
+    /// lists its candidates.
+    ids: Vec<(String, String)>,
+    shown: ShownLines,
+}
+
+impl PartTerms {
+    fn file_id(&self, local: &str) -> Option<&str> {
+        self.ids
+            .iter()
+            .find(|(id, _)| id == local)
+            .map(|(_, file)| file.as_str())
+    }
+
+    fn local_id(&self, file: &str) -> Option<&str> {
+        self.ids
+            .iter()
+            .find(|(_, id)| id == file)
+            .map(|(local, _)| local.as_str())
+    }
+}
+
+/// The part among `terms` that lists the candidate `file_id`.
+fn terms_holding<'a>(terms: &'a BTreeMap<String, PartTerms>, file_id: &str) -> &'a PartTerms {
+    terms
+        .values()
+        .find(|part| part.local_id(file_id).is_some())
+        .unwrap_or_else(|| panic!("no part lists {file_id}: {terms:?}"))
+}
+
+/// The answer a model gives to a part's prompt for the rows of `whole` that
+/// part can see: its candidates under the ids the prompt gives them, and the
+/// rows with no candidate only when the part shows their line, every line as
+/// the prompt numbers it. Rows stay in their order.
+fn in_part_terms(whole: &Value, part: &PartTerms) -> Value {
+    let renumber = |row: &Value| -> Option<Value> {
+        let mut row = row.clone();
+        let line = u32::try_from(row["line_number"].as_i64()?).ok()?;
+        row["line_number"] = json!(part.shown.prompt_line(line)?);
+        Some(row)
+    };
+    let of_candidates = |name: &str| -> Vec<Value> {
+        whole[name]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let local = part.local_id(row["candidate_id"].as_str()?)?;
+                let mut row = renumber(row)?;
+                row["candidate_id"] = json!(local);
+                Some(row)
+            })
+            .collect()
+    };
+    let of_lines = |name: &str| -> Vec<Value> {
+        whole[name]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(renumber)
+            .collect()
+    };
+    json!({
+        "mounts": of_lines("mounts"),
+        "endpoints": of_candidates("endpoints"),
+        "data_calls": of_candidates("data_calls"),
+        "pubsub_operations": of_lines("pubsub_operations"),
+    })
 }
 
 /// One candidate as a prompt's CANDIDATE CONTEXT section states it.
@@ -270,18 +387,43 @@ struct Listed {
 }
 
 /// The candidates a file asked in parts lists, in source order: each part's,
-/// parts in the order their labels sort, which is source order.
-fn listed_in_parts(parts: &BTreeMap<String, String>) -> Vec<Listed> {
-    parts
-        .values()
-        .flat_map(|prompt| listed_in(prompt))
+/// parts in the order their labels sort, which is source order. Read back
+/// into the file's terms through each part's dump: a part's prompt names its
+/// candidates and their lines in its own (carrick#2794).
+fn listed_in_parts(dumps: &Dumps) -> Vec<Listed> {
+    dumps
+        .parts
+        .iter()
+        .flat_map(|(label, prompt)| {
+            let terms = &dumps.terms[label];
+            listed_in(prompt).into_iter().map(move |candidate| {
+                let id = terms
+                    .file_id(&candidate.id)
+                    .unwrap_or_else(|| panic!("{label} lists {}", candidate.id));
+                let (start, end) = id
+                    .strip_prefix("span:")
+                    .and_then(|span| span.split_once('-'))
+                    .expect("a file id names a span");
+                Listed {
+                    id: id.to_string(),
+                    span_start: start.parse().unwrap(),
+                    span_end: end.parse().unwrap(),
+                    line: terms
+                        .shown
+                        .file_line(candidate.line)
+                        .expect("a candidate's line is shown") as i64,
+                }
+            })
+        })
         .collect()
 }
 
 fn listed_in(prompt: &str) -> Vec<Listed> {
     section(prompt, "CANDIDATE CONTEXT")
         .lines()
-        .filter(|line| line.starts_with("{\"candidate_id\""))
+        // A part's context is written with its keys sorted, so the id is not
+        // the first key (carrick#2794).
+        .filter(|line| line.starts_with('{') && line.contains("\"candidate_id\""))
         .map(|line| {
             // The section's closing note follows the last object on its line.
             let value: Value = serde_json::Deserializer::from_str(line)
@@ -291,8 +433,9 @@ fn listed_in(prompt: &str) -> Vec<Listed> {
                 .expect("a candidate context object");
             Listed {
                 id: value["candidate_id"].as_str().unwrap().to_string(),
-                span_start: value["span_start"].as_u64().unwrap() as u32,
-                span_end: value["span_end"].as_u64().unwrap() as u32,
+                // A part's context states no span (carrick#2794).
+                span_start: value["span_start"].as_u64().unwrap_or(0) as u32,
+                span_end: value["span_end"].as_u64().unwrap_or(0) as u32,
                 line: value["line_number"].as_i64().unwrap(),
             }
         })
@@ -466,6 +609,25 @@ async fn requests_and_part_sizes(fx: &Fixture, verdict: &str) -> (usize, Vec<usi
     (sent, sizes)
 }
 
+/// What every part of the table says of itself, from a run in which each
+/// request in `refusals` is refused once as its marker says and every other
+/// request is answered. The same refusals then go to the run under test.
+async fn part_terms(fx: &Fixture, refusals: &[(String, String)]) -> BTreeMap<String, PartTerms> {
+    part_dumps(fx, refusals).await.terms
+}
+
+/// [`part_terms`], with the prompts the parts were sent as well.
+async fn part_dumps(fx: &Fixture, refusals: &[(String, String)]) -> Dumps {
+    let dump = tempfile::tempdir().unwrap();
+    for (marker, verdict) in refusals {
+        agent_service::inject_mock_envelope(ROUTE, marker, 1, verdict);
+    }
+    dump_into(Some(dump.path()));
+    fx.analyze().await;
+    dump_into(None);
+    fx.dumps(dump.path())
+}
+
 /// What the hint line of single registration `i` holds and nothing else in a
 /// request does, as it reads inside the serialized request body.
 fn single_marker(tag: &str, i: usize) -> String {
@@ -610,23 +772,25 @@ fn part_markers(tag: &str) -> [String; 3] {
 }
 
 /// Cut the table's whole answer and answer each of its three parts with its
-/// share of `whole`, rows reversed. Returns the answers injected, in part
-/// order.
-fn cut_whole_and_answer_parts(
+/// share of `whole`, rows reversed, as the model reads that part's prompt:
+/// in the part's candidate ids and the part's line numbers. Returns the same
+/// answers in the file's own terms, in part order.
+async fn cut_whole_and_answer_parts(
     fx: &Fixture,
     tag: &str,
     whole: &Value,
     listed: &[Listed],
 ) -> Vec<Value> {
+    let terms = part_terms(fx, &[(fx.whole_marker(), cut())]).await;
     agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
-    let answers: Vec<Value> = PART_RANGES
-        .iter()
-        .map(|range| reversed(projected(whole, listed, *range)))
-        .collect();
-    for (marker, answer) in part_markers(tag).iter().zip(&answers) {
+    let mut in_file_terms = Vec::new();
+    for (marker, range) in part_markers(tag).iter().zip(PART_RANGES) {
+        let part = terms_holding(&terms, &listed[range.0].id);
+        let answer = reversed(in_part_terms(whole, part));
         agent_service::inject_mock_answer(ROUTE, marker, 1, &answer.to_string());
+        in_file_terms.push(reversed(projected(whole, listed, range)));
     }
-    answers
+    in_file_terms
 }
 
 /// The fixture is what the tests' expected parts are read off, so its shape
@@ -662,7 +826,7 @@ async fn a_cut_whole_answer_is_stored_once_as_the_union_of_its_parts() {
     assert_the_table_lists_what_the_tests_assume(&listed);
 
     let whole = whole_answer(&listed);
-    cut_whole_and_answer_parts(&fx, tag, &whole, &listed);
+    cut_whole_and_answer_parts(&fx, tag, &whole, &listed).await;
 
     let before = requests();
     let result = fx.analyze().await;
@@ -698,7 +862,7 @@ async fn the_merged_answer_is_the_same_bytes_whatever_order_its_parts_arrive_in(
     let fx = Fixture::table(tag);
     let listed = fx.listed().await;
     let whole = whole_answer(&listed);
-    let answers = cut_whole_and_answer_parts(&fx, tag, &whole, &listed);
+    let answers = cut_whole_and_answer_parts(&fx, tag, &whole, &listed).await;
 
     let before = requests();
     let result = fx.analyze().await;
@@ -752,9 +916,10 @@ async fn a_stored_whole_answer_split_by_candidate_id_merges_back_to_itself() {
     let stored_whole = bytes(&answered_whole.raw_model_results[&fx.table]);
 
     // The same rows, each given back by the part that lists its candidate.
+    let terms = part_terms(&fx, &[(fx.whole_marker(), cut())]).await;
     agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
     for (marker, range) in part_markers(tag).iter().zip(PART_RANGES) {
-        let part = projected(&whole, &listed, range);
+        let part = in_part_terms(&whole, terms_holding(&terms, &listed[range.0].id));
         agent_service::inject_mock_answer(ROUTE, marker, 1, &part.to_string());
     }
     let before = requests();
@@ -782,15 +947,24 @@ async fn a_part_that_is_cut_is_halved_by_groups() {
     let (from, to) = PART_RANGES[1];
     let front = (from, from + CHAIN_LINKS + 14);
     let back = (front.1, to);
-    agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
-    agent_service::inject_mock_envelope(ROUTE, &single_marker(tag, LOCAL_SINGLES), 1, &cut());
+    let refusals = [
+        (fx.whole_marker(), cut()),
+        (single_marker(tag, LOCAL_SINGLES), cut()),
+    ];
+    let terms = part_terms(&fx, &refusals).await;
+    for (marker, verdict) in &refusals {
+        agent_service::inject_mock_envelope(ROUTE, marker, 1, verdict);
+    }
     for (marker, range) in [
         (single_marker(tag, 0), PART_RANGES[0]),
         (single_marker(tag, LOCAL_SINGLES), front),
         (single_marker(tag, LOCAL_SINGLES + 14), back),
         (single_marker(tag, LAST_PART_FIRST_SINGLE), PART_RANGES[2]),
     ] {
-        let part = reversed(projected(&whole, &listed, range));
+        let part = reversed(in_part_terms(
+            &whole,
+            terms_holding(&terms, &listed[range.0].id),
+        ));
         agent_service::inject_mock_answer(ROUTE, &marker, 1, &part.to_string());
     }
 
@@ -996,21 +1170,30 @@ fn assert_a_part_prompt_shows(prompt: &str, whole: &str, part: &SourcePart, sour
     };
     assert_eq!([*same], whole_section.under_header.as_slice());
     let (first, last) = part.window();
+    let shown = part.shown();
+    let (a, b) = (
+        shown.prompt_line(first).unwrap(),
+        shown.prompt_line(last).unwrap(),
+    );
     assert!(
         sentence.starts_with(&format!(
-            "This request covers lines {first} to {last} of the file."
+            "This request covers lines {a} to {b} below, one part of the file."
         )),
+        "{sentence}"
+    );
+    assert!(
+        sentence.contains("the numbers count the lines shown here")
+            || sentence.contains("The numbers count the lines shown here"),
         "{sentence}"
     );
     assert!(
         sentence.contains("the rest of the file is not shown")
             && sentence.contains(&format!(
-                "no entry is owed for anything outside lines {first} to {last}"
+                "no entry is owed for anything outside lines {a} to {b}"
             )),
         "{sentence}"
     );
     // 3. Lines with no number are under one in ten of the lines shown.
-    let shown = part.shown();
     let numbered: Vec<u32> = section
         .fence
         .iter()
@@ -1028,16 +1211,25 @@ fn assert_a_part_prompt_shows(prompt: &str, whole: &str, part: &SourcePart, sour
         .runs
         .iter()
         .flat_map(|(first, last)| *first..=*last)
+        .map(|line| shown.prompt_line(line).unwrap())
         .collect();
     assert_eq!(numbered, expected, "part {}", part.label());
+    // The part's numbers count from 1 and skip one number a gap.
+    assert_eq!(numbered[0], 1);
+    assert_eq!(
+        numbered.len() as u32 + shown.runs.len() as u32 - 1,
+        *numbered.last().unwrap(),
+        "one number skipped at each gap"
+    );
     assert!((first..=last).all(|line| shown.holds(line)));
     let lines: Vec<&str> = source.lines().collect();
     for line in &section.fence {
         if let Some(number) = line_number(line) {
+            let file = shown.file_line(number.into()).unwrap();
             assert_eq!(
                 *line,
-                format!("{number:4}| {}", lines[number as usize - 1]),
-                "line {number}"
+                format!("{number:4}| {}", lines[file as usize - 1]),
+                "prompt line {number}"
             );
         }
     }
@@ -1133,9 +1325,14 @@ async fn a_part_prompt_shows_its_window_and_lists_its_own_candidates_imports_and
             part.len() < whole.len(),
             "a part is smaller than the request that was cut"
         );
-        let ids: Vec<&str> = listed[from..to].iter().map(|c| c.id.as_str()).collect();
+        let ids: Vec<String> = (1..=to - from).map(|n| format!("c{n}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
         let in_context: Vec<String> = listed_in(part).into_iter().map(|c| c.id).collect();
         assert_eq!(in_context, ids, "the part's candidate contexts");
+        assert!(
+            !part.contains("span_start") && !part.contains("(span "),
+            "a part states no position in the file"
+        );
         let in_targets: Vec<&str> = section(part, "CANDIDATE TARGETS")
             .lines()
             .filter_map(|line| line.strip_prefix("- Candidate "))
@@ -1418,21 +1615,39 @@ async fn a_mocked_scan_sends_one_request_a_file() {
     );
 }
 
+/// The text only candidate `i` of the generated `flat_module` carries in a
+/// request, which a part's candidate ids (`c1`, `c2`, ...) cannot be.
+fn flat_module_marker(tag: &str, i: usize) -> String {
+    format!("[path: '/{tag}/items/{i}']")
+}
+
 /// Answer each of `parts` with a call row for each of its candidates, rows
-/// last first: the order a part's rows arrive in is the model's.
-fn answer_parts_with_call_rows(parts: &[SourcePart], listed: &[Listed]) {
+/// last first: the order a part's rows arrive in is the model's. A part is
+/// answered in what its prompt shows: its candidate ids and its line numbers
+/// (carrick#2794). `marker_of` names the text only a part's first candidate
+/// carries, by its place in the file.
+fn answer_parts_with_call_rows(
+    dumps: &Dumps,
+    parts: &[SourcePart],
+    listed: &[Listed],
+    marker_of: impl Fn(usize) -> String,
+) {
     for part in parts {
-        let rows: Vec<Value> = part
-            .candidates
-            .iter()
-            .rev()
-            .map(|position| data_call_row(&listed[*position], *position))
-            .collect();
-        let answer = json!({ "mounts": [], "endpoints": [], "data_calls": rows });
-        let first = &listed[part.candidates[0]].id;
+        let terms = &dumps.terms[&part.label()];
+        let whole = json!({
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": part
+                .candidates
+                .iter()
+                .rev()
+                .map(|position| data_call_row(&listed[*position], *position))
+                .collect::<Vec<_>>(),
+        });
+        let answer = in_part_terms(&whole, terms);
         agent_service::inject_mock_answer(
             ROUTE,
-            &format!("- Candidate {first}: "),
+            &marker_of(part.candidates[0]),
             1,
             &answer.to_string(),
         );
@@ -1465,7 +1680,7 @@ async fn a_part_sends_its_window_and_not_the_file() {
     let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
     let (first, _) = fx.dumped_run().await;
     assert!(first.whole.is_none(), "the file is never sent whole");
-    let listed = listed_in_parts(&first.parts);
+    let listed = listed_in_parts(&first);
     assert_eq!(listed.len(), FUNCTIONS, "one candidate a function");
     assert!(
         listed
@@ -1486,7 +1701,7 @@ async fn a_part_sends_its_window_and_not_the_file() {
         "32 candidates a part"
     );
 
-    answer_parts_with_call_rows(&parts, &listed);
+    answer_parts_with_call_rows(&first, &parts, &listed, |i| flat_module_marker(tag, i));
     let dump = tempfile::tempdir().unwrap();
     dump_into(Some(dump.path()));
     let before = requests();
@@ -1579,7 +1794,7 @@ async fn a_file_over_the_line_is_never_sent_whole() {
             prompt.len()
         );
     }
-    let listed = listed_in_parts(&first.parts);
+    let listed = listed_in_parts(&first);
     assert_eq!(listed.len(), FUNCTIONS);
     let parts = source_parts(
         Path::new(&subject),
@@ -1594,7 +1809,7 @@ async fn a_file_over_the_line_is_never_sent_whole() {
         "the parts asked are the file's windows"
     );
 
-    answer_parts_with_call_rows(&parts, &listed);
+    answer_parts_with_call_rows(&first, &parts, &listed, |i| flat_module_marker(tag, i));
     let before = requests();
     let result = fx.analyze().await;
     assert_eq!(requests() - before, parts.len());
@@ -1683,7 +1898,7 @@ async fn the_route_table_literal_keeps_every_route() {
     let fx = Fixture::of(&[(subject.clone(), shape.source.clone())], &subject);
     let (first, _) = fx.dumped_run().await;
     assert!(first.whole.is_none(), "the file is over the line");
-    let listed = listed_in_parts(&first.parts);
+    let listed = listed_in_parts(&first);
     assert_eq!(listed.len(), ROUTES, "one candidate a route");
     let parts = source_parts(
         Path::new(&subject),
@@ -1694,7 +1909,8 @@ async fn the_route_table_literal_keeps_every_route() {
     .expect("the module parses");
     assert!(parts.len() > 1);
 
-    // Each part answers the routes the generator states for its candidates.
+    // Each part answers the routes the generator states for its candidates,
+    // in the ids and line numbers its prompt shows.
     for part in &parts {
         let rows: Vec<Value> = part
             .candidates
@@ -1706,14 +1922,14 @@ async fn the_route_table_literal_keeps_every_route() {
                 row
             })
             .collect();
-        let answer = json!({ "mounts": [], "endpoints": rows, "data_calls": [] });
-        let first = &listed[part.candidates[0]].id;
-        agent_service::inject_mock_answer(
-            ROUTE,
-            &format!("- Candidate {first}: "),
-            1,
-            &answer.to_string(),
+        let whole = json!({ "mounts": [], "endpoints": rows, "data_calls": [] });
+        let answer = in_part_terms(&whole, &first.terms[&part.label()]);
+        // The text of the part's first route, which no other part carries.
+        let marker = format!(
+            "res.json({{ service: SERVICE, route: {} }})",
+            part.candidates[0]
         );
+        agent_service::inject_mock_answer(ROUTE, &marker, 1, &answer.to_string());
     }
     let before = requests();
     let result = fx.analyze().await;
@@ -1911,15 +2127,22 @@ fn wiring_fixture(tag: &str, plugins: usize, padded: bool) -> (Fixture, String) 
 }
 
 /// The one part prompt that lists the outer registration.
-fn outer_registration_part<'a>(parts: &'a BTreeMap<String, String>, source: &str) -> &'a String {
+fn outer_registration_part<'a>(dumps: &'a Dumps, source: &str) -> &'a String {
     let outer_line = source
         .lines()
         .position(|line| line.contains("server.register("))
         .unwrap() as i64
         + 1;
-    let outer: Vec<&String> = parts
-        .values()
-        .filter(|prompt| listed_in(prompt).iter().any(|c| c.line == outer_line))
+    // A part states a candidate's line in its own numbers.
+    let outer: Vec<&String> = dumps
+        .parts
+        .iter()
+        .filter(|(label, prompt)| {
+            listed_in(prompt)
+                .iter()
+                .any(|c| dumps.terms[*label].shown.file_line(c.line) == Some(outer_line as u32))
+        })
+        .map(|(_, prompt)| prompt)
         .collect();
     let [prompt] = outer[..] else {
         panic!("one part lists the outer registration: {}", outer.len());
@@ -1965,7 +2188,7 @@ async fn a_registration_whose_callback_holds_the_file_carries_only_the_modules_i
             prompt.len()
         );
     }
-    let listed = listed_in_parts(&dumps.parts);
+    let listed = listed_in_parts(&dumps);
     assert_eq!(
         listed.len(),
         PLUGINS + 1,
@@ -1974,7 +2197,7 @@ async fn a_registration_whose_callback_holds_the_file_carries_only_the_modules_i
 
     // The part that lists the outer registration attaches the plugins its
     // shown lines register, and no other.
-    let prompt = outer_registration_part(&dumps.parts, &source);
+    let prompt = outer_registration_part(&dumps, &source);
     let expected = registered_on_shown_lines(prompt);
     assert!(!expected.is_empty() && expected.len() < PLUGINS);
     assert_eq!(attached_modules(prompt), expected);
@@ -2000,7 +2223,7 @@ async fn a_part_under_the_line_keeps_every_module_its_candidates_name() {
     let dumps = fx.dumps(dump.path());
     assert!(dumps.whole.is_none(), "the whole request was cut");
 
-    let prompt = outer_registration_part(&dumps.parts, &source);
+    let prompt = outer_registration_part(&dumps, &source);
     assert!(prompt.len() <= WHOLE_PROMPT_MAX_BYTES);
     let shown = registered_on_shown_lines(prompt);
     assert!(
@@ -2044,7 +2267,7 @@ async fn a_window_of_types_only_is_not_sent() {
             .all(|prompt| !prompt.contains("OnlyATypeNumber0100 {")),
         "the windows of types alone are not sent"
     );
-    assert_eq!(listed_in_parts(&dumps.parts).len(), 4);
+    assert_eq!(listed_in_parts(&dumps).len(), 4);
 }
 
 /// carrick#2309: beside a GraphQL section a type can be the thing located, so
@@ -2138,7 +2361,7 @@ async fn a_whole_request_refused_for_size_is_asked_in_parts() {
             prompt.len()
         );
     }
-    assert_eq!(listed_in_parts(&dumps.parts).len(), 150);
+    assert_eq!(listed_in_parts(&dumps).len(), 150);
     assert_eq!(lost_reason(&fx.table), None, "the file's rows are stored");
 }
 
@@ -2168,7 +2391,7 @@ async fn a_stated_limit_no_part_could_meet_is_ignored() {
     );
     assert!(dumps.parts.len() > 1, "{} part(s)", dumps.parts.len());
     assert_eq!(sent, 1 + dumps.parts.len());
-    assert_eq!(listed_in_parts(&dumps.parts).len(), 150);
+    assert_eq!(listed_in_parts(&dumps).len(), 150);
     assert_eq!(lost_reason(&fx.table), None, "the file's rows are stored");
 }
 
@@ -2185,11 +2408,17 @@ async fn a_refused_part_is_halved() {
     let (first, _) = fx.dumped_run().await;
     let labels: Vec<String> = first.parts.keys().cloned().collect();
     let refused = &labels[1];
-    let refused_first = listed_in(&first.parts[refused])[0].id.clone();
+    // The refused part's first candidate, named by the text only it carries
+    // (a part's own ids repeat across parts).
+    let refused_first = first.terms[refused].file_id("c1").unwrap().to_string();
+    let position = listed_in_parts(&first)
+        .iter()
+        .position(|candidate| candidate.id == refused_first)
+        .unwrap();
 
     agent_service::inject_mock_envelope(
         ROUTE,
-        &format!("- Candidate {refused_first}: "),
+        &flat_module_marker(tag, position),
         1,
         &too_large(json!({})),
     );
@@ -2205,7 +2434,7 @@ async fn a_refused_part_is_halved() {
     );
     assert_eq!(dumps.parts.len(), labels.len() + 1);
     assert_eq!(
-        listed_in_parts(&dumps.parts).len(),
+        listed_in_parts(&dumps).len(),
         400,
         "every candidate is asked"
     );
@@ -2263,9 +2492,11 @@ async fn rows_with_no_candidate_are_kept_once() {
     let tag = "keptonce";
     let fx = Fixture::table(tag);
     let listed = fx.listed().await;
-    let mount = |line: u32, child: &str, seen_by: &str| {
+    let terms = part_terms(&fx, &[(fx.whole_marker(), cut())]).await;
+    // A part states a line in its own numbers.
+    let mount = |part: &PartTerms, line: u32, child: &str, seen_by: &str| {
         json!({
-            "line_number": line,
+            "line_number": part.shown.prompt_line(line).expect("the part shows the line"),
             "parent_node": "table",
             "child_node": child,
             "mount_path": format!("/{child}"),
@@ -2273,23 +2504,35 @@ async fn rows_with_no_candidate_are_kept_once() {
             "pattern_matched": seen_by,
         })
     };
-    // Line 40 is in the middle part's window. Every part states the mount on
-    // it; the last part alone states one on line 2, outside its own window.
+    // Line 6 is in the first part's window and shown beside the window of the
+    // other two. Every part states the mount on it; the last part alone states
+    // one on line 5, outside its own window.
     agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut());
     let seen_by = ["the first part", "the middle part", "the last part"];
     for ((marker, range), seen_by) in part_markers(tag).iter().zip(PART_RANGES).zip(seen_by) {
-        let mut mounts = vec![mount(40, "shared", seen_by)];
+        let part = terms_holding(&terms, &listed[range.0].id);
+        let mut mounts = vec![mount(part, 6, "shared", seen_by)];
         if range == PART_RANGES[2] {
-            mounts.push(mount(2, "far", seen_by));
+            mounts.push(mount(part, 5, "far", seen_by));
         }
+        let candidate = Listed {
+            id: part.local_id(&listed[range.0].id).unwrap().to_string(),
+            line: part
+                .shown
+                .prompt_line(listed[range.0].line as u32)
+                .unwrap()
+                .into(),
+            ..listed[range.0].clone()
+        };
         let answer = json!({
             "mounts": mounts,
-            "endpoints": [endpoint_row(&listed[range.0], range.0)],
+            "endpoints": [endpoint_row(&candidate, range.0)],
             "data_calls": [],
         });
         agent_service::inject_mock_answer(ROUTE, marker, 1, &answer.to_string());
     }
-    assert!((PART_WINDOWS[1].0..=PART_WINDOWS[1].1).contains(&40));
+    assert!((PART_WINDOWS[0].0..=PART_WINDOWS[0].1).contains(&6));
+    assert!(!(PART_WINDOWS[1].0..=PART_WINDOWS[1].1).contains(&6));
 
     let before = requests();
     let result = fx.analyze().await;
@@ -2308,12 +2551,228 @@ async fn rows_with_no_candidate_are_kept_once() {
         .collect();
     assert_eq!(
         mounts,
-        [
-            (40, "shared", "the middle part"),
-            (2, "far", "the last part")
-        ]
+        [(6, "shared", "the first part"), (5, "far", "the last part")]
     );
     assert_eq!(stored.endpoints.len(), 3, "one route row a part");
+}
+
+// ---------------------------------------------------------------------------
+// A part's prompt does not move with an edit outside it (carrick#2794)
+// ---------------------------------------------------------------------------
+
+/// The statements the edit tests insert, and what names them in a source.
+const INSERTED: &str = "inserted";
+
+/// The lines of `source` that hold an inserted statement.
+fn inserted_lines(source: &str) -> Vec<u32> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(INSERTED))
+        .map(|(index, _)| index as u32 + 1)
+        .collect()
+}
+
+/// `source` with two statements that raise no candidate inserted after the
+/// first line that holds `after`.
+fn with_two_statements_after(source: &str, after: &str, indent: &str) -> String {
+    let mut out = String::new();
+    let mut done = false;
+    for line in source.split_inclusive('\n') {
+        out.push_str(line);
+        if !done && line.contains(after) {
+            writeln!(out, "{indent}const {INSERTED}A = 1;").unwrap();
+            writeln!(out, "{indent}const {INSERTED}B = 2;").unwrap();
+            done = true;
+        }
+    }
+    assert!(done, "{after} is in the source");
+    out
+}
+
+/// A route table written as one exported function: its registrations are the
+/// statements of its body, so a part shows the function's opening and closing
+/// lines beside its window.
+fn function_table_source(tag: &str) -> String {
+    let mut out = String::new();
+    out.push_str("declare function makeTable(): any;\n");
+    out.push_str("export function register(): void {\n");
+    out.push_str("  const table = makeTable();\n");
+    out.push_str("  const local = (req: any, res: any) => {};\n");
+    for i in 0..50 {
+        writeln!(out, "  table.get(\"/{tag}/r/{i}\", local);").unwrap();
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Both scans of a table, before and after an edit, with the whole request
+/// cut so that parts follow the candidate limit and not the bytes: what each
+/// sent for the subject.
+async fn parts_before_and_after(before: &Fixture, after: &Fixture) -> (Dumps, Dumps) {
+    let cut_at_ten = cut_stating(json!(10));
+    let mut both = Vec::new();
+    for fx in [before, after] {
+        agent_service::inject_mock_envelope(ROUTE, &fx.whole_marker(), 1, &cut_at_ten);
+        both.push(fx.dumped_run().await.0);
+    }
+    let after = both.pop().unwrap();
+    (both.pop().unwrap(), after)
+}
+
+/// A part's window, read off its label.
+fn window_of(label: &str) -> (u32, u32) {
+    let (first, last) = label.split_once('-').expect("a part label");
+    (first.parse().unwrap(), last.parse().unwrap())
+}
+
+/// Every part of `after` whose window holds no line of the edit is a part
+/// `before` sent, byte for byte; the part that holds it is a new prompt.
+fn assert_only_the_part_that_holds_the_edit_differs(before: &Dumps, after: &Dumps, edited: &[u32]) {
+    assert_eq!(
+        before.parts.len(),
+        after.parts.len(),
+        "the edit moves no boundary between parts"
+    );
+    assert!(after.parts.len() > 3, "parts: {:?}", after.parts.keys());
+    let sent_before: std::collections::HashSet<&String> = before.parts.values().collect();
+    let mut changed = Vec::new();
+    for (label, prompt) in &after.parts {
+        let (first, last) = window_of(label);
+        let holds_the_edit = edited.iter().any(|line| (first..=last).contains(line));
+        assert_eq!(
+            !sent_before.contains(prompt),
+            holds_the_edit,
+            "part {label} (window {first} to {last}, edit on {edited:?})"
+        );
+        if holds_the_edit {
+            changed.push(label);
+        }
+    }
+    assert_eq!(changed.len(), 1, "one part holds the edit: {changed:?}");
+}
+
+/// carrick#2794: a part's prompt states nothing about where in the file it
+/// is, so an edit above or below it leaves its bytes alone, and the cloud's
+/// cache answers it for nothing. A file whose parts are cut between its
+/// statements and one whose parts are cut out of a function body.
+#[tokio::test]
+#[serial]
+async fn an_edit_outside_a_part_leaves_its_prompt_the_same_bytes() {
+    offline();
+
+    // (a) Lines inserted among the declarations, inside the first part's
+    // window: every registration below moves down two lines, and so does the
+    // byte offset of each.
+    let tag = "editedtable";
+    let source = table_source(tag);
+    let edited_source = with_two_statements_after(&source, "const local =", "");
+    let before = Fixture::table_from(tag, source);
+    let after = Fixture::table_from(tag, edited_source.clone());
+    let (sent_before, sent_after) = parts_before_and_after(&before, &after).await;
+    assert_only_the_part_that_holds_the_edit_differs(
+        &sent_before,
+        &sent_after,
+        &inserted_lines(&edited_source),
+    );
+
+    // (b) The same registrations inside one function, and the lines inserted
+    // inside the last part's window: the function's closing line moves, and
+    // every part but the first shows it.
+    let tag = "editedfunction";
+    let source = function_table_source(tag);
+    let edited_source =
+        with_two_statements_after(&source, "table.get(\"/editedfunction/r/49\"", "  ");
+    let before = Fixture::lone_table(tag, source);
+    let after = Fixture::lone_table(tag, edited_source.clone());
+    let (sent_before, sent_after) = parts_before_and_after(&before, &after).await;
+    assert_only_the_part_that_holds_the_edit_differs(
+        &sent_before,
+        &sent_after,
+        &inserted_lines(&edited_source),
+    );
+}
+
+/// carrick#2794: the text a part's first candidate is named by in a request,
+/// as the serialized request body holds it: the `[path: ...]` of its hint.
+fn first_candidate_marker(prompt: &str) -> String {
+    let hint = section(prompt, "CANDIDATE TARGETS")
+        .lines()
+        .find(|line| line.starts_with("- Candidate "))
+        .expect("a part that lists a candidate");
+    let start = hint.find("[path: ").expect("a hint names a path");
+    let path = &hint[start..=start + hint[start..].find(']').unwrap()];
+    path.replace('"', "\\\"")
+}
+
+/// carrick#2794: a part answer is read as the part states it. The cloud
+/// returns the stored answer of an unchanged part for the same bytes, whatever
+/// scan asked first, so that answer must mean the same lines and candidates
+/// in the scan that receives it.
+#[tokio::test]
+#[serial]
+async fn a_replayed_part_answer_lands_on_this_scans_lines_and_candidates() {
+    offline();
+    let tag = "replayed";
+    let source = table_source(tag);
+    let edited_source = with_two_statements_after(&source, "const local =", "");
+    let before = Fixture::table_from(tag, source);
+    let after = Fixture::table_from(tag, edited_source.clone());
+    let listed_before = before.listed().await;
+    let listed_after = after.listed().await;
+    assert_the_table_lists_what_the_tests_assume(&listed_after);
+    let whole_before = whole_answer(&listed_before);
+    let whole_after = whole_answer(&listed_after);
+    assert_eq!(
+        listed_after[LOCAL_SINGLES].line,
+        listed_before[LOCAL_SINGLES].line + 2,
+        "the edit moved the registrations down"
+    );
+
+    // The first scan: each part is answered in what its prompt shows.
+    let cut_at_ten = cut_stating(json!(10));
+    let refusals = [(before.whole_marker(), cut_at_ten.clone())];
+    let first = part_dumps(&before, &refusals).await;
+    // The second scan before any answer, to know which of its parts the
+    // first scan already asked.
+    let refusals_after = [(after.whole_marker(), cut_at_ten.clone())];
+    let second = part_dumps(&after, &refusals_after).await;
+
+    agent_service::inject_mock_envelope(ROUTE, &after.whole_marker(), 1, &cut_at_ten);
+    let mut replayed = 0;
+    for (label, prompt) in &second.parts {
+        let asked_before = first.parts.iter().find(|(_, earlier)| *earlier == prompt);
+        // An unchanged part gets the answer the first scan's part got, which
+        // is what the cloud hands back for the same bytes. The part that holds
+        // the edit is asked afresh and answers in its own terms.
+        let answer = match asked_before {
+            Some((earlier, _)) => {
+                replayed += 1;
+                in_part_terms(&whole_before, &first.terms[earlier])
+            }
+            None => in_part_terms(&whole_after, &second.terms[label]),
+        };
+        agent_service::inject_mock_answer(
+            ROUTE,
+            &first_candidate_marker(prompt),
+            1,
+            &answer.to_string(),
+        );
+    }
+    assert!(
+        replayed + 1 == second.parts.len() && replayed > 3,
+        "every part but the one that holds the edit is replayed: {replayed} of {}",
+        second.parts.len()
+    );
+
+    let result = after.analyze().await;
+    let stored = &result.raw_model_results[&after.table];
+    assert_eq!(
+        bytes(stored),
+        stored_form(&whole_after),
+        "the replayed answers carry this scan's candidate ids and lines"
+    );
+    assert_eq!(lost_reason(&after.table), None);
 }
 
 /// A $0 helper, run by hand: write the four generated shapes to disk, each as

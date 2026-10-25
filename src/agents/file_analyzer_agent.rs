@@ -809,7 +809,12 @@ impl FileAnalyzerAgent {
     /// each is dumped beside the others as `<file>.part-<part>.json` with the
     /// part named in the payload. A whole-file dump is the name and the bytes
     /// it always was.
-    fn dump_eval_artifact(file_path: &str, part: Option<&str>, user_message: &str, response: &str) {
+    fn dump_eval_artifact(
+        file_path: &str,
+        part: Option<(&str, &serde_json::Value)>,
+        user_message: &str,
+        response: &str,
+    ) {
         let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
             return;
         };
@@ -827,15 +832,20 @@ impl FileAnalyzerAgent {
                     "raw_response": response,
                 }),
             ),
-            Some(part) => (
-                format!("{stem}.part-{part}.json"),
-                serde_json::json!({
+            Some((part, facts)) => {
+                let mut payload = serde_json::json!({
                     "file_path": file_path,
                     "part": part,
                     "request_user_message": user_message,
                     "raw_response": response,
-                }),
-            ),
+                });
+                // `candidate_ids` and `shown_runs`: what a harness needs to
+                // read the part's answer as the scanner does (carrick#2794).
+                if let (Some(into), Some(facts)) = (payload.as_object_mut(), facts.as_object()) {
+                    into.extend(facts.clone());
+                }
+                (format!("{stem}.part-{part}.json"), payload)
+            }
         };
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
             let _ = std::fs::write(dir.join(name), s);
@@ -896,21 +906,26 @@ impl FileAnalyzerAgent {
     /// only the file: in the prompt fingerprint's log line and in the eval
     /// dump, so a file's parts sit beside each other and never under the name
     /// of its whole prompt.
+    ///
+    /// `dump_facts` is written into the part's eval dump beside the prompt:
+    /// the file id each local candidate id stands for and the file lines the
+    /// part shows (carrick#2794). Nothing else reads it.
     pub async fn analyze_part_prompt(
         &self,
         file_path: &str,
         part: &str,
         prompt: &AnalysisPrompt,
         guidance: &FrameworkGuidance,
+        dump_facts: &serde_json::Value,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
-        self.send_prompt(file_path, Some(part), prompt, guidance)
+        self.send_prompt(file_path, Some((part, dump_facts)), prompt, guidance)
             .await
     }
 
     async fn send_prompt(
         &self,
         file_path: &str,
-        part: Option<&str>,
+        part: Option<(&str, &serde_json::Value)>,
         prompt: &AnalysisPrompt,
         guidance: &FrameworkGuidance,
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
@@ -943,7 +958,7 @@ impl FileAnalyzerAgent {
         // A part's line carries the part after the fields a whole file's line
         // has, so a file asked in parts reads as one line for the request
         // that was cut and one per part (carrick#1898).
-        match part {
+        match part.map(|(label, _)| label) {
             None => debug!(
                 target: PROMPT_FINGERPRINT_TARGET,
                 "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={}",
@@ -1336,46 +1351,56 @@ impl FileAnalyzerAgent {
     /// it is the whole file's, byte for byte, because the cloud reads the
     /// path off that line (carrick-cloud#2266). The cloud's own instruction
     /// calls the file content complete, so this says what is not shown and
-    /// that nothing is owed for it.
+    /// that nothing is owed for it. `first` and `last` are the prompt's
+    /// numbers for the window's lines, and the sentence says the numbers
+    /// count the lines shown and not the lines of the file (carrick#2794).
     fn window_sentence((first, last): (u32, u32)) -> String {
         format!(
-            "This request covers lines {first} to {last} of the file. Return entries only for \
-             what lines {first} to {last} hold. Every other line shown is there only because \
-             lines {first} to {last} use it, the rest of the file is not shown, and no entry is \
-             owed for anything outside lines {first} to {last}.\n"
+            "This request covers lines {first} to {last} below, one part of the file. The \
+             numbers count the lines shown here, not the lines of the whole file. Return \
+             entries only for what lines {first} to {last} hold. Every other line shown is \
+             there only because lines {first} to {last} use it, the rest of the file is not \
+             shown, and no entry is owed for anything outside lines {first} to {last}.\n"
         )
     }
 
-    /// The lines a part shows, each under its number in the whole file, as
-    /// the whole prompt numbers them (carrick#2308).
+    /// The prompt's numbers for a part's window: its first and last line.
+    fn window_in_prompt_lines(shown: &ShownLines) -> (u32, u32) {
+        let (first, last) = shown.window;
+        (
+            shown.prompt_line(first).unwrap_or(first),
+            shown.prompt_line(last).unwrap_or(last),
+        )
+    }
+
+    /// The lines a part shows, each under its number in the part
+    /// ([`ShownLines::prompt_line`]), written as the whole prompt writes
+    /// them (carrick#2794).
     ///
-    /// Between two runs, when the part writes such lines at all
-    /// ([`ShownLines::markers`]), one line with an empty number column says
-    /// which lines are not shown. It carries no number, so nothing that
-    /// strips the numbers reads it as a line of the file.
+    /// Where the part writes markers ([`ShownLines::markers`]), the number a
+    /// gap skips holds one line with an empty number column: `lines not
+    /// shown`. It carries no number, so nothing that strips the numbers reads
+    /// it as a line, and it names no line of the file, so an edit in the gap
+    /// moves nothing the part shows.
     fn numbered_lines(file_content: &str, shown: &ShownLines) -> String {
         use std::fmt::Write;
         let lines: Vec<&str> = file_content.lines().collect();
         let mut numbered = String::new();
-        let mut shown_to: Option<u32> = None;
+        let mut written_any = false;
         for (first, last) in &shown.runs {
-            if let Some(before) = shown_to
-                && shown.markers
-            {
-                let _ = writeln!(
-                    numbered,
-                    "    | lines {} to {} are not shown",
-                    before + 1,
-                    first - 1
-                );
+            if written_any && shown.markers {
+                let _ = writeln!(numbered, "    | lines not shown");
             }
             for number in *first..=*last {
                 let Some(line) = lines.get(number as usize - 1) else {
                     break;
                 };
-                let _ = writeln!(numbered, "{number:4}| {line}");
+                let Some(prompt_line) = shown.prompt_line(number) else {
+                    break;
+                };
+                let _ = writeln!(numbered, "{prompt_line:4}| {line}");
             }
-            shown_to = Some(*last);
+            written_any = true;
         }
         // The fence's own newline follows, as it follows a whole file.
         numbered.truncate(numbered.trim_end_matches('\n').len());
@@ -1409,7 +1434,7 @@ impl FileAnalyzerAgent {
         Some(self.render_user_message(
             file_path,
             &Self::numbered_lines(file_content, shown),
-            &Self::window_sentence(shown.window),
+            &Self::window_sentence(Self::window_in_prompt_lines(shown)),
             guidance,
             candidate_hints,
             candidate_contexts,
@@ -3479,39 +3504,38 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert_eq!(whole_lines[2], "```", "a whole prompt says nothing more");
 
         // One sentence, on a line of its own between that line and the fence.
+        // The window is file lines 6 to 8, which the part numbers 3 to 5.
         assert_eq!(
             part_lines[2],
-            "This request covers lines 6 to 8 of the file. Return entries only for what lines \
-             6 to 8 hold. Every other line shown is there only because lines 6 to 8 use it, the \
-             rest of the file is not shown, and no entry is owed for anything outside lines 6 \
-             to 8."
+            "This request covers lines 3 to 5 below, one part of the file. The numbers count \
+             the lines shown here, not the lines of the whole file. Return entries only for \
+             what lines 3 to 5 hold. Every other line shown is there only because lines 3 to 5 \
+             use it, the rest of the file is not shown, and no entry is owed for anything \
+             outside lines 3 to 5."
         );
         assert_eq!(part_lines[3], "```");
 
-        // The shown lines under their numbers in the whole file, written as
-        // the whole prompt writes them, with one line between two runs.
+        // The shown lines under the part's own numbers: one number a gap, and
+        // the marker in its place (carrick#2794).
         assert_eq!(
             part_lines[4..],
             [
-                "   2| const line2 = 2;",
-                "    | lines 3 to 5 are not shown",
-                "   6| const line6 = 6;",
-                "   7| const line7 = 7;",
-                "   8| const line8 = 8;",
-                "    | lines 9 to 10 are not shown",
-                "  11| const line11 = 11;",
-                "  12| const line12 = 12;",
+                "   1| const line2 = 2;",
+                "    | lines not shown",
+                "   3| const line6 = 6;",
+                "   4| const line7 = 7;",
+                "   5| const line8 = 8;",
+                "    | lines not shown",
+                "   7| const line11 = 11;",
+                "   8| const line12 = 12;",
             ]
         );
         for line in &part_lines[4..] {
             assert_eq!(
                 carries_a_line_number(line),
-                !line.contains("are not shown"),
+                !line.contains("not shown"),
                 "{line}"
             );
-            if carries_a_line_number(line) {
-                assert!(whole_lines.contains(line), "{line}");
-            }
         }
     }
 
@@ -3522,10 +3546,10 @@ const data = await fetch('/api/users').then(resp => resp.json());
         assert_eq!(
             lines[4..],
             [
-                "   2| const line2 = 2;",
-                "   6| const line6 = 6;",
-                "   7| const line7 = 7;",
-                "   8| const line8 = 8;",
+                "   1| const line2 = 2;",
+                "   3| const line6 = 6;",
+                "   4| const line7 = 7;",
+                "   5| const line8 = 8;",
             ]
         );
     }

@@ -4,8 +4,9 @@
 //! A file whose whole answer does not fit one response is asked again in
 //! parts. A part does not repeat the file. It shows a window of consecutive
 //! lines, the opening and closing lines of every construct the window was cut
-//! out of, and the declarations the window refers to, each line under its
-//! number in the whole file.
+//! out of, and the declarations the window refers to, each line under a
+//! number that counts the lines the part shows ([`ShownLines::prompt_line`]),
+//! so an edit elsewhere in the file moves no number in the part (carrick#2794).
 //!
 //! Everything here is a function of the file's text, its listed candidates
 //! and the limits: no I/O, no name of a library, a framework or a file, and
@@ -115,6 +116,46 @@ pub struct ShownLines {
 }
 
 impl ShownLines {
+    /// The number the prompt gives `file_line`, or `None` when it is not
+    /// shown (carrick#2794).
+    ///
+    /// A part numbers the lines it shows, not the lines of the file: the
+    /// first shown line is 1, each next line in a run is the next number, and
+    /// each gap between two runs skips exactly one number. Nothing in the
+    /// numbering depends on where in the file a run is, so an edit above or
+    /// between the runs changes no number and the part's prompt stays the
+    /// same bytes. This and [`Self::file_line`] are the one definition of the
+    /// numbering: the prompt is written with the first and its answer is read
+    /// with the second.
+    pub fn prompt_line(&self, file_line: u32) -> Option<u32> {
+        let mut next = 1;
+        for (first, last) in &self.runs {
+            if (*first..=*last).contains(&file_line) {
+                return Some(next + (file_line - first));
+            }
+            next += (last - first + 1) + 1;
+        }
+        None
+    }
+
+    /// The file line a prompt number names, or `None` for a number that is
+    /// not a shown line: zero or below, a skipped gap number, or one past the
+    /// last line.
+    pub fn file_line(&self, prompt_line: i64) -> Option<u32> {
+        if prompt_line <= 0 {
+            return None;
+        }
+        let mut next: i64 = 1;
+        for (first, last) in &self.runs {
+            let len = i64::from(last - first + 1);
+            if (next..next + len).contains(&prompt_line) {
+                return Some(first + u32::try_from(prompt_line - next).ok()?);
+            }
+            next += len + 1;
+        }
+        None
+    }
+
     /// How many lines are shown.
     pub fn line_count(&self) -> usize {
         self.runs
@@ -1214,6 +1255,26 @@ mod tests {
 
     /// How many requests or routes each generated file holds.
     const N: usize = 400;
+
+    #[test]
+    fn a_part_numbers_its_shown_lines_and_skips_one_number_a_gap() {
+        let shown = ShownLines {
+            window: (6, 8),
+            runs: vec![(2, 2), (6, 8), (11, 12)],
+            markers: true,
+        };
+        for (file, prompt) in [(2, 1), (6, 3), (8, 5), (11, 7), (12, 8)] {
+            assert_eq!(shown.prompt_line(file), Some(prompt), "file line {file}");
+        }
+        assert_eq!(shown.prompt_line(3), None, "a line in a gap is not shown");
+        assert_eq!(shown.prompt_line(13), None);
+        for (prompt, file) in [(1, 2), (3, 6), (5, 8), (7, 11), (8, 12)] {
+            assert_eq!(shown.file_line(prompt), Some(file), "prompt line {prompt}");
+        }
+        for prompt in [2, 6, 9, 0, -1] {
+            assert_eq!(shown.file_line(prompt), None, "prompt line {prompt}");
+        }
+    }
 
     fn listed_at(starts: &[usize]) -> Vec<ListedCandidate> {
         starts

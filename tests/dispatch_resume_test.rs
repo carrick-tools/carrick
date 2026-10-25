@@ -368,23 +368,25 @@ async fn a_dispatched_file_over_the_line_records_a_prompt_a_part() {
         "one row a part, got {}",
         collected.rows.len()
     );
-    let mut windows: Vec<&str> = Vec::new();
     for row in &collected.rows {
         assert!(
             row.body
                 .contains("### FILE CONTENT (Path: src/large_client.ts)"),
             "every row is the file's"
         );
-        let window = row
-            .body
-            .lines()
-            .find(|line| line.starts_with("This request covers lines "))
-            .expect("every row is a part");
-        windows.push(window);
+        assert!(
+            row.body
+                .lines()
+                .any(|line| line.starts_with("This request covers lines ")),
+            "every row is a part"
+        );
         assert!(row.body.len() <= line, "a row of {} bytes", row.body.len());
     }
-    windows.dedup();
-    assert_eq!(windows.len(), collected.rows.len(), "each part once");
+    // A part numbers its own lines (carrick#2794), so two parts can share a
+    // window sentence: each part is told apart by its body.
+    let bodies: std::collections::HashSet<&str> =
+        collected.rows.iter().map(|row| row.body.as_str()).collect();
+    assert_eq!(bodies.len(), collected.rows.len(), "each part once");
     let listed: usize = collected
         .rows
         .iter()
