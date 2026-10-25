@@ -1026,7 +1026,7 @@ impl<'a> Calls<'a> {
                 // carrick#2386). A function handed to a call stays its
                 // caller's, whatever the extractor names it.
                 let own = (key.is_none() && depth == 0)
-                    .then(|| inner.site.as_ref())
+                    .then_some(inner.site.as_ref())
                     .flatten()
                     .and_then(|site| in_file.by_start.get(&site.lo).copied());
                 match own {
