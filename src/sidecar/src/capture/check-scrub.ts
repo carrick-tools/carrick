@@ -84,6 +84,8 @@ export function rewriteAliases(
   return text
     .split(`'Sent'`)
     .join(`'${sentAlias}'`)
+    .split(`'SentBody'`)
+    .join(`'${sentAlias}'`)
     .split(`'Expected'`)
     .join(`'${expectedAlias}'`);
 }

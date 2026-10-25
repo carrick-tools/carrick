@@ -334,7 +334,20 @@ export function buildProbe(
       'expected:envelope'
     );
   }
-  push(`declare const sent: Sent;`);
+  // carrick#2814: a request body the caller may omit (`T | undefined`,
+  // `T | void`) is compatible with a route whose request type has no required
+  // member: the empty body is a value of that type, so the route accepts the
+  // call with nothing sent. The absent members are dropped from the sent side
+  // only then (`{} extends Expected`), and what remains is compared as before.
+  // A route that requires a member, or a scalar, keeps today's reading. Only
+  // the HTTP request direction: a socket or pub/sub payload and a GraphQL
+  // request are not read this way.
+  const absentBodyAllowed = spec.protocol === 'http' && spec.type_kind === 'request';
+  const sentBodyType = (sent: string): string =>
+    `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? Exclude<${sent}, undefined | void> : ${sent}`;
+  if (absentBodyAllowed) push(`type SentBody = ${sentBodyType('Sent')};`);
+  const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
+  push(`declare const sent: ${sentBody};`);
 
   let assignmentLine: number;
   if (spec.protocol === 'graphql') {
@@ -458,7 +471,7 @@ export function buildProbe(
     // that name — and there the declared name no longer describes what travels.
     for (const line of jsonWireDeclarations('')) push(line);
     push(
-      `type WireSent = [Sent] extends [Expected] ? Sent : (JsonWireSame<JsonWire<Sent>, Sent> extends true ? Sent : JsonWire<Sent>);`
+      `type WireSent = [${sentBody}] extends [Expected] ? ${sentBody} : (JsonWireSame<JsonWire<${sentBody}>, ${sentBody}> extends true ? ${sentBody} : JsonWire<${sentBody}>);`
     );
     push(`declare const sentWire: WireSent;`);
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
@@ -492,8 +505,13 @@ export function buildProbe(
     push(`type _G_unwidened_any = Assert<Not<IsAny<${local}>>>;`);
     push(`type _G_unwidened_unknown = Assert<Not<IsUnknown<${local}>>>;`);
     push(`type _G_unwidened_never = Assert<Not<IsNever<${local}>>>;`);
+    let unwidenedBody = local;
+    if (absentBodyAllowed) {
+      push(`type SentUnwidenedBody = ${sentBodyType(local)};`);
+      unwidenedBody = 'SentUnwidenedBody';
+    }
     push(
-      `type WireSentUnwidened = [${local}] extends [Expected] ? ${local} : (JsonWireSame<JsonWire<${local}>, ${local}> extends true ? ${local} : JsonWire<${local}>);`
+      `type WireSentUnwidened = [${unwidenedBody}] extends [Expected] ? ${unwidenedBody} : (JsonWireSame<JsonWire<${unwidenedBody}>, ${unwidenedBody}> extends true ? ${unwidenedBody} : JsonWire<${unwidenedBody}>);`
     );
     push(`declare const sentWireUnwidened: WireSentUnwidened;`);
     push(`const expectedWireUnwidened: Expected = sentWireUnwidened;`);
