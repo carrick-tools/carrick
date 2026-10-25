@@ -3301,47 +3301,6 @@ impl FileOrchestrator {
                 );
                 pf.list(sites.candidates);
             }
-            for pf in &pending {
-                let shorts: BTreeSet<(u32, u32)> = facts
-                    .calls
-                    .range(
-                        (pf.prompt_path.clone(), 0, 0)
-                            ..(pf.prompt_path.clone(), u32::MAX, u32::MAX),
-                    )
-                    .filter(|(_, followed)| followed.short())
-                    .map(|((_, lo, hi), _)| (*lo, *hi))
-                    .filter(|span| {
-                        !pf.listed
-                            .iter()
-                            .any(|listed| (listed.span_start, listed.span_end) == *span)
-                    })
-                    .collect();
-                if shorts.is_empty() {
-                    continue;
-                }
-                let made: BTreeSet<(u32, u32)> = self
-                    .swc_scanner
-                    .scan_sites(Path::new(&pf.path_str), &pf.content, &shorts)
-                    .candidates
-                    .iter()
-                    .map(|c| (c.span_start, c.span_end))
-                    .collect();
-                for span in &shorts {
-                    debug!(
-                        "DIAG2813B {} {}-{} {:?} {} cand={}",
-                        pf.prompt_path,
-                        span.0,
-                        span.1,
-                        facts.followed(&pf.prompt_path, *span),
-                        facts
-                            .diag
-                            .get(&(pf.prompt_path.clone(), span.0, span.1))
-                            .cloned()
-                            .unwrap_or_else(|| "top".to_string()),
-                        made.contains(span)
-                    );
-                }
-            }
             // Rules 2-4: a file no signal raised a candidate in is read when
             // the fact layer found a site, a lead or an unanswered-package
             // call in it, with those calls listed.
@@ -3409,6 +3368,55 @@ impl FileOrchestrator {
                 pending.push(pf);
             }
             deferred_zero_candidates = still_deferred;
+            // DIAG #2813: every short walk the fact layer recorded, in files
+            // read or not, after Rules 2-4, with what lists it.
+            {
+                let mut by_file: BTreeMap<String, BTreeSet<(u32, u32)>> = BTreeMap::new();
+                for ((file, lo, hi), followed) in &facts.calls {
+                    if followed.short() {
+                        by_file.entry(file.clone()).or_default().insert((*lo, *hi));
+                    }
+                }
+                debug!(
+                    "DIAG2813C files {} short {}",
+                    by_file.len(),
+                    by_file.values().map(|s| s.len()).sum::<usize>()
+                );
+                for (file, shorts) in &by_file {
+                    let pf = pending.iter().find(|pf| &pf.prompt_path == file);
+                    let made: Option<BTreeSet<(u32, u32)>> = pf.map(|pf| {
+                        self.swc_scanner
+                            .scan_sites(Path::new(&pf.path_str), &pf.content, shorts)
+                            .candidates
+                            .iter()
+                            .map(|c| (c.span_start, c.span_end))
+                            .collect()
+                    });
+                    let listed_facts = facts.listed_in(file);
+                    for span in shorts {
+                        debug!(
+                            "DIAG2813C {} {}-{} {:?} {} read={} facts_listed={} pf_listed={} cand={}",
+                            file,
+                            span.0,
+                            span.1,
+                            facts.followed(file, *span),
+                            facts
+                                .diag
+                                .get(&(file.clone(), span.0, span.1))
+                                .cloned()
+                                .unwrap_or_else(|| "top".to_string()),
+                            pf.is_some(),
+                            listed_facts.contains(span),
+                            pf.is_some_and(|pf| pf
+                                .listed
+                                .iter()
+                                .any(|l| (l.span_start, l.span_end) == *span)),
+                            made.as_ref()
+                                .map_or("?".to_string(), |m| m.contains(span).to_string())
+                        );
+                    }
+                }
+            }
         } else {
             // The engine sent no fact files (site questions off, nothing
             // asked, no rows): every candidate stays, and the files whose

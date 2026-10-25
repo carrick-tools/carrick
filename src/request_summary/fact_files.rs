@@ -125,6 +125,22 @@ impl FactFiles {
             ask_failed: first.ask_failed,
             ..FactFiles::default()
         };
+        // DIAG #2813 (N1a): a short walk that passed a call into a package
+        // the first answer has not finished (pending or failed) is listed,
+        // as a direct call into one is.
+        let pk = |file: &str, span: (u32, u32)| -> (String, bool) {
+            match discovery
+                .unanswered_at
+                .get(&(file.to_string(), span.0, span.1))
+            {
+                Some(keys) => (
+                    keys.iter().cloned().collect::<Vec<_>>().join(","),
+                    keys.iter().any(|key| first.unanswered.contains(key)),
+                ),
+                None => (String::new(), false),
+            }
+        };
+        let mut n1a: Vec<(String, (u32, u32))> = Vec::new();
         for site in &discovery.sites {
             let followed = match (&site.end, &site.stop) {
                 (Some(_), _) => Followed::Site,
@@ -132,15 +148,21 @@ impl FactFiles {
                 (None, None) => continue,
             };
             if site.end.is_none() {
+                let (keys, pending) = pk(&site.file, (site.span_start, site.span_end));
+                if pending {
+                    n1a.push((site.file.clone(), (site.span_start, site.span_end)));
+                }
                 facts.diag.insert(
                     (site.file.clone(), site.span_start, site.span_end),
                     format!(
-                        "chain={} last={}",
+                        "chain={} last={} pk={} n1a={}",
                         site.chain.len(),
                         site.chain
                             .last()
                             .map(|h| h.file.clone())
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        if keys.is_empty() { "-" } else { keys.as_str() },
+                        pending
                     ),
                 );
             }
@@ -169,9 +191,18 @@ impl FactFiles {
             );
         }
         for missed in &discovery.missed_inside {
+            let (keys, pending) = pk(&missed.file, (missed.span_start, missed.span_end));
+            if pending {
+                n1a.push((missed.file.clone(), (missed.span_start, missed.span_end)));
+            }
             facts.diag.insert(
                 (missed.file.clone(), missed.span_start, missed.span_end),
-                format!("inner={}", missed.reason),
+                format!(
+                    "inner={} pk={} n1a={}",
+                    missed.reason,
+                    if keys.is_empty() { "-" } else { keys.as_str() },
+                    pending
+                ),
             );
             facts.record(
                 &missed.file,
@@ -181,6 +212,10 @@ impl FactFiles {
         }
         for (file, start, end) in &discovery.finished {
             facts.record(file, (*start, *end), Followed::Finished);
+        }
+        for (file, span) in n1a {
+            facts.select(&file, span, true);
+            facts.files.entry(file).or_default().unanswered_package = true;
         }
         for lead in &decided.leads {
             let listed = serde_json::from_value::<LibraryRole>(lead.end.role.clone().into())

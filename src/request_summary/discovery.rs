@@ -191,6 +191,9 @@ pub struct Discovery {
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<MissedInside>,
     pub counts: BTreeMap<String, usize>,
+    /// DIAG #2813: the store keys of the packages a short walk passed a call
+    /// into that the answer left unanswered, by file and SWC span.
+    pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
 }
 
 /// A call whose walk found no site and passed something it could not read
@@ -877,6 +880,8 @@ struct Outcome<'a> {
     /// site has not read everything the call runs (carrick#2613). The first
     /// such thing it passed ([`MissedInside::reason`]).
     missed: Option<&'static str>,
+    /// DIAG #2813: the unanswered packages the walk passed a call into.
+    unanswered: BTreeSet<String>,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
 }
@@ -975,6 +980,7 @@ impl<'a> Outcome<'a> {
         if self.missed.is_none() {
             self.missed = other.missed;
         }
+        self.unanswered.extend(other.unanswered);
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1686,12 +1692,31 @@ impl<'a> Walker<'a> {
             if let Some(reason) = self.misses(file, body, call, construction, &inner) {
                 inner.missed.get_or_insert(reason);
             }
+            if inner.ends.is_empty()
+                && inner.stop.is_none()
+                && self.unfollowed(file, call, construction) == Some(UNANSWERED_PACKAGE)
+            {
+                inner.unanswered.extend(self.unanswered_keys(file, call));
+            }
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// DIAG #2813: the store keys of `call`'s declaration the answer left
+    /// unanswered.
+    fn unanswered_keys(&self, file: &Path, call: &CallIr) -> Vec<String> {
+        let Some(row) = self.row(file, call) else {
+            return Vec::new();
+        };
+        store_keys(row, self.labels.exports)
+            .into_iter()
+            .filter(|key| self.labels.package_reason(key) == Some(UNANSWERED_PACKAGE))
+            .map(|key| key.to_string())
+            .collect()
     }
 
     /// Whether `call`, whose walk gave `outcome` and found no site, passed
@@ -1765,8 +1790,24 @@ impl<'a> Walker<'a> {
                     reached: None,
                 };
             if outcome.ends.is_empty() {
+                // DIAG #2813: the unanswered packages the walk passed.
+                if !outcome.unanswered.is_empty() {
+                    discovery.unanswered_at.insert(
+                        (self.rel(file), call.site.span_start, call.site.span_end),
+                        outcome.unanswered.clone(),
+                    );
+                }
+                // DIAG #2813 (unmask): a walk that read code (a value's
+                // functions included) and missed inside is missed inside,
+                // whatever the call's own row says.
+                let entered_missed = outcome.missed.filter(|_| outcome.stop.is_none());
                 let Some((chain, stop)) = outcome.stop else {
-                    match self.unfollowed(file, call, construction) {
+                    let own = if entered_missed.is_some() {
+                        None
+                    } else {
+                        self.unfollowed(file, call, construction)
+                    };
+                    match own {
                         Some(reason) => {
                             *discovery
                                 .counts
