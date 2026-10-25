@@ -336,6 +336,10 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
+        // A facts-only pass over a tree that moved since the hosted commit
+        // re-reads only the services whose inputs moved, and every other one
+        // stands in from its hosted blob (carrick#2840).
+        let carry = matches!(pass, Pass::Facts) && !hosted_blobs.is_empty();
         let report = scan_repo(
             &exe,
             repo,
@@ -346,6 +350,7 @@ fn run_generation(
             pass,
             workspace_position,
             targets.len(),
+            carry,
         )?;
         pending.extend(report.pending.iter().cloned());
         if let Some(split) = &report.timing {
@@ -379,7 +384,29 @@ fn run_generation(
             // artefact a killed scan leaves behind says what it had spent.
             super::scan_state::spent(&spend);
         }
-        for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
+        let mut written = read_blobs(&scan_dir)?;
+        if carry {
+            let carried = carried_services(&hosted_blobs, &written);
+            // Only the services this checkout resolves to: a hosted service
+            // the tree no longer declares is not carried back into it.
+            let resolved: Vec<Option<String>> =
+                crate::service_derivation::resolve_with_hosted(repo, Some(&hosted_blobs))
+                    .map(|services| services.into_iter().map(|s| s.service_name).collect())
+                    .unwrap_or_default();
+            written.extend(
+                carried
+                    .into_iter()
+                    .filter(|blob| resolved.contains(&blob.service_name)),
+            );
+            // In declared order, as a scan of every service writes them.
+            written.sort_by_key(|blob| {
+                resolved
+                    .iter()
+                    .position(|name| *name == blob.service_name)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        for (service, blob) in written.into_iter().enumerate() {
             let file = format!("local-{position}-{service}.json");
             write_blob(&blobs.join(&file), &blob)?;
             write_blob(&peers.join(&file), &blob)?;
@@ -586,6 +613,21 @@ pub(super) fn current_hosted_blobs(
     (resolved == held).then(|| blobs.to_vec())
 }
 
+/// The services of `previous` a `--changed-only` scan carried: it writes a
+/// carried service only when its join moved something the service holds, so
+/// every service of `previous` it did not write stands in as it was.
+pub(super) fn carried_services(
+    previous: &[CloudRepoData],
+    written: &[CloudRepoData],
+) -> Vec<CloudRepoData> {
+    let written: std::collections::BTreeSet<String> = written.iter().map(service_id).collect();
+    previous
+        .iter()
+        .filter(|blob| !written.contains(&service_id(blob)))
+        .cloned()
+        .collect()
+}
+
 /// Whether a change to `file` (repo-relative) can change what a scan writes.
 fn is_scan_input(repo: &Path, file: &str) -> bool {
     let name = file.rsplit('/').next().unwrap_or(file);
@@ -677,8 +719,12 @@ fn scan_repo(
     pass: &Pass,
     workspace_position: Option<(usize, usize)>,
     run_repos: usize,
+    changed_only: bool,
 ) -> Result<ScanReport, String> {
     let mut command = scan_command(exe, repo, blobs, previous, Some(peers), pass);
+    if changed_only {
+        command.arg("--changed-only");
+    }
     declare_run_repos(&mut command, pass, run_repos);
     if let Some((offset, total)) = workspace_position {
         command

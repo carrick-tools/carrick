@@ -332,6 +332,12 @@ pub fn is_repo_input(path: &str) -> bool {
 /// older than HEAD's; `refreshed_carried` does not refresh it today because
 /// no uploading run carries (pinned by
 /// `a_carried_write_keeps_the_stored_manifest_projection`).
+///
+/// A run that asks no model carries a blob another scanner release wrote in
+/// this cache format, the test `current_hosted_blobs` reads a hosted blob in
+/// with: such a run uploads nothing, and the release CI scanned with is
+/// rarely the CLI on a laptop (carrick#2840). A run that asks the model
+/// analyses it, so what it writes is its own release's.
 pub fn decide(
     stored: Option<&CloudRepoData>,
     this_run: ThisRun<'_>,
@@ -343,9 +349,9 @@ pub fn decide(
     let Some(stored) = stored else {
         return Scope::analysed(Reason::NoStored, "no stored index for this service");
     };
-    if stored.scanner_version.as_deref() != Some(this_run.scanner_version)
-        || stored.cache_version != Some(this_run.cache_version)
-    {
+    let other_release =
+        this_run.asks_model && stored.scanner_version.as_deref() != Some(this_run.scanner_version);
+    if other_release || stored.cache_version != Some(this_run.cache_version) {
         return Scope::analysed(
             Reason::OtherScanner,
             format!(
@@ -1447,6 +1453,52 @@ mod tests {
         assert_eq!(
             reason(&decide_with(Some(&blob), Err("bad object"), api_inputs())),
             Some(Reason::CommitMissing)
+        );
+    }
+
+    /// A laptop CLI is almost never the release CI scanned with. A run that
+    /// asks no model and uploads nothing carries a blob another release wrote
+    /// in this cache format, as `current_hosted_blobs` reads one in
+    /// (carrick#2840); a run that asks the model still refuses it.
+    #[test]
+    fn a_run_without_the_model_carries_a_blob_another_release_wrote() {
+        let changes: Vec<ChangedPath> = Vec::new();
+        let no_model = ThisRun {
+            asks_model: false,
+            ..THIS
+        };
+        let decide_no_model = |blob: &CloudRepoData| {
+            decide(
+                Some(blob),
+                no_model,
+                Some("{\"serviceName\":\"api\"}"),
+                Ok(&changes),
+                |_| false,
+                api_inputs,
+            )
+        };
+        let mut other_release = stored("abcdef1234");
+        other_release.scanner_version = Some("0.9.0".to_string());
+        assert_eq!(
+            decide_no_model(&other_release),
+            Scope::Carried {
+                commit: "abcdef1234".to_string()
+            }
+        );
+        assert_eq!(
+            reason(&decide_with(
+                Some(&other_release),
+                Ok(&changes),
+                api_inputs()
+            )),
+            Some(Reason::OtherScanner)
+        );
+        let mut other_cache = stored("abcdef1234");
+        other_cache.scanner_version = Some("0.9.0".to_string());
+        other_cache.cache_version = Some(6);
+        assert_eq!(
+            reason(&decide_no_model(&other_cache)),
+            Some(Reason::OtherScanner)
         );
     }
 

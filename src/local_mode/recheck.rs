@@ -288,15 +288,7 @@ pub(super) fn rejoin(
             .env_remove(crate::progress::PROGRESS_ENV);
         bounded(scan, "re-scan", deadline)?;
         let mut fresh = read_blobs(&scan_dir)?;
-        // A carried service is written by the scan only when the join moved
-        // something it holds, so every other one stands in from what the
-        // index already held for it.
-        let written: std::collections::BTreeSet<String> = fresh.iter().map(service_id).collect();
-        let carried: Vec<crate::cloud_storage::CloudRepoData> = previous_data
-            .iter()
-            .filter(|blob| !written.contains(&service_id(blob)))
-            .cloned()
-            .collect();
+        let carried = super::index::carried_services(&previous_data, &fresh);
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
             write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;

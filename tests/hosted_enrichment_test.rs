@@ -783,14 +783,16 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     stored["resolution"]["project_repos"][0]["repos"] = json!(["example/shop"]);
     save_snapshot(root, &stored);
     std::fs::remove_file(&config).unwrap();
-    // One file ahead of the hosted commit, so the refresh scans with the
-    // hosted configs and replays the answers rather than reading the hosted
-    // blobs in as they are (carrick#985).
-    std::fs::write(
-        repo.join("packages/b/ahead.ts"),
-        "export const ahead = 1;\n",
-    )
-    .unwrap();
+    // One file ahead of the hosted commit in each service, so the refresh
+    // scans both with the hosted configs and replays the answers rather than
+    // carrying the hosted blobs in as they are (carrick#985, carrick#2840).
+    for service in ["a", "b"] {
+        std::fs::write(
+            repo.join(format!("packages/{service}/ahead.ts")),
+            "export const ahead = 1;\n",
+        )
+        .unwrap();
+    }
 
     run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
@@ -842,4 +844,114 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
         "{a:#}"
     );
     assert!(a["function_definitions"].get("generated").is_none());
+}
+
+/// One edited file one commit ahead of the hosted index re-reads only the
+/// service that owns it: every other service is its hosted blob as it was,
+/// even one written by another scanner release (carrick#2840).
+#[test]
+fn an_edit_in_one_service_re_reads_that_service_and_carries_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let repo = root.join("shop");
+    std::fs::create_dir_all(repo.join("packages/a")).unwrap();
+    std::fs::create_dir_all(repo.join("packages/b")).unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"shop","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/a/package.json"),
+        r#"{"name":"@scope/a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/b/package.json"),
+        r#"{"name":"@scope/b","version":"1.0.0","dependencies":{"express":"^4.18.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/a/orders.ts"),
+        "export async function listOrders(): Promise<unknown> {\n  const res = await fetch(process.env.API_URL + \"/orders\");\n  return res.json();\n}\n",
+    )
+    .unwrap();
+    let server = "import express from \"express\";\nconst app = express();\napp.get(\"/orders\", (_req, res) => {\n  res.json([{ id: 1 }]);\n});\nexport default app;\n";
+    std::fs::write(repo.join("packages/b/server.ts"), server).unwrap();
+    std::fs::write(
+        repo.join("carrick.json"),
+        r#"{"services":[
+            {"name":"a","directory":"packages/a","internalEnvVars":["API_URL"]},
+            {"name":"b","directory":"packages/b","internalEnvVars":["API_URL"]}
+        ]}"#,
+    )
+    .unwrap();
+    init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/shop.git",
+        ],
+    );
+    std::fs::write(root.join("carrick-workspace.json"), r#"{"repos":["shop"]}"#).unwrap();
+
+    // The hosted index: what a scan of this commit writes, stamped by another
+    // release at a time no run of this test writes.
+    run(root, &["refresh", "--workspace", "."], None);
+    const HOSTED_AT: &str = "2020-01-01T00:00:00Z";
+    let mut hosted = blobs(root);
+    assert_eq!(hosted.len(), 2);
+    for blob in &mut hosted {
+        blob["scanner_version"] = json!("0.0.1-ci");
+        blob["last_updated"] = json!(HOSTED_AT);
+    }
+    let mut stored = snapshot(root, "shop", &hosted);
+    stored["resolution"]["project_repos"][0]["repos"] = json!(["example/shop"]);
+    save_snapshot(root, &stored);
+
+    // One uncommitted edit in `b`.
+    std::fs::write(
+        repo.join("packages/b/server.ts"),
+        server.replace(
+            "export default app;",
+            "export function listRefunds(): number[] {\n  return [];\n}\nexport default app;",
+        ),
+    )
+    .unwrap();
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+
+    let local = blobs(root);
+    let of = |name: &str| local.iter().find(|b| b["service_name"] == name).unwrap();
+    let a = of("a");
+    assert_eq!(a["last_updated"], HOSTED_AT, "`a` was re-read: {a:#}");
+    assert_eq!(a["scanner_version"], "0.0.1-ci", "{a:#}");
+    let b = of("b");
+    assert_ne!(b["last_updated"], HOSTED_AT, "`b` was not re-read: {b:#}");
+    assert!(
+        b["function_definitions"].get("listRefunds").is_some(),
+        "{b:#}"
+    );
+    let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
+    let states: Vec<(String, String)> = status["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["service"].as_str().unwrap().to_string(),
+                s["hosted_state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("a".to_string(), "enriched".to_string()),
+            ("b".to_string(), "enriched".to_string())
+        ],
+        "{status:#}"
+    );
 }

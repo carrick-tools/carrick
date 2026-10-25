@@ -94,7 +94,7 @@ A service is analysed, and the run logs why, when:
 | Reason | Condition |
 |---|---|
 | `no_stored` | No stored blob for this repository and service. |
-| `other_scanner` | The stored blob's scanner version or cache version is not this run's. |
+| `other_scanner` | The stored blob's cache version is not this run's, or (on a run that asks the model) its scanner version is not. |
 | `stored_dirty` | The stored blob was read from uncommitted changes. |
 | `stored_incomplete` | The stored blob records degraded types, or (on a run that asks the model) files the model never answered or candidates no model was asked about. |
 | `config_changed` | Its `carrick.json` entry differs from the stored one. |
