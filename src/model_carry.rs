@@ -93,7 +93,6 @@ pub fn carry_edited_files(
     files: impl Iterator<Item = (String, String)>,
     previous: &HashMap<String, FileAnalysisResult>,
     unchanged: &HashSet<String>,
-    data_fetchers: &[String],
     messaging_clients: &[String],
 ) -> Carried {
     let mut out = Carried::default();
@@ -113,15 +112,9 @@ pub fn carry_edited_files(
         let hunks = changed_hunks(repo_path, prev_commit, &relative);
         let new_text = std::fs::read_to_string(&key).ok();
         let carry = match (old_text, hunks, new_text) {
-            (Some(old), Ok(hunks), Some(new)) => carry_file(
-                &relative,
-                &old,
-                &new,
-                &hunks,
-                answer,
-                data_fetchers,
-                messaging_clients,
-            ),
+            (Some(old), Ok(hunks), Some(new)) => {
+                carry_file(&relative, &old, &new, &hunks, answer, messaging_clients)
+            }
             _ => unavailable(&relative, answer),
         };
         out.examined += carry.examined;
@@ -209,13 +202,12 @@ pub fn carry_file(
     new_text: &str,
     hunks: &[Hunk],
     answer: &FileAnalysisResult,
-    data_fetchers: &[String],
     messaging_clients: &[String],
 ) -> FileCarry {
     let scanner = SwcScanner::new();
     let path = Path::new(relative);
-    let old_scan = scanner.scan_content(path, old_text, data_fetchers, messaging_clients);
-    let new_scan = scanner.scan_content(path, new_text, data_fetchers, messaging_clients);
+    let old_scan = scanner.scan_content(path, old_text, messaging_clients);
+    let new_scan = scanner.scan_content(path, new_text, messaging_clients);
     let new_lines: Vec<&str> = new_text.lines().collect();
     let ctx = Context {
         hunks,
@@ -512,7 +504,7 @@ function listItems() {
 
     fn id_at(text: &str, line: usize) -> String {
         SwcScanner::new()
-            .scan_content(Path::new("routes.ts"), text, &[], &[])
+            .scan_content(Path::new("routes.ts"), text, &[])
             .candidates
             .iter()
             .find(|c| c.line_number == line)
@@ -562,7 +554,7 @@ function listItems() {
     }
 
     fn run(new: &str, hunks: &[Hunk]) -> FileCarry {
-        carry_file("routes.ts", OLD, new, hunks, &answer(), &[], &[])
+        carry_file("routes.ts", OLD, new, hunks, &answer(), &[])
     }
 
     fn insert_two_lines_above() -> (String, Vec<Hunk>) {
@@ -764,7 +756,7 @@ function listItems() {
             "primary_type_symbol": null, "type_import_source": null,
         }]))
         .expect("graphql row parses");
-        let carry = carry_file("routes.ts", OLD, OLD, &[], &answer, &[], &[]);
+        let carry = carry_file("routes.ts", OLD, OLD, &[], &answer, &[]);
         assert_eq!(carry.examined, 5);
         assert_eq!(carry.carried, 4);
         assert_eq!(
