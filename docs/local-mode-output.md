@@ -469,10 +469,13 @@ checks every source file the scan reads that differs from it: committed on the
 branch, uncommitted, or untracked. Each repo with such a file is scanned once
 with `--changed-only`, with no model and nothing on the wire: only the services
 whose inputs changed are re-extracted, and every other service is carried from
-the blob the index holds for it (carrick#2826). One join then runs over those
+the blob the index holds for it (carrick#2826). The re-extracted services run
+side by side: each one's type sidecar is held to a 3 GB heap (unless
+`CARRICK_SIDECAR_MAX_OLD_SPACE_MB` says otherwise), and the scan runs as many
+at once as the free memory holds at that cap. One join then runs over those
 blobs and every blob the index already holds — the same two phases as
 `check --recheck`, once for all files. Untouched files are
-re-extracted with their repo but not reported, except a call the index matched
+never reported, even when their service is re-extracted, except a call the index matched
 that now reaches no route (the work removed or moved its route).
 
 Human output is one summary line, then one line per problem:
