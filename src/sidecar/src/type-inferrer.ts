@@ -10961,6 +10961,28 @@ export class TypeInferrer {
       return undefined;
     }
 
+    // A locator that elides members (`body: { a: x, ... }`) stands for the
+    // whole node it opens: the text before the elision is where the source
+    // opens. Never a node the text merely contains, which is one member of the
+    // payload it names.
+    // An opening shorter than this (`{`) names no node in particular.
+    const MIN_ELIDED_OPENING_LEN = 8;
+    const elidedOpening = this.elidedLocatorOpening(normalizedTarget);
+    if (elidedOpening !== undefined) {
+      if (elidedOpening.length < MIN_ELIDED_OPENING_LEN) return undefined;
+      const opened = candidates.filter((c) => c.text.startsWith(elidedOpening));
+      if (opened.length === 0) return undefined;
+      if (lineNumber !== undefined) {
+        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
+        const nearest = Math.min(...opened.map(distance));
+        return this.pickBestMatch(
+          opened.filter((c) => distance(c) === nearest).map((c) => c.node),
+          lineNumber
+        ) as T;
+      }
+      return this.pickBestMatch(opened.map((c) => c.node), lineNumber) as T;
+    }
+
     // Fall back to substring match
     // For the reverse direction (target contains node text), require a minimum node text
     // length to avoid matching tiny identifiers like "res" or "body" too broadly.
@@ -11034,6 +11056,18 @@ export class TypeInferrer {
       if (enclosing) bound.add(enclosing);
     }
     return bound.size > 0 ? (this.pickBestMatch([...bound], lineNumber) as T) : undefined;
+  }
+
+  /**
+   * The text a locator opens with before an elision, or `undefined` when the
+   * locator has none. An elision is `...` followed only by closing brackets
+   * (`{ a: x, ... }`); `...rest` is a spread and source text. An opening too
+   * short to tell nodes apart is judged by the caller.
+   */
+  private elidedLocatorOpening(normalizedTarget: string): string | undefined {
+    const match = /^(.*?)[\s,]*\.\.\.[\s,)}\]]*$/s.exec(normalizedTarget);
+    if (!match) return undefined;
+    return match[1];
   }
 
   /**
