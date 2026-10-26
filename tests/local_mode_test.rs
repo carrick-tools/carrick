@@ -722,6 +722,163 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
     );
 }
 
+/// A re-check that missed its budget is not started again against the same
+/// index: the next one answers at once with the parse and the indexed
+/// verdicts, and says why. A new index tries again. On a large monorepo the
+/// re-scan never fits, so without this every edit waits out the whole budget
+/// for no verdict.
+#[test]
+#[serial]
+fn a_re_check_that_missed_its_budget_is_not_started_again_until_the_index_moves() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+    let ample = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+    let ask = |env: &[(&str, &str)]| -> serde_json::Value {
+        serde_json::from_str(&run_with_env(
+            root,
+            &["check", route, "--workspace", ".", "--recheck", "--json"],
+            env,
+        ))
+        .expect("check --recheck --json was not JSON")
+    };
+    let named = |answer: &serde_json::Value| -> Vec<String> {
+        answer["recheck"]["new_functions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no new_functions in:\n{answer:#}"))
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("a name").to_string())
+            .collect()
+    };
+
+    index(root);
+    let existing = std::fs::read_to_string(&route_file).expect("read the route file");
+    std::fs::write(
+        &route_file,
+        format!(
+            "{existing}\nexport function widgetLabel(name: string): string {{\n  return name;\n}}\n"
+        ),
+    )
+    .expect("write the route file");
+
+    // The miss itself: an answer of indexed age, and nothing skipped yet.
+    let missed = ask(&[("CARRICK_RECHECK_BUDGET_MS", "1")]);
+    assert_eq!(
+        missed["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{missed:#}"
+    );
+    assert_eq!(
+        missed["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{missed:#}"
+    );
+
+    // Same index, ample budget: the re-scan would fit now, and is still not
+    // started, because this repo already missed against this index.
+    let skipped = ask(&ample);
+    assert_eq!(
+        skipped["recheck"]["ran"],
+        serde_json::json!("none"),
+        "a known miss starts no re-scan:\n{skipped:#}"
+    );
+    assert_eq!(
+        skipped["recheck"]["known_miss"],
+        serde_json::json!(true),
+        "{skipped:#}"
+    );
+    assert!(
+        skipped["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("check --changed")),
+        "the reason names the fresh read:\n{skipped:#}"
+    );
+    assert_eq!(
+        named(&skipped),
+        ["widgetLabel"],
+        "the parse still answers:\n{skipped:#}"
+    );
+    assert_eq!(
+        skipped["items"][0]["verdict"]["state"],
+        serde_json::json!("resolved"),
+        "with the indexed verdicts:\n{skipped:#}"
+    );
+
+    // A new index is a new generation: the re-check is tried again, and fits.
+    std::thread::sleep(Duration::from_millis(1100));
+    index(root);
+    let existing = std::fs::read_to_string(&route_file).expect("read the route file");
+    std::fs::write(
+        &route_file,
+        format!("{existing}\nexport function widgetCount(names: string[]): number {{\n  return names.length;\n}}\n"),
+    )
+    .expect("write the route file");
+    let fresh = ask(&ample);
+    assert_ne!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("none"),
+        "a new index re-checks again:\n{fresh:#}"
+    );
+    assert_eq!(
+        fresh["recheck"]["known_miss"],
+        serde_json::Value::Null,
+        "{fresh:#}"
+    );
+    assert_eq!(named(&fresh), ["widgetCount"], "{fresh:#}");
+}
+
+/// `check --each` answers several files in one process, each exactly as the
+/// single-file `check` would, as one JSON array in the order named. The
+/// post-edit hook asks it for a patch that touches several files.
+#[test]
+#[serial]
+fn check_each_answers_every_file_in_one_call() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let client = "inventory-svc/src/client.ts";
+
+    index(root);
+    let text = run(
+        root,
+        &[
+            "check",
+            "--each",
+            route,
+            client,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    let answers: Vec<serde_json::Value> =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a JSON array: {e}\n{text}"));
+    assert_eq!(answers.len(), 2, "{text}");
+    for (answer, file) in answers.iter().zip([route, client]) {
+        let single: serde_json::Value = serde_json::from_str(&run(
+            root,
+            &["check", file, "--workspace", ".", "--recheck", "--json"],
+        ))
+        .expect("check --json was not JSON");
+        assert_eq!(
+            answer["schema"],
+            serde_json::json!("carrick.check/0"),
+            "{answer:#}"
+        );
+        assert_eq!(answer["file"], single["file"], "{answer:#}");
+        assert_eq!(
+            answer["items"], single["items"],
+            "the same rows as `check <file>`:\n{answer:#}"
+        );
+        assert_eq!(
+            answer["recheck"]["ran"], single["recheck"]["ran"],
+            "{answer:#}"
+        );
+    }
+}
+
 /// Temporary generations a re-check has left in the system temp directory.
 /// Compared before and after rather than required to be empty: another test
 /// binary may be running one of its own (carrick#592).

@@ -91,6 +91,16 @@ pub enum LocalCommand {
         json: bool,
         all: bool,
     },
+    /// The single-file `check`, once per named file, in one process: with
+    /// `--json`, one JSON array holding one `carrick.check/0` answer (or
+    /// refusal) per file, in the order named. The post-edit hook asks this
+    /// for a patch that touches several files.
+    CheckEach {
+        files: Vec<PathBuf>,
+        workspace: Option<PathBuf>,
+        json: bool,
+        recheck: bool,
+    },
     /// Collect a dispatched job's analysis and finish the index.
     ///
     /// Reads the answers, rebuilds each file's prompt locally and takes the
@@ -148,6 +158,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut recheck = false;
     let mut changed = false;
     let mut all = false;
+    let mut each = false;
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
     let mut candidates = false;
@@ -175,6 +186,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--recheck" => recheck = true,
             "--changed" => changed = true,
             "--all" => all = true,
+            "--each" => each = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
             // Accepting the flag and ignoring it would hand a scaffold that
@@ -237,6 +249,31 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
              changed since the main branch, re-extracted."
                 .to_string(),
         );
+    }
+    // `--each` is the single-file read, once per file named, in one process:
+    // the post-edit hook asks it for every file of one patch, so a patch
+    // costs one binary start rather than one per file. It is not the
+    // several-file pass, which re-scans with no per-edit budget.
+    if each && name != "check" {
+        return Err(format!("unknown option for `carrick {name}`: --each"));
+    }
+    if each {
+        if changed || all {
+            return Err(
+                "`carrick check --each` answers each named file as `carrick check <file>` \
+                 does; it takes no --changed and no --all."
+                    .to_string(),
+            );
+        }
+        if positional.is_empty() {
+            return Err("`carrick check --each` needs at least one file path".to_string());
+        }
+        return Ok(LocalCommand::CheckEach {
+            files: positional.iter().map(PathBuf::from).collect(),
+            workspace,
+            json,
+            recheck,
+        });
     }
     // `--all` widens the list of the two passes that quiet their output: the
     // changed pass and the several-file pass.
@@ -453,6 +490,21 @@ pub fn run(command: LocalCommand) -> i32 {
             workspace.as_deref(),
             json,
             Mode::Check,
+            if recheck {
+                Freshness::Recheck
+            } else {
+                Freshness::Indexed
+            },
+        ),
+        LocalCommand::CheckEach {
+            files,
+            workspace,
+            json,
+            recheck,
+        } => read_each(
+            &files,
+            workspace.as_deref(),
+            json,
             if recheck {
                 Freshness::Recheck
             } else {
@@ -1793,6 +1845,61 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
     }
 }
 
+/// `check --each`: [`read`] for every file, in one process and in the order
+/// named. With `--json` the answers go out as one array, each element the body
+/// `read` would print for that file alone (an answer or a refusal), so one
+/// unreadable file never takes the others' answers with it. Refuses (1) only
+/// when no file got an answer, as `read` does for its one file.
+///
+/// The files are answered in turn, so a re-check that misses its budget on the
+/// first is remembered before the second asks ([`super::recheck::run`]): on a
+/// repo whose re-check does not fit, a patch waits out one budget at most.
+fn read_each(files: &[PathBuf], root: Option<&Path>, json: bool, freshness: Freshness) -> i32 {
+    let mut bodies: Vec<serde_json::Value> = Vec::new();
+    let mut answered = 0usize;
+    for file in files {
+        let outcome = super::workspace::locate(root, Some(file))
+            .ok_or_else(|| ReadFailure::new(ReadError::NotIndexed))
+            .and_then(|located| super::query::answer(&located, file, Mode::Check, freshness));
+        match outcome {
+            Ok(output) => {
+                answered += 1;
+                if json {
+                    match serde_json::to_value(&output) {
+                        Ok(value) => bodies.push(value),
+                        Err(e) => {
+                            crate::errln!("carrick: could not serialize the answer: {e}");
+                            let failure = ReadFailure::new(ReadError::IndexUnreadable);
+                            bodies.push(error_body(&failure));
+                        }
+                    }
+                } else {
+                    crate::out!("{}", output.render());
+                }
+            }
+            Err(failure) => {
+                crate::errln!("carrick: {}: {}", file.display(), failure.message());
+                if json {
+                    bodies.push(error_body(&failure));
+                }
+            }
+        }
+    }
+    if json {
+        match serde_json::to_string_pretty(&bodies) {
+            Ok(text) => crate::outln!("{text}"),
+            Err(e) => crate::errln!("carrick: could not serialize the answers: {e}"),
+        }
+    }
+    if answered == 0 { 1 } else { 0 }
+}
+
+/// The JSON a refusal of one `check` file prints, as a value.
+fn error_body(failure: &ReadFailure) -> serde_json::Value {
+    serde_json::to_value(ErrorOutput::new(failure, super::contract::SCHEMA))
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Say why there is no answer, in the form the caller asked for, and answer 0.
 /// A caller that has decided a refusal of its own is worth an exit code says
 /// so itself; see [`read`].
@@ -1839,6 +1946,7 @@ USAGE:
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json] [--recheck]
     carrick check   <file> <file>... [--workspace <dir>] [--json] [--all]
+    carrick check   --each <file>... [--workspace <dir>] [--json] [--recheck]
     carrick check   --changed [--workspace <dir>] [--json] [--all]
     carrick refresh [--service <name>] [--workspace <dir>]
 
@@ -1880,7 +1988,12 @@ USAGE:
                one repo is re-scanned and the join runs over blobs already on
                disk, with no model and nothing on the wire. It has ten seconds
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
-               one and says so.
+               one and says so. A repo whose re-check missed its budget is
+               remembered against that index (.carrick/recheck-misses.json):
+               later re-checks there answer at once from the index until the
+               next `carrick refresh`.
+               --each answers several files one by one, each as `check <file>`
+               would, in one process (with --json, one array of answers).
                --changed takes no file: it checks every file changed since
                each repo's main branch (committed on the branch, uncommitted
                and untracked), re-extracted in one pass, and prints one
@@ -1952,6 +2065,32 @@ mod tests {
             "Nothing was handed over for web: nothing in it needed the analyzer. `carrick resume` \
              indexes it with the rest."
         );
+    }
+
+    /// `--each` is the single-file read per file, and keeps `--recheck`; the
+    /// several-file pass is unchanged without it.
+    #[test]
+    fn each_parses_to_one_read_per_file_and_keeps_the_recheck() {
+        assert!(matches!(
+            parse(&args(&["check", "--each", "a.ts", "b.ts", "c.ts", "--recheck", "--json"])),
+            Some(Ok(LocalCommand::CheckEach { ref files, recheck: true, json: true, .. }))
+                if files.len() == 3
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "--each", "a.ts"])),
+            Some(Ok(LocalCommand::CheckEach { ref files, recheck: false, .. })) if files.len() == 1
+        ));
+        assert!(matches!(
+            parse(&args(&["check", "a.ts", "b.ts", "--recheck"])),
+            Some(Ok(LocalCommand::CheckFiles { .. }))
+        ));
+        for refused in [
+            &["check", "--each"][..],
+            &["check", "--each", "a.ts", "--all"][..],
+            &["touch", "--each", "a.ts"][..],
+        ] {
+            assert!(matches!(parse(&args(refused)), Some(Err(_))), "{refused:?}");
+        }
     }
 
     /// carrick#2827: several files are one pass, `--all` belongs to the passes

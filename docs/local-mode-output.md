@@ -56,6 +56,17 @@ working tree rather than the tree the index was built on. It writes nothing:
 `.carrick/index.json` is untouched and the temporary generation is deleted on
 every path. The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
 past it the answer is the indexed one, and the `recheck` block below says so.
+A re-check that missed its budget is remembered in
+`.carrick/recheck-misses.json`, per repo and against the index it ran on (its
+`indexed_at`). Until `refresh` or `index` writes a new index, a later
+`--recheck` of a file in that repo starts no re-scan: it answers at once with
+the indexed verdicts and the new functions from the parse, and its block
+carries `known_miss: true`. On such a repo `carrick check --changed` is the
+fresh read. A repo where the re-check fits never misses and is never recorded.
+`carrick check --each <file>... --recheck --json` answers several files in one
+process, each element of the printed JSON array the body `check <file>
+--recheck --json` prints for that file alone; the post-edit hook asks it for a
+patch that touches several files.
 A file the tree has not changed, a deleted file, and every `touch` are answered
 from the index as before. A changed file that holds no row is re-checked like
 any other: the row it might hold now is the reason to look.
@@ -191,6 +202,7 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so it is present on a `none` that missed its budget too. Absent when the edit added no function, and when the index could not be read |
+| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this repo already missed its budget against this index. Absent otherwise |
 
 `new_functions` is a NAME comparison against everything the index holds for that
 file — the blobs the last local scan wrote AND the hosted record of the same

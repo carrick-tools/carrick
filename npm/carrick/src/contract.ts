@@ -185,6 +185,12 @@ export type Recheck = {
    * commit is the one the last scan of that repo ran on.
    */
   new_functions?: NewFunction[];
+  /**
+   * True on a `none` that did not try: a re-check of this repo already missed
+   * its budget against this index, so the re-scan was skipped and the verdicts
+   * are the indexed ones until the next `carrick refresh`. Absent otherwise.
+   */
+  known_miss?: boolean;
 };
 
 /** One function the working tree declares and the index does not. */
@@ -401,6 +407,25 @@ export function parseCheckResult(stdout: string): CheckResult | null {
   } catch {
     return null;
   }
+  return checkResultOf(parsed);
+}
+
+/**
+ * Parse `carrick check --each --json` output: one array, one element per file
+ * in the order asked, each read as {@link parseCheckResult} reads one answer.
+ * `null` when stdout is not an array at all.
+ */
+export function parseCheckResults(stdout: string): Array<CheckResult | null> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed) ? parsed.map(checkResultOf) : null;
+}
+
+function checkResultOf(parsed: unknown): CheckResult | null {
   if (!isRecord(parsed)) return null;
   if (typeof parsed["schema"] !== "string") return null;
   if (parsed["schema"] !== SCHEMA) return null;

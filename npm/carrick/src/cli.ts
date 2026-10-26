@@ -7,6 +7,7 @@
 import { execFile } from "node:child_process";
 import {
   parseCheckResult,
+  parseCheckResults,
   parseStatusResult,
   type CheckResult,
   type StatusResult,
@@ -99,9 +100,37 @@ export async function check(
  * The limit for a `--recheck` call: the caller's own if it set one, and
  * otherwise long enough to outlast the binary's budget and still return inside
  * the hook's fifteen seconds.
+ *
+ * A call about several files (`files` > 1, only ever a Codex patch) gets ten
+ * more seconds per further file, inside the 60 s Codex gives the hook. The
+ * binary stops re-checking a repo after its first miss, so a patch on a repo
+ * where the re-check does not fit waits out one budget, not one per file.
  */
-export function recheckTimeoutMs(env: NodeJS.ProcessEnv = process.env): string {
-  return env["CARRICK_TIMEOUT_MS"] ?? "12000";
+export function recheckTimeoutMs(env: NodeJS.ProcessEnv = process.env, files = 1): string {
+  const own = env["CARRICK_TIMEOUT_MS"];
+  if (own) return own;
+  return String(Math.min(12000 + 10000 * Math.max(files - 1, 0), 55000));
+}
+
+/**
+ * `carrick check --each <files...> --json --recheck`: every file of one patch
+ * in one binary call (each answered as `check <file> --recheck` would), so a
+ * patch that touches six files starts one process rather than six. The
+ * answers come back in the order asked; `null` for a file the binary refused.
+ */
+export async function checkEach(
+  files: string[],
+  options: RunOptions,
+): Promise<RunOutcome<Array<CheckResult | null>>> {
+  const env = {
+    ...(options.env ?? process.env),
+    CARRICK_TIMEOUT_MS: recheckTimeoutMs(options.env, files.length),
+  };
+  return await run(
+    ["check", "--each", ...files, "--json", "--recheck"],
+    { ...options, env },
+    parseCheckResults,
+  );
 }
 
 /**

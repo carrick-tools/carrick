@@ -551,6 +551,14 @@ pub struct Recheck {
     /// against is `index_commit` on the answer around this block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_functions: Vec<NewFunction>,
+    /// True on a `none` that did not try: an earlier re-check of this repo
+    /// missed its budget against this same index, so this one skipped the
+    /// re-scan and answered at once (`recheck.rs`, "known misses"). The
+    /// verdicts are the indexed ones until the next `index` or `refresh`;
+    /// `carrick check --changed` is the fresh read on such a repo. Absent on
+    /// every other answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub known_miss: bool,
 }
 
 /// One function the working tree declares and the index does not.
@@ -1255,6 +1263,7 @@ mod tests {
             stale_since: None,
             reason: None,
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = fresh.render();
         assert!(
@@ -1274,6 +1283,7 @@ mod tests {
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some("the re-scan ran past the budget".to_string()),
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
@@ -1292,6 +1302,7 @@ mod tests {
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some("the file has not changed since the index".to_string()),
             new_functions: Vec::new(),
+            known_miss: false,
         });
         let text = unchanged.render();
         assert!(

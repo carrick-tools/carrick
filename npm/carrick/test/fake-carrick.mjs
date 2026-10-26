@@ -43,20 +43,27 @@ const fallbackFixture = process.env.CARRICK_FAKE_FIXTURE
   ? path.resolve(process.env.CARRICK_FAKE_FIXTURE)
   : path.join(here, "fixtures", "check-mismatch.json");
 
-/** The file this call is about: `check <file> --json`, so the first non-flag. */
-const asked = argv.slice(1).find((value) => !value.startsWith("--"));
-let fixture = fallbackFixture;
-if (process.env.CARRICK_FAKE_FIXTURE_MAP && asked) {
-  const map = JSON.parse(fs.readFileSync(process.env.CARRICK_FAKE_FIXTURE_MAP, "utf8"));
-  if (map[asked]) fixture = path.resolve(map[asked]);
-}
-
-const delay = process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0;
-const print = () => {
+/** The files this call is about: `check <file> --json`, so the non-flags. */
+const files = argv.slice(1).filter((value) => !value.startsWith("--"));
+const map = process.env.CARRICK_FAKE_FIXTURE_MAP
+  ? JSON.parse(fs.readFileSync(process.env.CARRICK_FAKE_FIXTURE_MAP, "utf8"))
+  : {};
+/** The fixture body that answers one file. */
+const answer = (file) => {
+  const fixture = file && map[file] ? path.resolve(map[file]) : fallbackFixture;
   let body = fs.readFileSync(fixture, "utf8");
   if (process.env.CARRICK_FAKE_REBASE === "1") {
     body = body.split('"/workspace').join(`"${process.cwd()}`);
   }
+  return body;
+};
+
+const delay = process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0;
+const print = () => {
+  // `check --each a b --json`: one array, one answer per file, in order.
+  const body = argv.includes("--each")
+    ? `[${files.map(answer).join(",")}]`
+    : answer(files[0]);
   process.stdout.write(body);
   process.exit(0);
 };

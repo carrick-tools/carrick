@@ -122,6 +122,7 @@ pub fn answer(
             &repo_root,
             &relative,
             &indexed_at,
+            &index.indexed_at,
         )),
         (Freshness::Recheck, Mode::Check) => Some((
             None,
@@ -352,6 +353,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         stale_since: Some(indexed_at.to_string()),
         reason: Some(reason.to_string()),
         new_functions: Vec::new(),
+        known_miss: false,
     }
 }
 
@@ -367,6 +369,7 @@ fn rechecked(
     repo_root: &Path,
     relative: &str,
     indexed_at: &str,
+    index_generation: &str,
 ) -> (Option<Vec<IndexedItem>>, Recheck) {
     let started = std::time::Instant::now();
     let workspace = match super::workspace::Workspace::load(workspace_root) {
@@ -380,11 +383,12 @@ fn rechecked(
                     stale_since: Some(indexed_at.to_string()),
                     reason: Some(reason),
                     new_functions: Vec::new(),
+                    known_miss: false,
                 },
             );
         }
     };
-    match super::recheck::run(&workspace, repo_root, relative) {
+    match super::recheck::run(&workspace, repo_root, relative, index_generation) {
         Ok(fresh) => (
             Some(fresh.items),
             Recheck {
@@ -393,6 +397,7 @@ fn rechecked(
                 stale_since: None,
                 reason: None,
                 new_functions: fresh.new_functions,
+                known_miss: false,
             },
         ),
         Err(degraded) => (
@@ -406,6 +411,7 @@ fn rechecked(
                 // that missed its budget still says what the edit added
                 // (carrick#2849).
                 new_functions: degraded.new_functions,
+                known_miss: degraded.known_miss,
             },
         ),
     }

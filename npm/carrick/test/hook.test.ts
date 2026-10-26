@@ -423,7 +423,7 @@ function patchPayload(workspace: { root: string }, session: string) {
   };
 }
 
-test("a Codex patch is re-checked file by file, and the deleted one is not", async (t) => {
+test("a Codex patch is re-checked in one call, and the deleted file is not asked about", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -439,15 +439,21 @@ test("a Codex patch is re-checked file by file, and the deleted one is not", asy
   });
   assert.equal(run.code, 0);
 
-  const asked = fs
+  const calls = fs
     .readFileSync(argvLog, "utf8")
     .split("\n")
     .filter((line) => line.trim().length > 0)
-    .map((line) => (JSON.parse(line) as { argv: string[] }).argv[1]);
-  assert.deepEqual(asked, [
+    .map((line) => (JSON.parse(line) as { argv: string[] }).argv);
+  assert.equal(calls.length, 1, JSON.stringify(calls));
+  assert.deepEqual(calls[0], [
+    "check",
+    "--each",
     "user-service/src/routes/users.ts",
     "billing-service/src/lookup.ts",
+    "--json",
+    "--recheck",
   ]);
+  const asked = calls[0]!;
   // The deleted file is gone from disk, so asking about it would be asking
   // about nothing; the markdown file has no rows in any index.
   assert.equal(asked.includes("billing-service/src/charges.ts"), false);
@@ -455,6 +461,81 @@ test("a Codex patch is re-checked file by file, and the deleted one is not", asy
 
   // Recorded exactly as an Edit's new functions are, and still silent about it.
   assert.equal(sessionRecord(home, "codex-1").found.length, 2);
+});
+
+test("a three-file patch is one binary call, and every file gets its answer", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(home, "argv.log");
+  const files = [
+    "order-service/src/clients/users.ts",
+    "order-service/src/server.ts",
+    "billing-service/src/lookup.ts",
+  ];
+  const command = [
+    "*** Begin Patch",
+    ...files.flatMap((file) => [`*** Update File: ${file}`, "@@", "-const a = 1;", "+const a = 2;"]),
+    "*** End Patch",
+  ].join("\n");
+
+  const run = await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "apply_patch",
+      cwd: workspace.root,
+      session_id: "codex-3",
+      tool_input: { command },
+    },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  assert.equal(run.code, 0);
+  const calls = fs
+    .readFileSync(argvLog, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
+  assert.equal(calls.length, 1, calls.join("\n"));
+  // Three headers, one per answer, in the order the patch names them.
+  const headers = contextOf(run.stdout)
+    .split("\n")
+    .filter((line) => line.startsWith("Carrick checked "));
+  assert.equal(headers.length, 3, contextOf(run.stdout));
+});
+
+test("a repo whose re-check is known not to fit says so once per session and still records", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const knownMiss = path.join(home, "check-known-miss.json");
+  const body = JSON.parse(fs.readFileSync(fixturePath("check-new-functions.json"), "utf8")) as {
+    recheck: Record<string, unknown>;
+  };
+  body.recheck = {
+    ran: "none",
+    elapsed_ms: 40,
+    stale_since: "2026-09-06T21:14:03Z",
+    reason: "an earlier re-check of this repo ran past its budget against this index",
+    known_miss: true,
+    new_functions: [{ name: "slugify", line: 12 }],
+  };
+  fs.writeFileSync(knownMiss, JSON.stringify(body));
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: knownMiss });
+  const edit = (session: string) =>
+    runHook("post-edit.ts", {
+      payload: { ...editPayload(workspace), session_id: session },
+      env,
+    });
+
+  const first = contextOf((await edit("sess-km")).stdout);
+  const second = contextOf((await edit("sess-km")).stdout);
+  assert.ok(first.includes("carrick check --changed"), first);
+  assert.equal(second.includes("carrick check --changed"), false, second);
+  assert.ok(contextOf((await edit("sess-km2")).stdout).includes("carrick check --changed"));
+  // The new function is recorded on every edit, the skipped re-scan or not.
+  assert.deepEqual(
+    sessionRecord(home, "sess-km").found.map((entry) => (entry as { name: string }).name),
+    ["slugify"],
+  );
 });
 
 test("the Codex hook names the set on the next prompt, once", async (t) => {

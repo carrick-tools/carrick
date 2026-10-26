@@ -16,7 +16,7 @@
 // to say, could not find its binary, or timed out.
 
 import path from "node:path";
-import { check } from "../cli.ts";
+import { check, checkEach } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { renderPostToolUse } from "../render.ts";
@@ -82,6 +82,34 @@ export function filesFromPayload(payload: Payload): string[] {
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
 }
 
+/** The `told` key the known-miss line is remembered under, per repo. */
+const KNOWN_MISS_PREFIX = "known-miss::";
+
+/**
+ * Said once per session on a repo where a re-check already missed its budget
+ * against this index: the per-edit verdicts there are the index's.
+ */
+export const KNOWN_MISS_LINE =
+  "On this repo a re-check does not fit the per-edit budget, so verdicts after an edit are " +
+  "the index's until the next `carrick refresh`. Run `carrick check --changed` for fresh ones.";
+
+/**
+ * Every edited file's answer, in order, from one binary call: the
+ * single-file `check` for one file (what Claude Code's edits always are), and
+ * `check --each` for a patch that touches several.
+ */
+async function answersFor(
+  relatives: string[],
+  cwd: string,
+): Promise<{ results: Array<CheckResult | null>; failure: string | null; ms: number }> {
+  if (relatives.length === 1) {
+    const outcome = await check(relatives[0]!, { cwd, recheck: true });
+    return { results: [outcome.result], failure: outcome.failure, ms: outcome.ms };
+  }
+  const outcome = await checkEach(relatives, { cwd });
+  return { results: outcome.result ?? [], failure: outcome.failure, ms: outcome.ms };
+}
+
 function emit(context: string): void {
   process.stdout.write(
     JSON.stringify({
@@ -141,26 +169,38 @@ async function main(): Promise<void> {
   // Files whose uses lines this message carries, remembered only once it is
   // delivered: who uses a file is shown once per file per session (carrick#2067).
   const told: string[] = [];
-  for (const file of edited) {
-    const relative = path.relative(choice.root, file);
-    // The edit just landed, so the index describes the file as it was before
-    // it. This is the one surface that asks for the file to be re-judged from
-    // the working tree; it fires once per completed edit, where the language
-    // server fires on every save (carrick#1036).
-    const outcome = await check(relative, { cwd: choice.root, recheck: true });
-    if (!outcome.result) {
+  const relatives = edited.map((file) => path.relative(choice.root, file));
+  // The edit just landed, so the index describes the file as it was before
+  // it. This is the one surface that asks for the file to be re-judged from
+  // the working tree; it fires once per completed edit, where the language
+  // server fires on every save (carrick#1036). A patch of several files is
+  // one binary call, not one per file: each call re-reads the index and, on a
+  // repo whose re-check does not fit, would wait out a budget of its own.
+  const answers = await answersFor(relatives, choice.root);
+  for (const [index, relative] of relatives.entries()) {
+    const result = answers.results[index] ?? null;
+    if (!result) {
       // One unreadable file in a patch of four is not a reason to say nothing
       // about the other three.
-      log("no answer for", relative, outcome.failure ?? "");
+      log("no answer for", relative, answers.failure ?? "");
       continue;
     }
-    found.push(...newFunctions(outcome.result, relative));
-    const key = toldKey(outcome.result, relative);
+    found.push(...newFunctions(result, relative));
+    const key = toldKey(result, relative);
     const show = !payload.session_id || !wasTold(payload.session_id, key);
-    if (show && outcome.result.uses_lines?.length) told.push(key);
-    const context = renderPostToolUse(outcome.result, relative, { uses: show });
-    log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${outcome.ms}ms`);
+    if (show && result.uses_lines?.length) told.push(key);
+    const context = renderPostToolUse(result, relative, { uses: show });
+    log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) contexts.push(context);
+    // A repo whose re-check is known not to fit answers from the index on
+    // every edit; the reader is told so once per session, not once per edit.
+    if (result.recheck?.known_miss) {
+      const missKey = `${KNOWN_MISS_PREFIX}${result.repo ?? ""}`;
+      if (!told.includes(missKey) && !(payload.session_id && wasTold(payload.session_id, missKey))) {
+        told.push(missKey);
+        contexts.push(KNOWN_MISS_LINE);
+      }
+    }
   }
 
   // Silent and local: the names go to a file under the user's home directory

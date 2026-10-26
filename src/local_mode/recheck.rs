@@ -102,6 +102,9 @@ pub struct Degraded {
     /// at their indexed age, but what the edit added is known either way.
     pub new_functions: Vec<super::contract::NewFunction>,
     pub elapsed: Duration,
+    /// The re-scan was not started, because an earlier one of this repo
+    /// missed its budget against the same index ([`KnownMisses`]).
+    pub known_miss: bool,
 }
 
 /// The budget for one re-check.
@@ -119,7 +122,17 @@ fn budget_from(raw: Option<&str>) -> Duration {
 
 /// Re-extract `relative` in `repo`, re-join it against every blob the index
 /// already holds, and answer with the rows the working tree states.
-pub fn run(workspace: &Workspace, repo: &Path, relative: &str) -> Result<Fresh, Degraded> {
+///
+/// `index_generation` names the index this runs against (its `indexed_at`):
+/// a re-scan of `repo` that missed its budget against it is remembered there,
+/// and every later call against the same generation skips the re-scan and
+/// answers at once ([`KnownMisses`]).
+pub fn run(
+    workspace: &Workspace,
+    repo: &Path,
+    relative: &str,
+    index_generation: &str,
+) -> Result<Fresh, Degraded> {
     let started = Instant::now();
     let deadline = started + budget();
     // The index is read once, here, and named twice: for what the edit added
@@ -133,10 +146,20 @@ pub fn run(workspace: &Workspace, repo: &Path, relative: &str) -> Result<Fresh, 
                 reason,
                 new_functions: Vec::new(),
                 elapsed: started.elapsed(),
+                known_miss: false,
             });
         }
     };
     let new_functions = added_functions(&held, repo, relative);
+    let misses = KnownMisses::path(workspace);
+    if KnownMisses::read(&misses).holds(index_generation, repo) {
+        return Err(Degraded {
+            reason: KNOWN_MISS_REASON.to_string(),
+            new_functions,
+            elapsed: started.elapsed(),
+            known_miss: true,
+        });
+    }
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(workspace, held, repo, relative, &generation, deadline);
     // The temporary generation goes on every path, including the one where a
@@ -149,11 +172,87 @@ pub fn run(workspace: &Workspace, repo: &Path, relative: &str) -> Result<Fresh, 
             elapsed: started.elapsed(),
             ..fresh
         }),
-        Err(reason) => Err(Degraded {
-            reason,
-            new_functions,
-            elapsed: started.elapsed(),
-        }),
+        Err(reason) => {
+            // Only a miss of the budget is remembered: a phase that failed
+            // for another reason before the deadline says nothing about
+            // whether this repo fits, and remembering it would switch the
+            // re-check off on a repo where it does.
+            if Instant::now() >= deadline {
+                KnownMisses::record(&misses, index_generation, repo);
+            }
+            Err(Degraded {
+                reason,
+                new_functions,
+                elapsed: started.elapsed(),
+                known_miss: false,
+            })
+        }
+    }
+}
+
+/// The reason a re-check that skipped its re-scan gives.
+pub const KNOWN_MISS_REASON: &str = "an earlier re-check of this repo ran past its budget against \
+     this index, so this one did not start a re-scan; per-edit verdicts here are the index's \
+     until the next `carrick refresh`, and `carrick check --changed` gives fresh ones";
+
+/// The repos whose re-check missed its budget against one index generation
+/// (`.carrick/recheck-misses.json`).
+///
+/// On a large monorepo the re-scan alone outlasts the budget every time, so
+/// every edit would wait out the whole budget for an answer that never comes.
+/// The first miss is remembered here, keyed to the index it ran against; until
+/// `index` or `refresh` writes a new one, a re-check of that repo skips the
+/// re-scan and answers at once with the parse and the indexed verdicts. A new
+/// generation does not match, so the re-check is tried again after it. A repo
+/// that fits never misses and is never written here. The reader-facing side
+/// (`known_miss` on the `recheck` block) is `docs/local-mode-output.md`.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
+struct KnownMisses {
+    /// The `indexed_at` of the index the misses were against.
+    generation: String,
+    /// Absolute repo paths, as the workspace names them.
+    repos: Vec<String>,
+}
+
+impl KnownMisses {
+    fn path(workspace: &Workspace) -> std::path::PathBuf {
+        workspace.index_dir().join("recheck-misses.json")
+    }
+
+    /// Unreadable or absent is "no misses": a lost record costs one more
+    /// re-check, never a wrong answer.
+    fn read(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn holds(&self, generation: &str, repo: &Path) -> bool {
+        !generation.is_empty()
+            && self.generation == generation
+            && self.repos.iter().any(|known| Path::new(known) == repo)
+    }
+
+    /// Add `repo` for `generation`, dropping the misses of any older one.
+    fn record(path: &Path, generation: &str, repo: &Path) {
+        if generation.is_empty() {
+            return;
+        }
+        let mut misses = Self::read(path);
+        if misses.generation != generation {
+            misses = Self {
+                generation: generation.to_string(),
+                repos: Vec::new(),
+            };
+        }
+        let repo = repo.to_string_lossy().to_string();
+        if !misses.repos.contains(&repo) {
+            misses.repos.push(repo);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&misses) {
+            let _ = std::fs::write(path, text);
+        }
     }
 }
 
@@ -621,5 +720,35 @@ mod tests {
         let error = bounded(command, "re-scan", Instant::now() + Duration::from_secs(30))
             .expect_err("a failing phase is not a success");
         assert!(error.contains("exited"), "{error}");
+    }
+
+    /// A miss is remembered per repo and per index generation: another repo,
+    /// or the same repo against a newer index, tries the re-check again.
+    #[test]
+    fn a_known_miss_holds_for_its_repo_and_generation_only() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        let big = Path::new("/w/big");
+        let small = Path::new("/w/small");
+
+        assert!(!KnownMisses::read(&path).holds("g1", big), "nothing yet");
+        KnownMisses::record(&path, "g1", big);
+        KnownMisses::record(&path, "g1", big);
+        let read = KnownMisses::read(&path);
+        assert!(read.holds("g1", big));
+        assert_eq!(read.repos.len(), 1, "recorded once");
+        assert!(!read.holds("g1", small), "a sibling repo still re-checks");
+        assert!(!read.holds("g2", big), "a new index tries again");
+
+        // A miss against a newer index replaces the older generation's.
+        KnownMisses::record(&path, "g2", small);
+        let read = KnownMisses::read(&path);
+        assert!(read.holds("g2", small));
+        assert!(!read.holds("g2", big));
+        assert!(!read.holds("g1", big));
+
+        // No generation means no record either way.
+        KnownMisses::record(&path, "", big);
+        assert!(!KnownMisses::read(&path).holds("", big));
     }
 }
