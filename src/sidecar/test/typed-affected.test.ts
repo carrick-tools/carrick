@@ -313,6 +313,121 @@ describe('affected set and kept infer items (carrick#2881)', () => {
     await stopDaemon(child, socket);
   });
 
+  it('reaches a JavaScript file that names a type only in JSDoc, and answers as a cold process', async () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'cjsd-'));
+    workspaces.push(ws);
+    const root = path.join(ws, 'svc');
+    const files: Record<string, string> = {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: { target: 'es2020', module: 'commonjs', strict: true, allowJs: true, checkJs: true, noEmit: true, types: [] },
+        include: ['src/**/*'],
+      }),
+      'package.json': JSON.stringify({ name: 'svc', private: true }),
+      'src/models.ts': `export interface User {
+  id: string;
+}
+export interface Order {
+  id: string;
+}
+export interface Invoice {
+  id: string;
+}
+export interface Account {
+  id: string;
+}
+`,
+      // A typedef on one statement, read by another statement's @param, in a module.
+      'src/handlers.js': `/** @typedef {import('./models').User} User */
+export const kind = 'user';
+/** @param {User} u */
+export function handle(u) {
+  return { ...u };
+}
+`,
+      // A typedef after the last statement.
+      'src/accounts.js': `/** @param {Account} a */
+export function show(a) {
+  return { ...a };
+}
+/** @typedef {import('./models').Account} Account */
+`,
+      // An @import tag, read by @param.
+      'src/orders.js': `/** @import { Order } from './models' */
+/** @param {Order} o */
+function copy(o) {
+  return { ...o };
+}
+module.exports = { copy };
+`,
+      // An @type naming the type through an import type.
+      'src/invoices.js': `/** @type {import('./models').Invoice} */
+const base = { id: 'a' };
+function dup() {
+  return { ...base };
+}
+module.exports = { dup };
+`,
+      // `infer` answers TypeScript files: each reads one JavaScript file's function.
+      'src/view-handlers.ts': `import { handle } from './handlers';
+export function viewHandle(u: Parameters<typeof handle>[0]) {
+  return handle(u);
+}
+`,
+      'src/view-orders.ts': `import { copy } from './orders';
+export function viewCopy(o: Parameters<typeof copy>[0]) {
+  return copy(o);
+}
+`,
+      'src/view-accounts.ts': `import { show } from './accounts';
+export function viewShow(a: Parameters<typeof show>[0]) {
+  return show(a);
+}
+`,
+      'src/view-invoices.ts': `import { dup } from './invoices';
+export function viewDup() {
+  return dup();
+}
+`,
+    };
+    for (const [file, text] of Object.entries(files)) write(root, file, text);
+    const items: Array<[string, number]> = [
+      ['src/view-handlers.ts', 2], // 0
+      ['src/view-orders.ts', 2], // 1
+      ['src/view-invoices.ts', 2], // 2
+      ['src/view-accounts.ts', 2], // 3
+    ];
+    const child = await daemon(ws, { CARRICK_UNWIDENED_BUDGET_MS: '100000000' });
+    const socket = recordOf(ws)!.socket;
+    const client = await SocketClient.greeted(socket);
+    assert.strictEqual((await client.send({ request_id: 'i', action: 'init', repo_root: root })).status, 'ready');
+    const addField = (name: string) => () =>
+      edit(root, 'src/models.ts', (t) => t.replace(`export interface ${name} {\n  id: string;\n`, `export interface ${name} {\n  id: string;\n  extra${name}: number;\n`));
+    const steps: Array<[string, () => void, number[]]> = [
+      ['first answer', () => {}, [0, 1, 2, 3]],
+      ['@typedef import type', addField('User'), [0]],
+      ['@import tag', addField('Order'), [1]],
+      ['@type import type', addField('Invoice'), [2]],
+      ['@typedef after the last statement', addField('Account'), [3]],
+      ['the typedef itself edited', () => edit(root, 'src/handlers.js', (t) => t.replace("import('./models').User", "import('./models').Order")), [0]],
+    ];
+    for (const [name, change, readAgain] of steps) {
+      change();
+      const request = inferOf(root, items);
+      const before = await serviceStatus(client, root);
+      const got = untimed(await client.send(request));
+      const after = await serviceStatus(client, root);
+      assert.strictEqual(got, await cold(root, request), `${name}: warm and cold answers differ`);
+      assert.ok(got.includes('"status":"success"'), `${name}: ${got}`);
+      assert.deepStrictEqual(
+        [after.items.recomputed - before.items.recomputed, after.items.replayed - before.items.replayed],
+        [readAgain.length, items.length - readAgain.length],
+        `${name}: [read again, kept]`
+      );
+    }
+    client.conn.destroy();
+    await stopDaemon(child, socket);
+  });
+
   it('releases the least recently used service over its heap cap, and builds it again on its next request', async () => {
     const one = workspace();
     const two = workspace();

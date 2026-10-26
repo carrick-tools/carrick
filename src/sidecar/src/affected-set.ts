@@ -164,11 +164,54 @@ export function declaredNames(statement: ts.Statement): string[] {
   return names;
 }
 
-function mentioned(node: ts.Node): Set<string> {
+const JAVASCRIPT = /\.[cm]?jsx?$/i;
+
+/**
+ * Visit `n`'s children and, in a JavaScript file, the JSDoc comments attached
+ * to it first: there `@type`, `@param`, `@returns`, `@typedef` and `@import`
+ * type the file, and `forEachChild` never enters them.
+ */
+function forEachChildAndJSDoc(n: ts.Node, js: boolean, visit: (child: ts.Node) => void): void {
+  if (js) for (const doc of (n as { jsDoc?: ts.JSDoc[] }).jsDoc ?? []) visit(doc);
+  n.forEachChild(visit);
+}
+
+/** The type names a JavaScript statement's JSDoc declares (`@typedef`, `@callback`): top-level names of the file. */
+function jsDocNames(statement: ts.Node, js: boolean): string[] {
+  if (!js) return [];
+  const names: string[] = [];
+  for (const doc of (statement as { jsDoc?: ts.JSDoc[] }).jsDoc ?? []) {
+    for (const tag of doc.tags ?? []) {
+      const name = typedefName(tag);
+      if (name !== undefined) names.push(name);
+    }
+  }
+  return names;
+}
+
+function typedefName(node: ts.Node): string | undefined {
+  if (!ts.isJSDocTypedefTag(node) && !ts.isJSDocCallbackTag(node)) return undefined;
+  const name = node.name;
+  return name && ts.isIdentifier(name) ? name.text : undefined;
+}
+
+/**
+ * The statements of a file, and in a JavaScript file the end-of-file token
+ * when a JSDoc comment (a trailing `@typedef`) is attached to it.
+ */
+function statementsOf(sourceFile: ts.SourceFile, js: boolean): ts.Node[] {
+  const statements: ts.Node[] = [...sourceFile.statements];
+  if (js && ((sourceFile.endOfFileToken as { jsDoc?: ts.JSDoc[] }).jsDoc ?? []).length > 0) {
+    statements.push(sourceFile.endOfFileToken);
+  }
+  return statements;
+}
+
+function mentioned(node: ts.Node, js: boolean): Set<string> {
   const refs = new Set<string>();
   const visit = (n: ts.Node): void => {
     if (ts.isIdentifier(n)) refs.add(n.text);
-    n.forEachChild(visit);
+    forEachChildAndJSDoc(n, js, visit);
   };
   visit(node);
   return refs;
@@ -197,15 +240,30 @@ function shapeOfSource(sourceFile: ts.SourceFile): Shape {
     exportTargets: new Map(),
     global: !ts.isExternalModule(sourceFile),
   };
+  const js = JAVASCRIPT.test(sourceFile.fileName);
   const declare = (name: string, text: string, refs: Set<string>): void => {
     shape.declared.set(name, [...(shape.declared.get(name) ?? []), text]);
     const known = shape.refs.get(name) ?? new Set<string>();
     for (const ref of refs) known.add(ref);
     shape.refs.set(name, known);
   };
-  for (const statement of sourceFile.statements) {
+  for (const node of statementsOf(sourceFile, js)) {
     // With its leading comments: a JSDoc comment types a JavaScript file.
-    const text = statement.getFullText(sourceFile);
+    const text = node.getFullText(sourceFile);
+    // A top-level `@typedef` is a name of the file, exported from a module.
+    const typedefs = jsDocNames(node, js);
+    if (typedefs.length > 0) {
+      const refs = mentioned(node, js);
+      for (const name of typedefs) {
+        declare(name, text, refs);
+        shape.exports.add(name);
+      }
+    }
+    if (node.kind === ts.SyntaxKind.EndOfFileToken) {
+      shape.loose.push({ pos: node.pos, text, refs: mentioned(node, js) });
+      continue;
+    }
+    const statement = node as ts.Statement;
     if (ts.isExportDeclaration(statement)) {
       const clause = statement.exportClause;
       if (!clause) {
@@ -227,12 +285,12 @@ function shapeOfSource(sourceFile: ts.SourceFile): Shape {
     }
     const names = declaredNames(statement);
     if (names.length === 0) {
-      shape.loose.push({ pos: statement.pos, text, refs: mentioned(statement) });
+      shape.loose.push({ pos: statement.pos, text, refs: mentioned(statement, js) });
       continue;
     }
     const refs = ts.isImportDeclaration(statement) || ts.isImportEqualsDeclaration(statement)
       ? new Set<string>()
-      : mentioned(statement);
+      : mentioned(statement, js);
     for (const name of names) declare(name, text, refs);
     if (hasModifier(statement, ts.SyntaxKind.ExportKeyword) || ts.isExportAssignment(statement)) {
       for (const name of names) shape.exports.add(name);
@@ -332,6 +390,11 @@ function originsOfSymbol(checker: ts.TypeChecker, symbol: ts.Symbol | undefined,
       into.push({ file: sourceFile.fileName, name: '*' });
       continue;
     }
+    const typedef = typedefName(decl);
+    if (typedef !== undefined) {
+      into.push({ file: sourceFile.fileName, name: typedef });
+      continue;
+    }
     const top = topStatement(decl);
     const names = top ? declaredNames(top) : [];
     if (names.length === 0) into.push({ file: sourceFile.fileName, name: '*' });
@@ -363,6 +426,9 @@ function originsOfModule(checker: ts.TypeChecker, moduleSymbol: ts.Symbol | unde
 }
 
 const WHOLE_MODULE_HINT = /\bimport\s*\(|\brequire\s*\(/;
+
+/** A JavaScript file's `@import` tag. */
+const JSDOC_IMPORT_HINT = /@import\b/;
 
 /** The name a dynamic import, `require()` or import type is bound under: no identifier can spell it. */
 const WHOLE_MODULE = '\u0000reads module ';
@@ -405,9 +471,31 @@ function nodeOf(checker: ts.TypeChecker, sourceFile: ts.SourceFile): FileNode {
       }
     }
   }
-  if (WHOLE_MODULE_HINT.test(sourceFile.text)) {
-    let holder: ts.Statement = sourceFile.statements[0]!;
+  const js = JAVASCRIPT.test(sourceFile.fileName);
+  if (WHOLE_MODULE_HINT.test(sourceFile.text) || (js && JSDOC_IMPORT_HINT.test(sourceFile.text))) {
+    let holder: ts.Node = sourceFile.statements[0] ?? sourceFile.endOfFileToken;
+    /** The statement holding a binding reads it, as it would read an import. */
+    const holderReads = (local: string): void => {
+      const names = holder.kind === ts.SyntaxKind.EndOfFileToken ? [] : declaredNames(holder as ts.Statement);
+      for (const name of [...names, ...jsDocNames(holder, js)]) node.shape.refs.get(name)?.add(local);
+      if (names.length === 0) node.shape.loose.find((loose) => loose.pos === holder.pos)?.refs.add(local);
+    };
     const visit = (n: ts.Node): void => {
+      // `@import { T } from 'm'`: an import declaration written in JSDoc.
+      if (ts.isJSDocImportTag(n)) {
+        const clause = n.importClause;
+        const bindings = clause?.namedBindings;
+        if (clause?.name) bind(clause.name, 'default');
+        if (bindings && ts.isNamespaceImport(bindings)) {
+          const origins: Origin[] = [];
+          originsOfModule(checker, checker.getSymbolAtLocation(n.moduleSpecifier), origins);
+          node.bindings.set(bindings.name.text, origins);
+          node.wholeLocals.add(bindings.name.text);
+        } else if (bindings) {
+          for (const el of bindings.elements) bind(el.name, (el.propertyName ?? el.name).text);
+        }
+        return;
+      }
       let specifier: ts.Node | undefined;
       /** `import('m').T` reads `T` only; `typeof import('m')` reads the whole module. */
       let named: ts.Identifier | undefined;
@@ -433,14 +521,11 @@ function nodeOf(checker: ts.TypeChecker, sourceFile: ts.SourceFile): FileNode {
         else originsOfModule(checker, checker.getSymbolAtLocation(specifier), origins);
         node.bindings.set(local, origins);
         if (!symbol) node.wholeLocals.add(local);
-        // The statement holding it reads it, as it would read an import.
-        const names = declaredNames(holder);
-        for (const name of names) node.shape.refs.get(name)?.add(local);
-        if (names.length === 0) node.shape.loose.find((loose) => loose.pos === holder.pos)?.refs.add(local);
+        holderReads(local);
       }
-      n.forEachChild(visit);
+      forEachChildAndJSDoc(n, js, visit);
     };
-    for (const statement of sourceFile.statements) {
+    for (const statement of statementsOf(sourceFile, js)) {
       holder = statement;
       visit(statement);
     }
