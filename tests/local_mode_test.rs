@@ -2818,6 +2818,85 @@ fn check_several_files_judges_them_in_one_pass_and_fails_on_a_fact() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// Naming only files the index cannot check is not a pass: it exits 2, a code
+/// no verdict uses, and says which files and what fixes it (carrick#2850).
+#[test]
+#[serial]
+fn check_named_files_exits_two_when_none_was_covered() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &["/not/in/the/workspace/x.ts", "/not/in/the/workspace/y.ts"],
+    );
+    assert!(
+        text.contains("not checked: covered none of the 2 files asked about"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts: not in a repo of this workspace")
+            && text.contains("carrick refresh"),
+        "the file, the reason and the fix are named:\n{text}"
+    );
+    assert_eq!(code, Some(2), "nothing covered is not a pass:\n{text}");
+}
+
+/// Some files covered and some not: the covered ones decide the exit code and
+/// the skipped one is listed.
+#[test]
+#[serial]
+fn check_a_mix_of_covered_and_uncovered_files_exits_by_the_covered_ones() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let (code, text) = check_files(
+        root,
+        &[
+            "inventory-svc/src/inventory.ts",
+            "/not/in/the/workspace/x.ts",
+        ],
+    );
+    assert!(
+        text.contains("not checked: /not/in/the/workspace/x.ts"),
+        "the skipped file is listed:\n{text}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "one file was covered and holds no problem:\n{text}"
+    );
+}
+
+/// An index whose paths belong to another folder covers nothing of the files
+/// changed here. That is the pilot copy that read as a pass.
+#[test]
+#[serial]
+fn check_changed_exits_two_when_the_index_is_not_bound_to_this_folder() {
+    let original = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    index(original.path());
+    let copy = tempfile::tempdir().expect("temp dir");
+    copy_tree(original.path(), copy.path());
+    drop(original);
+    let root = copy.path();
+    // The folders carry other names than the ones the index was built under.
+    std::fs::rename(root.join("catalog-web"), root.join("web-copy")).expect("rename");
+    std::fs::rename(root.join("inventory-svc"), root.join("svc-copy")).expect("rename");
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        r#"{"repos": ["./web-copy", "./svc-copy"]}"#,
+    )
+    .expect("workspace file");
+    edit(
+        &root.join("svc-copy/src/inventory.ts"),
+        "export",
+        "// edited\nexport",
+    );
+    let (code, text) = check_changed(root, false);
+    assert!(text.contains("not checked"), "{text}");
+    assert_eq!(code, Some(2), "nothing was covered:\n{text}");
+}
+
 /// Naming only files that hold no problem exits 0.
 #[test]
 #[serial]

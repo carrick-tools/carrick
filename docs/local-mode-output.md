@@ -505,9 +505,15 @@ base: a parameter, a field, a config value that reads no environment variable)
 is `unconfirmed` and never fails, because the check cannot tell a service of
 this workspace from an outside API there; the exception is a call the index
 matched to a workspace route, whose loss is a fact. A problem resting on a
-model candidate, or on rows that state no source, exits 0 too. A
-check that could not run (no index, no main branch, budget spent) says why on
-its summary line and exits 0, so a test run never fails on a missing index.
+model candidate, or on rows that state no source, exits 0 too. A check that
+covered none of the files it was asked about exits 2, which no verdict uses:
+no index, an index not bound to this folder, a file not in the index, a
+service that is not indexed, or the budget spent. It names each file or repo
+and the reason, and says to run `carrick init` or `carrick refresh`. A check
+that covered some files exits 0 or 1 by those files and lists the skipped ones
+as `not checked:` lines. `--changed` with no changed file asked about nothing
+and exits 0. `carrick hook post-edit` does not run this pass and keeps its
+exit codes.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
 
 **Quiet by default.** Only problems that fail the run are listed. The rest

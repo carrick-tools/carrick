@@ -16,9 +16,10 @@
 //! The exit code is the one read in local mode that a verdict moves (see
 //! `docs/local-mode-output.md`, "check --changed"): 1 when a problem is a fact,
 //! 0 otherwise. A problem resting on a model candidate does not fail the run
-//! and is counted on the summary line, listed only with `--all`. Neither does
-//! a check that could not run: it says why on its summary line, because a
-//! test run must not fail on a missing index.
+//! and is counted on the summary line, listed only with `--all`. A check that
+//! covered none of the files it was asked about, or could not run, exits
+//! [`EXIT_NOTHING_COVERED`] (carrick#2850): a pass it did not look at is not
+//! a pass.
 //!
 //! `carrick check a.ts b.ts` runs the same pass over the files named instead
 //! of the files changed ([`Selection::Named`]).
@@ -60,7 +61,8 @@ pub struct ChangedOutput {
     /// How many of `problems` fail the run.
     pub failing: usize,
     pub elapsed_ms: u64,
-    /// Why nothing was checked, when nothing was. The run then exits 0.
+    /// Why nothing was checked, when nothing was. The run then exits
+    /// [`EXIT_NOTHING_COVERED`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_checked: Option<String>,
 }
@@ -79,6 +81,14 @@ pub struct ChangedRepo {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// How many files the caller asked about that this entry could not check.
+    /// Zero when `skipped` is not set.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unchecked: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -137,6 +147,33 @@ pub enum Selection<'a> {
     Named(&'a [PathBuf]),
 }
 
+/// The exit code of a run that covered none of the files it was asked about,
+/// or could not run at all. Distinct from 1 (a problem is a fact), so a caller
+/// reading 0 or 1 never mistakes "nothing was looked at" for a pass
+/// (carrick#2850). Hooks do not run this pass and keep their own exit codes.
+pub const EXIT_NOTHING_COVERED: i32 = 2;
+
+impl ChangedOutput {
+    /// Files the caller asked about that no repo could check.
+    pub fn unchecked(&self) -> usize {
+        self.repos.iter().map(|repo| repo.unchecked).sum()
+    }
+
+    /// The process exit code: [`EXIT_NOTHING_COVERED`] when the run could not
+    /// run, or asked about files and covered none; 1 when a problem is a
+    /// fact; else 0, including when some files were covered and others
+    /// skipped (the skipped ones are listed).
+    pub fn exit_code(&self) -> i32 {
+        if self.not_checked.is_some() || (self.files == 0 && self.unchecked() > 0) {
+            EXIT_NOTHING_COVERED
+        } else if self.failing > 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// Run the pass and print it. Returns the exit code. `all` lists the problems
 /// that rest on rows that are not facts; without it they are only counted.
 /// `--json` always lists every problem, each with its `source` and `fails`.
@@ -152,7 +189,7 @@ pub fn run(root: Option<&Path>, selection: Selection, json: bool, all: bool) -> 
     } else {
         crate::out!("{}", output.render(all));
     }
-    if output.failing > 0 { 1 } else { 0 }
+    output.exit_code()
 }
 
 fn not_checked(workspace: &str, reason: impl Into<String>) -> ChangedOutput {
@@ -257,9 +294,26 @@ fn changed_files(
             base: None,
             files: Vec::new(),
             skipped: None,
+            unchecked: 0,
         };
         let Some(indexed) = index.repos.iter().find(|indexed| indexed.name == name) else {
-            entry.skipped = Some("not in the index; run `carrick refresh`".to_string());
+            // The files the work changed here are ones the caller asked
+            // about, so count them: a repo the index does not hold is a
+            // check that covered none of them.
+            if let Ok((_, base)) = crate::git_state::main_base(&text)
+                && let Some(paths) = super::query::changed_since(repo, &base)
+            {
+                entry.files = paths
+                    .into_iter()
+                    .filter(|file| crate::file_finder::is_scanned_source(&repo.join(file), repo))
+                    .collect();
+                entry.unchecked = entry.files.len();
+            }
+            entry.skipped = Some(
+                "not in the index, or the index is not bound to this folder; run \
+                 `carrick init` or `carrick refresh`"
+                    .to_string(),
+            );
             listed.push(entry);
             continue;
         };
@@ -279,14 +333,26 @@ fn changed_files(
         // Source the scan reads, in a service this index covers. A repo whose
         // services are all hosted lists none locally, and then every source
         // file in it is the repo's.
-        let files: BTreeSet<String> = paths
+        let sources: BTreeSet<String> = paths
             .into_iter()
             .filter(|file| crate::file_finder::is_scanned_source(&repo.join(file), repo))
+            .collect();
+        let files: BTreeSet<String> = sources
+            .iter()
             .filter(|file| {
                 indexed.services.is_empty()
                     || indexed.services.iter().any(|service| service.covers(file))
             })
+            .cloned()
             .collect();
+        if files.len() < sources.len() {
+            entry.unchecked = sources.len() - files.len();
+            entry.skipped = Some(format!(
+                "{} changed file(s) are in no indexed service; run `carrick init` or \
+                 `carrick refresh`",
+                entry.unchecked
+            ));
+        }
         entry.main_branch = Some(branch);
         entry.base = Some(base);
         entry.files = files.iter().cloned().collect();
@@ -311,7 +377,8 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             main_branch: None,
             base: None,
             files: Vec::new(),
-            skipped: Some(reason.to_string()),
+            skipped: Some(format!("{reason}; run `carrick init` or `carrick refresh`")),
+            unchecked: 1,
         });
     };
     for file in files {
@@ -346,6 +413,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             base: None,
             files: files.iter().cloned().collect(),
             skipped: None,
+            unchecked: 0,
         })
         .collect();
     repos.extend(listed);
@@ -590,6 +658,14 @@ impl ChangedOutput {
         if let Some(reason) = &self.not_checked {
             return format!("carrick check: not checked: {reason}\n");
         }
+        if self.files == 0 && self.unchecked() > 0 {
+            let mut out = format!(
+                "carrick check: not checked: covered none of the {} asked about\n",
+                plural(self.unchecked(), "file", "files")
+            );
+            out.push_str(&self.skipped_lines());
+            return out;
+        }
         let listed: Vec<&Problem> = self
             .problems
             .iter()
@@ -651,6 +727,12 @@ impl ChangedOutput {
                 problem.role, problem.method, problem.path, problem.reason
             ));
         }
+        out.push_str(&self.skipped_lines());
+        out
+    }
+
+    fn skipped_lines(&self) -> String {
+        let mut out = String::new();
         for repo in &self.repos {
             if let Some(reason) = &repo.skipped {
                 out.push_str(&format!("not checked: {}: {reason}\n", repo.repo));
@@ -745,6 +827,52 @@ mod tests {
     fn a_check_that_could_not_run_says_so_on_one_line() {
         let text = not_checked("/w", "no index").render(false);
         assert_eq!(text, "carrick check: not checked: no index\n");
+    }
+
+    #[test]
+    fn nothing_covered_exits_two_and_a_partial_cover_exits_by_the_covered_files() {
+        let skipped = ChangedRepo {
+            repo: "x.ts".to_string(),
+            main_branch: None,
+            base: None,
+            files: Vec::new(),
+            skipped: Some("not in a repo of this workspace".to_string()),
+            unchecked: 1,
+        };
+        let none = ChangedOutput {
+            repos: vec![skipped.clone()],
+            ..not_checked("/w", "")
+        };
+        let none = ChangedOutput {
+            not_checked: None,
+            ..none
+        };
+        assert_eq!(none.exit_code(), EXIT_NOTHING_COVERED);
+        assert!(
+            none.render(false).starts_with(
+                "carrick check: not checked: covered none of the 1 file asked about\n"
+            )
+        );
+        let some = ChangedOutput {
+            files: 1,
+            ..none.clone()
+        };
+        assert_eq!(some.exit_code(), 0);
+        let failing = ChangedOutput { failing: 1, ..some };
+        assert_eq!(failing.exit_code(), 1);
+        assert_eq!(
+            not_checked("/w", "no index").exit_code(),
+            EXIT_NOTHING_COVERED
+        );
+        let nothing_asked = ChangedOutput {
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        assert_eq!(
+            nothing_asked.exit_code(),
+            0,
+            "no changed file asked about nothing"
+        );
     }
 
     #[test]

@@ -1889,7 +1889,9 @@ USAGE:
                pair, or a call that reaches no route); one that was already
                in the index, rests on a model candidate, or calls through a
                base set at run time is counted on the summary line ("plus N
-               unconfirmed") and exits 0, as does a check that could not run.
+               unconfirmed") and exits 0. A check that covered none of the
+               files it was asked about, or could not run, exits 2 and says
+               what to run (`carrick init` or `carrick refresh`).
                --all lists the unconfirmed ones too. Five minutes at most
                (CARRICK_CHECK_BUDGET_MS). Run it with your tests.
                Several files (`check a.ts b.ts`) are checked the same way:
