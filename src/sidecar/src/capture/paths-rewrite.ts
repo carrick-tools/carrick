@@ -133,12 +133,15 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
   const installs: Record<string, string> = {};
   let total = 0;
 
-  const installed = (spec: string, importedName?: string): string | undefined => {
+  const installed = (
+    spec: string,
+    importedName?: string
+  ): { specifier: string; exportName?: string } | undefined => {
     const mapped = installedPackageSpecifier(spec, importedName);
     if (!mapped) return undefined;
     installs[mapped.install.name] = mapped.install.root;
     if (mapped.pin) pins[mapped.pin.name] = mapped.pin.version;
-    return mapped.specifier;
+    return { specifier: mapped.specifier, exportName: mapped.exportName };
   };
 
   for (const file of args.files) {
@@ -154,14 +157,14 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
         const replacement = installed(spec, name);
         if (replacement === undefined) return whole;
         importTypeRewrites++;
-        return `${open}${quote}${replacement}${quote}${close}${dot}${name}`;
+        return `${open}${quote}${replacement.specifier}${quote}${close}${dot}${replacement.exportName ?? name}`;
       }
     );
     const { text: rewritten, rewrites } = rewriteSpecifiers(text, (spec) => {
       // Absolute paths: an emitted tree file, else an installed package.
       if (spec.startsWith('/')) {
         const target = treeFileFor(spec, args.entryDir, emitted, args.outside);
-        return target ? relativeSpecifier(file, target) : installed(spec);
+        return target ? relativeSpecifier(file, target) : installed(spec)?.specifier;
       }
       if (isRelative(spec)) return undefined;
       // tsconfig-paths patterns, first matching target that exists in-tree
