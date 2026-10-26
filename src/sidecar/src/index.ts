@@ -72,6 +72,7 @@ import {
   TypedServer,
   buildIdOf,
 } from './typed-server.js';
+import { newVerifyCounts, spawnColdRunner, verifyAnswer, verifyEnabled, type ColdRunner } from './typed-verify.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -1430,6 +1431,7 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
       evictions: held.evictions,
     })),
     heap_cap_mb: heapCapMb(),
+    ...(verifyEnabled() ? { verify: { ...verifyCounts } } : {}),
     heap_used_mb: Math.round(memory.heapUsed / 1048576),
     rss_mb: Math.round(memory.rss / 1048576),
   };
@@ -1489,8 +1491,12 @@ async function serveLine(
         const held = conn.slot as Session | undefined;
         session = held ?? newSession();
         if (held) held.lastUsed = performance.now();
-        if (held && READS_HELD_PROJECT.has(request.action)) writeResponse(answerFresh(request));
-        else await dispatch(request);
+        const answer = async (): Promise<void> => {
+          if (held && READS_HELD_PROJECT.has(request.action)) writeResponse(answerFresh(request));
+          else await dispatch(request);
+        };
+        if (verifyEnabled()) await answerVerified(conn, line, held?.init ?? null, answer);
+        else await answer();
       }
     }
   } finally {
@@ -1498,6 +1504,38 @@ async function serveLine(
     session = newSession();
     evictOverCap(conn.slot as Session | undefined);
   }
+}
+
+/** Verify mode (carrick#2886): what it has seen, and the cold runner it asks. */
+const verifyCounts = newVerifyCounts();
+let coldRunner: ColdRunner | null = null;
+
+/**
+ * Verify mode: run `answer` with its frames held back, answer the same request
+ * cold, and write the terminal frame that `verifyAnswer` picks. Progress frames
+ * go out as they are written.
+ */
+async function answerVerified(
+  conn: Connection,
+  line: string,
+  init: object | null,
+  answer: () => Promise<void>
+): Promise<void> {
+  const terminal: string[] = [];
+  sink = (frame) => {
+    if ((JSON.parse(frame) as { status?: string }).status === 'progress') conn.write(frame);
+    else terminal.push(frame);
+  };
+  await answer();
+  sink = (frame) => conn.write(frame);
+  if (terminal.length !== 1) {
+    log(`verify: ${terminal.length} terminal frames, not compared`);
+    for (const frame of terminal) conn.write(frame);
+    return;
+  }
+  coldRunner ??= spawnColdRunner(fileURLToPath(import.meta.url));
+  const outcome = await verifyAnswer(terminal[0], init, line, coldRunner, verifyCounts, log);
+  conn.write(outcome.frame);
 }
 
 /** The heap a daemon keeps its held services under (carrick#2881). */
