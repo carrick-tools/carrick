@@ -1384,11 +1384,14 @@ enum SidecarRequest {
     #[serde(rename = "shutdown")]
     Shutdown { request_id: String },
     /// The first frame on a connection to the resident type daemon: the
-    /// build id of the sidecar this would otherwise have spawned (carrick#2884).
+    /// build id of the sidecar this would otherwise have spawned (carrick#2884),
+    /// and the kind of connection (`probe` or `warm`, the lifecycle policy's
+    /// L3).
     #[serde(rename = "hello")]
     Hello {
         request_id: String,
         build_id: String,
+        mode: &'static str,
     },
 }
 
@@ -1920,9 +1923,10 @@ const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
 pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// How long a connection to the resident type daemon waits for its `hello`
-/// (carrick#2884). An idle daemon answers at once; one answering another
-/// client's request is left for a process of this sidecar's own.
-const DAEMON_HELLO_WAIT: Duration = Duration::from_secs(1);
+/// (carrick#2884, the lifecycle policy's L3). An idle daemon answers at once;
+/// one answering another client's request is left for a process of this
+/// sidecar's own.
+const DAEMON_HELLO_WAIT: Duration = Duration::from_secs(2);
 
 /// How often a progress frame is written to the log while an operation runs.
 /// The sidecar reports far more often than this; the log needs enough to tell
@@ -2149,7 +2153,7 @@ impl MemoryDeath {
 /// runs) and one `sysctl` call on macOS (where it is developed). On Linux the
 /// cgroup limit wins when it is lower, because that is the memory this
 /// process actually has.
-fn total_memory_mb() -> Option<u64> {
+pub(crate) fn total_memory_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -2640,17 +2644,21 @@ impl SidecarRecipe {
         }
         #[cfg(unix)]
         {
-            let connected =
-                TypeSidecar::connect_daemon(&self.sidecar_path, daemon.socket(), build_id)
-                    .and_then(|sidecar| {
-                        let sidecar = sidecar.with_operation_timeout(self.operation_timeout);
-                        if let Some(scan_root) = &self.scan_root {
-                            sidecar.set_scan_root(scan_root);
-                        }
-                        sidecar.start_init(repo_root, tsconfig_path);
-                        sidecar.wait_ready(ready_budget())?;
-                        Ok(sidecar)
-                    });
+            let connected = TypeSidecar::connect_daemon(
+                &self.sidecar_path,
+                daemon.socket(),
+                build_id,
+                daemon.mode(),
+            )
+            .and_then(|sidecar| {
+                let sidecar = sidecar.with_operation_timeout(self.operation_timeout);
+                if let Some(scan_root) = &self.scan_root {
+                    sidecar.set_scan_root(scan_root);
+                }
+                sidecar.start_init(repo_root, tsconfig_path);
+                sidecar.wait_ready(ready_budget())?;
+                Ok(sidecar)
+            });
             match connected {
                 Ok(sidecar) => Some(sidecar),
                 Err(e) => {
@@ -2760,12 +2768,14 @@ impl TypeSidecar {
     ///
     /// The requests and answers are the ones a process of its own exchanges,
     /// frame for frame. What differs is what happens when the other end goes
-    /// away: see [`Self::restart`] and [`Self::fall_back_cold`].
+    /// away: see [`Self::restart`] and [`Self::fall_back_cold`]. `mode` is the
+    /// kind of connection: only a warm one builds a program in the daemon.
     #[cfg(unix)]
     pub fn connect_daemon(
         sidecar_path: &Path,
         socket: &Path,
         build_id: &str,
+        mode: crate::services::typed_daemon::HelloMode,
     ) -> Result<Self, SidecarError> {
         let spawn_time = Instant::now();
         let stream = std::os::unix::net::UnixStream::connect(socket)
@@ -2792,6 +2802,7 @@ impl TypeSidecar {
         sidecar.send_request(&SidecarRequest::Hello {
             request_id: request_id.clone(),
             build_id: build_id.to_string(),
+            mode: mode.wire(),
         })?;
         // The daemon answers every connection in one queue, so `hello` waits
         // behind whatever it is answering for another. An idle daemon answers
@@ -4185,6 +4196,15 @@ impl TypeSidecar {
         loop {
             let remaining = timeout.saturating_sub(last_sign_of_life.elapsed());
             if remaining.is_zero() {
+                // Through the daemon, the deadline closes the connection and
+                // the same request goes to a process of this sidecar's own
+                // with a fresh deadline: neither lost nor a time limit that
+                // ran out (the lifecycle policy's L3 and L4).
+                if self.answers_cold_after(&"it gave no answer or progress in time") {
+                    self.fall_back_cold()?;
+                    last_sign_of_life = Instant::now();
+                    continue;
+                }
                 return Err(SidecarError::Timeout);
             }
             crate::shutdown::check().map_err(SidecarError::Interrupted)?;

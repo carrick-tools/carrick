@@ -11,22 +11,25 @@
 //!   never asked;
 //! - [`probe`]: whether a daemon serves a workspace, on which build, and which
 //!   services it holds a built program for;
-//! - [`start_detached`], [`kill`] and [`stop`]: its lifecycle. It is started
+//! - [`start_detached`], [`retire`] and [`stop`]: its lifecycle. It is started
 //!   by the CLI, lazily, as a process of the user's own, never as a system
-//!   service;
+//!   service, and signalled only once its identity is proven;
+//! - [`backed_off`]: a build that crashed twice within an hour is not started
+//!   again for a day;
 //! - [`Use`]: what a `check` hands the scan it starts, so the scan's services
 //!   connect to the daemon instead of each spawning a process
 //!   ([`crate::services::type_sidecar::SidecarRecipe::with_daemon`]).
 //!
-//! When to start, use or warm it is `local_mode::typed`'s.
+//! When to start, use or warm it is `local_mode::typed`'s. The rules are the
+//! lifecycle policy (L0-L6) in the sidecar README's "Server mode" section.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Turns the daemon off for this process and every scan it starts: `off`,
@@ -42,19 +45,31 @@ pub const ROUTE_ENV: &str = "CARRICK_TYPED_ROUTE";
 /// to, so the `check` can warm the daemon for it afterwards.
 pub const MISSES_ENV: &str = "CARRICK_TYPED_MISSES";
 
-/// The heap the daemon keeps its held services under (the sidecar's
-/// `CARRICK_TYPED_HEAP_CAP_MB`): the re-scan's per-process cap, so the daemon
-/// holds about what one re-scanned service's process held.
-const HEAP_CAP_MB: u64 = 3072;
-/// V8's own limit for the daemon, above [`HEAP_CAP_MB`]: the cap is where the
-/// daemon starts releasing services, and the request that crossed it still
-/// has to finish.
-const OLD_SPACE_MB: u64 = 4096;
+/// The sidecar's setting for the heap its held services are kept under.
+pub const HEAP_CAP_ENV: &str = "CARRICK_TYPED_HEAP_CAP_MB";
+/// The most the daemon holds by default, whatever the machine (L2).
+const HEAP_CAP_CEILING_MB: u64 = 3072;
+/// The default share of physical memory it holds: an eighth, so 2048 MB on a
+/// 16 GB laptop and the ceiling from 24 GB (L2).
+const HEAP_CAP_RAM_DIVISOR: u64 = 8;
 
-/// How long `stop` waits for the daemon to exit before killing it. `stop`
-/// waits for the request it is answering, which on a large service is minutes
-/// (carrick#2884, the server-mode note).
+/// How long `stop` waits for the daemon to exit after asking it, and again
+/// after SIGTERM, before the next step. A daemon answering a request reads
+/// neither until the request ends (one event loop).
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long a check that found another build waits for it to stop on its
+/// token before killing it (L5, upgrade).
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
+
+/// Each crash of a daemon, one line `<unix secs> <build id>`, inside `.carrick/`.
+const CRASHES: &str = "typed.crashes";
+/// Crashes of one build within this window back it off (L2).
+const CRASH_WINDOW_SECS: u64 = 60 * 60;
+/// How long a backed-off build is not started again.
+const BACK_OFF_SECS: u64 = 24 * 60 * 60;
+/// How far `ps`'s start time may sit from the record's `started_at` and still
+/// be the same process (L5 (c)).
+const START_TIME_SLACK_SECS: i64 = 2;
 
 /// Whether this process may use the daemon at all.
 pub fn enabled() -> bool {
@@ -149,10 +164,32 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// What `<workspace>/.carrick/typed.json` holds, as far as this side reads it.
+/// The fields beyond `pid` and `socket` prove whose record it is (L5); a
+/// record without them proves nothing, so nothing is signalled on its word.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Record {
     pub pid: u32,
     pub socket: PathBuf,
+    #[serde(default)]
+    pub build_id: Option<String>,
+    /// The workspace's real path, as the daemon read it.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    /// The secret a `stop` carries to be obeyed from any build.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// When the daemon started (RFC 3339).
+    #[serde(default)]
+    pub started_at: Option<String>,
+}
+
+impl Record {
+    fn started_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let text = self.started_at.as_deref()?;
+        chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
+    }
 }
 
 /// The daemon's record for `workspace`.
@@ -168,19 +205,46 @@ pub fn read_record(workspace: &Path) -> Option<Record> {
 }
 
 /// What the daemon's `status` says of one service it holds.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HeldService {
     pub repo_root: PathBuf,
     /// Whether it holds a built program for it now. A service it released to
     /// keep under its heap cap is held but not built.
+    #[serde(default)]
     pub built: bool,
+    /// `built`, `released`, `cold_only:too_big` or `cold_only:no_room` (L2).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// The heap its program took when it was built.
+    #[serde(default)]
+    pub footprint_mb: Option<f64>,
     #[serde(default)]
     pub items: HeldItems,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl HeldService {
+    /// Whether it holds a built program for the service now.
+    pub fn is_built(&self) -> bool {
+        match self.state.as_deref() {
+            Some(state) => state == "built",
+            None => self.built,
+        }
+    }
+
+    /// Whether it answers this service only cold, for the rest of its life:
+    /// a miss on it warms nothing (L1).
+    pub fn is_cold_only(&self) -> bool {
+        self.state
+            .as_deref()
+            .is_some_and(|state| state.starts_with("cold_only"))
+    }
 }
 
 /// The `infer` items the daemon keeps for a service, and how often it has
 /// answered one again (`replayed`) or read it afresh (`recomputed`).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HeldItems {
     #[serde(default)]
     pub held: u64,
@@ -190,14 +254,38 @@ pub struct HeldItems {
     pub recomputed: u64,
 }
 
-/// What the daemon's `status` says of itself.
-#[derive(Debug, Clone, Deserialize)]
+/// One daemon-only event in the daemon's `status` (L6): counts, MB and a
+/// service's path, never anything the scanned code said.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DaemonEvent {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// What the daemon's `status` says of itself. Fields this side does not read
+/// are kept, so `carrick status --json` passes the whole object on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Status {
     pub pid: u32,
     pub socket: PathBuf,
     pub services: Vec<HeldService>,
     #[serde(default)]
-    pub rss_mb: u64,
+    pub rss_mb: f64,
+    #[serde(default)]
+    pub heap_cap_mb: Option<f64>,
+    /// A warm-up's connection is open: a check treats the daemon as busy.
+    #[serde(default)]
+    pub warming: bool,
+    #[serde(default)]
+    pub errors: Vec<DaemonEvent>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Status {
@@ -205,9 +293,36 @@ impl Status {
     pub fn built(&self) -> BTreeSet<PathBuf> {
         self.services
             .iter()
-            .filter(|service| service.built)
+            .filter(|service| service.is_built())
             .map(|service| service.repo_root.clone())
             .collect()
+    }
+
+    /// The roots of the services it answers only cold.
+    pub fn cold_only(&self) -> BTreeSet<PathBuf> {
+        self.services
+            .iter()
+            .filter(|service| service.is_cold_only())
+            .map(|service| service.repo_root.clone())
+            .collect()
+    }
+}
+
+/// Which kind of connection a `hello` opens (L3): a check's (`probe`), which
+/// is answered only for services the daemon already holds built, or the
+/// warm-up's (`warm`), the only kind that builds programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloMode {
+    Probe,
+    Warm,
+}
+
+impl HelloMode {
+    pub fn wire(self) -> &'static str {
+        match self {
+            HelloMode::Probe => "probe",
+            HelloMode::Warm => "warm",
+        }
     }
 }
 
@@ -227,23 +342,72 @@ pub enum Probe {
 
 /// Whether a daemon serves `workspace` on the build `build_id`, waiting at
 /// most `wait` for each answer: `hello`, then `status`.
+///
+/// A daemon is used only on proof that it is this workspace's (L5 (b)): its
+/// socket is owned by this user, and its `hello` answer names the record's
+/// pid and this workspace's real path. A record copied with a workspace names
+/// another workspace's daemon and is not used. A record whose process is gone
+/// is a crash: it is noted ([`backed_off`]) and the record removed.
 pub fn probe(workspace: &Path, build_id: &str, wait: Duration) -> Probe {
     let Some(record) = read_record(workspace) else {
         return Probe::Absent;
     };
     if !pid_alive(record.pid) {
+        note_crash(workspace, record.build_id.as_deref().unwrap_or(""));
+        remove_record_of(workspace, &record);
         return Probe::Absent;
     }
-    probe_socket(&record, build_id, wait)
+    if !socket_is_ours(&record.socket) {
+        return Probe::Absent;
+    }
+    probe_socket(&record, workspace, build_id, wait)
+}
+
+/// Whether `socket` is owned by the user this process runs as.
+fn socket_is_ours(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        std::fs::metadata(socket).is_ok_and(|meta| meta.uid() == uid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        false
+    }
+}
+
+/// Whether a `hello` answer comes from the daemon `record` names, serving
+/// `workspace`: it carries that pid and the workspace's real path.
+fn answered_as(frame: &serde_json::Value, record: &Record, workspace: &Path) -> bool {
+    let pid = frame.get("pid").and_then(|p| p.as_u64());
+    let named = frame
+        .get("workspace")
+        .and_then(|w| w.as_str())
+        .map(PathBuf::from);
+    let real = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    pid == Some(u64::from(record.pid))
+        && named.is_some_and(|named| named == real || named == workspace)
+}
+
+/// A `hello` naming this side's build and connection kind.
+fn hello(build_id: &str, mode: HelloMode) -> serde_json::Value {
+    serde_json::json!({ "action": "hello", "build_id": build_id, "mode": mode.wire() })
 }
 
 #[cfg(unix)]
-fn probe_socket(record: &Record, build_id: &str, wait: Duration) -> Probe {
+fn probe_socket(record: &Record, workspace: &Path, build_id: &str, wait: Duration) -> Probe {
     let Ok(mut conn) = Conn::open(&record.socket, wait) else {
         return Probe::Absent;
     };
-    let hello = serde_json::json!({ "action": "hello", "build_id": build_id });
-    match conn.ask(hello) {
+    match conn.ask(hello(build_id, HelloMode::Probe)) {
+        Answer::Frame(frame) if !answered_as(&frame, record, workspace) => {
+            return Probe::Absent;
+        }
         Answer::Frame(frame) if succeeded(&frame) => {}
         Answer::Frame(frame) if mismatched(&frame) => {
             return Probe::Mismatch { pid: record.pid };
@@ -266,7 +430,7 @@ fn probe_socket(record: &Record, build_id: &str, wait: Duration) -> Probe {
 }
 
 #[cfg(not(unix))]
-fn probe_socket(_record: &Record, _build_id: &str, _wait: Duration) -> Probe {
+fn probe_socket(_record: &Record, _workspace: &Path, _build_id: &str, _wait: Duration) -> Probe {
     Probe::Absent
 }
 
@@ -375,58 +539,93 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Whether process `pid` is the type daemon of `workspace`: its command line
-/// runs the sidecar in server mode (`--serve`) for this workspace. A record
-/// outlives its daemon when the daemon is killed, and the kernel hands its pid
-/// to the next process, so a pid read from a record is never signalled on the
+/// Whether the process `record` names is the daemon that wrote it, for
+/// `workspace`, when its socket cannot say (L5 (c)): `ps` shows it running
+/// `--serve <workspace>`, and the start time `ps` gives sits within
+/// [`START_TIME_SLACK_SECS`] of the record's `started_at`. A record outlives
+/// its daemon when the daemon is killed, and the kernel hands its pid to the
+/// next process, so a pid read from a record is never signalled on the
 /// record's word alone.
-pub fn is_daemon_of(pid: u32, workspace: &Path) -> bool {
+pub fn identity(record: &Record, workspace: &Path) -> bool {
+    let pid = record.pid;
     if pid == 0 || !pid_alive(pid) {
         return false;
     }
+    let Some(started_at) = record.started_at() else {
+        return false;
+    };
     // `-ww`: the whole command line, however long, with no terminal to fit.
     let Ok(out) = Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .args(["-ww", "-o", "etime=,command=", "-p", &pid.to_string()])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
         return false;
     };
-    let command = String::from_utf8_lossy(&out.stdout);
-    let names_workspace = |path: &Path| command.contains(&*path.to_string_lossy());
-    command.contains(" --serve ")
-        && (names_workspace(workspace)
-            || workspace
-                .canonicalize()
-                .is_ok_and(|real| names_workspace(&real)))
-}
-
-/// Kill the type daemon of `workspace`, process `pid`, now and wait, briefly,
-/// for it to be gone. Nothing is signalled unless `pid` is that daemon
-/// ([`is_daemon_of`]); returns whether it was.
-///
-/// `stop` and SIGTERM wait for the request the daemon is answering, which on a
-/// large service is minutes (carrick#2884); a daemon of another build must not
-/// answer anything, so it is killed outright. The next start takes over the
-/// record it leaves (carrick#2879).
-pub fn kill(pid: u32, workspace: &Path) -> bool {
-    if !is_daemon_of(pid, workspace) {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some((etime, command)) = text.trim().split_once(char::is_whitespace) else {
+        return false;
+    };
+    let Some(elapsed) = parse_etime(etime) else {
+        return false;
+    };
+    let started = chrono::Utc::now() - chrono::Duration::seconds(elapsed as i64);
+    if (started - started_at).num_seconds().abs() > START_TIME_SLACK_SECS {
         return false;
     }
+    let serves = |path: &Path| command.contains(&format!(" --serve {}", path.display()));
+    serves(workspace)
+        || record.workspace.as_deref().is_some_and(serves)
+        || workspace.canonicalize().is_ok_and(|real| serves(&real))
+}
+
+/// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let mut seconds = 0u64;
+    for part in clock.split(':') {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+
+/// Send `signal` to `pid` and wait up to `grace` for it to be gone; whether
+/// it is. Callers prove the pid first ([`identity`], or a `hello` answer
+/// naming it).
+fn signal_and_wait(pid: u32, signal: i32, grace: Duration) -> bool {
     #[cfg(unix)]
     {
-        // SAFETY: SIGKILL to a process whose command line shows it is this
-        // workspace's daemon.
+        // SAFETY: a signal to a pid whose identity the caller proved.
         unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-        let waited = Instant::now();
-        while pid_alive(pid) && waited.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(20));
+            libc::kill(pid as libc::pid_t, signal);
         }
     }
-    true
+    #[cfg(not(unix))]
+    let _ = signal;
+    wait_gone(pid, grace)
+}
+
+/// Wait up to `grace` for `pid` to be gone; whether it is.
+fn wait_gone(pid: u32, grace: Duration) -> bool {
+    let waited = Instant::now();
+    while pid_alive(pid) && waited.elapsed() < grace {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !pid_alive(pid)
+}
+
+/// The heap a new daemon keeps its held services under, unless
+/// [`HEAP_CAP_ENV`] says otherwise: an eighth of physical memory, at most
+/// [`HEAP_CAP_CEILING_MB`] (L2).
+pub fn default_heap_cap_mb(total_memory_mb: Option<u64>) -> u64 {
+    total_memory_mb.map_or(HEAP_CAP_CEILING_MB, |total| {
+        (total / HEAP_CAP_RAM_DIVISOR).min(HEAP_CAP_CEILING_MB)
+    })
 }
 
 /// Start a daemon for `workspace` from the sidecar whose entry script is
@@ -444,17 +643,21 @@ pub fn start_detached(workspace: &Path, entry: &Path) -> std::io::Result<()> {
     let mut command = Command::new("node");
     // V8 flags precede the script, or node hands them to it. The collector
     // is exposed so the daemon can release a service and get its heap back
-    // at once (carrick#2881).
+    // at once (carrick#2881). V8's limit is the cold path's own, so a request
+    // a process of its own answers does not abort the daemon (L2).
+    command.arg("--expose-gc");
+    if let Some(mb) = crate::services::type_sidecar::heap_cap_mb() {
+        command.arg(format!("--max-old-space-size={mb}"));
+    }
     command
-        .arg("--expose-gc")
-        .arg(format!("--max-old-space-size={OLD_SPACE_MB}"))
         .arg(entry)
         .arg("--serve")
         .arg(workspace)
         .arg("--cli-version")
         .arg(env!("CARGO_PKG_VERSION"));
-    if std::env::var_os("CARRICK_TYPED_HEAP_CAP_MB").is_none() {
-        command.env("CARRICK_TYPED_HEAP_CAP_MB", HEAP_CAP_MB.to_string());
+    if std::env::var_os(HEAP_CAP_ENV).is_none() {
+        let cap = default_heap_cap_mb(crate::services::type_sidecar::total_memory_mb());
+        command.env(HEAP_CAP_ENV, cap.to_string());
     }
     // The answers a scan's own processes keep, it keeps too (carrick#2843):
     // the same directory a local scan hands its sidecars.
@@ -491,11 +694,13 @@ pub fn wait_serving(workspace: &Path, build_id: &str, timeout: Duration) -> Opti
     }
 }
 
-/// Stop the daemon serving `workspace`, if one is: `stop` when it is this
-/// build and answers, killed when it is another build, does not answer, or is
-/// still running [`STOP_GRACE`] after `stop`. A record left by a daemon that
-/// was killed is removed. Returns one line saying what happened.
-pub fn stop(workspace: &Path, build_id: Option<&str>) -> String {
+/// Stop the daemon serving `workspace`, if one is (L5): `stop` carrying the
+/// record's token, which it obeys from any build; [`STOP_GRACE`] for it to
+/// exit; then, only when [`identity`] proves the pid is that daemon, SIGTERM,
+/// [`STOP_GRACE`] again, and SIGKILL. A pid it cannot prove is another
+/// process: it gets no signal, and the stale record is removed. Returns one
+/// line saying what happened.
+pub fn stop(workspace: &Path) -> String {
     let Some(record) = read_record(workspace) else {
         return "No type daemon is running for this workspace.".to_string();
     };
@@ -506,52 +711,122 @@ pub fn stop(workspace: &Path, build_id: Option<&str>) -> String {
             "No type daemon is running for this workspace (removed the record of pid {pid}, which had exited)."
         );
     }
-    let asked = build_id.is_some_and(|id| ask_to_stop(&record, id));
-    let waited = Instant::now();
-    while asked && pid_alive(pid) && waited.elapsed() < STOP_GRACE {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if !pid_alive(pid) {
+    if ask_to_stop(&record) && wait_gone(pid, STOP_GRACE) {
         return format!("Stopped the type daemon (pid {pid}).");
     }
-    if kill(pid, workspace) {
+    if !identity(&record, workspace) {
         remove_record_of(workspace, &record);
-        return format!("Stopped the type daemon (pid {pid}): killed.");
+        return format!(
+            "No type daemon is running for this workspace (removed a stale record: pid {pid} is not its daemon and was left running)."
+        );
     }
-    // The record outlived its daemon and the pid now belongs to another
-    // process, which is left alone.
+    let ended = if signal_and_wait(pid, libc::SIGTERM, STOP_GRACE) {
+        "SIGTERM"
+    } else {
+        signal_and_wait(pid, libc::SIGKILL, STOP_GRACE);
+        "SIGKILL"
+    };
     remove_record_of(workspace, &record);
-    format!(
-        "No type daemon is running for this workspace (removed a stale record: pid {pid} is another process, left running)."
-    )
+    format!("Stopped the type daemon (pid {pid}) with {ended}: it did not stop when asked.")
 }
 
+/// Ask the daemon `record` names to stop, with the record's token as the
+/// connection's first frame: obeyed from any build (L5).
 #[cfg(unix)]
-fn ask_to_stop(record: &Record, build_id: &str) -> bool {
+fn ask_to_stop(record: &Record) -> bool {
+    let Some(token) = record.token.as_deref() else {
+        return false;
+    };
     let Ok(mut conn) = Conn::open(&record.socket, Duration::from_secs(2)) else {
         return false;
     };
-    let hello = serde_json::json!({ "action": "hello", "build_id": build_id });
-    if !matches!(conn.ask(hello), Answer::Frame(frame) if succeeded(&frame)) {
-        return false;
-    }
-    matches!(conn.ask(serde_json::json!({ "action": "stop" })), Answer::Frame(frame) if succeeded(&frame))
+    matches!(
+        conn.ask(serde_json::json!({ "action": "stop", "token": token })),
+        Answer::Frame(frame) if succeeded(&frame)
+    )
 }
 
 #[cfg(not(unix))]
-fn ask_to_stop(_record: &Record, _build_id: &str) -> bool {
+fn ask_to_stop(_record: &Record) -> bool {
     false
 }
 
 /// Clear the way for a new daemon of `workspace` when the one its record names,
-/// `pid`, runs another build: killed when it is this workspace's daemon
-/// ([`kill`]), and either way its record removed, so the new daemon does not
-/// find a live process named in it and exit.
+/// `pid`, runs another build (L5, upgrade): asked to stop on its token, given
+/// [`RETIRE_GRACE`], then killed only on proven [`identity`]. Either way its
+/// record is removed, so the new daemon does not find a live process named in
+/// it and exit, and an old daemon left running stops itself once its record is
+/// gone.
 pub fn retire(workspace: &Path, pid: u32) {
-    kill(pid, workspace);
-    if let Some(record) = read_record(workspace).filter(|record| record.pid == pid) {
-        remove_record_of(workspace, &record);
+    let Some(record) = read_record(workspace).filter(|record| record.pid == pid) else {
+        return;
+    };
+    let stopped = ask_to_stop(&record) && wait_gone(pid, RETIRE_GRACE);
+    if !stopped && identity(&record, workspace) {
+        signal_and_wait(pid, libc::SIGKILL, RETIRE_GRACE);
     }
+    remove_record_of(workspace, &record);
+}
+
+/// Note a crash of the daemon of build `build_id`: its record named a process
+/// that is gone. A daemon that stops on its own removes its record first, so a
+/// record left behind is a crash (an out-of-heap abort, a kill).
+pub fn note_crash(workspace: &Path, build_id: &str) {
+    let path = workspace.join(".carrick").join(CRASHES);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{secs} {build_id}");
+    }
+}
+
+/// A build that is not started again for now, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackOff {
+    /// Unix seconds until which no daemon of the build is started.
+    pub until: u64,
+    /// Crashes of the build on record.
+    pub crashes: usize,
+}
+
+/// Whether the daemon of build `build_id` is backed off in `workspace`: two
+/// of its crashes fell within [`CRASH_WINDOW_SECS`] of each other, and the
+/// latest is less than [`BACK_OFF_SECS`] ago (L2). A new build starts afresh.
+pub fn backed_off(workspace: &Path, build_id: &str) -> Option<BackOff> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    back_off_at(
+        &std::fs::read_to_string(workspace.join(".carrick").join(CRASHES)).ok()?,
+        build_id,
+        now,
+    )
+}
+
+fn back_off_at(crashes: &str, build_id: &str, now: u64) -> Option<BackOff> {
+    let mut times: Vec<u64> = crashes
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, build)| build.trim() == build_id)
+        .filter_map(|(secs, _)| secs.parse().ok())
+        .collect();
+    times.sort_unstable();
+    let latest = *times.last()?;
+    let close = times
+        .windows(2)
+        .any(|pair| pair[1] - pair[0] <= CRASH_WINDOW_SECS);
+    let until = latest + BACK_OFF_SECS;
+    (close && now < until).then_some(BackOff {
+        until,
+        crashes: times.len(),
+    })
 }
 
 /// Remove the record and its socket while the record still names `record`'s
@@ -563,30 +838,116 @@ fn remove_record_of(workspace: &Path, record: &Record) {
     }
 }
 
-/// One line for `carrick status` about the daemon serving `workspace`, or
-/// `None` when there is no record of one.
-pub fn status_line(workspace: &Path, build_id: Option<&str>) -> Option<String> {
-    let record = read_record(workspace)?;
-    let pid = record.pid;
-    let line = match build_id.map(|id| probe(workspace, id, Duration::from_secs(1))) {
-        Some(Probe::Serving(status)) => format!(
-            "Type daemon: pid {pid}, {} service(s) held, {} with a built program, {} MB resident.",
-            status.services.len(),
-            status.built().len(),
-            status.rss_mb
-        ),
-        Some(Probe::Busy { .. }) => format!("Type daemon: pid {pid}, answering a request."),
-        Some(Probe::Mismatch { .. }) => format!(
-            "Type daemon: pid {pid} runs another build of the sidecar; the next check replaces it."
-        ),
-        Some(Probe::Absent) | None if !pid_alive(pid) => {
-            format!("Type daemon: not running (pid {pid} in its record has exited).")
+/// What `carrick status` says about the daemon serving `workspace` (L6): at
+/// most four lines, none when there is no record of one and no back-off, and
+/// the daemon's whole `status` object for `--json` when it answered.
+pub fn status_report(
+    workspace: &Path,
+    build_id: Option<&str>,
+) -> (Vec<String>, Option<serde_json::Value>) {
+    let mut lines = Vec::new();
+    let mut object = None;
+    let back_off = build_id.and_then(|id| backed_off(workspace, id));
+    if let Some(record) = read_record(workspace) {
+        let pid = record.pid;
+        match build_id.map(|id| probe(workspace, id, Duration::from_secs(1))) {
+            Some(Probe::Serving(status)) => {
+                lines.extend(serving_lines(&record, &status, workspace));
+                object = serde_json::to_value(&status).ok();
+            }
+            Some(Probe::Busy { .. }) => lines.push(format!(
+                "Type daemon: pid {pid}, answering a request; status after it."
+            )),
+            Some(Probe::Mismatch { .. }) => lines.push(format!(
+                "Type daemon: pid {pid} runs another build of the sidecar; the next check replaces it."
+            )),
+            Some(Probe::Absent) | None if !pid_alive(pid) => lines.push(format!(
+                "Type daemon: not running (pid {pid} in its record has exited)."
+            )),
+            Some(Probe::Absent) | None => lines.push(format!(
+                "Type daemon: pid {pid}, not answering as this workspace's daemon."
+            )),
         }
-        Some(Probe::Absent) | None => {
-            format!("Type daemon: pid {pid}, not answering on its socket.")
-        }
+    }
+    if let Some(back_off) = back_off {
+        let until = chrono::DateTime::<chrono::Utc>::from_timestamp(back_off.until as i64, 0)
+            .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default();
+        lines.truncate(3);
+        lines.push(format!(
+            "Type daemon: off until {until} after {} crashes; log .carrick/typed.log",
+            back_off.crashes
+        ));
+    }
+    (lines, object)
+}
+
+/// The lines for a daemon that answered: itself; its largest held services;
+/// its last daemon-only events.
+fn serving_lines(record: &Record, status: &Status, workspace: &Path) -> Vec<String> {
+    let uptime = record
+        .started_at()
+        .map(|at| (chrono::Utc::now() - at).num_minutes())
+        .map(|minutes| format!(", up {minutes} min"))
+        .unwrap_or_default();
+    let cap = status
+        .heap_cap_mb
+        .map(|cap| format!(" (cap {cap:.0} MB)"))
+        .unwrap_or_default();
+    let warming = if status.warming { ", warming" } else { "" };
+    let mut lines = vec![format!(
+        "Type daemon: pid {}{uptime}, {:.0} MB resident{cap}, {} service(s) held, {} built{warming}.",
+        status.pid,
+        status.rss_mb,
+        status.services.len(),
+        status.built().len(),
+    )];
+    let relative = |path: &Path| -> String {
+        path.strip_prefix(workspace)
+            .ok()
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .unwrap_or(path)
+            .display()
+            .to_string()
     };
-    Some(line)
+    let mut held: Vec<&HeldService> = status
+        .services
+        .iter()
+        .filter(|service| service.footprint_mb.is_some())
+        .collect();
+    held.sort_by(|a, b| {
+        b.footprint_mb
+            .unwrap_or(0.0)
+            .total_cmp(&a.footprint_mb.unwrap_or(0.0))
+    });
+    if !held.is_empty() {
+        let largest: Vec<String> = held
+            .iter()
+            .take(5)
+            .map(|service| {
+                format!(
+                    "{} {:.0} MB",
+                    relative(&service.repo_root),
+                    service.footprint_mb.unwrap_or(0.0)
+                )
+            })
+            .collect();
+        lines.push(format!("  Largest held: {}.", largest.join(", ")));
+    }
+    if !status.errors.is_empty() {
+        let recent: Vec<String> = status
+            .errors
+            .iter()
+            .rev()
+            .take(3)
+            .map(|event| match &event.service {
+                Some(service) => format!("{} ({service})", event.kind),
+                None => event.kind.clone(),
+            })
+            .collect();
+        lines.push(format!("  Recent daemon events: {}.", recent.join(", ")));
+    }
+    lines
 }
 
 /// Which services a scan answers through the daemon.
@@ -651,6 +1012,15 @@ impl Use {
         &self.socket
     }
 
+    /// The kind of connection its services open: the warm-up's routes every
+    /// service and builds; a check's routes only what the daemon holds built.
+    pub fn mode(&self) -> HelloMode {
+        match self.route {
+            Route::All => HelloMode::Warm,
+            Route::Held(_) => HelloMode::Probe,
+        }
+    }
+
     /// Whether the service at `repo_root` answers through the daemon.
     pub fn routes(&self, repo_root: &Path) -> bool {
         match &self.route {
@@ -693,6 +1063,71 @@ mod tests {
         assert_eq!(first, build_id(&entry).unwrap());
         std::fs::write(src.join("nested/a.js"), "three").unwrap();
         assert_ne!(first, build_id(&entry).unwrap());
+    }
+
+    /// The installed compiler is part of the build: a TypeScript reinstall at
+    /// another version moves the id, found by walking up from the sidecar.
+    #[test]
+    fn a_build_id_moves_with_the_installed_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("sidecar/dist/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("index.js"), "one").unwrap();
+        let entry = src.join("index.js");
+        let none = build_id(&entry).unwrap();
+        // Hoisted: one level above the sidecar root.
+        let ts = dir.path().join("node_modules/typescript");
+        std::fs::create_dir_all(&ts).unwrap();
+        std::fs::write(ts.join("package.json"), r#"{"version":"5.9.3"}"#).unwrap();
+        let first = build_id(&entry).unwrap();
+        assert_ne!(none, first);
+        std::fs::write(ts.join("package.json"), r#"{"version":"6.0.2"}"#).unwrap();
+        assert_ne!(first, build_id(&entry).unwrap());
+    }
+
+    /// Two crashes of one build within the hour back it off for a day from
+    /// the latest; crashes far apart, or of another build, do not.
+    #[test]
+    fn two_close_crashes_back_a_build_off_for_a_day() {
+        let crashes = "1000 b\n1000 other\n4000 b\n";
+        let off = back_off_at(crashes, "b", 4001).unwrap();
+        assert_eq!(off.until, 4000 + BACK_OFF_SECS);
+        assert_eq!(off.crashes, 2);
+        assert!(back_off_at(crashes, "b", 4000 + BACK_OFF_SECS).is_none());
+        assert!(back_off_at(crashes, "other", 4001).is_none());
+        assert!(back_off_at("1000 b\n9000 b\n", "b", 9001).is_none());
+    }
+
+    #[test]
+    fn ps_elapsed_times_read_as_seconds() {
+        assert_eq!(parse_etime("05"), Some(5));
+        assert_eq!(parse_etime("01:05"), Some(65));
+        assert_eq!(parse_etime("02:01:05"), Some(7265));
+        assert_eq!(parse_etime("3-02:01:05"), Some(3 * 86_400 + 7265));
+        assert_eq!(parse_etime("x"), None);
+    }
+
+    /// An eighth of the machine, at most 3 GB.
+    #[test]
+    fn the_default_heap_cap_is_an_eighth_of_memory_at_most_three_gb() {
+        assert_eq!(default_heap_cap_mb(Some(16 * 1024)), 2048);
+        assert_eq!(default_heap_cap_mb(Some(64 * 1024)), 3072);
+        assert_eq!(default_heap_cap_mb(None), 3072);
+    }
+
+    /// A live process that is not a `--serve` daemon is never proven one,
+    /// whatever its record says.
+    #[test]
+    fn a_process_that_is_not_a_daemon_has_no_identity() {
+        let record = Record {
+            pid: std::process::id(),
+            socket: PathBuf::from("/nonexistent"),
+            build_id: None,
+            workspace: Some(PathBuf::from("/w")),
+            token: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        assert!(!identity(&record, Path::new("/w")));
     }
 
     /// A route lists the roots the daemon holds a built program for, and a

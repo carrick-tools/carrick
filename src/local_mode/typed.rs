@@ -23,6 +23,7 @@
 //! warm == cold tests), and any daemon failure falls back to a process of the
 //! sidecar's own for that request ([`crate::services::TypeSidecar`]).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -59,6 +60,8 @@ pub(super) struct Session {
     warm_after: bool,
     /// Where the re-scans list the services they answered without it.
     misses: PathBuf,
+    /// The services the daemon answers only cold: a miss on one warms nothing.
+    cold_only: BTreeSet<PathBuf>,
 }
 
 impl Session {
@@ -70,6 +73,7 @@ impl Session {
             daemon: None,
             warm_after: false,
             misses: misses.clone(),
+            cold_only: BTreeSet::new(),
         };
         if !typed_daemon::enabled() {
             return session;
@@ -77,6 +81,15 @@ impl Session {
         let Some(build_id) = sidecar_build_id() else {
             return session;
         };
+        // A build that crashed twice within the hour is neither used nor
+        // started again for a day (the lifecycle policy's L2).
+        if let Some(back_off) = typed_daemon::backed_off(root, &build_id) {
+            tracing::debug!(
+                "The type daemon is off after {} crashes; this re-check answers cold",
+                back_off.crashes
+            );
+            return session;
+        }
         if mode == Mode::All {
             // The warm-up fills the daemon, once it has answered `hello` on
             // this build: a record names a socket, not who listens on it.
@@ -84,7 +97,16 @@ impl Session {
             return session;
         }
         match typed_daemon::probe(root, &build_id, PROBE_WAIT) {
+            // A warm-up holds the daemon's one queue with minute-long
+            // requests: this check answers cold and starts no second one.
+            Probe::Serving(status) if status.warming => {
+                tracing::debug!(
+                    "The type daemon (pid {}) is warming; this re-check answers cold",
+                    status.pid
+                );
+            }
             Probe::Serving(status) => {
+                session.cold_only = status.cold_only();
                 session.daemon = Some(Use::new(
                     status.socket.clone(),
                     Route::Held(status.built()),
@@ -106,6 +128,11 @@ impl Session {
 
     /// Hand the daemon, when this run uses one, to the scan `command` starts.
     pub(super) fn apply(&self, command: &mut Command) {
+        // The warm-up's scans run one service at a time, so they and the
+        // daemon's queue use one core between them (L1).
+        if self.mode == Mode::All {
+            command.env(crate::engine::service_workers::SERVICE_CONCURRENCY_ENV, "1");
+        }
         match &self.daemon {
             Some(daemon) => daemon.apply(command),
             // An inherited handle is not this run's to use.
@@ -119,12 +146,17 @@ impl Session {
     }
 
     /// Start the warm-up in the background when this run found no daemon, or
-    /// answered a service without the one it found.
+    /// answered a service the daemon could hold without it. A service the
+    /// daemon answers only cold never starts one (L1).
     pub(super) fn close(self) {
         if self.mode != Mode::Probe {
             return;
         }
-        let missed = std::fs::metadata(&self.misses).is_ok_and(|m| m.len() > 0);
+        let missed = std::fs::read_to_string(&self.misses).is_ok_and(|text| {
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .any(|line| !self.cold_only.contains(Path::new(line.trim())))
+        });
         if self.warm_after || missed {
             start_warm_up(&self.root);
         }
@@ -239,6 +271,15 @@ pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
         .ok_or("the type sidecar was not found, so there is nothing to start")?;
     let build_id = typed_daemon::build_id(&entry)
         .map_err(|e| format!("could not read the sidecar's build: {e}"))?;
+    if let Some(back_off) = typed_daemon::backed_off(&root, &build_id) {
+        return Err(format!(
+            "the type daemon is off for this build after {} crashes; its log is {}",
+            back_off.crashes,
+            root.join(super::workspace::INDEX_DIR)
+                .join("typed.log")
+                .display()
+        ));
+    }
     let started = Instant::now();
     match typed_daemon::probe(&root, &build_id, PROBE_WAIT) {
         Probe::Serving(_) | Probe::Busy { .. } => {}
@@ -277,6 +318,10 @@ pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
     if repos.is_empty() {
         return Ok(format!("{serving} No repo has changes to warm it for."));
     }
+    // The daemon was started at this process's priority, so it answers the
+    // checks the user waits on at full speed; the warm-up's own scans run at
+    // background priority from here (L1).
+    lower_own_priority();
     let generation =
         std::env::temp_dir().join(format!("carrick-typed-warm-{}", uuid::Uuid::new_v4()));
     let warmed = super::recheck::rejoin(
@@ -295,16 +340,34 @@ pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
     ))
 }
 
+/// Run this process at background priority from now on: macOS's background
+/// band (lower CPU and I/O priority), Linux's lowest nice. Children started
+/// after inherit it.
+fn lower_own_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: setpriority on this process (who 0) with the darwin background
+    // band; it changes nothing but scheduling.
+    unsafe {
+        libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpriority on this process (who 0) to nice 19.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+    }
+}
+
 /// `carrick daemon stop`.
 pub(super) fn stop(root: Option<&Path>) -> Result<String, String> {
     let root = super::workspace::locate(root, None)
         .ok_or("no Carrick index above this directory, so no type daemon serves it")?;
-    Ok(typed_daemon::stop(&root, sidecar_build_id().as_deref()))
+    Ok(typed_daemon::stop(&root))
 }
 
-/// The line `carrick status` prints about the daemon, when there is one.
-pub(super) fn status_line(root: &Path) -> Option<String> {
-    typed_daemon::status_line(root, sidecar_build_id().as_deref())
+/// What `carrick status` says about the daemon: its lines, and its status
+/// object for `--json`.
+pub(super) fn status_report(root: &Path) -> (Vec<String>, Option<serde_json::Value>) {
+    typed_daemon::status_report(root, sidecar_build_id().as_deref())
 }
 
 #[cfg(test)]

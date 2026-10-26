@@ -335,6 +335,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         running_scans: Vec::new(),
         last_scan: None,
         analysing: Vec::new(),
+        type_daemon: None,
         services,
         type_check: index.type_check.clone(),
     })

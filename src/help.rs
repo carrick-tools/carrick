@@ -54,8 +54,7 @@ WORKSPACE:
                it on every edit.
     daemon     `daemon start` starts the resident type process a re-check
                answers through, which keeps each service's TypeScript program
-               between checks; with --warm it also re-scans the changed repos
-               through it. `daemon stop` stops it. A re-check starts one by
+               between checks. `daemon stop` stops it. A re-check starts one by
                itself, and it stops after 15 minutes with no request.
 
     The workspace is a repository, or the folder holding sibling repositories.

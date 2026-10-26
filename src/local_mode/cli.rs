@@ -251,7 +251,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             _ => return Err("`carrick daemon` takes `start` or `stop`".to_string()),
         };
         if json || recheck || changed || each || all || detach || dispatch {
-            return Err("`carrick daemon` takes only --workspace, and --warm with start".into());
+            return Err("`carrick daemon` takes only --workspace".into());
         }
         return Ok(LocalCommand::Daemon { action, workspace });
     }
@@ -684,6 +684,10 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             output.running_scans = scans;
             output.last_scan = last_scan;
             output.analysing = analysing.clone();
+            // At most four lines, and only when a daemon has a record here or
+            // is backed off (carrick#2884, the lifecycle policy's L6).
+            let (daemon_lines, daemon_status) = super::typed::status_report(&root);
+            output.type_daemon = daemon_status;
             if json {
                 match serde_json::to_string_pretty(&output) {
                     Ok(text) => crate::outln!("{text}"),
@@ -698,9 +702,7 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                 }
             } else {
                 crate::out!("{}", output.render());
-                // One line, and only when a daemon has a record here
-                // (carrick#2884): the JSON contract is unchanged.
-                if let Some(line) = super::typed::status_line(&root) {
+                for line in &daemon_lines {
                     crate::outln!("{line}");
                 }
             }

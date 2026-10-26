@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-use carrick::services::typed_daemon::{self, Probe};
+use carrick::services::typed_daemon::{self, HelloMode, Probe};
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -161,6 +161,130 @@ impl Drop for StopOnDrop {
 
 const ROUTE: &str = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
 
+/// SIGKILL `pid`, as an out-of-heap abort or a crash would end it.
+fn sigkill(pid: u32) {
+    let out = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "kill -9 {pid}");
+    wait_for(
+        "the killed daemon to be gone",
+        Duration::from_secs(10),
+        || {
+            !typed_daemon::pid_alive(pid)
+                || Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
+        },
+    );
+}
+
+/// A stand-in daemon on a socket in `root/.carrick`, with a record naming
+/// this test process (alive, ours) as its pid and `claimed` as its workspace.
+/// Every connection's `hello` is answered with that pid and workspace, then
+/// `answer` answers each later frame; `None` reads `hello` and answers nothing.
+struct StandIn {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StandIn {
+    fn start(
+        root: &Path,
+        claimed: &Path,
+        answer: Option<fn(&serde_json::Value) -> serde_json::Value>,
+    ) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+        let carrick_dir = root.join(".carrick");
+        std::fs::create_dir_all(&carrick_dir).unwrap();
+        let socket = carrick_dir.join("typed.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let pid = std::process::id();
+        std::fs::write(
+            carrick_dir.join("typed.json"),
+            serde_json::json!({
+                "pid": pid,
+                "socket": socket,
+                "workspace": claimed,
+                "token": "t",
+                "started_at": chrono::Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let claimed = claimed.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stopping.load(Ordering::Relaxed) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let claimed = claimed.clone();
+                held.push(stream.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut lines = BufReader::new(stream).lines();
+                    let mut greeted = false;
+                    while let Some(Ok(line)) = lines.next() {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let id = request["request_id"].clone();
+                        let frame = if !greeted {
+                            greeted = true;
+                            if answer.is_none() {
+                                continue;
+                            }
+                            serde_json::json!({
+                                "request_id": id, "status": "success",
+                                "pid": pid, "workspace": claimed,
+                            })
+                        } else {
+                            let Some(answer) = answer else { continue };
+                            let mut frame = answer(&request);
+                            frame["request_id"] = id;
+                            frame
+                        };
+                        if writeln!(writer, "{frame}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(held);
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A `status` that says a warm-up is filling the daemon.
+fn warming_status(request: &serde_json::Value) -> serde_json::Value {
+    assert_eq!(request["action"], "status");
+    serde_json::json!({
+        "status": "success",
+        "daemon": { "pid": std::process::id(), "socket": "", "services": [], "warming": true },
+    })
+}
+
 fn break_the_producer(root: &Path) {
     let file = root.join(ROUTE);
     let text = std::fs::read_to_string(&file).unwrap();
@@ -270,10 +394,12 @@ fn a_daemon_that_died_is_replaced_and_its_run_answers_cold() {
     let (code, _) = run(&root, &["daemon", "start", "--workspace", "."], true);
     assert_eq!(code, Some(0));
     let dead = serving(&root).unwrap().pid;
+    let record = typed_daemon::read_record(&root).unwrap();
     assert!(
-        typed_daemon::kill(dead, &root),
+        typed_daemon::identity(&record, &root),
         "it is this workspace's daemon"
     );
+    sigkill(dead);
     assert!(
         typed_daemon::read_record(&root).is_some(),
         "a killed daemon leaves its record"
@@ -395,7 +521,8 @@ fn a_request_the_daemon_drops_is_answered_cold() {
         }
     });
 
-    let warm = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any").unwrap();
+    let warm =
+        TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any", HelloMode::Probe).unwrap();
     warm.start_init(&service, None);
     warm.wait_ready(Duration::from_secs(30)).unwrap();
     assert!(warm.on_daemon());
@@ -475,7 +602,8 @@ fn an_error_the_daemon_answers_is_answered_cold() {
         let _ = finished.recv();
     });
 
-    let warm = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any").unwrap();
+    let warm =
+        TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any", HelloMode::Probe).unwrap();
     warm.start_init(&service, None);
     warm.wait_ready(Duration::from_secs(30)).unwrap();
     assert!(warm.on_daemon());
@@ -504,7 +632,7 @@ fn a_daemon_that_does_not_answer_hello_is_left_at_once() {
         let _ = finished.recv();
     });
     let started = Instant::now();
-    let connected = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any");
+    let connected = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any", HelloMode::Probe);
     let waited = started.elapsed();
     done.send(()).unwrap();
     stand_in.join().unwrap();
@@ -536,7 +664,10 @@ fn daemon_stop_leaves_another_process_named_by_a_stale_record() {
         .to_string(),
     )
     .unwrap();
-    assert!(!typed_daemon::is_daemon_of(other.id(), &root));
+    assert!(!typed_daemon::identity(
+        &typed_daemon::read_record(&root).unwrap(),
+        &root
+    ));
 
     let (code, said) = run(&root, &["daemon", "stop", "--workspace", "."], true);
     assert_eq!(code, Some(0), "{said}");
@@ -548,6 +679,127 @@ fn daemon_stop_leaves_another_process_named_by_a_stale_record() {
         typed_daemon::read_record(&root).is_none(),
         "the stale record is removed"
     );
+}
+
+/// A record whose process is gone is a crash: the probe notes it and removes
+/// the record. Two crashes of one build within the hour back it off: no daemon
+/// is started, and `carrick status` says so.
+#[test]
+#[serial]
+fn two_crashes_of_one_build_back_it_off() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    let carrick_dir = root.join(".carrick");
+    std::fs::create_dir_all(&carrick_dir).unwrap();
+    let id = build_id();
+    for _ in 0..2 {
+        let mut gone = Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        std::fs::write(
+            carrick_dir.join("typed.json"),
+            serde_json::json!({
+                "pid": gone.id(),
+                "socket": carrick_dir.join("typed.sock"),
+                "build_id": id,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            typed_daemon::probe(&root, &id, Duration::from_secs(1)),
+            Probe::Absent
+        ));
+        assert!(
+            typed_daemon::read_record(&root).is_none(),
+            "the dead record is removed"
+        );
+    }
+    let crashes = std::fs::read_to_string(carrick_dir.join("typed.crashes")).unwrap();
+    assert_eq!(crashes.lines().count(), 2, "{crashes}");
+    assert!(typed_daemon::backed_off(&root, &id).is_some());
+
+    let (code, _) = run(&root, &["daemon", "start", "--workspace", "."], true);
+    assert_ne!(code, Some(0), "a backed-off build is not started");
+    assert!(typed_daemon::read_record(&root).is_none());
+    let (lines, _) = typed_daemon::status_report(&root, Some(&id));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("off until") && line.contains("2 crashes")),
+        "{lines:?}"
+    );
+    // Another build starts afresh.
+    assert!(typed_daemon::backed_off(&root, "another build").is_none());
+}
+
+/// A daemon a warm-up is filling is busy for a check: the check answers cold,
+/// the same as with no daemon, and starts no second warm-up.
+#[test]
+#[serial]
+fn a_warming_daemon_leaves_the_check_cold_and_starts_nothing() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    run(&root, &["refresh", "--workspace", "."], false);
+    break_the_producer(&root);
+    let recheck = ["check", ROUTE, "--workspace", ".", "--recheck", "--json"];
+    let (cold_code, cold) = run(&root, &recheck, false);
+
+    let stand_in = StandIn::start(&root, &root, Some(warming_status));
+    let (code, answered) = run(&root, &recheck, true);
+    assert_eq!(code, cold_code);
+    assert_eq!(without_timing(&answered), without_timing(&cold));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        typed_daemon::read_record(&root).map(|r| r.pid),
+        Some(std::process::id()),
+        "no daemon was started in its place"
+    );
+    assert!(
+        !root.join(".carrick/typed-warm.pid").exists(),
+        "no warm-up was started"
+    );
+    drop(stand_in);
+}
+
+/// A daemon that accepts a connection and never answers: the check's output
+/// and exit code are those of `CARRICK_TYPED=off`.
+#[test]
+#[serial]
+fn a_daemon_that_never_answers_leaves_the_check_as_with_none() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    run(&root, &["refresh", "--workspace", "."], false);
+    break_the_producer(&root);
+    for args in [
+        vec!["check", ROUTE, "--workspace", ".", "--recheck", "--json"],
+        vec!["check", "--changed", "--workspace", ".", "--json"],
+    ] {
+        let (cold_code, cold) = run(&root, &args, false);
+        let stand_in = StandIn::start(&root, &root, None);
+        let started = Instant::now();
+        let (code, answered) = run(&root, &args, true);
+        drop(stand_in);
+        assert_eq!(code, cold_code, "{args:?}");
+        assert_eq!(without_timing(&answered), without_timing(&cold), "{args:?}");
+        assert!(started.elapsed() < Duration::from_secs(300));
+    }
+}
+
+/// A record copied with a workspace names another workspace's daemon: its
+/// `hello` names that other workspace, so the copy does not use it.
+#[test]
+#[serial]
+fn a_copied_workspaces_record_is_not_used() {
+    let original = tempfile::tempdir().unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let original_root = original.path().canonicalize().unwrap();
+    let copy_root = copy.path().canonicalize().unwrap();
+    let stand_in = StandIn::start(&copy_root, &original_root, Some(warming_status));
+    assert!(matches!(
+        typed_daemon::probe(&copy_root, &build_id(), Duration::from_secs(2)),
+        Probe::Absent
+    ));
+    drop(stand_in);
 }
 
 /// The build id the CLI computes is the one the sidecar computes: a daemon
