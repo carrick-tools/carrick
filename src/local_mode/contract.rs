@@ -805,6 +805,10 @@ pub struct StatusRepo {
     /// Up to [`MAX_STALE_FILES`] of THOSE, repo-relative.
     pub stale_files: Vec<String>,
     pub stale_files_truncated: bool,
+    /// The repo's services were read in from the hosted index, not scanned on
+    /// this machine (carrick#2839): their types are the hosted scan's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_from_hosted: bool,
 }
 
 /// What `carrick status` answers: the workspace, not a file.
@@ -1563,6 +1567,7 @@ mod hosted_wire_tests {
                     "scripts/seed.ts".to_string(),
                 ],
                 stale_files_truncated: false,
+                read_from_hosted: false,
             }],
             services: vec![StatusService {
                 hosted: None,

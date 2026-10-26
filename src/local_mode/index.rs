@@ -490,6 +490,9 @@ fn run_generation(
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
+    for repo in &mut index.repos {
+        repo.read_from_hosted = fetched.contains(&repo.name);
+    }
     index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();
     index.hosted_source_key = hosted.source_key();
@@ -1618,6 +1621,7 @@ pub(super) fn build(
             services,
             files: BTreeMap::new(),
             uses: None,
+            read_from_hosted: false,
         });
     }
 

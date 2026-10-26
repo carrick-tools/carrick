@@ -272,6 +272,12 @@ export type StatusRepo = {
   /** Up to 50 of the ones outside every service, repo-relative. */
   stale_files?: string[];
   stale_files_truncated?: boolean;
+  /**
+   * The repo's services were read in from the hosted index, not scanned on this
+   * machine, so their types are the hosted scan's (carrick#2839). Absent when
+   * false.
+   */
+  read_from_hosted?: boolean;
 };
 
 /**

@@ -55,7 +55,7 @@ export type NativeRun = (
 
 export type HostedDownload =
   /** The hosted rows are on this machine, for `services` services. */
-  | { kind: "downloaded"; services: number; reread: boolean }
+  | { kind: "downloaded"; services: number; reread: boolean; readFromHosted: string[] }
   /** The hosted blob predates this CLI, so its rows were not replayed. */
   | { kind: "version_mismatch"; services: number; reread: boolean }
   /**
@@ -460,7 +460,10 @@ function classify(status: StatusResult | null, problem: string | null, reread: b
     if (state !== "commit_missing") return { kind: "local_only", services, state, reread };
     return { kind: "local_only", services, state, reread, missing: missingCommits(status) };
   }
-  return { kind: "downloaded", services: enriched.length, reread };
+  // The repos whose services stand in from the hosted scan, whose types were
+  // captured with dependencies installed (carrick#2839).
+  const readFromHosted = (status.repos ?? []).filter((repo) => repo.read_from_hosted === true).map((repo) => repo.repo);
+  return { kind: "downloaded", services: enriched.length, reread, readFromHosted };
 }
 
 /**

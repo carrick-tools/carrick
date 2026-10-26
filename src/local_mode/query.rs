@@ -315,6 +315,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
             outside_every_service: outside_total,
             stale_files: outside,
             stale_files_truncated: outside_truncated,
+            read_from_hosted: repo.read_from_hosted,
         });
     }
 
@@ -1261,6 +1262,7 @@ mod drift_tests {
                 name: "service-repo".to_string(),
                 files: Default::default(),
                 uses: None,
+                read_from_hosted: false,
             }],
             type_check: None,
         };
@@ -1278,6 +1280,50 @@ mod drift_tests {
         let text = answer.render();
         assert!(!text.contains("carrick.json"), "{text}");
         assert!(!text.contains(".claude"), "{text}");
+    }
+
+    /// carrick#2839: `status` says which repos were read in from the hosted
+    /// index, so `carrick init` does not tell them to install dependencies for
+    /// types the hosted scan already holds. A repo scanned here says nothing.
+    #[test]
+    fn status_names_the_repos_read_in_from_the_hosted_index() {
+        let (dir, commit) = committed_repo(&[("src/main.ts", "export const a = 1;")]);
+        let repo = dir.path();
+        let mut index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![IndexedRepo {
+                path: repo.to_string_lossy().into_owned(),
+                services: vec![service(None, &commit)],
+                name: "service-repo".to_string(),
+                files: Default::default(),
+                uses: None,
+                read_from_hosted: true,
+            }],
+            type_check: None,
+        };
+        let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        crate::local_mode::workspace::write_self_ignore(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+        let hosted = serde_json::to_value(status(repo).unwrap()).unwrap();
+        assert_eq!(hosted["repos"][0]["read_from_hosted"], true, "{hosted}");
+
+        index.repos[0].read_from_hosted = false;
+        index.write(&index_dir.join("index.json")).unwrap();
+        let scanned = serde_json::to_value(status(repo).unwrap()).unwrap();
+        assert!(
+            scanned["repos"][0].get("read_from_hosted").is_none(),
+            "{scanned}"
+        );
     }
 
     /// Straight after onboarding, `status` and the session-start hook reported
@@ -1316,6 +1362,7 @@ mod drift_tests {
                 services: vec![service(Some("apps/gateway"), &commit)],
                 files: Default::default(),
                 uses: None,
+                read_from_hosted: false,
             }],
             type_check: None,
         };
@@ -1371,6 +1418,7 @@ mod drift_tests {
             services: vec![service(None, "")],
             files: Default::default(),
             uses: None,
+            read_from_hosted: false,
         };
         let index = LocalIndex {
             hosted_identity: None,
@@ -1442,6 +1490,7 @@ mod drift_tests {
                     services: vec![service(None, "")],
                     files: Default::default(),
                     uses,
+                    read_from_hosted: false,
                 }],
                 type_check: None,
             };

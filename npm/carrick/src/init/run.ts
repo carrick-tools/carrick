@@ -392,9 +392,13 @@ export function summaryLine(project: string | null, repos: string[]): string {
  * preflight rule the scan refuses on), so this only says where each runs, as
  * a path from the workspace the agent is in (carrick#1489).
  */
-export function installCommands(plan: WorkspaceProposal): string[] {
+export function installCommands(plan: WorkspaceProposal, readFromHosted: string[] = []): string[] {
   const commands: string[] = [];
+  const hosted = new Set(readFromHosted.map(realPath));
   for (const repo of plan.repos) {
+    // Its types are the hosted scan's, captured with dependencies installed
+    // (carrick#2839).
+    if (hosted.has(realPath(repo.path))) continue;
     for (const row of repo.not_installed) {
       const where = path.join(path.relative(plan.workspace, repo.path), row.directory);
       const command = where === "." ? `\`${row.command}\`` : `\`${row.command}\` in ${where}`;
@@ -1716,6 +1720,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // what leaves `.carrick/index.json` here, and the session-start hook reads a
   // later hosted index in only onto a machine that has one (carrick#2219).
   let downloaded = false;
+  let readFromHosted: string[] = [];
   if (hostedIndex.length > 0 || cloud !== null) {
     // The step reports its own outcome, so the read is one line in a terminal
     // as well as in a pipe: a spinner that stopped with its label spent a
@@ -1738,6 +1743,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000, cloud !== null ? "cloud" : "laptop"),
     );
     downloaded = read.kind === "downloaded";
+    if (read.kind === "downloaded") readFromHosted = read.readFromHosted;
   }
   for (const line of todo) out.warn(line);
   const installs = installCommands(plan);
@@ -1752,7 +1758,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
         `Carrick has no index for ${listed(cloud.waiting, 10)} yet. It builds ${one ? "it" : "them"} in the cloud, and ${workspaceUrls(cloud.identity.workspace.slug).repos} shows where ${one ? "it is" : "they are"}. Run carrick refresh here once ${one ? "it is" : "they are"} ready.`,
       );
     }
-    const install = installSentence(installs, "cloud");
+    const install = installSentence(installCommands(plan, readFromHosted), "cloud");
     if (install !== null) out.warn(install);
     if (downloaded) out.done(READY_SENTENCE);
     return 0;
