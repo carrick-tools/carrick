@@ -31,6 +31,7 @@ import {
   captureStub,
   findDisqualifyingTopTypes,
   jsonWireDeclarations,
+  KeptJudge,
   runCheck,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
@@ -464,6 +465,12 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
  * install/check and one terminal `success`/`error` frame. Writes its own
  * frames, so processLine hands off and does not write a response for it.
  */
+/**
+ * A daemon's judge workspace, kept between checks (carrick#2883). Over stdio
+ * every check builds its own, as before.
+ */
+let keptJudge: KeptJudge | null = null;
+
 async function handleCheckV2Async(
   request: SidecarRequest & { action: 'check_v2' }
 ): Promise<void> {
@@ -481,6 +488,8 @@ async function handleCheckV2Async(
         pairs: request.pairs,
         workspaceRoot: request.workspace_root,
         cleanup: request.keep_workspace !== true,
+        // A caller that asks for the workspace gets a fresh one of its own.
+        kept: request.keep_workspace === true ? undefined : keptJudge ?? undefined,
       },
       (p) => {
         phase = p;
@@ -1714,6 +1723,9 @@ async function serve(workspace: string, cliVersion: string | null): Promise<void
     log(`a daemon already serves ${workspace}`);
     process.exit(EXIT_ALREADY_RUNNING);
   }
+  const judge = new KeptJudge();
+  keptJudge = judge;
+  process.on('exit', () => judge.discard());
   const stopOn = (signal: string) => () => server.stop(`${signal} received`);
   process.on('SIGINT', stopOn('SIGINT'));
   process.on('SIGTERM', stopOn('SIGTERM'));

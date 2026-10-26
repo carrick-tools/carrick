@@ -9,6 +9,7 @@
  */
 
 import type { ResultLabel } from './result-label.js';
+import type { KeptJudge } from './kept-judge.js';
 
 export type { ResultLabel };
 
@@ -631,6 +632,15 @@ export interface CheckResult {
    * signal, or a non-zero exit with no parseable diagnostics): every pair is then
    * unverifiable, and this says whether it died of memory (carrick#2209). */
   compiler_end?: CompilerEnd;
+  /** Present when the check ran on a kept judge workspace (carrick#2883). */
+  judge?: KeptJudgeUse;
+}
+
+/** How a check used the kept judge workspace. */
+export interface KeptJudgeUse {
+  kept: true;
+  /** The manifests were unchanged, so the install was not run again. */
+  install_skipped: boolean;
 }
 
 /** How the check's compiler process ended. */
@@ -663,6 +673,11 @@ export interface CheckOptions {
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */
   cleanup?: boolean;
+  /** A resident sidecar's kept judge workspace (carrick#2883): brought to
+   * this check's plan, its install skipped while the manifests are
+   * unchanged, its compiler run incrementally. Never handed out or cleaned
+   * up by the check. Absent, or held by another check: a fresh workspace. */
+  kept?: KeptJudge;
 }
 
 /** Progress phases emitted over the async install protocol. */
