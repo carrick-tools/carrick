@@ -10,6 +10,7 @@ import {
   renderSessionStart,
   runningScanLine,
   serviceLine,
+  hasSomethingToDo,
   shortHash,
   typedMismatchClause,
   unclassifiedLines,
@@ -397,6 +398,15 @@ test("a service line names its own count, and what is waiting for a paid scan", 
     serviceLine({ ...service, boundary: { ...service.boundary, candidates_awaiting_model: 8 } }),
     /8 candidate\(s\) waiting for `carrick index`$/,
   );
+});
+
+test("a service answered by the hosted index says nothing about candidates waiting", () => {
+  const [service] = statusFixture("status-workspace.json").services;
+  assert.ok(service);
+  const counted = { ...service, boundary: { ...service.boundary, candidates_awaiting_model: 8 } };
+  assert.equal(serviceLine({ ...counted, hosted_state: "enriched" }).includes("candidate"), false);
+  assert.match(serviceLine({ ...counted, hosted_state: "no_index_yet" }), /8 candidate\(s\) waiting/);
+  assert.equal(hasSomethingToDo({ ...counted, changed_since_index: 0, hosted_state: "enriched" }), false);
 });
 
 test("files outside every service are the repo's line, not each service's", () => {

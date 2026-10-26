@@ -462,6 +462,17 @@ function staleText(service: StatusService): string {
 }
 
 /**
+ * Candidates only `carrick index` resolves, or 0 when the hosted index is the
+ * index answering for this service: an index read in from the hosted rows
+ * (`hosted_state` "enriched") was built with the model, so the local
+ * pre-model count describes nothing the agent can act on.
+ */
+export function candidatesWaiting(service: StatusService): number {
+  if (service.hosted_state === "enriched") return 0;
+  return service.boundary?.candidates_awaiting_model ?? 0;
+}
+
+/**
  * One line per service: what it holds, at which commit, how far the part of
  * the tree it reads has moved since, and what is waiting for a paid scan.
  *
@@ -471,7 +482,7 @@ function staleText(service: StatusService): string {
  */
 export function serviceLine(service: StatusService): string {
   const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
-  const waiting = service.boundary?.candidates_awaiting_model;
+  const waiting = candidatesWaiting(service);
   const awaiting = waiting ? `, ${waiting} candidate(s) waiting for \`carrick index\`` : "";
   return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}${awaiting}`;
 }
@@ -596,6 +607,13 @@ export function renderSessionStart(status: StatusResult): string {
   return lines.join("\n");
 }
 
+/**
+ * The one instruction a session start gives about finishing work. The
+ * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
+ */
+export const CHECK_BEFORE_DONE =
+  "Before you say a change is done, run `carrick check --changed`: it checks every changed file against the other services. Exit 1 means a contract problem, exit 2 means nothing could be checked.";
+
 /** Up to this many services, a session start states every one of them. */
 export const DETAILED_SERVICES = 3;
 
@@ -617,7 +635,7 @@ export const BOUNDARY_POINTER =
  */
 export function hasSomethingToDo(service: StatusService): boolean {
   if (service.changed_since_index > 0) return true;
-  if ((service.boundary?.candidates_awaiting_model ?? 0) > 0) return true;
+  if (candidatesWaiting(service) > 0) return true;
   return service.hosted_state !== undefined && service.hosted_state !== "enriched";
 }
 

@@ -240,6 +240,8 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   assert.deepEqual(Object.keys(wire), ["hookSpecificOutput"]);
   const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
   assert.equal(output.hookEventName, "SessionStart");
+  // Both carry the finish-line check.
+  assert.match(plain.stdout, /\nBefore you say a change is done, run `carrick check --changed`.*Exit 1 means a contract problem, exit 2 means nothing could be checked\.\n$/);
   // The same text Claude Code is given, byte for byte.
   assert.equal(`${output.additionalContext}\n`, plain.stdout);
 });

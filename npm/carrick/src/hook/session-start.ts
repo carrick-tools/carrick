@@ -20,7 +20,7 @@
 import { status } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { renderSessionStart } from "../render.ts";
+import { CHECK_BEFORE_DONE, renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { refreshInBackground } from "./refresh.ts";
@@ -115,6 +115,7 @@ async function main(): Promise<void> {
   // Ends with a newline: this is a line a developer also runs by hand and
   // compares against `carrick status`, and that one ends its output properly.
   lines.push(renderSessionStart(outcome.result));
+  if (!outcome.result.error) lines.push(CHECK_BEFORE_DONE);
 
   // The hosted index the first CI scan writes is picked up here rather than by
   // a command the developer has to remember (carrick#955). Detached and
