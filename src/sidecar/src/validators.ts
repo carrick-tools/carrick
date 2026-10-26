@@ -470,6 +470,13 @@ const RequestAtSchema = z
   })
   .strict();
 
+/** Exactly one of the whole return, one member name, or a parse method (carrick#2817). */
+const ResultShapeSchema = z.union([
+  z.object({ whole: z.literal(true) }).strict(),
+  z.object({ member: z.tuple([z.string().min(1)]) }).strict(),
+  z.object({ parse: z.string().min(1) }).strict(),
+]);
+
 const ClaimOnSchema = z.enum(['export', 'instance', 'both']);
 const MemberPathSchema = z.array(z.string().min(1));
 const KeyLabelsSchema = z.record(z.string().min(1), z.enum(['name', 'not_name']));
@@ -498,6 +505,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       key_labels: KeyLabelsSchema.optional(),
       name_scope: NameScopeSchema.optional(),
       picker: z.string().optional(),
+      result: ResultShapeSchema.optional(),
     })
     .strict(),
   z
@@ -541,6 +549,19 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       runs: RunsSlotSchema.optional(),
       yields: YieldsSchema.optional(),
       request: RequestAtSchema.optional(),
+      result: ResultShapeSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('result'),
+      form: z.enum(['make', 'op']),
+      member: z.string().min(1).nullable(),
+      path: MemberPathSchema.optional(),
+      on: ClaimOnSchema.optional(),
+      of: z.string().min(1).optional(),
+      picker: z.string().optional(),
+      result: ResultShapeSchema,
     })
     .strict(),
   z

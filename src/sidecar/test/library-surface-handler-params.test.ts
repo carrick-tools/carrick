@@ -234,7 +234,7 @@ describe('list_library_surface: handler parameter members (carrick#2674 S3)', ()
     );
     const [routes] = response.surfaces;
     assert.ok(membersOf(routes).some(m => m.handlers !== undefined), 'the fixture lists no handlers');
-    const stripped = JSON.parse(JSON.stringify(routes, (key, value) => (key === 'handlers' ? undefined : value))) as Surface;
+    const stripped = JSON.parse(JSON.stringify(routes, (key, value) => (key === 'handlers' || key === 'result_candidates' ? undefined : value))) as Surface;
     const expected = crypto
       .createHash('sha256')
       .update(JSON.stringify([[routes.package, stripped.exports]]))

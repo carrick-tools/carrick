@@ -40,6 +40,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts, type Project } from 'ts-morph';
+import { holdsResult, resultCandidatesOf } from './result-candidates.js';
 import { PathNames, declaringFileName, type PackageDirectoryOf } from './position-rows.js';
 import type {
   ClaimSlot,
@@ -49,6 +50,7 @@ import type {
   LibraryRole,
   LibrarySurface,
   RequestAt,
+  ResultShape,
   RunsSlot,
   SemanticsCheck,
   SemanticsModule,
@@ -1071,9 +1073,12 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
     .filter(surface => surface.reason === undefined && surface.exports.length > 0)
     .map(surface => [surface.package, surface.exports] as const)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  // A member's `handlers` (carrick#2674) is out of the hash at every depth, so
-  // a package's key does not change when the lister learns to list them.
-  const text = JSON.stringify(listed, (key, value) => (key === 'handlers' ? undefined : value));
+  // A member's `handlers` (carrick#2674) and a signature's `result_candidates`
+  // (carrick#2817) are out of the hash at every depth, so a package's key does
+  // not change when the lister learns to list them.
+  const text = JSON.stringify(listed, (key, value) =>
+    key === 'handlers' || key === 'result_candidates' ? undefined : value
+  );
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
@@ -1719,6 +1724,7 @@ class DeclarationReader {
    * `claim_invalid`.
    */
   judgeHttp(receiver: ts.Type, claim: LibraryClaim): Outcome {
+    if (claim.kind === 'result') return this.judgeHttpResult(receiver, claim);
     if (claim.kind === 'make') {
       const base = claim.base;
       if (
@@ -2002,7 +2008,36 @@ class DeclarationReader {
         return { outcome: this.judgeOp(receiver, claim, rules) };
       case 'reserved':
         return { outcome: this.judgeReserved(receiver, claim) };
+      case 'result':
+        return { outcome: this.resultOutcome(this.ownCallee(receiver, claim.path ?? [], claim.member, 'call'), claim.result) };
     }
+  }
+
+  /**
+   * A `result` claim (carrick#2817): the claimed result is a candidate of at
+   * least one signature the callee declares, by rule R (`result-candidates.ts`).
+   * Anything else, including a call that returns nothing, is
+   * `result_not_candidate`.
+   */
+  private resultOutcome(callee: Callable, shape: ResultShape): Outcome {
+    if ('failure' in callee) return callee.failure;
+    for (const signature of callee.signatures) {
+      const candidates = resultCandidatesOf(this.checker, signature);
+      if (candidates !== undefined && holdsResult(candidates, shape)) return VERIFIED;
+    }
+    return failed('result_not_candidate');
+  }
+
+  /** A `result` claim on an HTTP receiver: `path` walked from it, then `member` of what that reaches. */
+  private judgeHttpResult(receiver: ts.Type, claim: Extract<LibraryClaim, { kind: 'result' }>): Outcome {
+    let holder = receiver;
+    for (const hop of claim.path ?? []) {
+      const property = this.declaredProperty(holder, hop);
+      if (!property) return failed('member_missing');
+      holder = this.checker.getTypeOfSymbol(property);
+    }
+    const callee = claim.member === null ? this.callSignatures(holder) : this.callableProperty(holder, claim.member);
+    return this.resultOutcome(callee, claim.result);
   }
 
   /**
@@ -3723,7 +3758,10 @@ class DeclarationReader {
         if (literals.size > 0) param.literals = [...literals].sort();
         params.push(param);
       }
-      listed.push({ params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) });
+      const entry: SurfaceSignature = { params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) };
+      const candidates = resultCandidatesOf(this.checker, signature);
+      if (candidates !== undefined) entry.result_candidates = candidates;
+      listed.push(entry);
     }
     return listed;
   }

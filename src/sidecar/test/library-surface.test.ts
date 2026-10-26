@@ -1156,11 +1156,11 @@ export declare function connect(options: Partial<Address>): Client;
     for (const dir of [root, fs.realpathSync(root)]) assert.ok(!text.includes(dir), `listing names ${dir}`);
 
     // The hash is the sha256 of the listed specifiers, in order, with their exports
-    // and without a member's `handlers` (carrick#2674).
+    // and without a member's `handlers` (carrick#2674) and a signature's `result_candidates` (carrick#2817).
     const listed = [...first.surfaces].sort((a, b) => (a.package < b.package ? -1 : a.package > b.package ? 1 : 0));
     const expected = crypto
       .createHash('sha256')
-      .update(JSON.stringify(listed.map(s => [s.package, s.exports]), (key, value) => (key === 'handlers' ? undefined : value)))
+      .update(JSON.stringify(listed.map(s => [s.package, s.exports]), (key, value) => (key === 'handlers' || key === 'result_candidates' ? undefined : value)))
       .digest('hex');
     assert.strictEqual(first.surface_sha256, expected);
 

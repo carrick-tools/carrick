@@ -616,6 +616,8 @@ export type LibraryClaim =
       key_labels?: Record<string, KeyLabel>;
       name_scope?: NameScope;
       picker?: string;
+      /** Which part of what the maker returns holds the value its function resolves to; read by a `result` claim, never by this one. */
+      result?: ResultShape;
     }
   | {
       /** A member that returns a receiver bound to a name (a channel, room or queue). */
@@ -678,6 +680,24 @@ export type LibraryClaim =
       yields?: Yields;
       /** Route fields (#2474 R0), `receive` only: where the handler's request holds its path and method. */
       request?: RequestAt;
+      /** Which part of what the call returns holds the response; read by a `result` claim, never by this one. */
+      result?: ResultShape;
+    }
+  | {
+      /**
+       * Which part of what a call returns holds the response body, judged over
+       * every overload of `member` (after `path`) on the receiver; `member`
+       * null is the receiver itself called (carrick#2817). `form` says whether
+       * the call is a maker's or an op's.
+       */
+      kind: 'result';
+      form: 'make' | 'op';
+      member: string | null;
+      path?: string[];
+      on?: ClaimOn;
+      of?: string;
+      picker?: string;
+      result: ResultShape;
     }
   | {
       /** A name the library emits itself, spelled in one of `member`'s parameters. */
@@ -1133,7 +1153,30 @@ export interface SurfaceKey {
 export interface SurfaceSignature {
   params: SurfaceParam[];
   returns: string;
+  /**
+   * Which parts of the awaited return could hold the response body
+   * (carrick#2817). Left out of the surface hash. Absent when the signature
+   * returns nothing.
+   */
+  result_candidates?: SurfaceResultCandidates;
 }
+
+/** What a signature's return offers as its result, by rule R (`result-candidates.ts`). */
+export interface SurfaceResultCandidates {
+  /** The caller supplies the whole return as a type argument: `whole` is the only candidate. */
+  whole_decided: boolean;
+  /** Properties that carry a type parameter of the signature, sorted. */
+  members: string[];
+  /** Methods with no required argument that return a bare type parameter of their own, sorted. */
+  parse: string[];
+}
+
+/**
+ * Which part of what a call returns holds the response the server sent:
+ * exactly one of the whole awaited return, one member of it, or the awaited
+ * return of one of its parse methods (carrick#2817).
+ */
+export type ResultShape = { whole: true } | { member: [string] } | { parse: string };
 
 export interface SurfaceMember {
   name: string;
