@@ -207,17 +207,19 @@ export function hookTarget(command: string): string | null {
 }
 
 /**
- * Whether a settings entry is one the hosted scaffold's hook pack wrote.
+ * Whether a settings entry is the hosted scaffold hook pack's session start.
  *
- * The pack's three scripts are wired by exactly these commands (carrick-cloud
- * `lambdas/mcp-server/src/tools/scaffold.ts`, `buildHookSettings`). The test
- * is the whole command, so a user's own script in the same directory, or the
- * same script run with arguments, is never taken for the pack's. Its
- * session-start script prints the message `carrick hook session-start` prints,
- * so a repo holding both sent every session two of them (carrick#2854).
+ * The pack wires its session-start script by exactly this command
+ * (carrick-cloud `lambdas/mcp-server/src/tools/scaffold.ts`,
+ * `buildHookSettings`). The test is the whole command, so a user's own script
+ * in the same directory, or the same script run with arguments, is never taken
+ * for the pack's. That script prints the message `carrick hook session-start`
+ * prints, so a repo holding both sent every session two of them
+ * (carrick#2854). The pack's prompt reminder and search nudge stay: init has
+ * nothing in their place, and they are what sends an agent to Carrick before
+ * it greps.
  */
-const SCAFFOLD_HOOK =
-  /^"?\$CLAUDE_PROJECT_DIR\/\.claude\/(?:session-start|turn-reminder|search-gate)\.sh"?$/;
+const SCAFFOLD_HOOK = /^"?\$CLAUDE_PROJECT_DIR\/\.claude\/session-start\.sh"?$/;
 
 export function isScaffoldHook(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null) return false;

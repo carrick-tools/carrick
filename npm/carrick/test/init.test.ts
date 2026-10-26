@@ -493,10 +493,11 @@ test("the hook entries land beside everything else the settings file holds", () 
 });
 
 // carrick#2854: the hosted scaffold's hook pack wires the same session-start
-// message init does, so a session got it twice. Init replaces the pack's three
-// entries (the exact `$CLAUDE_PROJECT_DIR/.claude/<name>.sh` commands the
-// scaffold writes) and leaves every entry that is not its own or the pack's.
-test("init replaces the scaffold's hook-pack entries and keeps the user's own", () => {
+// message init does, so a session got it twice. Init replaces the pack's
+// session-start entry (the exact `$CLAUDE_PROJECT_DIR/.claude/session-start.sh`
+// command the scaffold writes) and keeps the pack's prompt reminder and search
+// nudge, which init has nothing in place of, and every entry of the user's.
+test("init replaces the scaffold's session-start entry and keeps its nudges and the user's own", () => {
   const pack = (name: string) => ({ type: "command", command: `"$CLAUDE_PROJECT_DIR/.claude/${name}.sh"` });
   const scaffolded = JSON.stringify(
     {
@@ -525,8 +526,10 @@ test("init replaces the scaffold's hook-pack entries and keeps the user's own", 
     ["carrick hook session-start"],
     "one session-start message",
   );
-  assert.equal(written.hooks.UserPromptSubmit, undefined);
+  assert.deepEqual(written.hooks.UserPromptSubmit, [{ hooks: [pack("turn-reminder")] }]);
   assert.deepEqual(written.hooks.PreToolUse, [
+    { matcher: "Grep", hooks: [pack("search-gate")] },
+    { matcher: "Bash", hooks: [pack("search-gate")] },
     { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
   ]);
   assert.equal(written.hooks.Stop.length, 2);
