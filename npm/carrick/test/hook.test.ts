@@ -213,6 +213,36 @@ test("the session line asks status about the workspace, and states what it holds
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
 });
 
+// A session start starts and warms no type daemon: a daemon holding nothing
+// routes nothing, and a warm-up re-scan with no edit costs minutes on a large
+// workspace (the lifecycle policy, carrick#2884). Only a check starts one.
+test("the session start starts no type daemon", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+    }),
+  });
+  assert.equal(run.code, 0);
+  // A detached start would log its call after the hook returned.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const calls = fs
+    .readFileSync(argvLog, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => (JSON.parse(line) as { argv: string[] }).argv);
+  assert.ok(calls.length > 0, "the hook asked the binary something");
+  assert.deepEqual(
+    calls.filter((argv) => argv[0] === "daemon"),
+    [],
+  );
+});
+
 // What Codex's own parser takes from a SessionStart hook
 // (`codex-rs/hooks/src/engine/output_parser.rs`, `parse_session_start`): one JSON
 // object whose `hookSpecificOutput.additionalContext` is the context. It reads

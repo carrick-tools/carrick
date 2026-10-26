@@ -140,7 +140,7 @@ jobs:
           - shard: steps
             runner: steps
             targets: >-
-              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test typed_daemon_test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

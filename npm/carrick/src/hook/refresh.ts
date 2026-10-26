@@ -120,7 +120,7 @@ export type RefreshOptions = {
   start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
 };
 
-export function startDetached(command: string, args: string[], env: NodeJS.ProcessEnv): void {
+function startDetached(command: string, args: string[], env: NodeJS.ProcessEnv): void {
   const child = spawn(command, args, { detached: true, stdio: "ignore", env });
   child.unref();
 }
