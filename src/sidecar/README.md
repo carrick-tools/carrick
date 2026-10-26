@@ -122,6 +122,8 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 `capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. When both die, the service is recorded with how each process ended and the stage its last progress frame named. The `resolve_definitions` that follows a capture is answered by that fresh process, which reads the stub and builds nothing of the service (carrick#1927).
 
+In server mode (`--serve`) a capture keeps what it built for the service's next capture (carrick#2882): parsed files, each source file's declaration output and each stub file's diagnostics. The next capture parses again only changed files, emits again only the surface entry, changed files and the files an edit can reach (the import graph of #2881), and checks again only changed stub files, unless a changed stub file declares something global or a file the stub reads outside itself changed. It writes the stub and answer a cold capture writes, byte for byte. Held captures count toward the daemon's heap cap and are released least recently used first. A capture over stdio is cold, as before.
+
 ### Actions
 
 | Action | Needs `init` | Purpose |

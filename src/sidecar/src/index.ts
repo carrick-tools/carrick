@@ -28,10 +28,12 @@ import { TypeBundler } from './bundler.js';
 import { TypeInferrer } from './type-inferrer.js';
 import { DefinitionResolver } from './definition-resolver.js';
 import {
+  CaptureHold,
   captureStub,
   findDisqualifyingTopTypes,
   jsonWireDeclarations,
   runCheck,
+  type EmitReach,
 } from './capture/index.js';
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
@@ -425,7 +427,8 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
     const withinStage = atMostEvery(PROGRESS_INTERVAL_MS, (phase: string, message: string) =>
       writeProgress(request.request_id, phase, message)
     );
-    const result = captureStub({
+    const result = captureStub(
+      {
       repoRoot: request.repo_root,
       serviceName: request.service_name,
       anchors: request.anchors,
@@ -437,7 +440,9 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
         stage = phase;
         writeProgress(request.request_id, phase, message);
       },
-    });
+      },
+      captureHoldFor(request)
+    );
     return {
       request_id: request.request_id,
       status: result.success ? 'success' : 'error',
@@ -1379,6 +1384,50 @@ function processLine(line: string): void {
 /** Sessions a daemon holds, by what their `init` named. */
 const heldSessions = new Map<string, Session>();
 
+/**
+ * Server mode: what each service's last capture kept (carrick#2882), by the
+ * fields that scope a capture. Null over stdio, where every capture is cold.
+ */
+let captureHolds: Map<string, { hold: CaptureHold; repo_root: string; service_name: string; evictions: number }> | null = null;
+
+/** The hold for `request`'s service, made on its first capture; undefined over stdio. */
+function captureHoldFor(request: SidecarRequest & { action: 'capture_v2' }): CaptureHold | undefined {
+  if (!captureHolds) return undefined;
+  const key = JSON.stringify([
+    path.resolve(request.repo_root),
+    request.tsconfig_path ?? null,
+    request.scan_root ?? null,
+    request.service_name,
+  ]);
+  let held = captureHolds.get(key);
+  if (!held) {
+    held = { hold: new CaptureHold(emitReach()), repo_root: path.resolve(request.repo_root), service_name: request.service_name, evictions: 0 };
+    captureHolds.set(key, held);
+  }
+  held.hold.lastUsed = performance.now();
+  return held.hold;
+}
+
+/**
+ * carrick#2882: the files whose declarations an edit can change, read from
+ * the import graph of the emit program the kept output came from, and the
+ * graph carried to the next one (as `graphFor` carries a held project's).
+ */
+function emitReach(): EmitReach {
+  let carried: { graph: ImportGraph; program: unknown } | undefined;
+  return (before, after, changes) => {
+    const graph = carried?.program === before ? carried.graph : importGraphOf(before as never);
+    const reached = affectedFiles(graph, changes);
+    if (reached === 'all' || reached.exportsMoved) {
+      carried = undefined;
+      return reached === 'all' ? 'all' : reached.files;
+    }
+    readAgain(graph, after as never, changes.map((change) => change.file));
+    carried = { graph, program: after };
+    return reached.files;
+  };
+}
+
 /** The key of the service an `init` names: every field that scopes its project. */
 function sessionKey(request: SidecarRequest & { action: 'init' }): string {
   return JSON.stringify([
@@ -1427,6 +1476,12 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
       built: held.components.size > 0,
       freshness: { ...held.freshness },
       items: { held: held.items?.size ?? 0, ...held.answers },
+      evictions: held.evictions,
+    })),
+    captures: [...(captureHolds?.values() ?? [])].map((held) => ({
+      repo_root: held.repo_root,
+      service_name: held.service_name,
+      ...held.hold.report(),
       evictions: held.evictions,
     })),
     heap_cap_mb: heapCapMb(),
@@ -1520,20 +1575,39 @@ function evictOverCap(current: Session | undefined): void {
   for (;;) {
     const heapMb = process.memoryUsage().heapUsed / 1048576;
     if (heapMb <= heapCapMb()) return;
-    const victim = [...heldSessions.values()]
-      .filter((held) => held !== current && held.projectLoader !== null)
-      .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    // A held capture is released as a service is (carrick#2882), never the one that just answered.
+    const captures = [...(captureHolds?.values() ?? [])].filter((held) => held.hold.emit || held.hold.selfCheck);
+    const newest = Math.max(...captures.map((held) => held.hold.lastUsed));
+    const victim = [
+      ...[...heldSessions.values()]
+        .filter((held) => held !== current && held.projectLoader !== null)
+        .map((held) => ({ lastUsed: held.lastUsed, label: held.scope?.repo_root ?? 'a held service', release: () => releaseSession(held) })),
+      ...captures
+        .filter((held) => held.hold.lastUsed !== newest)
+        .map((held) => ({
+          lastUsed: held.hold.lastUsed,
+          label: `the capture of ${held.service_name}`,
+          release: () => {
+            held.hold = new CaptureHold(emitReach());
+            held.evictions += 1;
+          },
+        })),
+    ].sort((a, b) => a.lastUsed - b.lastUsed)[0];
     if (!victim) return;
-    log(`Heap ${Math.round(heapMb)} MB is over its cap of ${heapCapMb()} MB: releasing ${victim.scope?.repo_root ?? 'a held service'} (carrick#2881)`);
-    victim.projectLoader = null;
-    victim.components = new Map();
-    victim.items = victim.items && new Map();
-    victim.held = null;
-    victim.graphs = new Map();
-    victim.evictions += 1;
+    log(`Heap ${Math.round(heapMb)} MB is over its cap of ${heapCapMb()} MB: releasing ${victim.label} (carrick#2881)`);
+    victim.release();
     if (!gc) return;
     gc();
   }
+}
+
+function releaseSession(victim: Session): void {
+  victim.projectLoader = null;
+  victim.components = new Map();
+  victim.items = victim.items && new Map();
+  victim.held = null;
+  victim.graphs = new Map();
+  victim.evictions += 1;
 }
 
 /**
@@ -1700,6 +1774,7 @@ function answerFresh(request: SidecarRequest): SidecarResponse {
 /** `--serve <workspace> [--cli-version <v>]`: run as the workspace's daemon. */
 async function serve(workspace: string, cliVersion: string | null): Promise<void> {
   const buildId = buildIdOf(DIST_SRC);
+  captureHolds = new Map();
   const idle = Number(process.env.CARRICK_TYPED_IDLE_MS);
   const server: TypedServer = new TypedServer({
     workspace: path.resolve(workspace),
