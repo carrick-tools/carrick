@@ -232,14 +232,6 @@ impl HeldService {
             None => self.built,
         }
     }
-
-    /// Whether it answers this service only cold, for the rest of its life:
-    /// a miss on it warms nothing (L1).
-    pub fn is_cold_only(&self) -> bool {
-        self.state
-            .as_deref()
-            .is_some_and(|state| state.starts_with("cold_only"))
-    }
 }
 
 /// The `infer` items the daemon keeps for a service, and how often it has
@@ -298,11 +290,10 @@ impl Status {
             .collect()
     }
 
-    /// The roots of the services it answers only cold.
-    pub fn cold_only(&self) -> BTreeSet<PathBuf> {
+    /// The roots of every service it lists, in any state.
+    pub fn listed(&self) -> BTreeSet<PathBuf> {
         self.services
             .iter()
-            .filter(|service| service.is_cold_only())
             .map(|service| service.repo_root.clone())
             .collect()
     }

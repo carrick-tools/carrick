@@ -60,8 +60,9 @@ pub(super) struct Session {
     warm_after: bool,
     /// Where the re-scans list the services they answered without it.
     misses: PathBuf,
-    /// The services the daemon answers only cold: a miss on one warms nothing.
-    cold_only: BTreeSet<PathBuf>,
+    /// Every service the daemon's status lists, in any state: a miss on one
+    /// warms nothing ([`warms_after`]).
+    listed: BTreeSet<PathBuf>,
 }
 
 impl Session {
@@ -73,7 +74,7 @@ impl Session {
             daemon: None,
             warm_after: false,
             misses: misses.clone(),
-            cold_only: BTreeSet::new(),
+            listed: BTreeSet::new(),
         };
         if !typed_daemon::enabled() {
             return session;
@@ -106,7 +107,7 @@ impl Session {
                 );
             }
             Probe::Serving(status) => {
-                session.cold_only = status.cold_only();
+                session.listed = status.listed();
                 session.daemon = Some(Use::new(
                     status.socket.clone(),
                     Route::Held(status.built()),
@@ -145,22 +146,33 @@ impl Session {
         }
     }
 
-    /// Start the warm-up in the background when this run found no daemon, or
-    /// answered a service the daemon could hold without it. A service the
-    /// daemon answers only cold never starts one (L1).
+    /// Start the warm-up in the background when this run found no daemon (or
+    /// one of another build), or answered without it a service the daemon has
+    /// never seen (L1).
     pub(super) fn close(self) {
         if self.mode != Mode::Probe {
             return;
         }
-        let missed = std::fs::read_to_string(&self.misses).is_ok_and(|text| {
-            text.lines()
-                .filter(|line| !line.trim().is_empty())
-                .any(|line| !self.cold_only.contains(Path::new(line.trim())))
-        });
-        if self.warm_after || missed {
+        let misses = std::fs::read_to_string(&self.misses).unwrap_or_default();
+        if warms_after(self.warm_after, &misses, &self.listed) {
             start_warm_up(&self.root);
         }
     }
+}
+
+/// Whether a re-check starts the warm-up: when it found no daemon to use
+/// (`warm_after`), or one of its misses is a service the daemon's status does
+/// not list at all. A service it lists, in any state (built, released after
+/// an eviction, cold only), starts nothing: the daemon has had it, and warming
+/// it again after every check would evict the next service a check needs, in a
+/// loop.
+fn warms_after(warm_after: bool, misses: &str, listed: &BTreeSet<PathBuf>) -> bool {
+    warm_after
+        || misses
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .any(|line| !listed.contains(Path::new(line)))
 }
 
 /// The warm-up's use of the daemon serving `root`: every service through it,
@@ -390,5 +402,17 @@ mod tests {
         )
         .unwrap();
         assert!(warm_up_use(dir.path(), "any build").is_none());
+    }
+
+    /// A miss warms only a service the daemon has never listed: one it
+    /// released after an eviction, or holds cold only, starts nothing, so a
+    /// check after an eviction does not start the warm-up that evicts again.
+    #[test]
+    fn only_a_service_the_daemon_never_saw_starts_a_warm_up() {
+        let listed: BTreeSet<PathBuf> = [PathBuf::from("/w/a"), PathBuf::from("/w/b")].into();
+        assert!(!warms_after(false, "/w/a\n/w/b\n", &listed));
+        assert!(!warms_after(false, "", &listed));
+        assert!(warms_after(false, "/w/a\n/w/c\n", &listed));
+        assert!(warms_after(true, "", &listed));
     }
 }

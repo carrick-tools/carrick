@@ -194,7 +194,7 @@ impl StandIn {
     fn start(
         root: &Path,
         claimed: &Path,
-        answer: Option<fn(&serde_json::Value) -> serde_json::Value>,
+        answer: Option<fn(&serde_json::Value, &Path) -> serde_json::Value>,
     ) -> Self {
         use std::io::{BufRead, BufReader, Write};
         use std::sync::atomic::Ordering;
@@ -221,7 +221,6 @@ impl StandIn {
         let stopping = stop.clone();
         let claimed = claimed.to_path_buf();
         let thread = std::thread::spawn(move || {
-            let mut held = Vec::new();
             while !stopping.load(Ordering::Relaxed) {
                 let Ok((stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(20));
@@ -229,7 +228,6 @@ impl StandIn {
                 };
                 stream.set_nonblocking(false).unwrap();
                 let claimed = claimed.clone();
-                held.push(stream.try_clone().unwrap());
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().unwrap();
                     let mut lines = BufReader::new(stream).lines();
@@ -248,7 +246,12 @@ impl StandIn {
                             })
                         } else {
                             let Some(answer) = answer else { continue };
-                            let mut frame = answer(&request);
+                            let mut frame = answer(&request, &claimed);
+                            // Null: close the connection, as a daemon does on
+                            // a failure only it has (L4).
+                            if frame.is_null() {
+                                return;
+                            }
                             frame["request_id"] = id;
                             frame
                         };
@@ -258,7 +261,6 @@ impl StandIn {
                     }
                 });
             }
-            drop(held);
         });
         Self {
             stop,
@@ -277,11 +279,30 @@ impl Drop for StandIn {
 }
 
 /// A `status` that says a warm-up is filling the daemon.
-fn warming_status(request: &serde_json::Value) -> serde_json::Value {
-    assert_eq!(request["action"], "status");
+fn warming_status(request: &serde_json::Value, _root: &Path) -> serde_json::Value {
+    if request["action"] != "status" {
+        return serde_json::Value::Null;
+    }
     serde_json::json!({
         "status": "success",
         "daemon": { "pid": std::process::id(), "socket": "", "services": [], "warming": true },
+    })
+}
+
+/// A `status` that lists both fixture services as released (evicted to stay
+/// under the heap cap), holding neither built.
+fn released_status(request: &serde_json::Value, root: &Path) -> serde_json::Value {
+    // Anything else (the join's check) closes the connection: answered cold.
+    if request["action"] != "status" {
+        return serde_json::Value::Null;
+    }
+    let service = |name: &str| serde_json::json!({ "repo_root": root.join(name), "built": false, "state": "released" });
+    serde_json::json!({
+        "status": "success",
+        "daemon": {
+            "pid": std::process::id(), "socket": root.join(".carrick/typed.sock"),
+            "services": [service("catalog-web"), service("inventory-svc")], "warming": false,
+        },
     })
 }
 
@@ -757,6 +778,36 @@ fn a_warming_daemon_leaves_the_check_cold_and_starts_nothing() {
     assert!(
         !root.join(".carrick/typed-warm.pid").exists(),
         "no warm-up was started"
+    );
+    drop(stand_in);
+}
+
+/// A check after an eviction: the daemon lists both services as released, so
+/// the check answers them cold, the same as with no daemon, and starts no
+/// warm-up (one would evict the next service a check needs, in a loop).
+#[test]
+#[serial]
+fn a_check_after_an_eviction_starts_no_warm_up() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    run(&root, &["refresh", "--workspace", "."], false);
+    break_the_producer(&root);
+    let recheck = ["check", ROUTE, "--workspace", ".", "--recheck", "--json"];
+    let (cold_code, cold) = run(&root, &recheck, false);
+
+    let stand_in = StandIn::start(&root, &root, Some(released_status));
+    let (code, answered) = run(&root, &recheck, true);
+    assert_eq!(code, cold_code);
+    assert_eq!(without_timing(&answered), without_timing(&cold));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !root.join(".carrick/typed-warm.pid").exists(),
+        "no warm-up was started"
+    );
+    assert_eq!(
+        typed_daemon::read_record(&root).map(|r| r.pid),
+        Some(std::process::id()),
+        "nothing was started in the stand-in's place"
     );
     drop(stand_in);
 }
