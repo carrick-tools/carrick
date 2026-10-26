@@ -44,6 +44,7 @@ import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Project } from 'ts-morph';
+import { WriteGuard } from './capture/guarded-fs.js';
 import { listProgramFiles } from './program-files.js';
 import type { InferredType } from './types.js';
 
@@ -263,7 +264,10 @@ export function rebuildProgram(project: Project): void {
  * for `ENTRY_MAX_AGE_MS` are deleted on the way.
  */
 export function writeEntry(key: AnswerKey, programs: ProgramRecord[], answer: KeptAnswer): void {
-  fs.mkdirSync(key.dir, { recursive: true });
+  // The cache directory is the only place this writes, and never the
+  // service it read (carrick#1748).
+  const guard = WriteGuard.of({ dirs: [key.dir], protect: [key.repoRoot] });
+  guard.mkdir(key.dir);
   const entry: Entry = {
     version: ENTRY_VERSION,
     identity: sidecarIdentity(),
@@ -274,13 +278,13 @@ export function writeEntry(key: AnswerKey, programs: ProgramRecord[], answer: Ke
   };
   const target = entryPath(key);
   const temporary = `${target}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(entry));
-  fs.renameSync(temporary, target);
+  guard.writeFile(temporary, JSON.stringify(entry));
+  guard.rename(temporary, target);
   const now = Date.now();
   for (const name of fs.readdirSync(key.dir)) {
     const file = path.join(key.dir, name);
     try {
-      if (now - fs.statSync(file).mtimeMs > ENTRY_MAX_AGE_MS) fs.rmSync(file, { force: true });
+      if (now - fs.statSync(file).mtimeMs > ENTRY_MAX_AGE_MS) guard.remove(file);
     } catch {
       // Another process removed it first.
     }

@@ -107,7 +107,8 @@ describe('a kept infer answer (carrick#2843)', () => {
 
   beforeEach(() => {
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-infer-cache-')));
-    cache = path.join(root, '.cache');
+    // Outside the service: the write guard refuses a cache in the tree it reads.
+    cache = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-infer-cache-dir-'))), 'infer');
     fs.mkdirSync(path.join(root, 'src'));
     fs.mkdirSync(path.join(root, 'types'));
     fs.writeFileSync(path.join(root, 'tsconfig.json'), TSCONFIG);
@@ -119,6 +120,7 @@ describe('a kept infer answer (carrick#2843)', () => {
 
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(path.dirname(cache), { recursive: true, force: true });
   });
 
   it('serves the same answer to the same request of the same tree, and leaves the same program', async () => {
