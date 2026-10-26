@@ -865,6 +865,12 @@ pub(super) fn scan_command(
     } else {
         command.env_remove(crate::preflight::ALLOW_ENV);
     }
+    // The fact layer the cloud runner scans with, so an edited file is read
+    // with the detection its hosted rows were built with. A value the caller
+    // set, `0` included, is inherited unchanged ([`crate::fact_layer`]).
+    for switch in crate::fact_layer::local_defaults(|name| std::env::var_os(name)) {
+        command.env(switch, "1");
+    }
     // A laptop scans the same services again and again, so its sidecars keep
     // their type answers and serve them again while the program they were
     // read in is unchanged (carrick#2843). A directory the caller named wins.
@@ -2252,6 +2258,21 @@ mod tests {
             Some(&None),
             "the laptop flag is explicitly cleared, not merely absent"
         );
+    }
+
+    /// Every local scan, with or without the model, runs the fact layer the
+    /// cloud runner scans with; a switch the caller set is inherited as set.
+    #[test]
+    fn every_local_scan_turns_the_fact_layer_on() {
+        for pass in [Pass::Facts, Pass::Infer, Pass::Dispatch] {
+            let env = scan_env(&pass);
+            for switch in crate::fact_layer::SWITCHES {
+                let expected = std::env::var_os(switch)
+                    .is_none()
+                    .then(|| Some("1".to_string()));
+                assert_eq!(env.get(switch), expected.as_ref(), "{switch}");
+            }
+        }
     }
 
     /// A laptop scan asks the model, generates intents and uploads — the same

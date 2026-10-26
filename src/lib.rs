@@ -31,6 +31,7 @@ pub mod eval_output;
 pub mod event_emitter;
 pub mod external_call_candidates;
 pub mod extractor;
+pub mod fact_layer;
 pub mod fallback_tally;
 pub mod file_based_router;
 pub mod file_finder;
