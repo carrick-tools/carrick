@@ -412,8 +412,8 @@ pub(super) struct Rejoined {
 ///    incremental scan.
 /// 2. The join over every blob, re-scanned and retained, with the type check.
 ///
-/// `typed` says how the re-scans use the resident type daemon (carrick#2884):
-/// the join's own type check never does.
+/// `typed` says how the re-scans and the join's type check use the resident
+/// type daemon (carrick#2884, carrick#2883).
 pub(super) fn rejoin(
     workspace: &Workspace,
     repos: &[&Path],
@@ -534,6 +534,8 @@ fn rejoin_through(
     let out = generation.join("join.json");
     let mut join = join_command(&exe, anchor, &blobs, &out);
     join.env_remove(crate::progress::PROGRESS_ENV);
+    // The join's type check asks the daemon first, when this run uses one.
+    typed.apply(&mut join);
     bounded(join, "re-join", deadline)?;
     let text = std::fs::read_to_string(&out)
         .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;

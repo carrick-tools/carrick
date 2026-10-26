@@ -643,6 +643,12 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             match spawn_sidecar(&sidecar_path, &args.repo_path, &initial_service) {
                 Ok(sidecar) => {
                     debug!("Sidecar spawned, initializing in background...");
+                    // A local join asks the resident type daemon its `check`
+                    // handed it for the type check first (carrick#2883); any
+                    // failure there is checked in this process instead.
+                    if env::var_os(carrick::local_mode::JOIN_OUT_ENV).is_some() {
+                        sidecar.set_check_daemon(carrick::services::typed_daemon::Use::from_env());
+                    }
                     Some(sidecar)
                 }
                 Err(e) => {

@@ -2533,6 +2533,13 @@ pub struct TypeSidecar {
     /// The last request written to the daemon, sent again to a process of
     /// this sidecar's own when the daemon goes away before answering it.
     sent_to_daemon: Mutex<Option<String>>,
+    /// Whether a daemon link that fails falls back to a process of this
+    /// sidecar's own. Off for the join's `check_v2` link, whose caller asks
+    /// its own cold process instead ([`Self::check_v2`]).
+    cold_fallback: AtomicBool,
+    /// The resident type daemon a `check_v2` is asked of first, with the
+    /// build id of this sidecar ([`Self::set_check_daemon`]).
+    check_daemon: Mutex<Option<(PathBuf, String)>>,
     /// Lines the sidecar wrote to stdout, in order, delivered by the reader
     /// thread spawned in [`TypeSidecar::spawn`]. Reading through a channel
     /// rather than blocking on `read_line` is what makes every timeout in
@@ -2844,6 +2851,8 @@ impl TypeSidecar {
             stdin: Mutex::new(stdin),
             daemon: Mutex::new(daemon),
             sent_to_daemon: Mutex::new(None),
+            cold_fallback: AtomicBool::new(true),
+            check_daemon: Mutex::new(None),
             responses: Mutex::new(responses),
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
             spawn_time,
@@ -3351,6 +3360,11 @@ impl TypeSidecar {
     /// consumer each lost pair belongs to
     /// ([`crate::time_limits::from_check_outcomes`]).
     fn restarting_on_timeout<T>(&self, answer: Result<T, SidecarError>) -> Result<T, SidecarError> {
+        if self.on_daemon() && !self.cold_fallback.load(Ordering::Relaxed) {
+            // The join's check link: its caller checks in its own process,
+            // so this is no time limit and nothing here is restarted.
+            return answer;
+        }
         if matches!(answer, Err(SidecarError::Timeout)) && self.record_only {
             // Nobody reads its answer, so nothing is counted and nothing is
             // replaced: the process is stopped and the caller loses its work.
@@ -3824,7 +3838,84 @@ impl TypeSidecar {
                 "check_v2 requires at least one stub and one pair".to_string(),
             ));
         }
+        if let Some(answer) = self.check_v2_through_daemon(stubs, pairs) {
+            return Ok(answer);
+        }
+        self.check_v2_here(stubs, pairs)
+    }
 
+    /// Ask the resident type daemon this sidecar was handed
+    /// ([`Self::set_check_daemon`]) for the check, on a connection of its own
+    /// that sends no `init`: the daemon keeps its judge's workspace between
+    /// checks and re-checks only what changed (carrick#2883). `None` when
+    /// there is no daemon, it refuses or is busy, closes the connection, or
+    /// does not answer in time: the caller then asks its own process, whose
+    /// answer is the one a run without a daemon reads (the lifecycle
+    /// policy's L4).
+    #[cfg(unix)]
+    fn check_v2_through_daemon(
+        &self,
+        stubs: &[CheckStubInput],
+        pairs: &[CheckPairSpec],
+    ) -> Option<CheckV2Result> {
+        let (socket, build_id) = self.check_daemon.lock().unwrap().clone()?;
+        let link = match TypeSidecar::connect_daemon(
+            &self.sidecar_path,
+            &socket,
+            &build_id,
+            crate::services::typed_daemon::HelloMode::Probe,
+        ) {
+            Ok(link) => link.with_operation_timeout(self.operation_timeout),
+            Err(e) => {
+                debug!("[type_sidecar] The type daemon did not take the check: {e}");
+                return None;
+            }
+        };
+        link.cold_fallback.store(false, Ordering::Relaxed);
+        // No `init`: a check reads only the stubs and pairs it is sent.
+        *link.state.lock().unwrap() = SidecarState::Ready;
+        match link.check_v2_here(stubs, pairs) {
+            Ok(answer) => Some(answer),
+            Err(e) => {
+                debug!(
+                    "[type_sidecar] The type daemon gave no check ({e}); checking in this sidecar's own process"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn check_v2_through_daemon(
+        &self,
+        _stubs: &[CheckStubInput],
+        _pairs: &[CheckPairSpec],
+    ) -> Option<CheckV2Result> {
+        None
+    }
+
+    /// Ask the daemon `daemon` names for every `check_v2` first, on a
+    /// connection of its own ([`Self::check_v2`]). Nothing changes when it is
+    /// `None` or this sidecar's build id cannot be read.
+    pub fn set_check_daemon(&self, daemon: Option<crate::services::typed_daemon::Use>) {
+        let routed = daemon.and_then(|daemon| {
+            match crate::services::typed_daemon::build_id(&self.sidecar_path) {
+                Ok(id) => Some((daemon.socket().to_path_buf(), id)),
+                Err(e) => {
+                    debug!("[type_sidecar] No build id for the type daemon: {e}");
+                    None
+                }
+            }
+        });
+        *self.check_daemon.lock().unwrap() = routed;
+    }
+
+    /// One `check_v2` request in this sidecar, as [`Self::check_v2`] reads it.
+    fn check_v2_here(
+        &self,
+        stubs: &[CheckStubInput],
+        pairs: &[CheckPairSpec],
+    ) -> Result<CheckV2Result, SidecarError> {
         let request_id = self.next_request_id();
         let request = SidecarRequest::CheckV2 {
             request_id: request_id.clone(),
@@ -4102,7 +4193,10 @@ impl TypeSidecar {
     /// cannot take a service's `init` is left for a process of its own by
     /// the caller ([`SidecarRecipe::spawn_scoped`]).
     fn answers_cold_after(&self, why: &dyn std::fmt::Display) -> bool {
-        if !self.on_daemon() || *self.state.lock().unwrap() != SidecarState::Ready {
+        if !self.on_daemon()
+            || !self.cold_fallback.load(Ordering::Relaxed)
+            || *self.state.lock().unwrap() != SidecarState::Ready
+        {
             return false;
         }
         // The log's: what went away is ours, and nothing the scanned code said.
@@ -8017,5 +8111,101 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
         let back: ResultShape = serde_json::from_str(r#"{"parse":"json"}"#).unwrap();
         assert_eq!(back, ResultShape::Parse("json".into()));
+    }
+
+    /// A join handed a daemon asks it for the type check first, on a
+    /// connection that sends no `init` (carrick#2883); a daemon that closes
+    /// the connection or does not answer leaves the check to the join's own
+    /// process, whose answer is used (the lifecycle policy's L4).
+    #[cfg(unix)]
+    #[test]
+    fn a_join_checks_through_the_daemon_and_falls_back_to_its_own_process() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  write({ request_id, status: 'success', result: { success: true, isolation: 'cold', install_ok: true, ts_version: 't' } });
+});
+"#,
+        )
+        .unwrap();
+        let stubs = [CheckStubInput {
+            service_name: "api".into(),
+            stub_dir: "/s".into(),
+        }];
+        let pairs = [CheckPairSpec {
+            pair_key: "p".into(),
+            protocol: ProbeProtocol::Http,
+            type_kind: ProbeTypeKind::Response,
+            producer: CheckPairEndpoint {
+                service_name: "api".into(),
+                alias: "A".into(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: "web".into(),
+                alias: "B".into(),
+            },
+            topic: None,
+        }];
+        let join = TypeSidecar::spawn(&script).unwrap();
+        join.start_init(&root, None);
+        join.wait_ready(Duration::from_secs(20)).unwrap();
+
+        for close in [false, true] {
+            let socket = root.join(format!("d-{close}.sock"));
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let daemon = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut seen = Vec::new();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let action = request["action"].as_str().unwrap_or("").to_string();
+                    seen.push(action.clone());
+                    let id = request["request_id"].clone();
+                    let answer = match action.as_str() {
+                        "hello" => {
+                            serde_json::json!({"request_id": id, "status": "success", "pid": 1})
+                        }
+                        "check_v2" if close => break,
+                        "check_v2" => serde_json::json!({"request_id": id, "status": "success",
+                            "result": {"success": true, "isolation": "warm", "install_ok": true, "ts_version": "t"}}),
+                        _ => break,
+                    };
+                    writeln!(writer, "{answer}").unwrap();
+                }
+                seen
+            });
+            join.set_check_daemon(Some(crate::services::typed_daemon::Use::new(
+                socket,
+                crate::services::typed_daemon::Route::Held(Default::default()),
+                None,
+            )));
+            let answer = join.check_v2(&stubs, &pairs).unwrap();
+            // Before the thread is joined: a join that never asks the daemon
+            // fails here rather than waiting on its accept.
+            if close {
+                assert_eq!(answer.isolation, "cold", "the join's own process answered");
+            } else {
+                assert_eq!(answer.isolation, "warm", "the daemon answered the check");
+            }
+            let seen = daemon.join().unwrap();
+            assert_eq!(
+                &seen[..2],
+                ["hello", "check_v2"],
+                "no init on the check link"
+            );
+        }
     }
 }
