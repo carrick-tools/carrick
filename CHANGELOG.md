@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.132](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.131...carrick-v0.3.132) (2026-10-26)
+
+
+### Features
+
+* **local:** carrick check --changed checks every changed file in one pass ([#2825](https://github.com/carrick-tools/carrick/issues/2825)) ([3042be1](https://github.com/carrick-tools/carrick/commit/3042be1df494874c169c82739c1e47d4e5f6e811))
+* **local:** carrick check takes several files, and --changed lists only facts ([#2827](https://github.com/carrick-tools/carrick/issues/2827)) ([#2834](https://github.com/carrick-tools/carrick/issues/2834)) ([37334d6](https://github.com/carrick-tools/carrick/commit/37334d6aff3cb1d195e49cbbf2036c38820d4eb0))
+
+
+### Bug Fixes
+
+* **call_through:** a call on a factory's value reaches the request the compiler's call row names ([#2822](https://github.com/carrick-tools/carrick/issues/2822), [#2823](https://github.com/carrick-tools/carrick/issues/2823)) ([#2830](https://github.com/carrick-tools/carrick/issues/2830)) ([132eeeb](https://github.com/carrick-tools/carrick/commit/132eeebe48e36fedc62f3c7ab3c8bf2978ae0728))
+* **local:** check --changed fails only on new facts, scans changed services only ([#2838](https://github.com/carrick-tools/carrick/issues/2838)) ([c0d5572](https://github.com/carrick-tools/carrick/commit/c0d5572076dc3b7943f6c8bde27e21f5f0df6a39))
+* **local:** hosted rows replay under the cloud's service slug; a current checkout is read in without a re-read ([#2841](https://github.com/carrick-tools/carrick/issues/2841)) ([a208d66](https://github.com/carrick-tools/carrick/commit/a208d66a36c0bae86ba541d7c4398f60d521585f))
+* **local:** refresh re-reads only the services an edit moved, and carries the rest from the hosted index ([#2845](https://github.com/carrick-tools/carrick/issues/2845)) ([7813f60](https://github.com/carrick-tools/carrick/commit/7813f60a63606ca491ae18acc404bfbb0e223a5a))
+* **scope:** skip services the change did not touch on unbuilt checkouts and init-dirty indexes ([#2842](https://github.com/carrick-tools/carrick/issues/2842)) ([280bd1d](https://github.com/carrick-tools/carrick/commit/280bd1d8d0ebb5b6d26f83818ca9b66c13e7600f))
+* **sidecar:** absent body is compatible only where the receiver's handler tolerates it ([#2815](https://github.com/carrick-tools/carrick/issues/2815)) ([c957a76](https://github.com/carrick-tools/carrick/commit/c957a7658cb7d5807208cb7f16988da54bbb9adb))
+
+
+### Performance
+
+* **local:** re-scan the services a change reaches side by side ([#2844](https://github.com/carrick-tools/carrick/issues/2844)) ([bc6d99d](https://github.com/carrick-tools/carrick/commit/bc6d99d4d3260a13bb0bc593e216a3b56278330b))
+
 ## [0.3.131](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.130...carrick-v0.3.131) (2026-10-25)
 
 
