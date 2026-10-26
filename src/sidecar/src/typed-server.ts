@@ -75,7 +75,34 @@ export function buildIdOf(distSrc: string): string {
     const content = crypto.createHash('sha256').update(fs.readFileSync(path.join(distSrc, rel))).digest('hex');
     hash.update(`${rel}\0${content}\n`);
   }
+  // The compiler is part of the build: the same sources over another
+  // TypeScript answer differently.
+  const root = path.resolve(distSrc, '..', '..');
+  for (const name of COMPILER_PACKAGES) hash.update(`pkg:${name}\0${installedVersion(root, name)}\n`);
   return hash.digest('hex');
+}
+
+/** The packages whose installed version the build id hashes, in order. The Rust client hashes the same. */
+const COMPILER_PACKAGES = ['typescript', 'ts-morph', '@ts-morph/common'];
+
+/**
+ * The `version` of the first `node_modules/<name>/package.json` from `root`
+ * up (Node's lookup, so a hoisted install is found), or `''` when there is
+ * none, it does not parse, or its version is not a string.
+ */
+function installedVersion(root: string, name: string): string {
+  for (let dir = root; ; dir = path.dirname(dir)) {
+    const manifest = path.join(dir, 'node_modules', name, 'package.json');
+    if (fs.existsSync(manifest)) {
+      try {
+        const version = JSON.parse(fs.readFileSync(manifest, 'utf8'))?.version;
+        return typeof version === 'string' ? version : '';
+      } catch {
+        return '';
+      }
+    }
+    if (path.dirname(dir) === dir) return '';
+  }
 }
 
 /**

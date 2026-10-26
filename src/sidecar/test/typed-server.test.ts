@@ -23,11 +23,14 @@
 
 import { describe, it, after } from 'node:test';
 import * as assert from 'node:assert';
+import * as crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { ts } from 'ts-morph';
 import { SidecarClient, SIDECAR_PATH } from './helpers.js';
+import { buildIdOf } from '../src/typed-server.js';
 import {
   SocketClient,
   buildId,
@@ -340,5 +343,51 @@ describe('typed server (carrick#2879)', () => {
     } finally {
       await client.stop();
     }
+  });
+});
+
+describe('build id (carrick#2879)', () => {
+  /** The id by the formula the Rust client hashes too: file lines, then one line per compiler package. */
+  function expectedId(distSrc: string, versions: [string, string, string]): string {
+    const hash = crypto.createHash('sha256');
+    for (const rel of fs.readdirSync(distSrc).sort()) {
+      const content = crypto.createHash('sha256').update(fs.readFileSync(path.join(distSrc, rel))).digest('hex');
+      hash.update(`${rel}\0${content}\n`);
+    }
+    ['typescript', 'ts-morph', '@ts-morph/common'].forEach((name, i) => hash.update(`pkg:${name}\0${versions[i]}\n`));
+    return hash.digest('hex');
+  }
+
+  function writePackage(dir: string, name: string, version: unknown): void {
+    fs.mkdirSync(path.join(dir, 'node_modules', name), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'node_modules', name, 'package.json'), JSON.stringify({ name, version }));
+  }
+
+  it('hashes the installed compiler versions, found nested or hoisted, so another TypeScript is another build', () => {
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), 'cbid-'));
+    try {
+      const root = path.join(top, 'app', 'sidecar');
+      const distSrc = path.join(root, 'dist', 'src');
+      fs.mkdirSync(distSrc, { recursive: true });
+      fs.writeFileSync(path.join(distSrc, 'index.js'), 'export {};\n');
+      writePackage(root, 'typescript', '6.0.2');
+      // Hoisted above the sidecar, as an npm install of a parent package lays it out.
+      writePackage(top, 'ts-morph', '28.0.0');
+      // Absent: ts-morph's compiler package. A version that is not a string reads as absent.
+      writePackage(path.join(top, 'app'), '@ts-morph/common', 7);
+      const first = buildIdOf(distSrc);
+      assert.strictEqual(first, expectedId(distSrc, ['6.0.2', '28.0.0', '']));
+      writePackage(root, 'typescript', '6.0.3');
+      assert.notStrictEqual(buildIdOf(distSrc), first);
+      assert.strictEqual(buildIdOf(distSrc), expectedId(distSrc, ['6.0.3', '28.0.0', '']));
+    } finally {
+      fs.rmSync(top, { recursive: true, force: true });
+    }
+  });
+
+  it("names the TypeScript this build runs: the located version is the compiler's own", () => {
+    const sidecarRoot = path.resolve(path.dirname(SIDECAR_PATH), '..', '..');
+    const located = JSON.parse(fs.readFileSync(path.join(sidecarRoot, 'node_modules', 'typescript', 'package.json'), 'utf8')).version;
+    assert.strictEqual(located, ts.version);
   });
 });
