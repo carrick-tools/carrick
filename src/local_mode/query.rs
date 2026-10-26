@@ -402,10 +402,10 @@ fn rechecked(
                 elapsed_ms: degraded.elapsed.as_millis() as u64,
                 stale_since: Some(indexed_at.to_string()),
                 reason: Some(degraded.reason),
-                // A re-check that did not run extracted nothing, so it has
-                // nothing to compare: silence here is "not asked", never
-                // "nothing new".
-                new_functions: Vec::new(),
+                // Named from a parse that ran before the re-scan, so a re-scan
+                // that missed its budget still says what the edit added
+                // (carrick#2849).
+                new_functions: degraded.new_functions,
             },
         ),
     }

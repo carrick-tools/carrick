@@ -540,9 +540,9 @@ pub struct Recheck {
     /// Functions this file declares in the working tree that the index does
     /// not hold under that name (carrick#1330).
     ///
-    /// The re-check already re-extracts the file, so this costs one set
-    /// difference on top of work that has been done. Empty on a `none` — a
-    /// re-check that did not run extracted nothing to compare — and empty,
+    /// Named from one parse of the file before the re-scan starts, so it does
+    /// not wait on the re-scan: a `none` that missed its budget still carries
+    /// it (carrick#2849). Empty when the index could not be read, and empty,
     /// which is the usual answer, when the edit added no function.
     ///
     /// It is a NAME comparison against one commit, and both halves of that

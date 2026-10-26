@@ -181,7 +181,7 @@ Three parts, in the order they fire:
 
 | Part | Governed code | What it does |
 |---|---|---|
-| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | already re-extracts the edited file; now also answers with `recheck.new_functions`, the functions it declares that the index does not hold (`docs/local-mode-output.md`) |
+| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | answers with `recheck.new_functions`, the functions the edited file declares that the index does not hold (`docs/local-mode-output.md`), from a parse of that file that does not wait on the re-scan, so a re-scan that misses its budget still records them (carrick#2849) |
 | `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
 | `carrick hook stop` (Claude Code) or `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/user-prompt.ts`, `drain` in `npm/carrick/src/hook/reuse.ts` | names the accumulated set once and points at this skill |
 

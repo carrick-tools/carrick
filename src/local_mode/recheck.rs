@@ -21,9 +21,12 @@
 //!    [`LocalJoin`] the indexer folds. Nothing is downloaded and nothing is
 //!    written outside a temporary directory this module deletes.
 //!
-//! It also answers with the functions the re-extracted file declares that the
-//! index does not hold, which is what the end-of-task reuse nudge speaks from
-//! (carrick#1330; `docs/reference/task-skills.md`, "The reuse nudge").
+//! It also answers with the functions the edited file declares that the index
+//! does not hold, which is what the end-of-task reuse nudge speaks from
+//! (carrick#1330; `docs/reference/task-skills.md`, "The reuse nudge"). Those
+//! come from one parse of the file before either phase starts, and are kept on
+//! a miss too (carrick#2849): on a large monorepo the re-scan alone outlasts
+//! the budget, and the nudge must not depend on it.
 //!
 //! A deadline covers both phases. On a miss the caller keeps the indexed
 //! answer and says how old it is; the re-check never blocks an edit and never
@@ -93,6 +96,11 @@ const MAX_NEW_FUNCTIONS: usize = 20;
 /// Why a re-check did not produce one.
 pub struct Degraded {
     pub reason: String,
+    /// The functions the edited file declares that the index does not hold,
+    /// named from a parse of the file before the re-scan started
+    /// (carrick#2849). A re-scan that misses its budget leaves the verdicts
+    /// at their indexed age, but what the edit added is known either way.
+    pub new_functions: Vec<super::contract::NewFunction>,
     pub elapsed: Duration,
 }
 
@@ -114,48 +122,103 @@ fn budget_from(raw: Option<&str>) -> Duration {
 pub fn run(workspace: &Workspace, repo: &Path, relative: &str) -> Result<Fresh, Degraded> {
     let started = Instant::now();
     let deadline = started + budget();
+    // The index is read once, here, and named twice: for what the edit added
+    // and for the re-join. What the edit added does not wait on the re-scan
+    // (carrick#2849): on a large repo the re-scan alone outlasts the budget,
+    // and the reuse nudge would then never hear of a function the edit wrote.
+    let held = match Held::read(workspace) {
+        Ok(held) => held,
+        Err(reason) => {
+            return Err(Degraded {
+                reason,
+                new_functions: Vec::new(),
+                elapsed: started.elapsed(),
+            });
+        }
+    };
+    let new_functions = added_functions(&held, repo, relative);
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
-    let outcome = inside(workspace, repo, relative, &generation, deadline);
+    let outcome = inside(workspace, held, repo, relative, &generation, deadline);
     // The temporary generation goes on every path, including the one where a
     // phase was killed at the deadline: a hook that leaves a directory behind
     // per edit is a hook that fills a disk in an afternoon.
     let _ = std::fs::remove_dir_all(&generation);
     match outcome {
         Ok(fresh) => Ok(Fresh {
+            new_functions,
             elapsed: started.elapsed(),
             ..fresh
         }),
         Err(reason) => Err(Degraded {
             reason,
+            new_functions,
             elapsed: started.elapsed(),
         }),
     }
 }
 
+/// What the last `index` left on disk, read once per re-check: the local
+/// blobs (`.carrick/repos`) and the cached hosted snapshot. Nothing is
+/// downloaded: a re-check that waited on the network would miss its budget on
+/// the wire rather than on the work.
+struct Held {
+    local: Vec<crate::cloud_storage::CloudRepoData>,
+    hosted: super::hosted::HostedInput,
+}
+
+impl Held {
+    fn read(workspace: &Workspace) -> Result<Self, String> {
+        Ok(Self {
+            local: read_blobs(&workspace.blobs_dir())?,
+            hosted: super::hosted::cached(workspace),
+        })
+    }
+}
+
+/// The functions `relative` declares in the working tree that the index does
+/// not hold for it, from one parse of the file (carrick#2849).
+///
+/// The parse is the extractor discovery runs ([`crate::pr_functions::stated_in`]),
+/// so a name here is spelled as the index spells it. What the index holds is
+/// BOTH records of this repo, because neither is present on every install:
+/// `index` keeps only the blobs of services it scanned locally in
+/// `.carrick/repos` (the write there filters out every service the hosted
+/// snapshot answers for), and the hosted half is empty on a machine that is
+/// not signed in. A union is also the truer reading of "the index": the hosted
+/// blob is this repo on its default branch, which is what a nudge built on
+/// this tells the agent it was compared against. Either one alone would
+/// report every function in an edited file as new on the install the other
+/// covers.
+fn added_functions(held: &Held, repo: &Path, relative: &str) -> Vec<super::contract::NewFunction> {
+    let name = repo_label(repo);
+    let hosted = held.hosted.local_blobs(repo);
+    let indexed = functions_in(
+        held.local
+            .iter()
+            .filter(|blob| blob.repo_name == name)
+            .chain(hosted.iter()),
+        relative,
+    );
+    let path = repo.join(relative);
+    // A file that cannot be read (deleted by the edit, or not script) states
+    // no functions, as it states no rows.
+    let Some(source) = crate::parser::read_source(&path) else {
+        return Vec::new();
+    };
+    let stated = crate::pr_functions::stated_in(Path::new(relative), relative.to_string(), source);
+    new_functions(&indexed, stated.into_values())
+}
+
 fn inside(
     workspace: &Workspace,
+    held: Held,
     repo: &Path,
     relative: &str,
     generation: &Path,
     deadline: Instant,
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
-    let rejoined = rejoin(workspace, &[repo], generation, deadline)?;
-
-    // What the index holds for THIS file, before the re-scan answers the same
-    // question about the working tree. BOTH records of it, because neither is
-    // present on every install: `index` keeps only the blobs of services it
-    // scanned locally in `.carrick/repos` (the write there filters out every
-    // service the hosted snapshot answers for), and the hosted half is empty
-    // on a machine that is not signed in. A union is also the truer reading of
-    // "the index": the hosted blob is this repo on its default branch, which
-    // is what a nudge built on this tells the agent it was compared against.
-    // Either one alone would report every function in an edited file as new on
-    // the install the other covers.
-    let indexed_functions = functions_in(rejoined.indexed.iter(), relative);
-    // One set difference over work already done: the re-scan walked this
-    // file's AST to re-extract its rows, and its functions came back with them.
-    let new_functions = new_functions(&indexed_functions, rejoined.rescanned.iter(), relative);
+    let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline)?;
 
     let items = rejoined
         .index
@@ -175,7 +238,8 @@ fn inside(
     };
     Ok(Fresh {
         items,
-        new_functions,
+        // Filled in by `run`, from the parse that did not wait on this.
+        new_functions: Vec::new(),
         ran,
         elapsed: Duration::default(),
     })
@@ -189,11 +253,6 @@ pub(super) struct Rejoined {
     /// The join it was folded from, for a reader that needs what the read
     /// model does not carry (an edge's source, the calls that reach no route).
     pub join: super::LocalJoin,
-    /// The blobs the re-scans wrote, every re-scanned repo's.
-    pub rescanned: Vec<crate::cloud_storage::CloudRepoData>,
-    /// What the index held for the re-scanned repos before: the local blobs
-    /// and the hosted snapshot's copy, both, for the reason [`inside`] gives.
-    pub indexed: Vec<crate::cloud_storage::CloudRepoData>,
     /// How many distinct services the join read, re-scanned and retained.
     pub services: usize,
 }
@@ -216,6 +275,23 @@ pub(super) fn rejoin(
     generation: &Path,
     deadline: Instant,
 ) -> Result<Rejoined, String> {
+    rejoin_held(
+        workspace,
+        Held::read(workspace)?,
+        repos,
+        generation,
+        deadline,
+    )
+}
+
+/// [`rejoin`], over an index already read.
+fn rejoin_held(
+    workspace: &Workspace,
+    held: Held,
+    repos: &[&Path],
+    generation: &Path,
+    deadline: Instant,
+) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
     let blobs = generation.join("repos");
@@ -225,7 +301,10 @@ pub(super) fn rejoin(
     let mut services = std::collections::BTreeSet::new();
 
     // Everything except the re-scanned repos, exactly as the last index left it.
-    let retained = read_blobs(&workspace.blobs_dir())?;
+    let Held {
+        local: retained,
+        hosted,
+    } = held;
     let mut indexed = Vec::new();
     for (position, blob) in retained.into_iter().enumerate() {
         if names.contains(&blob.repo_name) {
@@ -235,10 +314,7 @@ pub(super) fn rejoin(
         services.insert(service_id(&blob));
         write_blob(&blobs.join(format!("retained-{position}.json")), &blob)?;
     }
-    // The hosted services, from the snapshot on disk. No request is made: a
-    // re-check that waited on the network would miss its budget on the wire
-    // rather than on the work.
-    let hosted = super::hosted::cached(workspace);
+    // The hosted services, from the snapshot on disk.
     let mut remote_services = std::collections::BTreeMap::new();
     for (position, (remote, blob)) in hosted.remote_blobs().into_iter().enumerate() {
         services.insert(service_id(&blob));
@@ -252,7 +328,6 @@ pub(super) fn rejoin(
     // and the local blob of every service the snapshot does not hold. It is
     // what an unchanged file replays its hosted answers from, and what the
     // change scope carries an untouched service from.
-    let mut rescanned = Vec::new();
     for (position, repo) in repos.iter().enumerate() {
         let name = repo_label(repo);
         let mut previous_data = hosted.local_blobs(repo);
@@ -277,18 +352,12 @@ pub(super) fn rejoin(
         let scan_dir = generation.join(format!("scan-{position}"));
         let scan = rescan_command(&exe, repo, &scan_dir, &previous);
         bounded(scan, "re-scan", deadline)?;
-        let mut fresh = read_blobs(&scan_dir)?;
+        let fresh = read_blobs(&scan_dir)?;
         let carried = super::index::carried_services(&previous_data, &fresh);
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
             write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;
         }
-        rescanned.append(&mut fresh);
-        indexed.extend(
-            previous_data
-                .into_iter()
-                .filter(|blob| hosted_ids.contains(&service_id(blob))),
-        );
     }
 
     // Phase 2. The join reads the blobs back and runs the type check over
@@ -310,8 +379,6 @@ pub(super) fn rejoin(
     Ok(Rejoined {
         index,
         join: joined,
-        rescanned,
-        indexed,
         services: services.len(),
     })
 }
@@ -387,31 +454,24 @@ fn functions_in<'a>(
         .collect()
 }
 
-/// What the re-scan declares in this file that `indexed` does not name.
+/// What the parse states in this file that `indexed` does not name.
 ///
 /// A name, not a body: the index holds no hash of the source, so a function
 /// that was renamed reads as new and one that was rewritten under its old name
 /// does not. That limit is stated wherever this list is rendered, because it
-/// decides what the answer means.
-fn new_functions<'a>(
+/// decides what the answer means. The parse keys definitions by name, so each
+/// name comes once; `<module>` never comes ([`crate::pr_functions::stated_in`]).
+fn new_functions(
     indexed: &std::collections::BTreeSet<String>,
-    rescanned: impl Iterator<Item = &'a crate::cloud_storage::CloudRepoData>,
-    relative: &str,
+    stated: impl Iterator<Item = crate::pr_functions::Stated>,
 ) -> Vec<super::contract::NewFunction> {
-    let mut found: Vec<super::contract::NewFunction> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for function in rescanned
-        .flat_map(|blob| blob.function_definitions.values())
-        .filter(|function| declared_in(function, relative))
-    {
-        if indexed.contains(&function.name) || !seen.insert(function.name.clone()) {
-            continue;
-        }
-        found.push(super::contract::NewFunction {
-            name: function.name.clone(),
-            line: function.line_number,
-        });
-    }
+    let mut found: Vec<super::contract::NewFunction> = stated
+        .filter(|function| !indexed.contains(&function.name))
+        .map(|function| super::contract::NewFunction {
+            name: function.name,
+            line: function.line,
+        })
+        .collect();
     // Line order, so the list reads down the file rather than out of a hash
     // map, and two runs over one tree produce the same answer.
     found.sort_by(|left, right| left.line.cmp(&right.line).then(left.name.cmp(&right.name)));

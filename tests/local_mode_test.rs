@@ -631,19 +631,31 @@ fn a_re_check_names_the_functions_the_index_does_not_hold() {
         "and says what they are new since:\n{text}"
     );
 
-    // Nothing is claimed when no re-check ran: a degraded answer extracted
-    // nothing, so it cannot say whether a function is new.
+    // A re-scan that misses its budget still names what the edit added
+    // (carrick#2849): the names come from a parse of the file, which does not
+    // wait on the re-scan. On a large monorepo the re-scan never fits the
+    // budget, and the reuse nudge would otherwise never hear of a function.
     let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
         root,
         &["check", route, "--workspace", ".", "--recheck", "--json"],
         &[("CARRICK_RECHECK_BUDGET_MS", "1")],
     ))
     .expect("check --recheck --json was not JSON");
-    assert_eq!(degraded["recheck"]["ran"], serde_json::json!("none"));
     assert_eq!(
-        degraded["recheck"]["new_functions"],
-        serde_json::Value::Null,
-        "a re-check that did not run names nothing:\n{degraded:#}"
+        degraded["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the verdicts are the indexed ones:\n{degraded:#}"
+    );
+    let named_degraded: Vec<&str> = degraded["recheck"]["new_functions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a missed budget dropped the new functions:\n{degraded:#}"))
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        named_degraded,
+        ["widgetLabel", "countActive"],
+        "the same names as a re-check that finished:\n{degraded:#}"
     );
 }
 
@@ -691,6 +703,13 @@ fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
         "the indexed verdict stands:\n{degraded:#}"
     );
     assert_eq!(degraded["stale"], serde_json::json!(true));
+    // The edit changed a type and added no function, so a degraded answer
+    // names none either (carrick#2849).
+    assert_eq!(
+        degraded["recheck"]["new_functions"],
+        serde_json::Value::Null,
+        "an edit that added no function names none:\n{degraded:#}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "a missed budget answers at once, not eventually: {:?}",
