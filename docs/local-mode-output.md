@@ -71,6 +71,18 @@ A file the tree has not changed, a deleted file, and every `touch` are answered
 from the index as before. A changed file that holds no row is re-checked like
 any other: the row it might hold now is the reason to look.
 
+A re-check (`--recheck`, `--changed`, `--each`) answers through the resident
+type daemon when one of this build serves the workspace: one sidecar process
+per workspace that keeps each service's TypeScript program between checks and
+reads again only what an edit reaches. Its answers are the ones a process of
+its own gives; anything that fails only in the daemon is answered by a process
+of the check's own instead. A check that finds none answers cold and starts one
+in the background (`carrick daemon start` starts one by hand, `carrick daemon
+stop` stops it); it stops after 15 minutes with no request. A session start
+starts nothing. `CARRICK_TYPED=off` turns it off for the process and every scan
+it starts. A build whose daemon crashed twice within an hour is not started
+again for a day, and `carrick status` says until when.
+
 `index` recomputes deterministic facts from the working tree and reads hosted
 indexes using the credential stored by `carrick login` or `CARRICK_TOKEN`.
 Unchanged files can replay the hosted model answers through the scanner's
@@ -445,6 +457,10 @@ unclassified in this service.
 | `.carrick/scan-<id>.log` | everything a detached build printed: its banner, its per-service lines, its map, and any error. Kept after the scan ends — it is the record of a run nobody watched |
 | `.carrick/scan-<id>.json` | what that build is doing NOW: phase, service, counts, pid, when it started, and `spend` once an upload has come back with a figure. Removed when the scan finishes; left with `"status": "failed"` when it fails, and left as-is when the process is killed, which is how `carrick status` can say a scan stopped part-way |
 | `.carrick/jobs.json` | the analysis Carrick Cloud is doing for this workspace: one entry per repo `carrick index --dispatch` handed over, with the job id, the commit the prompts were built at, how many files it carries and when it was submitted. `carrick resume` reads it and removes each entry once its answers are collected; `carrick status` reads it to say what is in flight. Outlives the scan record beside it, because a job outlives a build |
+| `.carrick/typed.json` | the resident type daemon's record (mode 0600): `pid`, `socket`, `build_id`, `cli_version`, `started_at`, `workspace`, `token`, `node_version`. Written by the daemon when it starts and removed when it stops; one left behind with no process is a crash |
+| `.carrick/typed.sock` | the daemon's socket (a per-user temp directory instead when the path is too long for a socket) |
+| `.carrick/typed.log` | what the daemon wrote, truncated at each start |
+| `.carrick/typed.crashes` | one line `<unix seconds> <build id>` per crash. Two of one build within an hour keep that build from starting for a day |
 | `.carrick/last-scan.json` | what the last scan reported: one entry per repo `carrick index` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each block lands, so a run killed part-way still leaves the record of the repos it uploaded. Beside the index rather than in it, because `carrick refresh` rebuilds the read model from scratch and a first run may be killed before there is one. Nothing the CLI prints reads from it |
 
 `index.json` is derived: deleting it and re-running `carrick index` reproduces
@@ -612,6 +628,7 @@ printed above the sentence, and carried in `running_scans` on the error body.
 | `hosted_checked_at` | when repository metadata last answered for this workspace |
 | `repos_detected_by` | `carrick_json`, `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
 | `repos_added`, `repos_excluded` | explicit workspace override paths; absent when empty |
+| `type_daemon` | the resident type daemon's own `status` object, as it answered: `pid`, `rss_mb`, `heap_used_mb`, `heap_cap_mb`, `heap_limit_mb`, `warming`, `queued`, `services[]` with `state` (`built`, `released`, `cold_only:too_big`, `cold_only:no_room`) and `footprint_mb`, `counters`, the last daemon-only `errors`, and `judge`. Absent when no daemon of this build answered for the workspace. The human `status` prints at most four lines about it: the daemon, its largest held services, its last events, and the back-off line `Type daemon: off until HH:MM after N crashes; log .carrick/typed.log` when a build crashed twice within an hour |
 | `type_check` | what the last build's type check did: `pairs` matched, `judged` of them, `skipped` with the reason when it did not run, and `not_stored[]` of `{ consumer, producer, verdicts, indexed_before_producer, check_skipped }` for verdicts judged here that a consumer's upload does not carry, where `check_skipped` is why that consumer's own scan did not run its check. A laptop scan pairs with the siblings indexed before it, so a consumer scanned before its producer uploads without that verdict. The human `status` and the build's own output print it as lines. Absent on an index written before it existed |
 
 Errors are the same three, with the same `message` beside the code, under this
