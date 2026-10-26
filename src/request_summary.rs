@@ -1164,6 +1164,11 @@ struct FnIr {
     /// its position, the keys down to it and what it may hold, read in the
     /// function's own scope (carrick#2432). Read by discovery alone.
     param_defaults: Vec<(usize, Vec<String>, Vec<ValueAt>)>,
+    /// Each function written as a parameter's default, read with this
+    /// function's own captures (carrick#2813). A value that is one reaches it
+    /// here, by where it starts. Discovery's value walk enters it; no site
+    /// walk does, so the call inside it is no lead of its own.
+    param_functions: Vec<FnIr>,
     /// What each `return` (an arrow's expression body included) may hand
     /// back, for a callee an own factory returns (carrick#2432). Read by
     /// discovery alone.
@@ -1404,6 +1409,9 @@ pub struct FileIr {
     /// t = task({ … })`) is one. Read for the message-role readers only
     /// (carrick#1661); the summaries are composed from the functions alone.
     module_level: FnIr,
+    /// The functions written as a default of a class constructor's parameter,
+    /// which no function definition holds (carrick#2813).
+    constructor_defaults: Vec<FnIr>,
     /// Each class field that holds one maker's instance as a message role
     /// reads it (carrick#1665), keyed by its class (the class's span start)
     /// and the field. An HTTP reading reads the class's own field table.
@@ -4698,6 +4706,25 @@ impl Reader<'_> {
                     file.functions
                         .insert(key(&member_name, method.is_static), in_class(ir));
                 }
+                ClassMember::Constructor(ctor) => {
+                    let pats: Vec<Pat> = ctor
+                        .params
+                        .iter()
+                        .map(|param| match param {
+                            ParamOrTsParamProp::Param(param) => param.pat.clone(),
+                            ParamOrTsParamProp::TsParamProp(prop) => match &prop.param {
+                                TsParamPropParam::Ident(ident) => Pat::Ident(ident.clone()),
+                                TsParamPropParam::Assign(assign) => Pat::Assign(assign.clone()),
+                            },
+                        })
+                        .collect();
+                    file.constructor_defaults.extend(self.param_functions(
+                        pats.iter(),
+                        None,
+                        module,
+                        &none,
+                    ));
+                }
                 ClassMember::ClassProp(prop) => {
                     let (Some(member_name), Some(init)) = (prop_name(&prop.key), &prop.value)
                     else {
@@ -5125,6 +5152,12 @@ impl Reader<'_> {
         );
         let values = self.param_values(function.params.iter().map(|param| &param.pat), &scope);
         scope.held.extend(values.held);
+        let param_functions = self.param_functions(
+            function.params.iter().map(|param| &param.pat),
+            fields,
+            module,
+            captured,
+        );
         let mut ir = FnIr {
             params: ParamDecl::all(
                 function.params.iter().map(|param| &param.pat),
@@ -5134,6 +5167,7 @@ impl Reader<'_> {
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
             param_defaults: values.defaults,
+            param_functions,
             ..FnIr::default()
         };
         match &function.body {
@@ -5186,11 +5220,13 @@ impl Reader<'_> {
         );
         let values = self.param_values(&arrow.params, &scope);
         scope.held.extend(values.held);
+        let param_functions = self.param_functions(&arrow.params, fields, module, captured);
         let mut ir = FnIr {
             params: ParamDecl::all(&arrow.params, Some(&*arrow.body), self.source_map),
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
             param_defaults: values.defaults,
+            param_functions,
             ..FnIr::default()
         };
         match &*arrow.body {

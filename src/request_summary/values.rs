@@ -347,6 +347,60 @@ impl Reader<'_> {
         values
     }
 
+    /// The functions written as a parameter's default (`doFetch = (url, init)
+    /// => fetch(url, init)`), positional or at a destructured key, read the
+    /// way [`Self::param_values`] records them as [`ValueAt::Function`]. No
+    /// body states them (carrick#2813), so the value walk finds them here.
+    pub(super) fn param_functions<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p Pat>,
+        fields: Option<&ClassFields>,
+        module: &ModuleScope,
+        captured: &Captured,
+    ) -> Vec<FnIr> {
+        let mut out = Vec::new();
+        let mut read = |expr: &Expr| match expr {
+            Expr::Arrow(arrow) => out.push(self.arrow(arrow, fields, module, captured)),
+            Expr::Fn(function) => {
+                out.push(self.function(&function.function, fields, module, captured));
+            }
+            _ => {}
+        };
+        for pat in params {
+            let pattern = match pat {
+                Pat::Assign(assign) => {
+                    if matches!(&*assign.left, Pat::Ident(_)) {
+                        read(&assign.right);
+                    }
+                    &*assign.left
+                }
+                other => other,
+            };
+            let Pat::Object(object) = pattern else {
+                continue;
+            };
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => {
+                        if let Some(default) = assign.value.as_deref() {
+                            read(default);
+                        }
+                    }
+                    ObjectPatProp::KeyValue(kv) => {
+                        if let Pat::Assign(assign) = &*kv.value
+                            && matches!(&*assign.left, Pat::Ident(_))
+                            && prop_name(&kv.key).is_some()
+                        {
+                            read(&assign.right);
+                        }
+                    }
+                    ObjectPatProp::Rest(_) => {}
+                }
+            }
+        }
+        out
+    }
+
     /// The keys each destructured parameter holds and the defaults the
     /// parameters are given, read in `scope` (the function's own, its
     /// parameters read). A binding the body assigns again holds nothing it

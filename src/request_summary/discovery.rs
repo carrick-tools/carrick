@@ -1899,6 +1899,7 @@ impl<'a> Walker<'a> {
             ir.nested
                 .iter()
                 .chain(&ir.detached)
+                .chain(&ir.param_functions)
                 .find_map(|inner| find(inner, start))
         }
         let ir = self.inputs_for(file).files.get(file)?;
@@ -1907,6 +1908,7 @@ impl<'a> Walker<'a> {
         keys.into_iter()
             .map(|key| &ir.functions[key])
             .chain(std::iter::once(&ir.module_level))
+            .chain(&ir.constructor_defaults)
             .find_map(|body| find(body, start))
     }
 
@@ -2900,6 +2902,106 @@ mod tests {
                 .unanswered_at
                 .contains_key(&span("client.ts", "transmit(path, body)")),
             "a direct call records no passed package"
+        );
+    }
+
+    /// carrick#2813 slice S2: a function written as a parameter's default
+    /// (`doFetch = (url, init) => fetch(url, init)`), positional, at a
+    /// destructured key or on a constructor, is read as the value the
+    /// parameter holds. The call that invokes the value ends at the `fetch`
+    /// the default calls, through a value hop at the default's line. The
+    /// answer key is `tests/fixtures/discovery-default-function/README.md`.
+    #[test]
+    fn a_function_written_as_a_parameter_default_is_read_as_its_value() {
+        let Some(on) = walked(
+            "discovery-default-function",
+            "services/web",
+            "web",
+            &[],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/discovery-default-function/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let at = |file: &str, line: u32| -> Vec<&DiscoverySite> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .collect()
+        };
+        // (file, the call that invokes the value, the default's line)
+        for (file, call, default) in [
+            ("arrow.ts", 7, 5),
+            ("destructured.ts", 7, 5),
+            ("ctor.ts", 10, 6),
+            ("several.ts", 4, 3),
+        ] {
+            let [site] = at(file, call)[..] else {
+                panic!(
+                    "a site at {file}:{call}: {:?} {:?}",
+                    discovery.sites, discovery.unfollowed
+                );
+            };
+            let end = site.end.as_ref().expect("the call reaches fetch");
+            assert_eq!(
+                (end.package.as_str(), end.export.as_str()),
+                ("lib.dom", "fetch"),
+                "{file}"
+            );
+            assert_eq!(end.line, default, "{file}: the end is the default's call");
+            let hops: Vec<(&str, u32)> = site
+                .chain
+                .iter()
+                .map(|hop| (hop.function.as_str(), hop.line))
+                .collect();
+            assert!(
+                hops.contains(&(VALUE_HOP, default)),
+                "{file}: the chain goes through the default: {hops:?}"
+            );
+        }
+        // One caller fills nothing and another passes its own function: the
+        // other value decides, and an end is kept.
+        let [several] = at("several.ts", 4)[..] else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(several.stop.as_deref(), Some("several_values"));
+        // The control: the default is the global `fetch` itself, a site on
+        // main, and it stays one.
+        let [control] = at("control.ts", 4)[..] else {
+            panic!("a site at control.ts:4: {:?}", discovery.sites);
+        };
+        assert_eq!(
+            control.end.as_ref().map(|end| end.export.as_str()),
+            Some("fetch")
+        );
+        // The call inside a default is no site of its own: only the call that
+        // invokes the value is one (arrow.ts:5 has the default's call).
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("arrow.ts"))
+                .all(|site| site.callee != "fetch"),
+            "the default's own call is not walked as a site: {:?}",
+            discovery.sites
+        );
+        // A default that calls nothing labelled ends nowhere.
+        assert!(
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with("plain.ts"))
+                .all(|site| site.end.is_none()),
+            "{:?}",
+            discovery.sites
         );
     }
 
