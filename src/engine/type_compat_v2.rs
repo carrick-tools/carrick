@@ -702,6 +702,30 @@ pub(crate) fn derive_capture_anchors(
             });
             continue;
         }
+        // A line-only body request has no payload for the capture to re-read:
+        // the first expression on a registration line is the registration
+        // call, and its own result (a route chain, `void`) would be served as
+        // the reply (carrick#2727). It takes the placeholder, as a decided
+        // abstain does.
+        if matches!(
+            request.infer_kind,
+            InferKind::ResponseBody | InferKind::RequestBody
+        ) && request.span_start.is_none()
+            && request.span_end.is_none()
+            && request.expression_text.is_none()
+            && request.param_name.is_none()
+        {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: "unknown".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+                absent_body_tolerated: false,
+            });
+            continue;
+        }
         // The capture locator prefers span, then expression text (from its
         // line), then first expression on the line — same precedence as the
         // v1 inferrer's locator inputs.
@@ -5564,6 +5588,194 @@ mod tests {
             matches!(&anchors[1], CaptureAnchor::Infer { alias, .. } if alias == "Endpoint_blind_Response"),
             "a blind inference without a decision keeps its infer anchor, got {:?}",
             anchors[1]
+        );
+    }
+
+    /// A line names no payload (carrick#2727). A body request that carries a
+    /// line only (no span, no expression text, no parameter name) and that the
+    /// inferrer left unanswered takes the `unknown` placeholder. An infer anchor
+    /// would let the capture read the first expression on that line, which on a
+    /// registration line is the registration call's own result.
+    #[test]
+    fn derive_anchors_gives_a_line_only_body_request_the_placeholder() {
+        let line_only = |alias: &str, kind: InferKind| {
+            let mut request = response_body_infer(alias);
+            request.span_start = None;
+            request.span_end = None;
+            request.infer_kind = kind;
+            request
+        };
+        let mut with_text = line_only("Endpoint_text_Response", InferKind::ResponseBody);
+        with_text.expression_text = Some("res.json(body)".to_string());
+        let infer = vec![
+            line_only("Endpoint_line_Response", InferKind::ResponseBody),
+            line_only("Endpoint_line_Request", InferKind::RequestBody),
+            with_text,
+            line_only("Endpoint_call_Response", InferKind::CallResult),
+            line_only("Endpoint_return_Response", InferKind::FunctionReturn),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], "/repo");
+
+        assert_eq!(anchors.len(), 5, "{anchors:?}");
+        for anchor in &anchors[..2] {
+            match anchor {
+                CaptureAnchor::Literal {
+                    type_text,
+                    anchor_origin,
+                    source_file,
+                    ..
+                } => {
+                    assert_eq!(type_text, "unknown");
+                    assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
+                    assert!(source_file.is_none());
+                }
+                other => {
+                    panic!("a line-only body request must be a literal unknown, got {other:?}")
+                }
+            }
+        }
+        for anchor in &anchors[2..] {
+            assert!(
+                matches!(anchor, CaptureAnchor::Infer { .. }),
+                "a located or non-body request keeps its infer anchor, got {anchor:?}"
+            );
+        }
+    }
+
+    /// carrick#2727 through the real sidecar: line-only body requests at three
+    /// registration lines. The inferrer types the imported handler's reply; the
+    /// inline route and the middleware registration answer nothing, and the
+    /// capture must not publish the registration call's own result (a route
+    /// chain object, `void`) as their reply.
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn a_line_only_registration_request_is_not_answered_by_the_registration_call() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let sidecar_path = manifest_dir.join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("api");
+        let write = |rel: &str, text: &str| {
+            let file = repo.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{ "name": "route-chain-api", "version": "1.0.0" }"#,
+        );
+        write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "target": "ES2020", "module": "commonjs", "moduleResolution": "node", "strict": true, "esModuleInterop": true, "skipLibCheck": true }, "include": ["src/**/*"] }"#,
+        );
+        write(
+            "src/framework.ts",
+            "export interface Req { params: Record<string, string>; }\n\
+             export interface Res { sendStatus(code: number): void; write(text: string): void; }\n\
+             export type Handler = (req: Req, res: Res) => unknown;\n\
+             export interface RouteChain { get(...handlers: Handler[]): RouteChain; }\n\
+             export class Router { route(path: string): RouteChain { throw new Error(path); } }\n\
+             export const server: { use(fn: unknown): void } = { use() {} };\n",
+        );
+        write(
+            "src/items.handlers.ts",
+            "import { Req } from './framework';\n\
+             export interface ItemList { items: { id: string }[]; total: number; }\n\
+             export async function listItems(_req: Req): Promise<ItemList> {\n\
+             \x20 const body: ItemList = { items: [{ id: 'a' }], total: 1 };\n\
+             \x20 return body;\n\
+             }\n",
+        );
+        write(
+            "src/items.routes.ts",
+            "import { Router } from './framework';\n\
+             import { listItems } from './items.handlers';\n\
+             \n\
+             export const router = new Router();\n\
+             \n\
+             router.route('/items').get(listItems);\n\
+             router.route('/ping').get((_req, res) => {\n\
+             \x20 res.sendStatus(204);\n\
+             });\n",
+        );
+        write(
+            "src/use.ts",
+            "import { server } from './framework';\n\
+             \n\
+             server.use(async (_req: unknown, res: { write(text: string): void }): Promise<void> => {\n\
+             \x20 res.write('x');\n\
+             });\n",
+        );
+
+        let request = |file: &str, line: u32, alias: &str| InferRequestItem {
+            member: None,
+            file_path: repo.join(file).to_string_lossy().to_string(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::ResponseBody,
+            alias: Some(alias.to_string()),
+            param_name: None,
+            result: None,
+        };
+        let items = vec![
+            request("src/items.routes.ts", 6, "Route_imported_Response"),
+            request("src/items.routes.ts", 7, "Route_inline_Response"),
+            request("src/use.ts", 3, "Route_middleware_Response"),
+        ];
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(&repo, None);
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+        let resolved = sidecar
+            .resolve_all_types(&[], &items, None, None)
+            .expect("resolve_all_types");
+        let anchors = derive_capture_anchors(
+            &[],
+            &items,
+            &[],
+            &resolved.inferred_types,
+            &[],
+            repo.to_str().unwrap(),
+        );
+        let (stub_dir, _artifact) = run_capture(
+            &sidecar,
+            repo.to_str().unwrap(),
+            "route-chain-api",
+            &anchors,
+            &HashMap::new(),
+            None,
+        )
+        .expect("capture");
+        let surface = std::fs::read_to_string(stub_dir.join("types/surface.d.ts")).unwrap();
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        let line_of = |alias: &str| -> String {
+            let start = surface
+                .find(&format!("type {alias} "))
+                .unwrap_or_else(|| panic!("no surface line for {alias}:\n{surface}"));
+            let rest = &surface[start..];
+            let end = rest[1..].find("\nexport ").map_or(rest.len(), |i| i + 1);
+            rest[..end].trim_end().to_string()
+        };
+        assert!(
+            line_of("Route_imported_Response").contains("total: number"),
+            "the imported handler's reply keeps its stated body:\n{surface}"
+        );
+        assert!(
+            line_of("Route_inline_Response").ends_with("= unknown;"),
+            "the inline route must not serve the registration call's result:\n{surface}"
+        );
+        assert!(
+            line_of("Route_middleware_Response").ends_with("= unknown;"),
+            "the middleware registration must not serve `void`:\n{surface}"
         );
     }
 
