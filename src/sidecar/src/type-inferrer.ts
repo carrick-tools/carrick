@@ -45,6 +45,7 @@ import {
 import { typeToStringAsDeclared } from './print-type.js';
 import type {
   InferRequestItem,
+  InferItemOutcome,
   InferResult,
   InferSlotTiming,
   InferredType,
@@ -790,8 +791,13 @@ export class TypeInferrer {
     const bodies: Array<{ request: InferRequestItem; result: InferredType }> = [];
     /** How long each request took, in the order they were done (carrick#1985). */
     const timings: InferSlotTiming[] = [];
+    /** What each request came to, in request order (carrick#2881). */
+    const items: InferItemOutcome[] = requests.map(() => ({ errors: [] }));
+    this.pathFiles = new Map();
 
-    for (const request of requests) {
+    for (const [index, request] of requests.entries()) {
+      const item = items[index]!;
+      const errorsBefore = errors.length;
       const slotStarted = performance.now();
       const phasesStarted = phaseClock();
       const firstInFile = !this.filesAsked.has(request.file_path);
@@ -824,6 +830,7 @@ export class TypeInferrer {
           printedLength = result.type_string.length;
           this.recordPrintedNames(result, request, prints);
           inferredTypes.push(result);
+          item.inferred = result;
           if (request.infer_kind === 'response_body' || request.infer_kind === 'function_return') {
             responses.push({ request, result });
           } else if (request.infer_kind === 'request_body') {
@@ -855,6 +862,7 @@ export class TypeInferrer {
           printed_length: printedLength,
           first_in_file: firstInFile,
         });
+        item.errors = errors.slice(errorsBefore);
         onRequestDone?.();
       }
     }
@@ -911,13 +919,25 @@ export class TypeInferrer {
       );
     }
 
+    for (const [index, request] of requests.entries()) {
+      const files = this.pathFiles.get(request);
+      if (files) items[index]!.pathFiles = [...files].sort();
+    }
+    this.pathFiles = new Map();
     return {
       success: errors.length === 0 || inferredTypes.length > 0,
       inferred_types: inferredTypes.length > 0 ? inferredTypes : undefined,
       timing: inferTiming(timings),
       errors: errors.length > 0 ? errors : undefined,
+      items,
     };
   }
+
+  /**
+   * carrick#2881: the files of each request's unwidened path in the batch
+   * being inferred, as `addUnwidenedReadings` plans them.
+   */
+  private pathFiles = new Map<InferRequestItem, Set<string>>();
 
   /** The types the model named, by the alias of the row each is for (carrick#2111). */
   private modelSymbols = new Map<string, ModelSymbol>();
@@ -1091,6 +1111,9 @@ export class TypeInferrer {
         end: fn.getEnd(),
       }));
       for (const fn of path) checkedFiles.add(fn.file);
+      const pathFiles = this.pathFiles.get(request) ?? new Set<string>();
+      for (const fn of path) pathFiles.add(fn.file.getFilePath());
+      this.pathFiles.set(request, pathFiles);
       let locatedByText: Plan['locatedByText'];
       if (request.expression_text && request.span_start === undefined) {
         const sourceFile = this.getSourceFile(request.file_path);

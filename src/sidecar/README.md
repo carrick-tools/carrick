@@ -1033,6 +1033,7 @@ Response, written before the process exits:
 - **One queue:** every request from every connection runs in arrival order, `check_v2` included; each request's frames go to the connection that sent it.
 - **Held services:** `init` selects the service its fields name (`repo_root`, `tsconfig_path`, `scan_root`, `tsconfig_snapshot`, `pinned_dependencies`), or resolves a new one; the connection's later requests read it. A second connection with the same `init` reads the project the first one built. Over stdio, `init` still re-scopes the one project.
 - **After edits (carrick#2880):** before and after every request that reads a held project (`infer`, `retype_check`, `bundle`, the library checks, `list_program_files`, `add_program_files`, `position_rows`, `implementations`), the files its programs were built from are checked against the disk by stat, and a changed stat against the text the program holds. Changed source files whose imports and references are as they were are read again into the held projects (`freshness.refreshes`). Anything else builds the service again from its `init` (`freshness.drops`): a config in the `extends` chain, a `package.json`, lockfile or install record, a file added to or removed from a config's file list, a file gone, a changed import or reference, more than 200 changed files, or any change in a service not built from a tsconfig (default patterns, a snapshot, Deno). An answer read while files changed is dropped and the request answered again, at most 3 times, then answered with an error.
+- **Kept `infer` items (carrick#2881):** a held service keeps each `infer` item's answer, keyed by the item and every request field beside the items, and answers it again while no edit reaches it (`items.replayed`); the rest are read again (`items.recomputed`), in one batch per program, in request order. An edit reaches its changed files and every file importing a declaration that reads a changed name, followed through re-exports to the declaring file, name by name: one changed export of a barrel reaches the files that name it, not every importer of the barrel. A namespace import, `import()`, `require()` and `typeof import('m')` read every export of the module; `import('m').T` reads `T`. Every item is read again when a changed name is a `declare global` or a module augmentation (or one reads a changed name), when a script, a non-source file or an installed package's file changes. When an export is added, removed or pointed at another local, the files importing that name are reached and every item with an unwidened reading is read again. Items whose unwidened readings can meet (one's path holds a file the other's types read) are read again together, and a kept reading answers only beside the items it was read beside. Held services are released least recently used first while the heap is over `CARRICK_TYPED_HEAP_CAP_MB` (default 3072; one per request unless Node runs with `--expose-gc`); a released service is built again by its next request (`evictions`).
 - **One daemon per workspace:** `typed.json` is claimed with a hard link. A second start while one answers exits with code 3. A record whose process is dead, or whose socket does not answer within 2 s, is taken over.
 - **Stop:** on `stop`, SIGTERM or SIGINT, and after 15 minutes with no request (`CARRICK_TYPED_IDLE_MS` sets another idle time), it removes the socket and `typed.json` and exits 0. It exits without removing anything when `typed.json` is gone or names another process. `shutdown` ends only the client's connection. A client that disconnects mid-request does not stop it.
 
@@ -1065,11 +1066,14 @@ Response, written before the process exits:
         "repo_root": "/repo/services/api",
         "scan_root": "/repo",
         "built": true,
-        "freshness": { "refreshes": 3, "drops": 1 }
+        "freshness": { "refreshes": 3, "drops": 1 },
+        "items": { "held": 608, "replayed": 1824, "recomputed": 612 },
+        "evictions": 0
       }
     ],
     "heap_used_mb": 412,
-    "rss_mb": 655
+    "rss_mb": 655,
+    "heap_cap_mb": 3072
   }
 }
 ```

@@ -1038,6 +1038,14 @@ export interface HeldService {
    * or the service built again from its `init` (`drops`).
    */
   freshness: { refreshes: number; drops: number };
+  /**
+   * Its kept `infer` items (carrick#2881): how many are held, how many
+   * requests' items were answered from them (`replayed`) and read again
+   * (`recomputed`).
+   */
+  items: { held: number; replayed: number; recomputed: number };
+  /** How often it was released to keep the heap under its cap; its next request builds it again. */
+  evictions: number;
 }
 
 /** Response for status. */
@@ -1054,6 +1062,8 @@ export interface StatusResponse extends BaseResponse {
     services: HeldService[];
     heap_used_mb: number;
     rss_mb: number;
+    /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default 3072). */
+    heap_cap_mb: number;
   };
 }
 
@@ -1621,4 +1631,22 @@ export interface InferResult {
   timing: InferTiming;
   /** General error messages */
   errors?: string[];
+  /**
+   * What each request came to, in request order: its inferred type or the
+   * error it gave, and the files its unwidened reading rewrote and checked
+   * (carrick#2881). The daemon keeps each one to answer it again.
+   */
+  items: InferItemOutcome[];
+}
+
+/** What one `infer` request item came to (carrick#2881). */
+export interface InferItemOutcome {
+  inferred?: InferredType;
+  errors: string[];
+  /**
+   * The files holding a function on the item's unwidened path: the reading
+   * rewrote and type-checked them beside every other item's, so another
+   * item reaching them can change it. Absent when it had no reading to make.
+   */
+  pathFiles?: string[];
 }
