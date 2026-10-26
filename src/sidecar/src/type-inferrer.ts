@@ -2696,7 +2696,11 @@ export class TypeInferrer {
         );
       if (!signature) return missing(`the method '${label.parse}'`);
       const returned = signature.getReturnType();
-      read = [this.awaitedBeyondPromise(returned) ?? this.unwrapPromiseType(returned)];
+      const parsed = this.awaitedBeyondPromise(returned) ?? this.unwrapPromiseType(returned);
+      // A type parameter of the method that nothing at the call instantiates
+      // (`json<J>()`) states no type: the caller supplies it.
+      if (parsed.isTypeParameter()) return missing(`a concrete type from '${label.parse}'`);
+      read = [parsed];
     }
 
     const texts: string[] = [];

@@ -246,8 +246,9 @@ describe('carrick#2818: a labelled call result is read through its label', () =>
     assert.match(v1('ParseConcrete').type_string, /\bid: string\b/);
     assert.match(v2('ParseConcrete'), /\bid: string\b/);
     // `json<J>()` is generic and nothing at the call instantiates `J`: the
-    // return is the method's own type parameter, as the ticket reads it.
-    assert.strictEqual(v1('ParseGeneric').type_string, 'J');
+    // caller supplies the type, so both readers abstain.
+    assert.strictEqual(v1('ParseGeneric').type_string, 'unknown');
+    assert.strictEqual(v1('ParseGeneric').any_provenance?.[0]?.reason, 'result_member_missing');
     assert.strictEqual(v2('ParseGeneric'), 'unknown');
     assert.strictEqual(v1('ParseText').type_string, 'string');
     assert.strictEqual(v2('ParseText'), 'string');
