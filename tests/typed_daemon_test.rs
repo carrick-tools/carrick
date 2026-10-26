@@ -270,7 +270,10 @@ fn a_daemon_that_died_is_replaced_and_its_run_answers_cold() {
     let (code, _) = run(&root, &["daemon", "start", "--workspace", "."], true);
     assert_eq!(code, Some(0));
     let dead = serving(&root).unwrap().pid;
-    typed_daemon::kill(dead);
+    assert!(
+        typed_daemon::kill(dead, &root),
+        "it is this workspace's daemon"
+    );
     assert!(
         typed_daemon::read_record(&root).is_some(),
         "a killed daemon leaves its record"
@@ -400,6 +403,151 @@ fn a_request_the_daemon_drops_is_answered_cold() {
     assert!(!warm.on_daemon(), "and answered by a process of its own");
     assert_eq!(answered, expected);
     stand_in.join().unwrap();
+}
+
+/// The daemon answers a request with an error a process of its own would not
+/// give (files kept changing under its held program): the request is answered
+/// by a process of the sidecar's own instead, as without a daemon. A stand-in
+/// daemon accepts `hello` and `init` and answers the next request with that
+/// error, keeping the connection open.
+#[test]
+#[serial]
+fn an_error_the_daemon_answers_is_answered_cold() {
+    use carrick::services::TypeSidecar;
+    use std::io::{BufRead, BufReader, Write};
+
+    let service = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/local-mode-workspace/inventory-svc")
+        .canonicalize()
+        .unwrap();
+    let cold = TypeSidecar::spawn(&sidecar_entry()).unwrap();
+    cold.start_init(&service, None);
+    cold.wait_ready(Duration::from_secs(120)).unwrap();
+    let item = || carrick::services::type_sidecar::InferRequestItem {
+        file_path: service
+            .join("src/inventory.ts")
+            .to_string_lossy()
+            .into_owned(),
+        line_number: 5,
+        span_start: None,
+        span_end: None,
+        expression_text: None,
+        expression_line: None,
+        infer_kind: carrick::services::type_sidecar::InferKind::SignatureReturn,
+        alias: Some("CountActive".to_string()),
+        param_name: None,
+        member: None,
+        result: None,
+    };
+    let inferred = |sidecar: &TypeSidecar| {
+        let response = sidecar.infer_types(&[item()], None).expect("an answer");
+        serde_json::to_string(&response.inferred_types).unwrap()
+    };
+    let expected = inferred(&cold);
+
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("d.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let stand_in = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        for answered in 0..3 {
+            let Some(Ok(line)) = lines.next() else { return };
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = request["request_id"].clone();
+            let answer = match (answered, request["action"].as_str()) {
+                (0, Some("hello")) => {
+                    serde_json::json!({"request_id": id, "status": "success", "pid": 1})
+                }
+                (1, Some("init")) => serde_json::json!({"request_id": id, "status": "ready"}),
+                _ => serde_json::json!({
+                    "request_id": id,
+                    "status": "error",
+                    "errors": ["files kept changing while the request ran (3 answers dropped)"],
+                }),
+            };
+            writeln!(writer, "{answer}").unwrap();
+        }
+        // Held open until the test is done: the error is the answer, not a
+        // closed connection.
+        let _ = finished.recv();
+    });
+
+    let warm = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any").unwrap();
+    warm.start_init(&service, None);
+    warm.wait_ready(Duration::from_secs(30)).unwrap();
+    assert!(warm.on_daemon());
+    let answered = inferred(&warm);
+    assert!(!warm.on_daemon(), "and answered by a process of its own");
+    assert_eq!(answered, expected);
+    done.send(()).unwrap();
+    stand_in.join().unwrap();
+}
+
+/// A daemon that does not answer `hello` within a second is answering someone
+/// else: the connection is given up at once, not after the readiness budget,
+/// and the service answered by a process of its own.
+#[test]
+#[serial]
+fn a_daemon_that_does_not_answer_hello_is_left_at_once() {
+    use carrick::services::TypeSidecar;
+
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("d.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let stand_in = std::thread::spawn(move || {
+        // Accepts, reads nothing, answers nothing.
+        let (_stream, _) = listener.accept().unwrap();
+        let _ = finished.recv();
+    });
+    let started = Instant::now();
+    let connected = TypeSidecar::connect_daemon(&sidecar_entry(), &socket, "any");
+    let waited = started.elapsed();
+    done.send(()).unwrap();
+    stand_in.join().unwrap();
+    assert!(connected.is_err(), "a silent daemon is not used");
+    assert!(
+        waited < Duration::from_secs(5),
+        "gave it up after {waited:?}"
+    );
+}
+
+/// `daemon stop` signals only a process that is the workspace's daemon. A
+/// record left by a daemon that was killed names a pid the kernel may have
+/// handed to another process: that process is left running and the stale
+/// record removed.
+#[test]
+#[serial]
+fn daemon_stop_leaves_another_process_named_by_a_stale_record() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    let mut other = Command::new("sleep").arg("60").spawn().unwrap();
+    let carrick_dir = root.join(".carrick");
+    std::fs::create_dir_all(&carrick_dir).unwrap();
+    std::fs::write(
+        carrick_dir.join("typed.json"),
+        serde_json::json!({
+            "pid": other.id(),
+            "socket": carrick_dir.join("typed.sock"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(!typed_daemon::is_daemon_of(other.id(), &root));
+
+    let (code, said) = run(&root, &["daemon", "stop", "--workspace", "."], true);
+    assert_eq!(code, Some(0), "{said}");
+    let still_running = other.try_wait().unwrap().is_none();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(still_running, "daemon stop killed another process: {said}");
+    assert!(
+        typed_daemon::read_record(&root).is_none(),
+        "the stale record is removed"
+    );
 }
 
 /// The build id the CLI computes is the one the sidecar computes: a daemon

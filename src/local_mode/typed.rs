@@ -78,10 +78,9 @@ impl Session {
             return session;
         };
         if mode == Mode::All {
-            // The warm-up was started once the daemon answered; it fills it.
-            if let Some(record) = typed_daemon::read_record(root) {
-                session.daemon = Some(Use::new(record.socket, Route::All, None));
-            }
+            // The warm-up fills the daemon, once it has answered `hello` on
+            // this build: a record names a socket, not who listens on it.
+            session.daemon = warm_up_use(root, &build_id);
             return session;
         }
         match typed_daemon::probe(root, &build_id, PROBE_WAIT) {
@@ -97,7 +96,7 @@ impl Session {
             }
             Probe::Mismatch { pid } => {
                 tracing::debug!("The type daemon (pid {pid}) runs another build; replacing it");
-                typed_daemon::kill(pid);
+                typed_daemon::retire(root, pid);
                 session.warm_after = true;
             }
             Probe::Absent => session.warm_after = true,
@@ -129,6 +128,16 @@ impl Session {
         if self.warm_after || missed {
             start_warm_up(&self.root);
         }
+    }
+}
+
+/// The warm-up's use of the daemon serving `root`: every service through it,
+/// when it answers `hello` with `build_id`. Otherwise none, and the warm-up's
+/// re-scan answers cold.
+fn warm_up_use(root: &Path, build_id: &str) -> Option<Use> {
+    match typed_daemon::probe(root, build_id, PROBE_WAIT) {
+        Probe::Serving(status) => Some(Use::new(status.socket, Route::All, None)),
+        Probe::Busy { .. } | Probe::Mismatch { .. } | Probe::Absent => None,
     }
 }
 
@@ -234,7 +243,7 @@ pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
     match typed_daemon::probe(&root, &build_id, PROBE_WAIT) {
         Probe::Serving(_) | Probe::Busy { .. } => {}
         Probe::Mismatch { pid } => {
-            typed_daemon::kill(pid);
+            typed_daemon::retire(&root, pid);
             typed_daemon::start_detached(&root, &entry)
                 .map_err(|e| format!("could not start the type daemon: {e}"))?;
         }
@@ -296,4 +305,27 @@ pub(super) fn stop(root: Option<&Path>) -> Result<String, String> {
 /// The line `carrick status` prints about the daemon, when there is one.
 pub(super) fn status_line(root: &Path) -> Option<String> {
     typed_daemon::status_line(root, sidecar_build_id().as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record naming a live process and a socket nobody answers on is not a
+    /// daemon to fill: the warm-up answers cold rather than sending its
+    /// re-scan to whatever the record names.
+    #[test]
+    fn the_warm_up_uses_only_a_daemon_that_answered_hello() {
+        let dir = tempfile::tempdir().unwrap();
+        let carrick = dir.path().join(".carrick");
+        std::fs::create_dir_all(&carrick).unwrap();
+        let socket = carrick.join("typed.sock");
+        std::fs::write(&socket, "not a socket").unwrap();
+        std::fs::write(
+            carrick.join("typed.json"),
+            serde_json::json!({ "pid": std::process::id(), "socket": socket }).to_string(),
+        )
+        .unwrap();
+        assert!(warm_up_use(dir.path(), "any build").is_none());
+    }
 }

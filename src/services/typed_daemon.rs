@@ -70,7 +70,9 @@ pub fn enabled() -> bool {
 /// The build id of the sidecar whose entry script is `entry`
 /// (`<dir>/dist/src/index.js`): sha256 over every file beneath the entry's
 /// directory, by `/`-separated relative path in sorted order, each line
-/// `<path>\0<sha256 of its content>\n`. The same hash as the sidecar's
+/// `<path>\0<sha256 of its content>\n`, then one line `pkg:<name>\0<version>\n`
+/// per [`COMPILER_PACKAGES`] entry as installed for the sidecar (empty when
+/// not found). The same hash as the sidecar's
 /// `buildIdOf` (`src/sidecar/src/typed-server.ts`), which the daemon compares
 /// every `hello` against.
 pub fn build_id(entry: &Path) -> std::io::Result<String> {
@@ -89,7 +91,35 @@ pub fn build_id(entry: &Path) -> std::io::Result<String> {
         let digest = hex(&Sha256::digest(&content));
         hash.update(format!("{relative}\0{digest}\n").as_bytes());
     }
+    // The compiler the sidecar runs is part of its build: the same sources
+    // over another TypeScript answer differently.
+    let sidecar_root = root.parent().and_then(Path::parent);
+    for package in COMPILER_PACKAGES {
+        let version = sidecar_root
+            .and_then(|start| installed_version(start, package))
+            .unwrap_or_default();
+        hash.update(format!("pkg:{package}\0{version}\n").as_bytes());
+    }
     Ok(hex(&hash.finalize()))
+}
+
+/// The packages whose installed versions are part of the build id, in the
+/// order they are hashed (the sidecar's `buildIdOf` takes the same):
+/// `@ts-morph/common` carries the compiler ts-morph runs.
+const COMPILER_PACKAGES: [&str; 3] = ["typescript", "ts-morph", "@ts-morph/common"];
+
+/// The `version` of `node_modules/<package>/package.json` in the first of
+/// `start` and its ancestors that has one, as node resolves it from there.
+/// `None` when none has one, or the first found does not parse or carries no
+/// string version.
+fn installed_version(start: &Path, package: &str) -> Option<String> {
+    let manifest = start
+        .ancestors()
+        .map(|dir| dir.join("node_modules").join(package).join("package.json"))
+        .find(|manifest| manifest.is_file())?;
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
 }
 
 /// Every regular file under `dir`, relative to `root` with `/` separators.
@@ -345,20 +375,49 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Kill the daemon `pid` now and wait, briefly, for it to be gone.
+/// Whether process `pid` is the type daemon of `workspace`: its command line
+/// runs the sidecar in server mode (`--serve`) for this workspace. A record
+/// outlives its daemon when the daemon is killed, and the kernel hands its pid
+/// to the next process, so a pid read from a record is never signalled on the
+/// record's word alone.
+pub fn is_daemon_of(pid: u32, workspace: &Path) -> bool {
+    if pid == 0 || !pid_alive(pid) {
+        return false;
+    }
+    // `-ww`: the whole command line, however long, with no terminal to fit.
+    let Ok(out) = Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&out.stdout);
+    let names_workspace = |path: &Path| command.contains(&*path.to_string_lossy());
+    command.contains(" --serve ")
+        && (names_workspace(workspace)
+            || workspace
+                .canonicalize()
+                .is_ok_and(|real| names_workspace(&real)))
+}
+
+/// Kill the type daemon of `workspace`, process `pid`, now and wait, briefly,
+/// for it to be gone. Nothing is signalled unless `pid` is that daemon
+/// ([`is_daemon_of`]); returns whether it was.
 ///
 /// `stop` and SIGTERM wait for the request the daemon is answering, which on a
 /// large service is minutes (carrick#2884); a daemon of another build must not
 /// answer anything, so it is killed outright. The next start takes over the
 /// record it leaves (carrick#2879).
-pub fn kill(pid: u32) {
+pub fn kill(pid: u32, workspace: &Path) -> bool {
+    if !is_daemon_of(pid, workspace) {
+        return false;
+    }
     #[cfg(unix)]
     {
-        if pid == 0 {
-            return;
-        }
-        // SAFETY: SIGKILL to a pid read from the daemon's own record, after
-        // its socket answered as a daemon.
+        // SAFETY: SIGKILL to a process whose command line shows it is this
+        // workspace's daemon.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
@@ -367,8 +426,7 @@ pub fn kill(pid: u32) {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    #[cfg(not(unix))]
-    let _ = pid;
+    true
 }
 
 /// Start a daemon for `workspace` from the sidecar whose entry script is
@@ -453,12 +511,19 @@ pub fn stop(workspace: &Path, build_id: Option<&str>) -> String {
     while asked && pid_alive(pid) && waited.elapsed() < STOP_GRACE {
         std::thread::sleep(Duration::from_millis(50));
     }
-    if pid_alive(pid) {
-        kill(pid);
+    if !pid_alive(pid) {
+        return format!("Stopped the type daemon (pid {pid}).");
+    }
+    if kill(pid, workspace) {
         remove_record_of(workspace, &record);
         return format!("Stopped the type daemon (pid {pid}): killed.");
     }
-    format!("Stopped the type daemon (pid {pid}).")
+    // The record outlived its daemon and the pid now belongs to another
+    // process, which is left alone.
+    remove_record_of(workspace, &record);
+    format!(
+        "No type daemon is running for this workspace (removed a stale record: pid {pid} is another process, left running)."
+    )
 }
 
 #[cfg(unix)]
@@ -476,6 +541,17 @@ fn ask_to_stop(record: &Record, build_id: &str) -> bool {
 #[cfg(not(unix))]
 fn ask_to_stop(_record: &Record, _build_id: &str) -> bool {
     false
+}
+
+/// Clear the way for a new daemon of `workspace` when the one its record names,
+/// `pid`, runs another build: killed when it is this workspace's daemon
+/// ([`kill`]), and either way its record removed, so the new daemon does not
+/// find a live process named in it and exit.
+pub fn retire(workspace: &Path, pid: u32) {
+    kill(pid, workspace);
+    if let Some(record) = read_record(workspace).filter(|record| record.pid == pid) {
+        remove_record_of(workspace, &record);
+    }
 }
 
 /// Remove the record and its socket while the record still names `record`'s

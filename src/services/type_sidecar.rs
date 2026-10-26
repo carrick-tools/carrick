@@ -1919,6 +1919,11 @@ const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
 /// limit that ran out ([`crate::time_limits`], carrick#2021).
 pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// How long a connection to the resident type daemon waits for its `hello`
+/// (carrick#2884). An idle daemon answers at once; one answering another
+/// client's request is left for a process of this sidecar's own.
+const DAEMON_HELLO_WAIT: Duration = Duration::from_secs(1);
+
 /// How often a progress frame is written to the log while an operation runs.
 /// The sidecar reports far more often than this; the log needs enough to tell
 /// steady work from a stall, and no more.
@@ -2789,9 +2794,10 @@ impl TypeSidecar {
             build_id: build_id.to_string(),
         })?;
         // The daemon answers every connection in one queue, so `hello` waits
-        // behind whatever it is answering for another: the readiness budget,
-        // as an `init` would have.
-        let answer = sidecar.read_result_value(&request_id, ready_budget())?;
+        // behind whatever it is answering for another. An idle daemon answers
+        // at once; a busy one is left, and the service answered by a process
+        // of its own, rather than queued behind someone else's request.
+        let answer = sidecar.read_result_value(&request_id, DAEMON_HELLO_WAIT)?;
         if answer.get("status").and_then(|s| s.as_str()) != Some("success") {
             let errors = answer
                 .get("errors")
@@ -4236,6 +4242,20 @@ impl TypeSidecar {
                 continue;
             }
 
+            // The daemon answered with an error (one it gives and a process
+            // of its own does not: the files kept changing under a held
+            // program): the request goes to a process of this sidecar's own,
+            // whose answer, error or not, is the one a scan without a daemon
+            // reads.
+            if self.on_daemon()
+                && daemon_error_for(trimmed, request_id)
+                && self.answers_cold_after(&"it answered with an error")
+            {
+                self.fall_back_cold()?;
+                last_sign_of_life = Instant::now();
+                continue;
+            }
+
             if let Some(answer) = terminal(trimmed)? {
                 return Ok(answer);
             }
@@ -4253,6 +4273,16 @@ fn process_end(status: std::process::ExitStatus) -> Option<ProcessEnd> {
         }
     }
     status.code().map(ProcessEnd::Code)
+}
+
+/// Whether `line` is a terminal frame with `status: "error"`, answering
+/// `request_id` when one is named.
+fn daemon_error_for(line: &str, request_id: Option<&str>) -> bool {
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    frame.get("status").and_then(|s| s.as_str()) == Some("error")
+        && request_id.is_none_or(|id| frame.get("request_id").and_then(|r| r.as_str()) == Some(id))
 }
 
 /// Join the `errors` array of a terminal sidecar frame into one message.
