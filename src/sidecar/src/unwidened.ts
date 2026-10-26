@@ -344,12 +344,22 @@ export function mapBack(pos: number, insertions: Insertion[]): number {
   return pos - shift;
 }
 
+/**
+ * Diagnostics about how the program was assembled (a file outside `rootDir`,
+ * a file missing from a composite project's list, an output that would
+ * overwrite its input), not about the text of the file they are reported on.
+ * The compiler attaches them to an import or a root file, and whether one is
+ * present depends on which program build ran last, so a before/after
+ * comparison would read it as added by a rewrite (carrick#2898).
+ */
+const PROGRAM_ASSEMBLY_CODES = new Set([6059, 6305, 6307]);
+
 /** Syntactic and semantic diagnostics reported in this file. */
 export function fileDiagnostics(sourceFile: SourceFile): FileDiagnostic[] {
   const program = sourceFile.getProject().getProgram().compilerObject;
   const node = sourceFile.compilerNode;
   return [...program.getSyntacticDiagnostics(node), ...program.getSemanticDiagnostics(node)]
-    .filter((d) => d.file === node && d.start !== undefined)
+    .filter((d) => d.file === node && d.start !== undefined && !PROGRAM_ASSEMBLY_CODES.has(d.code))
     .map((d) => ({
       start: d.start!,
       code: d.code,
