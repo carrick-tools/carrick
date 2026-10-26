@@ -18,7 +18,7 @@ import * as fs from 'node:fs';
 
 const PREFILTER = /declare\s+(?:global|module)\b/;
 
-function declaresAugmentation(sourceFile: ts.SourceFile): boolean {
+export function declaresAugmentation(sourceFile: ts.SourceFile): boolean {
   // Augmentations only have their augmentation semantics inside a module;
   // in a script file `declare module "x"` is an ambient module declaration,
   // which the closure treatment still wants shipped when present.
