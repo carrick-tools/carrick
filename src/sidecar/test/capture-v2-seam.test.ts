@@ -101,7 +101,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'declaration-attribution.ts' ||
           base === 'position-rows.ts' ||
           base === 'infer-cache.ts' ||
-          base === 'retype.ts'
+          base === 'retype.ts' ||
+          base === 'typed-server.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
@@ -110,7 +111,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // through the guard and name packages as the capture does
           // (carrick#2405), and so do the kept infer answers (carrick#2843).
           // The retype reads a declared no-body return
-          // with the same `statesNoBody` (carrick#2743).
+          // with the same `statesNoBody` (carrick#2743). The server mode
+          // writes its record and socket through the guard (carrick#2879).
           assert.strictEqual(
             spec,
             './capture/index.js',

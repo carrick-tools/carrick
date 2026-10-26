@@ -141,7 +141,10 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
-| `shutdown` | no | Graceful exit |
+| `shutdown` | no | Graceful exit (in server mode: ends the client's connection, not the daemon) |
+| `hello` | — | Server mode only: the build id handshake every connection opens with |
+| `status` | — | Server mode only: what the daemon holds |
+| `stop` | — | Server mode only: stop the daemon |
 
 #### `init` - Point the sidecar at a project
 
@@ -1021,6 +1024,57 @@ Response, written before the process exits:
 { "request_id": "11", "status": "success" }
 ```
 
+### Server mode
+
+`node dist/src/index.js --serve <workspace> [--cli-version <v>]` runs one resident sidecar for a workspace, so the programs a scan builds outlive the scan (carrick#2879). The protocol is the one above, one JSON frame per line, over a Unix socket instead of stdio. `node dist/src/index.js --build-id` prints the build id and exits: sha256 over every file under the running `dist/src`, by relative path in sorted order.
+
+- **Where:** it listens on `<workspace>/.carrick/typed.sock`, mode 0600, and writes `<workspace>/.carrick/typed.json`: `pid`, `socket`, `build_id`, `cli_version`, `started_at`. A workspace whose socket path would pass the platform limit (104 bytes on macOS) listens on `carrick-typed-<hash>.sock` under the OS temp dir instead; read the path from `typed.json`, never derive it.
+- **Handshake:** every connection opens with `hello` naming the build id of the sidecar the client would have spawned. Any other first frame, or another build id, is answered with an error starting `build_mismatch` and the connection is closed, so a stale build never answers.
+- **One queue:** every request from every connection runs in arrival order, `check_v2` included; each request's frames go to the connection that sent it.
+- **Held services:** `init` selects the service its fields name (`repo_root`, `tsconfig_path`, `scan_root`, `tsconfig_snapshot`, `pinned_dependencies`), or resolves a new one; the connection's later requests read it. A second connection with the same `init` reads the project the first one built. Over stdio, `init` still re-scopes the one project.
+- **One daemon per workspace:** `typed.json` is claimed with a hard link. A second start while one answers exits with code 3. A record whose process is dead, or whose socket does not answer within 2 s, is taken over.
+- **Stop:** on `stop`, SIGTERM or SIGINT, and after 15 minutes with no request (`CARRICK_TYPED_IDLE_MS` sets another idle time), it removes the socket and `typed.json` and exits 0. It exits without removing anything when `typed.json` is gone or names another process. `shutdown` ends only the client's connection. A client that disconnects mid-request does not stop it.
+
+```json
+{ "request_id": "12", "action": "hello", "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5" }
+```
+
+```json
+{ "request_id": "12", "status": "success", "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5", "pid": 48121 }
+```
+
+```json
+{ "request_id": "13", "action": "status" }
+```
+
+```json
+{
+  "request_id": "13",
+  "status": "success",
+  "daemon": {
+    "pid": 48121,
+    "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5",
+    "cli_version": "0.3.133",
+    "socket": "/repo/.carrick/typed.sock",
+    "started_at": "2026-10-26T14:02:11.000Z",
+    "uptime_ms": 81234,
+    "idle_ms": 5120,
+    "services": [{ "repo_root": "/repo/services/api", "scan_root": "/repo", "built": true }],
+    "heap_used_mb": 412,
+    "rss_mb": 655
+  }
+}
+```
+
+```json
+{ "request_id": "14", "action": "stop" }
+```
+
+Response, written before the daemon exits:
+```json
+{ "request_id": "14", "status": "success" }
+```
+
 ## Architecture
 
 ```
@@ -1044,6 +1098,7 @@ Response, written before the process exits:
 | File | Description |
 |------|-------------|
 | `src/index.ts` | Entry point, message loop, dispatch, response/progress frames |
+| `src/typed-server.ts` | Server mode: the socket, `typed.json`, the build id, the request queue, idle stop and clean-up |
 | `src/types.ts` | Request/response interfaces |
 | `src/validators.ts` | Zod schemas; the authority on request shape |
 | `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |

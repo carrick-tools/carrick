@@ -162,6 +162,16 @@ export class WriteGuard {
     fs.renameSync(from, to);
   }
 
+  /**
+   * A hard link at `linkPath` onto the file `existing`; throws `EEXIST` when
+   * `linkPath` is taken. The one file operation two processes cannot both
+   * win, so it is how a file is claimed with its whole content in place.
+   */
+  link(existing: string, linkPath: string): void {
+    this.check(linkPath, entry(linkPath), 'link');
+    fs.linkSync(existing, linkPath);
+  }
+
   symlink(target: string, linkPath: string, type?: fs.symlink.Type): void {
     this.check(linkPath, entry(linkPath), 'link');
     fs.symlinkSync(target, linkPath, type);
