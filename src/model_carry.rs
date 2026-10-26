@@ -115,6 +115,21 @@ pub fn carry_edited_files(
             out.answers.insert(key, carry.answer);
         }
     }
+    if out.examined > 0 {
+        // The reasons by name, whole: the boundary keeps the first few sites.
+        let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for line in &out.not_carried {
+            if let Some((_, reason)) = line.split_once(' ') {
+                *tally.entry(reason).or_default() += 1;
+            }
+        }
+        tracing::debug!(
+            "Edited files: {} row(s) carried of {} examined; not carried by reason: {:?}",
+            out.carried,
+            out.examined,
+            tally
+        );
+    }
     out
 }
 
