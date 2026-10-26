@@ -2572,7 +2572,12 @@ mod tests {
             .collect();
         let refusal = inference_refusal(&repos).unwrap();
         assert!(refusal.contains("and 3 more"), "{refusal}");
-        assert!(!refusal.contains("r7"), "{refusal}");
+        // The path segment, not the bare name: the temp dir's random name can
+        // itself contain "r7".
+        assert!(
+            !refusal.contains(&repos[7].display().to_string()),
+            "{refusal}"
+        );
     }
 
     #[test]
