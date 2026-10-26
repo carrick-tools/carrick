@@ -826,13 +826,13 @@ fn carried_clause(boundary: Option<&crate::boundary::ServiceBoundary>) -> String
         return String::new();
     };
     let left = boundary.model_rows_not_carried.as_ref();
-    let mut clause =
-        format!(" {carried} row(s) in edited files were carried by their unchanged lines");
+    // Wording agreed with David, 2026-10-26.
+    let mut clause = format!(" {carried} checks in edited files kept from unchanged lines");
     match left {
         Some(left) if !left.is_zero() => {
-            clause.push_str(&format!("; {} were not and are not checked", left.total));
+            clause.push_str(&format!("; {} skipped", left.total));
             if let Some(first) = left.reasons.first() {
-                clause.push_str(&format!(": {first}"));
+                clause.push_str(&format!(" (first: {first})"));
             }
             clause.push('.');
         }
