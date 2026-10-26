@@ -3311,16 +3311,16 @@ fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
         "the re-scan failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let written = out.join("items-api.json");
-    let text = std::fs::read_to_string(&written).unwrap_or_else(|e| {
-        let held: Vec<_> = std::fs::read_dir(&out)
-            .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
-            .unwrap_or_default();
-        panic!(
-            "no blob at {}: {e}; the scan dir holds {held:?}",
-            written.display()
-        )
-    });
+    // The blob is named for the service, which differs by checkout; the
+    // scan wrote exactly one.
+    let mut written: Vec<PathBuf> = std::fs::read_dir(&out)
+        .expect("read the scan dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(written.len(), 1, "one blob expected in {written:?}");
+    let text = std::fs::read_to_string(written.remove(0)).expect("read the blob");
     serde_json::from_str(&text).expect("the re-scan blob is JSON")
 }
 
