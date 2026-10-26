@@ -2,7 +2,9 @@
 // PostToolUse hook for a file edit, on either host.
 //
 // Reads the tool payload on stdin, runs `carrick check <file> --json` from the
-// workspace root and prints the verdicts as `additionalContext`, which the host
+// workspace root and prints what the edit needs acted on (`renderPostToolUse`:
+// its problems, or a pointer to `carrick check --changed` when the file could
+// not be re-checked) as `additionalContext`, which the host
 // attaches to the tool result. Attaching to the result rather than to the next
 // turn is why this channel has no "the run ended on the edit" hole.
 //
@@ -81,17 +83,6 @@ export function filesFromPayload(payload: Payload): string[] {
   if (named) return [named];
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
 }
-
-/** The `told` key the known-miss line is remembered under, per repo. */
-const KNOWN_MISS_PREFIX = "known-miss::";
-
-/**
- * Said once per session on a repo where a re-check already missed its budget
- * against this index: the per-edit verdicts there are the index's.
- */
-export const KNOWN_MISS_LINE =
-  "On this repo a re-check does not fit the per-edit budget, so verdicts after an edit are " +
-  "the index's until the next `carrick refresh`. Run `carrick check --changed` for fresh ones.";
 
 /**
  * Every edited file's answer, in order, from one binary call: the
@@ -192,15 +183,6 @@ async function main(): Promise<void> {
     const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) contexts.push(context);
-    // A repo whose re-check is known not to fit answers from the index on
-    // every edit; the reader is told so once per session, not once per edit.
-    if (result.recheck?.known_miss) {
-      const missKey = `${KNOWN_MISS_PREFIX}${result.repo ?? ""}`;
-      if (!told.includes(missKey) && !(payload.session_id && wasTold(payload.session_id, missKey))) {
-        told.push(missKey);
-        contexts.push(KNOWN_MISS_LINE);
-      }
-    }
   }
 
   // Silent and local: the names go to a file under the user's home directory

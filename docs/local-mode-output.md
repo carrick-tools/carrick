@@ -288,11 +288,23 @@ through a published package, are not recorded.
 
 Types first in line order, one line per operation; then functions, most callers
 first. A location in another service is prefixed with that service. A line
-names at most four locations and counts the rest. The post-edit hook prints at
-most eight of these lines, once per file per session. The Read hook
+names at most four locations and counts the rest. The Read hook
 (`carrick hook post-read`) prints them, with the other side of each route or
-call in the file, the first time a session reads a TypeScript file; the
-post-edit hook then leaves them out for that file.
+call in the file, the first time a session reads a TypeScript file. The
+post-edit hook prints none of them: it counts them in one line, once per file
+per session, and leaves that out too for a file the Read hook already covered.
+
+### What the post-edit hook prints
+
+Only what the edit needs acted on, a few lines per file
+(`renderPostToolUse` in `npm/carrick/src/render.ts`):
+
+- A file the re-check answered from the working tree: one line counting its
+  contract problems, then at most three of them, one line each.
+- A file the re-check did not answer for (it missed its budget, or none ran):
+  one line that sends the reader to `carrick check --changed`, and none of the
+  index's verdicts, which describe the file before the edit.
+- A deleted file: what the index still holds for it, and its problems.
 
 ### `items[]`
 

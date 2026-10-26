@@ -280,96 +280,52 @@ export function itemLine(
   return segments.map((segment) => segment.replace(/\.+$/, "")).join(". ");
 }
 
-/** Problems first, then everything that names another service, both by line. */
-export function reportableItems(result: CheckResult): CheckItem[] {
-  const byLine = (a: CheckItem, b: CheckItem): number => (a.line ?? 0) - (b.line ?? 0);
-  const problems = problemItems(result).sort(byLine);
-  const connected = connectedItems(result)
-    .filter((item) => !problems.includes(item))
-    .sort(byLine);
-  return [...problems, ...connected];
+/** Problem lines one edit's message carries before it counts the rest. */
+export const MAX_EDIT_PROBLEMS = 3;
+/** How long one problem line of an edit's message may run before it is cut. */
+export const MAX_EDIT_LINE_CHARS = 400;
+
+function cutLine(text: string): string {
+  return text.length <= MAX_EDIT_LINE_CHARS ? text : `${text.slice(0, MAX_EDIT_LINE_CHARS - 3)}...`;
 }
 
-function deletedLine(result: CheckResult): string | null {
-  if (!result.deleted) return null;
+/**
+ * Whether the items describe the file as it is on disk now: the file has not
+ * moved past the index, a re-check answered from the working tree, or the
+ * file is gone (its rows then say what the deletion leaves behind).
+ */
+function answersTheEdit(result: CheckResult): boolean {
+  if (!result.stale || result.deleted) return true;
+  const ran = result.recheck?.ran;
+  return ran !== undefined && ran !== "none";
+}
+
+function deletedLine(result: CheckResult, where: string): string {
   const consumers = (result.items ?? []).reduce(
     (total, item) => total + (item.counterparts ?? []).length,
     0,
   );
-  return `This file is gone from disk and the index still holds ${(result.items ?? []).length} row(s) for it, with ${consumers} counterpart(s) still on the other side.`;
-}
-
-function staleLine(result: CheckResult): string | null {
-  if (!result.stale) return null;
-  const changed = result.changed_since_index;
-  const suffix =
-    typeof changed === "number"
-      ? ` ${changed} file(s) in the workspace have changed since ${shortHash(result.index_commit)}.`
-      : "";
-  // A re-check that ran has already answered from the working tree, so the
-  // sentence that sends a reader to re-index would be false (carrick#1036).
-  const ran = result.recheck?.ran;
-  if (ran && ran !== "none") {
-    return `These verdicts were re-computed from your working tree in ${result.recheck?.elapsed_ms} ms.${suffix}`;
-  }
-  const since = result.recheck?.stale_since;
-  const budget = since
-    ? ` The re-check did not finish inside its budget, so this is the answer computed at ${since}.`
-    : "";
-  return `This file has changed since the index, so these verdicts describe the indexed version.${suffix}${budget}`;
-}
-
-/** Lines of the edited file the unclassified sentence names before it counts the rest. */
-const MAX_UNCLASSIFIED_LINES = 5;
-
-/**
- * Lines in the checked file that the local index holds as unclassified: calls
- * with no expected type, calls to a path nothing resolved, and literal
- * candidates no row came out of. Each source lists `file:line` sites for the
- * whole service, so this keeps the ones in `result.file` and nothing else.
- */
-export function unclassifiedLines(result: CheckResult): number[] {
-  const file = result.file;
-  const boundary = result.boundary;
-  if (!file || !boundary) return [];
-  const sites = [
-    ...(boundary.unemitted_literal_sites ?? []),
-    ...(boundary.calls_without_expected_type?.reasons ?? []),
-    ...(boundary.unknown_call_paths?.reasons ?? []),
-  ];
-  const lines = new Set<number>();
-  for (const site of sites) {
-    const colon = site.lastIndexOf(":");
-    if (colon < 0 || site.slice(0, colon) !== file) continue;
-    const line = Number(site.slice(colon + 1));
-    if (Number.isInteger(line) && line > 0) lines.add(line);
-  }
-  return [...lines].sort((a, b) => a - b);
-}
-
-function unclassifiedLine(result: CheckResult): string | null {
-  const lines = unclassifiedLines(result);
-  if (!lines.length) return null;
-  const rest = lines.length - MAX_UNCLASSIFIED_LINES;
-  const shown = lines.slice(0, MAX_UNCLASSIFIED_LINES).join(", ");
-  const named = rest > 0 ? `${shown}, +${rest} more` : shown;
-  const noun = lines.length === 1 ? "call site" : "call sites";
-  return `${lines.length} ${noun} in this file not classified locally (line ${named}): ${lines.length === 1 ? "its route or type is" : "their routes or types are"} unchecked here.`;
+  return `Carrick: ${where} is gone from disk and the index still holds ${(result.items ?? []).length} row(s) for it, with ${consumers} counterpart(s) still on the other side.`;
 }
 
 /**
  * The PostToolUse context, or `null` for an error payload.
  *
- * The header is printed on every checked file, even one with nothing to report:
- * it is the only sign the hook ran, and silence reads the same as a hook that is
- * not installed. The service-wide boundary is not here: it is the same text on
- * every edit, which is what an agent learns to skip, so `renderSessionStart`
- * prints it once. An edit adds one line, only when this file holds call sites
- * the local index did not classify.
+ * Only what this edit changed or what needs action, a few lines at most: on a
+ * large repo the index's stored verdicts for one file ran to 8.7 KB per edit,
+ * every one of them about rows the edit did not touch. So:
  *
- * Then the CLI's `uses_lines`, who calls this file's functions and which
- * operations read its types (carrick#2067), unless `options.uses` is `false`:
- * the hook shows them once per file per session.
+ * - A file the re-check did not answer for (it missed its budget, or none
+ *   ran): one line, and no stored verdict, because those describe the file
+ *   before the edit. It sends the reader to `carrick check --changed`.
+ * - A file answered from the working tree: its problems (a result other than
+ *   `compatible`), at most three, and nothing about the rows that are fine.
+ * - Then, unless `options.uses` is `false`, one line counting who uses this
+ *   file from elsewhere (carrick#2067); the hook shows it once per file per
+ *   session, and the uses themselves are the Read hook's to list.
+ *
+ * Every checked file gets at least one line: it is the only sign the hook
+ * ran, and silence reads the same as a hook that is not installed.
  */
 export function renderPostToolUse(
   result: CheckResult,
@@ -377,35 +333,34 @@ export function renderPostToolUse(
   options: { uses?: boolean } = {},
 ): string | null {
   if (result.error) return null;
-  const items = reportableItems(result);
-  const unclassified = unclassifiedLine(result);
-
   // `result.file` is relative to the repo that owns it, so the caller's own
   // workspace-relative path is the one a reader can open; it wins when given.
-  const where = displayFile ?? result.file;
-  const service = result.service ? `${result.service}, ` : "";
-  const lines: string[] = [
-    `Carrick checked ${where ?? "this file"} against the workspace index (${service}indexed at ${shortHash(result.index_commit)}).`,
-  ];
-  for (const item of items.slice(0, MAX_ITEM_LINES)) lines.push(itemLine(item, where));
-  const hidden = items.length - Math.min(items.length, MAX_ITEM_LINES);
-  if (hidden > 0) {
-    lines.push(`- and ${hidden} more route(s) or call(s) in this file, from \`carrick check\`.`);
-  }
-  const deleted = deletedLine(result);
-  if (deleted) lines.push(deleted);
-  const stale = staleLine(result);
-  if (stale) lines.push(stale);
-  if (unclassified) lines.push(unclassified);
-  if (options.uses !== false) {
-    const uses = result.uses_lines ?? [];
-    lines.push(...uses.slice(0, MAX_USE_LINES));
-    const rest = uses.length - Math.min(uses.length, MAX_USE_LINES);
-    if (rest > 0) {
-      lines.push(
-        `- and ${rest} more line(s) like these; \`carrick check\` on this file prints them all.`,
-      );
+  const where = displayFile ?? result.file ?? "this file";
+  const lines: string[] = [];
+  if (!answersTheEdit(result)) {
+    lines.push(
+      `Carrick noted the edit to ${where}. It was not re-checked here, so run \`carrick check --changed\` before you finish.`,
+    );
+  } else {
+    const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+    if (result.deleted) {
+      lines.push(deletedLine(result, where));
+    } else {
+      const count =
+        problems.length === 0
+          ? "no contract problem"
+          : `${problems.length} contract ${problems.length === 1 ? "problem" : "problems"}`;
+      lines.push(`Carrick re-checked ${where} after this edit: ${count}.`);
     }
+    for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));
+    const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
+    if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${where}\` lists them.`);
+  }
+  const uses = options.uses === false ? 0 : (result.uses_lines ?? []).length;
+  if (uses > 0) {
+    lines.push(
+      `Other files use what this file declares: \`carrick check ${where}\` lists the ${uses} ${uses === 1 ? "use" : "uses"}; open them if this edit changed a signature or a type.`,
+    );
   }
   return lines.join("\n");
 }

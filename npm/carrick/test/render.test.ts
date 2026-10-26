@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   BOUNDARY_POINTER,
   LISTED_SERVICES,
+  MAX_EDIT_LINE_CHARS,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -13,24 +14,86 @@ import {
   hasSomethingToDo,
   shortHash,
   typedMismatchClause,
-  unclassifiedLines,
 } from "../src/render.ts";
-import type { CheckItem } from "../src/contract.ts";
+import type { CheckItem, CheckResult } from "../src/contract.ts";
 import { fixture, statusFixture } from "./helpers.ts";
 
-test("the hook context puts locations first and the file's unclassified line last", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json"));
-  assert.ok(context);
+// What an edit is told (the post-edit hook): only what this edit changed or
+// what needs action, a few lines at most. Never the index's stored verdict
+// list: on a large repo that was 8.7 KB of rows the edit did not touch.
+
+/** The mismatch fixture as the re-check answers it from the working tree. */
+function rechecked(): CheckResult {
+  return { ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 900 } };
+}
+
+/** `count` routes that name a consumer and claim nothing: the bulk of a stale answer. */
+function connectedRows(count: number): CheckItem[] {
+  return Array.from({ length: count }, (_, n) => ({
+    kind: "route",
+    method: "GET",
+    path: `/api/things/${n}`,
+    line: 100 + n,
+    col: 1,
+    source: "fact",
+    counterparts: [{ role: "consumer", service: "web", file: "src/client.ts", line: n + 1 }],
+    verdict: { state: "unresolved", result: null, detail: "a side did not resolve" },
+  }));
+}
+
+test("an edit the hook could not re-check lists none of the index's verdicts", () => {
+  const stale = fixture("check-mismatch.json");
+  stale.items = [...(stale.items ?? []), ...connectedRows(40)];
+  for (const recheck of [
+    undefined,
+    {
+      ran: "none" as const,
+      elapsed_ms: 10004,
+      stale_since: "2026-09-13T22:26:26.123456789Z",
+      reason: "the re-scan ran past the budget",
+    },
+    { ran: "none" as const, elapsed_ms: 40, known_miss: true },
+  ]) {
+    assert.equal(
+      renderPostToolUse({ ...stale, recheck }),
+      "Carrick noted the edit to src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish.",
+    );
+  }
+});
+
+test("a re-checked edit lists its problems and nothing that is fine", () => {
+  const context = renderPostToolUse(rechecked()) ?? "";
   const lines = context.split("\n");
-  assert.match(lines[0] ?? "", /^Carrick checked src\/routes\/users\.ts against the workspace index \(user-service, indexed at 6a1b2c3\)/);
-  // Problems first, by line, then the rows that only name a counterpart.
-  assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3/);
-  assert.match(lines[2] ?? "", /^- src\/routes\/users\.ts:61:9/);
-  assert.match(lines[3] ?? "", /^- src\/routes\/users\.ts:12:3/);
-  const unclassifiedAt = lines.findIndex((line) => line.includes("not classified locally"));
-  const lastItemAt = lines.reduce((at, line, index) => (line.startsWith("- ") ? index : at), -1);
-  assert.ok(unclassifiedAt > lastItemAt, "the file's line follows every location line");
-  assert.equal(unclassifiedAt, lines.length - 1);
+  assert.equal(lines[0], "Carrick re-checked src/routes/users.ts after this edit: 2 contract problems.");
+  assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3 route GET \/api\/users\/:id .*type_mismatch/);
+  assert.match(lines[2] ?? "", /^- src\/routes\/users\.ts:61:9 call POST \/api\/orders .*method_mismatch/);
+  assert.equal(lines.length, 3, context);
+  // The compatible row, the row that claims nothing and the peer row are not problems.
+  for (const quiet of [":12:3", ":80:5", ":95:7", "compatible"]) {
+    assert.equal(context.includes(quiet), false, quiet);
+  }
+});
+
+test("a re-checked edit with many problems prints three and counts the rest", () => {
+  const result = rechecked();
+  const mismatch = result.items![0]!;
+  result.items = Array.from({ length: 7 }, (_, n) => ({ ...mismatch, line: n + 1 }));
+  const lines = (renderPostToolUse(result) ?? "").split("\n");
+  assert.equal(lines[0], "Carrick re-checked src/routes/users.ts after this edit: 7 contract problems.");
+  assert.equal(lines.filter((line) => line.startsWith("- src/")).length, 3);
+  assert.equal(lines[4], "- and 4 more: `carrick check src/routes/users.ts` lists them.");
+  assert.equal(lines.length, 5);
+  for (const line of lines) assert.ok(line.length <= MAX_EDIT_LINE_CHARS, line);
+});
+
+test("a re-checked edit with no problem says so in one line", () => {
+  const result = rechecked();
+  result.items = result.items!.filter((item) => item.verdict?.result == null || item.verdict.result === "compatible");
+  result.items.push(...connectedRows(40));
+  assert.equal(
+    renderPostToolUse(result),
+    "Carrick re-checked src/routes/users.ts after this edit: no contract problem.",
+  );
 });
 
 test("an edit never carries the service-wide boundary", () => {
@@ -43,73 +106,35 @@ test("an edit never carries the service-wide boundary", () => {
   }
 });
 
-test("the edit's one boundary line names only this file's unclassified lines", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  // The fixture's boundary also lists src/proxy.ts:22, which is another file's.
-  assert.match(
-    context,
-    /\n1 call site in this file not classified locally \(line 80\): its route or type is unchecked here\.$/,
-  );
-  assert.equal(context.includes("proxy.ts"), false);
-  assert.equal(context.includes("22"), false);
-});
-
-test("unclassifiedLines reads every site list, once per line, sorted", () => {
-  const result = fixture("check-mismatch.json");
-  result.boundary = {
-    unemitted_literal_sites: ["src/routes/users.ts:9", "src/other.ts:3", "src/routes/users.ts:80"],
-    calls_without_expected_type: { total: 2, reasons: ["src/routes/users.ts:80", "src/routes/users.ts:5"] },
-    unknown_call_paths: { total: 1, reasons: ["src/routes/users.ts:not-a-line"] },
-  };
-  assert.deepEqual(unclassifiedLines(result), [5, 9, 80]);
-  assert.equal(
-    (renderPostToolUse(result) ?? "").split("\n").at(-1),
-    "3 call sites in this file not classified locally (line 5, 9, 80): their routes or types are unchecked here.",
-  );
-});
-
-test("a file with items and no unclassified sites ends on its items", () => {
-  const result = fixture("check-mismatch.json");
-  result.boundary = { calls_without_expected_type: { total: 1, reasons: ["src/elsewhere.ts:1"] } };
-  const context = renderPostToolUse(result) ?? "";
-  assert.equal(context.includes("not classified locally"), false);
-});
-
-test("every route or call gets exactly one line", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json"));
-  const itemLines = (context ?? "").split("\n").filter((line) => line.startsWith("- "));
-  assert.equal(itemLines.length, 5);
-  for (const line of itemLines) assert.equal(line.includes("\n"), false);
-});
+/** One fixture row as `itemLine` renders it, found by its path. */
+function lineFor(name: string, pathPart: string): string {
+  const result = fixture(name);
+  const item = (result.items ?? []).find((row) => (row.path ?? "").includes(pathPart));
+  assert.ok(item, pathPart);
+  return itemLine(item, result.file);
+}
 
 test("a candidate row is labelled as one and names what produced it", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("/api/orders"));
+  const line = lineFor("check-mismatch.json", "/api/orders");
   assert.ok(line);
   assert.match(line, /\[candidate, model\]/);
   assert.match(line, /method_mismatch \(no type verdict\): order-service serves PUT at this path/);
 });
 
 test("consumer sites ride the item line", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("/api/users/:id"));
-  assert.ok(line);
+  const line = lineFor("check-mismatch.json", "/api/users/:id");
   assert.match(line, /Consumers: order-service src\/clients\/users\.ts:18/);
   assert.match(line, /billing-service src\/lookup\.ts:7/);
 });
 
 test("a peer counterpart gets locations and no producer or consumer word", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("example-payments"));
-  assert.ok(line);
+  const line = lineFor("check-mismatch.json", "example-payments");
   assert.match(line, /Same contract in: billing-service src\/charges\.ts:31/);
   assert.equal(/consumer|producer/i.test(line), false);
 });
 
 test("a not_checked row prints the state, never the word null", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("example-payments"));
-  assert.ok(line);
+  const line = lineFor("check-mismatch.json", "example-payments");
   // result is null wherever the state is the whole statement.
   assert.match(line, /no type verdict: matched to a shared external contract/);
   assert.equal(/\bnull\b/.test(line), false);
@@ -118,6 +143,7 @@ test("a not_checked row prints the state, never the word null", () => {
 
 test("no rendered line anywhere prints the word null", () => {
   const rendered = [
+    renderPostToolUse(rechecked()) ?? "",
     renderPostToolUse(fixture("check-mismatch.json")) ?? "",
     renderPostToolUse(fixture("check-deleted.json")) ?? "",
     renderPostToolUse(fixture("check-pre-rendered-boundary.json")) ?? "",
@@ -128,80 +154,44 @@ test("no rendered line anywhere prints the word null", () => {
 });
 
 test("a verdict that claims nothing says so, and a compiler verdict stands alone", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
   // `unresolved` is the type layer's word: a side would not resolve, so there
   // is no result to print and nothing is asserted about the pair.
-  const unresolved = context.split("\n").find((text) => text.includes("/api/audit/:id"));
-  assert.match(unresolved ?? "", /no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`/);
-  assert.equal(/type_mismatch/.test(unresolved ?? ""), false);
-  const compared = context.split("\n").find((text) => text.includes("/api/users/:id"));
-  assert.match(compared ?? "", /type_mismatch: the response no longer carries/);
-  assert.equal(compared?.includes("no type verdict"), false);
+  const unresolved = lineFor("check-mismatch.json", "/api/audit/:id");
+  assert.match(unresolved, /no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`/);
+  assert.equal(/type_mismatch/.test(unresolved), false);
+  const compared = lineFor("check-mismatch.json", "/api/users/:id");
+  assert.match(compared, /type_mismatch: the response no longer carries/);
+  assert.equal(compared.includes("no type verdict"), false);
 });
 
 test("evidence rides the item line when the row states it", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("/api/users/:id"));
-  assert.match(line ?? "", /Read off loader export claimed by a file-route convention/);
+  const line = lineFor("check-mismatch.json", "/api/users/:id");
+  assert.match(line, /Read off loader export claimed by a file-route convention/);
 });
 
-test("a deleted file says so and keeps its consumers", () => {
+test("a deleted file says so and names the problem it leaves", () => {
   const context = renderPostToolUse(fixture("check-deleted.json")) ?? "";
-  assert.match(context, /This file is gone from disk and the index still holds 1 row\(s\) for it, with 1 counterpart\(s\)/);
-  assert.match(context, /producer_removed/);
-});
-
-test("a stale file says the verdicts describe the indexed version", () => {
-  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  assert.match(context, /This file has changed since the index/);
-  assert.match(context, /3 file\(s\) in the workspace have changed since 6a1b2c3/);
-});
-
-test("a re-checked file says its verdicts came from the working tree", () => {
-  const stale = fixture("check-mismatch.json");
-  const rechecked = {
-    ...stale,
-    recheck: { ran: "extraction+types" as const, elapsed_ms: 2543 },
-  };
-  const context = renderPostToolUse(rechecked) ?? "";
-  assert.match(context, /re-computed from your working tree in 2543 ms/);
-  assert.doesNotMatch(context, /describe the indexed version/);
-});
-
-test("a re-check that missed its budget says how old the answer is", () => {
-  const stale = fixture("check-mismatch.json");
-  const degraded = {
-    ...stale,
-    recheck: {
-      ran: "none" as const,
-      elapsed_ms: 10004,
-      stale_since: "2026-09-13T22:26:26Z",
-      reason: "the re-scan ran past the budget",
-    },
-  };
-  const context = renderPostToolUse(degraded) ?? "";
-  assert.match(context, /describe the indexed version/);
-  assert.match(context, /did not finish inside its budget.*2026-09-13T22:26:26Z/);
-});
-
-test("a file with no rows but unclassified sites says so in one line", () => {
-  const result = fixture("check-clean.json");
-  result.boundary = { unemitted_literal_sites: ["src/util/format.ts:7"] };
+  const lines = context.split("\n");
   assert.equal(
-    renderPostToolUse(result),
-    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).\n1 call site in this file not classified locally (line 7): its route or type is unchecked here.",
+    lines[0],
+    "Carrick: src/routes/users.ts is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.",
   );
+  assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3 route GET \/api\/users\/:id .*producer_removed/);
+  assert.equal(lines.length, 2);
 });
 
-test("a file with nothing to report still prints the header, and only the header", () => {
-  assert.equal(
-    renderPostToolUse(fixture("check-silent.json")),
-    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).",
-  );
-  assert.equal(
-    renderPostToolUse(fixture("check-clean.json")),
-    "Carrick checked src/util/format.ts against the workspace index (user-service, indexed at 6a1b2c3).",
-  );
+test("a file with nothing to report still prints one line, and only that", () => {
+  // The line is the only sign the hook ran: silence reads the same as a hook
+  // that is not installed.
+  for (const name of ["check-silent.json", "check-clean.json"]) {
+    const result = fixture(name);
+    result.boundary = { unemitted_literal_sites: [`${result.file}:7`] };
+    assert.equal(
+      renderPostToolUse(result),
+      "Carrick re-checked src/util/format.ts after this edit: no contract problem.",
+      name,
+    );
+  }
 });
 
 test("an error payload prints nothing", () => {
@@ -210,6 +200,7 @@ test("an error payload prints nothing", () => {
 
 test("no user-visible line carries an em-dash", () => {
   const rendered = [
+    renderPostToolUse(rechecked()) ?? "",
     renderPostToolUse(fixture("check-mismatch.json")) ?? "",
     renderPostToolUse(fixture("check-deleted.json")) ?? "",
     renderSessionStart(statusFixture("status-workspace.json")),
@@ -669,30 +660,27 @@ test("a session that starts while Carrick Cloud is analysing is told so", () => 
   assert.doesNotMatch(handed, /is running|\.log/, "it is not still going, and its log ended");
 });
 
-// Who uses the edited file (carrick#2067): the CLI's lines, after everything the
-// hook printed before them, at most eight, and only when the hook asks.
-test("uses lines follow the file's own lines, in the CLI's order", () => {
-  const withUnclassified = { ...fixture("check-mismatch.json"), uses_lines: ["- a (line 1) has 1 caller(s) outside this file: src/b.ts:2", "- c (line 3) has 1 caller(s) outside this file: src/d.ts:4"] };
-  const lines = (renderPostToolUse(withUnclassified) ?? "").split("\n");
-  const unclassifiedAt = lines.findIndex((line) => line.includes("not classified locally"));
-  assert.ok(unclassifiedAt > 0);
-  assert.deepEqual(lines.slice(unclassifiedAt + 1), withUnclassified.uses_lines);
-
+// Who uses the edited file (carrick#2067): one line that counts the uses and
+// names the command that lists them, after everything else, and only when the
+// hook asks. The uses themselves are the Read hook's to print.
+test("an edit's uses are one counted line, never the list", () => {
+  const many = Array.from({ length: 400 }, (_, n) => `- f${n} (line ${n + 1}) has 1 caller(s) outside this file: src/x.ts:${n + 1}`);
+  for (const result of [
+    { ...rechecked(), uses_lines: many },
+    { ...fixture("check-mismatch.json"), uses_lines: many },
+  ]) {
+    const lines = (renderPostToolUse(result) ?? "").split("\n");
+    assert.equal(
+      lines.at(-1),
+      "Other files use what this file declares: `carrick check src/routes/users.ts` lists the 400 uses; open them if this edit changed a signature or a type.",
+    );
+    assert.equal(lines.some((line) => line.startsWith("- f")), false);
+  }
   const uses = fixture("check-uses.json");
-  const context = renderPostToolUse(uses) ?? "";
-  assert.deepEqual(context.split("\n").slice(1), uses.uses_lines);
-});
-
-test("more than eight uses lines are cut to eight and counted", () => {
-  const many = Array.from({ length: 11 }, (_, n) => `- f${n} (line ${n + 1}) has 1 caller(s) outside this file: src/x.ts:${n + 1}`);
-  const context = renderPostToolUse({ ...fixture("check-uses.json"), uses_lines: many }) ?? "";
-  const lines = context.split("\n");
-  assert.deepEqual(lines.slice(1, 9), many.slice(0, 8));
   assert.equal(
-    lines[9],
-    "- and 3 more line(s) like these; `carrick check` on this file prints them all.",
+    renderPostToolUse(uses),
+    "Carrick re-checked src/client.ts after this edit: no contract problem.\nOther files use what this file declares: `carrick check src/client.ts` lists the 2 uses; open them if this edit changed a signature or a type.",
   );
-  assert.equal(lines.length, 10);
 });
 
 test("a hook that has already shown a file's uses prints the rest unchanged", () => {
