@@ -2884,6 +2884,85 @@ fn check_changed_names_the_untouched_calls_a_deleted_route_leaves_with_no_route(
     assert_eq!(code, Some(1), "{text}");
 }
 
+/// Marks the workspace's index as written by an older scanner, as an upgrade
+/// leaves it: same rows, another version.
+fn as_written_by_an_older_scanner(root: &Path) {
+    let path = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the index"))
+            .expect("the index is JSON");
+    index["scanner_version"] = serde_json::json!("0.0.1");
+    std::fs::write(&path, index.to_string()).expect("write the index");
+}
+
+/// carrick#2911: an index an older scanner wrote holds the rows that scanner
+/// read. A row this build reads and that one did not looks new, so a check
+/// against it cannot tell a new problem from an upgrade: it does not fail,
+/// says why in one line, and exits 2.
+#[test]
+#[serial]
+fn check_changed_does_not_fail_on_a_row_an_older_scanners_index_cannot_date() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    let (code, text) = check_changed(root, false);
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("inventory-svc/src/client.ts:") && line.contains("  no route  ")
+        })
+        .unwrap_or_else(|| panic!("the call is listed, not hidden:\n{text}"));
+    assert!(
+        problem.contains("[not checked: the index is from another scanner build]"),
+        "marked as not checked:\n{text}"
+    );
+    assert!(
+        text.contains("written by carrick 0.0.1")
+            && text.contains("Run `carrick refresh` on the main branch"),
+        "one line says which build wrote the index and what to run:\n{text}"
+    );
+    assert_eq!(code, Some(2), "not a pass and not a failure:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["failing"], 0, "{json:#}");
+    assert_eq!(json["index_scanner"], "0.0.1", "{json:#}");
+    assert!(
+        json["problems"].as_array().is_some_and(|problems| problems
+            .iter()
+            .any(|p| p["other_build"] == true && p["fails"] == false)),
+        "{json:#}"
+    );
+}
+
+/// carrick#2911: what the older index did read still decides. It matched this
+/// call to a route, and the work deleted the route: that fails whichever
+/// build wrote the index.
+#[test]
+#[serial]
+fn check_changed_still_fails_a_call_an_older_scanners_index_matched() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    as_written_by_an_older_scanner(root);
+    std::fs::remove_file(root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"))
+        .expect("delete the route");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("inventory-svc/src/client.ts:")
+                && line.contains("  no route  ")
+                && line.contains("the index matched this call")
+                && !line.contains("not checked")),
+        "the consumer the deletion broke still fails:\n{text}"
+    );
+    assert_eq!(code, Some(1), "{text}");
+}
+
 /// The two fixture repos as two services of one monorepo, committed and
 /// listed as the workspace's one repo.
 fn monorepo_workspace() -> tempfile::TempDir {

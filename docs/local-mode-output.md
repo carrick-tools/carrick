@@ -531,8 +531,9 @@ inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no
 `services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
-`unconfirmed`, `fails`), `failing`,
-`elapsed_ms`, and `not_checked` when nothing could be checked.
+`unconfirmed`, `other_build`, `fails`), `failing`,
+`elapsed_ms`, `not_checked` when nothing could be checked, and
+`index_scanner` when the index was written by another scanner build.
 
 **Exit code.** The one read a verdict moves: 1 when any problem `fails`, else
 0. An incompatible pair fails when its finding's edge source is `fact` and its
@@ -545,7 +546,19 @@ base: a parameter, a field, a config value that reads no environment variable)
 is `unconfirmed` and never fails, because the check cannot tell a service of
 this workspace from an outside API there; the exception is a call the index
 matched to a workspace route, whose loss is a fact. A problem resting on a
-model candidate, or on rows that state no source, exits 0 too. A check that
+model candidate, or on rows that state no source, exits 0 too.
+
+**An index another scanner build wrote** (carrick#2911). The index records
+the version and the stamped commit of the build that wrote it. When that is
+not the running build (after an upgrade, or a local build), the index's
+silence about a row is no evidence the row is new: that build may not have
+read it. A problem that is new only by that silence is `other_build`: it
+is listed without `--all`, marked `[not checked: the index is from another
+scanner build]`, does not fail, and the run exits 2 when nothing else fails,
+with one line naming both builds and saying to run `carrick refresh` on the
+main branch (on a branch, `refresh` would take the branch's own new problems
+in as already indexed). What the index did read still decides: a call it
+matched that now reaches no route fails whichever build wrote it. A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
 no index, an index not bound to this folder, a file not in the index, a
 service that is not indexed, or the budget spent. It names each file or repo

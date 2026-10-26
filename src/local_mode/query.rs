@@ -1357,6 +1357,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1403,6 +1404,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1459,6 +1461,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![IndexedRepo {
                 path: repo.to_string_lossy().into_owned(),
@@ -1534,6 +1537,7 @@ mod drift_tests {
             hosted_checked_at: None,
             version: crate::local_mode::read_model::READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             repos: vec![repo("api"), repo("web")],
             type_check: None,
@@ -1587,6 +1591,7 @@ mod drift_tests {
                 hosted_checked_at: None,
                 version: crate::local_mode::read_model::READ_MODEL_VERSION,
                 scanner_version: "test".to_string(),
+                scanner_build: None,
                 indexed_at: "2026-09-12T10:00:00Z".to_string(),
                 repos: vec![IndexedRepo {
                     path: root.canonicalize().unwrap().to_string_lossy().into_owned(),

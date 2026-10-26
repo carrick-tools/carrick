@@ -1736,6 +1736,7 @@ pub(super) fn build(
         hosted_source_key: None,
         version: READ_MODEL_VERSION,
         scanner_version: join.scanner_version.clone(),
+        scanner_build: crate::cloud_storage::ScannerBuild::current(),
         indexed_at: now,
         repos,
         // Stated by the caller, which alone knows what each repo uploaded.

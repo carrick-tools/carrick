@@ -343,6 +343,12 @@ pub struct LocalIndex {
     pub hosted_checked_at: Option<String>,
     pub version: u32,
     pub scanner_version: String,
+    /// The build of the scanner that wrote this index, as a release binary
+    /// stamps it. Absent on a debug build's index and on one written before
+    /// carrick#2911; `check --changed` reads that as another build when this
+    /// binary is stamped (see [`LocalIndex::written_by_this_build`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_build: Option<crate::cloud_storage::ScannerBuild>,
     /// RFC 3339, when the last `index` or `refresh` finished.
     pub indexed_at: String,
     pub repos: Vec<IndexedRepo>,
@@ -421,6 +427,21 @@ impl TypeCheckSummary {
 }
 
 impl LocalIndex {
+    /// Whether the running binary reads rows as the build that wrote this
+    /// index did: the same version and the same stamped build (carrick#2911).
+    /// An index from another build lacks the rows that build did not read, so
+    /// its silence about a row is no evidence the row is new.
+    pub fn written_by_this_build(&self) -> bool {
+        self.scanner_version == env!("CARGO_PKG_VERSION")
+            && self.scanner_build == crate::cloud_storage::ScannerBuild::current()
+    }
+
+    /// The build that wrote this index, as a person reads it: the version,
+    /// and the commit's first seven characters when one was stamped.
+    pub fn scanner_shown(&self) -> String {
+        shown_build(&self.scanner_version, self.scanner_build.as_ref())
+    }
+
     pub fn read(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let index: LocalIndex =
@@ -499,6 +520,18 @@ fn absolutize(file: &Path) -> std::path::PathBuf {
     }
 }
 
+/// A scanner build as a person reads it: `0.3.134`, or `0.3.134 (1a2b3c4)`
+/// when a commit was stamped.
+pub fn shown_build(version: &str, build: Option<&crate::cloud_storage::ScannerBuild>) -> String {
+    match build {
+        Some(build) => format!(
+            "{version} ({})",
+            build.commit.get(..7).unwrap_or(&build.commit)
+        ),
+        None => version.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +561,7 @@ mod tests {
             hosted_source_key: None,
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-06T00:00:00Z".to_string(),
             repos: vec![repo("/w/mono", "mono"), repo("/w/mono/packages/api", "api")],
             type_check: None,
@@ -551,6 +585,7 @@ mod tests {
             hosted_source_key: None,
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
+            scanner_build: None,
             indexed_at: "2026-09-06T00:00:00Z".to_string(),
             repos: vec![repo("/w/api", "api")],
             type_check: None,
