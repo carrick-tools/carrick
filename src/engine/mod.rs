@@ -22976,6 +22976,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     param: 0,
                     param_name: Some("message".to_string()),
                 }),
+                key: None,
             },
             lead: crate::possible_calls::PossibleCall {
                 file_path: file.to_string(),

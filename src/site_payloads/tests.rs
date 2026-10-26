@@ -60,6 +60,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
                 param: 0,
                 param_name: Some("order".to_string()),
             }),
+            key: None,
         },
         payloads,
         basis: Default::default(),

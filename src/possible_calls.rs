@@ -225,7 +225,10 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
         // The record's own decided site carries the labelled end and the
         // depth the record does not.
         let site = decided.sites.iter().find(|site| {
-            site.file == at.file && site.span_start == at.span_start && site.span_end == at.span_end
+            site.file == at.file
+                && site.span_start == at.span_start
+                && site.span_end == at.span_end
+                && site.key == record.anchors.key
         });
         out.push(PossibleCall {
             file_path: at.file.clone(),

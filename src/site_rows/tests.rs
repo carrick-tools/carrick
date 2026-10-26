@@ -129,6 +129,7 @@ fn record(site: &DecidedSite, forced: &[(Slot, &str)], asked: &[Slot]) -> SiteRe
                 param: 0,
                 param_name: Some("message".to_string()),
             }),
+            key: site.key.clone(),
         },
         payloads: Default::default(),
         // A forced name is the code's; every other forced slot the label's.
@@ -1327,16 +1328,11 @@ fn traced_site(file: &str, start: u32, ends: &[(&str, Option<&str>)]) -> Decided
 }
 
 /// Each reason a route site is left to the reader, counted once, beside
-/// the one route the trace serves (PR #2687 review). A table's keys share
-/// their loop's call span, so no keyed site is served.
+/// the one route the trace serves (PR #2687 review).
 #[test]
 fn every_route_the_trace_does_not_serve_is_counted_by_why() {
     let served = traced_site("src/served.ts", 100, &[("top", Some("/v1/items/:id"))]);
     let unstated = traced_site("src/unstated.ts", 100, &[("top", Some("/v1/items/:id"))]);
-    let keyed = DecidedSite {
-        key: Some("/items/:id".to_string()),
-        ..traced_site("src/table.ts", 100, &[("top", Some("/items/:id"))])
-    };
     let trimmed = DecidedSite {
         composed_trimmed: true,
         ..traced_site("src/trimmed.ts", 100, &[("top", Some("/v1/items/:id"))])
@@ -1356,7 +1352,6 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
     let sites = [
         &served,
         &unstated,
-        &keyed,
         &trimmed,
         &no_instance,
         &unverified,
@@ -1396,7 +1391,6 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
             ("method_unstated".to_string(), 1),
             ("mount_unverified".to_string(), 1),
             ("no_instance".to_string(), 1),
-            ("table_key".to_string(), 1),
             ("trimmed".to_string(), 1),
             ("unread_prefix".to_string(), 2),
         ])

@@ -165,6 +165,7 @@ fn row(
             payload: None,
             payload_at: None,
             handler: None,
+            key: None,
         },
         lead: lead(place, UnreadReason::BelowBand),
         needs_reader: false,

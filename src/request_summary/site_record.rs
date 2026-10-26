@@ -230,6 +230,12 @@ pub struct TypeAnchors {
     /// builds.
     pub payload_at: Option<AnchorAt>,
     pub handler: Option<HandlerAnchor>,
+    /// The key of a handler table's entry, when the site is one: a table
+    /// registered in a loop gives every key the loop's call span, so the key
+    /// is what tells a record's site from its siblings'. Off the wire (only
+    /// `state` is sent) and not part of the question id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// A handler function and the parameter its payload arrives in.
@@ -1780,6 +1786,7 @@ fn record(
         payload: site.payload.clone(),
         payload_at,
         handler,
+        key: site.key.clone(),
     };
     let payloads = payload_slots(
         &anchors.call,
@@ -2209,6 +2216,26 @@ mod tests {
             Some("image.resize")
         );
         assert_eq!(resize.anchors.handler.as_ref().map(|h| h.at.line), Some(5));
+    }
+
+    /// A handler table registered in a loop gives every key the loop's call
+    /// span; each key's record finds its own site by the key, so each lands
+    /// at its own handler's line instead of the first key's (carrick#2730).
+    /// The table's kind is asked and unanswered here, so the three keys are
+    /// possible calls; the rows case is `site_rows::of`'s on the same lookup.
+    #[test]
+    fn each_key_of_a_handler_table_finds_its_own_site() {
+        let (records, decided) = records_with_rows(&repo());
+        let (_, _, _, labels) = discovery_fixture_at(&repo());
+        let rows = crate::site_rows::of(&decided, &records, &labels, &Default::default());
+        let mut lines: Vec<u32> = rows
+            .leads
+            .iter()
+            .filter(|lead| lead.file_path.ends_with("job-table.ts"))
+            .map(|lead| lead.line_number)
+            .collect();
+        lines.sort();
+        assert_eq!(lines, vec![5, 9, 13], "{:?}", rows.leads);
     }
 
     /// The compiler's names carry the declaration text sliced from the

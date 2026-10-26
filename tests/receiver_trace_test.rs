@@ -600,11 +600,12 @@ for (const [path, handler] of Object.entries(table)) {
 export default api;
 "#;
 
-/// PR #2687 review: a table's keys share their loop's call, so the trace
-/// cannot say which key a site is; it writes none of them, and no key's
-/// route is written at another key's line.
+/// carrick#2730: a table's keys share their loop's call span, and each key's
+/// record finds its own site by the key. With the trace on, each key is its
+/// own route, written at its handler's line, and no key's path sits at
+/// another key's line. The trace off writes none of them.
 #[test]
-fn routes_a_loop_registers_from_a_table_are_not_written() {
+fn each_key_of_a_loop_registered_table_is_its_own_route() {
     let table_rows = |trace: Option<&str>| -> Vec<String> {
         let blobs = scan_runs(
             "receiver-scopes",
@@ -620,7 +621,29 @@ fn routes_a_loop_registers_from_a_table_are_not_written() {
             .filter(|row| row.starts_with("src/table.ts:"))
             .collect()
     };
-    assert_eq!(table_rows(Some("1")), table_rows(None));
+    let on = table_rows(Some("1"));
+    let line_of = |name: &str| {
+        LOOP_TABLE
+            .lines()
+            .position(|line| line.starts_with(&format!("function {name}(")))
+            .unwrap()
+            + 1
+    };
+    let at = |name: &str, path: &str| {
+        on.iter()
+            .filter(|row| {
+                row.starts_with(&format!(
+                    "src/table.ts:{} GET {path} library_claim",
+                    line_of(name)
+                ))
+            })
+            .count()
+    };
+    assert_eq!(at("list", "/t/list"), 1, "{on:#?}");
+    assert_eq!(at("show", "/t/show"), 1, "{on:#?}");
+    assert_eq!(at("list", "/t/show"), 0, "{on:#?}");
+    assert_eq!(at("show", "/t/list"), 0, "{on:#?}");
+    assert_ne!(on, table_rows(None));
 }
 
 /// Every HTTP producer manifest entry of the blobs, as `file:line METHOD
