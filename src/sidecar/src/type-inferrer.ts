@@ -1326,6 +1326,23 @@ export class TypeInferrer {
     const func = this.resolveContainingFunction(sourceFile, request);
 
     if (!func) {
+      // carrick#807: a file route exported as a call to a route builder
+      // (`export const x = builder(options, async () => ...)`) starts no
+      // function at its line; the handler follows the options object. Where a
+      // registration sits on the line, read the handler it hands in, as the
+      // line-only `response_body` path does.
+      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      if (atLine) {
+        this.log(
+          `Line ${request.line_number} is a route registration; following handler return`
+        );
+        return this.buildFunctionReturnInferredType(
+          request,
+          atLine.handler,
+          extractionConfig,
+          true
+        );
+      }
       this.log(`No function found for request at ${request.file_path}:${request.line_number}`);
       return null;
     }
