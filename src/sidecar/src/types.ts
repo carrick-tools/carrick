@@ -4,7 +4,7 @@
  */
 
 import type { ResponseModes } from './response-modes.js';
-import type { ResultLabel } from './capture/result-label.js';
+import type { ResultLabel } from './capture/api.js';
 
 // ============================================================================
 // Inference Kind Enum

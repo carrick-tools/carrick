@@ -10,6 +10,8 @@
 
 import type { ResultLabel } from './result-label.js';
 
+export type { ResultLabel };
+
 /**
  * How the anchor was produced upstream (design-doc amendment 2). Recorded so
  * the fidelity metric separates anchor-recall loss from serialization loss.
