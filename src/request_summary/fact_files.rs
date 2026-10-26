@@ -28,10 +28,13 @@ use super::discovery::Discovery;
 use crate::library_store::FirstAnswer;
 use crate::services::type_sidecar::LibraryRole;
 
+/// The switch: on only when set to `1`.
+pub const SWITCH: &str = "CARRICK_FACT_FILES";
+
 /// Whether the fact layer chooses the file reader's files
 /// (`CARRICK_FACT_FILES=1`, decision D6). Off: it only logs them.
 pub fn enabled() -> bool {
-    std::env::var("CARRICK_FACT_FILES").is_ok_and(|value| value == "1")
+    std::env::var(SWITCH).is_ok_and(|value| value == "1")
 }
 
 /// The reason a call is not followed to the end when the walk found no site
