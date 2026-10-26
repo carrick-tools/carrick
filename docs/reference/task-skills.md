@@ -262,8 +262,9 @@ not read its own install as a dirty tree.
 
 **One step init cannot take for you.** A project hook is untrusted until Codex
 records its hash, and an untrusted hook is discovered and never run
-(`hook_trust_status` in `discovery.rs`). Only the `codex` TUI asks, at its next start; `codex exec` and the editor
-extensions never ask and skip untrusted hooks without saying so. `carrick init`
+(`hook_trust_status` in `discovery.rs`). Only the `codex` terminal app asks, at its next start, and its
+default is to carry on without them; `codex exec` skips untrusted hooks without saying so, and the editor
+extension and desktop app hold no prompt of their own (read from Codex 0.154's source, not run). `carrick init`
 says so on the line that reports the file.
 
 `carrick doctor` reports a missing or outdated Codex entry the way it reports

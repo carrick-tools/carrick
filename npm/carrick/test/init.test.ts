@@ -1443,7 +1443,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
       result.stdout.trimEnd().split("\n").slice(-5).join("\n"),
       [
         "◇ Set up in project payments: repo",
-        "▲ Open `codex` in this folder once and choose to trust the project's hooks: `codex exec` and the editor extensions never ask, and skip untrusted hooks without saying so.",
+        "▲ Open `codex` in this folder once and choose to trust the project's hooks. Only the terminal app asks; until you do, Codex skips them without saying so.",
         "",
         "Next: paste this into a new agent session",
         `  ${scaffoldFor("acme/api")}`,

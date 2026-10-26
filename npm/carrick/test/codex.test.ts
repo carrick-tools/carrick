@@ -225,6 +225,6 @@ test("a user's own SessionStart entry stays beside ours and survives the removal
 
 test("the init trust line is true on every Codex surface", () => {
   const source = fs.readFileSync(path.join(packageRoot, "src", "init", "run.ts"), "utf8");
-  assert.match(source, /`codex exec` and the editor extensions never ask, and skip untrusted hooks without saying so/);
+  assert.match(source, /Only the terminal app asks; until you do, Codex skips them without saying so/);
   assert.doesNotMatch(source, /Codex asks you to trust the Carrick hooks the next time it starts/);
 });
