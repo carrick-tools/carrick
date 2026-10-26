@@ -65,10 +65,11 @@ function runProcess(
   command: string,
   args: string[],
   cwd: string,
-  env?: NodeJS.ProcessEnv
+  env?: NodeJS.ProcessEnv,
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, signal, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
@@ -323,7 +324,7 @@ export async function runCheck(
     progress('installing', 'installing pinned dependencies');
     const install = taken?.installSkipped
       ? { code: 0, signal: null, stdout: '', stderr: '' }
-      : await runProcess(pnpmPath, ['install'], ws.workspaceDir);
+      : await runProcess(pnpmPath, ['install'], ws.workspaceDir, undefined, opts.signal);
     if (install.code !== 0) {
       const installError = scrubPaths(
         (install.stderr || install.stdout).trim().slice(0, 2000),
@@ -377,7 +378,8 @@ export async function runCheck(
       tscPath,
       ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json'), ...incremental],
       ws.workspaceDir,
-      { ...process.env, NODE_OPTIONS: heap.nodeOptions }
+      { ...process.env, NODE_OPTIONS: heap.nodeOptions },
+      opts.signal
     );
     const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
 

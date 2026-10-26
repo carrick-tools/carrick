@@ -33,8 +33,23 @@ export interface TypedRecord {
   socket: string;
   build_id: string;
   cli_version: string | null;
+  /** When the process started (not when it began serving): what `ps` reports. */
   started_at: string;
+  /** The workspace's real path. */
+  workspace: string;
+  /** 128 random bits, hex: a `stop` carrying it is obeyed as the first frame, from any build. */
+  token: string;
+  node_version: string;
 }
+
+/** How a client uses the daemon, named by its `hello`. */
+export type ConnectionMode = 'probe' | 'warm';
+
+/** Appended to, one `<unix secs> <build id>` line per fatal exit; never truncated. */
+export const CRASH_FILE = 'typed.crashes';
+
+/** How long a record's live process may take to answer `hello` before it counts as busy. */
+const HELLO_GRACE_MS = 2000;
 
 /** The record's name inside the workspace's `.carrick/` directory. */
 export const TYPED_RECORD = 'typed.json';
@@ -107,17 +122,25 @@ function installedVersion(root: string, name: string): string {
 
 /**
  * Where the daemon for `workspace` listens: `<workspace>/.carrick/typed.sock`,
- * or, when that path is past the platform's socket path limit, a name under
- * the OS temp directory derived from the workspace's real path. Either way
- * the record names it, so clients never derive it themselves.
+ * or, when that path is past the platform's socket path limit, a name derived
+ * from the workspace's real path in this user's directory under the OS temp
+ * directory (`carrick-<uid>/`, 0700, so no other user can bind the name
+ * first). Either way the record names it, so clients never derive it
+ * themselves.
  */
 export function socketPathFor(workspace: string): string {
   const inTree = path.join(workspace, '.carrick', 'typed.sock');
   if (Buffer.byteLength(inTree) <= MAX_SOCKET_PATH_BYTES) return inTree;
   const key = crypto.createHash('sha256').update(realPathOf(workspace)).digest('hex').slice(0, 16);
   const name = `carrick-typed-${key}.sock`;
-  const inTemp = path.join(os.tmpdir(), name);
-  return Buffer.byteLength(inTemp) <= MAX_SOCKET_PATH_BYTES ? inTemp : path.join('/tmp', name);
+  const own = `carrick-${process.getuid?.() ?? 'user'}`;
+  const inTemp = path.join(os.tmpdir(), own, name);
+  return Buffer.byteLength(inTemp) <= MAX_SOCKET_PATH_BYTES ? inTemp : path.join('/tmp', own, name);
+}
+
+/** The workspace's real path, as records and `hello` answers name it. */
+export function workspaceRealPath(workspace: string): string {
+  return realPathOf(workspace);
 }
 
 /** The record for `workspace`, or null when there is none or it does not parse. */
@@ -156,14 +179,84 @@ export function socketAnswers(socket: string, timeoutMs = 500): Promise<boolean>
   });
 }
 
+/**
+ * What a `hello` to `socket` says of the daemon there: its pid and workspace
+ * (a `build_mismatch` answer names them too), `busy` when it accepts but does
+ * not answer within `timeoutMs` (a synchronous request holds its event loop),
+ * or `none` when nothing accepts.
+ */
+export function helloIdentity(
+  socket: string,
+  buildId: string,
+  timeoutMs = HELLO_GRACE_MS
+): Promise<{ pid: number; workspace: string } | 'busy' | 'none' | 'unknown'> {
+  return new Promise((resolve) => {
+    const conn = net.createConnection(socket);
+    let buffer = '';
+    let connected = false;
+    const done = (outcome: { pid: number; workspace: string } | 'busy' | 'none' | 'unknown') => {
+      clearTimeout(timer);
+      conn.destroy();
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => done(connected ? 'busy' : 'none'), timeoutMs);
+    conn.setEncoding('utf8');
+    conn.once('connect', () => {
+      connected = true;
+      conn.write(JSON.stringify({ request_id: 'claim', action: 'hello', build_id: buildId, mode: 'probe' }) + '\n');
+    });
+    conn.on('data', (chunk: string) => {
+      buffer += chunk;
+      const end = buffer.indexOf('\n');
+      if (end === -1) return;
+      try {
+        const frame = JSON.parse(buffer.slice(0, end)) as { pid?: unknown; workspace?: unknown };
+        done(typeof frame.pid === 'number' && typeof frame.workspace === 'string' ? { pid: frame.pid, workspace: frame.workspace } : 'unknown');
+      } catch {
+        done('unknown');
+      }
+    });
+    conn.once('error', () => done(connected ? 'unknown' : 'none'));
+    conn.once('close', () => done(connected ? 'unknown' : 'none'));
+  });
+}
+
 /** One client connection. Frames written after it is gone are dropped. */
 export class Connection {
   /** Set by the first frame, `hello`, when its build id matches. */
   greeted = false;
+  /** What its `hello` said it is: a check's probe, or the warm-up. */
+  mode: ConnectionMode | null = null;
   /** The dispatcher's per-connection slot (the service this client init'd). */
   slot: unknown = undefined;
+  /** Its socket has closed: the client went away, or the daemon closed it. */
+  closed = false;
 
-  constructor(private readonly socket: net.Socket) {}
+  constructor(private readonly socket: net.Socket) {
+    socket.once('close', () => {
+      this.closed = true;
+    });
+  }
+
+  /** Call `listener` once the connection closes; returns how to stop listening. */
+  onClose(listener: () => void): () => void {
+    if (this.closed) {
+      listener();
+      return () => {};
+    }
+    this.socket.once('close', listener);
+    return () => this.socket.off('close', listener);
+  }
+
+  /** The daemon closed it (`destroy`), rather than the client going away. */
+  closedByDaemon = false;
+
+  /** Close at once, dropping any frame not yet sent: the client asks a process of its own. */
+  destroy(): void {
+    this.closed = true;
+    this.closedByDaemon = true;
+    this.socket.destroy();
+  }
 
   write(frame: string): void {
     if (this.socket.destroyed || !this.socket.writable) return;
@@ -189,6 +282,8 @@ export interface TypedServerOptions {
   idleMs: number;
   /** Answer one line from `conn`. Runs alone: the server queues every line. */
   handleLine: (conn: Connection, line: string) => Promise<void>;
+  /** A request ran to its end for a client that had gone. */
+  onAbandoned?: (conn: Connection) => void;
   log: (message: string) => void;
 }
 
@@ -198,12 +293,26 @@ export type StartOutcome = 'serving' | 'already_running';
 export class TypedServer {
   readonly socketPath: string;
   readonly recordPath: string;
-  readonly startedAt = new Date();
+  readonly crashPath: string;
+  /** The process's start, as `ps` reports it: the record's `started_at`. */
+  readonly startedAt = new Date(Math.round(performance.timeOrigin));
+  /** The workspace's real path. */
+  readonly workspaceReal: string;
+  /** The secret a first-frame `stop` must carry. */
+  readonly token = crypto.randomBytes(16).toString('hex');
+  /** Every open connection, for `warming`. */
+  readonly connections = new Set<Connection>();
+  /** Lines taken off the queue unanswered because their client had gone, and requests that ran for a client gone by their end. */
+  readonly counts = { skipped: 0, abandoned: 0 };
   private readonly carrickDir: string;
   private readonly guard: WriteGuard;
   private server: net.Server | null = null;
   private queue: Promise<void> = Promise.resolve();
-  private pending = 0;
+  /** Lines waiting in the queue. */
+  private waiting = 0;
+  /** A line is being answered. */
+  private running = false;
+  /** When a live line last arrived or a request last ended. */
   private lastActivity = Date.now();
   private watch: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -211,23 +320,51 @@ export class TypedServer {
   constructor(private readonly opts: TypedServerOptions) {
     this.carrickDir = path.join(opts.workspace, '.carrick');
     this.recordPath = path.join(this.carrickDir, TYPED_RECORD);
+    this.crashPath = path.join(this.carrickDir, CRASH_FILE);
     this.socketPath = socketPathFor(opts.workspace);
+    this.workspaceReal = realPathOf(opts.workspace);
     // Single-file roots: the guard takes a directory root inside the
     // workspace only beneath a `.carrick` directory, and the daemon writes
     // nothing but these four entries.
+    const socketDir = path.dirname(this.socketPath);
+    const ownSocketDir = socketDir === this.carrickDir ? [] : [socketDir];
     this.guard = WriteGuard.of({
-      files: [this.carrickDir, this.recordPath, this.temporaryRecordPath(), this.socketPath],
+      files: [this.carrickDir, this.recordPath, this.temporaryRecordPath(), this.crashPath, this.socketPath, ...ownSocketDir],
       protect: [opts.workspace],
     });
   }
 
-  /** Milliseconds since the last request finished, or 0 while one runs. */
+  /**
+   * Milliseconds since a live line last arrived or a request last ended, or 0
+   * while one runs. A line skipped because its client had gone is no activity.
+   */
   idleMs(): number {
-    return this.pending > 0 ? 0 : Date.now() - this.lastActivity;
+    return this.running ? 0 : Date.now() - this.lastActivity;
+  }
+
+  /** Lines waiting behind the one being answered. */
+  queued(): number {
+    return this.waiting;
+  }
+
+  /** Whether a warm-up connection is open. */
+  warming(): boolean {
+    for (const conn of this.connections) if (conn.mode === 'warm' && !conn.closed) return true;
+    return false;
+  }
+
+  /** Append this build's crash line (a fatal exit); never throws. */
+  noteCrash(): void {
+    try {
+      this.guard.appendFile(this.crashPath, `${Math.floor(Date.now() / 1000)} ${this.opts.buildId}\n`);
+    } catch {
+      // The exit goes on.
+    }
   }
 
   async start(): Promise<StartOutcome> {
     this.guard.mkdir(this.carrickDir);
+    if (path.dirname(this.socketPath) !== this.carrickDir) ownUserDir(this.guard, path.dirname(this.socketPath));
     if (!(await this.claim())) return 'already_running';
     if (fs.existsSync(this.socketPath)) this.guard.unlink(this.socketPath);
     // The socket file takes the process umask when it is bound: only its
@@ -280,9 +417,13 @@ export class TypedServer {
       build_id: this.opts.buildId,
       cli_version: this.opts.cliVersion,
       started_at: this.startedAt.toISOString(),
+      workspace: this.workspaceReal,
+      token: this.token,
+      node_version: process.version,
     };
     const temporary = this.temporaryRecordPath();
-    this.guard.writeFile(temporary, JSON.stringify(record, null, 2) + '\n');
+    // The token in it stops the daemon: only its owner may read it.
+    this.guard.writeFile(temporary, JSON.stringify(record, null, 2) + '\n', 0o600);
     try {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
@@ -306,9 +447,13 @@ export class TypedServer {
   }
 
   /**
-   * Whether the record names a daemon that answers. A live process gets a
-   * short grace to bind its socket (it claims first, then listens); a pid
-   * that never answers was reused by an unrelated process.
+   * Whether the record names this workspace's live daemon: its pid lives and
+   * its socket's `hello` answers with that pid and this workspace's real path,
+   * or accepts and does not answer within the grace (busy: a synchronous
+   * request holds its event loop). An answer naming another pid or workspace
+   * (a record copied with the workspace) is stale and taken over. A live
+   * process gets a short grace to bind its socket (it claims first, then
+   * listens); a pid that never answers was reused by an unrelated process.
    */
   private async heldByLiveDaemon(): Promise<boolean> {
     const deadline = Date.now() + START_GRACE_MS;
@@ -316,7 +461,11 @@ export class TypedServer {
       const record = readTypedRecord(this.opts.workspace);
       if (record === null && !fs.existsSync(this.recordPath)) return false;
       if (record !== null && !pidAlive(record.pid)) return false;
-      if (record !== null && (await socketAnswers(record.socket))) return true;
+      if (record !== null) {
+        const identity = await helloIdentity(record.socket, this.opts.buildId);
+        if (identity === 'busy') return true;
+        if (typeof identity === 'object') return identity.pid === record.pid && identity.workspace === this.workspaceReal;
+      }
       if (Date.now() >= deadline) return false;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -324,6 +473,8 @@ export class TypedServer {
 
   private accept(socket: net.Socket): void {
     const conn = new Connection(socket);
+    this.connections.add(conn);
+    socket.once('close', () => this.connections.delete(conn));
     // A client killed mid-request leaves EPIPE/ECONNRESET on its socket; an
     // unhandled one would reach `uncaughtException` and end the daemon. The
     // line reader re-emits its input's errors as its own, so it needs one too.
@@ -333,15 +484,35 @@ export class TypedServer {
     lines.on('line', (line) => this.enqueue(conn, line));
   }
 
+  /**
+   * One FIFO for the daemon. A line whose client has gone by the time it is
+   * taken off the queue is skipped and counted, and is no activity; a request
+   * whose client goes while it runs runs to its end (synchronous compiler
+   * work cannot be stopped) and is counted as abandoned.
+   */
   private enqueue(conn: Connection, line: string): void {
-    this.pending += 1;
-    this.queue = this.queue
-      .then(() => this.opts.handleLine(conn, line))
-      .catch((err) => this.opts.log(`request failed: ${err instanceof Error ? err.message : String(err)}`))
-      .finally(() => {
-        this.pending -= 1;
+    this.waiting += 1;
+    this.lastActivity = Date.now();
+    this.queue = this.queue.then(async () => {
+      this.waiting -= 1;
+      if (conn.closed) {
+        this.counts.skipped += 1;
+        return;
+      }
+      this.running = true;
+      try {
+        await this.opts.handleLine(conn, line);
+      } catch (err) {
+        this.opts.log(`request failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        this.running = false;
         this.lastActivity = Date.now();
-      });
+        if (conn.closed && !conn.closedByDaemon) {
+          this.counts.abandoned += 1;
+          this.opts.onAbandoned?.(conn);
+        }
+      }
+    });
   }
 
   private check(): void {
@@ -366,6 +537,19 @@ export class TypedServer {
       }
     }
   }
+}
+
+/**
+ * This user's own directory for a socket outside the workspace: created 0700,
+ * and refused when it exists owned by another user or is not a directory.
+ */
+function ownUserDir(guard: WriteGuard, dir: string): void {
+  guard.mkdir(dir, 0o700);
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) {
+    throw new Error(`${dir} is not this user's directory`);
+  }
+  if ((stat.mode & 0o777) !== 0o700) fs.chmodSync(dir, 0o700);
 }
 
 function realPathOf(p: string): string {

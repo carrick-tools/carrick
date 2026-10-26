@@ -230,7 +230,14 @@ describe('warm judge: a daemon keeps one judge workspace across checks', () => {
     const check = async (id: string) =>
       (await client.send({ request_id: id, action: 'check_v2', stubs: input, pairs: PAIRS, workspace_root: parent }))
         .result as CheckResult;
-    const judgeUses = async () => ((await client.send({ request_id: 'st', action: 'status' })).daemon as { judge: unknown }).judge;
+    const judgeUses = async () => {
+      const { checks, installs_skipped, workspace_dir, size_mb } = ((await client.send({ request_id: 'st', action: 'status' })).daemon as {
+        judge: { checks: number; installs_skipped: number; workspace_dir: string | null; size_mb: number | null };
+      }).judge;
+      assert.ok(workspace_dir !== null && workspace_dir.startsWith(parent), String(workspace_dir));
+      assert.ok(typeof size_mb === 'number' && size_mb >= 0, String(size_mb));
+      return { checks, installs_skipped };
+    };
     const first = await check('c1');
     assert.deepStrictEqual(await judgeUses(), { checks: 1, installs_skipped: 0 });
     const second = await check('c2');

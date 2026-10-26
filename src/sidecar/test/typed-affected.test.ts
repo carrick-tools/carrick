@@ -22,8 +22,6 @@
  * - an import type (`import('m').T`) reads `T`, not every export of `m`;
  * - two items whose unwidened readings meet in a shared file: read again
  *   together, and read again when asked apart from the batch they were read in.
- * Eviction: with a 1 MB heap cap, the least recently used service is released
- * and its next request builds it again, answering as before.
  */
 
 import { describe, it, after } from 'node:test';
@@ -425,33 +423,6 @@ export function viewDup() {
       );
     }
     client.conn.destroy();
-    await stopDaemon(child, socket);
-  });
-
-  it('releases the least recently used service over its heap cap, and builds it again on its next request', async () => {
-    const one = workspace();
-    const two = workspace();
-    // One daemon serves both: it is the first workspace's, and the second service is init'd on it.
-    const child = await daemon(one.ws, { CARRICK_TYPED_HEAP_CAP_MB: '1', CARRICK_UNWIDENED_BUDGET_MS: '100000000' });
-    const socket = recordOf(one.ws)!.socket;
-    const a = await SocketClient.greeted(socket);
-    const b = await SocketClient.greeted(socket);
-    // Every request ends over a 1 MB heap, so each releases every other held service.
-    assert.strictEqual((await a.send({ request_id: 'i', action: 'init', repo_root: one.root })).status, 'ready');
-    const first = untimed(await a.send(inferOf(one.root)));
-    assert.strictEqual((await serviceStatus(a, one.root)).items.held, ITEMS.length);
-    assert.strictEqual((await b.send({ request_id: 'i', action: 'init', repo_root: two.root })).status, 'ready');
-    // Read on b's connection: the request that reads it releases nothing more.
-    const released = await serviceStatus(b, one.root);
-    assert.deepStrictEqual([released.evictions, released.items.held], [1, 0]);
-    const again = untimed(await a.send(inferOf(one.root)));
-    assert.strictEqual(again, first, 'the rebuilt service answers as before');
-    assert.strictEqual(again, await cold(one.root, inferOf(one.root)));
-    const rebuilt = await serviceStatus(b, one.root);
-    assert.deepStrictEqual([rebuilt.items.held, rebuilt.items.recomputed], [ITEMS.length, 2 * ITEMS.length]);
-    assert.strictEqual((await serviceStatus(a, two.root)).evictions, 1);
-    a.conn.destroy();
-    b.conn.destroy();
     await stopDaemon(child, socket);
   });
 });

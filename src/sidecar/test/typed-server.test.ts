@@ -175,6 +175,10 @@ describe('typed server (carrick#2879)', () => {
     assert.strictEqual(record.cli_version, '9.9.9-test');
     assert.ok(!Number.isNaN(Date.parse(record.started_at)));
     assert.strictEqual(fs.statSync(record.socket).mode & 0o777, 0o600);
+    assert.strictEqual(record.workspace, fs.realpathSync(ws));
+    assert.match(record.token, /^[0-9a-f]{32}$/);
+    assert.strictEqual(record.node_version, process.version);
+    assert.strictEqual(fs.statSync(path.join(ws, '.carrick', 'typed.json')).mode & 0o777, 0o600);
 
     const client = await SocketClient.greeted(record.socket);
     const status = await client.send({ request_id: 'st', action: 'status' });
@@ -193,9 +197,11 @@ describe('typed server (carrick#2879)', () => {
     const socket = recordOf(ws)!.socket;
 
     const stale = await SocketClient.connect(socket);
-    const refused = await stale.send({ request_id: 'h', action: 'hello', build_id: 'f'.repeat(64) });
+    const refused = await stale.send({ request_id: 'h', action: 'hello', build_id: 'f'.repeat(64), mode: 'probe' });
     assert.strictEqual(refused.status, 'error');
     assert.match(String((refused.errors as string[])[0]), /^build_mismatch/);
+    // A refusal still names the daemon, so another build can tell whose it is.
+    assert.deepStrictEqual([refused.pid, refused.workspace], [child.pid, fs.realpathSync(ws)]);
     await stale.closed;
 
     const rude = await SocketClient.connect(socket);
@@ -311,6 +317,10 @@ describe('typed server (carrick#2879)', () => {
     const socket = recordOf(ws)!.socket;
     assert.ok(!socket.startsWith(ws), socket);
     assert.ok(Buffer.byteLength(socket) <= 103, socket);
+    // In this user's own directory, which no other user may enter (L5).
+    const dir = path.dirname(socket);
+    assert.strictEqual(path.basename(dir), `carrick-${process.getuid!()}`);
+    assert.strictEqual(fs.statSync(dir).mode & 0o777, 0o700);
     const client = await SocketClient.greeted(socket);
     client.conn.destroy();
     await stopDaemon(child, socket);
@@ -332,7 +342,7 @@ describe('typed server (carrick#2879)', () => {
     await client.start();
     try {
       for (const request of [
-        { request_id: '1', action: 'hello', build_id: 'x' },
+        { request_id: '1', action: 'hello', build_id: 'x', mode: 'probe' },
         { request_id: '2', action: 'status' },
         { request_id: '3', action: 'stop' },
       ]) {

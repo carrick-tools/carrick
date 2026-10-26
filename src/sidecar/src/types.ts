@@ -330,6 +330,12 @@ export interface HelloRequest extends BaseRequest {
   action: 'hello';
   /** The build id of the sidecar the client would have spawned (`--build-id`). */
   build_id: string;
+  /**
+   * `probe`: a check, which never builds a program (an `init` for a service
+   * the daemon holds no built program for is refused). `warm`: the warm-up,
+   * which builds.
+   */
+  mode: 'probe' | 'warm';
 }
 
 /** Server mode only: what the daemon holds. */
@@ -337,9 +343,14 @@ export interface StatusRequest extends BaseRequest {
   action: 'status';
 }
 
-/** Server mode only: stop the daemon, removing its socket and record. */
+/**
+ * Server mode only: stop the daemon, removing its socket and record. As the
+ * first frame, before any `hello`, it is obeyed from any build when it carries
+ * the record's `token`.
+ */
 export interface StopRequest extends BaseRequest {
   action: 'stop';
+  token?: string;
 }
 
 /**
@@ -1019,19 +1030,34 @@ export interface ShutdownResponse extends BaseResponse {
   status: 'success';
 }
 
-/** Response for hello: the daemon's build id and process. */
+/** Response for hello: the daemon's build id, process and workspace (its real path). A `build_mismatch` refusal names `pid` and `workspace` too. */
 export interface HelloResponse extends BaseResponse {
   status: 'success';
   build_id: string;
   pid: number;
+  workspace: string;
+}
+
+/** One daemon-only event (L6): counts, MB and the service's path relative to the workspace, never file or type text. */
+export interface DaemonEvent {
+  at: string;
+  kind: 'evicted' | 'released_on_drop' | 'unstable' | 'abandoned' | 'init_refused' | 'too_big' | 'no_room' | 'fatal' | 'exception';
+  service: string | null;
+  detail: Record<string, number | string>;
 }
 
 /** One service a daemon holds: the root and scan root its `init` named. */
 export interface HeldService {
   repo_root: string;
   scan_root: string | null;
-  /** Whether a request has built its program yet (`init` builds nothing). */
+  /** Whether its loader holds a built program (`init` builds nothing). */
   built: boolean;
+  /** `built`, `released` (nothing held; a warm request builds it again), or `cold_only:<too_big|no_room>` for the daemon's life. */
+  state: 'built' | 'released' | 'cold_only:too_big' | 'cold_only:no_room';
+  /** Heap its building request kept (program and capture), after a collection; null until built. */
+  footprint_mb: number | null;
+  /** Seconds since a request last used it; null when none has. */
+  last_used_s: number | null;
   /**
    * How often the files its programs were read from had changed before a
    * request (carrick#2880): read again into the held programs (`refreshes`),
@@ -1084,10 +1110,19 @@ export interface StatusResponse extends BaseResponse {
     captures: HeldCapture[];
     heap_used_mb: number;
     rss_mb: number;
-    /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default 3072). */
+    /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default min(3072, RAM/8)). */
     heap_cap_mb: number;
-    /** Checks run on the kept judge workspace (carrick#2883), and those whose install was skipped. */
-    judge: { checks: number; installs_skipped: number };
+    /** V8's heap size limit (`--max-old-space-size`). */
+    heap_limit_mb: number;
+    /** A warm-up connection is open. */
+    warming: boolean;
+    /** Lines waiting behind the one being answered. */
+    queued: number;
+    counters: { warm_answers: number; init_refused: number; closed_for_cold: number; abandoned: number; skipped: number };
+    /** The last 20 daemon-only events, oldest first. */
+    errors: DaemonEvent[];
+    /** Checks run on the kept judge workspace (carrick#2883), those whose install was skipped, and the workspace kept now (its size measured when the last check released it). */
+    judge: { checks: number; installs_skipped: number; workspace_dir: string | null; size_mb: number | null };
     /** Only under `CARRICK_TYPED_VERIFY=1` (carrick#2886): requests answered warm and cold, and how they compared. */
     verify?: { checked: number; mismatches: number; order_only: number };
   };

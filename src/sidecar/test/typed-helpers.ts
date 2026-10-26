@@ -17,7 +17,9 @@ export function killDaemons(): void {
   for (const child of startedDaemons) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
 }
 
-export function recordOf(ws: string): { pid: number; socket: string; build_id: string; cli_version: string | null; started_at: string } | null {
+export function recordOf(
+  ws: string
+): { pid: number; socket: string; build_id: string; cli_version: string | null; started_at: string; workspace: string; token: string; node_version: string } | null {
   try {
     return JSON.parse(fs.readFileSync(path.join(ws, '.carrick', 'typed.json'), 'utf8'));
   } catch {
@@ -54,7 +56,8 @@ export function answers(socket: string): Promise<boolean> {
 
 /** Start a daemon on `ws` and wait until its socket answers. */
 export async function daemon(ws: string, env: NodeJS.ProcessEnv = {}): Promise<ChildProcess> {
-  const child = spawn('node', [SIDECAR_PATH, '--serve', ws, '--cli-version', '9.9.9-test'], {
+  // `--expose-gc`, as the CLI starts it: the heap budget collects before it measures.
+  const child = spawn('node', ['--expose-gc', SIDECAR_PATH, '--serve', ws, '--cli-version', '9.9.9-test'], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, ...env },
   });
@@ -109,10 +112,10 @@ export class SocketClient {
     });
   }
 
-  /** Connect and say hello with this build's id. */
-  static async greeted(socket: string): Promise<SocketClient> {
+  /** Connect and say hello with this build's id: `warm` (the warm-up, which builds) unless a probe is asked for. */
+  static async greeted(socket: string, mode: 'probe' | 'warm' = 'warm'): Promise<SocketClient> {
     const client = await SocketClient.connect(socket);
-    const hello = await client.send({ request_id: 'h', action: 'hello', build_id: buildId() });
+    const hello = await client.send({ request_id: 'h', action: 'hello', build_id: buildId(), mode });
     assert.strictEqual(hello.status, 'success', JSON.stringify(hello));
     return client;
   }

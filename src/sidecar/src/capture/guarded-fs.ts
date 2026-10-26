@@ -117,16 +117,21 @@ export class WriteGuard {
     this.check(p, landing(p), 'work in');
   }
 
-  writeFile(p: string, data: string | NodeJS.ArrayBufferView): void {
+  writeFile(p: string, data: string | NodeJS.ArrayBufferView, mode?: number): void {
     this.check(p, landing(p), 'write');
-    fs.writeFileSync(p, data);
+    fs.writeFileSync(p, data, mode === undefined ? undefined : { mode });
+  }
+
+  appendFile(p: string, data: string): void {
+    this.check(p, landing(p), 'append to');
+    fs.appendFileSync(p, data);
   }
 
   /** `mkdir -p`. A directory that already exists is no write and passes unchecked. */
-  mkdir(p: string): void {
+  mkdir(p: string, mode?: number): void {
     if (isDirectory(p)) return;
     this.check(p, landing(p), 'create directory');
-    fs.mkdirSync(p, { recursive: true });
+    fs.mkdirSync(p, { recursive: true, ...(mode === undefined ? {} : { mode }) });
   }
 
   copyFile(from: string, to: string): void {

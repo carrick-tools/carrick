@@ -330,6 +330,7 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
 export const HelloRequestSchema = BaseRequestSchema.extend({
   action: z.literal('hello'),
   build_id: z.string().min(1),
+  mode: z.enum(['probe', 'warm']),
 });
 
 export const StatusRequestSchema = BaseRequestSchema.extend({
@@ -338,6 +339,7 @@ export const StatusRequestSchema = BaseRequestSchema.extend({
 
 export const StopRequestSchema = BaseRequestSchema.extend({
   action: z.literal('stop'),
+  token: z.string().min(1).optional(),
 });
 
 export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({

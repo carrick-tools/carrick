@@ -669,6 +669,9 @@ export interface CheckOptions {
    * unchanged, its compiler run incrementally. Never handed out or cleaned
    * up by the check. Absent, or held by another check: a fresh workspace. */
   kept?: KeptJudge;
+  /** Aborted when nobody waits for the answer: the install or compiler child
+   * is killed and the check rejects (a kept workspace is dropped). */
+  signal?: AbortSignal;
 }
 
 /** Progress phases emitted over the async install protocol. */

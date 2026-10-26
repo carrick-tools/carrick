@@ -16,6 +16,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { WriteGuard } from './guarded-fs.js';
 import {
@@ -30,6 +31,80 @@ import {
 
 /** The compiler's build info, kept beside the workspace's manifests. */
 export const JUDGE_BUILD_INFO = 'carrick-judge.tsbuildinfo';
+
+/** In a kept workspace: the pid of the daemon that keeps it. */
+export const JUDGE_OWNER_FILE = '.carrick-judge-owner';
+
+/** The prefix every check workspace's directory name starts with (`writeWorkspace`). */
+const CHECK_WORKSPACE_PREFIX = 'carrick-check-v2-';
+
+/**
+ * Remove the kept judge workspaces under `parent` whose owning daemon is dead:
+ * one that aborts (out of heap) never discards its own. Only a directory that
+ * carries the owner file is touched; returns how many were removed.
+ */
+export function removeOrphanedJudgeWorkspaces(parent: string = os.tmpdir()): number {
+  let removed = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(parent, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(CHECK_WORKSPACE_PREFIX)) continue;
+    const dir = path.join(parent, entry.name);
+    let owner: number;
+    try {
+      owner = Number(fs.readFileSync(path.join(dir, JUDGE_OWNER_FILE), 'utf8').trim());
+    } catch {
+      continue;
+    }
+    if (!Number.isInteger(owner) || owner <= 0 || alive(owner)) continue;
+    try {
+      WriteGuard.of({ dirs: [dir] }).remove(dir);
+      removed += 1;
+    } catch {
+      /* best effort */
+    }
+  }
+  return removed;
+}
+
+/** Bytes under `dir`, links counted as themselves. */
+function sizeOnDisk(dir: string): number {
+  let total = 0;
+  const walk = (at: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(at, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const abs = path.join(at, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else {
+        try {
+          total += fs.lstatSync(abs).size;
+        } catch {
+          /* gone meanwhile */
+        }
+      }
+    }
+  };
+  walk(dir);
+  return total;
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 interface Held {
   ws: AssembledWorkspace;
@@ -57,6 +132,13 @@ export class KeptJudge {
   readonly uses = { checks: 0, installs_skipped: 0 };
   /** Whether the last check that took the workspace skipped its install. */
   lastInstallSkipped: boolean | null = null;
+  /** The kept workspace's size on disk (MB), measured when a check releases it; null when none is kept. */
+  sizeMb: number | null = null;
+
+  /** Whether a check holds the workspace now. */
+  get inUse(): boolean {
+    return this.busy;
+  }
 
   /** The kept workspace's directory, or null when none is kept. */
   get workspaceDir(): string | null {
@@ -81,6 +163,8 @@ export class KeptJudge {
     this.discard();
     this.busy = true;
     const ws = writeWorkspace(plan, parent);
+    // Whoever finds this daemon dead removes the workspace (it never discards it after an abort).
+    ws.guard.writeFile(path.join(ws.workspaceDir, JUDGE_OWNER_FILE), `${process.pid}\n`);
     const written = new Map<string, string>();
     for (const [rel, entry] of plan.files) written.set(rel, entryDigest(entry));
     this.held = { ws, parent, installKey, written, installed: false };
@@ -106,6 +190,7 @@ export class KeptJudge {
       return;
     }
     if (installed) this.held.installed = true;
+    this.sizeMb = Math.round(sizeOnDisk(this.held.ws.workspaceDir) / 1048576);
   }
 
   /** Remove the kept workspace. */
@@ -113,6 +198,7 @@ export class KeptJudge {
     const held = this.held;
     this.held = null;
     this.busy = false;
+    this.sizeMb = null;
     if (!held) return;
     try {
       held.ws.guard.remove(held.ws.workspaceDir);
