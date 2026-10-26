@@ -13,6 +13,7 @@
  * Seam: node builtins + this bundle only.
  */
 
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { CheckStubInput } from './api.js';
@@ -204,18 +205,43 @@ export interface AssembleOptions {
   workspaceRoot?: string;
 }
 
-/** Create the scratch workspace and copy in the stub packages. */
-export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
-  // A fresh directory under the caller's root (the OS temp dir by default).
-  const { dir: workspaceDir, guard } = WriteGuard.scratch('carrick-check-v2-', opts.workspaceRoot);
-  const packagesDir = path.join(workspaceDir, 'packages');
-  guard.mkdir(packagesDir);
+/** One file of a planned workspace, by its forward-slash path inside it. */
+export type PlannedEntry = { data: Buffer } | { link: string };
 
-  guard.writeFile(path.join(workspaceDir, '.npmrc'), NPMRC);
-  guard.writeFile(
-    path.join(workspaceDir, 'pnpm-workspace.yaml'),
-    'packages:\n  - "packages/*"\n'
-  );
+/**
+ * Everything a judge workspace holds before its install, as data: the stub
+ * packages, the root manifests, the probes package and (once added) the
+ * probes. A fresh workspace is this written out; a kept one is brought to it
+ * (carrick#2883).
+ */
+export interface WorkspacePlan extends Omit<AssembledWorkspace, 'workspaceDir' | 'guard' | 'probesDir'> {
+  files: Map<string, PlannedEntry>;
+}
+
+/**
+ * Read a stub tree into `files` under `prefix`, as the stub copy writes it:
+ * `node_modules` is left out wherever it sits on the source path, and a link
+ * is kept as a link to the target the copy would give it.
+ */
+function planTree(from: string, prefix: string, files: Map<string, PlannedEntry>): void {
+  if (from.split(path.sep).includes('node_modules')) return;
+  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+    const source = path.join(from, entry.name);
+    const rel = `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) planTree(source, rel, files);
+    else if (entry.isSymbolicLink()) {
+      if (entry.name === 'node_modules') continue;
+      files.set(rel, { link: path.resolve(from, fs.readlinkSync(source)) });
+    } else if (entry.isFile()) files.set(rel, { data: fs.readFileSync(source) });
+  }
+}
+
+/** Plan the workspace for these stubs; no file is written. */
+export function planWorkspace(stubs: CheckStubInput[]): WorkspacePlan {
+  const files = new Map<string, PlannedEntry>();
+  const text = (rel: string, content: string) => files.set(rel, { data: Buffer.from(content) });
+  text('.npmrc', NPMRC);
+  text('pnpm-workspace.yaml', 'packages:\n  - "packages/*"\n');
 
   const assembled: AssembledStub[] = [];
   const dependencySets: { dependencies: Record<string, string> }[] = [];
@@ -224,11 +250,10 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
   const dirToPkg = new Map<string, string>();
   const dirToSvc = new Map<string, string>();
 
-  for (const stub of opts.stubs) {
+  for (const stub of stubs) {
     const packageName = readStubPackageName(stub.stub_dir);
     const packageDir = packageDirOf(packageName);
-    const dest = path.join(packagesDir, packageDir);
-    guard.copyTree(stub.stub_dir, dest, (src) => !src.split(path.sep).includes('node_modules'));
+    planTree(stub.stub_dir, `packages/${packageDir}`, files);
     assembled.push({ serviceName: stub.service_name, packageDir, packageName });
     dependencySets.push({ dependencies: readStubDependencies(stub.stub_dir) });
     edgeSets.push(readStubResolution(stub.stub_dir));
@@ -248,8 +273,8 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
       .sort()
       .map((k) => [k, merged[k]])
   );
-  guard.writeFile(
-    path.join(workspaceDir, 'package.json'),
+  text(
+    'package.json',
     JSON.stringify(
       {
         name: 'carrick-check-workspace',
@@ -262,12 +287,13 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
     ) + '\n'
   );
 
-  const probesDir = path.join(packagesDir, PROBES_PACKAGE);
-  guard.mkdir(path.join(probesDir, 'probes'));
+  // Sorted, so the stubs' order on the request never changes the manifest a
+  // kept workspace's install is keyed on (carrick#2883).
   const probeDeps: Record<string, string> = {};
-  for (const stub of assembled) probeDeps[stub.packageName] = 'workspace:*';
-  guard.writeFile(
-    path.join(probesDir, 'package.json'),
+  for (const name of assembled.map((s) => s.packageName).sort()) probeDeps[name] = 'workspace:*';
+  const probesRel = `packages/${PROBES_PACKAGE}`;
+  text(
+    `${probesRel}/package.json`,
     JSON.stringify(
       {
         name: PROBES_PACKAGE,
@@ -279,13 +305,11 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
       2
     ) + '\n'
   );
-  guard.writeFile(path.join(probesDir, 'tsconfig.json'), CHECKER_TSCONFIG);
+  text(`${probesRel}/tsconfig.json`, CHECKER_TSCONFIG);
 
   return {
-    workspaceDir,
-    guard,
-    probesDir,
-    probesRel: `packages/${PROBES_PACKAGE}`,
+    files,
+    probesRel,
     stubs: assembled,
     packageOf: (s) => {
       const pkg = svcToPkg.get(s);
@@ -297,11 +321,65 @@ export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
   };
 }
 
-/** Write the generated probe files into the assembled probes package. */
-export function writeProbes(ws: AssembledWorkspace, plans: ProbePlan[]): void {
-  for (const plan of plans) {
-    ws.guard.writeFile(path.join(ws.probesDir, 'probes', plan.fileName), plan.source);
+/** Add the generated probe files to the plan's probes package. */
+export function planProbes(plan: WorkspacePlan, plans: ProbePlan[]): void {
+  for (const probe of plans) {
+    plan.files.set(`${plan.probesRel}/probes/${probe.fileName}`, { data: Buffer.from(probe.source) });
   }
+}
+
+/**
+ * The files `pnpm install` reads: equal keys install the same tree, so a kept
+ * workspace whose key is unchanged skips the install (carrick#2883).
+ */
+export function installKeyOf(plan: WorkspacePlan): string {
+  const hash = createHash('sha256');
+  for (const rel of [...plan.files.keys()].sort()) {
+    if (!/(^|\/)package\.json$/.test(rel) && rel !== '.npmrc' && rel !== 'pnpm-workspace.yaml') continue;
+    const entry = plan.files.get(rel)!;
+    hash.update(rel).update('\0').update('data' in entry ? entry.data : `link:${entry.link}`).update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/** A digest of one planned entry, to tell a changed file from an unchanged one. */
+export function entryDigest(entry: PlannedEntry): string {
+  return 'data' in entry
+    ? createHash('sha1').update(entry.data).digest('hex')
+    : `link:${entry.link}`;
+}
+
+/** Write one planned entry, replacing what is there. */
+export function writeEntry(guard: WriteGuard, dir: string, rel: string, entry: PlannedEntry): void {
+  const target = path.join(dir, ...rel.split('/'));
+  guard.mkdir(path.dirname(target));
+  if ('data' in entry) {
+    if (fs.lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) guard.unlink(target);
+    guard.writeFile(target, entry.data);
+  } else {
+    if (fs.lstatSync(target, { throwIfNoEntry: false })) guard.remove(target);
+    guard.symlink(entry.link, target);
+  }
+}
+
+/** Write the plan into a fresh directory under `workspaceRoot` (the OS temp dir by default). */
+export function writeWorkspace(plan: WorkspacePlan, workspaceRoot?: string): AssembledWorkspace {
+  const { dir: workspaceDir, guard } = WriteGuard.scratch('carrick-check-v2-', workspaceRoot);
+  for (const [rel, entry] of plan.files) writeEntry(guard, workspaceDir, rel, entry);
+  const ws = withDir(plan, workspaceDir, guard);
+  guard.mkdir(path.join(ws.probesDir, 'probes'));
+  return ws;
+}
+
+/** The plan as a workspace at `workspaceDir`. */
+export function withDir(plan: WorkspacePlan, workspaceDir: string, guard: WriteGuard): AssembledWorkspace {
+  const { files: _files, ...layout } = plan;
+  return { ...layout, workspaceDir, guard, probesDir: path.join(workspaceDir, ...plan.probesRel.split('/')) };
+}
+
+/** Create the scratch workspace and copy in the stub packages. */
+export function assembleWorkspace(opts: AssembleOptions): AssembledWorkspace {
+  return writeWorkspace(planWorkspace(opts.stubs), opts.workspaceRoot);
 }
 
 const NPMRC = [
