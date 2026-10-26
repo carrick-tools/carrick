@@ -17,9 +17,11 @@
  *   `progress` frames as it finishes units of work (writeProgress).
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import type { Project } from 'ts-morph';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
 import { TypeBundler } from './bundler.js';
@@ -54,6 +56,16 @@ import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
 import { HeldFiles, answerWhileStable } from './held-freshness.js';
 import {
+  affectedFiles,
+  importGraphOf,
+  readAgain,
+  readsOf,
+  type FileChange,
+  type ImportGraph,
+  type Reached,
+} from './affected-set.js';
+import { couplingOf, dropReached, itemKeysOf, sameCoupling, type HeldItem } from './held-items.js';
+import {
   Connection,
   DEFAULT_IDLE_MS,
   EXIT_ALREADY_RUNNING,
@@ -85,6 +97,8 @@ import type {
   ErrorResponse,
   ServerClaims,
   InferRequestItem,
+  InferItemOutcome,
+  InferTiming,
 } from './types.js';
 
 // ===========================================================================
@@ -128,6 +142,22 @@ interface Session {
   held: HeldFiles | null;
   /** Server mode: how often a sweep refreshed it or dropped it. */
   freshness: { refreshes: number; drops: number };
+  /**
+   * Server mode: each `infer` item's answer, by item key, kept to answer it
+   * again while no edit reaches it (carrick#2881). Null over stdio.
+   */
+  items: Map<string, HeldItem> | null;
+  /** Server mode: `infer` items answered from `items`, and read again. */
+  answers: { replayed: number; recomputed: number };
+  /** Server mode: how often it was evicted to keep the heap under its cap. */
+  evictions: number;
+  /** Server mode: when it last answered a request (`performance.now()`). */
+  lastUsed: number;
+  /**
+   * Server mode: each held project's import graph, carried across edits with
+   * the files an edit changed read again on first use (carrick#2881).
+   */
+  graphs: Map<Project, { graph: ImportGraph; stale: Set<string> }>;
 }
 
 function newSession(): Session {
@@ -140,6 +170,11 @@ function newSession(): Session {
     init: null,
     held: null,
     freshness: { refreshes: 0, drops: 0 },
+    items: null,
+    answers: { replayed: 0, recomputed: 0 },
+    evictions: 0,
+    lastUsed: 0,
+    graphs: new Map(),
   };
 }
 
@@ -482,6 +517,8 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
     log(`Inferring ${request.requests.length} type(s)`);
 
     const groups = byProject(request.requests, (item) => item.file_path);
+    // A daemon answers from the items it keeps, never from the kept file.
+    if (session.items) return inferHeld(request, groups, session.items);
     const cacheKey = inferAnswerKey(request, groups);
     if (cacheKey) {
       const served = servedAnswer(cacheKey);
@@ -546,6 +583,126 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       status: 'error',
       errors: [error],
     };
+  }
+}
+
+/**
+ * carrick#2881: answer `infer` in a daemon, reading again only the items it
+ * keeps no answer for (`held-items.ts`) and taking the rest from `items`.
+ * Each program's items are read in request order, in one batch, as a cold
+ * process reads them; an item coupled to one read again is read again with it.
+ */
+function inferHeld(
+  request: SidecarRequest & { action: 'infer' },
+  groups: Map<string, InferRequestItem[]>,
+  items: Map<string, HeldItem>
+): InferResponse {
+  const keys = itemKeysOf(request as unknown as { requests: InferRequestItem[] } & Record<string, unknown>);
+  const indexOf = new Map(request.requests.map((item, index) => [item, index]));
+  const outcomes = new Array<InferItemOutcome>(request.requests.length);
+  const timings: InferTiming[] = [];
+  let readAgainCount = 0;
+  let done = 0;
+  const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+    writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
+  );
+  for (const [key, group] of groups) {
+    const indices = group.map((item) => indexOf.get(item)!);
+    const readAgain = new Set(indices.filter((index) => !items.has(keys[index]!)));
+    const fresh = new Map<number, Set<string>>();
+    for (;;) {
+      if (readAgain.size > 0) {
+        const chosen = indices.filter((index) => readAgain.has(index));
+        const asked = chosen.map((index) => request.requests[index]!);
+        const built = projectComponents(key);
+        const result = built.typeInferrer.infer(
+          asked,
+          request.extraction_config,
+          () => {
+            done += 1;
+            report();
+          },
+          request.model_symbols,
+          labelledMembersFor(built, key, asked, request.server_claims)
+        );
+        timings.push(result.timing);
+        chosen.forEach((index, at) => {
+          outcomes[index] = result.items[at]!;
+        });
+        fresh.clear();
+        const reading = chosen.filter((index) => (outcomes[index]!.pathFiles?.length ?? 0) > 0);
+        if (reading.length > 0) {
+          const project = initializedLoader().getProjectFor(key);
+          const program = project.getProgram().compilerObject;
+          const graph = graphFor(project);
+          for (const index of reading) {
+            const asked = path.resolve(initializedLoader().getRepoRoot(), request.requests[index]!.file_path);
+            fresh.set(index, readsOf(graph, program.getSourceFile(asked)?.fileName ?? asked));
+          }
+        }
+      }
+      const coupled = couplingOf(
+        indices.map((index) =>
+          readAgain.has(index)
+            ? { key: keys[index]!, pathFiles: outcomes[index]!.pathFiles, reads: fresh.get(index) }
+            : { key: keys[index]!, pathFiles: items.get(keys[index]!)!.outcome.pathFiles, reads: items.get(keys[index]!)!.reads }
+        )
+      );
+      const readAgainKeys = new Set([...readAgain].map((index) => keys[index]!));
+      const moved = indices.filter(
+        (index) =>
+          !readAgain.has(index) &&
+          !sameCoupling(items.get(keys[index]!)!.coupled, coupled.get(keys[index]!) ?? [], readAgainKeys)
+      );
+      if (moved.length === 0) {
+        for (const index of readAgain) {
+          items.set(keys[index]!, {
+            file: heldFileOf(request.requests[index]!),
+            outcome: outcomes[index]!,
+            coupled: coupled.get(keys[index]!) ?? [],
+            reads: fresh.get(index),
+          });
+        }
+        for (const index of indices) {
+          if (!readAgain.has(index)) outcomes[index] = items.get(keys[index]!)!.outcome;
+        }
+        session.answers.replayed += indices.length - readAgain.size;
+        session.answers.recomputed += readAgain.size;
+        readAgainCount += readAgain.size;
+        break;
+      }
+      for (const index of moved) readAgain.add(index);
+    }
+  }
+  // Assembled as `handleInfer` assembles a cold answer: by program, in request order within each.
+  const ordered = [...groups.values()].flatMap((group) => group.map((item) => outcomes[indexOf.get(item)!]!));
+  const inferred_types = ordered.flatMap((outcome) => (outcome.inferred ? [outcome.inferred] : []));
+  const errors = ordered.flatMap((outcome) => outcome.errors);
+  const success = errors.length === 0 || inferred_types.length > 0;
+  log(`Inferred ${request.requests.length} type(s): ${readAgainCount} read again, the rest kept (carrick#2881)`);
+  return {
+    request_id: request.request_id,
+    status: success ? 'success' : 'error',
+    inferred_types: inferred_types.length > 0 ? inferred_types : undefined,
+    errors: errors.length > 0 ? errors : undefined,
+    infer_timing: mergeInferTimings(timings),
+  };
+}
+
+/**
+ * An item's file by its real path: a program names a root file as its config
+ * lists it and a file reached through a link by its real path, so kept items
+ * and the files an edit reaches meet on the real path.
+ */
+function heldFileOf(item: InferRequestItem): string {
+  return realFileOf(path.resolve(initializedLoader().getRepoRoot(), item.file_path));
+}
+
+function realFileOf(file: string): string {
+  try {
+    return fs.realpathSync.native(file);
+  } catch {
+    return file;
   }
 }
 
@@ -1245,9 +1402,10 @@ function initHeld(request: SidecarRequest & { action: 'init' }): InitResponse {
     session = held;
     return { request_id: request.request_id, status: 'ready', init_time_ms: held.initTimeMs ?? undefined };
   }
-  session = newSession();
+  session = held && !held.projectLoader ? held : newSession();
   session.scope = { repo_root: path.resolve(request.repo_root), scan_root: request.scan_root ?? null };
   session.init = request;
+  session.items = new Map();
   const response = handleInit(request);
   if (response.status === 'ready') heldSessions.set(key, session);
   return response;
@@ -1268,7 +1426,10 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
       scan_root: held.scope?.scan_root ?? null,
       built: held.components.size > 0,
       freshness: { ...held.freshness },
+      items: { held: held.items?.size ?? 0, ...held.answers },
+      evictions: held.evictions,
     })),
+    heap_cap_mb: heapCapMb(),
     heap_used_mb: Math.round(memory.heapUsed / 1048576),
     rss_mb: Math.round(memory.rss / 1048576),
   };
@@ -1322,10 +1483,12 @@ async function serveLine(
       case 'init':
         writeResponse(initHeld(request));
         conn.slot = session;
+        session.lastUsed = performance.now();
         return;
       default: {
         const held = conn.slot as Session | undefined;
         session = held ?? newSession();
+        if (held) held.lastUsed = performance.now();
         if (held && READS_HELD_PROJECT.has(request.action)) writeResponse(answerFresh(request));
         else await dispatch(request);
       }
@@ -1333,6 +1496,43 @@ async function serveLine(
   } finally {
     sink = STDOUT;
     session = newSession();
+    evictOverCap(conn.slot as Session | undefined);
+  }
+}
+
+/** The heap a daemon keeps its held services under (carrick#2881). */
+const DEFAULT_HEAP_CAP_MB = 3072;
+
+function heapCapMb(): number {
+  const cap = Number(process.env.CARRICK_TYPED_HEAP_CAP_MB);
+  return Number.isFinite(cap) && cap > 0 ? cap : DEFAULT_HEAP_CAP_MB;
+}
+
+/**
+ * carrick#2881: while the heap is over its cap, release the held service that
+ * answered least recently, never `current` (the one that just answered). An
+ * evicted service keeps its `init` and is built again, cold, by its next
+ * request. Without a collector to call (`--expose-gc`), the heap only shrinks
+ * once the next collection runs, so one service is released per request.
+ */
+function evictOverCap(current: Session | undefined): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  for (;;) {
+    const heapMb = process.memoryUsage().heapUsed / 1048576;
+    if (heapMb <= heapCapMb()) return;
+    const victim = [...heldSessions.values()]
+      .filter((held) => held !== current && held.projectLoader !== null)
+      .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    if (!victim) return;
+    log(`Heap ${Math.round(heapMb)} MB is over its cap of ${heapCapMb()} MB: releasing ${victim.scope?.repo_root ?? 'a held service'} (carrick#2881)`);
+    victim.projectLoader = null;
+    victim.components = new Map();
+    victim.items = victim.items && new Map();
+    victim.held = null;
+    victim.graphs = new Map();
+    victim.evictions += 1;
+    if (!gc) return;
+    gc();
   }
 }
 
@@ -1362,23 +1562,103 @@ const MAX_ANSWERS = 3;
  * the changed files, or a rebuild from its `init` (`held-freshness.ts`).
  */
 function freshen(): void {
+  if (session.init && session.projectLoader === null) {
+    // Evicted to keep the heap under its cap: built again as a cold process builds it.
+    log('rebuilding an evicted service (carrick#2881)');
+    handleInit(session.init);
+    session.items = new Map();
+    session.held = null;
+  }
   if (!session.projectLoader?.isInitialized() || !session.init) return;
   session.held ??= heldFilesOf(session);
   const found = session.held.sweep();
   if (found.outcome === 'refresh') {
     log(`refreshing ${found.files.length} changed file(s)`);
+    const before = session.items ? textsHeld(found.files) : null;
     session.held.refresh(found.files);
     // Everything built over the programs reads them again.
     session.components = new Map();
     session.freshness.refreshes += 1;
+    if (session.items && before) {
+      const reached = reachedBy(before);
+      const dropped = dropReached(session.items, reached);
+      log(
+        `The edit reaches ${reached === 'all' ? 'every file' : `${reached.files.size} file(s)`}: ${dropped} kept infer item(s) dropped (carrick#2881)`
+      );
+    }
   } else if (found.outcome === 'drop') {
     log(`rebuilding the service: ${found.reason}`);
     session.freshness.drops += 1;
+    session.items?.clear();
+    session.graphs = new Map();
     handleInit(session.init);
     // Watched from now on, so a change while the next request runs is found.
     session.held = session.projectLoader?.isInitialized() ? heldFilesOf(session) : null;
     session.held?.sweep();
   }
+}
+
+/**
+ * carrick#2881: each held program, with the text it holds of each of `files`
+ * and its import graph, read before the files are read again.
+ */
+function textsHeld(files: string[]): Array<{ project: Project; graph: ImportGraph; before: Map<string, string> }> {
+  return initializedLoader()
+    .builtProjects()
+    .map((project) => {
+      const program = project.getProgram().compilerObject;
+      const before = new Map<string, string>();
+      for (const file of files) {
+        const text = program.getSourceFile(file)?.text;
+        if (text !== undefined) before.set(file, text);
+      }
+      return { project, graph: graphFor(project), before };
+    });
+}
+
+/**
+ * carrick#2881: what the refreshed files reach, in every held program. A
+ * carried graph reads the changed files again on its next use, and is read
+ * whole again after an edit that moved an export.
+ */
+function reachedBy(held: Array<{ project: Project; graph: ImportGraph; before: Map<string, string> }>): Reached {
+  const files = new Set<string>();
+  let exportsMoved = false;
+  let everything = false;
+  for (const { project, graph, before } of held) {
+    const changes: FileChange[] = [];
+    for (const [file, text] of before) {
+      changes.push({ file, before: text, after: project.getSourceFile(file)?.getFullText() ?? '' });
+    }
+    const reached = affectedFiles(graph, changes);
+    const carried = session.graphs.get(project);
+    if (reached === 'all' || reached.exportsMoved) session.graphs.delete(project);
+    else for (const file of before.keys()) carried?.stale.add(file);
+    if (reached === 'all') {
+      everything = true;
+      continue;
+    }
+    // Kept items name their file by its real path (`realFileOf`).
+    for (const file of reached.files) files.add(realFileOf(file));
+    exportsMoved ||= reached.exportsMoved;
+  }
+  return everything ? 'all' : { files, exportsMoved };
+}
+
+/** carrick#2881: `project`'s import graph as its program stands, carried across edits. */
+function graphFor(project: Project): ImportGraph {
+  const program = project.getProgram().compilerObject;
+  const carried = session.graphs.get(project);
+  if (!carried) {
+    const graph = importGraphOf(program);
+    session.graphs.set(project, { graph, stale: new Set() });
+    return graph;
+  }
+  if (carried.stale.size > 0) {
+    readAgain(carried.graph, program, carried.stale);
+    carried.stale.clear();
+  }
+  return carried.graph;
 }
 
 /** The files `held`'s current loader builds from, ready to sweep. */
