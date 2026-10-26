@@ -533,7 +533,7 @@ pub fn main_branch(repo_path: &str) -> Option<String> {
 pub fn main_base(repo_path: &str) -> Result<(String, String), String> {
     let branch = main_branch(repo_path).ok_or(
         "no main branch to compare against (looked for origin/HEAD, origin/main, \
-         origin/master, main and master)",
+         origin/master, main and master); run `git fetch origin main`",
     )?;
     let tip = run_git(
         repo_path,
@@ -542,7 +542,31 @@ pub fn main_base(repo_path: &str) -> Result<(String, String), String> {
     .trim()
     .to_string();
     let head = head_commit(repo_path)?;
-    Ok((branch, merge_base(repo_path, &head, &tip)?))
+    match merge_base(repo_path, &head, &tip) {
+        Ok(base) => Ok((branch, base)),
+        Err(_) => Err(no_base_message(repo_path, &branch)),
+    }
+}
+
+/// One line for a clone with no merge base against `branch`: the ref tried
+/// and the command that fixes it. A shallow clone is told to unshallow; any
+/// other is told to fetch the branch (unrelated history needs the real one).
+fn no_base_message(repo_path: &str, branch: &str) -> String {
+    let shallow = run_git(repo_path, &["rev-parse", "--is-shallow-repository"])
+        .map(|text| text.trim() == "true")
+        .unwrap_or(false);
+    if shallow {
+        format!(
+            "no merge base with {branch}: this clone is shallow, so its history stops short of \
+             it; run `git fetch --unshallow`"
+        )
+    } else {
+        let remote_branch = branch.strip_prefix("origin/").unwrap_or(branch);
+        format!(
+            "no merge base with {branch}: this clone shares no history with it; run \
+             `git fetch origin {remote_branch}`"
+        )
+    }
 }
 
 /// Every file that differs between commits `from` and `to`, as

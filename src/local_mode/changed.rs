@@ -85,6 +85,11 @@ pub struct ChangedRepo {
     /// Zero when `skipped` is not set.
     #[serde(skip_serializing_if = "is_zero")]
     pub unchecked: usize,
+    /// No base could be found to diff against, so nothing in this repo was
+    /// looked at. `skipped` carries the reason; the run exits
+    /// [`EXIT_NOTHING_COVERED`] when no repo covered a file.
+    #[serde(skip)]
+    pub no_base: bool,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -153,7 +158,22 @@ pub enum Selection<'a> {
 /// (carrick#2850). Hooks do not run this pass and keep their own exit codes.
 pub const EXIT_NOTHING_COVERED: i32 = 2;
 
+/// What a reason says when git gave none: a "not checked" line is never bare.
+fn reason_or_default(reason: &str) -> String {
+    let one = one_line(reason);
+    if one.is_empty() {
+        "git gave no reason".to_string()
+    } else {
+        one
+    }
+}
+
 impl ChangedOutput {
+    /// Some repo had files no check reached, or had no base to diff against.
+    fn nothing_asked_covered(&self) -> bool {
+        self.unchecked() > 0 || self.repos.iter().any(|repo| repo.no_base)
+    }
+
     /// Files the caller asked about that no repo could check.
     pub fn unchecked(&self) -> usize {
         self.repos.iter().map(|repo| repo.unchecked).sum()
@@ -164,7 +184,7 @@ impl ChangedOutput {
     /// fact; else 0, including when some files were covered and others
     /// skipped (the skipped ones are listed).
     pub fn exit_code(&self) -> i32 {
-        if self.not_checked.is_some() || (self.files == 0 && self.unchecked() > 0) {
+        if self.not_checked.is_some() || (self.files == 0 && self.nothing_asked_covered()) {
             EXIT_NOTHING_COVERED
         } else if self.failing > 0 {
             1
@@ -295,32 +315,41 @@ fn changed_files(
             files: Vec::new(),
             skipped: None,
             unchecked: 0,
+            no_base: false,
         };
         let Some(indexed) = index.repos.iter().find(|indexed| indexed.name == name) else {
             // The files the work changed here are ones the caller asked
             // about, so count them: a repo the index does not hold is a
             // check that covered none of them.
-            if let Ok((_, base)) = crate::git_state::main_base(&text)
-                && let Some(paths) = super::query::changed_since(repo, &base)
-            {
-                entry.files = paths
-                    .into_iter()
-                    .filter(|file| crate::file_finder::is_scanned_source(&repo.join(file), repo))
-                    .collect();
-                entry.unchecked = entry.files.len();
-            }
-            entry.skipped = Some(
-                "not in the index, or the index is not bound to this folder; run \
+            let mut reason = "not in the index, or the index is not bound to this folder; run \
                  `carrick init` or `carrick refresh`"
-                    .to_string(),
-            );
+                .to_string();
+            match crate::git_state::main_base(&text) {
+                Ok((_, base)) => {
+                    if let Some(paths) = super::query::changed_since(repo, &base) {
+                        entry.files = paths
+                            .into_iter()
+                            .filter(|file| {
+                                crate::file_finder::is_scanned_source(&repo.join(file), repo)
+                            })
+                            .collect();
+                        entry.unchecked = entry.files.len();
+                    }
+                }
+                Err(why) => {
+                    entry.no_base = true;
+                    reason = format!("{reason}. Also: {}", reason_or_default(&why));
+                }
+            }
+            entry.skipped = Some(reason);
             listed.push(entry);
             continue;
         };
         let (branch, base) = match crate::git_state::main_base(&text) {
             Ok(found) => found,
             Err(reason) => {
-                entry.skipped = Some(reason);
+                entry.no_base = true;
+                entry.skipped = Some(reason_or_default(&reason));
                 listed.push(entry);
                 continue;
             }
@@ -379,6 +408,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             files: Vec::new(),
             skipped: Some(format!("{reason}; run `carrick init` or `carrick refresh`")),
             unchecked: 1,
+            no_base: false,
         });
     };
     for file in files {
@@ -414,6 +444,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             files: files.iter().cloned().collect(),
             skipped: None,
             unchecked: 0,
+            no_base: false,
         })
         .collect();
     repos.extend(listed);
@@ -656,7 +687,17 @@ impl ChangedOutput {
     /// is counted on the summary line ("plus N unconfirmed") and not listed.
     pub fn render(&self, all: bool) -> String {
         if let Some(reason) = &self.not_checked {
-            return format!("carrick check: not checked: {reason}\n");
+            return format!(
+                "carrick check: not checked: {}\n",
+                reason_or_default(reason)
+            );
+        }
+        if self.files == 0 && self.repos.iter().any(|repo| repo.no_base) {
+            let mut out = String::from(
+                "carrick check: not checked: no base to compare against, so no change was looked at\n",
+            );
+            out.push_str(&self.skipped_lines());
+            return out;
         }
         if self.files == 0 && self.unchecked() > 0 {
             let mut out = format!(
@@ -735,7 +776,11 @@ impl ChangedOutput {
         let mut out = String::new();
         for repo in &self.repos {
             if let Some(reason) = &repo.skipped {
-                out.push_str(&format!("not checked: {}: {reason}\n", repo.repo));
+                out.push_str(&format!(
+                    "not checked: {}: {}\n",
+                    repo.repo,
+                    reason_or_default(reason)
+                ));
             }
         }
         out
@@ -838,6 +883,7 @@ mod tests {
             files: Vec::new(),
             skipped: Some("not in a repo of this workspace".to_string()),
             unchecked: 1,
+            no_base: false,
         };
         let none = ChangedOutput {
             repos: vec![skipped.clone()],
@@ -872,6 +918,37 @@ mod tests {
             nothing_asked.exit_code(),
             0,
             "no changed file asked about nothing"
+        );
+    }
+
+    #[test]
+    fn every_not_checked_line_carries_a_reason() {
+        let bare = ChangedRepo {
+            repo: "r".to_string(),
+            main_branch: None,
+            base: None,
+            files: Vec::new(),
+            skipped: Some(String::new()),
+            unchecked: 0,
+            no_base: true,
+        };
+        let output = ChangedOutput {
+            repos: vec![bare],
+            ..not_checked("/w", "")
+        };
+        let output = ChangedOutput {
+            not_checked: None,
+            ..output
+        };
+        assert_eq!(output.exit_code(), EXIT_NOTHING_COVERED);
+        for line in output.render(false).lines() {
+            assert!(!line.trim_end().ends_with("not checked:"), "{line}");
+            assert!(!line.ends_with(": "), "{line}");
+        }
+        assert!(
+            not_checked("/w", "")
+                .render(false)
+                .contains("git gave no reason")
         );
     }
 

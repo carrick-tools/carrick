@@ -3093,3 +3093,95 @@ fn check_several_files_exits_zero_when_none_is_a_problem() {
     );
     assert_eq!(code, Some(0), "{text}");
 }
+
+const COMMIT: [&str; 6] = [
+    "-c",
+    "user.email=fixture@carrick.test",
+    "-c",
+    "user.name=fixture",
+    "commit",
+    "-qm",
+];
+
+/// No base to diff against used to print an empty "not checked:" and exit 0.
+/// Unrelated history: the branch shares no commit with the main branch.
+#[test]
+#[serial]
+fn check_changed_with_no_merge_base_exits_two_and_names_the_fix() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    index(root);
+    let repo = root.join("catalog-web");
+    git(&repo, &["branch", "-M", "main"]);
+    git(&repo, &["checkout", "-q", "--orphan", "work"]);
+    git(&repo, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("unrelated");
+    git(&repo, &args);
+
+    let (code, text) = check_changed(root, false);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("no merge base with main") && text.contains("run `git fetch origin main`"),
+        "{text}"
+    );
+    assert!(!text.contains("not checked: \n"), "no bare reason:\n{text}");
+}
+
+/// A shallow clone whose history stops short of the main branch is told to
+/// unshallow it.
+#[test]
+#[serial]
+fn check_changed_in_a_shallow_clone_says_to_unshallow() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    let source = root.join("origin-repo");
+    std::fs::rename(root.join("catalog-web"), &source).expect("move the repo");
+    git(&source, &["branch", "-M", "main"]);
+    git(&source, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(source.join("a.txt"), "a\n").expect("write");
+    git(&source, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("feature work");
+    git(&source, &args);
+    git(&source, &["checkout", "-q", "main"]);
+    std::fs::write(source.join("b.txt"), "b\n").expect("write");
+    git(&source, &["add", "-A"]);
+    let mut args = COMMIT.to_vec();
+    args.push("main moved");
+    git(&source, &args);
+
+    let url = format!("file://{}", source.display());
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--depth=1",
+            "--branch",
+            "feature",
+            &url,
+            "catalog-web",
+        ],
+    );
+    let clone = root.join("catalog-web");
+    git(
+        &clone,
+        &[
+            "fetch",
+            "-q",
+            "--depth=1",
+            "origin",
+            "main:refs/remotes/origin/main",
+        ],
+    );
+    git(&clone, &["remote", "set-head", "origin", "-d"]);
+    index(root);
+
+    let (code, text) = check_changed(root, false);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("this clone is shallow") && text.contains("run `git fetch --unshallow`"),
+        "{text}"
+    );
+}
