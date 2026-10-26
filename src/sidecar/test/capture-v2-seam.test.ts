@@ -100,6 +100,7 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'bundler.ts' ||
           base === 'declaration-attribution.ts' ||
           base === 'position-rows.ts' ||
+          base === 'infer-cache.ts' ||
           base === 'retype.ts'
         ) {
           // Shared Deno resolution, the options every program carries
@@ -107,7 +108,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // reading the inferrer and the v1 bundle share with the capture's
           // symbol anchor (carrick#1841). The per-position rows write
           // through the guard and name packages as the capture does
-          // (carrick#2405). The retype reads a declared no-body return
+          // (carrick#2405), and so do the kept infer answers (carrick#2843).
+          // The retype reads a declared no-body return
           // with the same `statesNoBody` (carrick#2743).
           assert.strictEqual(
             spec,

@@ -44,7 +44,7 @@ import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Project } from 'ts-morph';
-import { WriteGuard } from './capture/guarded-fs.js';
+import { WriteGuard } from './capture/index.js';
 import { listProgramFiles } from './program-files.js';
 import type { InferredType } from './types.js';
 
