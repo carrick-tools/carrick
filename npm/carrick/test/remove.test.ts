@@ -69,14 +69,16 @@ test("uninstall reads its arguments, and takes no directory", () => {
 });
 
 test("the hooks the writer merged in are exactly the hooks the remover takes out", () => {
-  // A file holding someone else's hooks, the hosted index's hook pack, and a
-  // key of its own: the round trip has to give all three back untouched.
+  // A file holding someone else's hooks, a session-start script of the user's
+  // own, and a key of its own: the round trip has to give all three back
+  // untouched. (The hosted hook pack's entries are not in the set: init
+  // replaces them, carrick#2854.)
   const before = JSON.stringify(
     {
       permissions: { allow: ["Bash(ls:*)"] },
       hooks: {
         SessionStart: [
-          { hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/session-start.sh"' }] },
+          { hooks: [{ type: "command", command: "./my-own-start.sh" }] },
         ],
         PostToolUse: [
           { matcher: "Write|Edit", hooks: [{ type: "command", command: "eslint --fix" }] },
@@ -292,7 +294,7 @@ process.exit(0);
       JSON.stringify({
         permissions: { allow: ["Bash(ls:*)"] },
         hooks: {
-          SessionStart: [{ hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/session-start.sh"' }] }],
+          SessionStart: [{ hooks: [{ type: "command", command: "./my-own-start.sh" }] }],
         },
       }),
     ).body,
@@ -504,11 +506,11 @@ test("remove takes back what init wrote in this folder, and nothing of the machi
   );
   assert.equal(first.stdout.includes(SETTINGS_FILES[1]!), false, first.stdout);
 
-  // The hook pack and the permissions survive; only our entries are gone.
+  // The user's own hook and the permissions survive; only our entries are gone.
   const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
   assert.deepEqual(settings.permissions, { allow: ["Bash(ls:*)"] });
   assert.equal(settings.hooks.SessionStart.length, 1);
-  assert.match(settings.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "./my-own-start.sh");
   assert.equal(settings.hooks.PostToolUse, undefined);
   assert.equal(settings.hooks.Stop, undefined);
 

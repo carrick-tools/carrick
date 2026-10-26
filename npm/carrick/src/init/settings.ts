@@ -206,8 +206,32 @@ export function hookTarget(command: string): string | null {
   return match?.[1] ?? null;
 }
 
-/** Strip our entries from one event's groups, keeping everyone else's. */
-function withoutOurs(groups: unknown): HookGroup[] {
+/**
+ * Whether a settings entry is one the hosted scaffold's hook pack wrote.
+ *
+ * The pack's three scripts are wired by exactly these commands (carrick-cloud
+ * `lambdas/mcp-server/src/tools/scaffold.ts`, `buildHookSettings`). The test
+ * is the whole command, so a user's own script in the same directory, or the
+ * same script run with arguments, is never taken for the pack's. Its
+ * session-start script prints the message `carrick hook session-start` prints,
+ * so a repo holding both sent every session two of them (carrick#2854).
+ */
+const SCAFFOLD_HOOK =
+  /^"?\$CLAUDE_PROJECT_DIR\/\.claude\/(?:session-start|turn-reminder|search-gate)\.sh"?$/;
+
+export function isScaffoldHook(entry: unknown): boolean {
+  if (typeof entry !== "object" || entry === null) return false;
+  const command = (entry as HookEntry).command;
+  return typeof command === "string" && SCAFFOLD_HOOK.test(command.trim());
+}
+
+/**
+ * Strip our entries from one event's groups, keeping everyone else's.
+ *
+ * With `scaffold`, the hook pack's entries go too: that is init replacing them
+ * with its own. `carrick remove` leaves them for their owner.
+ */
+function withoutOurs(groups: unknown, scaffold: boolean): HookGroup[] {
   if (!Array.isArray(groups)) return [];
   const kept: HookGroup[] = [];
   for (const group of groups) {
@@ -220,7 +244,7 @@ function withoutOurs(groups: unknown): HookGroup[] {
       kept.push(group as HookGroup);
       continue;
     }
-    const others = hooks.filter((entry) => !isOurs(entry));
+    const others = hooks.filter((entry) => !isOurs(entry) && !(scaffold && isScaffoldHook(entry)));
     // A group that held only our entry goes with it; one that held a mix keeps
     // the rest of its entries and its matcher.
     if (others.length > 0) kept.push({ ...(group as HookGroup), hooks: others });
@@ -242,7 +266,8 @@ export type MergeResult = {
  * edited into invalid JSON is a thing to report, never a thing to overwrite.
  */
 export function mergeCarrickHooks(existing: string | null, command: string | null = "carrick"): MergeResult {
-  return mergeHookSet(existing, command === null ? null : carrickHooks(command));
+  // Adding ours replaces the scaffold's hook pack; removing ours leaves it.
+  return mergeHookSet(existing, command === null ? null : carrickHooks(command), command !== null);
 }
 
 /**
@@ -256,6 +281,7 @@ export function mergeCarrickHooks(existing: string | null, command: string | nul
 export function mergeHookSet(
   existing: string | null,
   set: Record<string, HookGroup[]> | null,
+  replaceScaffold = false,
 ): MergeResult {
   const base: Record<string, unknown> =
     existing == null || existing.trim() === ""
@@ -265,7 +291,7 @@ export function mergeHookSet(
   const hooksBefore = (base["hooks"] ?? {}) as Record<string, unknown>;
   const hooks: Record<string, unknown> = {};
   for (const [event, groups] of Object.entries(hooksBefore)) {
-    hooks[event] = withoutOurs(groups);
+    hooks[event] = withoutOurs(groups, replaceScaffold);
   }
   for (const [event, groups] of Object.entries(set ?? {})) {
     hooks[event] = [...((hooks[event] as HookGroup[]) ?? []), ...groups];

@@ -25,6 +25,7 @@ import {
   hookCommand,
   mergeCarrickHooks,
   ownEntryPoint,
+  removeCarrickHooks,
 } from "../src/init/settings.ts";
 import { PROJECT_RULE, planProject, projectStep, reposPhrase, type Project, type ProjectPrompts } from "../src/init/projects.ts";
 import {
@@ -464,12 +465,8 @@ test("the hook entries land beside everything else the settings file holds", () 
     {
       permissions: { allow: ["Bash(ls:*)"] },
       hooks: {
-        SessionStart: [
-          { hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/session-start.sh"' }] },
-        ],
-        PreToolUse: [
-          { matcher: "Grep", hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/search-gate.sh"' }] },
-        ],
+        SessionStart: [{ hooks: [{ type: "command", command: "./my-own-start.sh" }] }],
+        PreToolUse: [{ matcher: "Grep", hooks: [{ type: "command", command: "./my-own-gate.sh" }] }],
       },
     },
     null,
@@ -479,9 +476,9 @@ test("the hook entries land beside everything else the settings file holds", () 
   const written = JSON.parse(merged.body);
   assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
   assert.equal(written.hooks.PreToolUse.length, 1);
-  // The hosted index's session-start script survives, with ours after it.
+  // The user's own session-start script survives, with ours after it.
   assert.equal(written.hooks.SessionStart.length, 2);
-  assert.match(written.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
+  assert.equal(written.hooks.SessionStart[0].hooks[0].command, "./my-own-start.sh");
   assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   // The Read hook (carrick#2069) is its own group beside the Edit one.
@@ -493,6 +490,52 @@ test("the hook entries land beside everything else the settings file holds", () 
   // rather than by anything the user has to add.
   assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
+});
+
+// carrick#2854: the hosted scaffold's hook pack wires the same session-start
+// message init does, so a session got it twice. Init replaces the pack's three
+// entries (the exact `$CLAUDE_PROJECT_DIR/.claude/<name>.sh` commands the
+// scaffold writes) and leaves every entry that is not its own or the pack's.
+test("init replaces the scaffold's hook-pack entries and keeps the user's own", () => {
+  const pack = (name: string) => ({ type: "command", command: `"$CLAUDE_PROJECT_DIR/.claude/${name}.sh"` });
+  const scaffolded = JSON.stringify(
+    {
+      permissions: { allow: ["Bash(ls:*)"] },
+      hooks: {
+        SessionStart: [{ hooks: [pack("session-start")] }],
+        UserPromptSubmit: [{ hooks: [pack("turn-reminder")] }],
+        PreToolUse: [
+          { matcher: "Grep", hooks: [pack("search-gate")] },
+          { matcher: "Bash", hooks: [pack("search-gate")] },
+          // The user's own hook, sharing nothing with the pack but the event.
+          { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
+        ],
+        // A different script in the same directory is the user's, not the pack's.
+        Stop: [{ hooks: [{ type: "command", command: '"$CLAUDE_PROJECT_DIR/.claude/notify.sh"' }] }],
+      },
+    },
+    null,
+    2,
+  );
+  const merged = mergeCarrickHooks(scaffolded);
+  const written = JSON.parse(merged.body);
+  assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
+  assert.deepEqual(
+    written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
+    ["carrick hook session-start"],
+    "one session-start message",
+  );
+  assert.equal(written.hooks.UserPromptSubmit, undefined);
+  assert.deepEqual(written.hooks.PreToolUse, [
+    { matcher: "Bash", hooks: [{ type: "command", command: "./guard.sh" }] },
+  ]);
+  assert.equal(written.hooks.Stop.length, 2);
+  assert.equal(written.hooks.Stop[0].hooks[0].command, '"$CLAUDE_PROJECT_DIR/.claude/notify.sh"');
+  assert.equal(JSON.stringify(written).includes("session-start.sh"), false);
+  // Settled: a second run changes nothing.
+  assert.equal(mergeCarrickHooks(merged.body).changed, false);
+  // `carrick remove` is not a replacement: the pack's entries stay for their owner.
+  assert.equal(removeCarrickHooks(scaffolded).changed, false);
 });
 
 test("merging twice changes nothing the second time", () => {
