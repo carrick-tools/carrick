@@ -286,6 +286,36 @@ function entrySubpaths(manifest: PackageManifest): string[] {
   return [''];
 }
 
+/**
+ * Declaration keys (`file\0declaredName`) of what `file` exports as `name`.
+ * A chunk can declare a type under its public name and export it under a
+ * short one (`export { type OmitKeyof as O }`), so the name read off the
+ * import is not the name the declaration carries.
+ */
+function declarationKeysOfExport(file: string, name: string): string[] {
+  const program = ts.createProgram([file], RESOLUTION_OPTIONS);
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(file);
+  const moduleSymbol = source && checker.getSymbolAtLocation(source);
+  const symbol = moduleSymbol && checker.getExportsOfModule(moduleSymbol).find((s) => s.getName() === name);
+  if (!symbol) return [];
+  let target = symbol;
+  for (let hops = 0; target.flags & ts.SymbolFlags.Alias && hops < 16; hops++) {
+    const next = checker.getAliasedSymbol(target);
+    if (next === target) break;
+    target = next;
+  }
+  const keys: string[] = [];
+  for (const declaration of target.declarations ?? []) {
+    try {
+      keys.push(`${fs.realpathSync(declaration.getSourceFile().fileName)}\0${target.getName()}`);
+    } catch {
+      // declaration outside the real file system: ignore
+    }
+  }
+  return keys;
+}
+
 interface EntryExports {
   /** Exported names, each with the real files declaring it. */
   byName: Map<string, Set<string>>;
@@ -376,7 +406,11 @@ export function installedPackageSpecifier(
         return withPin(publicName + entry);
       }
       // The entry may export the declaration under another name.
-      const renamed = entryExports.byDeclaration.get(`${file}\0${importedName}`);
+      const renamed =
+        entryExports.byDeclaration.get(`${file}\0${importedName}`) ??
+        declarationKeysOfExport(file, importedName)
+          .map((key) => entryExports.byDeclaration.get(key))
+          .find((name) => name !== undefined);
       if (renamed !== undefined) {
         return { ...withPin(publicName + entry), exportName: renamed };
       }

@@ -24,7 +24,7 @@ function write(root: string, rel: string, text: string): void {
 
 const CHUNK = 'build/modern/chunk-AbC123';
 
-function fixture(scratch: string, entryText: string): string {
+function fixture(scratch: string, entryText: string, chunkText?: string): string {
   const repoRoot = path.join(scratch, 'repo');
   write(repoRoot, 'tsconfig.json', JSON.stringify({
     compilerOptions: {
@@ -42,10 +42,10 @@ function fixture(scratch: string, entryText: string): string {
     name: 'qcore', version: '5.0.0',
     exports: { '.': { types: './build/modern/index.d.ts', default: './build/modern/index.js' } },
   }));
-  write(repoRoot, `${pkg}/${CHUNK}.d.ts`,
-    'type O<T, K extends keyof T> = Omit<T, K>;\n' +
+  write(repoRoot, `${pkg}/${CHUNK}.d.ts`, chunkText ??
+    ('type O<T, K extends keyof T> = Omit<T, K>;\n' +
     'interface Y<T> { (input: T): Promise<T> }\n' +
-    'export { O, Y };\n');
+    'export { O, Y };\n'));
   write(repoRoot, `${pkg}/build/modern/index.d.ts`, entryText);
   return repoRoot;
 }
@@ -122,5 +122,27 @@ describe('capture names a renamed re-export by the name the entry exports', () =
     assert.strictEqual(mapped?.specifier, 'qcore');
     assert.strictEqual(mapped?.exportName, 'OmitKeys');
     assert.strictEqual(installedPackageSpecifier(chunk, 'Y')?.exportName, 'FetchFn');
+  });
+
+  // The chunk declares the type under its public name and exports it under a
+  // short one (`export { type OmitKeyof as O }`); the entry re-exports that
+  // short name under the public name again.
+  it('matches a chunk export whose local declaration name differs from its export name', () => {
+    const root = path.join(scratch, 'local-name');
+    const chunkText =
+      'type OmitKeyof<T, K extends keyof T> = Omit<T, K>;\n' +
+      'interface QueryFunction<T> { (input: T): Promise<T> }\n' +
+      'export { type OmitKeyof as O, type QueryFunction as Y };\n';
+    const repoRoot = fixture(
+      root,
+      "export { O as OmitKeyof, type Y as QueryFunction } from './chunk-AbC123.js';\n",
+      chunkText
+    );
+    const { records, surface } = capture(root, repoRoot);
+    assert.match(surface, /A_omit = import\("qcore"\)\.OmitKeyof</);
+    assert.match(surface, /A_fn = import\("qcore"\)\.QueryFunction</);
+    for (const alias of ['A_omit', 'A_fn']) {
+      assert.strictEqual(records.get(alias)?.self_check, 'ok', JSON.stringify(records.get(alias)));
+    }
   });
 });
