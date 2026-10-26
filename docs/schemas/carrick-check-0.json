@@ -61,13 +61,14 @@
         },
         "summary": {
           "type": "object",
-          "description": "What `carrick check` looked at. Absent on `touch`.",
+          "description": "What `carrick check` looked at. Absent on `touch` and on a run that did not finish.",
           "properties": {
             "files": { "type": "integer" },
             "services": { "type": "integer" },
             "calls": { "type": "integer" },
             "routes": { "type": "integer" },
-            "compared_with": { "type": "integer" },
+            "pairs_compared": { "type": "integer", "description": "Pairs of a checked call or route with a counterpart that reached a type verdict." },
+            "pairs_uncompared": { "type": "integer", "description": "Pairs that reached no verdict: a side did not resolve, or no type verdict bears on the row." },
             "breaks": { "type": "integer" }
           },
           "additionalProperties": true

@@ -247,26 +247,53 @@ pub struct CheckSummary {
     pub calls: usize,
     /// Routes in those files.
     pub routes: usize,
-    /// Services whose contracts the calls and routes were compared with.
-    pub compared_with: usize,
+    /// Pairs of one of those calls or routes with a route or call of another
+    /// row whose types the compiler compared and gave a verdict on.
+    pub pairs_compared: usize,
+    /// Pairs the index holds for them that reached no verdict: a side did not
+    /// resolve, or no type verdict bears on the row.
+    pub pairs_uncompared: usize,
     /// Problems that fail the run: incompatible pairs, plus (on several files
     /// and `--changed`) calls a fact says reach no route.
     pub breaks: usize,
 }
 
 impl CheckSummary {
+    /// Whether a stored verdict's `result` says the two types were compared.
+    pub fn reached_verdict(result: Option<&str>) -> bool {
+        matches!(
+            result,
+            Some("compatible" | "type_mismatch" | "method_mismatch")
+        )
+    }
+
     /// The one summary line. `changed` says the files are the ones git lists
     /// as changed rather than ones the caller named.
     pub fn line(&self, changed: bool) -> String {
         fn n(count: usize, one: &str, many: &str) -> String {
             format!("{count} {}", if count == 1 { one } else { many })
         }
-        let verdict = match self.breaks {
-            0 => "No breaks.".to_string(),
-            breaks => format!("{} (listed below).", n(breaks, "break", "breaks")),
+        let compared = if self.pairs_compared == 0 {
+            "nothing compared with other services".to_string()
+        } else {
+            format!(
+                "{} compared with other services",
+                n(self.pairs_compared, "pair", "pairs")
+            )
+        };
+        let uncompared = match (self.pairs_uncompared, self.pairs_compared) {
+            (0, _) => String::new(),
+            (1, 0) => " (1 pair could not be compared)".to_string(),
+            (count, 0) => format!(" ({count} pairs could not be compared)"),
+            (count, _) => format!(" ({count} could not be compared)"),
+        };
+        let verdict = match (self.breaks, self.pairs_compared) {
+            (0, 0) => "No breaks, but nothing was compared.".to_string(),
+            (0, _) => "No breaks.".to_string(),
+            (breaks, _) => format!("{} (listed below).", n(breaks, "break", "breaks")),
         };
         format!(
-            "Checked {} in {}: {} and {} against {}. {verdict}",
+            "Checked {} in {}: {} and {}, {compared}{uncompared}. {verdict}",
             n(
                 self.files,
                 if changed { "changed file" } else { "file" },
@@ -275,11 +302,6 @@ impl CheckSummary {
             n(self.services, "service", "services"),
             n(self.calls, "call", "calls"),
             n(self.routes, "route", "routes"),
-            if self.compared_with == 1 {
-                "1 service's contract".to_string()
-            } else {
-                format!("{} services' contracts", self.compared_with)
-            },
         )
     }
 }
@@ -1388,13 +1410,14 @@ mod tests {
             services: 1,
             calls: 0,
             routes: 1,
-            compared_with: 4,
+            pairs_compared: 4,
+            pairs_uncompared: 1,
             breaks: 0,
         });
         assert!(checked.render().lines().any(|line| line
-            == "Checked 1 file in 1 service: 0 calls and 1 route against 4 services' contracts. No breaks."));
+            == "Checked 1 file in 1 service: 0 calls and 1 route, 4 pairs compared with other services (1 could not be compared). No breaks."));
         let json = serde_json::to_value(&checked).unwrap();
-        assert_eq!(json["summary"]["compared_with"], 4);
+        assert_eq!(json["summary"]["pairs_compared"], 4);
         assert!(
             serde_json::to_value(output())
                 .unwrap()

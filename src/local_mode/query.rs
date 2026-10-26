@@ -192,12 +192,26 @@ pub fn answer(
             )
         })
         .collect();
+    let mut pairs_compared = 0;
+    let mut pairs_uncompared = 0;
+    for item in &items {
+        let reached = item
+            .verdict
+            .as_ref()
+            .is_some_and(|verdict| CheckSummary::reached_verdict(verdict.result.as_deref()));
+        if reached {
+            pairs_compared += item.counterparts.len();
+        } else {
+            pairs_uncompared += item.counterparts.len();
+        }
+    }
     let summary = (mode == Mode::Check).then(|| CheckSummary {
         files: 1,
         services: 1,
         calls: items.iter().filter(|item| item.kind == "call").count(),
         routes: items.iter().filter(|item| item.kind == "route").count(),
-        compared_with: index.repos.iter().map(|r| r.services.len()).sum(),
+        pairs_compared,
+        pairs_uncompared,
         breaks: items
             .iter()
             .filter(|item| {
