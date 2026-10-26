@@ -993,20 +993,12 @@ fn capture_in_a_fresh_process(
     };
     let mut died_before: Option<CaptureDeath> = None;
     loop {
-        // Through the resident type daemon the first attempt stays on it: it
-        // holds the service's program and emits again only what an edit
-        // reaches (carrick#2882). Anything that fails only there closes the
-        // connection, and the capture is asked again of a process of the
-        // sidecar's own with the same answer as without a daemon
-        // (`TypeSidecar::fall_back_cold`, the lifecycle policy's L4).
-        if died_before.is_some() || !sidecar.on_daemon() {
-            sidecar
-                .restart(match died_before {
-                    None => "a capture runs in a process of its own",
-                    Some(_) => "the sidecar died during a capture, which is retried once",
-                })
-                .map_err(not_started)?;
-        }
+        sidecar
+            .restart(match died_before {
+                None => "a capture runs in a process of its own",
+                Some(_) => "the sidecar died during a capture, which is retried once",
+            })
+            .map_err(not_started)?;
 
         let out_dir = std::env::temp_dir().join(format!(
             "carrick-capture-{}-{}",
@@ -6672,17 +6664,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
     }
 
-    /// Through the resident type daemon a capture is asked of the daemon
-    /// first (carrick#2882), not of a fresh process; when the daemon closes the
-    /// connection mid-capture, the capture is asked of a process of the
-    /// sidecar's own, whose answer is used (the lifecycle policy's L4).
+    /// A capture never goes to the resident type daemon: even on a daemon
+    /// link it runs in a process of the sidecar's own, since holding a
+    /// capture's programs costs more than a daemon's heap cap holds
+    /// (carrick#2914).
     #[cfg(unix)]
     #[test]
-    fn a_capture_through_the_daemon_is_asked_of_it_and_falls_back_cold() {
+    fn a_capture_on_a_daemon_link_runs_in_a_process_of_its_own() {
         use std::io::{BufRead, BufReader, Write};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        // The process of its own: answers a capture with stub_dir "cold".
         let script = root.join("stand-in-sidecar.cjs");
         std::fs::write(
             &script,
@@ -6701,6 +6692,39 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 "#,
         )
         .unwrap();
+        let socket = root.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // A stand-in daemon: answers hello and init, records every action.
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut seen = Vec::new();
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let action = request["action"].as_str().unwrap_or("").to_string();
+                seen.push(action.clone());
+                let id = request["request_id"].clone();
+                let answer = match action.as_str() {
+                    "hello" => serde_json::json!({"request_id": id, "status": "success", "pid": 1}),
+                    "init" => serde_json::json!({"request_id": id, "status": "ready"}),
+                    _ => break,
+                };
+                writeln!(writer, "{answer}").unwrap();
+            }
+            seen
+        });
+        let sidecar = TypeSidecar::connect_daemon(
+            &script,
+            &socket,
+            "any",
+            crate::services::typed_daemon::HelloMode::Probe,
+        )
+        .unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .unwrap();
         let anchors = [CaptureAnchor::Literal {
             alias: "Only".to_string(),
             type_text: "string".to_string(),
@@ -6710,63 +6734,16 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             raw_text_read: false,
             absent_body_tolerated: false,
         }];
-        // A stand-in daemon: hello, init, then the capture answered with
-        // stub_dir "warm", or the connection closed instead.
-        let daemon = |close: bool| {
-            let socket = root.join(format!("d-{close}.sock"));
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-            let thread = std::thread::spawn(move || {
-                let (stream, _) = listener.accept().unwrap();
-                let mut writer = stream.try_clone().unwrap();
-                let mut lines = BufReader::new(stream).lines();
-                while let Some(Ok(line)) = lines.next() {
-                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    let id = request["request_id"].clone();
-                    let answer = match request["action"].as_str() {
-                        Some("hello") => {
-                            serde_json::json!({"request_id": id, "status": "success", "pid": 1})
-                        }
-                        Some("init") => serde_json::json!({"request_id": id, "status": "ready"}),
-                        Some("capture_v2") if close => return,
-                        Some("capture_v2") => {
-                            serde_json::json!({"request_id": id, "status": "success", "result": {
-                            "success": true, "stub_dir": "warm", "package_name": "p",
-                            "fidelity": {"total_aliases": 0, "by_serialization": {}, "by_self_check": {}, "by_anchor_origin": {}, "usable_rate": 1},
-                            "bare_checkout": false, "ts_version": "t"}})
-                        }
-                        _ => return,
-                    };
-                    writeln!(writer, "{answer}").unwrap();
-                }
-            });
-            let sidecar = TypeSidecar::connect_daemon(
-                &script,
-                &socket,
-                "any",
-                crate::services::typed_daemon::HelloMode::Probe,
-            )
-            .unwrap();
-            sidecar.start_init(&root, None);
-            sidecar
-                .wait_ready(std::time::Duration::from_secs(20))
-                .unwrap();
-            (sidecar, thread)
-        };
-
-        let (warm, thread) = daemon(false);
         let answered =
-            capture_in_a_fresh_process(&warm, &root, "fixture", &anchors, None, false).unwrap();
-        assert_eq!(answered.stub_dir, "warm", "the daemon answered the capture");
-        assert!(warm.on_daemon());
-        drop(warm);
-        thread.join().unwrap();
-
-        let (dropped, thread) = daemon(true);
-        let answered =
-            capture_in_a_fresh_process(&dropped, &root, "fixture", &anchors, None, false).unwrap();
-        assert_eq!(answered.stub_dir, "cold", "a process of its own answered");
-        assert!(!dropped.on_daemon());
-        thread.join().unwrap();
+            capture_in_a_fresh_process(&sidecar, &root, "fixture", &anchors, None, false).unwrap();
+        assert_eq!(answered.stub_dir, "cold");
+        assert!(!sidecar.on_daemon(), "the capture left the daemon link");
+        drop(sidecar);
+        let seen = daemon.join().unwrap();
+        assert!(
+            !seen.iter().any(|action| action == "capture_v2"),
+            "the daemon was asked a capture: {seen:?}"
+        );
     }
 
     /// Acceptance is fail-closed: adopt only a clean backfill self-check with
