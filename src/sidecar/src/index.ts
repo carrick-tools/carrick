@@ -19,6 +19,7 @@
 
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
 import { TypeBundler } from './bundler.js';
@@ -51,6 +52,13 @@ import {
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
+import {
+  Connection,
+  DEFAULT_IDLE_MS,
+  EXIT_ALREADY_RUNNING,
+  TypedServer,
+  buildIdOf,
+} from './typed-server.js';
 import type {
   BundleResult,
   RetypeOutcome,
@@ -72,6 +80,7 @@ import type {
   AddProgramFilesResponse,
   PositionRowsResponse,
   ImplementationsResponse,
+  StatusResponse,
   ErrorResponse,
   ServerClaims,
   InferRequestItem,
@@ -80,11 +89,6 @@ import type {
 // ===========================================================================
 // Module-level state
 // ===========================================================================
-
-let projectLoader: ProjectLoader | null = null;
-let initTimeMs: number | null = null;
-/** `requestDigest` of the `init` request this process was last scoped with (carrick#2843). */
-let initDigest = '';
 
 /**
  * The components that read the init'd ts-morph project. Built together with
@@ -103,12 +107,32 @@ interface ProjectComponents {
   labelledMembers: Map<string, LabelledMembers>;
 }
 
+/** One init'd service: its project loader and everything built over it. */
+interface Session {
+  projectLoader: ProjectLoader | null;
+  initTimeMs: number | null;
+  /** `requestDigest` of the `init` request it was scoped with (carrick#2843). */
+  initDigest: string;
+  /**
+   * Components by project key (`ProjectLoader.projectKeyFor`): `''` is the
+   * default project, any other key the program of a project that owns some of
+   * the service's files (carrick#1604).
+   */
+  components: Map<string, ProjectComponents>;
+  /** The roots its `init` named, as `status` reports them. */
+  scope: { repo_root: string; scan_root: string | null } | null;
+}
+
+function newSession(): Session {
+  return { projectLoader: null, initTimeMs: null, initDigest: '', components: new Map(), scope: null };
+}
+
 /**
- * Components by project key (`ProjectLoader.projectKeyFor`): `''` is the
- * default project, any other key the program of a project that owns some of
- * the service's files (carrick#1604).
+ * The service the request being handled reads. Over stdio there is one, and
+ * re-init replaces what it holds. In server mode each connection selects the
+ * held session its `init` names before each of its requests (carrick#2879).
  */
-let components = new Map<string, ProjectComponents>();
+let session: Session = newSession();
 
 /**
  * Reads a capture stub's own declaration tree and nothing of the init'd
@@ -120,10 +144,10 @@ const definitionResolver = new DefinitionResolver();
 
 /** The init'd project loader, or the error every project-backed action gives without one. */
 function initializedLoader(): ProjectLoader {
-  if (!projectLoader?.isInitialized()) {
+  if (!session.projectLoader?.isInitialized()) {
     throw new Error('Sidecar not initialized. Call init first.');
   }
-  return projectLoader;
+  return session.projectLoader;
 }
 
 /**
@@ -149,7 +173,7 @@ function projectComponents(key = ''): ProjectComponents {
   // a re-init drops `components` and points the slot at another service, and
   // nothing built over this project may follow it there.
   const loader = initializedLoader();
-  let built = components.get(key);
+  let built = session.components.get(key);
   if (!built) {
     const project = loader.getProjectFor(key);
     const repoRoot = loader.getRepoRoot();
@@ -185,7 +209,7 @@ function projectComponents(key = ''): ProjectComponents {
       }),
       labelledMembers: new Map(),
     };
-    components.set(key, built);
+    session.components.set(key, built);
   }
   return built;
 }
@@ -218,7 +242,7 @@ function byProject<T>(items: T[], fileOf: (item: T) => string | undefined): Map<
   // An empty request is still answered by the default project, as before.
   const groups = new Map<string, T[]>(items.length === 0 ? [['', []]] : []);
   for (const item of items) {
-    const key = projectLoader?.projectKeyFor(fileOf(item)) ?? '';
+    const key = session.projectLoader?.projectKeyFor(fileOf(item)) ?? '';
     groups.set(key, [...(groups.get(key) ?? []), item]);
   }
   return groups;
@@ -239,9 +263,9 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
 
     // Re-init re-scopes the sidecar to another root: drop everything built
     // over the previous project before resolving the new one.
-    components = new Map();
-    initDigest = requestDigest(request);
-    projectLoader = new ProjectLoader({
+    session.components = new Map();
+    session.initDigest = requestDigest(request);
+    session.projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
       scanRoot: request.scan_root,
@@ -249,7 +273,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
       pinnedDependencies: request.pinned_dependencies,
     });
 
-    const result = projectLoader.load();
+    const result = session.projectLoader.load();
 
     if (!result.success) {
       return {
@@ -264,14 +288,14 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     // that needs them, so readiness costs the same on a bare checkout as on
     // one with its dependencies installed (carrick#749).
 
-    initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
+    session.initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
 
-    log(`Initialization complete in ${initTimeMs}ms`);
+    log(`Initialization complete in ${session.initTimeMs}ms`);
 
     return {
       request_id: request.request_id,
       status: 'ready',
-      init_time_ms: initTimeMs,
+      init_time_ms: session.initTimeMs,
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -392,9 +416,10 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
 async function handleCheckV2Async(
   request: SidecarRequest & { action: 'check_v2' }
 ): Promise<void> {
+  const out = sink;
   let phase = 'assembling';
   const keepalive = setInterval(() => {
-    writeProgress(request.request_id, phase, `check ${phase}`);
+    writeProgress(request.request_id, phase, `check ${phase}`, out);
   }, 1500);
   keepalive.unref();
   try {
@@ -417,16 +442,19 @@ async function handleCheckV2Async(
       result,
       errors: result.errors.length > 0 ? result.errors : undefined,
     };
-    writeResponse(response);
+    writeResponse(response, out);
   } catch (err) {
     clearInterval(keepalive);
     const error = err instanceof Error ? err.message : String(err);
     logError(`check_v2 failed: ${error}`);
-    writeResponse({
-      request_id: request.request_id,
-      status: 'error',
-      errors: [error],
-    });
+    writeResponse(
+      {
+        request_id: request.request_id,
+        status: 'error',
+        errors: [error],
+      },
+      out
+    );
   }
 }
 
@@ -522,7 +550,7 @@ function inferAnswerKey(
   const loader = initializedLoader();
   if (loader.resolvesThroughModuleGraph()) return undefined;
   for (const [key, items] of groups) {
-    if (loader.isBuilt(key) || components.has(key)) return undefined;
+    if (loader.isBuilt(key) || session.components.has(key)) return undefined;
     if (
       request.server_claims &&
       request.server_claims.checks.length > 0 &&
@@ -531,7 +559,7 @@ function inferAnswerKey(
       return undefined;
     }
   }
-  return { dir, repoRoot: loader.getRepoRoot(), init: initDigest, request: requestDigest(request) };
+  return { dir, repoRoot: loader.getRepoRoot(), init: session.initDigest, request: requestDigest(request) };
 }
 
 /**
@@ -717,7 +745,7 @@ function handleVerifyClientSemantics(
 ): VerifyClientSemanticsResponse {
   try {
     const { claimsVerifier } = projectComponents();
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
     const { semantics, modules } = claimsVerifier.run(
       fromDir,
@@ -750,7 +778,7 @@ function handleVerifyLibraryClaims(
     const { claimsVerifier } = projectComponents();
     // The verifier's budget starts now, and so does the scanner's wait.
     writeProgress(request.request_id, 'verify_library_claims', 'program ready');
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
     const { semantics, modules } = claimsVerifier.run(
       fromDir,
@@ -785,7 +813,7 @@ function handleListLibrarySurface(
 ): ListLibrarySurfaceResponse {
   try {
     const { claimsVerifier } = projectComponents();
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Listing the declared surface of ${request.packages.length} specifier(s) from ${fromDir}`);
     const { surfaces, surface_sha256 } = claimsVerifier.listSurface(
       fromDir,
@@ -937,7 +965,7 @@ function handlePositionRows(
   try {
     const loader = initializedLoader();
     // Built over programs the walk releases; nothing may read them after it.
-    components = new Map();
+    session.components = new Map();
     let done = 0;
     const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
       writeProgress(request.request_id, 'positions', `${done} of ${request.files.length}`)
@@ -969,12 +997,12 @@ function handlePositionRows(
  * Handle the 'health' action - report initialization status
  */
 function handleHealth(request: SidecarRequest & { action: 'health' }): HealthResponse {
-  const isReady = projectLoader?.isInitialized() ?? false;
+  const isReady = session.projectLoader?.isInitialized() ?? false;
 
   return {
     request_id: request.request_id,
     status: isReady ? 'ready' : 'not_ready',
-    init_time_ms: initTimeMs ?? undefined,
+    init_time_ms: session.initTimeMs ?? undefined,
   };
 }
 
@@ -1035,6 +1063,14 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleHealth(request);
     case 'shutdown':
       return handleShutdown(request);
+    case 'hello':
+    case 'status':
+    case 'stop':
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: [`${request.action} is answered in server mode only (--serve)`],
+      };
     default:
       // TypeScript should catch this, but just in case
       return {
@@ -1049,12 +1085,25 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
 // Response Writer
 // ===========================================================================
 
+/** Where the frames of the request being handled go. */
+type Sink = (frame: string) => void;
+
+const STDOUT: Sink = (frame) => {
+  process.stdout.write(frame);
+};
+
+/**
+ * The frames of the request being handled: stdout, or in server mode the
+ * connection that sent it. A request that answers later (`check_v2`) keeps the
+ * one it started with.
+ */
+let sink: Sink = STDOUT;
+
 /**
  * Write a JSON response to stdout
  */
-function writeResponse(response: SidecarResponse): void {
-  const json = JSON.stringify(response);
-  process.stdout.write(json + '\n');
+function writeResponse(response: SidecarResponse, out: Sink = sink): void {
+  out(JSON.stringify(response) + '\n');
 }
 
 /**
@@ -1068,10 +1117,8 @@ function writeResponse(response: SidecarResponse): void {
  * drains the pipe on its own thread, so there is room. It is written through
  * the same stream as every answer, so a frame can never land inside one.
  */
-function writeProgress(requestId: string, phase: string, message: string): void {
-  process.stdout.write(
-    JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n'
-  );
+function writeProgress(requestId: string, phase: string, message: string, out: Sink = sink): void {
+  out(JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n');
 }
 
 /**
@@ -1103,12 +1150,13 @@ function logError(message: string): void {
 // ===========================================================================
 
 /**
- * Process a single line of input
+ * The request a line holds, or null when it is empty or invalid (an invalid
+ * one is answered with an error frame through the current sink).
  */
-function processLine(line: string): void {
+function requestOf(line: string): SidecarRequest | null {
   // Skip empty lines
   const trimmed = line.trim();
-  if (!trimmed) return;
+  if (!trimmed) return null;
 
   // Parse JSON
   let json: unknown;
@@ -1117,7 +1165,7 @@ function processLine(line: string): void {
   } catch (err) {
     logError(`Invalid JSON: ${trimmed}`);
     writeErrorResponse('unknown', `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
-    return;
+    return null;
   }
 
   // Validate request
@@ -1128,19 +1176,165 @@ function processLine(line: string): void {
       (json as { request_id?: string })?.request_id || 'unknown',
       parseResult.error
     );
-    return;
+    return null;
   }
+  return parseResult.request;
+}
 
-  // check_v2 runs async (spawned pnpm install + tsc) and writes its own
-  // progress + terminal frames; hand off and return.
-  if (parseResult.request.action === 'check_v2') {
-    void handleCheckV2Async(parseResult.request);
-    return;
+/**
+ * Answer one request through the current sink. `check_v2` runs async
+ * (spawned pnpm install + tsc) and writes its own progress and terminal
+ * frames; the promise settles once it has.
+ */
+function dispatch(request: SidecarRequest): Promise<void> {
+  if (request.action === 'check_v2') return handleCheckV2Async(request);
+  writeResponse(handleRequest(request));
+  return Promise.resolve();
+}
+
+/** Process a single line of stdin. */
+function processLine(line: string): void {
+  const request = requestOf(line);
+  // Over stdio a check runs beside the requests after it, as before.
+  if (request) void dispatch(request);
+}
+
+// ===========================================================================
+// Server mode (carrick#2879)
+// ===========================================================================
+
+/** Sessions a daemon holds, by what their `init` named. */
+const heldSessions = new Map<string, Session>();
+
+/** The key of the service an `init` names: every field that scopes its project. */
+function sessionKey(request: SidecarRequest & { action: 'init' }): string {
+  return JSON.stringify([
+    path.resolve(request.repo_root),
+    request.tsconfig_path ?? null,
+    request.scan_root ?? null,
+    request.tsconfig_snapshot ?? null,
+    request.pinned_dependencies ?? null,
+  ]);
+}
+
+/**
+ * In server mode, `init` selects the held session for its service, or builds
+ * one: a second client of the same service reads the project the first one
+ * built. Over stdio, `init` re-scopes the one session instead.
+ */
+function initHeld(request: SidecarRequest & { action: 'init' }): InitResponse {
+  const key = sessionKey(request);
+  const held = heldSessions.get(key);
+  if (held?.projectLoader?.isInitialized()) {
+    session = held;
+    return { request_id: request.request_id, status: 'ready', init_time_ms: held.initTimeMs ?? undefined };
   }
+  session = newSession();
+  session.scope = { repo_root: path.resolve(request.repo_root), scan_root: request.scan_root ?? null };
+  const response = handleInit(request);
+  if (response.status === 'ready') heldSessions.set(key, session);
+  return response;
+}
 
-  // Handle request
-  const response = handleRequest(parseResult.request);
-  writeResponse(response);
+function statusOf(server: TypedServer, buildId: string, cliVersion: string | null): StatusResponse['daemon'] {
+  const memory = process.memoryUsage();
+  return {
+    pid: process.pid,
+    build_id: buildId,
+    cli_version: cliVersion,
+    socket: server.socketPath,
+    started_at: server.startedAt.toISOString(),
+    uptime_ms: Date.now() - server.startedAt.getTime(),
+    idle_ms: server.idleMs(),
+    services: [...heldSessions.values()].map((held) => ({
+      repo_root: held.scope?.repo_root ?? '',
+      scan_root: held.scope?.scan_root ?? null,
+      built: held.components.size > 0,
+    })),
+    heap_used_mb: Math.round(memory.heapUsed / 1048576),
+    rss_mb: Math.round(memory.rss / 1048576),
+  };
+}
+
+/** Answer one line from a connection, with its frames going back to it. */
+async function serveLine(
+  server: TypedServer,
+  buildId: string,
+  cliVersion: string | null,
+  conn: Connection,
+  line: string
+): Promise<void> {
+  sink = (frame) => conn.write(frame);
+  try {
+    const request = requestOf(line);
+    if (!request) return;
+    if (!conn.greeted) {
+      if (request.action !== 'hello' || request.build_id !== buildId) {
+        const saw = request.action === 'hello' ? `build ${request.build_id}` : `'${request.action}' first`;
+        await conn.flush(
+          JSON.stringify({
+            request_id: request.request_id,
+            status: 'error',
+            errors: [`build_mismatch: this daemon is build ${buildId}; a connection must open with hello naming it, saw ${saw}`],
+          }) + '\n'
+        );
+        conn.close();
+        return;
+      }
+      conn.greeted = true;
+      writeResponse({ request_id: request.request_id, status: 'success', build_id: buildId, pid: process.pid });
+      return;
+    }
+    switch (request.action) {
+      case 'hello':
+        writeResponse({ request_id: request.request_id, status: 'success', build_id: buildId, pid: process.pid });
+        return;
+      case 'status':
+        writeResponse({ request_id: request.request_id, status: 'success', daemon: statusOf(server, buildId, cliVersion) });
+        return;
+      case 'stop':
+        await conn.flush(JSON.stringify({ request_id: request.request_id, status: 'success' }) + '\n');
+        server.stop('stop requested');
+        return;
+      case 'shutdown':
+        // The client is done; the daemon is not.
+        await conn.flush(JSON.stringify({ request_id: request.request_id, status: 'success' }) + '\n');
+        conn.close();
+        return;
+      case 'init':
+        writeResponse(initHeld(request));
+        conn.slot = session;
+        return;
+      default:
+        session = (conn.slot as Session | undefined) ?? newSession();
+        await dispatch(request);
+    }
+  } finally {
+    sink = STDOUT;
+    session = newSession();
+  }
+}
+
+/** `--serve <workspace> [--cli-version <v>]`: run as the workspace's daemon. */
+async function serve(workspace: string, cliVersion: string | null): Promise<void> {
+  const buildId = buildIdOf(DIST_SRC);
+  const idle = Number(process.env.CARRICK_TYPED_IDLE_MS);
+  const server: TypedServer = new TypedServer({
+    workspace: path.resolve(workspace),
+    buildId,
+    cliVersion,
+    idleMs: Number.isFinite(idle) && idle > 0 ? idle : DEFAULT_IDLE_MS,
+    handleLine: (conn, line) => serveLine(server, buildId, cliVersion, conn, line),
+    log,
+  });
+  const outcome = await server.start();
+  if (outcome === 'already_running') {
+    log(`a daemon already serves ${workspace}`);
+    process.exit(EXIT_ALREADY_RUNNING);
+  }
+  const stopOn = (signal: string) => () => server.stop(`${signal} received`);
+  process.on('SIGINT', stopOn('SIGINT'));
+  process.on('SIGTERM', stopOn('SIGTERM'));
 }
 
 /** How often the sidecar looks for the process that started it. */
@@ -1169,10 +1363,31 @@ function exitWhenParentIsGone(): void {
   }, PARENT_CHECK_MS).unref();
 }
 
+/** This build's compiled sources: what its build id hashes. */
+const DIST_SRC = path.dirname(fileURLToPath(import.meta.url));
+
+/** The value after `flag` on the command line, or null. */
+function argValue(flag: string): string | null {
+  const at = process.argv.indexOf(flag);
+  return at === -1 ? null : (process.argv[at + 1] ?? null);
+}
+
 /**
  * Start the message loop
  */
 function main(): void {
+  if (process.argv.includes('--build-id')) {
+    process.stdout.write(buildIdOf(DIST_SRC) + '\n');
+    return;
+  }
+  const workspace = argValue('--serve');
+  if (workspace !== null) {
+    log(`Process started in server mode`);
+    installFatalHandlers();
+    void serve(workspace, argValue('--cli-version'));
+    return;
+  }
+
   log('Process started');
 
   const rl = readline.createInterface({
@@ -1201,6 +1416,10 @@ function main(): void {
     process.exit(0);
   });
 
+  installFatalHandlers();
+}
+
+function installFatalHandlers(): void {
   // Fail fast on uncaught errors. Continuing after one means serving later
   // requests from a possibly corrupted state and returning garbage types
   // with a success status; exiting surfaces as ProcessDied on the Rust side,
