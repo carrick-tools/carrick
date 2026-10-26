@@ -34,9 +34,9 @@ import {
   jsonWireDeclarations,
   KeptJudge,
   runCheck,
+  removeOrphanedJudgeWorkspaces,
   type EmitReach,
 } from './capture/index.js';
-import { removeOrphanedJudgeWorkspaces } from './capture/kept-judge.js';
 import * as os from 'node:os';
 import * as v8 from 'node:v8';
 import { Retyper, type TopTypeWalk } from './retype.js';
