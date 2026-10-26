@@ -390,9 +390,10 @@ fn run_generation(
             // Only the services this checkout resolves to: a hosted service
             // the tree no longer declares is not carried back into it.
             let resolved: Vec<Option<String>> =
-                crate::service_derivation::resolve_with_hosted(repo, Some(&hosted_blobs))
-                    .map(|services| services.into_iter().map(|s| s.service_name).collect())
-                    .unwrap_or_default();
+                crate::service_derivation::resolve_with_hosted(repo, Some(&hosted_blobs))?
+                    .into_iter()
+                    .map(|service| service.service_name)
+                    .collect();
             written.extend(
                 carried
                     .into_iter()
