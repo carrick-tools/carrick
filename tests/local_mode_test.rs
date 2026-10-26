@@ -108,6 +108,10 @@ fn run(workspace: &Path, args: &[&str]) -> String {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     assert!(
@@ -129,6 +133,10 @@ fn run_mocked(workspace: &Path, args: &[&str]) -> String {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
@@ -150,6 +158,10 @@ fn run_mocked_output(workspace: &Path, args: &[&str]) -> (String, String) {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
@@ -184,7 +196,11 @@ fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String
         .args(args)
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
-        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off");
     for (key, value) in env {
         command.env(key, value);
     }
@@ -2605,6 +2621,10 @@ fn check_changed(workspace: &Path, json: bool) -> (Option<i32>, String) {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
@@ -2622,6 +2642,10 @@ fn check_changed_all(workspace: &Path) -> (Option<i32>, String) {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .output()
         .unwrap_or_else(|e| panic!("carrick check --changed --all: {e}"));
@@ -2640,6 +2664,10 @@ fn check_files(workspace: &Path, files: &[&str]) -> (Option<i32>, String) {
         .current_dir(workspace)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        // No resident type daemon: these tests are about the answer, and a
+        // re-check would otherwise start one in the background
+        // (`typed_daemon_test.rs` covers it).
+        .env("CARRICK_TYPED", "off")
         .env("CARRICK_CHECK_BUDGET_MS", "600000")
         .output()
         .unwrap_or_else(|e| panic!("carrick check {files:?}: {e}"));

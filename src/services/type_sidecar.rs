@@ -1383,6 +1383,13 @@ enum SidecarRequest {
     },
     #[serde(rename = "shutdown")]
     Shutdown { request_id: String },
+    /// The first frame on a connection to the resident type daemon: the
+    /// build id of the sidecar this would otherwise have spawned (carrick#2884).
+    #[serde(rename = "hello")]
+    Hello {
+        request_id: String,
+        build_id: String,
+    },
 }
 
 impl SidecarRequest {
@@ -1392,7 +1399,8 @@ impl SidecarRequest {
         match self {
             SidecarRequest::Init { .. }
             | SidecarRequest::ListProgramFiles { .. }
-            | SidecarRequest::Shutdown { .. } => 0,
+            | SidecarRequest::Shutdown { .. }
+            | SidecarRequest::Hello { .. } => 0,
             SidecarRequest::AddProgramFiles { files, .. }
             | SidecarRequest::PositionRows { files, .. } => files.len(),
             SidecarRequest::Bundle { symbols, .. } => symbols.len(),
@@ -2185,6 +2193,68 @@ fn max_old_space_arg() -> Option<String> {
     heap_cap_mb().map(|mb| format!("--max-old-space-size={}", mb))
 }
 
+/// The sidecar's entry script, found in the known locations: the scan that
+/// spawns it and the `check` that starts the resident type daemon from it
+/// (carrick#2884) must find the same one, or their build ids differ.
+pub fn discover_sidecar_path() -> Option<PathBuf> {
+    // The sidecar entry point after building (TypeScript compiles to dist/src/)
+    let sidecar_entry = "dist/src/index.js";
+
+    // List of locations to check, in order of priority
+    let mut candidates: Vec<PathBuf> = vec![];
+
+    // 0. Told where it is. The npm package (carrick#710) is the case that
+    //    needs this: the binary ships in a per-platform package and the
+    //    sidecar ships in the main one, beside the `node_modules/` its
+    //    dependencies resolve through, so nothing relative to the executable
+    //    can reach it.
+    if let Ok(configured) = std::env::var("CARRICK_SIDECAR_DIR")
+        && !configured.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(configured));
+    }
+
+    candidates.extend([
+        // 1. Relative to executable (for packaged distribution)
+        executable_relative_path("sidecar"),
+        executable_relative_path("../sidecar"),
+        executable_relative_path("../lib/sidecar"),
+    ]);
+
+    // 2. For development builds, use CARGO_MANIFEST_DIR (set at compile time)
+    //    This ensures we find the sidecar regardless of the current working directory
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        candidates.push(PathBuf::from(manifest_dir).join("src/sidecar"));
+    }
+
+    // 3. Fallback to relative paths (in case running from project root)
+    candidates.extend([
+        PathBuf::from("src/sidecar"),
+        PathBuf::from("./src/sidecar"),
+        PathBuf::from("sidecar"),
+    ]);
+
+    for candidate in candidates {
+        let full_path = candidate.join(sidecar_entry);
+        if full_path.exists() {
+            debug!("Checking sidecar candidate: {:?}", full_path);
+            return Some(full_path);
+        }
+    }
+
+    None
+}
+
+/// A path relative to the executable's directory.
+fn executable_relative_path(relative: &str) -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        return exe_dir.join(relative);
+    }
+    PathBuf::from(relative)
+}
+
 // ============================================================================
 // The sidecar process
 // ============================================================================
@@ -2267,33 +2337,7 @@ impl SidecarProcess {
         // the death. Passed on, it parsed as a broken answer, and a sidecar
         // that ran out of heap mid-answer was recorded as a deserialization
         // error at the byte the pipe happened to hold (carrick#1916).
-        let (tx, responses) = channel::<String>();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) if line.ends_with('\n') => {
-                        if tx.send(line.trim_end().to_owned()).is_err() {
-                            break; // client gone
-                        }
-                    }
-                    Ok(cut_off) => {
-                        debug!(
-                            "[type_sidecar] stdout ended {} bytes into an unfinished frame",
-                            cut_off
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        debug!("[type_sidecar] stdout read ended: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
+        let responses = frames_of(stdout);
 
         // Pipe sidecar stderr through tracing on a background thread, keeping
         // whether V8 said its heap ran out: the abort that follows does not
@@ -2326,6 +2370,58 @@ impl SidecarProcess {
                 oom_kills_at_spawn: cgroup_oom_kills(),
             },
         })
+    }
+}
+
+/// Read `source` on a thread of its own, one whole line per frame, into a
+/// channel: a sidecar process's stdout, or the resident daemon's socket
+/// (carrick#2884). The channel disconnects when the source ends, which is how
+/// the other end going away surfaces (see [`SidecarProcess::spawn`]).
+fn frames_of(source: impl std::io::Read + Send + 'static) -> Receiver<String> {
+    let (tx, responses) = channel::<String>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(source);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line.ends_with('\n') => {
+                    if tx.send(line.trim_end().to_owned()).is_err() {
+                        break; // client gone
+                    }
+                }
+                Ok(cut_off) => {
+                    debug!(
+                        "[type_sidecar] the sidecar's output ended {} bytes into an unfinished frame",
+                        cut_off
+                    );
+                    break;
+                }
+                Err(e) => {
+                    debug!("[type_sidecar] the sidecar's output ended: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    responses
+}
+
+/// The connection to the resident type daemon a [`TypeSidecar`] answers
+/// through instead of a process of its own (carrick#2884).
+struct DaemonLink {
+    #[cfg(unix)]
+    stream: std::os::unix::net::UnixStream,
+    /// The daemon's process id, from its answer to `hello`.
+    pid: u32,
+}
+
+impl DaemonLink {
+    /// End this connection, and only it: the daemon serves others.
+    fn close(&self) {
+        #[cfg(unix)]
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -2415,10 +2511,19 @@ pub struct TypeSidecar {
     /// operation's deadline can be replaced by a fresh one (carrick#1914).
     sidecar_path: PathBuf,
     /// Child process handle. Behind a mutex because a timeout kills it, and
-    /// an operation's timeout replaces it, from a `&self` method.
-    child: Mutex<Child>,
-    /// Stdin for sending requests (wrapped in mutex for thread safety)
-    stdin: Mutex<ChildStdin>,
+    /// an operation's timeout replaces it, from a `&self` method. `None`
+    /// while this answers through the resident daemon ([`Self::daemon`]).
+    child: Mutex<Option<Child>>,
+    /// Where requests are written: the child's stdin, or the daemon's socket.
+    stdin: Mutex<Box<dyn Write + Send>>,
+    /// The resident type daemon's connection, while this answers through it
+    /// (carrick#2884). Any [`Self::restart`] leaves it for a process of its
+    /// own, so a capture, a missed deadline and a daemon that went away all
+    /// end on the cold path a scan without a daemon takes.
+    daemon: Mutex<Option<DaemonLink>>,
+    /// The last request written to the daemon, sent again to a process of
+    /// this sidecar's own when the daemon goes away before answering it.
+    sent_to_daemon: Mutex<Option<String>>,
     /// Lines the sidecar wrote to stdout, in order, delivered by the reader
     /// thread spawned in [`TypeSidecar::spawn`]. Reading through a channel
     /// rather than blocking on `read_line` is what makes every timeout in
@@ -2494,9 +2599,72 @@ pub struct SidecarRecipe {
     sidecar_path: PathBuf,
     operation_timeout: Duration,
     scan_root: Option<PathBuf>,
+    /// The resident type daemon this run was handed by the `check` that
+    /// started it, with the build id of this recipe's sidecar
+    /// (carrick#2884). Only [`Self::spawn_scoped`] reads it: a pool's or a
+    /// walk's processes stay processes of their own.
+    daemon: Option<(crate::services::typed_daemon::Use, String)>,
 }
 
 impl SidecarRecipe {
+    /// This recipe, answering each service through the resident type daemon
+    /// `daemon` names when it routes that service there. Nothing changes when
+    /// `daemon` is `None` or this sidecar's build id cannot be read.
+    pub fn with_daemon(mut self, daemon: Option<crate::services::typed_daemon::Use>) -> Self {
+        self.daemon = daemon.and_then(|daemon| {
+            match crate::services::typed_daemon::build_id(&self.sidecar_path) {
+                Ok(id) => Some((daemon, id)),
+                Err(e) => {
+                    debug!("[type_sidecar] No build id for the type daemon: {e}");
+                    None
+                }
+            }
+        });
+        self
+    }
+
+    /// The daemon's connection for the service at `repo_root`, initialised
+    /// and ready, or `None` when this run has no daemon, the daemon holds no
+    /// built program for the service, or it did not take the service: the
+    /// caller then starts a process of its own, as with no daemon.
+    fn through_daemon(&self, repo_root: &Path, tsconfig_path: Option<&str>) -> Option<TypeSidecar> {
+        let (daemon, build_id) = self.daemon.as_ref()?;
+        if !daemon.routes(repo_root) {
+            daemon.note_miss(repo_root);
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let connected =
+                TypeSidecar::connect_daemon(&self.sidecar_path, daemon.socket(), build_id)
+                    .and_then(|sidecar| {
+                        let sidecar = sidecar.with_operation_timeout(self.operation_timeout);
+                        if let Some(scan_root) = &self.scan_root {
+                            sidecar.set_scan_root(scan_root);
+                        }
+                        sidecar.start_init(repo_root, tsconfig_path);
+                        sidecar.wait_ready(ready_budget())?;
+                        Ok(sidecar)
+                    });
+            match connected {
+                Ok(sidecar) => Some(sidecar),
+                Err(e) => {
+                    debug!(
+                        "[type_sidecar] The type daemon did not take {}: {e}; starting a process of its own",
+                        repo_root.display()
+                    );
+                    daemon.note_miss(repo_root);
+                    None
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (build_id, tsconfig_path);
+            None
+        }
+    }
+
     /// A process from this recipe, initialised to `repo_root` and ready. Its
     /// program is built by its first request.
     pub fn spawn_scoped(
@@ -2504,6 +2672,9 @@ impl SidecarRecipe {
         repo_root: &Path,
         tsconfig_path: Option<&str>,
     ) -> Result<TypeSidecar, SidecarError> {
+        if let Some(sidecar) = self.through_daemon(repo_root, tsconfig_path) {
+            return Ok(sidecar);
+        }
         self.spawn_ready(repo_root, tsconfig_path, false)
     }
 
@@ -2564,10 +2735,98 @@ impl TypeSidecar {
             spawn_time.elapsed()
         );
 
-        Ok(Self {
+        Ok(Self::over(
+            sidecar_path,
+            Some(child),
+            Box::new(stdin),
+            None,
+            responses,
+            evidence,
+            spawn_time,
+        ))
+    }
+
+    /// A sidecar answering through the resident type daemon at `socket`
+    /// rather than a process of its own (carrick#2884), once the daemon has
+    /// answered `hello` with `build_id`: the build of the sidecar at
+    /// `sidecar_path`, which is the one this would otherwise have spawned. A
+    /// daemon of any other build refuses the connection, so a stale build
+    /// never answers.
+    ///
+    /// The requests and answers are the ones a process of its own exchanges,
+    /// frame for frame. What differs is what happens when the other end goes
+    /// away: see [`Self::restart`] and [`Self::fall_back_cold`].
+    #[cfg(unix)]
+    pub fn connect_daemon(
+        sidecar_path: &Path,
+        socket: &Path,
+        build_id: &str,
+    ) -> Result<Self, SidecarError> {
+        let spawn_time = Instant::now();
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .map_err(|e| SidecarError::SpawnFailed(format!("the type daemon: {e}")))?;
+        let reader = stream
+            .try_clone()
+            .map_err(|e| SidecarError::SpawnFailed(format!("the type daemon: {e}")))?;
+        let writer = stream
+            .try_clone()
+            .map_err(|e| SidecarError::SpawnFailed(format!("the type daemon: {e}")))?;
+        let sidecar = Self::over(
+            sidecar_path,
+            None,
+            Box::new(writer),
+            Some(DaemonLink { stream, pid: 0 }),
+            frames_of(reader),
+            DeathEvidence {
+                stderr: Arc::new(StderrEvidence::default()),
+                oom_kills_at_spawn: None,
+            },
+            spawn_time,
+        );
+        let request_id = sidecar.next_request_id();
+        sidecar.send_request(&SidecarRequest::Hello {
+            request_id: request_id.clone(),
+            build_id: build_id.to_string(),
+        })?;
+        // The daemon answers every connection in one queue, so `hello` waits
+        // behind whatever it is answering for another: the readiness budget,
+        // as an `init` would have.
+        let answer = sidecar.read_result_value(&request_id, ready_budget())?;
+        if answer.get("status").and_then(|s| s.as_str()) != Some("success") {
+            let errors = answer
+                .get("errors")
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            return Err(SidecarError::InitFailed(format!(
+                "the type daemon refused the connection: {errors}"
+            )));
+        }
+        let pid = answer.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+        if let Some(link) = sidecar.daemon.lock().unwrap().as_mut() {
+            link.pid = pid;
+        }
+        debug!(
+            "[type_sidecar] Connected to the type daemon (pid {pid}) in {:?}",
+            spawn_time.elapsed()
+        );
+        Ok(sidecar)
+    }
+
+    fn over(
+        sidecar_path: &Path,
+        child: Option<Child>,
+        stdin: Box<dyn Write + Send>,
+        daemon: Option<DaemonLink>,
+        responses: Receiver<String>,
+        evidence: DeathEvidence,
+        spawn_time: Instant,
+    ) -> Self {
+        Self {
             sidecar_path: sidecar_path.to_path_buf(),
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
+            daemon: Mutex::new(daemon),
+            sent_to_daemon: Mutex::new(None),
             responses: Mutex::new(responses),
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
             spawn_time,
@@ -2581,7 +2840,12 @@ impl TypeSidecar {
             death_noted: AtomicBool::new(false),
             replaced_peak: AtomicU64::new(0),
             record_only: false,
-        })
+        }
+    }
+
+    /// Whether this answers through the resident type daemon now.
+    pub fn on_daemon(&self) -> bool {
+        self.daemon.lock().unwrap().is_some()
     }
 
     /// How far the last request got, by its own account: its most recent
@@ -2603,7 +2867,10 @@ impl TypeSidecar {
     /// the process is reaped, so this waits for it, briefly: a process that
     /// closed its stdout and lives on is not waited for.
     pub fn how_the_process_ended(&self) -> Option<ProcessEnd> {
-        let mut child = self.child.lock().ok()?;
+        let mut guard = self.child.lock().ok()?;
+        // Through the daemon there is no process of this sidecar's own to
+        // have ended.
+        let child = guard.as_mut()?;
         let waited = Instant::now();
         loop {
             match child.try_wait() {
@@ -2702,9 +2969,17 @@ impl TypeSidecar {
         self
     }
 
-    /// The id of the process answering requests now (a restart replaces it).
+    /// The id of the process answering requests now (a restart replaces it):
+    /// the resident daemon's while this answers through it.
     pub fn pid(&self) -> u32 {
-        self.child.lock().unwrap().id()
+        if let Some(child) = self.child.lock().unwrap().as_ref() {
+            return child.id();
+        }
+        self.daemon
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |link| link.pid)
     }
 
     /// Another process from the same sidecar script, with this one's
@@ -2726,6 +3001,7 @@ impl TypeSidecar {
             sidecar_path: self.sidecar_path.clone(),
             operation_timeout: self.operation_timeout,
             scan_root: self.scan_root.lock().unwrap().clone(),
+            daemon: None,
         }
     }
 
@@ -2934,8 +3210,15 @@ impl TypeSidecar {
         self.kill();
     }
 
+    /// Through the daemon, only this sidecar's connection is closed: the
+    /// daemon serves other clients and keeps what it holds.
     fn kill(&self) {
-        if let Ok(mut child) = self.child.lock() {
+        if let Some(link) = self.daemon.lock().unwrap().take() {
+            link.close();
+        }
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(child) = guard.as_mut()
+        {
             if let Some(peak) = crate::services::machine::peak_resident_bytes(child.id()) {
                 self.replaced_peak.fetch_max(peak, Ordering::Relaxed);
             }
@@ -2997,8 +3280,8 @@ impl TypeSidecar {
             Ok(process) => process,
             Err(e) => return failed(e.to_string()),
         };
-        *self.child.lock().unwrap() = process.child;
-        *self.stdin.lock().unwrap() = process.stdin;
+        *self.child.lock().unwrap() = Some(process.child);
+        *self.stdin.lock().unwrap() = Box::new(process.stdin);
         *self.responses.lock().unwrap() = process.responses;
         *self.evidence.lock().unwrap() = process.evidence;
         self.death_noted.store(false, Ordering::SeqCst);
@@ -3774,12 +4057,55 @@ impl TypeSidecar {
             .map_err(|e| SidecarError::SerializationError(e.to_string()))?;
         self.in_flight_items
             .store(request.item_count(), Ordering::Relaxed);
+        if self.on_daemon() {
+            *self.sent_to_daemon.lock().unwrap() = Some(json.clone());
+        }
 
+        match self.write_line(&json) {
+            Ok(()) => Ok(()),
+            // The daemon went away: the request goes to a process of this
+            // sidecar's own instead, as it would have with no daemon.
+            Err(e) if self.answers_cold_after(&e) => self.fall_back_cold(),
+            Err(e) => {
+                // A write fails when the process at the other end is gone.
+                self.note_death();
+                Err(SidecarError::IoError(e.to_string()))
+            }
+        }
+    }
+
+    fn write_line(&self, json: &str) -> std::io::Result<()> {
         let mut stdin = self.stdin.lock().unwrap();
-        let written = writeln!(stdin, "{}", json).and_then(|()| stdin.flush());
-        drop(stdin);
-        written.map_err(|e| {
-            // A write fails when the process at the other end is gone.
+        writeln!(stdin, "{}", json).and_then(|()| stdin.flush())
+    }
+
+    /// Whether the daemon this answers through has gone away in the middle of
+    /// an operation, which then goes to a process of this sidecar's own
+    /// ([`Self::fall_back_cold`]). Not while it gets ready: a daemon that
+    /// cannot take a service's `init` is left for a process of its own by
+    /// the caller ([`SidecarRecipe::spawn_scoped`]).
+    fn answers_cold_after(&self, why: &dyn std::fmt::Display) -> bool {
+        if !self.on_daemon() || *self.state.lock().unwrap() != SidecarState::Ready {
+            return false;
+        }
+        // The log's: what went away is ours, and nothing the scanned code said.
+        debug!(
+            "[type_sidecar] The type daemon went away mid-request ({why}); answering it in a process of this sidecar's own"
+        );
+        true
+    }
+
+    /// Leave the daemon for a process of this sidecar's own, scoped as the
+    /// connection was ([`Self::restart`]), and send it the request the daemon
+    /// did not answer. The caller's read then waits on the new process, so the
+    /// answer is the one a scan with no daemon would have read.
+    fn fall_back_cold(&self) -> Result<(), SidecarError> {
+        let unanswered = self.sent_to_daemon.lock().unwrap().take();
+        self.restart("the type daemon went away")?;
+        let Some(json) = unanswered else {
+            return Ok(());
+        };
+        self.write_line(&json).map_err(|e| {
             self.note_death();
             SidecarError::IoError(e.to_string())
         })
@@ -3846,7 +4172,6 @@ impl TypeSidecar {
         timeout: Duration,
         mut terminal: impl FnMut(&str) -> Result<Option<T>, SidecarError>,
     ) -> Result<T, SidecarError> {
-        let responses = self.responses.lock().unwrap();
         let mut last_sign_of_life = Instant::now();
         let mut last_logged: Option<Instant> = None;
         *self.last_progress.lock().unwrap() = None;
@@ -3857,11 +4182,28 @@ impl TypeSidecar {
                 return Err(SidecarError::Timeout);
             }
             crate::shutdown::check().map_err(SidecarError::Interrupted)?;
-            let line = match responses.recv_timeout(remaining.min(INTERRUPT_CHECK)) {
+            // Locked for one slice at a time: a daemon that went away is
+            // replaced, channel and all, from inside this wait.
+            let received = self
+                .responses
+                .lock()
+                .unwrap()
+                .recv_timeout(remaining.min(INTERRUPT_CHECK));
+            let line = match received {
                 Ok(line) => line,
                 // The slice ran out, not the deadline: back round to the
                 // checks, where the deadline itself is read.
                 Err(RecvTimeoutError::Timeout) => continue,
+                // The daemon closed this connection before answering: the
+                // request goes to a process of this sidecar's own, and the
+                // wait goes on for its answer.
+                Err(RecvTimeoutError::Disconnected)
+                    if self.answers_cold_after(&"its connection closed") =>
+                {
+                    self.fall_back_cold()?;
+                    last_sign_of_life = Instant::now();
+                    continue;
+                }
                 // stdout hit EOF: the process is gone.
                 Err(RecvTimeoutError::Disconnected) => {
                     self.note_death();
@@ -4402,8 +4744,15 @@ impl Drop for TypeSidecar {
     fn drop(&mut self) {
         debug!("[type_sidecar] Shutting down sidecar");
 
-        // Try graceful shutdown first
+        // Try graceful shutdown first. Through the daemon, `shutdown` ends
+        // only this connection (carrick#2879), which is all that is ours.
         let _ = self.shutdown();
+        if let Ok(daemon) = self.daemon.get_mut()
+            && let Some(link) = daemon.take()
+        {
+            link.close();
+            return;
+        }
 
         // Give it a moment to exit
         thread::sleep(Duration::from_millis(100));
@@ -4411,7 +4760,7 @@ impl Drop for TypeSidecar {
         // Force kill if still running, and reap it: a scan starts a sidecar
         // per service, and each one left unreaped would stay in the process
         // table until the scan ends (carrick#1066).
-        if let Ok(child) = self.child.get_mut() {
+        if let Ok(Some(child)) = self.child.get_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
