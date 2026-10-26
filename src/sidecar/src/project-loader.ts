@@ -580,6 +580,23 @@ export class ProjectLoader {
   }
 
   /**
+   * Every project this loader has built and holds: the default one and each
+   * owning project's (carrick#2880).
+   */
+  builtProjects(): Project[] {
+    return [...(this.project ? [this.project] : []), ...this.ownerProjects.values()];
+  }
+
+  /**
+   * Whether every project this loader builds comes from a tsconfig whose file
+   * list can be read again from disk: not a snapshot, a Deno graph, or the
+   * default source patterns of a service with no config (carrick#2880).
+   */
+  buildsFromTsconfigs(): boolean {
+    return this.namedTsconfigPath !== undefined && !this.inferredService;
+  }
+
+  /**
    * The default project when a request has built it, and `undefined` before
    * that, without building it (carrick#2027).
    */
