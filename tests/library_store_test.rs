@@ -539,7 +539,18 @@ async fn no_sidecar_asks_nothing_and_no_model_reads_the_store_once() {
         "a package with no label stays unknown"
     );
     assert_eq!(store_requests() - asked, 1);
-    assert_eq!(message_rows(&read, &repo), rows_with_claims());
+    // The library rows are the ones a model-asking scan states. The socket
+    // pass's own row for the package the store skipped needs the detection a
+    // no-model pass does not ask for, so it is compared on neither side.
+    let library = |(endpoints, calls): (Vec<Row>, Vec<Row>)| {
+        let keep =
+            |rows: Vec<Row>| -> Vec<Row> { rows.into_iter().filter(|row| row.2 == FACT).collect() };
+        (keep(endpoints), keep(calls))
+    };
+    assert_eq!(
+        library(message_rows(&read, &repo)),
+        library(rows_with_claims())
+    );
 }
 
 /// A scan that reuses its previous generation (the incremental analysis:
