@@ -104,7 +104,9 @@ export function makeUser(): UserDto {
 
 const SERVICE: Record<string, string> = {
   'tsconfig.json': JSON.stringify({
-    compilerOptions: { target: 'es2020', module: 'commonjs', strict: true, skipLibCheck: true, types: [] },
+    // rootDir with a symlinked workspace package outside it raises TS6059,
+    // which used to taint a first-batch reading only (carrick#2898).
+    compilerOptions: { target: 'es2020', module: 'commonjs', strict: true, skipLibCheck: true, rootDir: 'src', types: [] },
     include: ['src/**/*.ts'],
   }),
   'package.json': JSON.stringify({ name: 'svc', private: true }),
