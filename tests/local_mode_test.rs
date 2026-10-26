@@ -3311,8 +3311,17 @@ fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
         "the re-scan failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_str(&std::fs::read_to_string(out.join("items-api.json")).expect("blob"))
-        .expect("the re-scan blob is JSON")
+    let written = out.join("items-api.json");
+    let text = std::fs::read_to_string(&written).unwrap_or_else(|e| {
+        let held: Vec<_> = std::fs::read_dir(&out)
+            .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
+            .unwrap_or_default();
+        panic!(
+            "no blob at {}: {e}; the scan dir holds {held:?}",
+            written.display()
+        )
+    });
+    serde_json::from_str(&text).expect("the re-scan blob is JSON")
 }
 
 /// The paths of the producer's endpoint rows in a blob, as `path@line`.
@@ -3403,7 +3412,7 @@ fn an_edited_handler_keeps_its_route_and_is_re_judged() {
     assert_eq!(problem["source"], "fact", "{changed:#}");
     assert_eq!(problem["fails"], true, "{changed:#}");
 
-    let blob = no_model_rescan(root, true);
+    let blob = no_model_rescan(root, false);
     assert_eq!(
         blob["boundary"]["model_rows_carried"], 3,
         "{:?}",
@@ -3430,7 +3439,7 @@ fn a_changed_registration_line_is_not_carried_and_is_counted() {
         "'/items/:id/state'",
     );
 
-    let blob = no_model_rescan(root, true);
+    let blob = no_model_rescan(root, false);
     assert_eq!(
         blob["boundary"]["model_rows_carried"], 2,
         "{:?}",
@@ -3464,7 +3473,7 @@ fn a_named_handler_whose_body_changed_is_not_carried() {
         "return [{ id: '1', isConnected: true }];",
     );
 
-    let blob = no_model_rescan(root, true);
+    let blob = no_model_rescan(root, false);
     assert_eq!(
         blob["boundary"]["model_rows_carried"], 2,
         "{:?}",
@@ -3508,7 +3517,7 @@ fn an_edited_file_keeps_no_carried_answer_in_the_blob() {
     );
     rename_connected(root);
 
-    let blob = no_model_rescan(root, true);
+    let blob = no_model_rescan(root, false);
     assert_eq!(
         blob["boundary"]["model_rows_carried"], 3,
         "{:?}",
