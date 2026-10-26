@@ -256,6 +256,8 @@ export type StatusHosted = {
   source?: string | null;
   /** The GitHub login that uploaded it, when the row records one. */
   uploaded_by?: string | null;
+  /** `cloud` when Carrick's hosted scan wrote the row; absent otherwise. */
+  origin?: string | null;
 };
 
 /**

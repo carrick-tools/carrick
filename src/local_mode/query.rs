@@ -1059,6 +1059,7 @@ mod hosted_change_tests {
             project: "payments".to_string(),
             source: source.map(str::to_string),
             uploaded_by: uploaded_by.map(str::to_string),
+            origin: None,
             dirty,
         }
     }
@@ -1146,6 +1147,36 @@ mod hosted_change_tests {
             today
         );
         assert_eq!(note_for(hosted_row(None, None, None)), today);
+    }
+
+    /// The hosted scan writes `source: "ci"` plus `origin: "cloud"` at a commit
+    /// it cloned from GitHub, so the CI sentences stay true and unchanged
+    /// (carrick#2214).
+    #[test]
+    fn a_cloud_origin_row_renders_the_ci_sentences_byte_for_byte() {
+        let cloud = |mut row: super::super::hosted::HostedProvenance| {
+            row.origin = Some("cloud".to_string());
+            row
+        };
+        let ci = hosted_row(Some("ci"), None, Some(false));
+        assert_eq!(note_for(cloud(ci.clone())), note_for(ci.clone()));
+        let missing = |hosted| {
+            enrichment_note(
+                &super::super::hosted::ServiceEnrichment {
+                    hosted: Some(hosted),
+                    hosted_state: super::super::hosted::HostedState::CommitMissing,
+                    remote: Some("example/api".to_string()),
+                    failure: None,
+                    allowance_sentence: None,
+                    hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+                    classified_here: false,
+                    write_refused_as_current: false,
+                },
+                None,
+                "orders",
+            )
+        };
+        assert_eq!(missing(cloud(ci.clone())), missing(ci));
     }
 
     /// A commit this clone does not have is recovered by a fetch and then a

@@ -46,6 +46,10 @@ struct HostedService {
     /// The GitHub login of whoever uploaded it. Never the user id.
     #[serde(default)]
     uploaded_by: Option<String>,
+    /// `cloud` when Carrick's hosted scan wrote the row; absent on every other
+    /// row. `source` stays the rank class (`ci` covers both).
+    #[serde(default)]
+    origin: Option<String>,
     /// The tree that produced it did not match its commit. A claim the
     /// surfaces display and nothing ranks on.
     #[serde(default)]
@@ -98,7 +102,7 @@ impl Resolution {
                         // the pre-field row and must read as "nothing to say",
                         // never as a parse failure that would cost the whole
                         // response. Present, they must be the right type.
-                        if ["source", "uploaded_by"].iter().any(|key| {
+                        if ["source", "uploaded_by", "origin"].iter().any(|key| {
                             service
                                 .get(key)
                                 .is_some_and(|v| !(v.is_null() || v.is_string()))
@@ -162,6 +166,9 @@ pub struct HostedProvenance {
     /// The GitHub login that uploaded it, when the row records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded_by: Option<String>,
+    /// `cloud` when Carrick's hosted scan wrote the row. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// The tree that produced it carried uncommitted changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
@@ -1033,6 +1040,7 @@ impl HostedInput {
             project: repo.project_slug.clone().unwrap_or_default(),
             source: row.and_then(|service| service.source.clone()),
             uploaded_by: row.and_then(|service| service.uploaded_by.clone()),
+            origin: row.and_then(|service| service.origin.clone()),
             dirty: row.and_then(|service| service.dirty),
         });
         result.hosted_state = if previous.cache_version != Some(crate::engine::CACHE_VERSION) {
@@ -1139,6 +1147,7 @@ impl HostedInput {
                 // process did: a laptop scan, by whoever this credential is.
                 source: Some("laptop".to_string()),
                 uploaded_by: None,
+                origin: None,
                 dirty: blob.dirty,
             }),
             hosted_state: HostedState::Enriched,
@@ -2590,6 +2599,65 @@ mod tests {
             "{note}"
         );
         assert!(!note.contains("retained"), "{note}");
+    }
+
+    /// `origin` rides the service row onto the hosted provenance (carrick#2214).
+    /// Absent and null both read as "nothing to say", and neither leaves a key
+    /// on the serialised `carrick.check/0` contract.
+    #[test]
+    fn origin_is_copied_from_the_row_and_absent_or_null_leaves_no_key() {
+        let hosted_for = |extra: serde_json::Value| {
+            let mut service = json!({
+                "service": "api", "hash": "abcdef", "updated_at": null,
+                "scanner_version": env!("CARGO_PKG_VERSION"), "source": "ci"
+            });
+            if let (Some(map), Some(extra)) = (service.as_object_mut(), extra.as_object()) {
+                map.extend(extra.clone());
+            }
+            let mut metadata = resolution();
+            metadata["repos"][0]["services"] = json!([service]);
+            let input = HostedInput {
+                snapshot: Some(Snapshot {
+                    identity: "test".into(),
+                    checked_at: "now".into(),
+                    resolution: Resolution::parse(metadata).unwrap(),
+                    projects: BTreeMap::from([(
+                        "p".into(),
+                        vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
+                    )]),
+                    stored_rows: BTreeMap::new(),
+                }),
+                failure: None,
+                remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+                unnamed: BTreeMap::new(),
+                downloads: None,
+            };
+            input
+                .uploaded(Path::new("/w/api"), &blob())
+                .hosted
+                .expect("the served row")
+        };
+        let cloud = hosted_for(json!({"origin": "cloud"}));
+        assert_eq!(cloud.origin.as_deref(), Some("cloud"));
+        assert_eq!(cloud.source.as_deref(), Some("ci"));
+        for row in [hosted_for(json!({})), hosted_for(json!({"origin": null}))] {
+            assert_eq!(row.origin, None);
+            let wire = serde_json::to_value(&row).unwrap();
+            assert!(wire.get("origin").is_none(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_typed_origin_fails_the_provenance_check_as_source_does() {
+        for (key, value) in [("origin", json!(3)), ("source", json!(3))] {
+            let mut metadata = resolution();
+            metadata["repos"][0]["services"] = json!([{
+                "service": "api", "hash": null, "updated_at": null,
+                "scanner_version": null, key: value
+            }]);
+            let err = Resolution::parse(metadata).unwrap_err();
+            assert!(err.contains("provenance"), "{key}: {err}");
+        }
     }
 
     /// A clean generation whose scan asked the analyzer about no file stores
