@@ -59,6 +59,19 @@
           "type": "string",
           "description": "Scanner release that wrote the index."
         },
+        "summary": {
+          "type": "object",
+          "description": "What `carrick check` looked at. Absent on `touch`.",
+          "properties": {
+            "files": { "type": "integer" },
+            "services": { "type": "integer" },
+            "calls": { "type": "integer" },
+            "routes": { "type": "integer" },
+            "compared_with": { "type": "integer" },
+            "breaks": { "type": "integer" }
+          },
+          "additionalProperties": true
+        },
         "changed_since_index": {
           "type": "integer",
           "minimum": 0,

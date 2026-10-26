@@ -507,16 +507,26 @@ blobs and every blob the index already holds — the same two phases as
 never reported, even when their service is re-extracted, except a call the index matched
 that now reaches no route (the work removed or moved its route).
 
-Human output is one summary line, then one line per problem:
+Human output is one summary line, one line saying what was checked, then one
+line per problem:
 
 ```
 carrick check: checked 1 route and 2 calls in 2 changed files against 2 services: 1 incompatible, 1 reaches no route
+Checked 2 changed files in 2 services: 2 calls and 1 route against 2 services' contracts. 2 breaks (listed below).
 catalog-web/app/routes/api.v1.widgets.$widgetId.ts:10  incompatible  route GET /api/v1/widgets/:widgetId with inventory-svc src/client.ts:20: Property 'activeCount' is missing ...
 inventory-svc/src/client.ts:13  no route  call GET /api/v1/gadgets/:gadgetId: no service in this workspace serves it
 ```
 
+The second line is always printed, also when nothing is wrong ("... No
+breaks."). `--json` carries the same numbers as `summary`: `files`, `services`
+(the services those files belong to), `calls`, `routes`, `compared_with` (the
+services whose contracts they were compared with) and `breaks` (the problems
+that fail the run). `carrick check <file>` prints the same line under its
+header (`files` 1) and carries the same `summary` in `--json`; there `breaks`
+counts incompatible pairs only. `touch` has neither.
+
 `--json` prints `carrick.check-changed/0`: `files`, `routes`, `calls`,
-`services`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
+`services`, `summary`, `repos` (each with `main_branch`, `base`, `files`, or `skipped`),
 `problems` (`kind` `incompatible` | `no_route`, `file`, `line`, `role`,
 `method`, `path`, `other`, `reason`, `source`, `already_indexed`,
 `unconfirmed`, `fails`), `failing`,

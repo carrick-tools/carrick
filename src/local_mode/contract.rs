@@ -234,9 +234,63 @@ pub struct Item {
 /// bounded and nothing downstream has to re-truncate it.
 pub const MAX_TYPE_TEXT_CHARS: usize = 200;
 
+/// What a `carrick check` run looked at, in numbers, so a clean run is not
+/// silent. One struct for the single-file read, `check a.ts b.ts` and
+/// `check --changed`; the line it prints is [`CheckSummary::line`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckSummary {
+    /// Files checked.
+    pub files: usize,
+    /// Services those files belong to.
+    pub services: usize,
+    /// Outbound calls in those files.
+    pub calls: usize,
+    /// Routes in those files.
+    pub routes: usize,
+    /// Services whose contracts the calls and routes were compared with.
+    pub compared_with: usize,
+    /// Problems that fail the run: incompatible pairs, plus (on several files
+    /// and `--changed`) calls a fact says reach no route.
+    pub breaks: usize,
+}
+
+impl CheckSummary {
+    /// The one summary line. `changed` says the files are the ones git lists
+    /// as changed rather than ones the caller named.
+    pub fn line(&self, changed: bool) -> String {
+        fn n(count: usize, one: &str, many: &str) -> String {
+            format!("{count} {}", if count == 1 { one } else { many })
+        }
+        let verdict = match self.breaks {
+            0 => "No breaks.".to_string(),
+            breaks => format!("{} (listed below).", n(breaks, "break", "breaks")),
+        };
+        format!(
+            "Checked {} in {}: {} and {} against {}. {verdict}",
+            n(
+                self.files,
+                if changed { "changed file" } else { "file" },
+                if changed { "changed files" } else { "files" },
+            ),
+            n(self.services, "service", "services"),
+            n(self.calls, "call", "calls"),
+            n(self.routes, "route", "routes"),
+            if self.compared_with == 1 {
+                "1 service's contract".to_string()
+            } else {
+                format!("{} services' contracts", self.compared_with)
+            },
+        )
+    }
+}
+
 /// The whole answer.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckOutput {
+    /// What this `check` looked at. Absent on `touch`, which states no
+    /// verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<CheckSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_checked_at: Option<String>,
     #[serde(default)]
@@ -646,6 +700,10 @@ impl CheckOutput {
         if self.deleted {
             out.push_str("this file is no longer on disk; the rows below are what the index still holds for it.\n");
         }
+        if let Some(summary) = &self.summary {
+            out.push_str(&summary.line(false));
+            out.push('\n');
+        }
         out.push('\n');
 
         if self.items.is_empty() {
@@ -972,6 +1030,7 @@ mod tests {
 
     pub(super) fn output() -> CheckOutput {
         CheckOutput {
+            summary: None,
             hosted: None,
             hosted_state: Default::default(),
             hosted_checked_at: None,
@@ -1319,6 +1378,31 @@ mod tests {
     #[test]
     fn a_short_commit_is_safe_on_a_short_string() {
         assert_eq!(short_commit("abc"), "abc");
+    }
+
+    #[test]
+    fn a_single_file_check_prints_and_carries_its_summary() {
+        let mut checked = output();
+        checked.summary = Some(CheckSummary {
+            files: 1,
+            services: 1,
+            calls: 0,
+            routes: 1,
+            compared_with: 4,
+            breaks: 0,
+        });
+        assert!(checked.render().lines().any(|line| line
+            == "Checked 1 file in 1 service: 0 calls and 1 route against 4 services' contracts. No breaks."));
+        let json = serde_json::to_value(&checked).unwrap();
+        assert_eq!(json["summary"]["compared_with"], 4);
+        assert!(
+            serde_json::to_value(output())
+                .unwrap()
+                .get("summary")
+                .is_none()
+        );
+        checked.summary.as_mut().unwrap().breaks = 2;
+        assert!(checked.render().contains("2 breaks (listed below)."));
     }
 }
 
