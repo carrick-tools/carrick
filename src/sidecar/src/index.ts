@@ -52,6 +52,7 @@ import {
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
+import { HeldFiles, answerWhileStable } from './held-freshness.js';
 import {
   Connection,
   DEFAULT_IDLE_MS,
@@ -121,10 +122,25 @@ interface Session {
   components: Map<string, ProjectComponents>;
   /** The roots its `init` named, as `status` reports them. */
   scope: { repo_root: string; scan_root: string | null } | null;
+  /** Server mode: the `init` that built it, to build it again from (carrick#2880). */
+  init: (SidecarRequest & { action: 'init' }) | null;
+  /** Server mode: the files its programs were built from, as last seen. */
+  held: HeldFiles | null;
+  /** Server mode: how often a sweep refreshed it or dropped it. */
+  freshness: { refreshes: number; drops: number };
 }
 
 function newSession(): Session {
-  return { projectLoader: null, initTimeMs: null, initDigest: '', components: new Map(), scope: null };
+  return {
+    projectLoader: null,
+    initTimeMs: null,
+    initDigest: '',
+    components: new Map(),
+    scope: null,
+    init: null,
+    held: null,
+    freshness: { refreshes: 0, drops: 0 },
+  };
 }
 
 /**
@@ -1231,6 +1247,7 @@ function initHeld(request: SidecarRequest & { action: 'init' }): InitResponse {
   }
   session = newSession();
   session.scope = { repo_root: path.resolve(request.repo_root), scan_root: request.scan_root ?? null };
+  session.init = request;
   const response = handleInit(request);
   if (response.status === 'ready') heldSessions.set(key, session);
   return response;
@@ -1250,6 +1267,7 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
       repo_root: held.scope?.repo_root ?? '',
       scan_root: held.scope?.scan_root ?? null,
       built: held.components.size > 0,
+      freshness: { ...held.freshness },
     })),
     heap_used_mb: Math.round(memory.heapUsed / 1048576),
     rss_mb: Math.round(memory.rss / 1048576),
@@ -1305,14 +1323,98 @@ async function serveLine(
         writeResponse(initHeld(request));
         conn.slot = session;
         return;
-      default:
-        session = (conn.slot as Session | undefined) ?? newSession();
-        await dispatch(request);
+      default: {
+        const held = conn.slot as Session | undefined;
+        session = held ?? newSession();
+        if (held && READS_HELD_PROJECT.has(request.action)) writeResponse(answerFresh(request));
+        else await dispatch(request);
+      }
     }
   } finally {
     sink = STDOUT;
     session = newSession();
   }
+}
+
+/**
+ * The actions that read the held project (carrick#2880). The rest build what
+ * they read from the request (`capture_v2`, `check_v2`, `resolve_definitions`)
+ * or read nothing.
+ */
+const READS_HELD_PROJECT = new Set<SidecarRequest['action']>([
+  'bundle',
+  'infer',
+  'retype_check',
+  'verify_client_semantics',
+  'verify_library_claims',
+  'list_library_surface',
+  'list_program_files',
+  'add_program_files',
+  'position_rows',
+  'implementations',
+]);
+
+/** How many times a request is answered again when files change while it runs. */
+const MAX_ANSWERS = 3;
+
+/**
+ * Bring the current session up to date with the disk: nothing, a refresh of
+ * the changed files, or a rebuild from its `init` (`held-freshness.ts`).
+ */
+function freshen(): void {
+  if (!session.projectLoader?.isInitialized() || !session.init) return;
+  session.held ??= heldFilesOf(session);
+  const found = session.held.sweep();
+  if (found.outcome === 'refresh') {
+    log(`refreshing ${found.files.length} changed file(s)`);
+    session.held.refresh(found.files);
+    // Everything built over the programs reads them again.
+    session.components = new Map();
+    session.freshness.refreshes += 1;
+  } else if (found.outcome === 'drop') {
+    log(`rebuilding the service: ${found.reason}`);
+    session.freshness.drops += 1;
+    handleInit(session.init);
+    // Watched from now on, so a change while the next request runs is found.
+    session.held = session.projectLoader?.isInitialized() ? heldFilesOf(session) : null;
+    session.held?.sweep();
+  }
+}
+
+/** The files `held`'s current loader builds from, ready to sweep. */
+function heldFilesOf(held: Session): HeldFiles {
+  const loader = held.projectLoader!;
+  const scope = held.scope;
+  return new HeldFiles({
+    projects: () => loader.builtProjects(),
+    refreshable: () => loader.buildsFromTsconfigs(),
+    roots: () => [...new Set([scope?.repo_root, scope?.scan_root].filter((r): r is string => !!r))],
+  });
+}
+
+/**
+ * Answer a request that reads the held project from programs equal to the
+ * disk. Files that change while it runs make the answer stale: it is dropped
+ * and the request answered again, at most {@link MAX_ANSWERS} times.
+ */
+function answerFresh(request: SidecarRequest): SidecarResponse {
+  const answer = answerWhileStable(
+    () => handleRequest(request),
+    freshen,
+    () => {
+      const stable = !session.held || session.held.sweep().outcome === 'none';
+      if (!stable) log('files changed while the request ran; answering it again');
+      return stable;
+    },
+    MAX_ANSWERS
+  );
+  return (
+    answer ?? {
+      request_id: request.request_id,
+      status: 'error',
+      errors: [`files kept changing while the request ran (${MAX_ANSWERS} answers dropped)`],
+    }
+  );
 }
 
 /** `--serve <workspace> [--cli-version <v>]`: run as the workspace's daemon. */

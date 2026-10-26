@@ -1032,6 +1032,7 @@ Response, written before the process exits:
 - **Handshake:** every connection opens with `hello` naming the build id of the sidecar the client would have spawned. Any other first frame, or another build id, is answered with an error starting `build_mismatch` and the connection is closed, so a stale build never answers.
 - **One queue:** every request from every connection runs in arrival order, `check_v2` included; each request's frames go to the connection that sent it.
 - **Held services:** `init` selects the service its fields name (`repo_root`, `tsconfig_path`, `scan_root`, `tsconfig_snapshot`, `pinned_dependencies`), or resolves a new one; the connection's later requests read it. A second connection with the same `init` reads the project the first one built. Over stdio, `init` still re-scopes the one project.
+- **After edits (carrick#2880):** before and after every request that reads a held project (`infer`, `retype_check`, `bundle`, the library checks, `list_program_files`, `add_program_files`, `position_rows`, `implementations`), the files its programs were built from are checked against the disk by stat, and a changed stat against the text the program holds. Changed source files whose imports and references are as they were are read again into the held projects (`freshness.refreshes`). Anything else builds the service again from its `init` (`freshness.drops`): a config in the `extends` chain, a `package.json`, lockfile or install record, a file added to or removed from a config's file list, a file gone, a changed import or reference, more than 200 changed files, or any change in a service not built from a tsconfig (default patterns, a snapshot, Deno). An answer read while files changed is dropped and the request answered again, at most 3 times, then answered with an error.
 - **One daemon per workspace:** `typed.json` is claimed with a hard link. A second start while one answers exits with code 3. A record whose process is dead, or whose socket does not answer within 2 s, is taken over.
 - **Stop:** on `stop`, SIGTERM or SIGINT, and after 15 minutes with no request (`CARRICK_TYPED_IDLE_MS` sets another idle time), it removes the socket and `typed.json` and exits 0. It exits without removing anything when `typed.json` is gone or names another process. `shutdown` ends only the client's connection. A client that disconnects mid-request does not stop it.
 
@@ -1059,7 +1060,14 @@ Response, written before the process exits:
     "started_at": "2026-10-26T14:02:11.000Z",
     "uptime_ms": 81234,
     "idle_ms": 5120,
-    "services": [{ "repo_root": "/repo/services/api", "scan_root": "/repo", "built": true }],
+    "services": [
+      {
+        "repo_root": "/repo/services/api",
+        "scan_root": "/repo",
+        "built": true,
+        "freshness": { "refreshes": 3, "drops": 1 }
+      }
+    ],
     "heap_used_mb": 412,
     "rss_mb": 655
   }
@@ -1099,6 +1107,7 @@ Response, written before the daemon exits:
 |------|-------------|
 | `src/index.ts` | Entry point, message loop, dispatch, response/progress frames |
 | `src/typed-server.ts` | Server mode: the socket, `typed.json`, the build id, the request queue, idle stop and clean-up |
+| `src/held-freshness.ts` | Server mode: the sweep that keeps a held service equal to the disk (refresh or rebuild) |
 | `src/types.ts` | Request/response interfaces |
 | `src/validators.ts` | Zod schemas; the authority on request shape |
 | `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |

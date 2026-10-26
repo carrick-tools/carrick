@@ -1032,6 +1032,12 @@ export interface HeldService {
   scan_root: string | null;
   /** Whether a request has built its program yet (`init` builds nothing). */
   built: boolean;
+  /**
+   * How often the files its programs were read from had changed before a
+   * request (carrick#2880): read again into the held programs (`refreshes`),
+   * or the service built again from its `init` (`drops`).
+   */
+  freshness: { refreshes: number; drops: number };
 }
 
 /** Response for status. */
