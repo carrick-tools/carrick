@@ -545,11 +545,13 @@ exit codes.
 The budget is five minutes, `CARRICK_CHECK_BUDGET_MS`.
 
 **Quiet by default.** Only problems that fail the run are listed. The rest
-are counted on the summary line, `..., plus 2 unconfirmed, run with --all to
-list them`, and `--all` lists them, each marked with why: `[already in the
-index, does not fail]`, `[unconfirmed: the base is set at run time, does not
-fail]`, `[model candidate, does not fail]` or `[source not stated, does not
-fail]`. `--json` always lists every problem, with its `source`,
+are counted on the summary line by why they do not fail, `..., plus 2 already
+in the index and 1 unconfirmed, run with --all to list them`, and `--all`
+lists them, each marked with the same reason: `[already in the index, does
+not fail]`, `[unconfirmed: the base is set at run time, does not fail]`,
+`[model candidate, does not fail]` or `[source not stated, does not fail]`.
+A problem the index already held is counted as that, whatever else holds for
+it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same

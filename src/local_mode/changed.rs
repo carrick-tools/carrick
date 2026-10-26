@@ -712,7 +712,14 @@ impl ChangedOutput {
             .iter()
             .filter(|problem| all || problem.fails)
             .collect();
-        let unconfirmed = self.problems.len() - listed.len();
+        // Each problem not listed, counted by why, in the order `--all`
+        // prints the reasons in.
+        let mut unlisted: BTreeMap<Unlisted, usize> = BTreeMap::new();
+        for problem in &self.problems {
+            if let (false, Some(why)) = (all, problem.unlisted()) {
+                *unlisted.entry(why).or_default() += 1;
+            }
+        }
         let incompatible = listed
             .iter()
             .filter(|p| p.kind == ProblemKind::Incompatible)
@@ -734,9 +741,14 @@ impl ChangedOutput {
         if advisory > 0 {
             out.push_str(&format!(" ({advisory} of them do not fail the check)"));
         }
-        if unconfirmed > 0 {
+        if !unlisted.is_empty() {
+            let counts: Vec<String> = unlisted
+                .iter()
+                .map(|(why, count)| why.counted(*count))
+                .collect();
             out.push_str(&format!(
-                ", plus {unconfirmed} unconfirmed, run with --all to list them"
+                ", plus {}, run with --all to list them",
+                join_and(&counts)
             ));
         }
         out.push('\n');
@@ -754,15 +766,7 @@ impl ChangedOutput {
             } else {
                 format!(" with {}", problem.other.join(", "))
             };
-            let note = match (problem.fails, problem.source.as_str()) {
-                (true, _) => "",
-                _ if problem.already_indexed => " [already in the index, does not fail]",
-                _ if problem.unconfirmed => {
-                    " [unconfirmed: the base is set at run time, does not fail]"
-                }
-                (false, "candidate") => " [model candidate, does not fail]",
-                (false, _) => " [source not stated, does not fail]",
-            };
+            let note = problem.unlisted().map_or("", Unlisted::note);
             out.push_str(&format!(
                 "{at}  {what}  {} {} {}{with}: {}{note}\n",
                 problem.role, problem.method, problem.path, problem.reason
@@ -784,6 +788,60 @@ impl ChangedOutput {
             }
         }
         out
+    }
+}
+
+/// Why a problem does not fail the run, so is listed only with `--all`: the
+/// note `--all` prints beside it and the count the summary line gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unlisted {
+    AlreadyIndexed,
+    Unconfirmed,
+    Candidate,
+    NotStated,
+}
+
+impl Unlisted {
+    fn note(self) -> &'static str {
+        match self {
+            Unlisted::AlreadyIndexed => " [already in the index, does not fail]",
+            Unlisted::Unconfirmed => " [unconfirmed: the base is set at run time, does not fail]",
+            Unlisted::Candidate => " [model candidate, does not fail]",
+            Unlisted::NotStated => " [source not stated, does not fail]",
+        }
+    }
+
+    fn counted(self, count: usize) -> String {
+        match self {
+            Unlisted::AlreadyIndexed => format!("{count} already in the index"),
+            Unlisted::Unconfirmed => format!("{count} unconfirmed"),
+            Unlisted::Candidate => plural(count, "model candidate", "model candidates"),
+            Unlisted::NotStated => format!("{count} with no stated source"),
+        }
+    }
+}
+
+impl Problem {
+    /// Why this problem is listed only with `--all`; `None` when it fails
+    /// the run. A problem the index already held says so first, whatever
+    /// else holds for it.
+    fn unlisted(&self) -> Option<Unlisted> {
+        match (self.fails, self.source.as_str()) {
+            (true, _) => None,
+            _ if self.already_indexed => Some(Unlisted::AlreadyIndexed),
+            _ if self.unconfirmed => Some(Unlisted::Unconfirmed),
+            (false, "candidate") => Some(Unlisted::Candidate),
+            (false, _) => Some(Unlisted::NotStated),
+        }
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -856,7 +914,7 @@ mod tests {
         assert_eq!(
             quiet.lines().next().unwrap(),
             "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
-             1 incompatible, 0 reach no route, plus 1 unconfirmed, run with --all to list them"
+             1 incompatible, 0 reach no route, plus 1 model candidate, run with --all to list them"
         );
         assert_eq!(quiet.lines().count(), 2, "the fact only:\n{quiet}");
         assert!(!quiet.contains("GET /b"), "{quiet}");
@@ -865,6 +923,53 @@ mod tests {
         assert!(
             !everything.contains("unconfirmed"),
             "nothing is hidden, so nothing is counted as hidden:\n{everything}"
+        );
+    }
+
+    /// The count of problems not listed names why each is not listed, with
+    /// the reason `--all` prints beside it: a problem the index already held
+    /// is not "unconfirmed".
+    #[test]
+    fn the_hidden_count_names_why_each_problem_is_not_listed() {
+        let mut held = problem(ProblemKind::NoRoute, false);
+        held.source = "fact".to_string();
+        held.already_indexed = true;
+        let mut held_too = held.clone();
+        held_too.path = "/c".to_string();
+        let mut runtime_base = problem(ProblemKind::NoRoute, false);
+        runtime_base.source = "fact".to_string();
+        runtime_base.unconfirmed = true;
+        runtime_base.path = "/d".to_string();
+        let mut candidate = problem(ProblemKind::NoRoute, false);
+        candidate.path = "/e".to_string();
+        let mut unstated = problem(ProblemKind::NoRoute, false);
+        unstated.source = "not_stated".to_string();
+        unstated.path = "/f".to_string();
+        let only_held = ChangedOutput {
+            routes: 0,
+            calls: 2,
+            files: 1,
+            services: 2,
+            problems: vec![held.clone(), held_too.clone()],
+            failing: 0,
+            not_checked: None,
+            ..not_checked("/w", "")
+        };
+        assert_eq!(
+            only_held.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 2 already in the index, \
+             run with --all to list them"
+        );
+        let mixed = ChangedOutput {
+            problems: vec![held, held_too, runtime_base, candidate, unstated],
+            ..only_held
+        };
+        assert_eq!(
+            mixed.render(false).lines().next().unwrap(),
+            "carrick check: checked 0 routes and 2 calls in 1 changed file against 2 services: \
+             0 incompatible, 0 reach no route, plus 2 already in the index, 1 unconfirmed, \
+             1 model candidate and 1 with no stated source, run with --all to list them"
         );
     }
 

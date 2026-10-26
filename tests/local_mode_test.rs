@@ -2812,7 +2812,7 @@ fn check_changed_does_not_fail_on_a_problem_the_index_already_held() {
 
     let (code, quiet) = check_changed(root, false);
     assert!(
-        quiet.contains("plus 1 unconfirmed, run with --all to list them"),
+        quiet.contains("plus 1 already in the index, run with --all to list them"),
         "counted, not listed:\n{quiet}"
     );
     assert_eq!(code, Some(0), "{quiet}");
