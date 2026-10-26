@@ -122,6 +122,12 @@ export class WriteGuard {
     fs.writeFileSync(p, data, mode === undefined ? undefined : { mode });
   }
 
+  /** Set a file's or directory's permission bits. */
+  chmod(p: string, mode: number): void {
+    this.check(p, landing(p), 'change the mode of');
+    fs.chmodSync(p, mode);
+  }
+
   appendFile(p: string, data: string): void {
     this.check(p, landing(p), 'append to');
     fs.appendFileSync(p, data);

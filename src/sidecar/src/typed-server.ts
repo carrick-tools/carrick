@@ -549,7 +549,7 @@ function ownUserDir(guard: WriteGuard, dir: string): void {
   if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) {
     throw new Error(`${dir} is not this user's directory`);
   }
-  if ((stat.mode & 0o777) !== 0o700) fs.chmodSync(dir, 0o700);
+  if ((stat.mode & 0o777) !== 0o700) guard.chmod(dir, 0o700);
 }
 
 function realPathOf(p: string): string {
