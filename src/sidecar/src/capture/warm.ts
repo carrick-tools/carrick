@@ -36,6 +36,7 @@
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { declaresAugmentation } from './augmentations.js';
 
 /** What decides how a file parses, beside its name. */
 function parseKey(fileName: string, version: ts.ScriptTarget | ts.CreateSourceFileOptions, options: ts.CompilerOptions): string {
@@ -322,12 +323,7 @@ function restore(kept: KeptDiagnostic, sourceFile: ts.SourceFile): ts.Diagnostic
 
 /** A stub file that can change what another file finds by name: a script, or a global or module declaration. */
 function declaresGlobally(sourceFile: ts.SourceFile): boolean {
-  if (!ts.isExternalModule(sourceFile)) return true;
-  return sourceFile.statements.some(
-    (statement) =>
-      ts.isModuleDeclaration(statement) &&
-      (ts.isStringLiteral(statement.name) || (statement.flags & ts.NodeFlags.GlobalAugmentation) !== 0)
-  );
+  return !ts.isExternalModule(sourceFile) || declaresAugmentation(sourceFile);
 }
 
 /**
