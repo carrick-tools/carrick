@@ -108,6 +108,7 @@ describe('warm judge: a kept workspace answers what a cold check answers (real p
     assert.strictEqual(cold.success, true, JSON.stringify(cold.errors));
     assert.strictEqual(verdictText(warm), verdictText(cold));
     assert.strictEqual(warm.workspace_dir, '', 'a kept workspace is never handed out');
+    assert.ok(!('judge' in warm), 'how the workspace was used is never in the answer');
     return { cold, warm };
   }
 
@@ -124,14 +125,14 @@ describe('warm judge: a kept workspace answers what a cold check answers (real p
 
   it('1. first run: installs, every pair compatible', async () => {
     const { warm } = await step(stubs(), PAIRS);
-    assert.deepStrictEqual(warm.judge, { kept: true, install_skipped: false });
+    assert.strictEqual(kept.lastInstallSkipped, false);
     assert.ok(warm.verdicts.every((v) => v.bucket === 'compatible'), JSON.stringify(warm.verdicts));
   });
 
   it('2. a contract edit flips the verdicts that read it; the install is skipped', async () => {
     writeStub(root, 'orders', ordersSurface('string'));
     const { warm } = await step(stubs(), PAIRS);
-    assert.deepStrictEqual(warm.judge, { kept: true, install_skipped: true });
+    assert.strictEqual(kept.lastInstallSkipped, true);
     const incompatible = warm.verdicts.filter((v) => v.bucket === 'incompatible').map((v) => v.pair_key).sort();
     assert.deepStrictEqual(incompatible, ['gql-order', 'http-list', 'http-order']);
   });
@@ -139,14 +140,14 @@ describe('warm judge: a kept workspace answers what a cold check answers (real p
   it('3. a leaf edit (no shape change), stubs sent in another order: install skipped', async () => {
     writeStub(root, 'orders', ordersSurface('string', '// a comment only'));
     const { warm } = await step([...stubs()].reverse(), PAIRS);
-    assert.deepStrictEqual(warm.judge, { kept: true, install_skipped: true });
+    assert.strictEqual(kept.lastInstallSkipped, true);
   });
 
   it('4. the edit reverted and a pair removed: its probe leaves the kept workspace', async () => {
     writeStub(root, 'orders', ordersSurface('number'));
     const pairs = PAIRS.filter((p) => p.pair_key !== 'socket-status');
     const { warm } = await step(stubs(), pairs);
-    assert.deepStrictEqual(warm.judge, { kept: true, install_skipped: true });
+    assert.strictEqual(kept.lastInstallSkipped, true);
     assert.ok(warm.verdicts.every((v) => v.bucket === 'compatible'), JSON.stringify(warm.verdicts));
     const removed = buildProbe(PAIRS[3], (s) => `@carrick/${s}`).fileName;
     const files = probeFiles(kept.workspaceDir!);
@@ -162,7 +163,7 @@ describe('warm judge: a kept workspace answers what a cold check answers (real p
       pair('http-invoice', 'http', 'Invoice_Sent', 'Order_Exp', { producer: { service_name: 'billing', alias: 'Invoice_Sent' } }),
     ];
     const { warm } = await step([...stubs(), { service_name: 'billing', stub_dir: billing }], pairs);
-    assert.deepStrictEqual(warm.judge, { kept: true, install_skipped: false });
+    assert.strictEqual(kept.lastInstallSkipped, false);
     assert.notStrictEqual(kept.workspaceDir, before);
     assert.ok(!fs.existsSync(before!), 'the replaced workspace is removed');
   });
@@ -199,7 +200,7 @@ describe('warm judge: a failed compiler run keeps nothing', () => {
     assert.strictEqual(crashed.success, false);
     assert.strictEqual(kept.workspaceDir, null);
     const next = await runCheck({ stubs: input, pairs: PAIRS, kept });
-    assert.deepStrictEqual(next.judge, { kept: true, install_skipped: false });
+    assert.strictEqual(kept.lastInstallSkipped, false);
   });
 });
 
@@ -229,10 +230,11 @@ describe('warm judge: a daemon keeps one judge workspace across checks', () => {
     const check = async (id: string) =>
       (await client.send({ request_id: id, action: 'check_v2', stubs: input, pairs: PAIRS, workspace_root: parent }))
         .result as CheckResult;
+    const judgeUses = async () => ((await client.send({ request_id: 'st', action: 'status' })).daemon as { judge: unknown }).judge;
     const first = await check('c1');
+    assert.deepStrictEqual(await judgeUses(), { checks: 1, installs_skipped: 0 });
     const second = await check('c2');
-    assert.deepStrictEqual(first.judge, { kept: true, install_skipped: false });
-    assert.deepStrictEqual(second.judge, { kept: true, install_skipped: true });
+    assert.deepStrictEqual(await judgeUses(), { checks: 2, installs_skipped: 1 });
     assert.strictEqual(verdictText(second), verdictText(first));
     assert.strictEqual(fs.readdirSync(parent).length, 1, 'one kept workspace');
     client.conn.destroy();

@@ -298,7 +298,6 @@ export async function runCheck(
   const taken = opts.kept?.take(layout, opts.workspaceRoot) ?? null;
   const ws = taken?.ws ?? writeWorkspace(layout, opts.workspaceRoot);
   const kept = taken !== null;
-  const judge = kept ? { kept: true as const, install_skipped: taken.installSkipped } : undefined;
   // Whatever happens below, a kept workspace is released: kept when the
   // check finished, dropped when it did not.
   let settled = false;
@@ -359,7 +358,6 @@ export async function runCheck(
         verdicts,
         degraded_services: degraded,
         errors,
-        ...(judge ? { judge } : {}),
       };
     }
 
@@ -439,7 +437,6 @@ export async function runCheck(
         degraded_services: dedupeDegraded(degraded),
         errors,
         compiler_end: compilerEnd,
-        ...(judge ? { judge } : {}),
       };
     }
 
@@ -504,7 +501,6 @@ export async function runCheck(
       verdicts,
       degraded_services: dedupeDegraded(degraded),
       errors,
-      ...(judge ? { judge } : {}),
     };
   } finally {
     // A throw part way leaves nothing kept that the check did not finish.

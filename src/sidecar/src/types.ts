@@ -1086,6 +1086,8 @@ export interface StatusResponse extends BaseResponse {
     rss_mb: number;
     /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default 3072). */
     heap_cap_mb: number;
+    /** Checks run on the kept judge workspace (carrick#2883), and those whose install was skipped. */
+    judge: { checks: number; installs_skipped: number };
     /** Only under `CARRICK_TYPED_VERIFY=1` (carrick#2886): requests answered warm and cold, and how they compared. */
     verify?: { checked: number; mismatches: number; order_only: number };
   };

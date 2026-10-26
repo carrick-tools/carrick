@@ -49,6 +49,14 @@ export interface TakenWorkspace {
 export class KeptJudge {
   private held: Held | null = null;
   private busy = false;
+  /**
+   * Checks that ran on the kept workspace, and those whose install was
+   * skipped: counted here, never in a check's answer, which equals a cold
+   * process's byte for byte.
+   */
+  readonly uses = { checks: 0, installs_skipped: 0 };
+  /** Whether the last check that took the workspace skipped its install. */
+  lastInstallSkipped: boolean | null = null;
 
   /** The kept workspace's directory, or null when none is kept. */
   get workspaceDir(): string | null {
@@ -67,6 +75,7 @@ export class KeptJudge {
     if (held && held.installed && held.installKey === installKey && held.parent === parent) {
       this.bringTo(held, plan);
       held.ws = withDir(plan, held.ws.workspaceDir, held.ws.guard);
+      this.counted(true);
       return { ws: held.ws, installSkipped: true };
     }
     this.discard();
@@ -75,7 +84,14 @@ export class KeptJudge {
     const written = new Map<string, string>();
     for (const [rel, entry] of plan.files) written.set(rel, entryDigest(entry));
     this.held = { ws, parent, installKey, written, installed: false };
+    this.counted(false);
     return { ws, installSkipped: false };
+  }
+
+  private counted(installSkipped: boolean): void {
+    this.uses.checks += 1;
+    if (installSkipped) this.uses.installs_skipped += 1;
+    this.lastInstallSkipped = installSkipped;
   }
 
   /**

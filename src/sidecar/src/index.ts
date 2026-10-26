@@ -1495,6 +1495,7 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
       evictions: held.evictions,
     })),
     heap_cap_mb: heapCapMb(),
+    judge: { ...(keptJudge?.uses ?? { checks: 0, installs_skipped: 0 }) },
     ...(verifyEnabled() ? { verify: { ...verifyCounts } } : {}),
     heap_used_mb: Math.round(memory.heapUsed / 1048576),
     rss_mb: Math.round(memory.rss / 1048576),
