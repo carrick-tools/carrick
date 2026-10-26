@@ -252,10 +252,13 @@ fn write(
         }
     }
     if write.applied.added > 0 || write.applied.corrected > 0 {
-        // A row added here has no type anchor this scan: documentation that
-        // states its operation keeps its own row, and its types.
+        // A row added here has no type anchor this scan, so documentation
+        // that states its operation folds onto it as onto any partner, and
+        // its manifest entries stay under the shared key at the
+        // documentation's own file and line (carrick#2742): the agent sees
+        // one row, typed by the documentation.
         let added = write.added.clone();
-        let folds = FileOrchestrator::documented_folds_onto(graph, |index| !added.contains(&index));
+        let folds = FileOrchestrator::documented_folds(graph);
         for (index, row) in graph.endpoints.iter().enumerate() {
             if folds.folded_into[index]
                 && let Some(flat) = flat_row(endpoints, row, &row.full_path)
@@ -270,7 +273,8 @@ fn write(
                         && endpoint.dispatch == row.dispatch
                         && endpoint.file_path == file_path)
                 });
-                if let Some(manifest) = type_manifest.as_mut() {
+                let onto_added = folds.onto[index].is_some_and(|p| added.contains(&p));
+                if !onto_added && let Some(manifest) = type_manifest.as_mut() {
                     manifest.retain(|entry| !manifest_of(entry, row, &row.full_path));
                 }
             }

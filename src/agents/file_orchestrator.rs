@@ -1348,6 +1348,8 @@ pub(crate) struct DocumentedFolds {
     pub(crate) folded_into: Vec<bool>,
     /// Documentation rows that go.
     pub(crate) drop: Vec<bool>,
+    /// For a documentation row that goes, the row it folded onto.
+    pub(crate) onto: Vec<Option<usize>>,
 }
 
 /// A mount-site binding, resolved back to the file that defines it.
@@ -11575,24 +11577,15 @@ impl FileOrchestrator {
     }
 
     /// What [`Self::fold_documented_operations`] does to `graph`, by row,
-    /// before it does it: which rows take the documentation's label, and
-    /// which documentation rows go. A caller that keeps a projection of the
-    /// graph (carrick#2474 R5b) follows the same marks.
+    /// before it does it: which rows take the documentation's label, which
+    /// documentation rows go, and onto which row each went. A caller that
+    /// keeps a projection of the graph (carrick#2474 R5b) follows the same
+    /// marks.
     pub(crate) fn documented_folds(graph: &MountGraph) -> DocumentedFolds {
-        Self::documented_folds_onto(graph, |_| true)
-    }
-
-    /// [`Self::documented_folds`], where a documentation row whose partners
-    /// include one `may_take` refuses (by index) stays: a row written with
-    /// no types (carrick#2474 R5b) does not take the documentation's place,
-    /// so the documentation's types are not lost.
-    pub(crate) fn documented_folds_onto(
-        graph: &MountGraph,
-        may_take: impl Fn(usize) -> bool,
-    ) -> DocumentedFolds {
         let documentation = Self::is_documentation_row;
         let mut folded_into = vec![false; graph.endpoints.len()];
         let mut drop = vec![false; graph.endpoints.len()];
+        let mut onto = vec![None; graph.endpoints.len()];
         for (index, descriptor) in graph.endpoints.iter().enumerate() {
             if !documentation(descriptor) {
                 continue;
@@ -11613,14 +11606,12 @@ impl FileOrchestrator {
                 })
                 .map(|(other, _)| other)
                 .collect();
-            if !partners.iter().all(|partner| may_take(*partner)) {
-                continue;
-            }
             match partners.as_slice() {
                 [] => {}
                 [partner] if !folded_into[*partner] => {
                     folded_into[*partner] = true;
                     drop[index] = true;
+                    onto[index] = Some(*partner);
                 }
                 _ => debug!(
                     "Documented operation {} {} at {} not folded: {} rows of this service \
@@ -11632,7 +11623,11 @@ impl FileOrchestrator {
                 ),
             }
         }
-        DocumentedFolds { folded_into, drop }
+        DocumentedFolds {
+            folded_into,
+            drop,
+            onto,
+        }
     }
 
     /// Whether `endpoint` is a bare documentation row: a route descriptor
@@ -18172,6 +18167,67 @@ export { routes };
         assert_eq!(endpoints[0].method, "POST");
         assert_eq!(endpoints[0].path, "/widgets");
         assert_eq!(endpoints[0].owner_node, ROUTE_DESCRIPTOR_OWNER);
+    }
+
+    fn graph_row(
+        method: &str,
+        path: &str,
+        line: u32,
+        handler: &str,
+        source: ResolutionSource,
+    ) -> ResolvedEndpoint {
+        ResolvedEndpoint {
+            method: method.to_string(),
+            path: path.to_string(),
+            full_path: path.to_string(),
+            handler: Some(handler.to_string()),
+            owner: "app".to_string(),
+            file_location: format!("src/routes.ts:{line}"),
+            middleware_chain: Vec::new(),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(source),
+            view_module: false,
+            dispatch: None,
+            handler_span: None,
+        }
+    }
+
+    #[test]
+    fn a_documentation_row_names_the_partner_it_folds_onto() {
+        // carrick#2742: the fold reports which row took the documentation, so
+        // a caller that wrote that row untyped can keep the documentation's
+        // manifest entries under the shared key.
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(graph_row(
+            "POST",
+            "/api/items",
+            4,
+            ROUTE_DESCRIPTOR_OWNER,
+            ResolutionSource::DescriptorRoute,
+        ));
+        graph.endpoints.push(graph_row(
+            "POST",
+            "/api/items",
+            9,
+            "createItem",
+            ResolutionSource::LibraryClaim,
+        ));
+        graph.endpoints.push(graph_row(
+            "GET",
+            "/api/items",
+            12,
+            "listItems",
+            ResolutionSource::LibraryClaim,
+        ));
+
+        let folds = FileOrchestrator::documented_folds(&graph);
+
+        assert_eq!(folds.drop, vec![true, false, false]);
+        assert_eq!(folds.folded_into, vec![false, true, false]);
+        assert_eq!(folds.onto, vec![Some(1), None, None]);
     }
 
     fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {

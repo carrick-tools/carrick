@@ -704,17 +704,18 @@ fn routes_across_services_take_the_receiving_scope() {
             // onto it in its own service.
             "packages/routes/src/admin.ts:5 GET /api/v1/admin/users descriptor_route app",
             // Added: no row stood there. With no type anchor this scan, the
-            // documentation of the same operation keeps its row.
-            "packages/routes/src/admin.ts:6 POST /api/v1/admin/users library_claim app",
-            "packages/routes/src/docs.ts:16 POST /api/v1/admin/users descriptor_route __route_descriptor__",
+            // documentation of the same operation folds onto it (carrick#2742)
+            // and its manifest entries stay at the documentation's site: one
+            // row, typed by the documentation.
+            "packages/routes/src/admin.ts:6 POST /api/v1/admin/users descriptor_route app",
             // The host's audit routes are documented here, in another
             // service (carrick#2474 R5d): `audit.ts:6` holds types and takes
             // the documentation's place, `audit.ts:7` was added untyped and
             // the documentation of it stays.
             "packages/routes/src/docs.ts:28 GET /api/v1/audit/events/{id} descriptor_route __route_descriptor__",
-            "packages/routes/src/docs.ts:4 GET /api/v1/orders descriptor_route __route_descriptor__",
-            // Q5 (ii): the path two hosts state; the third is counted.
-            "packages/routes/src/orders.ts:4 GET /api/v1/orders library_claim app",
+            // Q5 (ii): the path two hosts state; the third is counted. Its
+            // documentation (`docs.ts:4`) folds onto the added row.
+            "packages/routes/src/orders.ts:4 GET /api/v1/orders descriptor_route app",
             // The package's own app serves the same routes at its root
             // (PR #2734 review): that chain stays in the service, and its
             // path stands beside the hosts'.
@@ -765,18 +766,32 @@ fn routes_across_services_take_the_receiving_scope() {
             "packages/server/src/audit.ts:6 GET /api/v1/audit/events response Endpoint_cf8ea45ffddd4018_Response_Atde8b764d1203983c",
         ]
     );
-    // Each row's endpoint key, flat key and manifest key are one string.
+    // Every manifest entry has a row with its method and path in its own
+    // service. A documentation row folded onto an added row keeps its entries
+    // at the documentation's own site (carrick#2742), so the join is by
+    // key, as the cloud reads it, not by site.
     for entry in producer_manifest(&on) {
-        let (site, rest) = entry.split_once(' ').unwrap();
+        let (_site, rest) = entry.split_once(' ').unwrap();
         let (method, rest) = rest.split_once(' ').unwrap();
         let path = rest.split(' ').next().unwrap();
         assert!(
             graph
                 .iter()
-                .any(|row| row.starts_with(&format!("{site} {method} {path} "))),
+                .any(|row| row.split(' ').skip(1).take(2).eq([method, path])),
             "{entry} has no row at its key: {graph:#?}"
         );
     }
+    // One operation, one row per service: no method and path twice in the
+    // routes service.
+    let routes_rows: Vec<String> = graph
+        .iter()
+        .filter(|row| row.starts_with("packages/routes/"))
+        .map(|row| row.split(' ').skip(1).take(2).collect::<Vec<_>>().join(" "))
+        .collect();
+    let mut seen = routes_rows.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), routes_rows.len(), "{routes_rows:?}");
     let counts = |service: &str| -> Vec<String> {
         fallbacks[service]
             .iter()
