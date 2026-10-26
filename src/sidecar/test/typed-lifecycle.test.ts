@@ -47,7 +47,10 @@ function workspace(): string {
   for (const name of ['a', 'b', 'c']) {
     fs.mkdirSync(path.join(ws, name, 'src'), { recursive: true });
     fs.writeFileSync(path.join(ws, name, 'tsconfig.json'), TSCONFIG);
-    fs.writeFileSync(path.join(ws, name, 'src', 'main.ts'), `export function make() {\n  return { id: '${name}', n: 1 };\n}\n`);
+    fs.writeFileSync(
+      path.join(ws, name, 'src', 'main.ts'),
+      `export function make() {\n  return { id: '${name}', n: 1 };\n}\nexport interface Made {\n  id: string;\n}\n`
+    );
     fs.writeFileSync(path.join(ws, name, 'src', 'util.ts'), `export const flag = true;\n`);
   }
   return ws;
@@ -65,6 +68,17 @@ function inferOf(ws: string, name: string): Record<string, unknown> {
   };
 }
 
+function captureOf(ws: string, name: string, out: string): Record<string, unknown> {
+  return {
+    request_id: `c-${name}`,
+    action: 'capture_v2',
+    repo_root: path.join(ws, name),
+    service_name: name,
+    out_dir: out,
+    anchors: [{ kind: 'symbol', alias: 'Alias_made', symbol_name: 'Made', source_file: 'src/main.ts', anchor_origin: 'llm-symbol' }],
+  };
+}
+
 /** The answer, or `closed` when the daemon closes the connection instead. */
 async function answerOrClose(client: SocketClient, request: Record<string, unknown>): Promise<Record<string, unknown> | 'closed'> {
   return Promise.race([client.send(request), client.closed.then(() => 'closed' as const)]);
@@ -79,6 +93,7 @@ interface Status {
   heap_limit_mb: number;
   warming: boolean;
   queued: number;
+  collections: number;
 }
 
 async function statusOf(socket: string): Promise<Status> {
@@ -236,6 +251,7 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const w0 = await SocketClient.greeted(socket0);
     assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
     assert.strictEqual((await w0.send(inferOf(measure, 'a'))).status, 'success');
+    assert.strictEqual((await w0.send(captureOf(measure, 'a', fs.mkdtempSync(path.join(measure, 'stub-'))))).status, 'success');
     const heldA = (await statusOf(socket0)).heap_used_mb;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
@@ -249,6 +265,7 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const warm = await SocketClient.greeted(socket);
     assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
     assert.strictEqual((await warm.send(inferOf(ws, 'a'))).status, 'success');
+    assert.strictEqual((await warm.send(captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-'))))).status, 'success');
     const probe = await SocketClient.greeted(socket, 'probe');
     assert.strictEqual((await probe.send(initOf(ws, 'a'))).status, 'ready');
     assert.strictEqual((await probe.send(inferOf(ws, 'a'))).status, 'success');
@@ -273,21 +290,63 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     const child2 = await daemon(ws2, { CARRICK_TYPED_HEAP_CAP_MB: cap });
     const socket2 = recordOf(ws2)!.socket;
     const warm2 = await SocketClient.greeted(socket2);
-    for (const name of ['a', 'b']) {
-      assert.strictEqual((await warm2.send(initOf(ws2, name))).status, 'ready');
-      assert.strictEqual((await warm2.send(inferOf(ws2, name))).status, 'success');
-    }
+    assert.strictEqual((await warm2.send(initOf(ws2, 'a'))).status, 'ready');
+    assert.strictEqual((await warm2.send(inferOf(ws2, 'a'))).status, 'success');
+    assert.strictEqual((await warm2.send(captureOf(ws2, 'a', fs.mkdtempSync(path.join(ws2, 'stub-'))))).status, 'success');
+    const firstFootprint = serviceIn(await statusOf(socket2), ws2, 'a')!.footprint_mb!;
+    assert.strictEqual((await warm2.send(initOf(ws2, 'b'))).status, 'ready');
+    assert.strictEqual((await warm2.send(inferOf(ws2, 'b'))).status, 'success');
     status = await statusOf(socket2);
     assert.deepStrictEqual([serviceIn(status, ws2, 'a')!.state, serviceIn(status, ws2, 'b')!.state], ['released', 'built'], JSON.stringify(status));
     assert.ok(status.errors.some((e) => e.kind === 'evicted' && e.service === 'a'), JSON.stringify(status.errors));
-    // Its next warm request builds it again, answering as before.
+    // Its capture went with it: a probe capture is not built in the daemon.
+    const probe2 = await SocketClient.greeted(socket2, 'probe');
+    assert.strictEqual(await answerOrClose(probe2, captureOf(ws2, 'a', fs.mkdtempSync(path.join(ws2, 'stub-')))), 'closed');
+    // Its next warm request builds it again, answering as before, and its footprint is measured afresh.
     const first = await warm2.send(initOf(ws2, 'a'));
     assert.strictEqual(first.status, 'ready');
     const rebuilt = await warm2.send(inferOf(ws2, 'a'));
     assert.strictEqual(rebuilt.status, 'success');
     assert.match(JSON.stringify(rebuilt.inferred_types), /id: string; n: number/);
+    const again = serviceIn(await statusOf(socket2), ws2, 'a')!.footprint_mb!;
+    // Measured afresh, never added to the footprint it had before its release.
+    assert.ok(again <= firstFootprint, `footprint ${again} MB after a rebuild, ${firstFootprint} MB before`);
     warm2.conn.destroy();
     await stopDaemon(child2, socket2);
+  });
+
+  it('builds a service on its warm init, so a probe is served without another request', async () => {
+    const ws = workspace();
+    const child = await daemon(ws);
+    const socket = recordOf(ws)!.socket;
+    const warm = await SocketClient.greeted(socket);
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    const status = await statusOf(socket);
+    assert.strictEqual(serviceIn(status, ws, 'a')!.state, 'built', JSON.stringify(status.services));
+    assert.ok((serviceIn(status, ws, 'a')!.footprint_mb ?? 0) > 0);
+    const probe = await SocketClient.greeted(socket, 'probe');
+    assert.strictEqual((await probe.send(initOf(ws, 'a'))).status, 'ready');
+    assert.strictEqual((await probe.send(inferOf(ws, 'a'))).status, 'success');
+    warm.conn.destroy();
+    probe.conn.destroy();
+    await stopDaemon(child, socket);
+  });
+
+  it('forces a collection only for a warm build or over the cap, never for a probe under it', async () => {
+    const ws = workspace();
+    const child = await daemon(ws);
+    const socket = recordOf(ws)!.socket;
+    const warm = await SocketClient.greeted(socket);
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    const afterWarm = (await statusOf(socket)).collections;
+    assert.ok(afterWarm > 0, 'a warm build measures its footprint');
+    const probe = await SocketClient.greeted(socket, 'probe');
+    assert.strictEqual((await probe.send(initOf(ws, 'a'))).status, 'ready');
+    for (let i = 0; i < 3; i += 1) assert.strictEqual((await probe.send(inferOf(ws, 'a'))).status, 'success');
+    assert.strictEqual((await statusOf(socket)).collections, afterWarm);
+    warm.conn.destroy();
+    probe.conn.destroy();
+    await stopDaemon(child, socket);
   });
 
   it('removes the kept judge workspaces of dead daemons only', async () => {

@@ -1121,6 +1121,8 @@ export interface StatusResponse extends BaseResponse {
     counters: { warm_answers: number; init_refused: number; closed_for_cold: number; abandoned: number; skipped: number };
     /** The last 20 daemon-only events, oldest first. */
     errors: DaemonEvent[];
+    /** Full collections the daemon forced: for a warm build's footprint, or with the heap over its cap. */
+    collections: number;
     /** Checks run on the kept judge workspace (carrick#2883), those whose install was skipped, and the workspace kept now (its size measured when the last check released it). */
     judge: { checks: number; installs_skipped: number; workspace_dir: string | null; size_mb: number | null };
     /** Only under `CARRICK_TYPED_VERIFY=1` (carrick#2886): requests answered warm and cold, and how they compared. */
