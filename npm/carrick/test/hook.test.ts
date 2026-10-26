@@ -531,11 +531,12 @@ test("a three-file patch is one binary call, and every file gets its answer", as
     .split("\n")
     .filter((line) => line.trim().length > 0);
   assert.equal(calls.length, 1, calls.join("\n"));
-  // Three headers, one per answer, in the order the patch names them.
-  const headers = contextOf(run.stdout)
-    .split("\n")
-    .filter((line) => line.startsWith("Carrick noted the edit to "));
-  assert.equal(headers.length, 3, contextOf(run.stdout));
+  // None of the three was re-checked: one line names all three, in the order
+  // the patch names them, rather than the same sentence three times.
+  assert.equal(
+    contextOf(run.stdout),
+    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish.",
+  );
 });
 
 test("a repo whose re-check is known not to fit gets one pointer line per edit and still records", async (t) => {

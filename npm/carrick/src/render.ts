@@ -294,10 +294,32 @@ function cutLine(text: string): string {
  * moved past the index, a re-check answered from the working tree, or the
  * file is gone (its rows then say what the deletion leaves behind).
  */
-function answersTheEdit(result: CheckResult): boolean {
+export function answersTheEdit(result: CheckResult): boolean {
   if (!result.stale || result.deleted) return true;
   const ran = result.recheck?.ran;
   return ran !== undefined && ran !== "none";
+}
+
+/** Files one "not re-checked" line names before it counts the rest. */
+const MAX_NOTED_FILES = 5;
+
+/**
+ * The one line for edited files the re-check did not answer for: the index's
+ * verdicts describe them before the edit, so none is printed, and the reader
+ * is sent to the command that answers.
+ */
+export function notedLine(files: string[]): string {
+  const run = "run `carrick check --changed` before you finish.";
+  if (files.length === 1) {
+    return `Carrick noted the edit to ${files[0]}. It was not re-checked here, so ${run}`;
+  }
+  const shown = files.slice(0, MAX_NOTED_FILES);
+  const rest = files.length - shown.length;
+  const named =
+    rest > 0
+      ? `${shown.join(", ")} and ${rest} more`
+      : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
+  return `Carrick noted the edits to ${named}. They were not re-checked here, so ${run}`;
 }
 
 function deletedLine(result: CheckResult, where: string): string {
@@ -330,7 +352,7 @@ function deletedLine(result: CheckResult, where: string): string {
 export function renderPostToolUse(
   result: CheckResult,
   displayFile?: string,
-  options: { uses?: boolean } = {},
+  options: { uses?: boolean; noted?: boolean } = {},
 ): string | null {
   if (result.error) return null;
   // `result.file` is relative to the repo that owns it, so the caller's own
@@ -338,9 +360,8 @@ export function renderPostToolUse(
   const where = displayFile ?? result.file ?? "this file";
   const lines: string[] = [];
   if (!answersTheEdit(result)) {
-    lines.push(
-      `Carrick noted the edit to ${where}. It was not re-checked here, so run \`carrick check --changed\` before you finish.`,
-    );
+    // A patch of several files states this once for all of them (`notedLine`).
+    if (options.noted !== false) lines.push(notedLine([where]));
   } else {
     const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     if (result.deleted) {
@@ -358,8 +379,9 @@ export function renderPostToolUse(
   }
   const uses = options.uses === false ? 0 : (result.uses_lines ?? []).length;
   if (uses > 0) {
+    const them = uses === 1 ? "the 1 use; open it" : `the ${uses} uses; open them`;
     lines.push(
-      `Other files use what this file declares: \`carrick check ${where}\` lists the ${uses} ${uses === 1 ? "use" : "uses"}; open them if this edit changed a signature or a type.`,
+      `Other files use what this file declares: \`carrick check ${where}\` lists ${them} if this edit changed a signature or a type.`,
     );
   }
   return lines.join("\n");

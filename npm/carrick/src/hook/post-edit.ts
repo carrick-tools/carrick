@@ -21,7 +21,7 @@ import path from "node:path";
 import { check, checkEach } from "../cli.ts";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { renderPostToolUse } from "../render.ts";
+import { answersTheEdit, notedLine, renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
@@ -168,6 +168,9 @@ async function main(): Promise<void> {
   // one binary call, not one per file: each call re-reads the index and, on a
   // repo whose re-check does not fit, would wait out a budget of its own.
   const answers = await answersFor(relatives, choice.root);
+  // Files of this call the re-check did not answer for: one line names them
+  // all, rather than the same sentence once per file of a patch.
+  const unchecked: string[] = [];
   for (const [index, relative] of relatives.entries()) {
     const result = answers.results[index] ?? null;
     if (!result) {
@@ -180,10 +183,12 @@ async function main(): Promise<void> {
     const key = toldKey(result, relative);
     const show = !payload.session_id || !wasTold(payload.session_id, key);
     if (show && result.uses_lines?.length) told.push(key);
-    const context = renderPostToolUse(result, relative, { uses: show });
+    if (!result.error && !answersTheEdit(result)) unchecked.push(relative);
+    const context = renderPostToolUse(result, relative, { uses: show, noted: false });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) contexts.push(context);
   }
+  if (unchecked.length > 0) contexts.unshift(notedLine(unchecked));
 
   // Silent and local: the names go to a file under the user's home directory
   // and nothing about them is printed here.

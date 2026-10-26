@@ -4,6 +4,7 @@ import {
   BOUNDARY_POINTER,
   LISTED_SERVICES,
   MAX_EDIT_LINE_CHARS,
+  notedLine,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -59,6 +60,21 @@ test("an edit the hook could not re-check lists none of the index's verdicts", (
       "Carrick noted the edit to src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish.",
     );
   }
+});
+
+test("files a patch left un-checked share one line that names at most five", () => {
+  const files = Array.from({ length: 8 }, (_, n) => `src/f${n}.ts`);
+  assert.equal(
+    notedLine(files),
+    "Carrick noted the edits to src/f0.ts, src/f1.ts, src/f2.ts, src/f3.ts, src/f4.ts and 3 more. They were not re-checked here, so run `carrick check --changed` before you finish.",
+  );
+  assert.equal(
+    notedLine(files.slice(0, 2)),
+    "Carrick noted the edits to src/f0.ts and src/f1.ts. They were not re-checked here, so run `carrick check --changed` before you finish.",
+  );
+  // The caller that states the line itself asks the file's render to leave it out.
+  const stale = fixture("check-mismatch.json");
+  assert.equal(renderPostToolUse(stale, undefined, { noted: false }), "");
 });
 
 test("a re-checked edit lists its problems and nothing that is fine", () => {
