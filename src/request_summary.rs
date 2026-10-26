@@ -8636,6 +8636,7 @@ impl RequestSummaryIndex {
     pub fn withdraw_registrations(
         &mut self,
         registered: &HashMap<PathBuf, BTreeSet<u32>>,
+        facts: &[(String, u32)],
     ) -> usize {
         let mut withdrawn = 0;
         for sites in self.rows.values_mut() {
@@ -8645,6 +8646,10 @@ impl RequestSummaryIndex {
                     !registered
                         .get(&row.request_at.0)
                         .is_some_and(|spans| spans.contains(&row.request_at.1))
+                        && !facts.iter().any(|(file, start)| {
+                            row.request_at.0.ends_with(Path::new(file))
+                                && row.request_at.1 == *start
+                        })
                 });
                 withdrawn += before - rows.len();
             }

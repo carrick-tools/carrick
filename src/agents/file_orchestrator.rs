@@ -4236,10 +4236,15 @@ impl FileOrchestrator {
                     .filter_map(|endpoint| endpoint.call_expression_span_start),
             );
         }
-        let withdrawn = summaries.withdraw_registrations(&registered);
+        let store_registrations = fact_files
+            .as_ref()
+            .filter(|_| choosing_files)
+            .map(|facts| facts.server_framework_start_pairs())
+            .unwrap_or_default();
+        let withdrawn = summaries.withdraw_registrations(&registered, &store_registrations);
         if withdrawn > 0 {
             debug!(
-                "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint"
+                "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint or the store labels a server framework"
             );
         }
         let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
