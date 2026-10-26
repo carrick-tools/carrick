@@ -1342,7 +1342,7 @@ fn slot_pieces(placed: &Placed<'_>, name: &(usize, Option<String>)) -> Result<Ve
         (Some(value), None) => value,
         (Some(Value::Obj(object)), Some(key)) => match object.key(key) {
             KeyState::Known(value) => value,
-            KeyState::Unread => return Err(Prefix::Unread { text: None }),
+            KeyState::Unread | KeyState::Function => return Err(Prefix::Unread { text: None }),
             KeyState::Absent => return Err(Prefix::Unstated),
         },
         (Some(_), Some(_)) => return Err(Prefix::Unread { text: None }),

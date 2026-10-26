@@ -815,6 +815,104 @@ fn routes_across_services_take_the_receiving_scope() {
     );
 }
 
+/// Each service's `routes_*` counts, as `service key=count`.
+fn route_counts(fallbacks: &Fallbacks) -> Vec<String> {
+    let mut out = Vec::new();
+    for (service, counts) in fallbacks {
+        for (key, count) in counts.iter().filter(|(key, _)| key.starts_with("routes_")) {
+            out.push(format!("{service} {key}={count}"));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// carrick#2741: a callback option written as a method (`async extra(scope)
+/// {...}`) is the same function an arrow property is, so the scope it is
+/// handed is read the same way. The host's graph and counts are those of
+/// `routes_across_services_take_the_receiving_scope`'s arrow form.
+#[test]
+fn a_callback_option_written_as_a_method_is_read_like_an_arrow() {
+    let arrow = std::fs::read_to_string(
+        fixture_dir("receiver-scopes-across").join("repo/packages/server/src/server.ts"),
+    )
+    .unwrap();
+    let method = arrow.replace(
+        "extra: async (scope: App) => {",
+        "async extra(scope: App) {",
+    );
+    assert_ne!(arrow, method, "the fixture no longer states the arrow form");
+    let (arrow_blobs, arrow_counts) =
+        scan_runs_reading("receiver-scopes-across", &[], true, Some("1"), 1, true).remove(0);
+    let (method_blobs, method_counts) = scan_runs_reading(
+        "receiver-scopes-across",
+        &[("packages/server/src/server.ts", &method)],
+        true,
+        Some("1"),
+        1,
+        true,
+    )
+    .remove(0);
+    assert_eq!(endpoint_rows(&method_blobs), endpoint_rows(&arrow_blobs));
+    assert_eq!(route_counts(&method_counts), route_counts(&arrow_counts));
+    assert!(
+        route_counts(&method_counts)
+            .iter()
+            .any(|count| count.contains("routes_across_corrected=1")),
+        "{:#?}",
+        route_counts(&method_counts)
+    );
+}
+
+/// A host's options: a literal prefix beside a method.
+const HOOKS: &str = r#"import router, { Reply, Request } from "fixture-router";
+
+function ok(_request: Request, reply: Reply): void {
+  reply.send("ok");
+}
+
+const app = router();
+app.register((scoped) => {
+  scoped.get("/hooked", ok);
+}, { prefix: "/hk", onReady() {} });
+export default app;
+"#;
+
+/// carrick#2741: a method in a host's options sets its own key only, so a
+/// literal `prefix` beside it is still read (it used to read as unreadable,
+/// so the scope's route kept its unprefixed path).
+#[test]
+fn a_method_beside_a_literal_prefix_leaves_the_prefix_read() {
+    let (blobs, counts) = scan_runs_reading(
+        "receiver-scopes",
+        &[("src/hooks.ts", HOOKS)],
+        true,
+        Some("1"),
+        1,
+        true,
+    )
+    .remove(0);
+    let rows: Vec<String> = endpoint_rows(&blobs)
+        .0
+        .into_iter()
+        .filter(|row| row.starts_with("src/hooks.ts:"))
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["src/hooks.ts:9 GET /hk/hooked library_claim scoped"],
+        "{:#?} {:#?}",
+        endpoint_rows(&blobs),
+        route_counts(&counts)
+    );
+    assert!(
+        !route_counts(&counts)
+            .iter()
+            .any(|count| count.contains("unread_prefix")),
+        "{:#?}",
+        route_counts(&counts)
+    );
+}
+
 /// A scan flag set for the changed-only tests: the repository's name, and
 /// the unprepared tree allowed.
 fn named(cmd: &mut Command) -> &mut Command {

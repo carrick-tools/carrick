@@ -455,12 +455,16 @@ pub struct ObjValue {
     /// row moves.
     pub under_rest: Option<(u8, usize, BTreeSet<String>)>,
     /// The keys whose value depends on which spread branch runs (carrick#2474
-    /// R5e): `open` is also set, for the readers that only ask whether
-    /// anything beyond `fields` may be in the object.
+    /// R5e), or that a getter or setter writes (its value is not stated):
+    /// `open` is also set, for the readers that only ask whether anything
+    /// beyond `fields` may be in the object.
     pub unsettled: BTreeSet<String>,
-    /// Something the source does not state is in the object: a spread of a
-    /// value, a computed key, or a method, getter or setter. Any key not in
-    /// `fields` may be set by it.
+    /// The keys the literal writes as a method (carrick#2741): a function,
+    /// not a value any reader of `fields` takes. `open` is also set.
+    pub functions: BTreeSet<String>,
+    /// Something the source does not state may set any key not in `fields`: a
+    /// spread of a value, or a computed key. A method, getter or setter with a
+    /// plain key sets only that key.
     pub wide: bool,
 }
 
@@ -471,8 +475,10 @@ pub enum KeyState<'a> {
     Known(&'a Value),
     /// No spread or computed key can set the key: it is not there.
     Absent,
-    /// A spread or a computed key may set the key; the source does not say
-    /// to what.
+    /// The literal writes the key as a method: a function, not a value.
+    Function,
+    /// A spread or a computed key may set the key, or a getter or setter
+    /// writes it; the source does not say to what.
     Unread,
 }
 
@@ -483,6 +489,7 @@ impl ObjValue {
     pub fn key(&self, key: &str) -> KeyState<'_> {
         match self.fields.get(key) {
             Some(value) => KeyState::Known(value),
+            None if self.functions.contains(key) => KeyState::Function,
             None if self.wide || self.unsettled.contains(key) => KeyState::Unread,
             None => KeyState::Absent,
         }
@@ -509,6 +516,7 @@ impl ObjValue {
                 }
                 _ => {
                     self.fields.remove(key);
+                    self.functions.remove(key);
                     self.unsettled.insert(key.clone());
                     self.open = true;
                 }
@@ -553,6 +561,7 @@ impl Value {
                     .collect(),
                 open: obj.open,
                 unsettled: obj.unsettled.clone(),
+                functions: obj.functions.clone(),
                 wide: obj.wide,
                 // A closure's object reads as it always did.
                 under_param: None,
@@ -5513,6 +5522,7 @@ impl Reader<'_> {
                             under_param: None,
                             under_rest: None,
                             unsettled: BTreeSet::new(),
+                            functions: BTreeSet::new(),
                             wide: true,
                         });
                     }
@@ -5825,6 +5835,7 @@ impl Reader<'_> {
                                     .map(|index| (index, std::mem::take(&mut value.fields)));
                             }
                             value.fields.clear();
+                            value.functions.clear();
                             value.open = true;
                             value.wide = true;
                         }
@@ -5836,10 +5847,13 @@ impl Reader<'_> {
             match &**prop {
                 Prop::KeyValue(kv) => match prop_name(&kv.key) {
                     Some(key) => {
+                        value.functions.remove(&key);
+                        value.unsettled.remove(&key);
                         value.fields.insert(key, self.eval(&kv.value, scope));
                     }
                     None => {
                         value.fields.clear();
+                        value.functions.clear();
                         value.open = true;
                         value.wide = true;
                         value.under_param = None;
@@ -5848,26 +5862,44 @@ impl Reader<'_> {
                 },
                 Prop::Shorthand(ident) => {
                     let expr = Expr::Ident(ident.clone());
-                    value
-                        .fields
-                        .insert(ident.sym.to_string(), self.eval(&expr, scope));
+                    let key = ident.sym.to_string();
+                    value.functions.remove(&key);
+                    value.unsettled.remove(&key);
+                    value.fields.insert(key, self.eval(&expr, scope));
                 }
                 // A method, a getter or a setter: its key holds no value this
-                // pass reads.
+                // pass reads. With a plain key it sets that key only; any
+                // other form may set any key.
                 other => {
                     match other {
-                        Prop::Method(MethodProp { key, .. })
-                        | Prop::Getter(GetterProp { key, .. })
+                        Prop::Method(MethodProp { key, .. }) => match prop_name(key) {
+                            Some(name) => {
+                                value.fields.remove(&name);
+                                value.unsettled.remove(&name);
+                                value.functions.insert(name);
+                            }
+                            None => {
+                                value.fields.clear();
+                                value.functions.clear();
+                                value.wide = true;
+                            }
+                        },
+                        Prop::Getter(GetterProp { key, .. })
                         | Prop::Setter(SetterProp { key, .. }) => match prop_name(key) {
                             Some(name) => {
                                 value.fields.remove(&name);
+                                value.functions.remove(&name);
+                                value.unsettled.insert(name);
                             }
-                            None => value.fields.clear(),
+                            None => {
+                                value.fields.clear();
+                                value.functions.clear();
+                                value.wide = true;
+                            }
                         },
-                        _ => {}
+                        _ => value.wide = true,
                     }
                     value.open = true;
-                    value.wide = true;
                     value.under_param = None;
                     value.under_rest = None;
                 }
@@ -9926,6 +9958,7 @@ mod tests {
             under_param: None,
             under_rest: None,
             unsettled: BTreeSet::new(),
+            functions: BTreeSet::new(),
             wide: open,
         })
     }
@@ -10082,6 +10115,7 @@ mod tests {
             under_param: None,
             under_rest: None,
             unsettled: BTreeSet::new(),
+            functions: BTreeSet::new(),
             wide: false,
         });
         assert_eq!(
@@ -10328,6 +10362,69 @@ mod tests {
             }) => obj.clone(),
             other => panic!("{function} sends no object body: {other:?}"),
         }
+    }
+
+    /// What the object `literal` (written as a request body) states about
+    /// `a`, `b` and `c`, in that order.
+    fn key_states(literal: &str) -> Vec<String> {
+        let source = format!(
+            "export async function send(k: string) {{\n  return fetch(\"https://api.example.com/x\", {{ method: \"POST\", body: JSON.stringify({literal}) }});\n}}\n"
+        );
+        let body = request_body(&source, "send");
+        ["a", "b", "c"]
+            .iter()
+            .map(|key| match body.key(key) {
+                KeyState::Known(_) => "known",
+                KeyState::Function => "function",
+                KeyState::Unread => "unread",
+                KeyState::Absent => "absent",
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// carrick#2741: a method, getter or setter with a plain key sets that
+    /// key only, so every other absent key is still absent; a computed key
+    /// or a spread may set any key.
+    #[test]
+    fn a_method_sets_its_own_key_and_no_other() {
+        assert_eq!(
+            key_states("{ a() {}, b: 1 }"),
+            ["function", "known", "absent"]
+        );
+        assert_eq!(
+            key_states("{ get a() { return \"x\"; } }"),
+            ["unread", "absent", "absent"]
+        );
+        assert_eq!(
+            key_states("{ set a(v) {}, b() {} }"),
+            ["unread", "function", "absent"]
+        );
+        assert_eq!(key_states("{ [k]: 1 }"), ["unread", "unread", "unread"]);
+        assert_eq!(
+            key_states("{ [k]() {}, b: 1 }"),
+            ["unread", "known", "unread"]
+        );
+        // The last writer of a key wins.
+        assert_eq!(
+            key_states("{ a() {}, a: 1 }"),
+            ["known", "absent", "absent"]
+        );
+        assert_eq!(
+            key_states("{ a: 1, a() {} }"),
+            ["function", "absent", "absent"]
+        );
+        // A spread the source does not state may overwrite the method.
+        assert_eq!(
+            key_states("{ a() {}, ...k }"),
+            ["unread", "unread", "unread"]
+        );
+        // A method does not widen the object's body: it stays `open`.
+        assert!(request_body(
+            "export async function send() {\n  return fetch(\"https://api.example.com/x\", { method: \"POST\", body: JSON.stringify({ a() {}, b: 1 }) });\n}\n",
+            "send"
+        )
+        .open);
     }
 
     const SPREAD_WRAPPERS: &str = r#"

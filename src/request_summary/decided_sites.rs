@@ -1309,7 +1309,7 @@ fn payload_slot(down: &[Placed<'_>], slot: &ArgSlot) -> Option<SlotBinding> {
             arg,
             key: key.clone(),
         }),
-        KeyState::Unread => None,
+        KeyState::Unread | KeyState::Function => None,
     }
 }
 
