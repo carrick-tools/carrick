@@ -36,6 +36,19 @@ import { readServerLabels } from './server-labels.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
+import {
+  type AnswerKey,
+  type KeptAnswer,
+  changedSource,
+  inferCacheDir,
+  keepable,
+  programDifference,
+  programRecord,
+  rebuildProgram,
+  readEntry,
+  requestDigest,
+  writeEntry,
+} from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
 import type {
@@ -70,6 +83,8 @@ import type {
 
 let projectLoader: ProjectLoader | null = null;
 let initTimeMs: number | null = null;
+/** `requestDigest` of the `init` request this process was last scoped with (carrick#2843). */
+let initDigest = '';
 
 /**
  * The components that read the init'd ts-morph project. Built together with
@@ -225,6 +240,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     // Re-init re-scopes the sidecar to another root: drop everything built
     // over the previous project before resolving the new one.
     components = new Map();
+    initDigest = requestDigest(request);
     projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
@@ -421,12 +437,22 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
+    const groups = byProject(request.requests, (item) => item.file_path);
+    const cacheKey = inferAnswerKey(request, groups);
+    if (cacheKey) {
+      const served = servedAnswer(cacheKey);
+      if (served) {
+        log(`Inferred ${request.requests.length} type(s) from the kept answer (carrick#2843)`);
+        return { request_id: request.request_id, ...served };
+      }
+    }
+
     // One count for the request, whichever programs its items span.
     let done = 0;
     const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
       writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
     );
-    const results = [...byProject(request.requests, (item) => item.file_path)].map(
+    const results = [...groups].map(
       ([key, items]) => {
         const built = projectComponents(key);
         return built.typeInferrer.infer(
@@ -454,14 +480,18 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
             };
           })();
 
-    return {
-      request_id: request.request_id,
+    const answer: KeptAnswer = {
       status: result.success ? 'success' : 'error',
       inferred_types: result.inferred_types,
+      errors: result.errors,
+    };
+    if (cacheKey) keepAnswer(cacheKey, [...groups.keys()], answer);
+    return {
+      request_id: request.request_id,
+      ...answer,
       // Beside the answers and never in them: what the requests cost, for
       // the caller's log (carrick#1985).
       infer_timing: mergeInferTimings(results.map((r) => r.timing)),
-      errors: result.errors,
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -472,6 +502,103 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
       status: 'error',
       errors: [error],
     };
+  }
+}
+
+/**
+ * carrick#2843: what a kept answer to `request` is read against, or
+ * `undefined` when no answer to it is kept: the cache is off, the request
+ * reads server-framework claims (in a program the record does not cover),
+ * the project resolves through a module graph read outside the compiler, or
+ * a request before this one built a program it is answered in (its roots
+ * then depend on that request).
+ */
+function inferAnswerKey(
+  request: SidecarRequest & { action: 'infer' },
+  groups: Map<string, InferRequestItem[]>
+): AnswerKey | undefined {
+  const dir = inferCacheDir();
+  if (!dir) return undefined;
+  const loader = initializedLoader();
+  if (loader.resolvesThroughModuleGraph()) return undefined;
+  for (const [key, items] of groups) {
+    if (loader.isBuilt(key) || components.has(key)) return undefined;
+    if (
+      request.server_claims &&
+      request.server_claims.checks.length > 0 &&
+      items.some((item) => ROUTE_ROW_KINDS.has(item.infer_kind))
+    ) {
+      return undefined;
+    }
+  }
+  return { dir, repoRoot: loader.getRepoRoot(), init: initDigest, request: requestDigest(request) };
+}
+
+/**
+ * carrick#2843: the kept answer for `key` when every program it was read in
+ * is, built again now, the same program. Each is built from its tsconfig and
+ * given the roots the kept one had, in order, and rebuilt once more when the
+ * kept one had been, so a match leaves the program the inference would have
+ * left. A program that does not match is dropped
+ * again, so the inference that follows builds it as it would have with no
+ * cache.
+ */
+function servedAnswer(key: AnswerKey): KeptAnswer | undefined {
+  const entry = readEntry(key);
+  if (!entry) return undefined;
+  // A file that changed on disk is found without building a program.
+  for (const kept of entry.programs) {
+    const changedFile = changedSource(kept);
+    if (changedFile) {
+      log(`The kept infer answer was read in a program that has changed (${changedFile}): inferring again (carrick#2843)`);
+      return undefined;
+    }
+  }
+  const loader = initializedLoader();
+  const touched: string[] = [];
+  let same = true;
+  let changed = 'a root file it could not read';
+  for (const kept of entry.programs) {
+    touched.push(kept.key);
+    const project = loader.getProjectFor(kept.key);
+    addProgramFiles(project, kept.roots, () => {
+      same = false;
+    });
+    if (!same) break;
+    let now = programRecord(kept.key, project);
+    if (now.roots.length < kept.roots.length) {
+      // The inference's own rewrites rebuilt the program after its first
+      // build, and a rebuild names every file the first one reached as a
+      // root. Rebuilt once more here, it names the same.
+      rebuildProgram(project);
+      now = programRecord(kept.key, project);
+    }
+    const difference = programDifference(kept, now);
+    if (difference) {
+      same = false;
+      changed = difference;
+      break;
+    }
+  }
+  if (same) return entry.answer;
+  for (const programKey of touched) loader.releaseProjectFor(programKey);
+  log(`The kept infer answer was read in a program that has changed (${changed}): inferring again (carrick#2843)`);
+  return undefined;
+}
+
+/** carrick#2843: keep `answer` for `key`, with the programs it was read in as they stand. */
+function keepAnswer(key: AnswerKey, programKeys: string[], answer: KeptAnswer): void {
+  if (!keepable(answer)) return;
+  try {
+    const loader = initializedLoader();
+    writeEntry(
+      key,
+      programKeys.map((programKey) => programRecord(programKey, loader.getProjectFor(programKey))),
+      answer
+    );
+  } catch (err) {
+    // Keeping an answer never costs the answer.
+    logError(`The infer answer was not kept: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

@@ -865,6 +865,14 @@ pub(super) fn scan_command(
     } else {
         command.env_remove(crate::preflight::ALLOW_ENV);
     }
+    // A laptop scans the same services again and again, so its sidecars keep
+    // their type answers and serve them again while the program they were
+    // read in is unchanged (carrick#2843). A directory the caller named wins.
+    if std::env::var_os(crate::services::type_sidecar::INFER_CACHE_ENV).is_none()
+        && let Some(dir) = crate::services::type_sidecar::local_infer_cache_dir()
+    {
+        command.env(crate::services::type_sidecar::INFER_CACHE_ENV, dir);
+    }
     // Always: the ambient CI context would name every repo in the workspace
     // after the one whose shell this ran in, and on a laptop scan its OIDC
     // variables would select the wrong credential entirely.
@@ -2258,6 +2266,34 @@ mod tests {
         );
         assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&None));
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
+    }
+
+    /// Every laptop scan's sidecars keep their `infer` answers in the home
+    /// cache, and a directory the caller named is left to it (carrick#2843).
+    #[test]
+    #[serial_test::serial(infer_cache_dir)]
+    fn every_scan_keeps_its_infer_answers_in_the_home_cache() {
+        let env_name = crate::services::type_sidecar::INFER_CACHE_ENV;
+        // SAFETY: serialised with every other test that reads this variable.
+        let caller = std::env::var_os(env_name);
+        unsafe { std::env::remove_var(env_name) };
+        let expected = crate::services::type_sidecar::local_infer_cache_dir()
+            .map(|dir| dir.to_string_lossy().into_owned());
+        assert!(expected.is_some(), "the test machine has a home directory");
+        for pass in [Pass::Facts, Pass::Infer, Pass::Dispatch] {
+            assert_eq!(scan_env(&pass).get(env_name), Some(&expected));
+        }
+        unsafe { std::env::set_var(env_name, "/elsewhere") };
+        let named = scan_env(&Pass::Facts);
+        match caller {
+            Some(value) => unsafe { std::env::set_var(env_name, value) },
+            None => unsafe { std::env::remove_var(env_name) },
+        }
+        assert_eq!(
+            named.get(env_name),
+            None,
+            "the caller's directory is inherited"
+        );
     }
 
     /// A build the flag allowed hands that decision to every scan it starts,

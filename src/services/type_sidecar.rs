@@ -1940,6 +1940,19 @@ pub fn ready_budget() -> Duration {
 // V8 heap sizing
 // ============================================================================
 
+/// The directory a sidecar keeps its `infer` answers in, one per service, and
+/// serves them again from while the program they were read in is unchanged
+/// (carrick#2843, `src/sidecar/src/infer-cache.ts`). Unset, nothing is kept:
+/// a CI scan starts on a clean machine and has nothing to serve again.
+pub const INFER_CACHE_ENV: &str = "CARRICK_INFER_CACHE_DIR";
+
+/// Where a laptop scan's sidecars keep their `infer` answers:
+/// `~/.carrick/cache/infer`, beside the run logs, or `None` with no home
+/// directory.
+pub fn local_infer_cache_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".carrick").join("cache").join("infer"))
+}
+
 /// Env override for the sidecar's V8 old-space cap, in MB. `0` (or an
 /// unparseable value) means "do not pass the flag at all" — V8's own default.
 pub const MAX_OLD_SPACE_ENV: &str = "CARRICK_SIDECAR_MAX_OLD_SPACE_MB";

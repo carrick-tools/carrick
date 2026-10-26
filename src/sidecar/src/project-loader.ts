@@ -563,6 +563,23 @@ export class ProjectLoader {
   }
 
   /**
+   * Whether the project behind a key from `projectKeyFor` has been built,
+   * without building it (carrick#2843).
+   */
+  isBuilt(key: string): boolean {
+    return key === '' ? this.project !== null : this.ownerProjects.has(key);
+  }
+
+  /**
+   * Whether the project resolves through a module graph read outside the
+   * compiler (Deno, carrick#1260). What such a program reads is not all in
+   * its source files (carrick#2843).
+   */
+  resolvesThroughModuleGraph(): boolean {
+    return this.denoProject !== undefined;
+  }
+
+  /**
    * The default project when a request has built it, and `undefined` before
    * that, without building it (carrick#2027).
    */
