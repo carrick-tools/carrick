@@ -58,6 +58,7 @@ import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, type ReadBound } from './checkout.js';
+import { emitHeld, type CaptureHold } from './warm.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
@@ -79,6 +80,8 @@ export { KeptJudge } from './kept-judge.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations } from './check-probe.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';
+// carrick#2882: what a resident sidecar keeps of a service's capture.
+export { CaptureHold, type CaptureHoldCounts, type ChangedText, type EmitReach } from './warm.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';
 
@@ -162,7 +165,13 @@ function computeFidelity(records: CaptureAliasRecord[]): CaptureFidelity {
   return fidelity;
 }
 
-export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
+/**
+ * Capture one service's stub. `held`, given only by a resident sidecar, is
+ * what it kept of this service's last capture (carrick#2882): the capture
+ * reuses it where an edit cannot change the result, and writes the same
+ * stub and answer a cold capture writes.
+ */
+export function captureStub(opts: CaptureStubOptions, held?: CaptureHold): CaptureStubResult {
   const repoRoot = path.resolve(opts.repoRoot);
   const packageName = `@carrick/${sanitizeServiceName(opts.serviceName)}`;
   const stubDir = path.resolve(opts.outDir);
@@ -208,6 +217,9 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
+  // A Deno service reads through the Deno graph's host: captured cold.
+  const hold = deno ? undefined : held;
+  if (hold) hold.counts.captures += 1;
   if (deno) {
     parsed = deno.parsed;
     errors.push(...deno.diagnostics);
@@ -320,6 +332,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     augmentations,
     redirectFor,
     readsReferences: graphForRedirect?.hasReferences ?? false,
+    hold,
   };
   try {
     resolved = ownerGroups && emitProject
@@ -366,9 +379,12 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     written = emitDeclarations({
       rootNames: [entryPath, ...augmentationSources],
       options: emitOptions,
-      host: programHost(emitOptions, deno, bound),
+      host: hold
+        ? hold.sources.wrap(programHost(emitOptions, deno, bound) ?? ts.createCompilerHost(emitOptions), emitOptions)
+        : programHost(emitOptions, deno, bound),
       staging,
       entryDir,
+      held: hold ? { hold, entryPath } : undefined,
     });
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
@@ -579,6 +595,9 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     pinned,
     bareCheckout,
     repoRoot: dependencyRoot,
+    held: hold
+      ? { hold, context: JSON.stringify([bound !== undefined, Object.entries(rewritten.installs).sort()]) }
+      : undefined,
     compilerHost:
       deno || bound || Object.keys(rewritten.installs).length > 0
         ? (options) =>
@@ -664,20 +683,30 @@ function emitDeclarations(args: {
   staging: string;
   /** The directory the entry sits in (`options.rootDir`). */
   entryDir: string;
+  /** A resident sidecar's hold, and the entry this emit writes again (carrick#2882). */
+  held?: { hold: CaptureHold; entryPath: string };
 }): DeclarationEmit {
   const emitted = new Map<string, string>();
   const declarationSources = new Map<string, string>();
   const sourceByEmitted = new Map<string, string>();
   const program = ts.createProgram(args.rootNames, sidecarCompilerOptions(args.options), args.host);
-  const emitResult = program.emit(
-    undefined,
-    (fileName, text, _bom, _error, sources) => {
-      emitted.set(fileName, text);
-      if (sources?.[0]) sourceByEmitted.set(path.relative(args.staging, fileName).split(path.sep).join('/'), sources[0].fileName);
-    },
-    undefined,
-    /* emitOnlyDtsFiles */ true
-  );
+  const write = (fileName: string, text: string, source: string | undefined): void => {
+    emitted.set(fileName, text);
+    if (source) sourceByEmitted.set(path.relative(args.staging, fileName).split(path.sep).join('/'), source);
+  };
+  let emitResult: { emitSkipped: boolean; diagnostics: readonly ts.Diagnostic[] };
+  if (args.held) {
+    const result = emitHeld(args.held.hold, program, args.held.entryPath, args.staging);
+    for (const output of result.outputs) write(output.fileName, output.text, output.source);
+    emitResult = { emitSkipped: result.skipped, diagnostics: result.diagnostics };
+  } else {
+    emitResult = program.emit(
+      undefined,
+      (fileName, text, _bom, _error, sources) => write(fileName, text, sources?.[0]?.fileName),
+      undefined,
+      /* emitOnlyDtsFiles */ true
+    );
+  }
   // emitSkipped is PER-PROGRAM even when only one file's declaration emit
   // failed (e.g. TS4023 from a hand-rolled ambient stub shadowing a real
   // package): every other file's .d.ts was still written to the callback.
@@ -884,6 +913,8 @@ interface AnalysisContext {
   redirectFor: (owner: ServiceProject) => ReferenceRedirect | undefined;
   /** Whether the named config references other projects, so owners are read by references. */
   readsReferences: boolean;
+  /** A resident sidecar's hold: anchor programs read their files through its cache (carrick#2882). */
+  hold: CaptureHold | undefined;
 }
 
 /**
@@ -975,9 +1006,10 @@ function resolveAnchors(
       ...new Set([ctx.entryPath, ...anchorSources, ...ctx.augmentations(parsed), ...(deno?.globals ?? [])]),
     ];
     const redirect = owner && !deno ? ctx.redirectFor(owner) : undefined;
-    const host = redirect
-      ? redirectingCompilerHost(programHost(options, deno, ctx.bound) ?? ts.createCompilerHost(options), options, redirect)
+    const base = ctx.hold
+      ? ctx.hold.sources.wrap(programHost(options, deno, ctx.bound) ?? ts.createCompilerHost(options), options)
       : programHost(options, deno, ctx.bound);
+    const host = redirect ? redirectingCompilerHost(base ?? ts.createCompilerHost(options), options, redirect) : base;
     const program = ts.createProgram(rootNames, options, host);
     if (owner && !deno && ctx.readsReferences) markUncarried(program, uncarriedFiles(program, redirect, ctx.repoRoot));
     // The checker binds every file of the program when it is first asked for,

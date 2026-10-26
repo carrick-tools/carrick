@@ -47,6 +47,7 @@ import {
 } from './specifiers.js';
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
 import type { WriteGuard } from './guarded-fs.js';
+import { stubDiagnostics, type CaptureHold } from './warm.js';
 import {
   findDisqualifyingTopTypes,
   findUnresolvedPlaceholders,
@@ -68,6 +69,12 @@ export interface SelfCheckArgs {
   /** Producer repo root; its node_modules (if any) backs resolution. */
   repoRoot: string;
   compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
+  /**
+   * A resident sidecar's hold (carrick#2882), and what the stub's files
+   * resolve through beside the stub itself: the stub files whose text and
+   * surroundings are unchanged keep their diagnostics.
+   */
+  held?: { hold: CaptureHold; context: string };
 }
 
 interface FileFailures {
@@ -162,9 +169,25 @@ function runSelfCheck(
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, args.compilerHost?.(SELF_CHECK_OPTIONS));
+  const held = args.held;
+  const host = held
+    ? held.hold.sources.wrap(args.compilerHost?.(SELF_CHECK_OPTIONS) ?? ts.createCompilerHost(SELF_CHECK_OPTIONS), SELF_CHECK_OPTIONS)
+    : args.compilerHost?.(SELF_CHECK_OPTIONS);
+  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, host);
   const checker = program.getTypeChecker();
-  const diagnostics = ts.getPreEmitDiagnostics(program);
+  const diagnostics = held
+    ? stubDiagnostics(
+        held.hold,
+        program,
+        args.stubDir,
+        treeFiles,
+        JSON.stringify([
+          held.context,
+          fs.existsSync(path.join(args.stubDir, 'node_modules')),
+          treeFiles.map((file) => path.relative(args.stubDir, file)).sort(),
+        ])
+      )
+    : ts.getPreEmitDiagnostics(program);
 
   const surfaceAbs = path.resolve(args.surfaceAbsPath);
   const surfaceSource = program.getSourceFile(surfaceAbs);
