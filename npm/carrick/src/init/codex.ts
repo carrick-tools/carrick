@@ -15,8 +15,11 @@
 // the same reason: entries whose command is this CLI are the only ones touched,
 // and a hooks file a user already has keeps everything else in it.
 //
-// Two entries, which is the whole nudge on this host:
+// Three entries, which is the whole nudge on this host:
 //
+// * `SessionStart`, which puts the index map in front of the agent before its
+//   first move (carrick#2848). `hook session-start` prints it as
+//   `hookSpecificOutput.additionalContext` when Codex runs it.
 // * `PostToolUse` on `apply_patch`, which records what an edit added. The
 //   matcher is a regex (`codex-rs/hooks/src/engine/dispatcher.rs`) and
 //   `apply_patch` is the canonical tool name Codex puts on the payload.
@@ -28,7 +31,8 @@
 // One thing this file cannot do for the user: a project hook is untrusted until
 // Codex records its hash, and an untrusted hook is discovered and not run
 // (`hook_trust_status` in `discovery.rs`). Codex asks about it at its next
-// start. `carrick init` says so; nothing here can answer it.
+// start in the TUI only; `codex exec` and the editor extensions skip it without
+// a message. `carrick init` says so; nothing here can answer it.
 //
 // Reference: `docs/reference/task-skills.md`, "The reuse nudge".
 
@@ -54,6 +58,13 @@ export const CODEX_HOOKS_FILE = path.join(CODEX_DIR, "hooks.json");
 /** What this package registers with Codex, and the only entries it removes. */
 export function codexHooks(command = "carrick"): Record<string, HookGroup[]> {
   return {
+    // No matcher, timeout 30 as the Claude entry has it. Without this entry the
+    // agent is never told the index exists and starts without calling Carrick.
+    SessionStart: [
+      {
+        hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
+      },
+    ],
     // One call can carry a patch touching several files, and each one is a
     // separate `carrick check`, so this timeout is not the single-file 15 the
     // Claude entry uses. Codex applies the value as written for this event

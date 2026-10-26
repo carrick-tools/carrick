@@ -248,8 +248,11 @@ surviving path is re-checked and recorded exactly as a Claude Code edit is.
 **The file.** `carrick init` writes `.codex/hooks.json` — Codex's project config
 layer (`ConfigLayerSource::Project`), which nests its groups under a `hooks` key
 in the same shape a `.claude` settings file does, so the merge, the reader and
-the remover are the ones in `settings.ts`. It holds two entries: `PostToolUse`
-with matcher `apply_patch` (matchers are regexes) and `UserPromptSubmit`. A file
+the remover are the ones in `settings.ts`. It holds three entries: `SessionStart`
+(the index map before the agent's first move; `hook session-start` prints it as
+`hookSpecificOutput.additionalContext` when Codex runs it, and as plain text
+under Claude Code), `PostToolUse` with matcher `apply_patch` (matchers are
+regexes) and `UserPromptSubmit`. A file
 the user already has is merged into entry by entry; an entry is recognised as
 ours by the command it runs, which is the same rule the `.claude` file follows.
 `carrick remove` takes those entries out, and deletes the file — and the
@@ -259,8 +262,9 @@ not read its own install as a dirty tree.
 
 **One step init cannot take for you.** A project hook is untrusted until Codex
 records its hash, and an untrusted hook is discovered and never run
-(`hook_trust_status` in `discovery.rs`). Codex asks at its next start; `carrick
-init` says so on the line that reports the file.
+(`hook_trust_status` in `discovery.rs`). Only the `codex` TUI asks, at its next start; `codex exec` and the editor
+extensions never ask and skip untrusted hooks without saying so. `carrick init`
+says so on the line that reports the file.
 
 `carrick doctor` reports a missing or outdated Codex entry the way it reports
 the Claude ones, and only where the workspace holds a `.codex/` directory — that

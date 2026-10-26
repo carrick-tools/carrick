@@ -213,6 +213,37 @@ test("the session line asks status about the workspace, and states what it holds
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
 });
 
+// What Codex's own parser takes from a SessionStart hook
+// (`codex-rs/hooks/src/engine/output_parser.rs`, `parse_session_start`): one JSON
+// object whose `hookSpecificOutput.additionalContext` is the context. It reads
+// nothing else off stdout as context.
+test("under Codex the session line goes out as additionalContext; Claude Code keeps the plain print", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const env = (extra: Record<string, string>) =>
+    fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"), ...extra });
+
+  const plain = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "SessionStart" },
+    env: env({ CLAUDE_PROJECT_DIR: workspace.root }),
+  });
+  assert.match(plain.stdout, /^Carrick indexed 3 service\(s\)/);
+
+  const codex = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    payload: { hook_event_name: "SessionStart", session_id: "s", cwd: workspace.root },
+    env: env({ CLAUDE_PROJECT_DIR: "" }),
+  });
+  assert.equal(codex.code, 0);
+  const wire = JSON.parse(codex.stdout) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(wire), ["hookSpecificOutput"]);
+  const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
+  assert.equal(output.hookEventName, "SessionStart");
+  // The same text Claude Code is given, byte for byte.
+  assert.equal(`${output.additionalContext}\n`, plain.stdout);
+});
+
 test("no index gives the session one line and no session fails on it", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
