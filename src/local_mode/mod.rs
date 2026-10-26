@@ -29,6 +29,7 @@ pub(crate) mod query;
 mod read_model;
 pub(crate) mod recheck;
 pub(crate) mod scan_state;
+mod typed;
 mod uses;
 mod workspace;
 

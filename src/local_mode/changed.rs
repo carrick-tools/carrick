@@ -250,7 +250,13 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let generation =
         std::env::temp_dir().join(format!("carrick-check-changed-{}", uuid::Uuid::new_v4()));
     let rescan: Vec<&Path> = changed.values().map(|(path, _)| path.as_path()).collect();
-    let rejoined = super::recheck::rejoin(&workspace, &rescan, &generation, started + budget());
+    let rejoined = super::recheck::rejoin(
+        &workspace,
+        &rescan,
+        &generation,
+        started + budget(),
+        super::typed::Mode::Probe,
+    );
     // The temporary generation goes on every path, as the single-file
     // re-check's does.
     let _ = std::fs::remove_dir_all(&generation);
@@ -279,7 +285,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
 /// listed as the answer states them.
 type Changed = BTreeMap<String, (PathBuf, BTreeSet<String>)>;
 
-fn changed_files(
+pub(super) fn changed_files(
     workspace: &super::workspace::Workspace,
     index: &LocalIndex,
 ) -> (Vec<ChangedRepo>, Changed) {

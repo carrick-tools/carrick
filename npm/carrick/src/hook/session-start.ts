@@ -24,6 +24,7 @@ import { CHECK_BEFORE_DONE, renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { refreshInBackground } from "./refresh.ts";
+import { warmDaemonInBackground } from "./daemon.ts";
 import { versionMismatch } from "../init/outdated.ts";
 
 const log = createLogger("carrick-session");
@@ -127,6 +128,18 @@ async function main(): Promise<void> {
     log("background refresh not started", String(error));
   }
   if (started) lines.push(started);
+
+  // The resident type daemon each re-check answers through, started and
+  // warmed now so the session's first edit does not pay the cold path
+  // (carrick#2884). Detached and unwaited, and silent: nothing here is the
+  // agent's to act on.
+  if (!outcome.result.error) {
+    try {
+      warmDaemonInBackground(choice.root);
+    } catch (error) {
+      log("type daemon not started", String(error));
+    }
+  }
   flush(lines, codex);
 }
 

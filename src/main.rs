@@ -13,7 +13,7 @@ use carrick::{
 };
 use carrick::{errln, outln};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::{debug, error, info, warn};
 
 /// CLI arguments for the carrick analyzer
@@ -636,7 +636,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // =======================================================================
     let sp = logging::spinner("Initializing sidecar...");
     let mut sidecar_found = false;
-    let sidecar = match discover_sidecar_path() {
+    let sidecar = match type_sidecar::discover_sidecar_path() {
         Some(sidecar_path) => {
             sidecar_found = true;
             debug!("Found sidecar at: {}", sidecar_path.display());
@@ -772,66 +772,6 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Sidecar will be automatically shut down when it goes out of scope (Drop impl)
-}
-
-/// Discover the sidecar path by checking known locations
-fn discover_sidecar_path() -> Option<PathBuf> {
-    // The sidecar entry point after building (TypeScript compiles to dist/src/)
-    let sidecar_entry = "dist/src/index.js";
-
-    // List of locations to check, in order of priority
-    let mut candidates: Vec<PathBuf> = vec![];
-
-    // 0. Told where it is. The npm package (carrick#710) is the case that
-    //    needs this: the binary ships in a per-platform package and the
-    //    sidecar ships in the main one, beside the `node_modules/` its
-    //    dependencies resolve through, so nothing relative to the executable
-    //    can reach it.
-    if let Ok(configured) = env::var("CARRICK_SIDECAR_DIR")
-        && !configured.trim().is_empty()
-    {
-        candidates.push(PathBuf::from(configured));
-    }
-
-    candidates.extend([
-        // 1. Relative to executable (for packaged distribution)
-        get_executable_relative_path("sidecar"),
-        get_executable_relative_path("../sidecar"),
-        get_executable_relative_path("../lib/sidecar"),
-    ]);
-
-    // 2. For development builds, use CARGO_MANIFEST_DIR (set at compile time)
-    //    This ensures we find the sidecar regardless of the current working directory
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        candidates.push(PathBuf::from(manifest_dir).join("src/sidecar"));
-    }
-
-    // 3. Fallback to relative paths (in case running from project root)
-    candidates.extend([
-        PathBuf::from("src/sidecar"),
-        PathBuf::from("./src/sidecar"),
-        PathBuf::from("sidecar"),
-    ]);
-
-    for candidate in candidates {
-        let full_path = candidate.join(sidecar_entry);
-        if full_path.exists() {
-            debug!("Checking sidecar candidate: {:?}", full_path);
-            return Some(full_path);
-        }
-    }
-
-    None
-}
-
-/// Get a path relative to the executable location
-fn get_executable_relative_path(relative: &str) -> PathBuf {
-    if let Ok(exe_path) = env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        return exe_dir.join(relative);
-    }
-    PathBuf::from(relative)
 }
 
 /// Spawn the type sidecar and start initialization

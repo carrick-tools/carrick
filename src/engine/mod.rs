@@ -1065,7 +1065,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, at)| at.is_some())
         .map(|(service, _)| service.clone())
         .collect();
-    let recipe = sidecar.map(TypeSidecar::recipe);
+    // Each service answers through the resident type daemon when the `check`
+    // that started this scan handed one over and it holds the service's
+    // program (carrick#2884); otherwise through a process of its own.
+    let recipe = sidecar.map(|sidecar| {
+        sidecar
+            .recipe()
+            .with_daemon(crate::services::typed_daemon::Use::from_env())
+    });
     // Several services at once, each on a thread of its own and each started
     // in declared order (carrick#1066). A failure in one stops none of the
     // others, and each result is kept at its service's index. A carried

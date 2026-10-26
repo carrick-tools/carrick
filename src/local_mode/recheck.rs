@@ -317,7 +317,14 @@ fn inside(
     deadline: Instant,
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
-    let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline)?;
+    let rejoined = rejoin_held(
+        workspace,
+        held,
+        &[repo],
+        generation,
+        deadline,
+        super::typed::Mode::Probe,
+    )?;
 
     let items = rejoined
         .index
@@ -368,11 +375,15 @@ pub(super) struct Rejoined {
 ///    hosted answers for files the edit did not touch replay as they do on an
 ///    incremental scan.
 /// 2. The join over every blob, re-scanned and retained, with the type check.
+///
+/// `typed` says how the re-scans use the resident type daemon (carrick#2884):
+/// the join's own type check never does.
 pub(super) fn rejoin(
     workspace: &Workspace,
     repos: &[&Path],
     generation: &Path,
     deadline: Instant,
+    typed: super::typed::Mode,
 ) -> Result<Rejoined, String> {
     rejoin_held(
         workspace,
@@ -380,6 +391,7 @@ pub(super) fn rejoin(
         repos,
         generation,
         deadline,
+        typed,
     )
 }
 
@@ -390,6 +402,24 @@ fn rejoin_held(
     repos: &[&Path],
     generation: &Path,
     deadline: Instant,
+    typed: super::typed::Mode,
+) -> Result<Rejoined, String> {
+    let typed = super::typed::Session::open(&workspace.root, generation, typed);
+    let rejoined = rejoin_through(workspace, held, repos, generation, deadline, &typed);
+    // After the answer is read, on every path: a daemon this run found
+    // missing, or that held none of the services it re-scanned, is warmed
+    // for the next run in the background.
+    typed.close();
+    rejoined
+}
+
+fn rejoin_through(
+    workspace: &Workspace,
+    held: Held,
+    repos: &[&Path],
+    generation: &Path,
+    deadline: Instant,
+    typed: &super::typed::Session,
 ) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
@@ -450,7 +480,8 @@ fn rejoin_held(
         )
         .map_err(|e| e.to_string())?;
         let scan_dir = generation.join(format!("scan-{position}"));
-        let scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        typed.apply(&mut scan);
         bounded(scan, "re-scan", deadline)?;
         let fresh = read_blobs(&scan_dir)?;
         let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
