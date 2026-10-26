@@ -1217,6 +1217,11 @@ pub struct FunctionDefinitionExtractor {
     /// class rather than by definition because a field belongs to the class,
     /// and every method of it sees the same field.
     pub field_types: HashMap<String, ReceiverTypes>,
+    /// Keys of `function_definitions` the extractor named itself for an
+    /// anonymous callback passed to a call (`get_users_handler`,
+    /// [`derive_handler_name`]). Nobody wrote the name, so nobody can import
+    /// or reuse it. Scan-local, like `callee_refs`: the blob does not carry it.
+    pub synthetic_names: HashSet<String>,
     current_file_path: PathBuf,
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
@@ -1242,6 +1247,7 @@ impl FunctionDefinitionExtractor {
             function_definitions: HashMap::new(),
             callee_refs: HashMap::new(),
             field_types: HashMap::new(),
+            synthetic_names: HashSet::new(),
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
@@ -2386,6 +2392,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 .return_type
                                 .as_ref()
                                 .and_then(|t| self.type_ann_to_string(t));
+                            self.synthetic_names.insert(synthetic_name.clone());
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {
@@ -2429,6 +2436,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 .return_type
                                 .as_ref()
                                 .and_then(|t| self.type_ann_to_string(t));
+                            self.synthetic_names.insert(synthetic_name.clone());
                             self.function_definitions.insert(
                                 synthetic_name.clone(),
                                 FunctionDefinition {

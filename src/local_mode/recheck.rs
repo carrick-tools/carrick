@@ -291,21 +291,57 @@ impl Held {
 fn added_functions(held: &Held, repo: &Path, relative: &str) -> Vec<super::contract::NewFunction> {
     let name = repo_label(repo);
     let hosted = held.hosted.local_blobs(repo);
-    let indexed = functions_in(
-        held.local
-            .iter()
-            .filter(|blob| blob.repo_name == name)
-            .chain(hosted.iter()),
-        relative,
-    );
+    let blobs: Vec<crate::cloud_storage::CloudRepoData> = held
+        .local
+        .iter()
+        .filter(|blob| blob.repo_name == name)
+        .chain(hosted.iter())
+        .cloned()
+        .collect();
+    // The services the scan would resolve for this repo, the way `index`
+    // resolves them. A repo they cannot be resolved for names nothing: the
+    // question "would the scan read this file" has no answer.
+    let Ok(services) = crate::service_derivation::resolve_with_hosted(repo, Some(&blobs)) else {
+        return Vec::new();
+    };
+    let indexed = functions_in(blobs.iter(), relative);
+    named_additions(&services, repo, relative, &indexed)
+}
+
+/// What an edit to `relative` adds that the index would hold.
+///
+/// Only a file a service's walk reads counts
+/// ([`crate::file_finder::service_would_read`], the scan's own include and
+/// exclude decision, which skips test sources): the index holds nothing for
+/// any other file, so every function in one would read as new. Within such a
+/// file, only a function someone named counts: the callbacks the extractor
+/// names for itself (`it_handler`) are indexed but cannot be imported, so
+/// they are not reuse candidates.
+fn named_additions(
+    services: &[crate::config::Config],
+    repo: &Path,
+    relative: &str,
+    indexed: &std::collections::BTreeSet<String>,
+) -> Vec<super::contract::NewFunction> {
     let path = repo.join(relative);
+    let skip = crate::packages::MANIFEST_SKIP_DIRS;
+    let repo_path = repo.to_string_lossy();
+    if !services
+        .iter()
+        .any(|service| crate::file_finder::service_would_read(&repo_path, service, &skip, &path))
+    {
+        return Vec::new();
+    }
     // A file that cannot be read (deleted by the edit, or not script) states
     // no functions, as it states no rows.
     let Some(source) = crate::parser::read_source(&path) else {
         return Vec::new();
     };
     let stated = crate::pr_functions::stated_in(Path::new(relative), relative.to_string(), source);
-    new_functions(&indexed, stated.into_values())
+    new_functions(
+        indexed,
+        stated.into_values().filter(|function| !function.anonymous),
+    )
 }
 
 fn inside(
@@ -751,5 +787,63 @@ mod tests {
         // No generation means no record either way.
         KnownMisses::record(&path, "", big);
         assert!(!KnownMisses::read(&path).holds("", big));
+    }
+
+    fn write(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn names(found: Vec<super::super::contract::NewFunction>) -> Vec<String> {
+        found.into_iter().map(|f| f.name).collect()
+    }
+
+    /// Test sources are not in the index, so an edit to one adds nothing,
+    /// whatever functions or callbacks it states.
+    #[test]
+    fn an_edit_to_a_test_file_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{\"name\":\"svc\"}");
+        write(
+            dir.path(),
+            "src/a.test.ts",
+            "function helper() {}\nit('x', () => { helper(); });\ndescribe('y', () => {});\n",
+        );
+        write(
+            dir.path(),
+            "tests/b.ts",
+            "export function inTestsDir() {}\n",
+        );
+        let services = vec![crate::config::Config::default()];
+        let none = std::collections::BTreeSet::new();
+        for file in ["src/a.test.ts", "tests/b.ts"] {
+            assert_eq!(
+                names(named_additions(&services, dir.path(), file, &none)),
+                Vec::<String>::new(),
+                "{file}"
+            );
+        }
+    }
+
+    /// In a file the scan reads, one added named function is named, and the
+    /// extractor's own callback names are not.
+    #[test]
+    fn one_added_named_function_in_a_service_file_names_exactly_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{\"name\":\"svc\"}");
+        write(
+            dir.path(),
+            "src/a.ts",
+            "export function kept() {}\nexport function added() {}\n\
+             [1].forEach((x) => { kept(); });\nemitter.on('data', (c) => { kept(); });\n",
+        );
+        let services = vec![crate::config::Config::default()];
+        let indexed: std::collections::BTreeSet<String> =
+            ["kept".to_string()].into_iter().collect();
+        assert_eq!(
+            names(named_additions(&services, dir.path(), "src/a.ts", &indexed)),
+            vec!["added".to_string()]
+        );
     }
 }

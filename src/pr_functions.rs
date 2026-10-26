@@ -49,6 +49,8 @@ pub struct Stated {
     pub line: u32,
     pub end_line: u32,
     pub exported: bool,
+    /// The extractor named it for an anonymous callback; no one wrote the name.
+    pub anonymous: bool,
 }
 
 /// The definitions one copy of `path` states, by name. `label` names the copy
@@ -71,7 +73,8 @@ pub fn stated_in(path: &Path, label: String, source: String) -> BTreeMap<String,
         .function_definitions
         .into_iter()
         .filter(|(key, _)| key != MODULE_SCOPE_KEY)
-        .filter_map(|(_, definition)| {
+        .filter_map(|(key, definition)| {
+            let anonymous = extractor.synthetic_names.contains(&key);
             let span = definition.node_type.span();
             if span.is_dummy() {
                 return None;
@@ -85,6 +88,7 @@ pub fn stated_in(path: &Path, label: String, source: String) -> BTreeMap<String,
                     line: definition.line_number,
                     end_line: definition.end_line,
                     exported: definition.is_exported,
+                    anonymous,
                 },
             ))
         })
@@ -950,6 +954,7 @@ export function n(): number {
                 line,
                 end_line: line + 2,
                 exported: false,
+                anonymous: false,
             },
         }
     }
