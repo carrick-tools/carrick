@@ -19,6 +19,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import { statesNoShape, statusTableBody } from './status-table.js';
@@ -477,9 +478,25 @@ function finishInferAnchor(
     serialization: 'structural_fallback',
     failureReason: reason,
   });
-  let type = checker.getTypeAtLocation(located);
+  const rawType = checker.getTypeAtLocation(located);
+  let type = rawType;
   if ((request.unwrap ?? 'awaited') === 'awaited') {
     type = checker.getAwaitedType(type) ?? type;
+  }
+  // carrick#2818: the library store labels which part of this call's result
+  // holds the response body. A label the type cannot satisfy states no
+  // contract, and the capture's own re-read of the raw call must not fill in.
+  if (request.result) {
+    const read = readResultLabel(checker, rawType, type, request.result, located);
+    if ('abstain' in read) {
+      return {
+        request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        abstainReason: read.abstain,
+      };
+    }
+    type = read.type;
   }
   // #433: the checker gave us nothing (whole top type) — try the syntactic
   // recovery for an inline literal type argument of an unresolvable generic

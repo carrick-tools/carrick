@@ -180,6 +180,7 @@ impl SitePayloads {
                 alias: Some(entry.type_alias.clone()),
                 param_name,
                 member,
+                result: None,
             });
         }
         requests

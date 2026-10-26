@@ -162,6 +162,21 @@ pub struct SymbolRequest {
     pub consumer_response: bool,
 }
 
+/// The library store's label for which part of a call's result holds the
+/// response body (carrick#2818). On the wire it is exactly one key:
+/// `{"whole":true}`, `{"member":["data"]}` or `{"parse":"json"}`. Mirrors the
+/// sidecar's `ResultLabel` (src/sidecar/src/capture/result-label.ts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultShape {
+    /// The awaited value is the body (the flag is always `true`).
+    Whole(bool),
+    /// This member of every non-nullish constituent of the awaited value.
+    Member([String; 1]),
+    /// The awaited return of this no-argument method.
+    Parse(String),
+}
+
 /// Request for type inference at a specific location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferRequestItem {
@@ -193,6 +208,11 @@ pub struct InferRequestItem {
     /// request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// The library store's label for the call's result (carrick#2818), read
+    /// by the sidecar for `CallResult`. Absent from every request without one,
+    /// so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultShape>,
 }
 
 // ============================================================================
@@ -267,6 +287,10 @@ pub enum CaptureAnchor {
         /// captures that call's return type instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         param_name: Option<String>,
+        /// carrick#2818: the library store's label for the call this anchor
+        /// locates; the capture reads the labelled part of the call's result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ResultShape>,
     },
     /// Inline literal type text (the v1 inline-alias path).
     Literal {
@@ -460,7 +484,8 @@ pub struct TypeProvenance {
     /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
-    /// `serialised_body_unread`, `body_built_by_callee`, `not_recorded`.
+    /// `serialised_body_unread`, `body_built_by_callee`, `result_member_missing`,
+    /// `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4885,6 +4910,7 @@ mod tests {
     fn test_infer_request_serialization() {
         let request = InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/routes.ts".to_string(),
             line_number: 42,
             span_start: Some(128),
@@ -4981,6 +5007,7 @@ mod tests {
             line_number: None,
             expression_text: None,
             param_name: None,
+            result: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));
@@ -5122,6 +5149,7 @@ mod tests {
                     .into_iter()
                     .map(|infer_kind| InferRequestItem {
                         member: None,
+                        result: None,
                         file_path: "/repo/src/orders.ts".into(),
                         line_number: 4,
                         span_start: Some(10),
@@ -5216,6 +5244,7 @@ mod tests {
                         line_number: Some(4),
                         expression_text: Some("req.body".into()),
                         param_name: Some("event".into()),
+                        result: None,
                     },
                     CaptureAnchor::Literal {
                         alias: "D".into(),
@@ -5523,6 +5552,7 @@ mod tests {
         };
         let item = |infer_kind| InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/app.ts".into(),
             line_number: 1,
             span_start: None,
@@ -7263,6 +7293,7 @@ mod tests {
     fn model_symbols_are_sent_for_producer_response_reads_only() {
         let item = |alias: &str, infer_kind: InferKind| InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/routes.ts".into(),
             line_number: 4,
             span_start: None,
@@ -7489,6 +7520,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let items: Vec<InferRequestItem> = (0..ITEMS as u32)
             .map(|line| InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: line + 1,
                 span_start: None,
@@ -7528,5 +7560,50 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "no service was being analysed, named or not"
         );
         crate::scan_health::forget_service_losses(Some(SERVICE));
+    }
+
+    /// carrick#2818: a result label rides the infer item and the infer anchor
+    /// as exactly one key, and an item without one serialises as it did.
+    #[test]
+    fn result_label_wire_form() {
+        let item = |result: Option<ResultShape>| InferRequestItem {
+            file_path: "src/a.ts".into(),
+            line_number: 3,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::CallResult,
+            alias: None,
+            param_name: None,
+            member: None,
+            result,
+        };
+        let json = |r| serde_json::to_string(&item(r)).unwrap();
+        assert!(!json(None).contains(r#""result":"#), "{}", json(None));
+        assert!(json(Some(ResultShape::Whole(true))).contains(r#""result":{"whole":true}"#));
+        assert!(
+            json(Some(ResultShape::Member(["data".into()])))
+                .contains(r#""result":{"member":["data"]}"#)
+        );
+        assert!(
+            json(Some(ResultShape::Parse("json".into()))).contains(r#""result":{"parse":"json"}"#)
+        );
+
+        let anchor = CaptureAnchor::Infer {
+            alias: "A".into(),
+            source_file: "src/a.ts".into(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            span_start: None,
+            span_end: None,
+            line_number: Some(3),
+            expression_text: None,
+            param_name: None,
+            result: Some(ResultShape::Member(["data".into()])),
+        };
+        let wire = serde_json::to_string(&anchor).unwrap();
+        assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
+        let back: ResultShape = serde_json::from_str(r#"{"parse":"json"}"#).unwrap();
+        assert_eq!(back, ResultShape::Parse("json".into()));
     }
 }

@@ -152,6 +152,7 @@ fn infer(
         sidecar.infer_types(
             &[InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/a.ts".to_string(),
                 line_number: 1,
                 span_start: None,

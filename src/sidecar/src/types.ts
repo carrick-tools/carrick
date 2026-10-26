@@ -4,6 +4,7 @@
  */
 
 import type { ResponseModes } from './response-modes.js';
+import type { ResultLabel } from './capture/result-label.js';
 
 // ============================================================================
 // Inference Kind Enum
@@ -811,6 +812,11 @@ export interface InferRequestItem {
   param_name?: string;
   /** The member of a request options literal that carries the body (`request_config`). */
   member?: string;
+  /**
+   * carrick#2818: the library store's label for the call's result, naming the
+   * part that holds the response body. Read for `call_result`.
+   */
+  result?: ResultLabel;
 }
 
 // ============================================================================

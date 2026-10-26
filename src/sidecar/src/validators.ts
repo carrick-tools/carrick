@@ -104,6 +104,16 @@ export const SymbolRequestSchema = z.object({
 // Infer Request Item Schema
 // ============================================================================
 
+/**
+ * The library store's label for which part of a call's result holds the
+ * response body (carrick#2818). Exactly one key.
+ */
+export const ResultLabelSchema = z.union([
+  z.object({ whole: z.literal(true) }).strict(),
+  z.object({ member: z.tuple([z.string().min(1)]) }).strict(),
+  z.object({ parse: z.string().min(1) }).strict(),
+]);
+
 export const InferRequestItemSchema = z.object({
   file_path: z.string().min(1, 'File path cannot be empty'),
   line_number: z.number().int().positive('Line number must be positive'),
@@ -116,6 +126,8 @@ export const InferRequestItemSchema = z.object({
   param_name: z.string().optional(),
   // The body-carrying member a `request_config` item asks about.
   member: z.string().optional(),
+  // The library store's label for the call's result (carrick#2818).
+  result: ResultLabelSchema.optional(),
 });
 
 /**
@@ -220,6 +232,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     // the request.
     param_name: z.string().optional(),
     unwrap: z.enum(['awaited', 'none']).optional(),
+    result: ResultLabelSchema.optional(),
   }),
   z.object({
     kind: z.literal('literal'),

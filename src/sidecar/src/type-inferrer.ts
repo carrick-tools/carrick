@@ -2637,6 +2637,87 @@ export class TypeInferrer {
     return accept(parent) ? parent : undefined;
   }
 
+  /**
+   * A call's result read through the library store's label (carrick#2818):
+   * `whole` is the awaited type, `member` is that member of every non-nullish
+   * constituent of it, and `parse` is the awaited return of that method as the
+   * call returns it (a thenable's own `json()` is not on what it resolves to).
+   * A part the type lacks is a decided abstain, so the capture's own re-read
+   * of the raw call does not publish the envelope in its place.
+   */
+  private labelledCallResult(
+    request: InferRequestItem,
+    callExpr: CallExpression,
+    label: NonNullable<InferRequestItem['result']>
+  ): InferredType {
+    const location = this.getNodeLocation(callExpr);
+    const raw = callExpr.getType();
+    const awaited = this.awaitedBeyondPromise(raw) ?? this.unwrapPromiseType(raw);
+    const missing = (what: string): InferredType =>
+      this.decidedAbstain(request, location, {
+        path: '',
+        kind: 'unknown',
+        reason: 'result_member_missing',
+        detail: `the library's label names ${what}, which this call's type does not have`,
+      });
+
+    let read: Type[];
+    if ('whole' in label) {
+      read = [awaited];
+    } else if ('member' in label) {
+      const name = label.member[0];
+      read = [];
+      const constituents = awaited.isUnion() ? awaited.getUnionTypes() : [awaited];
+      for (const constituent of constituents) {
+        if (isNullishType(constituent)) continue;
+        const held = this.readMemberType(constituent, name, callExpr);
+        if (!held) return missing(`the member '${name}'`);
+        for (const part of held.isUnion() ? held.getUnionTypes() : [held]) {
+          if (!isNullishType(part)) read.push(part);
+        }
+      }
+      if (read.length === 0) return missing(`the member '${name}'`);
+    } else {
+      const method = (this.readMemberType(raw, label.parse, callExpr) ??
+        this.readMemberType(awaited, label.parse, callExpr)) as Type | undefined;
+      const signature = method
+        ?.getCallSignatures()
+        .find((candidate) =>
+          candidate.getParameters().every((parameter) => {
+            const declaration = parameter.getDeclarations()[0];
+            return (
+              !!declaration &&
+              Node.isParameterDeclaration(declaration) &&
+              (declaration.hasQuestionToken() ||
+                declaration.hasInitializer() ||
+                declaration.isRestParameter())
+            );
+          })
+        );
+      if (!signature) return missing(`the method '${label.parse}'`);
+      const returned = signature.getReturnType();
+      read = [this.awaitedBeyondPromise(returned) ?? this.unwrapPromiseType(returned)];
+    }
+
+    const texts: string[] = [];
+    for (const part of read) {
+      const text = this.structuralTextFromType(part, callExpr) ?? typeText(part, callExpr);
+      if (!texts.includes(text)) texts.push(text);
+    }
+    const anchor =
+      read.length === 1 ? this.unwrapArrayLevels(this.unwrapPromiseType(read[0])) : undefined;
+    return this.createInferredType(
+      request,
+      texts.join(' | '),
+      false,
+      location,
+      undefined,
+      anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
+      anchor?.depth,
+      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined
+    );
+  }
+
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem,
@@ -2652,6 +2733,13 @@ export class TypeInferrer {
         `Call-result locator at ${request.file_path}:${request.line_number} finds no call; leaving unresolved`
       );
       return null;
+    }
+
+    // carrick#2818: the library store labels which part of this call's result
+    // holds the response body. The label is the library's own statement, so it
+    // is read before any wrapper rule of the service's extraction config.
+    if (request.result) {
+      return this.labelledCallResult(request, callExpr, request.result);
     }
 
     // Walk up from the already-found call expression instead of re-searching
@@ -5782,6 +5870,15 @@ export class TypeInferrer {
   }
 
   /**
+   * The type of `type`'s member `name` at `node`, or `undefined` when the type
+   * has no such member. The one property read the payload-property rules and
+   * the library store's result label (carrick#2818) share.
+   */
+  private readMemberType(type: Type, name: string, node: Node): Type | undefined {
+    return type.getProperty(name)?.getTypeAtLocation(node);
+  }
+
+  /**
    * Extract the payload type from a matched wrapper. Returns null when the
    * rule matched the wrapper but no payload is recoverable from generics or
    * property paths — the caller decides what a payload-less match means
@@ -5866,11 +5963,10 @@ export class TypeInferrer {
       let currentType = type;
 
       for (const propName of rule.payloadPropertyPath) {
-        const prop = currentType.getProperty(propName);
-        if (!prop) {
+        const propType = this.readMemberType(currentType, propName, node);
+        if (!propType) {
           break;
         }
-        const propType = prop.getTypeAtLocation(node);
         currentType = propType;
       }
 
@@ -11584,4 +11680,9 @@ function nodeAtSpan(span: SavedSpan): Node | undefined {
     node = node.getParent();
   }
   return node;
+}
+
+/** `undefined`, `null` and `void`: what a labelled read removes (carrick#2818). */
+function isNullishType(type: Type): boolean {
+  return type.isUndefined() || type.isNull() || type.getText() === 'void';
 }

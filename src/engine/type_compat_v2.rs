@@ -432,13 +432,16 @@ fn path_names_a_member(path: &str) -> bool {
 /// (carrick#2200). `body_built_by_callee`: a request locator names an
 /// argument of a call into a function that builds the body from it, and the
 /// body it builds cannot be typed, so the argument is not the body
-/// (carrick#2628).
+/// (carrick#2628). `result_member_missing`: the library store labels which
+/// part of a call's result holds the body, and the type at the call has no such
+/// part, so the site states no contract (carrick#2818).
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
     "projected_value_only",
     "serialised_body_unread",
     "body_built_by_callee",
+    "result_member_missing",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -728,6 +731,7 @@ pub(crate) fn derive_capture_anchors(
             line_number,
             expression_text: request.expression_text.clone(),
             param_name,
+            result: request.result.clone(),
         });
     }
 
@@ -3948,6 +3952,7 @@ mod tests {
     fn the_unwidened_reading_is_captured_beside_the_published_type() {
         let request = InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/src/routes.ts".to_string(),
             line_number: 7,
             span_start: None,
@@ -4002,6 +4007,7 @@ mod tests {
     fn a_raw_text_read_marks_the_literal_anchor_that_publishes_it() {
         let request = |alias: &str| InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/src/client.ts".to_string(),
             line_number: 9,
             span_start: None,
@@ -4064,6 +4070,7 @@ mod tests {
     fn an_absent_body_tolerated_mark_rides_the_literal_anchor_that_publishes_it() {
         let request = |alias: &str| InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/src/routes.ts".to_string(),
             line_number: 4,
             span_start: None,
@@ -4430,6 +4437,7 @@ mod tests {
     fn consumer_call_locators_keep_the_first_call_result_per_alias() {
         let item = |kind: InferKind, alias: &str, line: u32| InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/web/src/client.ts".to_string(),
             line_number: line,
             span_start: Some(line * 10),
@@ -4554,6 +4562,7 @@ mod tests {
         let infer = vec![
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "/repo/src/handler.ts".to_string(),
                 line_number: 7,
                 span_start: Some(10),
@@ -4566,6 +4575,7 @@ mod tests {
             },
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "/repo/src/handler.ts".to_string(),
                 line_number: 9,
                 span_start: None,
@@ -4673,6 +4683,7 @@ mod tests {
     fn response_body_infer(alias: &str) -> InferRequestItem {
         InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/src/handler.ts".to_string(),
             line_number: 7,
             span_start: Some(10),
@@ -5474,6 +5485,7 @@ mod tests {
         }];
         let infer = vec![InferRequestItem {
             member: None,
+            result: None,
             file_path: "/repo/src/api.ts".to_string(),
             line_number: 30,
             span_start: None,
@@ -5951,6 +5963,7 @@ mod tests {
     fn derive_anchors_rejects_container_decayed_inferred_text() {
         let infer_item = |alias: &str| crate::services::type_sidecar::InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/bus.ts".to_string(),
             line_number: 4,
             span_start: None,
@@ -6040,6 +6053,7 @@ mod tests {
         let request = |alias: &str, kind: InferKind, param: Option<&str>| {
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
+                result: None,
                 file_path: "src/subscriber.ts".to_string(),
                 line_number: 12,
                 span_start: None,
@@ -6088,6 +6102,7 @@ mod tests {
     fn derive_anchors_prefers_v1_inferred_text_for_infer_aliases() {
         let infer_item = |alias: &str| crate::services::type_sidecar::InferRequestItem {
             member: None,
+            result: None,
             file_path: "src/bus.ts".to_string(),
             line_number: 4,
             span_start: None,
@@ -8545,6 +8560,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             .into_owned();
         let call = |line: u32, text: &str, alias: &str| InferRequestItem {
             member: None,
+            result: None,
             file_path: file.clone(),
             line_number: line,
             span_start: None,
@@ -8766,6 +8782,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
         let producer_infer = vec![InferRequestItem {
             member: None,
+            result: None,
             file_path: api_root
                 .join("src/routes.ts")
                 .to_string_lossy()
@@ -8866,6 +8883,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let consumer_infer = vec![InferRequestItem {
             member: None,
+            result: None,
             file_path: web_root
                 .join("src/holidays.ts")
                 .to_string_lossy()
@@ -9017,6 +9035,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let infer = vec![InferRequestItem {
             member: None,
+            result: None,
             file_path: web_root
                 .join("src/checkout.ts")
                 .to_string_lossy()
@@ -9207,6 +9226,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let infer = vec![InferRequestItem {
             member: None,
+            result: None,
             file_path: web_root.join("src/ping.ts").to_string_lossy().into_owned(),
             line_number: call_line,
             span_start: None,
@@ -9428,6 +9448,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             .iter()
             .map(|(key, line)| InferRequestItem {
                 member: None,
+                result: None,
                 file_path: routes_file.clone(),
                 line_number: *line,
                 span_start: None,
@@ -9549,6 +9570,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             .iter()
             .map(|(key, line, text, _)| InferRequestItem {
                 member: None,
+                result: None,
                 file_path: client_file.clone(),
                 line_number: *line,
                 span_start: None,
@@ -9732,6 +9754,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let (named, unnamed) = ("Named_Producer_Response", "Unnamed_Producer_Response");
         let request = |alias: &str, param_name: &str| InferRequestItem {
             member: None,
+            result: None,
             file_path: root.join("src/listener.ts").to_string_lossy().into_owned(),
             line_number: comparison_line,
             span_start: None,
@@ -10144,6 +10167,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 line_number: Some(27),
                 expression_text: None,
                 param_name: None,
+                result: None,
             }],
             &HashMap::new(),
             None,

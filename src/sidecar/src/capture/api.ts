@@ -8,6 +8,8 @@
  * stdio `capture_v2` action is the only surface the Rust client sees.
  */
 
+import type { ResultLabel } from './result-label.js';
+
 /**
  * How the anchor was produced upstream (design-doc amendment 2). Recorded so
  * the fidelity metric separates anchor-recall loss from serialization loss.
@@ -178,6 +180,12 @@ export interface InferAnchorRequest {
    * Default 'awaited': Promise / thenable layers are unwrapped.
    */
   unwrap?: 'awaited' | 'none';
+  /**
+   * carrick#2818: the library store's label for the call this anchor locates,
+   * naming the part of the call's result that holds the response body. Read
+   * after the awaited unwrap; absent means the type is taken as it stands.
+   */
+  result?: ResultLabel;
 }
 
 export type CaptureAnchorRequest =
@@ -260,6 +268,7 @@ export type TypeProvenanceReason =
   | 'projected_value_only'
   | 'serialised_body_unread'
   | 'body_built_by_callee'
+  | 'result_member_missing'
   | 'not_recorded';
 
 /**

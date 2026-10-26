@@ -521,6 +521,7 @@ fn build_infer_requests(
             counter += 1;
             requests.push(InferRequestItem {
                 member: None,
+                result: None,
                 file_path: file_path.clone(),
                 line_number: def.line_number,
                 span_start: None,
@@ -548,6 +549,7 @@ fn build_infer_requests(
             counter += 1;
             requests.push(InferRequestItem {
                 member: None,
+                result: None,
                 file_path: file_path.clone(),
                 line_number: def.line_number,
                 span_start: None,

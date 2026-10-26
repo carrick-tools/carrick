@@ -256,6 +256,7 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
 fn item(alias: &str, line: u32) -> InferRequestItem {
     InferRequestItem {
         member: None,
+        result: None,
         file_path: FILE.to_string(),
         line_number: line,
         span_start: None,
