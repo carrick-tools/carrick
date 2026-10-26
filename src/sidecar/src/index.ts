@@ -1362,14 +1362,8 @@ const MAX_ANSWERS = 3;
  * the changed files, or a rebuild from its `init` (`held-freshness.ts`).
  */
 function freshen(): void {
-  const loader = session.projectLoader;
-  if (!loader?.isInitialized() || !session.init) return;
-  const scope = session.scope;
-  session.held ??= new HeldFiles({
-    projects: () => loader.builtProjects(),
-    refreshable: () => loader.buildsFromTsconfigs(),
-    roots: () => [...new Set([scope?.repo_root, scope?.scan_root].filter((r): r is string => !!r))],
-  });
+  if (!session.projectLoader?.isInitialized() || !session.init) return;
+  session.held ??= heldFilesOf(session);
   const found = session.held.sweep();
   if (found.outcome === 'refresh') {
     log(`refreshing ${found.files.length} changed file(s)`);
@@ -1379,10 +1373,23 @@ function freshen(): void {
     session.freshness.refreshes += 1;
   } else if (found.outcome === 'drop') {
     log(`rebuilding the service: ${found.reason}`);
-    session.held = null;
     session.freshness.drops += 1;
     handleInit(session.init);
+    // Watched from now on, so a change while the next request runs is found.
+    session.held = session.projectLoader?.isInitialized() ? heldFilesOf(session) : null;
+    session.held?.sweep();
   }
+}
+
+/** The files `held`'s current loader builds from, ready to sweep. */
+function heldFilesOf(held: Session): HeldFiles {
+  const loader = held.projectLoader!;
+  const scope = held.scope;
+  return new HeldFiles({
+    projects: () => loader.builtProjects(),
+    refreshable: () => loader.buildsFromTsconfigs(),
+    roots: () => [...new Set([scope?.repo_root, scope?.scan_root].filter((r): r is string => !!r))],
+  });
 }
 
 /**
