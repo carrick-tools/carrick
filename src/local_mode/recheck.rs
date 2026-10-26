@@ -430,6 +430,7 @@ fn rejoin_held(
     for (position, repo) in repos.iter().enumerate() {
         let name = repo_label(repo);
         let mut previous_data = hosted.local_blobs(repo);
+        let hosted_data = previous_data.clone();
         let hosted_ids: std::collections::BTreeSet<String> =
             previous_data.iter().map(service_id).collect();
         let local: Vec<&crate::cloud_storage::CloudRepoData> = indexed
@@ -452,7 +453,7 @@ fn rejoin_held(
         let scan = rescan_command(&exe, repo, &scan_dir, &previous);
         bounded(scan, "re-scan", deadline)?;
         let fresh = read_blobs(&scan_dir)?;
-        let carried = super::index::carried_services(&previous_data, &fresh);
+        let carried = super::index::carried_services(repo, &hosted_data, &previous_data, &fresh)?;
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
             write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;

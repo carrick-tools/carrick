@@ -386,19 +386,13 @@ fn run_generation(
         }
         let mut written = read_blobs(&scan_dir)?;
         if carry {
-            let carried = carried_services(&hosted_blobs, &written);
-            // Only the services this checkout resolves to: a hosted service
-            // the tree no longer declares is not carried back into it.
+            let carried = carried_services(repo, &hosted_blobs, &hosted_blobs, &written)?;
             let resolved: Vec<Option<String>> =
                 crate::service_derivation::resolve_with_hosted(repo, Some(&hosted_blobs))?
                     .into_iter()
                     .map(|service| service.service_name)
                     .collect();
-            written.extend(
-                carried
-                    .into_iter()
-                    .filter(|blob| resolved.contains(&blob.service_name)),
-            );
+            written.extend(carried);
             // In declared order, as a scan of every service writes them.
             written.sort_by_key(|blob| {
                 resolved
@@ -616,17 +610,28 @@ pub(super) fn current_hosted_blobs(
 
 /// The services of `previous` a `--changed-only` scan carried: it writes a
 /// carried service only when its join moved something the service holds, so
-/// every service of `previous` it did not write stands in as it was.
+/// every service of `previous` it did not write stands in as it was. Only the
+/// services this checkout resolves to: a stored service the tree no longer
+/// declares is not carried back into it. `hosted` is the hosted copy of the
+/// repo's blobs, which the resolver reads when the tree declares no services.
 pub(super) fn carried_services(
+    repo: &Path,
+    hosted: &[CloudRepoData],
     previous: &[CloudRepoData],
     written: &[CloudRepoData],
-) -> Vec<CloudRepoData> {
+) -> Result<Vec<CloudRepoData>, String> {
     let written: std::collections::BTreeSet<String> = written.iter().map(service_id).collect();
-    previous
+    let resolved: Vec<Option<String>> =
+        crate::service_derivation::resolve_with_hosted(repo, Some(hosted))?
+            .into_iter()
+            .map(|service| service.service_name)
+            .collect();
+    Ok(previous
         .iter()
         .filter(|blob| !written.contains(&service_id(blob)))
+        .filter(|blob| resolved.contains(&blob.service_name))
         .cloned()
-        .collect()
+        .collect())
 }
 
 /// Whether a change to `file` (repo-relative) can change what a scan writes.
@@ -2415,6 +2420,23 @@ mod tests {
             blob("@acme/web", "services/web"),
         ];
         (dir, head, blobs)
+    }
+
+    /// carrick#2846: a stored service the checkout no longer declares is not
+    /// carried back into a re-check, whichever caller carries it.
+    #[test]
+    fn a_stored_service_the_tree_no_longer_declares_is_not_carried() {
+        let (dir, _, hosted) = hosted_monorepo();
+        let mut previous = hosted.clone();
+        let mut gone = hosted[0].clone();
+        gone.service_name = Some("@acme/gone".to_string());
+        previous.push(gone);
+        let carried = carried_services(dir.path(), &hosted, &previous, &[]).unwrap();
+        let names: Vec<_> = carried
+            .iter()
+            .map(|blob| blob.service_name.as_deref())
+            .collect();
+        assert_eq!(names, [Some("@acme/orders"), Some("@acme/web")]);
     }
 
     /// carrick#985: a checkout at the hosted commit is read in from the
