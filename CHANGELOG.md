@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.133](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.132...carrick-v0.3.133) (2026-10-26)
+
+
+### Features
+
+* **init:** Codex session-start hook and a trust line true on every surface ([#2852](https://github.com/carrick-tools/carrick/issues/2852)) ([bdbc7a4](https://github.com/carrick-tools/carrick/commit/bdbc7a4717d1894c57751bc2c78c27c73f8725f5))
+* **init:** write a Carrick check section into AGENTS.md ([#2831](https://github.com/carrick-tools/carrick/issues/2831)) ([ca0fed2](https://github.com/carrick-tools/carrick/commit/ca0fed2a165dba9f975e57b303646d158b1a0b0b)), closes [#2828](https://github.com/carrick-tools/carrick/issues/2828)
+
+
+### Bug Fixes
+
+* **check:** exit 2 when a check covered none of the files it was asked about ([#2853](https://github.com/carrick-tools/carrick/issues/2853)) ([0fe08d0](https://github.com/carrick-tools/carrick/commit/0fe08d05d8119d31cfc81c163b26ead36957cd54)), closes [#2850](https://github.com/carrick-tools/carrick/issues/2850)
+* **init:** replace the scaffold's Claude hook-pack entries (one session-start message) ([#2855](https://github.com/carrick-tools/carrick/issues/2855)) ([f959666](https://github.com/carrick-tools/carrick/commit/f959666682c0260e9548f546cde1df80d6c2ab52))
+* **local:** after-edit hook skips a re-check known not to fit, one call per patch ([#2857](https://github.com/carrick-tools/carrick/issues/2857)) ([8fc1829](https://github.com/carrick-tools/carrick/commit/8fc182981c8e0b893857acc357c36a9263d0f759))
+* **local:** name an edit's new functions without waiting on the re-scan ([#2849](https://github.com/carrick-tools/carrick/issues/2849)) ([#2856](https://github.com/carrick-tools/carrick/issues/2856)) ([84b3c52](https://github.com/carrick-tools/carrick/commit/84b3c522910e7f1f0951b83007c5a660f06c2f27))
+
 ## [0.3.132](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.131...carrick-v0.3.132) (2026-10-26)
 
 
