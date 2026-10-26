@@ -131,6 +131,17 @@ pub struct BindingResolver {
     /// resolver cannot find ([`WorkspaceIndex::names_an_unknown_module`]):
     /// what it looked for may be behind it.
     unresolved_hop: bool,
+    /// Every hop this resolver has resolved, `(importer, specifier) ->
+    /// module`. A barrel is walked again for every name looked up behind it,
+    /// and each walk would ask the filesystem the same question again (a
+    /// `canonicalize` per candidate extension): on a large service that was
+    /// most of discovery. Exact for the resolver's lifetime, which is one pass
+    /// over a tree the scan does not edit, the same assumption `exports`
+    /// makes.
+    modules: HashMap<(PathBuf, String), Option<PathBuf>>,
+    /// How many hops reached the module resolver rather than `modules`.
+    #[cfg(test)]
+    module_lookups: usize,
 }
 
 /// What a bounded lookup found.
@@ -166,6 +177,9 @@ impl BindingResolver {
             commonjs: false,
             capped: false,
             unresolved_hop: false,
+            modules: HashMap::new(),
+            #[cfg(test)]
+            module_lookups: 0,
         }
     }
 
@@ -192,11 +206,21 @@ impl BindingResolver {
     }
 
     /// The module one hop names.
-    fn resolve_module(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
-        match &self.workspace {
+    fn resolve_module(&mut self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        let key = (importer.to_path_buf(), specifier.to_string());
+        if let Some(known) = self.modules.get(&key) {
+            return known.clone();
+        }
+        #[cfg(test)]
+        {
+            self.module_lookups += 1;
+        }
+        let module = match &self.workspace {
             Some(workspace) => workspace.resolve_module_path(importer, specifier),
             None => FileOrchestrator::resolve_relative_import(importer, specifier),
-        }
+        };
+        self.modules.insert(key, module.clone());
+        module
     }
 
     /// [`resolve_module`](Self::resolve_module) for a hop a value walk takes,
@@ -751,6 +775,57 @@ mod tests {
         }
         let root = dir.path().canonicalize().expect("canonicalize root");
         (dir, root)
+    }
+
+    /// A barrel every lookup walks through asks the filesystem once per
+    /// (importer, specifier) hop, however many names are looked up behind
+    /// it, and answers exactly as a resolver that asks every time.
+    #[test]
+    fn a_barrel_hop_asks_the_filesystem_once_per_resolver() {
+        let (_dir, root) = workspace(&[
+            (
+                "src/api/index.ts",
+                r#"
+export * from "./users.js";
+export * from "./orders.js";
+export * as admin from "./admin/index.js";
+"#,
+            ),
+            (
+                "src/api/users.ts",
+                "export function listUsers() {}\nexport function getUser() {}\n",
+            ),
+            ("src/api/orders.ts", "export function listOrders() {}\n"),
+            ("src/api/admin/index.ts", "export const purge = 1;\n"),
+            (
+                "src/app.ts",
+                "import { listUsers } from './api/index.js';\n",
+            ),
+        ]);
+        let importer = root.join("src/app.ts");
+        let barrel = root.join("src/api/index.ts");
+        let names = ["listUsers", "getUser", "listOrders", "listOrders"];
+
+        let mut shared = BindingResolver::new();
+        for name in names {
+            let fresh = BindingResolver::new().resolve(&importer, "./api/index.js", name);
+            assert_eq!(
+                shared.resolve(&importer, "./api/index.js", name),
+                fresh,
+                "{name}"
+            );
+            assert!(fresh.is_some(), "{name} resolves");
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                shared.resolve_namespace_export(&barrel, "admin"),
+                Some(root.join("src/api/admin/index.ts"))
+            );
+        }
+
+        // app -> ./api/index.js, index -> ./users.js, ./orders.js and
+        // ./admin/index.js: four distinct hops.
+        assert_eq!(shared.module_lookups, 4);
     }
 
     #[test]
