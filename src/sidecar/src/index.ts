@@ -1915,7 +1915,7 @@ function collect(): void {
  * the cap release the least recently used held service (its programs and its
  * capture), never `current` (the request's own). A warm request (the warm-up)
  * may release only services no probe has used. After the request: a service
- * whose own footprint is over the cap is released and marked
+ * whose own footprint is over half the cap is released and marked
  * `cold_only:too_big`; a warm request that is still over the cap releases the
  * service it built and marks it `cold_only:no_room`. `cold_only` lasts the
  * daemon's life.
@@ -1924,8 +1924,8 @@ function keepUnderCap(current: string | null, mode: ConnectionMode, phase: 'befo
   const cap = heapCapMb();
   if (phase === 'after' && current !== null) {
     const state = services.get(current);
-    if (state && !state.coldOnly && state.footprintMb !== null && state.footprintMb > cap && serviceBuilt(current)) {
-      log(`${current} needs ${Math.round(state.footprintMb)} MB, over the cap of ${cap} MB: answered cold from now on`);
+    if (state && !state.coldOnly && state.footprintMb !== null && state.footprintMb > cap / 2 && serviceBuilt(current)) {
+      log(`${current} needs ${Math.round(state.footprintMb)} MB, over half the cap of ${cap} MB: answered cold from now on`);
       markColdOnly(current, 'too_big', { footprint_mb: Math.round(state.footprintMb), cap_mb: cap });
       collect();
     }

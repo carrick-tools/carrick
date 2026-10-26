@@ -56,6 +56,16 @@ function workspace(): string {
   return ws;
 }
 
+/** A workspace that also holds service `big`: one file of `count` declarations, so its program costs far more than a small service's. */
+function withBig(count: number): string {
+  const ws = workspace();
+  fs.mkdirSync(path.join(ws, 'big', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(ws, 'big', 'tsconfig.json'), TSCONFIG);
+  const decls = Array.from({ length: count }, (_, i) => `export interface Shape${i} { id: string; n${i}: number; next?: Shape${(i + 1) % count} }`);
+  fs.writeFileSync(path.join(ws, 'big', 'src', 'main.ts'), `${decls.join('\n')}\nexport function make() {\n  return { id: 'big', n: 1 };\n}\n`);
+  return ws;
+}
+
 function initOf(ws: string, name: string): Record<string, unknown> {
   return { request_id: `i-${name}`, action: 'init', repo_root: path.join(ws, name) };
 }
@@ -244,75 +254,126 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
   });
 
   it('under its heap cap, a warm build never releases a service a probe used: it is marked cold_only:no_room', async () => {
-    // The heap with service `a` held, measured on a daemon of its own.
+    // The heap with `a` held, and the footprints of `a` and then `b`, measured on a daemon of their own.
     const measure = workspace();
     const measuring = await daemon(measure);
     const socket0 = recordOf(measure)!.socket;
     const w0 = await SocketClient.greeted(socket0);
     assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
-    assert.strictEqual((await w0.send(inferOf(measure, 'a'))).status, 'success');
-    assert.strictEqual((await w0.send(captureOf(measure, 'a', fs.mkdtempSync(path.join(measure, 'stub-'))))).status, 'success');
-    const heldA = (await statusOf(socket0)).heap_used_mb;
+    const measured = await statusOf(socket0);
+    const heldA = measured.heap_used_mb;
+    const footprintA = serviceIn(measured, measure, 'a')!.footprint_mb!;
+    assert.strictEqual((await w0.send(initOf(measure, 'b'))).status, 'ready');
+    const footprintB = serviceIn(await statusOf(socket0), measure, 'b')!.footprint_mb!;
     w0.conn.destroy();
     await stopDaemon(measuring, socket0);
-    // `a` fits; `a` and `b` together do not (a second program costs far more than the margin).
-    const cap = String(heldA + 8);
+    // `a` fits and is under half the cap; `a` and `b` together do not fit; `b` is under half the cap.
+    const capMb = Math.max(heldA, 2 * footprintA) + Math.min(8, Math.floor(footprintB / 3));
+    const fixture = `heap with a ${heldA} MB, a ${footprintA} MB, b ${footprintB} MB, cap ${capMb} MB`;
+    assert.ok(heldA + footprintB > capMb + 4 && footprintB <= capMb / 2, `fixture: ${fixture}`);
 
-    // A probe used `a`: the warm build of `b` releases `b` itself.
     const ws = workspace();
-    const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: cap });
+    const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: String(capMb) });
     const socket = recordOf(ws)!.socket;
     const warm = await SocketClient.greeted(socket);
     assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
-    assert.strictEqual((await warm.send(inferOf(ws, 'a'))).status, 'success');
-    assert.strictEqual((await warm.send(captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-'))))).status, 'success');
     const probe = await SocketClient.greeted(socket, 'probe');
     assert.strictEqual((await probe.send(initOf(ws, 'a'))).status, 'ready');
     assert.strictEqual((await probe.send(inferOf(ws, 'a'))).status, 'success');
     assert.strictEqual((await warm.send(initOf(ws, 'b'))).status, 'ready');
-    assert.strictEqual((await warm.send(inferOf(ws, 'b'))).status, 'success');
-    let status = await statusOf(socket);
+    const status = await statusOf(socket);
     assert.deepStrictEqual(
       [serviceIn(status, ws, 'a')!.state, serviceIn(status, ws, 'b')!.state],
       ['built', 'cold_only:no_room'],
-      JSON.stringify(status)
+      `${fixture}: ${JSON.stringify(status)}`
     );
     assert.ok(status.errors.some((e) => e.kind === 'no_room' && e.service === 'b'), JSON.stringify(status.errors));
     assert.deepStrictEqual((await probe.send(initOf(ws, 'b'))).errors, ['not_held: cold_only:no_room']);
-    assert.strictEqual(status.heap_cap_mb, Number(cap));
+    assert.strictEqual(status.heap_cap_mb, capMb);
     assert.ok(status.heap_limit_mb > status.heap_cap_mb);
     warm.conn.destroy();
     probe.conn.destroy();
     await stopDaemon(child, socket);
+  });
 
-    // No probe: the warm build of `b` releases `a`, the least recently used.
-    const ws2 = workspace();
-    const child2 = await daemon(ws2, { CARRICK_TYPED_HEAP_CAP_MB: cap });
-    const socket2 = recordOf(ws2)!.socket;
-    const warm2 = await SocketClient.greeted(socket2);
-    assert.strictEqual((await warm2.send(initOf(ws2, 'a'))).status, 'ready');
-    assert.strictEqual((await warm2.send(inferOf(ws2, 'a'))).status, 'success');
-    assert.strictEqual((await warm2.send(captureOf(ws2, 'a', fs.mkdtempSync(path.join(ws2, 'stub-'))))).status, 'success');
-    const firstFootprint = serviceIn(await statusOf(socket2), ws2, 'a')!.footprint_mb!;
-    assert.strictEqual((await warm2.send(initOf(ws2, 'b'))).status, 'ready');
-    assert.strictEqual((await warm2.send(inferOf(ws2, 'b'))).status, 'success');
-    status = await statusOf(socket2);
-    assert.deepStrictEqual([serviceIn(status, ws2, 'a')!.state, serviceIn(status, ws2, 'b')!.state], ['released', 'built'], JSON.stringify(status));
+  it('without a probe, a warm build releases the least recently used service, its capture with it; a rebuild measures its footprint afresh', async () => {
+    // The heap with `a` and its capture held, and the footprint of `big` built after it.
+    const measure = withBig(40000);
+    const measuring = await daemon(measure);
+    const socket0 = recordOf(measure)!.socket;
+    const w0 = await SocketClient.greeted(socket0);
+    assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
+    assert.strictEqual((await w0.send(captureOf(measure, 'a', fs.mkdtempSync(path.join(measure, 'stub-'))))).status, 'success');
+    const measured = await statusOf(socket0);
+    const heldA = measured.heap_used_mb;
+    const footprintA = serviceIn(measured, measure, 'a')!.footprint_mb!;
+    assert.strictEqual((await w0.send(initOf(measure, 'big'))).status, 'ready');
+    const footprintBig = serviceIn(await statusOf(socket0), measure, 'big')!.footprint_mb!;
+    w0.conn.destroy();
+    await stopDaemon(measuring, socket0);
+    const capMb = Math.max(heldA, 2 * footprintA) + 8;
+    const fixture = `heap with a ${heldA} MB, a ${footprintA} MB, big ${footprintBig} MB, cap ${capMb} MB`;
+    assert.ok(heldA + footprintBig > capMb + 4 && footprintBig <= capMb / 2, `fixture: ${fixture}`);
+
+    const ws = withBig(40000);
+    const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: String(capMb) });
+    const socket = recordOf(ws)!.socket;
+    const warm = await SocketClient.greeted(socket);
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    assert.strictEqual((await warm.send(captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-'))))).status, 'success');
+    const firstFootprint = serviceIn(await statusOf(socket), ws, 'a')!.footprint_mb!;
+    assert.strictEqual((await warm.send(initOf(ws, 'big'))).status, 'ready');
+    const status = await statusOf(socket);
+    assert.deepStrictEqual([serviceIn(status, ws, 'a')!.state, serviceIn(status, ws, 'big')!.state], ['released', 'built'], `${fixture}: ${JSON.stringify(status)}`);
     assert.ok(status.errors.some((e) => e.kind === 'evicted' && e.service === 'a'), JSON.stringify(status.errors));
     // Its capture went with it: a probe capture is not built in the daemon.
-    const probe2 = await SocketClient.greeted(socket2, 'probe');
-    assert.strictEqual(await answerOrClose(probe2, captureOf(ws2, 'a', fs.mkdtempSync(path.join(ws2, 'stub-')))), 'closed');
+    const probe = await SocketClient.greeted(socket, 'probe');
+    assert.strictEqual(await answerOrClose(probe, captureOf(ws, 'a', fs.mkdtempSync(path.join(ws, 'stub-')))), 'closed');
     // Its next warm request builds it again, answering as before, and its footprint is measured afresh.
-    const first = await warm2.send(initOf(ws2, 'a'));
-    assert.strictEqual(first.status, 'ready');
-    const rebuilt = await warm2.send(inferOf(ws2, 'a'));
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    const rebuilt = await warm.send(inferOf(ws, 'a'));
     assert.strictEqual(rebuilt.status, 'success');
     assert.match(JSON.stringify(rebuilt.inferred_types), /id: string; n: number/);
-    const again = serviceIn(await statusOf(socket2), ws2, 'a')!.footprint_mb!;
+    const again = serviceIn(await statusOf(socket), ws, 'a')!.footprint_mb!;
     // Measured afresh, never added to the footprint it had before its release.
     assert.ok(again <= firstFootprint, `footprint ${again} MB after a rebuild, ${firstFootprint} MB before`);
-    warm2.conn.destroy();
-    await stopDaemon(child2, socket2);
+    warm.conn.destroy();
+    await stopDaemon(child, socket);
+  });
+
+  it('marks a service whose footprint is over half the cap too_big, and keeps a small one built', async () => {
+    // Footprints measured on a daemon of their own: `a` first, then `big`.
+    const measure = withBig(24000);
+    const measuring = await daemon(measure);
+    const socket0 = recordOf(measure)!.socket;
+    const w0 = await SocketClient.greeted(socket0);
+    assert.strictEqual((await w0.send(initOf(measure, 'a'))).status, 'ready');
+    const measured = await statusOf(socket0);
+    const small = serviceIn(measured, measure, 'a')!.footprint_mb!;
+    const heldSmall = measured.heap_used_mb;
+    assert.strictEqual((await w0.send(initOf(measure, 'big'))).status, 'ready');
+    const large = serviceIn(await statusOf(socket0), measure, 'big')!.footprint_mb!;
+    w0.conn.destroy();
+    await stopDaemon(measuring, socket0);
+    // `a` is under half the cap and fits; `big` is over half of it.
+    const cap = Math.max(2 * small, heldSmall) + 10;
+    assert.ok(large > cap / 2, `fixture: big ${large} MB, small ${small} MB, cap ${cap} MB`);
+
+    const ws = withBig(24000);
+    const child = await daemon(ws, { CARRICK_TYPED_HEAP_CAP_MB: String(cap) });
+    const socket = recordOf(ws)!.socket;
+    const warm = await SocketClient.greeted(socket);
+    assert.strictEqual((await warm.send(initOf(ws, 'a'))).status, 'ready');
+    assert.strictEqual((await warm.send(initOf(ws, 'big'))).status, 'ready');
+    const status = await statusOf(socket);
+    assert.deepStrictEqual(
+      [serviceIn(status, ws, 'a')!.state, serviceIn(status, ws, 'big')!.state],
+      ['built', 'cold_only:too_big'],
+      JSON.stringify({ cap, small, large, services: status.services, errors: status.errors })
+    );
+    assert.ok(status.errors.some((e) => e.kind === 'too_big' && e.service === 'big'), JSON.stringify(status.errors));
+    warm.conn.destroy();
+    await stopDaemon(child, socket);
   });
 
   it('builds a service on its warm init, so a probe is served without another request', async () => {
