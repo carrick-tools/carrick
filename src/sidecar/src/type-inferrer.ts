@@ -1305,11 +1305,57 @@ export class TypeInferrer {
   // Inference Methods by Kind
   // ===========================================================================
 
+  /**
+   * carrick#2824: a located response expression that sits in ANOTHER route's
+   * handler is not this row's. A model can locate `response` at a line that
+   * belongs to the next registration in the same module; reading that node
+   * publishes the other route's reply. Returns the request with its locator
+   * dropped, so it is answered by the registration on its own line, when:
+   *  1. a registration R sits on the request's line;
+   *  2. the located node is outside R and outside R's handler;
+   *  3. some ancestor of the node is a registration whose handler contains it.
+   * Anything else is returned unchanged. Matches on node shape, no names.
+   */
+  private withoutForeignLocator(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferRequestItem {
+    const node = this.resolveTargetNode(sourceFile, request);
+    if (!node) return request;
+    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    if (!atLine) return request;
+    const within = (inner: Node, outer: Node): boolean =>
+      inner.getPos() >= outer.getPos() && inner.getEnd() <= outer.getEnd();
+    if (within(node, atLine.registration) || within(node, atLine.handler)) {
+      return request;
+    }
+    const inOtherHandler = node.getAncestors().some((ancestor) => {
+      if (!Node.isCallExpression(ancestor) && !Node.isObjectLiteralExpression(ancestor)) {
+        return false;
+      }
+      const handler = this.resolveRegisteredHandler(ancestor);
+      return handler !== undefined && within(node, handler);
+    });
+    if (!inOtherHandler) return request;
+    this.log(
+      `Located expression at ${request.file_path}:${request.expression_line ?? request.line_number} ` +
+        `sits in another registration's handler; answering by the registration on line ${request.line_number}`
+    );
+    return {
+      ...request,
+      span_start: undefined,
+      span_end: undefined,
+      expression_text: undefined,
+      expression_line: undefined,
+    };
+  }
+
   private inferFunctionReturn(
     sourceFile: SourceFile,
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    request = this.withoutForeignLocator(sourceFile, request);
     // A `function_return` request can point at a route REGISTRATION: that is
     // the shape the scanner sends for a route whose handler RETURNS its
     // payload. The containing-function walk below then resolves the function
@@ -1736,6 +1782,7 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    request = this.withoutForeignLocator(sourceFile, request);
     const node = this.resolveTargetNode(sourceFile, request);
 
     if (!node) {
