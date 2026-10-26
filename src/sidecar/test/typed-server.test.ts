@@ -401,7 +401,9 @@ describe('typed server (carrick#2879)', () => {
   });
 
   it('listens under the temp dir when the workspace path is past the socket path limit', async () => {
-    let parent = os.tmpdir();
+    const top = fs.mkdtempSync(path.join(os.tmpdir(), 'ctyped-deep-'));
+    workspaces.push(top);
+    let parent = top;
     while (Buffer.byteLength(path.join(parent, 'ctyped-XXXXXX', '.carrick', 'typed.sock')) <= 110) {
       parent = path.join(parent, 'deep-directory-name');
     }
