@@ -5235,11 +5235,19 @@ async fn site_rows_of(
         .iter()
         .filter(|lead| lead.reason == crate::request_summary::decided_sites::Undecided::NoOpClaim)
         .count();
+    let several_operations = decided
+        .leads
+        .iter()
+        .filter(|lead| {
+            lead.reason == crate::request_summary::decided_sites::Undecided::SeveralOperations
+        })
+        .count();
     debug!(
         discovered,
         reached_label,
         decided = decided.sites.len(),
         no_op_claim,
+        several_operations,
         rows = rows.rows.len(),
         possible_calls = rows.leads.len(),
         leads_by_reason = ?leads_by_reason,
