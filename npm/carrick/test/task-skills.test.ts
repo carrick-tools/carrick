@@ -352,3 +352,27 @@ test("an ignored skills directory is reported, and a tracked one is not", () => 
   // Outside a repository git declines to answer, and this says nothing.
   assert.deepEqual(ignoredSkillRoots(workspace()), []);
 });
+
+// carrick#2837. A repository that links `.claude/skills` to a tracked folder
+// of its own would take Carrick's files into that folder through the link.
+test("a skills root linked outside its dot-folder is not written through", () => {
+  const dir = fs.realpathSync(workspace());
+  fs.mkdirSync(path.join(dir, "skills", "own"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "skills", "own", "SKILL.md"), "mine\n");
+  fs.mkdirSync(path.join(dir, ".claude"));
+  fs.symlinkSync(path.join("..", "skills"), path.join(dir, ".claude", "skills"));
+
+  const outcomes = writeTaskSkills(dir, { slug: "acme-index" });
+
+  // The tracked folder holds what it held, and nothing of ours.
+  assert.deepEqual(fs.readdirSync(path.join(dir, "skills")), ["own"]);
+  const linked = outcomes.filter((row) => row.state === "linked");
+  assert.equal(linked.length, 4);
+  assert.ok(linked.every((row) => !row.wrote && row.path.startsWith(SKILL_ROOTS[0]!)));
+  // The other harness's root is a real folder and gets all four.
+  assert.equal(outcomes.filter((row) => row.wrote && row.path.startsWith(SKILL_ROOTS[1]!)).length, 4);
+  // One line for the root, naming it and why.
+  assert.deepEqual(taskSkillWarnings(outcomes), [
+    ".claude/skills is a link to a folder outside .claude, so the Carrick skills were not written there. Writing through it would put them among that folder's own files.",
+  ]);
+});

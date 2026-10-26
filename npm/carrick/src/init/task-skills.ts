@@ -208,13 +208,36 @@ export function inspectTaskSkills(workspace: string): InstalledSkill[] {
 export type SkillOutcome = {
   /** Relative to the workspace. */
   path: string;
-  state: SkillState;
+  /**
+   * `linked` is a path under a root that a symlink routes outside its own
+   * dot-folder: nothing was written there (carrick#2837).
+   */
+  state: SkillState | "linked";
   /** True where this run put new bytes there. */
   wrote: boolean;
 };
 
 /**
+ * Where a root really lands when it is not under the workspace's own copy of
+ * its dot-folder, or null when it is. A repository that links
+ * `.claude/skills` to a tracked `skills/` folder would otherwise have these
+ * files written into that folder, among its own skills, where `carrick
+ * remove` does not look (carrick#2837).
+ */
+export function linkedRoot(workspace: string, root: string): string | null {
+  const realWorkspace = fs.realpathSync(workspace);
+  // The deepest part of the root that exists, since a root init has not
+  // created yet cannot be a link.
+  let existing = path.join(workspace, root);
+  while (!fs.existsSync(existing) && existing !== workspace) existing = path.dirname(existing);
+  const real = fs.realpathSync(existing);
+  const expected = path.join(realWorkspace, path.relative(workspace, existing));
+  return real === expected ? null : real;
+}
+
+/**
  * Write every skill under both roots, leaving alone anything that is not ours.
+ * A root a symlink routes elsewhere is not written to at all.
  *
  * Idempotent twice over: a second run renders the same bytes, and
  * `writeIfChanged` does not touch a file that already holds them.
@@ -222,6 +245,12 @@ export type SkillOutcome = {
 export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutcome[] {
   const outcomes: SkillOutcome[] = [];
   for (const root of SKILL_ROOTS) {
+    if (linkedRoot(workspace, root) !== null) {
+      for (const name of TASK_SKILLS) {
+        outcomes.push({ path: skillFile(root, name), state: "linked", wrote: false });
+      }
+      continue;
+    }
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
       const target = path.join(workspace, relative);
@@ -242,6 +271,13 @@ export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutc
 export function taskSkillWarnings(outcomes: SkillOutcome[]): string[] {
   const warn: string[] = [];
   for (const row of outcomes) {
+    if (row.state === "linked") {
+      // Once per root, not once per skill.
+      const root = path.dirname(path.dirname(row.path));
+      const line = `${root} is a link to a folder outside ${root.split(path.sep)[0]}, so the Carrick skills were not written there. Writing through it would put them among that folder's own files.`;
+      if (!warn.includes(line)) warn.push(line);
+      continue;
+    }
     if (row.state === "edited") {
       warn.push(
         `${row.path} has been edited here, so it was left as it is. Delete it and run carrick init again for the current version.`,
