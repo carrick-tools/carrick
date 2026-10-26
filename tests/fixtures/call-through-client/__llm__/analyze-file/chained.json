@@ -1,0 +1,72 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "model:9",
+      "line_number": 9,
+      "target": "/api/v1/save-run",
+      "method": "POST",
+      "pattern_matched": "useMutation(",
+      "call_expression_text": "useMutation({ mutationFn: (id: string) => saveRun({ path: { id } }), onSuccess: () => notify(\"saved\") })",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:14",
+      "line_number": 14,
+      "target": "/api/v1/save-run-cached",
+      "method": "POST",
+      "pattern_matched": "useMutation(",
+      "call_expression_text": "useMutation({ mutationFn: (id: string) => saveRun({ path: { id } }), onSuccess: () => cache.invalidate(\"runs\") })",
+      "call_expression_line": 14,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:20",
+      "line_number": 20,
+      "target": "/api/v1/list-runs",
+      "method": "GET",
+      "pattern_matched": "listRuns(",
+      "call_expression_text": "listRuns().catch(() => null)",
+      "call_expression_line": 20,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:21",
+      "line_number": 21,
+      "target": "/api/v1/get-status",
+      "method": "GET",
+      "pattern_matched": "getStatus(",
+      "call_expression_text": "getStatus().then((status) => status)",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "model:27",
+      "line_number": 27,
+      "target": "/api/v1/session/run",
+      "method": "POST",
+      "pattern_matched": "run(",
+      "call_expression_text": "(await openSession()).run()",
+      "call_expression_line": 27,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

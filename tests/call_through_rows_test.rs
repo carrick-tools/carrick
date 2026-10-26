@@ -665,8 +665,10 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         );
         assert_eq!(response_verdicts_at(file, line), []);
     }
+    // With `chained.ts` lines 9, 20 and 21: a callback's call and a call a
+    // promise method is read off carry no type either (carrick#2832).
     assert!(
-        settled_line().contains("(15 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(18 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -726,6 +728,45 @@ fn a_hook_call_takes_the_request_its_arguments_reach() {
         row_at("web", HOOKS, 19),
         corrected("POST", "/api/v1/audit", 17)
     );
+}
+
+const CHAINED: &str = "apps/web/src/chained.ts";
+
+/// carrick#2832: a hook given two callbacks takes the request one of them
+/// reaches when every call in the other reaches the app's own code, which
+/// requests nothing. A call on a promise method (`.catch`, `.then`) takes the
+/// request of the call the method is read off, when that call's function
+/// returns the request's value. Read with and without the compiler's rows.
+#[test]
+fn a_hook_with_two_callbacks_and_a_promise_chain_take_the_request_they_reach() {
+    let mut scans = vec![("call graph", blobs())];
+    if sidecar_available() {
+        scans.push(("compiler rows", blobs_with_rows()));
+    }
+    for (scan, blobs) in scans {
+        for (line, row) in [
+            (9, corrected("PUT", "/api/v1/runs/:id", 11)),
+            (20, corrected("GET", "/api/v1/runs", 8)),
+            (21, corrected("GET", "/api/v1/status", 23)),
+            // The other callback calls what nothing resolves.
+            (
+                14,
+                as_stated("POST", "/api/v1/save-run-cached", "/api/v1/save-run-cached"),
+            ),
+            // The factory the method is read off requests something, then
+            // returns an object of its own.
+            (
+                27,
+                as_stated("POST", "/api/v1/session/run", "/api/v1/session/run"),
+            ),
+        ] {
+            assert_eq!(
+                rows_in(blobs, "web", CHAINED, line),
+                [row],
+                "{scan}: {CHAINED}:{line}"
+            );
+        }
+    }
 }
 
 /// `save(id, await loadToken())`: both functions reach a request, and the row

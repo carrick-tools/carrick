@@ -91,7 +91,7 @@ Rows that stay as the model stated them:
 | `commands.ts:94` | only the model states the request the function called makes |
 | `commands.ts:127` | the site makes a request itself, inside a call that reaches another |
 | `commands.ts:139` | the function called asks for a token and returns a `fetch` only the model reads |
-| `hooks.ts:24` | two callbacks, and nothing says which makes the request |
+| `hooks.ts:24` | two callbacks, and one calls what nothing resolves |
 
 `commands.ts:113` writes its route into a function of the same file; the
 scanner reads that row off the source and this pass never touches it.
@@ -188,5 +188,19 @@ through the compiler's `call` rows, so these rows are asserted on a scan with
   row takes `GET /api/v1/status`.
 
 Without the rows these four stay as the model stated them.
+
+Two more call shapes (carrick#2832), in `apps/web/src/chained.ts`, read the
+same with and without the compiler's rows:
+
+| Site | Outcome |
+|---|---|
+| `chained.ts:9` | `PUT /api/v1/runs/:id`: a hook given two callbacks; the other calls only `notify` (`notify.ts`), the app's own function, which requests nothing |
+| `chained.ts:14` | as stated: the other callback calls `cache.invalidate`, which nothing resolves, so it could be the request |
+| `chained.ts:20` | `GET /api/v1/runs`: `.catch` is the library's, so `listRuns()`, the call it is read off, is read in its place; `listRuns` returns its request's value |
+| `chained.ts:21` | `GET /api/v1/status`: the same through `.then` |
+| `chained.ts:27` | as stated: `run` is a member of an interface, and `openSession` (`session.ts`) requests `POST /api/v1/audit` and then returns an object of its own |
+
+`hooks.ts:24` stays as stated for the reason `chained.ts:14` does:
+`vendor.send` resolves to nothing.
 
 Driven by `tests/call_through_rows_test.rs`.

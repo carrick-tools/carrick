@@ -65,6 +65,13 @@ use crate::wrapper_request_shape::{RequestShapeSignal, call_request_verb};
 /// How many call edges the walk follows from the definition a site reaches.
 const MAX_EDGE_DEPTH: usize = 4;
 
+/// The step a callback among a site's arguments decides at ([`Reach::One`]).
+const CALLBACK_STEP: usize = 2;
+
+/// The step the call a site's callee is read off decides at ([`Reach::One`]):
+/// not the own callee's, so the row keeps no type the call hands back.
+const RECEIVER_STEP: usize = 3;
+
 /// A definition as every service names it: its repository-relative file and
 /// the line it opens on. A definition key is one service's own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -91,6 +98,29 @@ pub struct SiteRow {
     /// 2. the calls whose result is spread into an object-literal argument;
     /// 3. the calls in the body of the one function-valued argument.
     pub steps: Vec<Vec<DefinitionSite>>,
+    /// The definitions the call this one is made on reaches, when the row's
+    /// own callee is a member the compiler places outside the repository
+    /// (`load(id).catch(…)`, `load(id).then(f).catch(g)`: `load(id)`), read
+    /// in the own callee's place (carrick#2832). Empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receiver: Vec<DefinitionSite>,
+    /// The calls of each function-valued argument, kept apart, when the call
+    /// holds two or more (carrick#2832): step 3 then states nothing, and one
+    /// of them decides only where every other is known to request nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callbacks: Vec<CallbackCalls>,
+}
+
+/// The calls written in one of a site's function-valued arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallbackCalls {
+    /// The definitions its calls reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reached: Vec<DefinitionSite>,
+    /// Every call written in it reaches a definition of the scan: nothing
+    /// unknown can make a request from it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub every_call_resolved: bool,
 }
 
 /// One service's model call rows at sites that write no request of their own.
@@ -375,7 +405,13 @@ pub fn read_sites(
             })
             .collect();
         let mut resolved: HashMap<(u32, u32), DefinitionSite> = HashMap::new();
+        // The calls whose callee is no function of the repository: the
+        // default library or a package (`.catch` on a promise).
+        let mut outside: HashSet<(u32, u32)> = HashSet::new();
         for (span, reach) in inputs.reaches_in(discovered) {
+            if reach == CallReach::NoFunction {
+                outside.insert(span);
+            }
             let definition = match reach {
                 CallReach::Function(file, key) | CallReach::OutsideService(file, key) => {
                     let file = crate::engine::repo_relative(&file.to_string_lossy(), root);
@@ -400,7 +436,10 @@ pub fn read_sites(
             &absolute,
             &relative,
             &file_results[key],
-            &resolved,
+            &Resolution {
+                resolved: &resolved,
+                outside: &outside,
+            },
         ));
     }
     CallThroughSites {
@@ -663,11 +702,53 @@ fn is_model_row(call: &DataCallResult) -> bool {
     call.resolution_source == Some(ResolutionSource::Model) && call.reaches_request.is_none()
 }
 
+/// What the compiler's rows say a file's calls reach, by the call's span in
+/// the units a row's span carries.
+struct Resolution<'a> {
+    /// The definition each call reaches.
+    resolved: &'a HashMap<(u32, u32), DefinitionSite>,
+    /// The calls whose callee is no function of the repository.
+    outside: &'a HashSet<(u32, u32)>,
+}
+
+impl Resolution<'_> {
+    /// The definitions `spans` reach, sorted and deduplicated.
+    fn reached(&self, spans: &[(u32, u32)]) -> Vec<DefinitionSite> {
+        let mut definitions: Vec<DefinitionSite> = spans
+            .iter()
+            .filter_map(|span| self.resolved.get(span).cloned())
+            .collect();
+        definitions.sort();
+        definitions.dedup();
+        definitions
+    }
+
+    /// What the call a site's call is made on reaches (carrick#2832), read
+    /// down `chain` (the calls each call is made on, outermost first) while
+    /// each call's callee is a member the compiler places outside the
+    /// repository: `load(id).then(f).catch(g)` reads `load(id)`. Empty where
+    /// the site's own callee resolves, a callee on the way is unknown, or the
+    /// chain ends on a call that reaches nothing.
+    fn receiver(&self, call: (u32, u32), chain: &[(u32, u32)]) -> Vec<DefinitionSite> {
+        let mut outer = call;
+        for &receiver in chain {
+            if self.resolved.contains_key(&outer) || !self.outside.contains(&outer) {
+                return Vec::new();
+            }
+            if let Some(definition) = self.resolved.get(&receiver) {
+                return vec![definition.clone()];
+            }
+            outer = receiver;
+        }
+        Vec::new()
+    }
+}
+
 fn read_file_sites(
     absolute: &Path,
     relative: &str,
     result: &FileAnalysisResult,
-    resolved: &HashMap<(u32, u32), DefinitionSite>,
+    resolution: &Resolution<'_>,
 ) -> Vec<SiteRow> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
@@ -716,14 +797,22 @@ fn read_file_sites(
         let Ok(line) = u32::try_from(call.line_number) else {
             continue;
         };
-        let reached = |spans: &[(u32, u32)]| -> Vec<DefinitionSite> {
-            let mut definitions: Vec<DefinitionSite> = spans
+        let callbacks = match site.callbacks.as_slice() {
+            [_, _, ..] => site
+                .callbacks
                 .iter()
-                .filter_map(|span| resolved.get(span).cloned())
-                .collect();
-            definitions.sort();
-            definitions.dedup();
-            definitions
+                .map(|calls| CallbackCalls {
+                    reached: resolution.reached(calls),
+                    every_call_resolved: calls
+                        .iter()
+                        .all(|span| resolution.resolved.contains_key(span)),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let callback_calls = match site.callbacks.as_slice() {
+            [one] => resolution.reached(one),
+            _ => Vec::new(),
         };
         rows.push(SiteRow {
             file: relative.to_string(),
@@ -731,10 +820,12 @@ fn read_file_sites(
             method,
             target: call.target.clone(),
             steps: vec![
-                reached(&[extent.span()]),
-                reached(&site.spread_calls),
-                reached(&site.callback_calls),
+                resolution.reached(&[extent.span()]),
+                resolution.reached(&site.spread_calls),
+                callback_calls,
             ],
+            receiver: resolution.receiver(extent.span(), &site.receivers),
+            callbacks,
         });
     }
     rows
@@ -969,11 +1060,14 @@ struct SiteReading {
     /// The calls whose result is spread into an object-literal argument:
     /// `useQuery({ ...runOptions(input) })`.
     spread_calls: Vec<(u32, u32)>,
-    /// The calls in the body of the function-valued argument, when the
-    /// expression holds exactly one, passed directly or as a property of an
-    /// object-literal argument. Empty when it holds two or more: nothing says
-    /// which of them makes the request.
-    callback_calls: Vec<(u32, u32)>,
+    /// The calls in the body of each function-valued argument, passed
+    /// directly or as a property of an object-literal argument, one list per
+    /// function.
+    callbacks: Vec<Vec<(u32, u32)>>,
+    /// The call the expression is made on, when its callee is a member of a
+    /// call's value (through `await`, parentheses and type assertions), then
+    /// the call that one is made on, and so on: outermost first.
+    receivers: Vec<(u32, u32)>,
 }
 
 struct SiteReader<'a> {
@@ -987,6 +1081,7 @@ impl SiteReader<'_> {
         &mut self,
         span: Span,
         node: &N,
+        callee: Option<&Expr>,
         args: &[ExprOrSpread],
     ) {
         let key = self.positions.extent(span).span();
@@ -1025,16 +1120,22 @@ impl SiteReader<'_> {
                 value => callbacks.extend(self.calls_in_function(value)),
             }
         }
-        let callback_calls = match callbacks.len() {
-            1 => callbacks.remove(0),
-            _ => Vec::new(),
-        };
+        let mut receivers = Vec::new();
+        let mut callee = callee;
+        while let Some(receiver) = callee.and_then(member_object_call) {
+            receivers.push(self.positions.extent(receiver.span).span());
+            callee = match &receiver.callee {
+                Callee::Expr(expr) => Some(&**expr),
+                Callee::Super(_) | Callee::Import(_) => None,
+            };
+        }
         self.read.insert(
             key,
             SiteReading {
                 writes_a_request: writer.found,
                 spread_calls,
-                callback_calls,
+                callbacks,
+                receivers,
             },
         );
     }
@@ -1064,12 +1165,16 @@ impl SiteReader<'_> {
 
 impl Visit for SiteReader<'_> {
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        self.read_site(node.span, node, &node.args);
+        let callee = match &node.callee {
+            Callee::Expr(callee) => Some(&**callee),
+            Callee::Super(_) | Callee::Import(_) => None,
+        };
+        self.read_site(node.span, node, callee, &node.args);
         node.visit_children_with(self);
     }
 
     fn visit_opt_call(&mut self, node: &OptCall) {
-        self.read_site(node.span, node, &node.args);
+        self.read_site(node.span, node, Some(&node.callee), &node.args);
         node.visit_children_with(self);
     }
 }
@@ -1077,9 +1182,24 @@ impl Visit for SiteReader<'_> {
 /// The span of the call an expression is, through `await` and the wrappers
 /// that pass a value along.
 fn call_span(expr: &Expr) -> Option<Span> {
+    call_of(expr).map(|call| call.span)
+}
+
+/// The call an expression is, through `await` and the wrappers that pass a
+/// value along.
+fn call_of(expr: &Expr) -> Option<&CallExpr> {
     match unwrap_expression(expr) {
-        Expr::Call(call) => Some(call.span),
-        Expr::Await(awaited) => call_span(&awaited.arg),
+        Expr::Call(call) => Some(call),
+        Expr::Await(awaited) => call_of(&awaited.arg),
+        _ => None,
+    }
+}
+
+/// The call whose value a member callee is read off: `load(id)` in
+/// `load(id).catch(…)` or `(await load(id)).run()`.
+fn member_object_call(callee: &Expr) -> Option<&CallExpr> {
+    match unwrap_expression(callee) {
+        Expr::Member(member) => call_of(&member.obj),
         _ => None,
     }
 }
@@ -1241,10 +1361,25 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     {
         let mut corrected = 0;
         for row in &service.sites.rows {
+            let left = |why: &str| {
+                debug!(
+                    "  - {}:{} {} {}: left as the model stated it, {why}",
+                    row.file, row.line, row.method, row.target
+                );
+            };
             match decider.decide(row) {
-                Reach::None => settled.reaches_none += 1,
-                Reach::Several => settled.reaches_several += 1,
-                Reach::Unstated => settled.reaches_unstated += 1,
+                Reach::None => {
+                    left("reaches no request row");
+                    settled.reaches_none += 1;
+                }
+                Reach::Several => {
+                    left("reaches several operations");
+                    settled.reaches_several += 1;
+                }
+                Reach::Unstated => {
+                    left("reaches a request only the model states");
+                    settled.reaches_unstated += 1;
+                }
                 Reach::One { request, step } => match apply(
                     service.data,
                     row,
@@ -1463,6 +1598,8 @@ fn state_leaves<'g>(
                 method: String::new(),
                 target: String::new(),
                 steps: vec![vec![callee.clone()]],
+                receiver: Vec::new(),
+                callbacks: Vec::new(),
             };
             match decider.decide(&row) {
                 Reach::One { request, .. } => Some(request),
@@ -1838,7 +1975,8 @@ enum Reach<'g> {
     One {
         request: &'g Reached,
         /// The step of the row that reached it: 0 is the row's own callee, 1
-        /// a call spread into an argument, 2 a callback among the arguments.
+        /// a call spread into an argument, [`CALLBACK_STEP`] a callback among
+        /// the arguments, [`RECEIVER_STEP`] the call the callee is read off.
         step: usize,
     },
 }
@@ -2169,17 +2307,33 @@ impl ReachGraph {
     /// state (carrick-cloud#2639), so such a chain abstains and the row keeps
     /// no type.
     fn hands_back_body(&self, start: &DefinitionSite, operation: &Operation) -> bool {
-        let Some((start, _)) = self.calls.get_key_value(start) else {
-            return false;
-        };
+        self.returned_steps(start, operation)
+            .is_some_and(|steps| steps == [ShapeKind::Parsed])
+    }
+
+    /// Whether `start` returns the value of a request of `operation`, whole,
+    /// parsed or read through members, as [`Self::hands_back_body`] follows
+    /// the returned call (carrick#2832): a function that requests something
+    /// and then returns a value of its own does not.
+    fn returns_request(&self, start: &DefinitionSite, operation: &Operation) -> bool {
+        self.returned_steps(start, operation).is_some()
+    }
+
+    /// The steps read off a request of `operation` on the way from it to what
+    /// `start` returns, where the returned call reaches that request and
+    /// nothing on the way is unproven ([`Self::hands_back_body`]).
+    fn returned_steps(
+        &self,
+        start: &DefinitionSite,
+        operation: &Operation,
+    ) -> Option<Vec<ShapeKind>> {
+        let (start, _) = self.calls.get_key_value(start)?;
         let mut seen: HashSet<&DefinitionSite> = HashSet::from([start]);
         let mut queue: VecDeque<(&DefinitionSite, usize)> = VecDeque::from([(start, 0)]);
         let mut steps: Vec<ShapeKind> = Vec::new();
         let mut reached = false;
         while let Some((definition, depth)) = queue.pop_front() {
-            let Some(shape) = self.shapes.get(definition) else {
-                return false;
-            };
+            let shape = self.shapes.get(definition)?;
             if shape.kind != ShapeKind::Value {
                 steps.push(shape.kind);
             }
@@ -2197,11 +2351,11 @@ impl ReachGraph {
                 continue;
             }
             if depth == MAX_EDGE_DEPTH {
-                return false;
+                return None;
             }
             for edge in self.calls.get(definition).into_iter().flatten() {
                 if edge.line == 0 {
-                    return false;
+                    return None;
                 }
                 if !written_in_base(edge.line) {
                     continue;
@@ -2214,18 +2368,16 @@ impl ReachGraph {
                         if self.side_edge(definition, edge) {
                             continue;
                         }
-                        return false;
+                        return None;
                     }
                 }
-                let Some((callee, _)) = self.calls.get_key_value(&edge.to) else {
-                    return false;
-                };
+                let (callee, _) = self.calls.get_key_value(&edge.to)?;
                 if seen.insert(callee) {
                     queue.push_back((callee, depth + 1));
                 }
             }
         }
-        reached && steps == [ShapeKind::Parsed]
+        reached.then_some(steps)
     }
 
     /// Whether `start`, or a definition it reaches within [`MAX_EDGE_DEPTH`]
@@ -2304,39 +2456,117 @@ impl<'g> Decider<'g> {
     /// requests reached only through a side call (a probe awaited and
     /// dropped, a token handed to the request returned). Where that leaves
     /// none, or still more than one, the row is left alone.
+    ///
+    /// The steps are read in order: the row's own callee; the call that
+    /// callee is read off, where the compiler places the callee outside the
+    /// repository ([`SiteRow::receiver`]); a call spread into an argument;
+    /// the callbacks among the arguments. A receiver's request decides only
+    /// where the receiver returns that request's value: a function that
+    /// requests something and returns a value of its own (a session object)
+    /// leaves the row alone. With two or more callbacks, the ones that reach
+    /// a request decide only where every call written in each other callback
+    /// reaches a definition of the scan: an unresolved call there could be
+    /// the request (carrick#2832).
     fn decide(&mut self, row: &SiteRow) -> Reach<'g> {
-        let graph = self.graph;
-        for (position, step) in row.steps.iter().enumerate() {
-            // By site, so a request two paths reach is one request.
-            let mut reached: BTreeMap<&'g str, (&'g Reached, bool)> = BTreeMap::new();
-            let mut unstated: BTreeMap<&'g str, (Vec<&'g Unstated>, bool)> = BTreeMap::new();
-            for definition in step {
-                graph.walk(definition, &mut reached, &mut unstated);
-            }
-            // A site a fact states is that fact's request, and the row's own
-            // site is the call being decided.
-            let own_site = format!("{}:{}", row.file, row.line);
-            unstated.retain(|site, _| !reached.contains_key(site) && *site != own_site);
-            if reached.is_empty() && unstated.is_empty() {
-                continue;
-            }
-            let every = self.judge(&reached, &unstated, false);
-            if matches!(every, Reach::One { .. }) {
-                return self.placed(every, position);
-            }
-            let side =
-                reached.values().any(|(_, side)| *side) || unstated.values().any(|(_, side)| *side);
-            if !side {
-                return every;
-            }
-            let returned = self.judge(&reached, &unstated, true);
-            return match returned {
-                Reach::One { .. } => self.placed(returned, position),
-                Reach::None => every,
+        let own = row.steps.first().map(Vec::as_slice).unwrap_or_default();
+        if let Some(reach) = self.decide_step(row, own, 0) {
+            return reach;
+        }
+        if let Some(reach) = self.decide_step(row, &row.receiver, RECEIVER_STEP) {
+            return match reach {
+                Reach::One { request, .. }
+                    if !row.receiver.iter().all(|definition| {
+                        self.graph
+                            .returns_request(definition, &operation_of(request))
+                    }) =>
+                {
+                    Reach::None
+                }
                 other => other,
             };
         }
-        Reach::None
+        for (position, step) in row.steps.iter().enumerate().skip(1) {
+            if let Some(reach) = self.decide_step(row, step, position) {
+                return reach;
+            }
+        }
+        if row.callbacks.is_empty() {
+            return Reach::None;
+        }
+        let (reaching, silent): (Vec<&CallbackCalls>, Vec<&CallbackCalls>) = row
+            .callbacks
+            .iter()
+            .partition(|callback| self.reaches_any(row, &callback.reached));
+        if reaching.is_empty() || !silent.iter().all(|callback| callback.every_call_resolved) {
+            return Reach::None;
+        }
+        let mut step: Vec<DefinitionSite> = reaching
+            .iter()
+            .flat_map(|callback| callback.reached.iter().cloned())
+            .collect();
+        step.sort();
+        step.dedup();
+        self.decide_step(row, &step, CALLBACK_STEP)
+            .unwrap_or(Reach::None)
+    }
+
+    /// The requests and the rows no fact states that `step` reaches, each
+    /// once by its site, the row's own site aside.
+    #[allow(clippy::type_complexity)]
+    fn reached_by(
+        &self,
+        row: &SiteRow,
+        step: &[DefinitionSite],
+    ) -> (
+        BTreeMap<&'g str, (&'g Reached, bool)>,
+        BTreeMap<&'g str, (Vec<&'g Unstated>, bool)>,
+    ) {
+        // By site, so a request two paths reach is one request.
+        let mut reached: BTreeMap<&'g str, (&'g Reached, bool)> = BTreeMap::new();
+        let mut unstated: BTreeMap<&'g str, (Vec<&'g Unstated>, bool)> = BTreeMap::new();
+        for definition in step {
+            self.graph.walk(definition, &mut reached, &mut unstated);
+        }
+        // A site a fact states is that fact's request, and the row's own
+        // site is the call being decided.
+        let own_site = format!("{}:{}", row.file, row.line);
+        unstated.retain(|site, _| !reached.contains_key(site) && *site != own_site);
+        (reached, unstated)
+    }
+
+    /// Whether `step` reaches any request, stated or not.
+    fn reaches_any(&self, row: &SiteRow, step: &[DefinitionSite]) -> bool {
+        let (reached, unstated) = self.reached_by(row, step);
+        !(reached.is_empty() && unstated.is_empty())
+    }
+
+    /// What one step of `row` decides, `None` when it reaches nothing and the
+    /// next step is read.
+    fn decide_step(
+        &mut self,
+        row: &SiteRow,
+        step: &[DefinitionSite],
+        position: usize,
+    ) -> Option<Reach<'g>> {
+        let (reached, unstated) = self.reached_by(row, step);
+        if reached.is_empty() && unstated.is_empty() {
+            return None;
+        }
+        let every = self.judge(&reached, &unstated, false);
+        if matches!(every, Reach::One { .. }) {
+            return Some(self.placed(every, position));
+        }
+        let side =
+            reached.values().any(|(_, side)| *side) || unstated.values().any(|(_, side)| *side);
+        if !side {
+            return Some(every);
+        }
+        let returned = self.judge(&reached, &unstated, true);
+        Some(match returned {
+            Reach::One { .. } => self.placed(returned, position),
+            Reach::None => every,
+            other => other,
+        })
     }
 
     /// `reach` with the step of the row that decided.
@@ -2662,6 +2892,8 @@ mod tests {
   const one = first(id); const two = second(id);
   const built = await request(`${target}/orders/${id}`);
   const split = await tokens(id.split("/"));
+  const caught = await listRuns().then(keep).catch(() => []);
+  const unknown = await listRuns().refresh();
 }
 "#;
 
@@ -2725,6 +2957,17 @@ mod tests {
                     method: "GET".to_string(),
                     target: "/getRun".to_string(),
                     steps: vec![vec![definition("b.ts", 9)], vec![]],
+                    receiver: vec![definition("c.ts", 3)],
+                    callbacks: vec![
+                        CallbackCalls {
+                            reached: vec![definition("b.ts", 9)],
+                            every_call_resolved: false,
+                        },
+                        CallbackCalls {
+                            reached: Vec::new(),
+                            every_call_resolved: true,
+                        },
+                    ],
                 }],
                 return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
@@ -2816,12 +3059,34 @@ mod tests {
         ]
         .into_iter()
         .map(|(needle, reached)| (span(needle), reached))
+        .chain([
+            // The first `listRuns()` of line 12, which the needle above
+            // cannot tell from the one inside the chain.
+            (
+                {
+                    let (start, _) = span("listRuns().then(keep)");
+                    (start, start + "listRuns()".len() as u32)
+                },
+                definition("client.ts", 20),
+            ),
+        ])
         .collect()
     }
 
-    /// The rows [`read_file_sites`] reads for `rows` over [`SOURCE`], as
-    /// (line, steps).
-    fn read(rows: Vec<DataCallResult>) -> Vec<(u32, Vec<Vec<DefinitionSite>>)> {
+    /// The calls whose callee the compiler places outside the repository:
+    /// the promise methods of line 12. `refresh` on line 13 is not one.
+    fn outside() -> HashSet<(u32, u32)> {
+        [
+            "listRuns().then(keep).catch(() => [])",
+            "listRuns().then(keep)",
+        ]
+        .into_iter()
+        .map(span)
+        .collect()
+    }
+
+    /// The rows [`read_file_sites`] reads for `rows` over [`SOURCE`].
+    fn read_rows(rows: Vec<DataCallResult>) -> Vec<SiteRow> {
         let dir = tempfile::tempdir().expect("temp dir");
         let file = dir.path().join("load.ts");
         std::fs::write(&file, SOURCE).expect("the source is written");
@@ -2829,7 +3094,20 @@ mod tests {
             data_calls: rows,
             ..Default::default()
         };
-        read_file_sites(&file, "src/load.ts", &result, &resolved())
+        read_file_sites(
+            &file,
+            "src/load.ts",
+            &result,
+            &Resolution {
+                resolved: &resolved(),
+                outside: &outside(),
+            },
+        )
+    }
+
+    /// [`read_rows`] as (line, steps).
+    fn read(rows: Vec<DataCallResult>) -> Vec<(u32, Vec<Vec<DefinitionSite>>)> {
+        read_rows(rows)
             .into_iter()
             .map(|row| (row.line, row.steps))
             .collect()
@@ -2873,13 +3151,53 @@ mod tests {
         );
     }
 
-    /// Nothing says which of two callbacks makes the request.
+    /// Two callbacks state no third step; each is kept apart, with whether
+    /// every call written in it resolves (carrick#2832).
     #[test]
-    fn two_callbacks_state_no_step() {
+    fn two_callbacks_are_kept_apart() {
+        let rows = read_rows(vec![model_row(5)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].steps, [vec![], vec![], vec![]]);
         assert_eq!(
-            read(vec![model_row(5)]),
-            [(5, vec![vec![], vec![], vec![]])]
+            rows[0].callbacks,
+            [
+                // `() => vendor.send(id)`: nothing resolves `vendor`.
+                CallbackCalls {
+                    reached: Vec::new(),
+                    every_call_resolved: false,
+                },
+                CallbackCalls {
+                    reached: vec![definition("audit.ts", 1)],
+                    every_call_resolved: true,
+                },
+            ]
         );
+        // One callback is the third step, and is not kept apart.
+        assert!(read_rows(vec![model_row(4)])[0].callbacks.is_empty());
+    }
+
+    /// `listRuns().then(keep).catch(() => [])`: both promise methods are the
+    /// library's, so the call they are read off, `listRuns()`, is read in the
+    /// own callee's place. `listRuns().refresh()`, whose callee the compiler
+    /// does not place outside the repository, reads nothing (carrick#2832).
+    #[test]
+    fn the_call_a_library_member_is_read_off_is_the_receiver() {
+        let rows = read_rows(vec![model_row(12), model_row(13)]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.line, row.steps.clone(), row.receiver.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    12,
+                    vec![vec![], vec![], vec![]],
+                    vec![definition("client.ts", 20)]
+                ),
+                (13, vec![vec![], vec![], vec![]], vec![]),
+            ]
+        );
+        // A row whose own callee resolves reads no receiver.
+        assert!(read_rows(vec![model_row(2)])[0].receiver.is_empty());
     }
 
     /// `save(id, await loadToken())`: `loadToken` reaches a definition too,
