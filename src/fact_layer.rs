@@ -1,12 +1,12 @@
 //! The fact layer's switches, listed once.
 //!
 //! The cloud runner turns the fact layer on by setting each of these to `1`
-//! (carrick-cloud `runner/image/src/proc.ts`). A laptop scan that asks the
-//! model turns on the same list ([`crate::local_mode`]'s scan command). A
-//! facts-only laptop scan does not: it asks the library store nothing, so
-//! the fact layer has no labelled site to find there. This list is the
-//! scanner's one copy: add a switch here and every model-asking local scan
-//! sets it. The runner's copy lives in carrick-cloud and is matched by hand.
+//! (carrick-cloud `runner/image/src/proc.ts`). Every laptop scan turns on the
+//! same list ([`crate::local_mode`]'s scan command), a facts-only pass
+//! included: it reads the library store's settled answers without starting a
+//! build (carrick#2907). This list is the scanner's one copy: add a switch
+//! here and every local scan sets it. The runner's copy lives in
+//! carrick-cloud and is matched by hand.
 
 use std::ffi::OsString;
 

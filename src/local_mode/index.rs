@@ -865,15 +865,13 @@ pub(super) fn scan_command(
     } else {
         command.env_remove(crate::preflight::ALLOW_ENV);
     }
-    // A pass that asks the model scans with the fact layer the cloud runner
-    // scans with. A value the caller set, `0` included, is inherited
-    // unchanged ([`crate::fact_layer`]). A facts-only pass gets none: it asks
-    // the library store nothing, so the switches would add the position-row
-    // walk and find no labelled site (measured: same rows, twice the time).
-    if pass.infers() {
-        for switch in crate::fact_layer::local_defaults(|name| std::env::var_os(name)) {
-            command.env(switch, "1");
-        }
+    // Every pass scans with the fact layer the cloud runner scans with. A
+    // value the caller set, `0` included, is inherited unchanged
+    // ([`crate::fact_layer`]). A facts-only pass reads the library store's
+    // settled answers and starts no build (carrick#2907), and asks no site
+    // question (`site_questions::asks`).
+    for switch in crate::fact_layer::local_defaults(|name| std::env::var_os(name)) {
+        command.env(switch, "1");
     }
     // A laptop scans the same services again and again, so its sidecars keep
     // their type answers and serve them again while the program they were
@@ -2275,12 +2273,12 @@ mod tests {
         );
     }
 
-    /// A local scan that asks the model runs the fact layer the cloud runner
-    /// scans with; a switch the caller set is inherited as set. A facts-only
-    /// pass sets none of them.
+    /// Every local scan runs the fact layer the cloud runner scans with, a
+    /// facts-only pass included (carrick#2907); a switch the caller set is
+    /// inherited as set.
     #[test]
-    fn a_model_pass_turns_the_fact_layer_on_and_a_facts_pass_does_not() {
-        for pass in [Pass::Infer, Pass::Dispatch] {
+    fn every_pass_turns_the_fact_layer_on() {
+        for pass in [Pass::Infer, Pass::Dispatch, Pass::Facts] {
             let env = scan_env(&pass);
             for switch in crate::fact_layer::SWITCHES {
                 let expected = std::env::var_os(switch)
@@ -2288,10 +2286,6 @@ mod tests {
                     .then(|| Some("1".to_string()));
                 assert_eq!(env.get(switch), expected.as_ref(), "{switch}");
             }
-        }
-        let facts = scan_env(&Pass::Facts);
-        for switch in crate::fact_layer::SWITCHES {
-            assert_eq!(facts.get(switch), None, "{switch}");
         }
     }
 
