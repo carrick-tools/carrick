@@ -1547,6 +1547,24 @@ function serviceState(service: string, repoRoot: string): ServiceState {
   return state;
 }
 
+/**
+ * Build a held session's program now, and watch its files from now on (as a
+ * rebuild after a drop does). A build that fails is left to the session's next
+ * request, which reports it as a cold process would.
+ */
+function buildHeld(held: Session): void {
+  const loader = held.projectLoader;
+  if (!loader?.isInitialized() || sessionBuilt(held)) return;
+  try {
+    loader.getProject();
+  } catch (err) {
+    log(`building the service at init failed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  held.held = heldFilesOf(held);
+  held.held.sweep();
+}
+
 /** Whether a session's loader holds a built program: the one test for `status` and the probe refusal. */
 function sessionBuilt(held: Session): boolean {
   return (held.projectLoader?.builtProjects().length ?? 0) > 0;
@@ -1561,6 +1579,8 @@ function serviceBuilt(service: string): boolean {
 
 /** Release everything `service` holds: its programs and its capture. Its `init` stays; a warm request builds it again. */
 function releaseService(service: string): void {
+  const state = services.get(service);
+  if (state) state.footprintMb = null;
   for (const held of heldSessions.values()) if (held.service === service && held.projectLoader !== null) releaseSession(held);
   for (const held of captureHolds?.values() ?? []) {
     if (held.service !== service || !captureBuilt(held)) continue;
@@ -1585,23 +1605,11 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
         repo_root: held.scope?.repo_root ?? '',
         scan_root: held.scope?.scan_root ?? null,
         built: sessionBuilt(held),
-        ...serviceReport(held.service, now),
+        ...serviceReport(held, now),
         freshness: { ...held.freshness },
         items: { held: held.items?.size ?? 0, ...held.answers },
         evictions: held.evictions,
       })),
-      // A service only captured (no `init`): its capture is what it holds.
-      ...[...services.keys()]
-        .filter((key) => ![...heldSessions.values()].some((held) => held.service === key))
-        .map((key) => ({
-          repo_root: services.get(key)!.repo_root,
-          scan_root: (JSON.parse(key) as Array<string | null>)[2],
-          built: false,
-          ...serviceReport(key, now),
-          freshness: { refreshes: 0, drops: 0 },
-          items: { held: 0, replayed: 0, recomputed: 0 },
-          evictions: 0,
-        })),
     ],
     captures: [...(captureHolds?.values() ?? [])].map((held) => ({
       repo_root: held.repo_root,
@@ -1620,20 +1628,25 @@ function statusOf(server: TypedServer, buildId: string, cliVersion: string | nul
     queued: server.queued(),
     counters: { ...counters, abandoned: server.counts.abandoned, skipped: server.counts.skipped },
     errors: [...events],
+    collections,
     ...(verifyEnabled() ? { verify: { ...verifyCounts } } : {}),
     heap_used_mb: Math.round(memory.heapUsed / 1048576),
     rss_mb: Math.round(memory.rss / 1048576),
   };
 }
 
-/** A service's budget fields for `status`: its state counts its programs and its capture. */
+/**
+ * A held session's budget fields for `status`. `built` is the probe refusal's
+ * test (a built program); a held capture is reported under `captures`. The
+ * footprint counts the service's programs and its capture.
+ */
 function serviceReport(
-  service: string | null,
+  held: Session,
   now: number
 ): { state: HeldService['state']; footprint_mb: number | null; last_used_s: number | null } {
-  const state = service ? services.get(service) : undefined;
+  const state = held.service ? services.get(held.service) : undefined;
   return {
-    state: state?.coldOnly ? `cold_only:${state.coldOnly}` : service && serviceBuilt(service) ? 'built' : 'released',
+    state: state?.coldOnly ? `cold_only:${state.coldOnly}` : sessionBuilt(held) ? 'built' : 'released',
     footprint_mb: state?.footprintMb != null ? Math.round(state.footprintMb) : null,
     last_used_s: state?.lastUsed != null ? Math.round((now - state.lastUsed) / 1000) : null,
   };
@@ -1641,6 +1654,9 @@ function serviceReport(
 
 /** Daemon counters (L6); `abandoned` and `skipped` are the server's. */
 const counters = { warm_answers: 0, init_refused: 0, closed_for_cold: 0 };
+
+/** Full collections the daemon forced (each costs hundreds of ms on a GB heap). */
+let collections = 0;
 
 /** The last daemon-only events, oldest first (L6). */
 const events: DaemonEvent[] = [];
@@ -1736,11 +1752,21 @@ async function serveLine(
         conn.close();
         return;
       case 'init': {
-        const response = initHeld(request, conn.mode ?? 'probe');
-        writeResponse(response);
-        if (response.status !== 'ready') return;
-        conn.slot = session;
-        session.lastUsed = performance.now();
+        const mode = conn.mode ?? 'probe';
+        const service = mode === 'warm' ? serviceKeyOf(request) : null;
+        const budget = service === null ? null : underBudget(service, mode);
+        try {
+          const response = initHeld(request, mode);
+          // The warm-up builds the program now, as a cold process does on its first request, so a check finds it held.
+          if (response.status === 'ready' && mode === 'warm') buildHeld(session);
+          writeResponse(response);
+          if (response.status !== 'ready') return;
+          conn.slot = session;
+          session.lastUsed = performance.now();
+          if (service !== null) serviceState(service, request.repo_root).lastUsed = Date.now();
+        } finally {
+          budget?.end();
+        }
         return;
       }
       default:
@@ -1760,9 +1786,7 @@ async function serveRequest(conn: Connection, line: string, request: SidecarRequ
   const mode = conn.mode ?? 'probe';
   const held = conn.slot as Session | undefined;
   const service = held?.service ?? (request.action === 'capture_v2' ? serviceKeyOf(request) : null);
-  keepUnderCap(service, mode, 'before');
-  const before = heapUsedMb();
-  const wasBuilt = service !== null && serviceBuilt(service);
+  const budget = underBudget(service, mode);
   let stopListening = (): void => {};
   try {
     // The daemon never changes a held program at a client's request.
@@ -1772,7 +1796,8 @@ async function serveRequest(conn: Connection, line: string, request: SidecarRequ
       if (held && (held.projectLoader === null || (held.service && services.get(held.service)?.coldOnly))) {
         throw new CloseForCold('the service is not held');
       }
-      if (request.action === 'capture_v2' && !captureHolds?.has(captureKeyOf(request))) {
+      const capture = request.action === 'capture_v2' ? captureHolds?.get(captureKeyOf(request)) : undefined;
+      if (request.action === 'capture_v2' && (!capture || !captureBuilt(capture) || services.get(serviceKeyOf(request))?.coldOnly)) {
         throw new CloseForCold('no capture is held for the service');
       }
     }
@@ -1803,13 +1828,31 @@ async function serveRequest(conn: Connection, line: string, request: SidecarRequ
     conn.destroy();
   } finally {
     stopListening();
-    if (service !== null) {
-      collect();
-      const state = services.get(service);
-      if (state && !wasBuilt && serviceBuilt(service)) state.footprintMb = (state.footprintMb ?? 0) + Math.max(0, heapUsedMb() - before);
-    }
-    keepUnderCap(service, mode, 'after');
+    budget.end();
   }
+}
+
+/**
+ * The heap budget around one request on `service` (L2): the cap kept before
+ * and after; on a warm request, the heap it kept added to the service's
+ * footprint (collected before and after, so it counts what stays). A probe
+ * forces no collection unless the heap reads over the cap.
+ */
+function underBudget(service: string | null, mode: ConnectionMode): { end: () => void } {
+  keepUnderCap(service, mode, 'before');
+  const measured = mode === 'warm' && service !== null;
+  if (measured) collect();
+  const before = heapUsedMb();
+  return {
+    end: () => {
+      if (measured) {
+        collect();
+        const state = services.get(service);
+        if (state && serviceBuilt(service)) state.footprintMb = (state.footprintMb ?? 0) + Math.max(0, heapUsedMb() - before);
+      }
+      keepUnderCap(service, mode, 'after');
+    },
+  };
 }
 
 /** Verify mode (carrick#2886): what it has seen, and the cold runner it asks. */
@@ -1861,7 +1904,10 @@ function heapUsedMb(): number {
 
 /** A full collection, when the daemon runs with `--expose-gc` (as the CLI starts it). */
 function collect(): void {
-  (globalThis as { gc?: () => void }).gc?.();
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) return;
+  gc();
+  collections += 1;
 }
 
 /**
@@ -1876,7 +1922,6 @@ function collect(): void {
  */
 function keepUnderCap(current: string | null, mode: ConnectionMode, phase: 'before' | 'after'): void {
   const cap = heapCapMb();
-  collect();
   if (phase === 'after' && current !== null) {
     const state = services.get(current);
     if (state && !state.coldOnly && state.footprintMb !== null && state.footprintMb > cap && serviceBuilt(current)) {
@@ -1885,6 +1930,9 @@ function keepUnderCap(current: string | null, mode: ConnectionMode, phase: 'befo
       collect();
     }
   }
+  // A forced collection costs hundreds of ms on a GB heap: only when the heap reads over the cap.
+  if (heapUsedMb() <= cap) return;
+  collect();
   while (heapUsedMb() > cap) {
     const victim = [...services.entries()]
       .filter(([key, state]) => key !== current && serviceBuilt(key) && !(mode === 'warm' && state.probeUsed))
