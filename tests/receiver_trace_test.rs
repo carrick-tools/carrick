@@ -864,7 +864,7 @@ fn a_callback_option_written_as_a_method_is_read_like_an_arrow() {
     );
 }
 
-/// A host's options: a literal prefix beside a method.
+/// A host's options holding a method: one states no prefix, one a literal.
 const HOOKS: &str = r#"import router, { Reply, Request } from "fixture-router";
 
 function ok(_request: Request, reply: Reply): void {
@@ -874,15 +874,18 @@ function ok(_request: Request, reply: Reply): void {
 const app = router();
 app.register((scoped) => {
   scoped.get("/hooked", ok);
+}, { onReady() {} });
+app.register((scoped) => {
+  scoped.get("/other", ok);
 }, { prefix: "/hk", onReady() {} });
 export default app;
 "#;
 
-/// carrick#2741: a method in a host's options sets its own key only, so a
-/// literal `prefix` beside it is still read (it used to read as unreadable,
-/// so the scope's route kept its unprefixed path).
+/// carrick#2741: a method in a host's options sets its own key only. With no
+/// `prefix` written the scope has none (it used to read as unreadable, so the
+/// route stayed untraced), and a literal `prefix` beside it is still read.
 #[test]
-fn a_method_beside_a_literal_prefix_leaves_the_prefix_read() {
+fn a_method_beside_a_prefix_slot_leaves_the_slot_read() {
     let (blobs, counts) = scan_runs_reading(
         "receiver-scopes",
         &[("src/hooks.ts", HOOKS)],
@@ -899,9 +902,11 @@ fn a_method_beside_a_literal_prefix_leaves_the_prefix_read() {
         .collect();
     assert_eq!(
         rows,
-        vec!["src/hooks.ts:9 GET /hk/hooked library_claim scoped"],
-        "{:#?} {:#?}",
-        endpoint_rows(&blobs),
+        vec![
+            "src/hooks.ts:12 GET /hk/other library_claim scoped",
+            "src/hooks.ts:9 GET /hooked library_claim scoped",
+        ],
+        "{:#?}",
         route_counts(&counts)
     );
     assert!(
