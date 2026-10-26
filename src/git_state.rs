@@ -244,6 +244,105 @@ pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>,
         .collect())
 }
 
+/// One run of lines a diff replaces: `old_count` lines from `old_start` in the
+/// commit's copy became `new_count` lines from `new_start` in the working
+/// tree. Either count can be zero (a pure insertion or deletion); a zero
+/// `old_count` places the insertion AFTER line `old_start`, as git states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hunk {
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+}
+
+/// Parse one `@@ -a[,b] +c[,d] @@` header. A missing count is one line.
+pub fn parse_hunk_header(line: &str) -> Option<Hunk> {
+    let body = line.strip_prefix("@@ -")?;
+    let (ranges, _) = body.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let range = |text: &str| -> Option<(u32, u32)> {
+        match text.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((text.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_count) = range(old)?;
+    let (new_start, new_count) = range(new)?;
+    Some(Hunk {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+    })
+}
+
+/// The hunks that turn `path` as `commit` holds it into the working tree's
+/// copy, in file order, with no context lines (carrick#2894).
+///
+/// Run from `repo_path`, with `path` relative to it. Guarded as
+/// [`unchanged_since`] is: a value that is not a hex object name never reaches
+/// git, a partial clone's stat-refresh is off, and no blob is fetched. `Err`
+/// is "git could not answer", which is not the same as no hunks.
+pub fn changed_hunks(repo_path: &str, commit: &str, path: &str) -> Result<Vec<Hunk>, String> {
+    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    let mut args = vec![];
+    if is_partial_clone(repo_path) {
+        args.extend(["-c", "diff.autoRefreshIndex=false"]);
+    }
+    args.extend([
+        "diff",
+        "-U0",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-renames",
+        "--relative",
+        commit,
+        "--",
+        path,
+    ]);
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().filter_map(parse_hunk_header).collect())
+}
+
+/// Where line `old_line` of the commit's copy sits in the working tree's, or
+/// `None` when a hunk replaced it. Lines outside every hunk move by the net
+/// change of the hunks above them.
+pub fn map_line(hunks: &[Hunk], old_line: u32) -> Option<u32> {
+    let mut shift: i64 = 0;
+    for hunk in hunks {
+        if hunk.old_count == 0 {
+            // Inserted after `old_start`: it moves only the lines below it.
+            if hunk.old_start < old_line {
+                shift += i64::from(hunk.new_count);
+            } else {
+                break;
+            }
+        } else if old_line < hunk.old_start {
+            break;
+        } else if old_line < hunk.old_start + hunk.old_count {
+            return None;
+        } else {
+            shift += i64::from(hunk.new_count) - i64::from(hunk.old_count);
+        }
+    }
+    u32::try_from(i64::from(old_line) + shift).ok()
+}
+
 /// Whether the checkout at `repo_path` is a partial clone: git's own marker,
 /// `extensions.partialClone` or a remote with `promisor = true`.
 fn is_partial_clone(repo_path: &str) -> bool {

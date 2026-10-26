@@ -1,0 +1,54 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "owner_node": "api",
+      "method": "GET",
+      "path": "/items/:id",
+      "handler_name": "anonymous",
+      "pattern_matched": "api.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ id, connected: true }",
+      "response_expression_line": 6,
+      "emission_style": "return-value",
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "owner_node": "api",
+      "method": "GET",
+      "path": "/items/:id/status",
+      "handler_name": "anonymous",
+      "pattern_matched": "api.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ id, state: 'ready' }",
+      "response_expression_line": 11,
+      "emission_style": "imperative-send",
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:14",
+      "line_number": 14,
+      "owner_node": "api",
+      "method": "GET",
+      "path": "/items",
+      "handler_name": "listItems",
+      "pattern_matched": "api.get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "[{ id: '1', connected: true }]",
+      "response_expression_line": 18,
+      "emission_style": "return-value",
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

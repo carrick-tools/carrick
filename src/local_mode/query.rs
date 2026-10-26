@@ -814,6 +814,33 @@ fn hosted_provenance_clause(hosted: &super::hosted::HostedProvenance) -> String 
     clause
 }
 
+/// What the scan did with the model rows of the files edited since the hosted
+/// index (carrick#2894): how many it carried onto their unchanged lines, and
+/// the first row it could not, with the reason. Empty when the scan carried
+/// nothing to speak of.
+fn carried_clause(boundary: Option<&crate::boundary::ServiceBoundary>) -> String {
+    let Some(boundary) = boundary else {
+        return String::new();
+    };
+    let Some(carried) = boundary.model_rows_carried else {
+        return String::new();
+    };
+    let left = boundary.model_rows_not_carried.as_ref();
+    let mut clause =
+        format!(" {carried} row(s) in edited files were carried by their unchanged lines");
+    match left {
+        Some(left) if !left.is_zero() => {
+            clause.push_str(&format!("; {} were not and are not checked", left.total));
+            if let Some(first) = left.reasons.first() {
+                clause.push_str(&format!(": {first}"));
+            }
+            clause.push('.');
+        }
+        _ => clause.push('.'),
+    }
+    clause
+}
+
 /// Hosted provenance feeds the same boundary renderer used by every local
 /// surface. Read commands never probe the network to compose this sentence.
 ///
@@ -829,13 +856,14 @@ pub fn enrichment_note(
     let remote = enrichment.remote.as_deref().unwrap_or("this repo");
     let mut note = match (&enrichment.hosted_state, &enrichment.hosted) {
         (HostedState::Enriched, Some(hosted)) => format!(
-            "candidates: from the hosted index at {} (indexed {}{}); {} file(s) changed since then hold facts only.",
+            "candidates: from the hosted index at {} (indexed {}{}); {} file(s) changed since then hold facts only.{}",
             hosted.commit.chars().take(7).collect::<String>(),
             hosted.indexed_at,
             hosted_provenance_clause(hosted),
             boundary
                 .and_then(|b| b.candidates_withheld_changed_files)
-                .unwrap_or(0)
+                .unwrap_or(0),
+            carried_clause(boundary)
         ),
         (HostedState::VersionMismatch, Some(hosted)) => format!(
             "hosted index written by carrick {} (cache {:?}), this binary is {} (cache {}); candidates not replayed.",

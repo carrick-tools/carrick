@@ -80,7 +80,19 @@
         "boundary": {
           "type": ["object", "null"],
           "description": "ServiceBoundary for this file's service (src/boundary.rs), verbatim. Null when the index states none.",
-          "properties": { "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 } },
+          "properties": {
+            "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 },
+            "model_rows_carried": { "type": "integer", "minimum": 0, "description": "Rows of edited files a no-model scan carried onto the lines the edit left alone." },
+            "model_rows_not_carried": {
+              "type": "object",
+              "description": "Rows of edited files that were not carried, or carried without a response type, as `file:line reason`. These rows are not checked.",
+              "properties": {
+                "total": { "type": "integer", "minimum": 0 },
+                "reasons": { "type": "array", "items": { "type": "string" } },
+                "truncated": { "type": "boolean" }
+              }
+            }
+          },
           "additionalProperties": true
         },
         "boundary_note": {

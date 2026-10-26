@@ -164,6 +164,22 @@ is 0 on every service `refresh` scans, because `refresh` asks the model nothing.
 model answers were withheld because their working-tree bytes changed. An absent
 counter means this scan did not record it.
 
+`model_rows_carried` and `model_rows_not_carried` say what a no-model scan did
+with the rows of those files (carrick#2894). A row whose call sits on a line the
+edit left alone is carried: it moves to its new line and its types are read from
+the working tree. Every other row is counted in `model_rows_not_carried` as
+`file:line reason`, and is not checked. The reasons are
+`registration_line_changed` (the edit replaced the registration line),
+`no_matching_call` (no single call on that line matches the one the answer
+named), `hint_outside_registration_changed` (a handler named at the
+registration changed, so a type read there could come from the wrong function),
+`carried_untyped` (carried, but the send line was edited, so there is no
+response type), `old_source_unavailable` (this clone does not hold the indexed
+commit's copy of the file) and `not_carried_<field>` (GraphQL, pub/sub and
+dispatch rows are not carried yet). Both counters are absent when the tree has
+no edited file with rows to carry. Carried rows are never written to the
+stored index.
+
 ### Top level
 
 | field | type | meaning |

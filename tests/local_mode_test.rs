@@ -3185,3 +3185,393 @@ fn check_changed_in_a_shallow_clone_says_to_unshallow() {
         "{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// carrick#2894: an edited file keeps the model's answer for the lines the edit
+// left alone. The producer registers its routes on a typed receiver, which no
+// deterministic reader states, so the rows below exist only as the model's
+// answer (the cassettes in the fixture), replayed from the index.
+// ---------------------------------------------------------------------------
+
+/// The fixture's cassettes: the model's answers, keyed by file stem.
+fn carry_cassettes() -> String {
+    format!(
+        "{}/",
+        repo_root()
+            .join("tests/fixtures/edited-handler-carry/cassettes")
+            .display()
+    )
+}
+
+/// The producer's route module, as the cassette's line numbers see it.
+const CARRY_ROUTES: &str = "items-api/src/routes.ts";
+
+/// The fixture's two repos, indexed with the model mocked to the fixture's
+/// cassettes, so the index holds the model's answers a check later replays.
+fn carry_workspace() -> tempfile::TempDir {
+    let workspace = workspace("edited-handler-carry", &["items-api", "items-web"]);
+    let root = workspace.path();
+    for repo in ["items-api", "items-web"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+    let output = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", carry_cassettes())
+        .output()
+        .expect("spawn carrick index");
+    assert!(
+        output.status.success(),
+        "index failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    workspace
+}
+
+/// A command with its exit code, since a failing check is the point here.
+fn carrick_code(workspace: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(carrick())
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_RECHECK_BUDGET_MS", "600000")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+    )
+}
+
+/// `check --changed --json`, against a base that is the commit indexed.
+fn carry_check_changed(workspace: &Path) -> (Option<i32>, serde_json::Value) {
+    for repo in ["items-api", "items-web"] {
+        git(
+            &workspace.join(repo),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+    }
+    let (code, text) = carrick_code(
+        workspace,
+        &["check", "--changed", "--workspace", ".", "--json"],
+    );
+    let json = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("check --changed --json was not JSON: {e}\n{text}"));
+    (code, json)
+}
+
+/// The producer's route module with two lines above the plugin and the first
+/// route's field renamed: the edit every test below starts from.
+fn rename_connected(root: &Path) {
+    let file = root.join(CARRY_ROUTES);
+    edit(
+        &file,
+        "export async function itemRoutes",
+        "// A note.\n// Another.\nexport async function itemRoutes",
+    );
+    edit(
+        &file,
+        "return { id, connected: true };",
+        "return { id, isConnected: true };",
+    );
+}
+
+/// The no-model re-scan the re-check and `refresh` run for the producer, with
+/// the stored index as its previous generation, and the blob it writes.
+fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
+    let out = root.join("rescan-out");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).expect("create the scan dir");
+    let previous = root.join("rescan-previous.json");
+    std::fs::write(
+        &previous,
+        serde_json::to_vec(&vec![stored_blob(root, "items-api")]).expect("serialise"),
+    )
+    .expect("write the previous generation");
+    let output = Command::new(carrick())
+        .arg(root.join("items-api"))
+        .args(changed_only.then_some("--changed-only"))
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_NO_MODEL", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env("CARRICK_SKIP_SIGNATURES", "1")
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_LOCAL_STORAGE_DIR", &out)
+        .env("CARRICK_LOCAL_HOSTED_PREVIOUS", &previous)
+        .output()
+        .expect("spawn the re-scan");
+    assert!(
+        output.status.success(),
+        "the re-scan failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(&std::fs::read_to_string(out.join("items-api.json")).expect("blob"))
+        .expect("the re-scan blob is JSON")
+}
+
+/// The paths of the producer's endpoint rows in a blob, as `path@line`.
+fn carried_routes(blob: &serde_json::Value) -> Vec<String> {
+    blob["endpoints"]
+        .as_array()
+        .expect("endpoints")
+        .iter()
+        .map(|row| {
+            format!(
+                "{}@{}",
+                row["key"]["path"].as_str().unwrap_or_default(),
+                row["file_path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+fn not_carried(blob: &serde_json::Value) -> Vec<String> {
+    blob["boundary"]["model_rows_not_carried"]["reasons"]
+        .as_array()
+        .map(|reasons| {
+            reasons
+                .iter()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A producer registers its routes on a typed receiver, so only the model's
+/// answer states them. Editing the file used to drop all three from the one scan
+/// meant to judge the edit; now the lines the edit left alone keep their rows,
+/// and a field renamed inside a handler fails the check.
+#[test]
+#[serial]
+fn an_edited_handler_keeps_its_route_and_is_re_judged() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+
+    let before = check_json(root, CARRY_ROUTES);
+    let results: Vec<&str> = before["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["verdict"]["result"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        results,
+        vec!["compatible"; 3],
+        "the fixture starts compatible, which is the known positive:\n{before:#}"
+    );
+
+    rename_connected(root);
+
+    let (code, text) = carrick_code(
+        root,
+        &[
+            "check",
+            CARRY_ROUTES,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let rechecked: serde_json::Value = serde_json::from_str(&text).expect("recheck is JSON");
+    let first = &rechecked["items"][0];
+    assert_eq!(
+        first["line"], 6,
+        "the route moved with the two inserted lines:\n{rechecked:#}"
+    );
+    assert_eq!(first["verdict"]["result"], "type_mismatch", "{rechecked:#}");
+    assert!(
+        first["actual_type"]
+            .as_str()
+            .is_some_and(|t| t.contains("isConnected")),
+        "with the producer's fresh type:\n{rechecked:#}"
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(code, Some(1), "a fact fails the run:\n{changed:#}");
+    let problem = &changed["problems"][0];
+    assert_eq!(problem["kind"], "incompatible", "{changed:#}");
+    assert_eq!(problem["file"], CARRY_ROUTES, "{changed:#}");
+    assert_eq!(problem["line"], 6, "{changed:#}");
+    assert_eq!(problem["source"], "fact", "{changed:#}");
+    assert_eq!(problem["fails"], true, "{changed:#}");
+
+    let blob = no_model_rescan(root, true);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 3,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert!(
+        blob["boundary"].get("model_rows_not_carried").is_none(),
+        "every row was carried and typed: {:?}",
+        blob["boundary"]
+    );
+}
+
+/// A registration whose own line the edit replaced is not carried: nothing
+/// proves it still states the route the answer named. It is counted, with the
+/// line, and its neighbours are still carried.
+#[test]
+#[serial]
+fn a_changed_registration_line_is_not_carried_and_is_counted() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "'/items/:id/status'",
+        "'/items/:id/state'",
+    );
+
+    let blob = no_model_rescan(root, true);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 2,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert_eq!(
+        not_carried(&blob),
+        vec!["src/routes.ts:9 registration_line_changed".to_string()],
+        "{:?}",
+        blob["boundary"]
+    );
+    let routes = carried_routes(&blob);
+    assert!(
+        routes.iter().any(|r| r.starts_with("/api/v1/items/:id@"))
+            && routes.iter().any(|r| r.starts_with("/api/v1/items@")),
+        "the untouched registrations kept their routes: {routes:?}"
+    );
+}
+
+/// A handler named at the registration whose body the edit changed is not
+/// carried: its response is read where the model said, and that place moved
+/// under it. Left out rather than risk a false failure, and counted.
+#[test]
+#[serial]
+fn a_named_handler_whose_body_changed_is_not_carried() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return [{ id: '1', connected: true }];",
+        "return [{ id: '1', isConnected: true }];",
+    );
+
+    let blob = no_model_rescan(root, true);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 2,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert_eq!(
+        not_carried(&blob),
+        vec!["src/routes.ts:14 hint_outside_registration_changed".to_string()],
+        "{:?}",
+        blob["boundary"]
+    );
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(
+        code,
+        Some(0),
+        "no row was judged against the wrong function:\n{changed:#}"
+    );
+    assert!(
+        changed["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .all(|p| p["fails"] != true),
+        "{changed:#}"
+    );
+}
+
+/// A carried answer is joined and never stored: it is keyed by this tree's
+/// candidate ids and mapped from the previous generation's commit, so a stored
+/// copy would be mapped again from the wrong base.
+#[test]
+#[serial]
+fn an_edited_file_keeps_no_carried_answer_in_the_blob() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    assert!(
+        stored_blob(root, "items-api")["file_results"]
+            .get("src/routes.ts")
+            .is_some(),
+        "the model scan stored its answer for the file"
+    );
+    rename_connected(root);
+
+    let blob = no_model_rescan(root, true);
+    assert_eq!(
+        blob["boundary"]["model_rows_carried"], 3,
+        "{:?}",
+        blob["boundary"]
+    );
+    assert!(
+        blob["file_results"].get("src/routes.ts").is_none(),
+        "the edited file stores no answer: {:?}",
+        blob["file_results"]
+    );
+    assert!(blob["file_results"].get("src/server.ts").is_some());
+}
+
+/// Nothing changes where nothing was edited, and a model scan is not touched.
+#[test]
+#[serial]
+fn carrying_leaves_a_clean_tree_and_a_model_scan_alone() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    let indexed = stored_blob(root, "items-api");
+
+    let clean = no_model_rescan(root, false);
+    assert!(
+        clean["boundary"].get("model_rows_carried").is_none(),
+        "{:?}",
+        clean["boundary"]
+    );
+    assert!(clean["boundary"].get("model_rows_not_carried").is_none());
+    assert_eq!(clean["endpoints"], indexed["endpoints"]);
+    assert_eq!(clean["file_results"], indexed["file_results"]);
+
+    // The same edit, scanned with the model: the cassette answers again and
+    // nothing is carried. (A dirty tree stores no answer for the file it
+    // changed, with or without this change.)
+    edit(
+        &root.join(CARRY_ROUTES),
+        "return { id, connected: true };",
+        "return { id, isConnected: true };",
+    );
+    let output = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", carry_cassettes())
+        .output()
+        .expect("spawn carrick index");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rescanned = stored_blob(root, "items-api");
+    assert!(rescanned["boundary"].get("model_rows_carried").is_none());
+    assert!(
+        rescanned["boundary"]
+            .get("model_rows_not_carried")
+            .is_none()
+    );
+    assert_eq!(
+        carried_routes(&rescanned).len(),
+        3,
+        "the model answered for the edited file again"
+    );
+}

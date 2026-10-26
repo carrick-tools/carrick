@@ -55,6 +55,7 @@ pub mod library_store;
 pub mod local_http_wrapper;
 pub mod local_mode;
 pub mod logging;
+pub mod model_carry;
 pub mod module_aliases;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
