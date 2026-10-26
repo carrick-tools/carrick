@@ -273,8 +273,8 @@ impl Drop for WarmClaim {
 pub(super) fn start(root: Option<&Path>, warm: bool) -> Result<String, String> {
     if !typed_daemon::enabled() {
         return Err(format!(
-            "the type daemon is off here ({}=off, or a platform without it)",
-            typed_daemon::OFF_ENV
+            "the type daemon is off here (set {}=on to use it; it needs Unix sockets)",
+            typed_daemon::ON_ENV
         ));
     }
     let root = super::workspace::locate(root, None)

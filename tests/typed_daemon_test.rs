@@ -105,9 +105,8 @@ fn run(root: &Path, args: &[&str], daemon: bool) -> (Option<i32>, String) {
                 .parent()
                 .unwrap(),
         );
-    if !daemon {
-        command.env("CARRICK_TYPED", "off");
-    }
+    // Opt-in: the daemon is used only with `on`.
+    command.env("CARRICK_TYPED", if daemon { "on" } else { "off" });
     let output = command.output().unwrap();
     (
         output.status.code(),

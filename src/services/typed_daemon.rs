@@ -32,10 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Turns the daemon off for this process and every scan it starts: `off`,
-/// `0` or `false`. Every `check` then answers as it did before the daemon
-/// existed, and none is started.
-pub const OFF_ENV: &str = "CARRICK_TYPED";
+/// Turns the daemon on for this process and every scan it starts: `on`. It is
+/// off otherwise (opt-in until a measured whole-check gain, 2026-10-27): every
+/// `check` answers as it did before the daemon existed, and none is started.
+pub const ON_ENV: &str = "CARRICK_TYPED";
 /// The daemon's socket, handed by a `check` to the scan it starts.
 pub const SOCKET_ENV: &str = "CARRICK_TYPED_SOCKET";
 /// Which services that scan answers through the daemon: `*` for every one, or
@@ -71,15 +71,15 @@ const BACK_OFF_SECS: u64 = 24 * 60 * 60;
 /// be the same process (L5 (c)).
 const START_TIME_SLACK_SECS: i64 = 2;
 
-/// Whether this process may use the daemon at all.
+/// Whether this process may use the daemon at all: only when [`ON_ENV`] says
+/// `on`, on a platform with Unix sockets.
 pub fn enabled() -> bool {
-    if cfg!(not(unix)) {
-        return false;
-    }
-    !matches!(
-        std::env::var(OFF_ENV).ok().as_deref().map(str::trim),
-        Some("off" | "0" | "false")
-    )
+    cfg!(unix) && switched_on(std::env::var(ON_ENV).ok().as_deref())
+}
+
+/// Whether a value of [`ON_ENV`] turns the daemon on.
+fn switched_on(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("on")
 }
 
 /// The build id of the sidecar whose entry script is `entry`
@@ -971,7 +971,7 @@ impl Use {
     }
 
     /// The daemon this process was handed, or `None` when it was handed none
-    /// or the daemon is off ([`OFF_ENV`]).
+    /// or the daemon is off ([`ON_ENV`]).
     pub fn from_env() -> Option<Self> {
         if !enabled() {
             return None;
@@ -1096,6 +1096,18 @@ mod tests {
         assert_eq!(parse_etime("02:01:05"), Some(7265));
         assert_eq!(parse_etime("3-02:01:05"), Some(3 * 86_400 + 7265));
         assert_eq!(parse_etime("x"), None);
+    }
+
+    /// Opt-in: only `on` turns the daemon on; unset, `off` or anything else
+    /// leaves every check on processes of its own.
+    #[test]
+    fn the_daemon_is_on_only_when_switched_on() {
+        assert!(!switched_on(None));
+        assert!(!switched_on(Some("")));
+        assert!(!switched_on(Some("off")));
+        assert!(!switched_on(Some("1")));
+        assert!(switched_on(Some("on")));
+        assert!(switched_on(Some(" on\n")));
     }
 
     /// An eighth of the machine, at most 3 GB.

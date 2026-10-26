@@ -71,16 +71,16 @@ A file the tree has not changed, a deleted file, and every `touch` are answered
 from the index as before. A changed file that holds no row is re-checked like
 any other: the row it might hold now is the reason to look.
 
-A re-check (`--recheck`, `--changed`, `--each`) answers through the resident
-type daemon when one of this build serves the workspace: one sidecar process
+With `CARRICK_TYPED=on` (off by default), a re-check (`--recheck`,
+`--changed`, `--each`) answers through the resident type daemon when one of
+this build serves the workspace: one sidecar process
 per workspace that keeps each service's TypeScript program between checks and
 reads again only what an edit reaches. Its answers are the ones a process of
 its own gives; anything that fails only in the daemon is answered by a process
 of the check's own instead. A check that finds none answers cold and starts one
 in the background (`carrick daemon start` starts one by hand, `carrick daemon
 stop` stops it); it stops after 15 minutes with no request. A session start
-starts nothing. `CARRICK_TYPED=off` turns it off for the process and every scan
-it starts. A build whose daemon crashed twice within an hour is not started
+starts nothing. The variable reaches every scan the check starts. A build whose daemon crashed twice within an hour is not started
 again for a day, and `carrick status` says until when.
 
 `index` recomputes deterministic facts from the working tree and reads hosted
