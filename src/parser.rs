@@ -108,13 +108,15 @@ impl ModuleReader {
         module_loads(&module)
     }
 
-    /// What `file` reads in type position that [`Self::loaded_specifiers`]
-    /// does not: see [`type_reads`] and [`reference_directives`].
-    pub fn type_reads(&mut self, file: &Path) -> Vec<String> {
+    /// [`Self::loaded_specifiers`] and, after them, what `file` reads in type
+    /// position ([`type_reads`], [`reference_directives`]), from one parse:
+    /// the reach walk's reads of a file.
+    pub fn reach_specifiers(&mut self, file: &Path) -> Vec<String> {
         let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
             return Vec::new();
         };
-        let mut found = type_reads(&module);
+        let mut found = module_loads(&module);
+        found.extend(type_reads(&module));
         if let Some(source) = read_source(file) {
             found.extend(reference_directives(&source));
         }

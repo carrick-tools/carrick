@@ -737,10 +737,8 @@ impl ClosureReads {
         }
         #[cfg(test)]
         self.parsed.set(self.parsed.get() + 1);
-        // A type named through `import('./x').T` or a `/// <reference>` is a
-        // read for reach, though `loaded_specifiers` does not load it.
-        let mut loaded = self.reader.borrow_mut().loaded_specifiers(file);
-        loaded.extend(self.reader.borrow_mut().type_reads(file));
+        // Includes types named through `import('./x').T` or a `/// <reference>`.
+        let loaded = self.reader.borrow_mut().reach_specifiers(file);
         self.specifiers.borrow_mut().insert(key, loaded.clone());
         loaded
     }
