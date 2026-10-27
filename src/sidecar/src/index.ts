@@ -2098,12 +2098,13 @@ async function serve(workspace: string, cliVersion: string | null): Promise<void
   const stopOn = (signal: string) => () => server.stop(`${signal} received`);
   process.on('SIGINT', stopOn('SIGINT'));
   process.on('SIGTERM', stopOn('SIGTERM'));
-  const judge = new KeptJudge();
+  // A daemon that aborted (out of heap) never removed its kept judge workspace: each is listed as it is made.
+  const orphans = removeOrphanedJudgeWorkspaces(server.listedJudges());
+  server.rewriteJudges(orphans.live);
+  if (orphans.removed > 0) log(`removed ${orphans.removed} judge workspace(s) a dead daemon kept`);
+  const judge = new KeptJudge((dir) => server.listJudge(dir));
   keptJudge = judge;
   process.on('exit', () => judge.discard());
-  // A daemon that aborted (out of heap) never removed its kept judge workspace.
-  const orphans = removeOrphanedJudgeWorkspaces();
-  if (orphans > 0) log(`removed ${orphans} judge workspace(s) a dead daemon kept`);
 }
 
 /** How often the sidecar looks for the process that started it. */

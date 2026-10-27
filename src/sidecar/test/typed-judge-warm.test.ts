@@ -12,13 +12,14 @@
 
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck, KeptJudge } from '../src/capture/index.js';
 import type { CheckPairSpec, CheckResult, CheckStubInput } from '../src/capture/api.js';
 import { buildProbe } from '../src/capture/check-probe.js';
-import { SocketClient, daemon, killDaemons, recordOf, stopDaemon } from './typed-helpers.js';
+import { SocketClient, daemon, killDaemons, recordOf, stopDaemon, until } from './typed-helpers.js';
 
 let root: string;
 
@@ -240,6 +241,9 @@ describe('warm judge: a daemon keeps one judge workspace across checks', () => {
     };
     const first = await check('c1');
     assert.deepStrictEqual(await judgeUses(), { checks: 1, installs_skipped: 0 });
+    // Listed where the next daemon's start reads it, should this one abort without discarding it.
+    const listed = fs.readFileSync(path.join(ws, '.carrick', 'typed.judges'), 'utf8').split('\n').filter(Boolean);
+    assert.deepStrictEqual(listed.map((dir) => path.dirname(dir)), [parent]);
     const second = await check('c2');
     assert.deepStrictEqual(await judgeUses(), { checks: 2, installs_skipped: 1 });
     assert.strictEqual(verdictText(second), verdictText(first));
@@ -248,4 +252,44 @@ describe('warm judge: a daemon keeps one judge workspace across checks', () => {
     await stopDaemon(child, socket);
     assert.deepStrictEqual(fs.readdirSync(parent), [], 'the kept workspace leaves with the daemon');
   });
+
+  it('a check whose client goes away kills its install, and the kept judge is free for the next check', async () => {
+    const ws = path.join(dir, 'ws-abort');
+    fs.mkdirSync(ws);
+    const parent = path.join(dir, 'judge-abort');
+    const input: CheckStubInput[] = [
+      { service_name: 'orders', stub_dir: writeStub(dir, 'orders-abort', ordersSurface('number')) },
+      { service_name: 'web', stub_dir: writeStub(dir, 'web-abort', WEB_SURFACE) },
+    ];
+    const child = await daemon(ws);
+    const socket = recordOf(ws)!.socket;
+    const children = (): number[] =>
+      spawnSync('pgrep', ['-P', String(child.pid)], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean).map(Number);
+    const doomed = await SocketClient.greeted(socket);
+    doomed.conn.write(JSON.stringify({ request_id: 'c1', action: 'check_v2', stubs: input, pairs: PAIRS, workspace_root: parent }) + '\n');
+    await until('the install to start', () => children().length > 0, 60000);
+    const install = children();
+    doomed.conn.destroy();
+    await until('the install to be killed', () => install.every((pid) => !alive(pid)), 20000);
+    const next = await SocketClient.greeted(socket);
+    type Status = { counters: { abandoned: number }; judge: { checks: number; installs_skipped: number; workspace_dir: string | null } };
+    // Answered once the killed check has ended: it finished nothing, so it kept no workspace.
+    const after = (await next.send({ request_id: 'st0', action: 'status' })).daemon as Status;
+    assert.deepStrictEqual([after.counters.abandoned, after.judge.workspace_dir], [1, null]);
+    const answer = await next.send({ request_id: 'c2', action: 'check_v2', stubs: input, pairs: PAIRS, workspace_root: parent });
+    assert.strictEqual(answer.status, 'success', JSON.stringify(answer).slice(0, 500));
+    const status = (await next.send({ request_id: 'st', action: 'status' })).daemon as Status;
+    assert.deepStrictEqual([status.judge.checks, status.judge.installs_skipped], [2, 0], 'the next check installs afresh');
+    next.conn.destroy();
+    await stopDaemon(child, socket);
+  });
 });
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}

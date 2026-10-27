@@ -48,6 +48,9 @@ export type ConnectionMode = 'probe' | 'warm';
 /** Appended to, one `<unix secs> <build id>` line per fatal exit; never truncated. */
 export const CRASH_FILE = 'typed.crashes';
 
+/** The kept judge workspaces this workspace's daemons made, one path per line (carrick#2916). */
+export const JUDGES_FILE = 'typed.judges';
+
 /** How long a record's live process may take to answer `hello` before it counts as busy. */
 const HELLO_GRACE_MS = 2000;
 
@@ -294,6 +297,7 @@ export class TypedServer {
   readonly socketPath: string;
   readonly recordPath: string;
   readonly crashPath: string;
+  readonly judgesPath: string;
   /** The process's start, as `ps` reports it: the record's `started_at`. */
   readonly startedAt = new Date(Math.round(performance.timeOrigin));
   /** The workspace's real path. */
@@ -321,6 +325,7 @@ export class TypedServer {
     this.carrickDir = path.join(opts.workspace, '.carrick');
     this.recordPath = path.join(this.carrickDir, TYPED_RECORD);
     this.crashPath = path.join(this.carrickDir, CRASH_FILE);
+    this.judgesPath = path.join(this.carrickDir, JUDGES_FILE);
     this.socketPath = socketPathFor(opts.workspace);
     this.workspaceReal = realPathOf(opts.workspace);
     // Single-file roots: the guard takes a directory root inside the
@@ -329,7 +334,7 @@ export class TypedServer {
     const socketDir = path.dirname(this.socketPath);
     const ownSocketDir = socketDir === this.carrickDir ? [] : [socketDir];
     this.guard = WriteGuard.of({
-      files: [this.carrickDir, this.recordPath, this.temporaryRecordPath(), this.crashPath, this.socketPath, ...ownSocketDir],
+      files: [this.carrickDir, this.recordPath, this.temporaryRecordPath(), this.crashPath, this.judgesPath, this.socketPath, ...ownSocketDir],
       protect: [opts.workspace],
     });
   }
@@ -351,6 +356,25 @@ export class TypedServer {
   warming(): boolean {
     for (const conn of this.connections) if (conn.mode === 'warm' && !conn.closed) return true;
     return false;
+  }
+
+  /** The kept judge workspaces listed by this workspace's daemons. */
+  listedJudges(): string[] {
+    try {
+      return fs.readFileSync(this.judgesPath, 'utf8').split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Keep only `dirs` in the list. */
+  rewriteJudges(dirs: string[]): void {
+    this.guard.writeFile(this.judgesPath, dirs.map((dir) => `${dir}\n`).join(''));
+  }
+
+  /** List a kept judge workspace this daemon just made. */
+  listJudge(dir: string): void {
+    this.guard.appendFile(this.judgesPath, `${dir}\n`);
   }
 
   /** Append this build's crash line (a fatal exit); never throws. */

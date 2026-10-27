@@ -453,21 +453,42 @@ describe('daemon lifecycle (warm type process L2-L6)', () => {
     await stopDaemon(child, socket);
   });
 
-  it('removes the kept judge workspaces of dead daemons only', async () => {
+  it('removes the listed kept judge workspaces of dead daemons only, wherever they are', async () => {
+    // A request's workspace_root, not the OS temp dir.
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'clife-judges-'));
     workspaces.push(parent);
+    const root = path.join(parent, 'any', 'judge-root');
     const gone = spawn('node', ['-e', ''], { stdio: 'ignore' });
     await exited(gone);
     const dirs: Record<string, string | null> = { dead: String(gone.pid), live: String(process.pid), unmarked: null };
     for (const [name, owner] of Object.entries(dirs)) {
-      fs.mkdirSync(path.join(parent, `carrick-check-v2-${name}`, 'node_modules'), { recursive: true });
-      if (owner !== null) fs.writeFileSync(path.join(parent, `carrick-check-v2-${name}`, JUDGE_OWNER_FILE), `${owner}\n`);
+      fs.mkdirSync(path.join(root, `carrick-check-v2-${name}`, 'node_modules'), { recursive: true });
+      if (owner !== null) fs.writeFileSync(path.join(root, `carrick-check-v2-${name}`, JUDGE_OWNER_FILE), `${owner}\n`);
     }
     // Not a check workspace, though it names a dead owner.
-    fs.mkdirSync(path.join(parent, 'other-dead'));
-    fs.writeFileSync(path.join(parent, 'other-dead', JUDGE_OWNER_FILE), `${gone.pid}\n`);
-    assert.strictEqual(removeOrphanedJudgeWorkspaces(parent), 1);
-    assert.deepStrictEqual(fs.readdirSync(parent).sort(), ['carrick-check-v2-live', 'carrick-check-v2-unmarked', 'other-dead']);
+    fs.mkdirSync(path.join(root, 'other-dead'));
+    fs.writeFileSync(path.join(root, 'other-dead', JUDGE_OWNER_FILE), `${gone.pid}\n`);
+    const listed = [...Object.keys(dirs).map((name) => path.join(root, `carrick-check-v2-${name}`)), path.join(root, 'other-dead'), path.join(root, 'carrick-check-v2-gone')];
+    const outcome = removeOrphanedJudgeWorkspaces(listed);
+    assert.deepStrictEqual(outcome, { removed: 1, live: [path.join(root, 'carrick-check-v2-live')] });
+    assert.deepStrictEqual(fs.readdirSync(root).sort(), ['carrick-check-v2-live', 'carrick-check-v2-unmarked', 'other-dead']);
+  });
+
+  it('on start, removes the dead kept judge workspaces its record lists and keeps the list to the live ones', async () => {
+    const ws = workspace();
+    const gone = spawn('node', ['-e', ''], { stdio: 'ignore' });
+    await exited(gone);
+    const judges = fs.mkdtempSync(path.join(os.tmpdir(), 'clife-root-'));
+    workspaces.push(judges);
+    const dead = path.join(judges, 'carrick-check-v2-dead');
+    fs.mkdirSync(path.join(dead, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(dead, JUDGE_OWNER_FILE), `${gone.pid}\n`);
+    fs.mkdirSync(path.join(ws, '.carrick'));
+    fs.writeFileSync(path.join(ws, '.carrick', 'typed.judges'), `${dead}\n`);
+    const child = await daemon(ws);
+    await until('the dead judge workspace to go', () => !fs.existsSync(dead));
+    assert.strictEqual(fs.readFileSync(path.join(ws, '.carrick', 'typed.judges'), 'utf8'), '');
+    await stopDaemon(child, recordOf(ws)!.socket);
   });
 
   it('says warming while a warm connection is open', async () => {

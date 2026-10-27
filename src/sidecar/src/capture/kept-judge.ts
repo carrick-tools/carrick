@@ -16,7 +16,6 @@
  */
 
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { WriteGuard } from './guarded-fs.js';
 import {
@@ -39,28 +38,27 @@ export const JUDGE_OWNER_FILE = '.carrick-judge-owner';
 const CHECK_WORKSPACE_PREFIX = 'carrick-check-v2-';
 
 /**
- * Remove the kept judge workspaces under `parent` whose owning daemon is dead:
- * one that aborts (out of heap) never discards its own. Only a directory that
- * carries the owner file is touched; returns how many were removed.
+ * Remove the kept judge workspaces among `dirs` (the ones a daemon listed as
+ * it made them) whose owning daemon is dead: one that aborts (out of heap)
+ * never discards its own. Only a check workspace that carries the owner file
+ * is touched. Returns how many were removed and the ones whose owner lives.
  */
-export function removeOrphanedJudgeWorkspaces(parent: string = os.tmpdir()): number {
+export function removeOrphanedJudgeWorkspaces(dirs: Iterable<string>): { removed: number; live: string[] } {
   let removed = 0;
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(parent, { withFileTypes: true });
-  } catch {
-    return 0;
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(CHECK_WORKSPACE_PREFIX)) continue;
-    const dir = path.join(parent, entry.name);
+  const live: string[] = [];
+  for (const dir of dirs) {
+    if (!path.basename(dir).startsWith(CHECK_WORKSPACE_PREFIX)) continue;
     let owner: number;
     try {
       owner = Number(fs.readFileSync(path.join(dir, JUDGE_OWNER_FILE), 'utf8').trim());
     } catch {
       continue;
     }
-    if (!Number.isInteger(owner) || owner <= 0 || alive(owner)) continue;
+    if (!Number.isInteger(owner) || owner <= 0) continue;
+    if (alive(owner)) {
+      live.push(dir);
+      continue;
+    }
     try {
       WriteGuard.of({ dirs: [dir] }).remove(dir);
       removed += 1;
@@ -68,7 +66,7 @@ export function removeOrphanedJudgeWorkspaces(parent: string = os.tmpdir()): num
       /* best effort */
     }
   }
-  return removed;
+  return { removed, live };
 }
 
 /** Bytes under `dir`, links counted as themselves. */
@@ -135,6 +133,9 @@ export class KeptJudge {
   /** The kept workspace's size on disk (MB), measured when a check releases it; null when none is kept. */
   sizeMb: number | null = null;
 
+  /** `onCreated` hears each workspace it writes, so a later daemon can find it after an abort. */
+  constructor(private readonly onCreated?: (workspaceDir: string) => void) {}
+
   /** Whether a check holds the workspace now. */
   get inUse(): boolean {
     return this.busy;
@@ -165,6 +166,7 @@ export class KeptJudge {
     const ws = writeWorkspace(plan, parent);
     // Whoever finds this daemon dead removes the workspace (it never discards it after an abort).
     ws.guard.writeFile(path.join(ws.workspaceDir, JUDGE_OWNER_FILE), `${process.pid}\n`);
+    this.onCreated?.(ws.workspaceDir);
     const written = new Map<string, string>();
     for (const [rel, entry] of plan.files) written.set(rel, entryDigest(entry));
     this.held = { ws, parent, installKey, written, installed: false };
