@@ -27,12 +27,49 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { isCheckedSource } from "./check-nudge.ts";
 import { markTold, NOTED_KEY, record, toldKey, wasTold } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
 
 const log = createLogger("carrick-hook");
+
+/**
+ * The files `carrick check --changed` judges: the scanner's own source
+ * extensions (`SOURCE_EXTENSIONS` in `src/file_finder.rs`, carrick#904). An API
+ * spec file is not counted: the hook cannot tell a spec the scan reads from any
+ * other `.json` or `.yaml` without reading the repo, and a config file that
+ * moves no contract is what the line used to be wrong about.
+ */
+const CHECKED_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
+
+/** `TEST_FILE_INFIXES` in `src/file_finder.rs`: a test or story file name ends its stem in one. */
+const TEST_FILE_INFIXES = [".test", ".spec", ".stories"];
+
+/** `TEST_DIR_NAMES` in `src/file_finder.rs` (plus `.storybook`): trees the scan does not read. */
+const TEST_DIR_NAMES = new Set([
+  "__tests__",
+  "__mocks__",
+  "__fixtures__",
+  "tests",
+  "test",
+  "fixtures",
+  "e2e",
+  ".storybook",
+]);
+
+/** Whether `carrick check --changed` would judge this edited file: source, and not a test or story. */
+export function isCheckedSource(file: string): boolean {
+  const extension = path.extname(file).toLowerCase();
+  if (!CHECKED_EXTENSIONS.has(extension)) return false;
+  const stem = path.basename(file, extension).toLowerCase();
+  if (TEST_FILE_INFIXES.some((infix) => stem.endsWith(infix))) return false;
+  // Directory names above the file. The scanner reads them relative to the
+  // scan root; the hook does not know it, so a checkout under a directory
+  // named `test` hides its source here: the line is then missing, not wrong.
+  const directories = path.dirname(file).split(/[\\/]/);
+  return !directories.some((name) => TEST_DIR_NAMES.has(name.toLowerCase()));
+}
+
 /** The files the index has rows for. */
 const CHECKED = /\.(ts|tsx|mts|cts)$/;
 

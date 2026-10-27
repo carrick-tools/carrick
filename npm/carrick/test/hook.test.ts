@@ -244,7 +244,7 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
   assert.equal(output.hookEventName, "SessionStart");
   // Both carry the finish-line check.
-  assert.match(plain.stdout, /\nBefore you say a change is done, run `carrick check --changed`.*Exit 1 means a contract problem, exit 2 means nothing could be checked\.\n$/);
+  assert.match(plain.stdout, /\nBefore you call a change done, run `carrick check --changed`\. Exit 1 is a contract problem; exit 2 means nothing could be checked\.\n$/);
   // The same text Claude Code is given, byte for byte.
   assert.equal(`${output.additionalContext}\n`, plain.stdout);
 });
@@ -599,7 +599,7 @@ test("a three-file patch is one binary call, and every file gets its answer", as
   // the patch names them, rather than the same sentence three times.
   assert.equal(
     contextOf(run.stdout),
-    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
+    "Carrick: order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts were not re-checked here. Run `carrick check --changed` before you finish.",
   );
 });
 
@@ -632,7 +632,7 @@ test("a repo whose re-check is known not to fit gets one pointer line per sessio
   // The index's verdicts describe the file before the edit, so none is
   // printed: one line that sends the reader to the command that answers.
   const pointer =
-    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).";
+    "Carrick: user-service/src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.";
   assert.equal(first, pointer);
   // Said once per session: the second edit's line would be the same sentence.
   assert.equal(second, "");

@@ -48,11 +48,6 @@ export type SessionRecord = {
    * asks once per file per session, whatever the answer was.
    */
   read: string[];
-  /**
-   * The newest unchecked edit the Stop hook's check line has named
-   * (carrick#2933), so one edit set is named once.
-   */
-  checkNudged: string;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -88,7 +83,6 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     nudged: [],
     told: [],
     read: [],
-    checkNudged: "",
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -119,7 +113,6 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       read: Array.isArray(record.read)
         ? record.read.filter((entry): entry is string => typeof entry === "string")
         : [],
-      checkNudged: typeof record.checkNudged === "string" ? record.checkNudged : "",
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -299,20 +292,6 @@ export function markRead(sessionId: string, file: string, home?: string): void {
   current.read.push(file);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
-}
-
-/**
- * Remember the newest edit the check line has named, and say whether it was
- * new (carrick#2933). Marked before the caller writes, for the same reason as
- * `drain`: a line written and not recorded fires again on the next stop.
- */
-export function markCheckNudged(sessionId: string, lastEdit: string, home?: string): boolean {
-  const current = readSession(sessionId, home);
-  if (current.checkNudged === lastEdit) return false;
-  current.checkNudged = lastEdit;
-  current.updated = new Date().toISOString();
-  write(sessionId, current, home);
-  return true;
 }
 
 /** What one delivery of the nudge said, for the hook that delivered it. */

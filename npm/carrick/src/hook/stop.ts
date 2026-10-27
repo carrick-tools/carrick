@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// Stop hook: one reuse nudge per task, one `carrick check --changed` line per
-// set of unchecked edits (carrick#2933), or nothing at all (carrick#1330).
+// Stop hook: one reuse nudge per task, or nothing at all (carrick#1330).
 //
 // What it prints, and why that shape: Claude Code delivers a Stop hook's
 // `hookSpecificOutput.additionalContext` to the MODEL and lets the turn
@@ -23,8 +22,7 @@
 
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
-import { drain, markCheckNudged } from "./reuse.ts";
-import { checkLine, readUncheckedEdits } from "./check-nudge.ts";
+import { drain } from "./reuse.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 
@@ -32,10 +30,6 @@ const log = createLogger("carrick-stop");
 
 type Payload = {
   session_id?: string;
-  /** True when this stop is itself the result of a hook holding the turn. */
-  stop_hook_active?: boolean;
-  /** The session's JSONL transcript, read for the check line. */
-  transcript_path?: unknown;
 };
 
 async function readStdin(): Promise<string> {
@@ -92,19 +86,6 @@ async function main(): Promise<void> {
   const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
   const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
   if (mismatch) parts.push(mismatch);
-
-  // Source edits no `carrick check` has seen since (carrick#2933), read from
-  // the transcript. Once per edit set, and never on a stop a hook caused: that
-  // stop already carries what the hook said.
-  if (payload.stop_hook_active === true) {
-    log("stop_hook_active; no check line");
-  } else {
-    const unchecked = readUncheckedEdits(payload.transcript_path);
-    if (unchecked !== null && markCheckNudged(session, unchecked.lastEdit)) {
-      parts.push(checkLine(unchecked));
-      log(`asked for carrick check --changed: ${unchecked.files.length} file(s) edited unchecked`);
-    }
-  }
 
   if (parts.length === 0) return;
   process.stdout.write(emission(parts.join("\n\n")));

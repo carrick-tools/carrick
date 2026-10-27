@@ -304,26 +304,14 @@ export function answersTheEdit(result: CheckResult): boolean {
 const MAX_NOTED_FILES = 5;
 
 /**
- * What every surface that asks for `carrick check --changed` adds: a Bash tool
- * call times out at 120 s by default, and the check can run longer.
- */
-export const CHECK_TAKES_MINUTES = "it can take a few minutes; allow up to five";
-
-/**
- * The ask both the post-edit "not re-checked" line and the Stop hook's check
- * line end on (carrick#2933), so the two say the same command the same way.
- */
-export const RUN_CHECK_CHANGED = `run \`carrick check --changed\` before you finish (${CHECK_TAKES_MINUTES}).`;
-
-/**
  * The one line for edited files the re-check did not answer for: the index's
  * verdicts describe them before the edit, so none is printed, and the reader
  * is sent to the command that answers.
  */
 export function notedLine(files: string[]): string {
-  const run = RUN_CHECK_CHANGED;
+  const run = "Run `carrick check --changed` before you finish.";
   if (files.length === 1) {
-    return `Carrick noted the edit to ${files[0]}. It was not re-checked here, so ${run}`;
+    return `Carrick: ${files[0]} was not re-checked here. ${run}`;
   }
   const shown = files.slice(0, MAX_NOTED_FILES);
   const rest = files.length - shown.length;
@@ -331,7 +319,7 @@ export function notedLine(files: string[]): string {
     rest > 0
       ? `${shown.join(", ")} and ${rest} more`
       : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
-  return `Carrick noted the edits to ${named}. They were not re-checked here, so ${run}`;
+  return `Carrick: ${named} were not re-checked here. ${run}`;
 }
 
 function deletedLine(result: CheckResult, where: string): string {
@@ -601,7 +589,7 @@ export function renderSessionStart(status: StatusResult): string {
  * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
  */
 export const CHECK_BEFORE_DONE =
-  "Before you say a change is done, run `carrick check --changed` (" + CHECK_TAKES_MINUTES + "): it checks every changed file against the other services. Exit 1 means a contract problem, exit 2 means nothing could be checked.";
+  "Before you call a change done, run `carrick check --changed`. Exit 1 is a contract problem; exit 2 means nothing could be checked.";
 
 /** Up to this many services, a session start states every one of them. */
 export const DETAILED_SERVICES = 3;

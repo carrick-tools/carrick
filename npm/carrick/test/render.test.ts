@@ -6,7 +6,6 @@ import {
   MAX_EDIT_LINE_CHARS,
   CHECK_BEFORE_DONE,
   notedLine,
-  RUN_CHECK_CHANGED,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -59,7 +58,7 @@ test("an edit the hook could not re-check lists none of the index's verdicts", (
   ]) {
     assert.equal(
       renderPostToolUse({ ...stale, recheck }),
-      "Carrick noted the edit to src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
+      "Carrick: src/routes/users.ts was not re-checked here. Run `carrick check --changed` before you finish.",
     );
   }
 });
@@ -68,11 +67,11 @@ test("files a patch left un-checked share one line that names at most five", () 
   const files = Array.from({ length: 8 }, (_, n) => `src/f${n}.ts`);
   assert.equal(
     notedLine(files),
-    "Carrick noted the edits to src/f0.ts, src/f1.ts, src/f2.ts, src/f3.ts, src/f4.ts and 3 more. They were not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
+    "Carrick: src/f0.ts, src/f1.ts, src/f2.ts, src/f3.ts, src/f4.ts and 3 more were not re-checked here. Run `carrick check --changed` before you finish.",
   );
   assert.equal(
     notedLine(files.slice(0, 2)),
-    "Carrick noted the edits to src/f0.ts and src/f1.ts. They were not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
+    "Carrick: src/f0.ts and src/f1.ts were not re-checked here. Run `carrick check --changed` before you finish.",
   );
   // The caller that states the line itself asks the file's render to leave it out.
   const stale = fixture("check-mismatch.json");
@@ -715,9 +714,9 @@ test("a payload without uses lines renders exactly as before", () => {
   }
 });
 
-test("every surface that asks for the check says it can take minutes", () => {
-  const clause = "it can take a few minutes; allow up to five";
-  assert.ok(notedLine(["src/a.ts"]).includes(clause));
-  assert.ok(RUN_CHECK_CHANGED.includes(clause));
-  assert.ok(CHECK_BEFORE_DONE.includes(clause));
+test("the session-start check line is short and names both exit codes", () => {
+  assert.equal(
+    CHECK_BEFORE_DONE,
+    "Before you call a change done, run `carrick check --changed`. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
+  );
 });
