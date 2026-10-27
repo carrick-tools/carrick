@@ -207,6 +207,33 @@ what an empty answer means: a function added on this branch is compared against
 the default branch as the last scan saw it, and the comparison is on what each
 function is described as doing, not on its source.
 
+**The check line (carrick#2933).** The same Stop emission can carry a second
+line, about `carrick check --changed` rather than reuse. The post-edit hook
+re-checks one file at a time, so a shape changed across several files is only
+judged whole by `--changed`, and an agent that changed a response shape in ten
+files was measured calling the task done without running it. The Stop hook
+reads the session transcript (`transcript_path` in the payload) and finds the
+Edit, Write and MultiEdit calls on a source or config file (`.ts`, `.tsx`,
+`.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.json`, `.yaml`, `.yml`) made
+after the last Bash command that runs `carrick check` (with any arguments,
+`npx` included). When there are any, the line reads:
+
+> This task edited 3 files and has not run `carrick check`. Run `carrick check
+> --changed` now, before you call the work done: it checks every file changed on
+> this branch in one pass, which the per-edit re-check does not.
+
+or, when a check ran earlier, "This task edited 2 files since its last `carrick
+check`." with the same second sentence. The edited file is read as the
+post-edit hook reads it: `file_path`, or the first of a MultiEdit's `edits`. The count is distinct files. The
+newest such edit is stored in the session record (`checkNudged`), so one set of
+edits is named once and a later edit starts a new set. The line is not added
+when `stop_hook_active` is true, when the transcript is missing or unreadable,
+or when no qualifying edit follows the last check. Governed code:
+`npm/carrick/src/hook/check-nudge.ts` and `markCheckNudged` in
+`npm/carrick/src/hook/reuse.ts`. Codex has no equivalent yet: its `Stop` event
+cannot carry `additionalContext` (see below), and its edits arrive as
+`apply_patch`, not `file_path` tools.
+
 `carrick uninstall` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.
 

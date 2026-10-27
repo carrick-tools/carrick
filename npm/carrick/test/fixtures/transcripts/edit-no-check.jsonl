@@ -1,0 +1,15 @@
+{"type": "user", "message": {"role": "user", "content": "change the order response shape"}}
+{"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {"file_path": "/w/src/order.ts"}}]}}
+{"type": "user", "uuid": "u1", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a2", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_02", "name": "Edit", "input": {"file_path": "/w/src/order.ts", "old_string": "a", "new_string": "b"}}]}}
+{"type": "user", "uuid": "u2", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a3", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_03", "name": "Edit", "input": {"file_path": "/w/src/order.ts", "old_string": "a", "new_string": "b"}}]}}
+{"type": "user", "uuid": "u3", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_03", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a4", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_04", "name": "MultiEdit", "input": {"file_path": "/w/src/client.tsx", "edits": [{"old_string": "a", "new_string": "b"}]}}]}}
+{"type": "user", "uuid": "u4", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_04", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a5", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_05", "name": "Write", "input": {"file_path": "/w/config/routes.yaml", "content": "x"}}]}}
+{"type": "user", "uuid": "u5", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_05", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a6", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_06", "name": "Bash", "input": {"command": "carrick status", "description": "x"}}]}}
+{"type": "user", "uuid": "u6", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_06", "content": "ok"}]}}
+{"type": "assistant", "uuid": "a7", "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_07", "name": "Bash", "input": {"command": "npm test", "description": "x"}}]}}
+{"type": "user", "uuid": "u7", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_07", "content": "ok"}]}}
