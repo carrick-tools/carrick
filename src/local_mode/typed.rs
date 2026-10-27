@@ -374,7 +374,77 @@ fn lower_own_priority() {
 pub(super) fn stop(root: Option<&Path>) -> Result<String, String> {
     let root = super::workspace::locate(root, None)
         .ok_or("no Carrick index above this directory, so no type daemon serves it")?;
-    Ok(typed_daemon::stop(&root))
+    // The warm-up first: left running, it would go on re-scanning through a
+    // daemon that is gone.
+    let warm_up = stop_warm_up(&root);
+    let daemon = typed_daemon::stop(&root);
+    Ok(match warm_up {
+        Some(line) => format!("{line}\n{daemon}"),
+        None => daemon,
+    })
+}
+
+/// How long a warm-up's start may precede its claim: it starts the daemon and
+/// waits for it to serve ([`START_WAIT`]) before it takes the claim.
+const WARM_CLAIM_SLACK: Duration = Duration::from_secs(60);
+/// How long a warm-up has to exit after SIGTERM before SIGKILL: it ends its
+/// re-scans on the signal first (carrick#2923).
+const WARM_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// End the warm-up holding the claim for `root`, when there is one, and say
+/// what happened. It is signalled only when proven to be this workspace's
+/// warm-up: its command line is `daemon start --warm --workspace <root>` and
+/// it started at most [`WARM_CLAIM_SLACK`] before its claim was written. A
+/// claim naming anything else is stale: removed, its process left alone.
+fn stop_warm_up(root: &Path) -> Option<String> {
+    let claim = root.join(super::workspace::INDEX_DIR).join(WARM_CLAIM);
+    let pid = std::fs::read_to_string(&claim)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if !typed_daemon::pid_alive(pid) {
+        let _ = std::fs::remove_file(&claim);
+        return None;
+    }
+    let claimed_at = std::fs::metadata(&claim)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from);
+    if warm_up_proven(pid, root, claimed_at) {
+        let ended = typed_daemon::end_proven(pid, WARM_STOP_GRACE);
+        let _ = std::fs::remove_file(&claim);
+        return Some(format!(
+            "Stopped the type daemon's warm-up (pid {pid}) with {ended}."
+        ));
+    }
+    let _ = std::fs::remove_file(&claim);
+    Some(format!(
+        "Removed a stale warm-up claim: pid {pid} is not this workspace's warm-up and was left running."
+    ))
+}
+
+/// Whether process `pid` is the warm-up of `root` that wrote a claim at
+/// `claimed_at`.
+fn warm_up_proven(
+    pid: u32,
+    root: &Path,
+    claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let (Some((started, command)), Some(claimed_at)) =
+        (typed_daemon::process_start(pid), claimed_at)
+    else {
+        return false;
+    };
+    let names = |path: &Path| {
+        command.contains(&format!(
+            "daemon start --warm --workspace {}",
+            path.display()
+        ))
+    };
+    let fits = started <= claimed_at + chrono::Duration::seconds(2)
+        && claimed_at - started <= chrono::Duration::from_std(WARM_CLAIM_SLACK).unwrap_or_default();
+    fits && (names(root) || root.canonicalize().is_ok_and(|real| names(&real)))
 }
 
 /// What `carrick status` says about the daemon: its lines, and its status

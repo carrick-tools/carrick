@@ -291,11 +291,21 @@ fn warming_status(request: &serde_json::Value, _root: &Path) -> serde_json::Valu
 /// A `status` that lists both fixture services as released (evicted to stay
 /// under the heap cap), holding neither built.
 fn released_status(request: &serde_json::Value, root: &Path) -> serde_json::Value {
+    status_listing(request, root, "released")
+}
+
+/// A `status` that lists both fixture services as refused for want of room
+/// under the cap (carrick#2915, carrick#2928).
+fn no_room_status(request: &serde_json::Value, root: &Path) -> serde_json::Value {
+    status_listing(request, root, "cold_only:no_room")
+}
+
+fn status_listing(request: &serde_json::Value, root: &Path, state: &str) -> serde_json::Value {
     // Anything else (the join's check) closes the connection: answered cold.
     if request["action"] != "status" {
         return serde_json::Value::Null;
     }
-    let service = |name: &str| serde_json::json!({ "repo_root": root.join(name), "built": false, "state": "released" });
+    let service = |name: &str| serde_json::json!({ "repo_root": root.join(name), "built": false, "state": state });
     serde_json::json!({
         "status": "success",
         "daemon": {
@@ -794,21 +804,75 @@ fn a_check_after_an_eviction_starts_no_warm_up() {
     let recheck = ["check", ROUTE, "--workspace", ".", "--recheck", "--json"];
     let (cold_code, cold) = run(&root, &recheck, false);
 
-    let stand_in = StandIn::start(&root, &root, Some(released_status));
-    let (code, answered) = run(&root, &recheck, true);
-    assert_eq!(code, cold_code);
-    assert_eq!(without_timing(&answered), without_timing(&cold));
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(
-        !root.join(".carrick/typed-warm.pid").exists(),
-        "no warm-up was started"
-    );
-    assert_eq!(
-        typed_daemon::read_record(&root).map(|r| r.pid),
-        Some(std::process::id()),
-        "nothing was started in the stand-in's place"
-    );
-    drop(stand_in);
+    // Evicted (released) and refused for want of room (cold_only:no_room):
+    // either way the daemon has seen the service.
+    let listings: [fn(&serde_json::Value, &Path) -> serde_json::Value; 2] =
+        [released_status, no_room_status];
+    for listing in listings {
+        let stand_in = StandIn::start(&root, &root, Some(listing));
+        let (code, answered) = run(&root, &recheck, true);
+        assert_eq!(code, cold_code);
+        assert_eq!(without_timing(&answered), without_timing(&cold));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !root.join(".carrick/typed-warm.pid").exists(),
+            "no warm-up was started"
+        );
+        assert_eq!(
+            typed_daemon::read_record(&root).map(|r| r.pid),
+            Some(std::process::id()),
+            "nothing was started in the stand-in's place"
+        );
+        drop(stand_in);
+    }
+}
+
+/// `daemon stop` also ends the warm-up holding the workspace's claim, once
+/// its command line and start time prove it is this workspace's warm-up; a
+/// claim naming another process is removed and that process left running
+/// (carrick#2928).
+#[test]
+#[serial]
+fn daemon_stop_ends_the_warm_up_and_only_a_proven_one() {
+    let dir = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    let claim = root.join(".carrick/typed-warm.pid");
+    std::fs::create_dir_all(root.join(".carrick")).unwrap();
+
+    // A stand-in warm-up: its command line names this workspace's warm-up.
+    // Two commands, so the shell stays the process rather than exec'ing sleep.
+    let mut warm_up = Command::new("sh")
+        .args([
+            "-c",
+            "sleep 60; true",
+            "carrick",
+            "daemon",
+            "start",
+            "--warm",
+            "--workspace",
+        ])
+        .arg(&root)
+        .spawn()
+        .unwrap();
+    std::fs::write(&claim, format!("{}\n", warm_up.id())).unwrap();
+    let (code, said) = run(&root, &["daemon", "stop", "--workspace", "."], true);
+    assert_eq!(code, Some(0), "{said}");
+    wait_for("the warm-up to end", Duration::from_secs(15), || {
+        warm_up.try_wait().unwrap().is_some()
+    });
+    assert!(said.contains("warm-up"), "{said}");
+    assert!(!claim.exists(), "its claim is removed");
+
+    // A claim naming another process: left running, the claim removed.
+    let mut other = Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(&claim, format!("{}\n", other.id())).unwrap();
+    let (code, said) = run(&root, &["daemon", "stop", "--workspace", "."], true);
+    assert_eq!(code, Some(0), "{said}");
+    let still_running = other.try_wait().unwrap().is_none();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(still_running, "daemon stop killed another process: {said}");
+    assert!(!claim.exists(), "the stale claim is removed");
 }
 
 /// A daemon that accepts a connection and never answers: the check's output

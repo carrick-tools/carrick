@@ -545,24 +545,9 @@ pub fn identity(record: &Record, workspace: &Path) -> bool {
     let Some(started_at) = record.started_at() else {
         return false;
     };
-    // `-ww`: the whole command line, however long, with no terminal to fit.
-    let Ok(out) = Command::new("ps")
-        .env("LC_ALL", "C")
-        .args(["-ww", "-o", "etime=,command=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Some((started, command)) = process_start(pid) else {
         return false;
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Some((etime, command)) = text.trim().split_once(char::is_whitespace) else {
-        return false;
-    };
-    let Some(elapsed) = parse_etime(etime) else {
-        return false;
-    };
-    let started = chrono::Utc::now() - chrono::Duration::seconds(elapsed as i64);
     if (started - started_at).num_seconds().abs() > START_TIME_SLACK_SECS {
         return false;
     }
@@ -570,6 +555,38 @@ pub fn identity(record: &Record, workspace: &Path) -> bool {
     serves(workspace)
         || record.workspace.as_deref().is_some_and(serves)
         || workspace.canonicalize().is_ok_and(|real| serves(&real))
+}
+
+/// When process `pid` started (to the second, from `ps`'s elapsed time) and
+/// its whole command line, or `None` when `ps` cannot say.
+pub fn process_start(pid: u32) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+    if pid == 0 || !pid_alive(pid) {
+        return None;
+    }
+    // `-ww`: the whole command line, however long, with no terminal to fit.
+    let out = Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-ww", "-o", "etime=,command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (etime, command) = text.trim().split_once(char::is_whitespace)?;
+    let elapsed = parse_etime(etime)?;
+    let started = chrono::Utc::now() - chrono::Duration::seconds(elapsed as i64);
+    Some((started, command.trim().to_string()))
+}
+
+/// End process `pid`, whose identity the caller proved: SIGTERM, up to
+/// `grace` for it to exit, then SIGKILL. Returns the signal that ended it.
+pub fn end_proven(pid: u32, grace: Duration) -> &'static str {
+    if signal_and_wait(pid, libc::SIGTERM, grace) {
+        "SIGTERM"
+    } else {
+        signal_and_wait(pid, libc::SIGKILL, grace);
+        "SIGKILL"
+    }
 }
 
 /// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
@@ -711,12 +728,7 @@ pub fn stop(workspace: &Path) -> String {
             "No type daemon is running for this workspace (removed a stale record: pid {pid} is not its daemon and was left running)."
         );
     }
-    let ended = if signal_and_wait(pid, libc::SIGTERM, STOP_GRACE) {
-        "SIGTERM"
-    } else {
-        signal_and_wait(pid, libc::SIGKILL, STOP_GRACE);
-        "SIGKILL"
-    };
+    let ended = end_proven(pid, STOP_GRACE);
     remove_record_of(workspace, &record);
     format!("Stopped the type daemon (pid {pid}) with {ended}: it did not stop when asked.")
 }
