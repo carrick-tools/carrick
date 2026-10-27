@@ -138,7 +138,9 @@ pub struct Problem {
     /// fails the run.
     pub unconfirmed: bool,
     /// In a file the work did not touch: a call the index matched whose
-    /// route the work took away. Listed when it fails, and with `--all`;
+    /// route the work took away, or a row whose verdict newly became a
+    /// mismatch because a type it reads changed. Listed when it fails, and
+    /// with `--all`;
     /// never counted on the summary line, which is about the edited files.
     #[serde(skip)]
     pub outside_the_change: bool,
@@ -554,12 +556,15 @@ fn judge(
         let Some(&(repo, repo_path)) = repo_of.get(operation.service.as_str()) else {
             continue;
         };
-        if !is_changed(repo, &operation.file) {
-            continue;
-        }
-        match operation.role {
-            Role::Producer => judged.routes += 1,
-            Role::Consumer => judged.calls += 1,
+        // A file the work did not touch is counted nowhere. Its verdict is
+        // read below, and reported only when it moved: the work changed
+        // something the row's type reads (a shared type), not the row.
+        let in_the_change = is_changed(repo, &operation.file);
+        if in_the_change {
+            match operation.role {
+                Role::Producer => judged.routes += 1,
+                Role::Consumer => judged.calls += 1,
+            }
         }
         let Some(item) = item_of(repo, operation) else {
             continue;
@@ -592,6 +597,9 @@ fn judge(
                     .and_then(|verdict| verdict.result.as_deref())
                     .is_some_and(|result| matches!(result, "type_mismatch" | "method_mismatch"))
         });
+        if !in_the_change && already {
+            continue;
+        }
         let named: Vec<&String> = finding
             .map(|f| f.call_sites.iter().collect())
             .unwrap_or_default();
@@ -626,7 +634,7 @@ fn judge(
                 .unwrap_or_else(|| "not_stated".to_string()),
             already_indexed: already,
             unconfirmed: false,
-            outside_the_change: false,
+            outside_the_change: !in_the_change,
             other_build: fact && !already && !same_build,
             fails: fact && !already && same_build,
         });

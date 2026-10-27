@@ -2732,6 +2732,51 @@ fn check_changed_fails_when_a_changed_handler_drops_a_field_a_consumer_reads() {
     assert_eq!(json["problems"][0]["fails"], true, "{json:#}");
 }
 
+/// A shared type loses a field a consumer reads. Only the types file is
+/// edited: the route that returns it and the call that reads it are in files
+/// the work did not touch, and the route's verdict is the one that moved.
+#[test]
+#[serial]
+fn check_changed_fails_when_a_shared_type_drops_a_field_a_consumer_reads() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let producer = root.join("catalog-web");
+    let route = producer.join("app/routes/api.v1.widgets.$widgetId.ts");
+    let types =
+        "export type Widget = {\n  id: string;\n  name: string;\n  activeCount: number;\n};\n";
+    edit(&route, types, "import type { Widget } from \"../types\";\n");
+    std::fs::write(producer.join("app/types.ts"), types).expect("write the types file");
+    commit_all(&producer, "move the widget type into its own file");
+    index(root);
+
+    git(&producer, &["checkout", "-qb", "feature"]);
+    edit(
+        &producer.join("app/types.ts"),
+        "  activeCount: number;\n",
+        "",
+    );
+    commit_all(&producer, "drop activeCount from the shared type");
+
+    let (code, text) = check_changed(root, false);
+    assert!(
+        text.starts_with("carrick check: checked 0 routes and 0 calls in 1 changed file"),
+        "the summary is about the one file the branch changed:\n{text}"
+    );
+    let problem = text
+        .lines()
+        .find(|line| {
+            line.starts_with("catalog-web/app/routes/api.v1.widgets.$widgetId.ts:")
+                && line.contains("  incompatible  ")
+        })
+        .unwrap_or_else(|| panic!("the untouched route is named at its line:\n{text}"));
+    assert!(problem.contains("activeCount"), "with the reason:\n{text}");
+    assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
+
+    let (_, body) = check_changed(root, true);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert_eq!(json["problems"][0]["fails"], true, "{json:#}");
+}
+
 /// A new call, uncommitted, to a route no service in the workspace serves.
 /// Its path is bare, so it goes to the origin the client already talks to.
 #[test]

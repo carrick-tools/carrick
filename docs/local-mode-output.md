@@ -579,10 +579,16 @@ A problem the index already held is counted as that, whatever else holds for
 it. `--json` always lists every problem, with its `source`,
 `already_indexed`, `unconfirmed` and `fails`.
 
-**Files the work did not touch.** A call in such a file is reported only when
-the index matched it and no service serves it now. It is listed when it fails,
+**Files the work did not touch.** A row in such a file is reported in two
+cases only. A call the index matched, and no service serves now. Or a route or
+call whose verdict is a type or method mismatch now and was not one in the
+index for the same row: the work changed something the row reads, such as a
+shared type in a contracts file. A mismatch the index already held is never
+reported. Either is judged by the same `fact` rule as a changed file's
+problem, so it fails the run when it is a fact. It is listed when it fails,
 and with `--all` otherwise; it is never counted on the summary line, which is
-about the changed files.
+about the changed files. `--json` marks none of this; the list shows the row's
+own file, which is how an outside row reads.
 
 **Several files.** `carrick check a.ts b.ts [--all] [--json]` runs the same
 pass over the files named, in any repos of the workspace, instead of the
