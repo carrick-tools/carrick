@@ -849,6 +849,7 @@ export function checkTaskSkills(installed: InstalledSkill[]): Line[] {
   const missing = installed.filter((skill) => skill.state === "absent");
   const stale = installed.filter((skill) => skill.state === "ours" && !skill.current);
   const edited = installed.filter((skill) => skill.state === "edited");
+  const linked = installed.filter((skill) => skill.state === "linked");
   // "and others" only when there are others: one missing file was named as the
   // first of several (carrick#1574).
   const named = (skills: InstalledSkill[]): string => `${skills[0]!.path}${skills.length > 1 ? " and others" : ""}`;
@@ -863,6 +864,13 @@ export function checkTaskSkills(installed: InstalledSkill[]): Line[] {
     lines.push(
       warn(
         `${stale.length} task skill file(s) here were written by an older version of carrick (${named(stale)}). Re-run \`carrick init\`: it rewrites the ones still untouched and leaves the rest.`,
+      ),
+    );
+  }
+  if (linked.length > 0) {
+    lines.push(
+      say(
+        `${linked.length} task skill file(s) were not installed (${named(linked)}) because their folder is a link out of its harness folder, and a write would land in the folder it points to. This is not a fault.`,
       ),
     );
   }

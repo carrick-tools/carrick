@@ -49,7 +49,8 @@ import {
   chooseEditors,
   type InitOptions,
 } from "../src/init/run.ts";
-import { taskSkillPaths } from "../src/init/task-skills.ts";
+import { inspectTaskSkills, removeTaskSkills, taskSkillPaths, taskSkillWarnings, writeTaskSkills } from "../src/init/task-skills.ts";
+import { checkTaskSkills } from "../src/init/doctor.ts";
 import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
@@ -4175,5 +4176,78 @@ test("on that workspace an editor found on this machine gets its entry unasked, 
     assert.match(out.lines.join("\n").replace(/\n +/g, " "), /add Carrick's MCP server to Claude Code and ~\/\.cursor\/mcp\.json/);
   } finally {
     fixture.restore();
+  }
+});
+
+// A team can point `.claude/skills` at its own product's `skills/` folder. A
+// skill written through that link lands in the product, so init writes none
+// there, says so in one line, and carries on with the rest.
+for (const harness of [".claude", ".agents"]) {
+  test(`init writes no task skill through a linked ${harness}/skills and names the link`, posixNativeFixture, () => {
+    const fixture = executableInitFixture("payments", "absent", "monorepo");
+    try {
+      const product = path.join(fixture.repo, "skills");
+      fs.mkdirSync(path.join(product, "own"), { recursive: true });
+      fs.writeFileSync(path.join(product, "own", "SKILL.md"), "mine\n");
+      fs.mkdirSync(path.join(fixture.repo, harness), { recursive: true });
+      fs.symlinkSync(path.join("..", "skills"), path.join(fixture.repo, harness, "skills"));
+      const result = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+        { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      // The product's folder holds only what it held.
+      assert.deepEqual(pathsUnder(product), [path.join("own", "SKILL.md")]);
+      assert.match(
+        result.stdout,
+        new RegExp(`${harness.replace(".", "\\.")}/skills is a link to \\.\\./skills, outside its own folder, so the Carrick task skills were not installed there`),
+      );
+      // The other harness is an ordinary folder and gets all four, and the
+      // rest of init carried on.
+      const other = harness === ".claude" ? ".agents" : ".claude";
+      for (const skill of taskSkillPaths().filter((p) => p.startsWith(other))) {
+        assert.ok(fs.existsSync(path.join(fixture.repo, skill)), skill);
+      }
+      assert.ok(fs.existsSync(path.join(fixture.repo, "AGENTS.md")));
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("a task skill root that is an ordinary folder, or a link that stays inside its harness folder, still gets all four", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-skill-link-"));
+  try {
+    fs.mkdirSync(path.join(dir, ".agents", "real"), { recursive: true });
+    fs.symlinkSync("real", path.join(dir, ".agents", "skills"));
+    const outcomes = writeTaskSkills(dir, { slug: null });
+    assert.equal(outcomes.length, 8);
+    assert.ok(outcomes.every((row) => row.state === "absent" && row.wrote), JSON.stringify(outcomes));
+    assert.deepEqual(taskSkillWarnings(outcomes), []);
+    assert.ok(fs.existsSync(path.join(dir, ".agents", "real", "carrick-impact", "SKILL.md")));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("removing task skills deletes nothing through a link out of the harness folder, and doctor calls them skipped", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-skill-link-"));
+  try {
+    writeTaskSkills(dir, { slug: null });
+    // Move .claude/skills into the product and link to it, as the customer has.
+    fs.renameSync(path.join(dir, ".claude", "skills"), path.join(dir, "skills"));
+    fs.symlinkSync(path.join("..", "skills"), path.join(dir, ".claude", "skills"));
+    const before = pathsUnder(path.join(dir, "skills"));
+    const lines = checkTaskSkills(inspectTaskSkills(dir));
+    assert.ok(lines.every((line) => !/missing/.test(JSON.stringify(line))), JSON.stringify(lines));
+    assert.match(JSON.stringify(lines), /not installed/);
+    const { deleted } = removeTaskSkills(dir);
+    assert.deepEqual(deleted.filter((p) => p.startsWith(".claude")), []);
+    assert.deepEqual(pathsUnder(path.join(dir, "skills")), before);
+    // The ordinary root was still taken back.
+    assert.ok(deleted.some((p) => p.startsWith(".agents")));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

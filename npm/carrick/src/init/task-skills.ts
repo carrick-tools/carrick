@@ -79,7 +79,47 @@ export function stamped(body: string): string {
  * `theirs` carries no stamp at all: a skill of the same name somebody wrote
  * themselves. Only `absent` and `ours` are written over.
  */
-export type SkillState = "absent" | "ours" | "edited" | "theirs";
+export type SkillState = "absent" | "ours" | "edited" | "theirs" | "linked";
+
+/** A skill root reached through a link that leaves its harness folder. */
+export type SkillLink = { path: string; target: string };
+
+/**
+ * The link that carries a skill root out of its harness folder, or null.
+ *
+ * A team can point `.claude/skills` at its own product's `skills/` folder, and
+ * a skill written through that link lands in the product. The root, and the
+ * harness folder above it, are each looked at without following: a link whose
+ * target stays inside the harness folder is just a folder with another name,
+ * and anything else is somebody else's folder. `.claude` or `.agents` being a
+ * link is always outside, since the folder it stands for is not in this
+ * workspace's own tree.
+ */
+export function skillRootLink(workspace: string, root: string): SkillLink | null {
+  const harness = root.split(path.sep)[0]!;
+  const isLink = (relative: string): boolean => {
+    try {
+      return fs.lstatSync(path.join(workspace, relative)).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  const describe = (relative: string): SkillLink => ({
+    path: relative.split(path.sep).join("/"),
+    target: fs.readlinkSync(path.join(workspace, relative)),
+  });
+  if (isLink(harness)) return describe(harness);
+  if (!isLink(root)) return null;
+  try {
+    const inside = fs.realpathSync(path.join(workspace, harness));
+    const resolved = fs.realpathSync(path.join(workspace, root));
+    if (resolved === inside || resolved.startsWith(inside + path.sep)) return null;
+  } catch {
+    // A dangling link resolves to nothing, and a write through it would create
+    // the target wherever it points.
+  }
+  return describe(root);
+}
 
 export function skillState(existing: string | null): SkillState {
   if (existing === null) return "absent";
@@ -185,8 +225,13 @@ export type InstalledSkill = {
 export function inspectTaskSkills(workspace: string): InstalledSkill[] {
   const installed: InstalledSkill[] = [];
   for (const root of SKILL_ROOTS) {
+    const linked = skillRootLink(workspace, root) !== null;
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
+      if (linked) {
+        installed.push({ path: relative, state: "linked", current: false });
+        continue;
+      }
       let existing: string | null;
       try {
         existing = fs.readFileSync(path.join(workspace, relative), "utf8");
@@ -211,6 +256,8 @@ export type SkillOutcome = {
   state: SkillState;
   /** True where this run put new bytes there. */
   wrote: boolean;
+  /** Set where the state is `linked`: the link nothing was written through. */
+  link?: SkillLink;
 };
 
 /**
@@ -222,8 +269,13 @@ export type SkillOutcome = {
 export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutcome[] {
   const outcomes: SkillOutcome[] = [];
   for (const root of SKILL_ROOTS) {
+    const link = skillRootLink(workspace, root);
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
+      if (link !== null) {
+        outcomes.push({ path: relative, state: "linked", wrote: false, link });
+        continue;
+      }
       const target = path.join(workspace, relative);
       const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
       const state = skillState(existing);
@@ -238,11 +290,20 @@ export function writeTaskSkills(workspace: string, scope: SkillScope): SkillOutc
   return outcomes;
 }
 
+/** The one line for a skill root left alone because it is a link out. */
+export function linkedLine(link: SkillLink): string {
+  return `${link.path} is a link to ${link.target}, outside its own folder, so the Carrick task skills were not installed there: they would land in that folder.`;
+}
+
 /** The lines `carrick init` prints about the skills it left alone. */
 export function taskSkillWarnings(outcomes: SkillOutcome[]): string[] {
   const warn: string[] = [];
+  const named = new Set<string>();
   for (const row of outcomes) {
-    if (row.state === "edited") {
+    if (row.state === "linked" && row.link && !named.has(row.link.path)) {
+      named.add(row.link.path);
+      warn.push(linkedLine(row.link));
+    } else if (row.state === "edited") {
       warn.push(
         `${row.path} has been edited here, so it was left as it is. Delete it and run carrick init again for the current version.`,
       );
@@ -270,6 +331,9 @@ export function removeTaskSkills(
   const deleted: string[] = [];
   const kept: SkillOutcome[] = [];
   for (const root of SKILL_ROOTS) {
+    // Nothing is deleted through a link out of the harness folder, even a file
+    // that carries our stamp: it sits in somebody else's folder now.
+    if (skillRootLink(workspace, root) !== null) continue;
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
       if (!only(relative)) continue;

@@ -59,7 +59,7 @@ import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { CODEX_HOOKS_FILE, isEmptyHooksDocument, readHooksFile, uninstallCodexHooks } from "./codex.ts";
 import { AGENTS_FILE, hasAgentsSection, removeAgentsSection } from "./agents-section.ts";
-import { inspectTaskSkills, removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
+import { inspectTaskSkills, removeTaskSkills, SKILL_ROOTS, skillRootLink } from "./task-skills.ts";
 import { noticeFile, removeNotice } from "./outdated.ts";
 import { readWorkspaceFile, removeSelection, withoutOurExclusions, WORKSPACE_FILE } from "./workspace-file.ts";
 import { recordedRepoCopy, removeRepoCopy } from "./repo-copies.ts";
@@ -380,6 +380,11 @@ export function folderPlan(workspace: string): FolderPlan {
     } else if (skill.state === "theirs") {
       plan.leaves.push(`${skill.path} was not written by Carrick, so it stays.`);
     }
+  }
+  // A skill root that is a link out of its folder is never deleted through.
+  for (const root of SKILL_ROOTS) {
+    const link = skillRootLink(workspace, root);
+    if (link !== null) plan.leaves.push(`${link.path} is a link to ${link.target}, so nothing was removed through it.`);
   }
 
   plan.agents = hasAgentsSection(workspace);

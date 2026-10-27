@@ -39,6 +39,7 @@ import {
   skillState,
   taskSkillPaths,
   SKILL_ROOTS,
+  skillRootLink,
   TASK_SKILLS,
   type SkillScope,
 } from "./task-skills.ts";
@@ -183,6 +184,7 @@ export function writeRepoCopy(repo: string, command: string, scope: SkillScope):
     writes.push({ relative: CODEX_HOOKS_FILE, body: mergeHookSet(existing, codexHooks(command)).body });
   }
   for (const root of SKILL_ROOTS) {
+    if (skillRootLink(repo, root) !== null) continue;
     for (const name of TASK_SKILLS) {
       const relative = skillFile(root, name);
       if (tracked.has(relative)) continue;

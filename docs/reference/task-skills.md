@@ -106,6 +106,14 @@ writes over it. A file carrying the marker over a body that has moved has been
 edited here, and one carrying no marker was never ours; both are left where they
 are and named on the terminal.
 
+A skill root (`.claude/skills` or `.agents/skills`), or the `.claude` or `.agents`
+folder above it, that is a symlink leading outside its harness folder is never
+written or deleted through: the skills would land in whatever folder the link
+points at (a product's own `skills/`, say). `carrick init` names the link in one
+line, `carrick doctor` reports the skills as not installed rather than missing,
+and `carrick remove` leaves the target alone. A link that stays inside its
+harness folder is an ordinary folder.
+
 `carrick remove` deletes the files whose digest still matches, and names the
 rest for a human. It is the one thing `carrick remove` deletes from a repository
 rather than printing a `git rm` line for, and the digest is why: those bytes are
