@@ -335,7 +335,7 @@ fn declared_location(
 /// Never a failure and never a claim that anything is wrong: the handler
 /// works. What is missing is in the index, not in the code.
 pub fn dispatch_operation_findings(
-    repos: &[crate::cloud_storage::CloudRepoData],
+    repos: &[&crate::cloud_storage::CloudRepoData],
 ) -> Vec<crate::findings::Finding> {
     let mut findings = Vec::new();
     for repo in repos {
@@ -452,7 +452,7 @@ fn handler_identity(table: &DispatchTable) -> (String, String) {
 /// A call counts when it states a value for this field that this handler
 /// answers — that, and not the path, is what ties it to this table.
 fn consumers_naming(
-    repos: &[crate::cloud_storage::CloudRepoData],
+    repos: &[&crate::cloud_storage::CloudRepoData],
     service: &str,
     table: &DispatchTable,
 ) -> Vec<(String, Option<String>)> {
@@ -952,7 +952,7 @@ mod tests {
             inference: None,
         });
 
-        let findings = dispatch_operation_findings(&[producer, consumer]);
+        let findings = dispatch_operation_findings(&[&producer, &consumer]);
         assert_eq!(findings.len(), 1);
         let crate::findings::Finding::DispatchOperations {
             service,
@@ -1104,7 +1104,7 @@ mod tests {
             ("NoticesController.create".to_string(), controller_create),
         ]);
 
-        let findings = dispatch_operation_findings(&[repo]);
+        let findings = dispatch_operation_findings(&[&repo]);
         assert!(
             findings.is_empty(),
             "no operation is selected here: {findings:#?}"
@@ -1153,7 +1153,7 @@ mod tests {
             ("handler".to_string(), lambda),
         ]);
 
-        let findings = dispatch_operation_findings(&[repo]);
+        let findings = dispatch_operation_findings(&[&repo]);
         assert_eq!(findings.len(), 1, "{findings:#?}");
         let crate::findings::Finding::DispatchOperations {
             dispatch_field,
@@ -1205,7 +1205,7 @@ mod tests {
             function("Jobs.run", "/repo/src/a.ts", 5),
         )]);
 
-        let findings = dispatch_operation_findings(&[repo]);
+        let findings = dispatch_operation_findings(&[&repo]);
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(values_of(&findings[0]), ["archive", "publish", "retire"]);
     }
@@ -1238,7 +1238,7 @@ mod tests {
             ("b".to_string(), function("handler", "/repo/src/b.ts", 5)),
         ]);
 
-        let findings = dispatch_operation_findings(&[repo]);
+        let findings = dispatch_operation_findings(&[&repo]);
         assert_eq!(findings.len(), 2, "{findings:#?}");
         assert_eq!(values_of(&findings[0]), ["archive", "publish"]);
         assert_eq!(values_of(&findings[1]), ["publish", "retire"]);
@@ -1263,7 +1263,7 @@ mod tests {
         repo.function_definitions =
             std::collections::HashMap::from([("handler".to_string(), recursive)]);
 
-        assert_eq!(dispatch_operation_findings(&[repo]).len(), 1);
+        assert_eq!(dispatch_operation_findings(&[&repo]).len(), 1);
     }
 
     /// A routed handler with plain rows is not made a dispatcher by a
@@ -1288,7 +1288,7 @@ mod tests {
             Some(body("action", "archive")),
         ));
 
-        assert!(dispatch_operation_findings(&[repo]).is_empty());
+        assert!(dispatch_operation_findings(&[&repo]).is_empty());
     }
 
     /// A routed handler whose rows extraction marked with the dispatch is the
@@ -1315,7 +1315,7 @@ mod tests {
             function("run", "/repo/src/jobs.ts", 3),
         )]);
 
-        assert_eq!(dispatch_operation_findings(&[repo]).len(), 1);
+        assert_eq!(dispatch_operation_findings(&[&repo]).len(), 1);
     }
 
     /// A table whose field the repo already declares asks nothing, so it says
@@ -1343,7 +1343,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(dispatch_operation_findings(&[producer]).is_empty());
+        assert!(dispatch_operation_findings(&[&producer]).is_empty());
     }
 
     /// The table lands on the handler's own function row, and a table whose

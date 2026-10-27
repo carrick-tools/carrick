@@ -1597,6 +1597,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             }
         })
         .collect();
+    // The laptop's stored generations were read for the lookups above and
+    // nothing below reads them: freed before the join and the type check, the
+    // scan's most memory-hungry stretch (carrick#2948).
+    drop(local_previous);
     // Decided here, while every service's rows and dependency facts are still
     // in hand, and printed with the report (carrick#1099). Index for index
     // with `services`, as `current_services_data` is.
@@ -1861,7 +1865,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         &all_repo_data
             .iter()
             .chain(current_services_data.iter())
-            .cloned()
             .collect::<Vec<_>>(),
     );
 
