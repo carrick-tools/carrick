@@ -75,6 +75,7 @@ export { moduleExport } from './anchors.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
+export { KeptJudge, removeOrphanedJudgeWorkspaces } from './kept-judge.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations } from './check-probe.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';

@@ -37,6 +37,11 @@
           "description": "Builds started with `carrick index --detach` that are running now, or stopped without finishing. Absent in the ordinary case."
         },
         "last_scan": { "$ref": "#/$defs/run_spend" },
+        "type_daemon": {
+          "type": "object",
+          "description": "The resident type daemon's own `status` object, as it answered (pid, rss_mb, heap_used_mb, heap_cap_mb, warming, services with their state and footprint_mb, counters, errors). Absent when no daemon of this build answered for the workspace.",
+          "additionalProperties": true
+        },
         "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/service" }

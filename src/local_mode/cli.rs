@@ -119,6 +119,23 @@ pub enum LocalCommand {
         workspace: Option<PathBuf>,
         json: bool,
     },
+    /// Start or stop the resident type daemon a re-check answers through
+    /// (carrick#2884).
+    Daemon {
+        action: DaemonAction,
+        workspace: Option<PathBuf>,
+    },
+}
+
+/// What `carrick daemon` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Start one unless one of this build serves; with `warm`, also re-scan
+    /// the changed repos through it.
+    Start {
+        warm: bool,
+    },
+    Stop,
 }
 
 impl LocalCommand {
@@ -135,8 +152,8 @@ impl LocalCommand {
 
 /// Every subcommand the binary answers. `carrick --help` names each one with a
 /// description, and the test in `src/help.rs` holds it to this list.
-pub const LOCAL_COMMANDS: [&str; 7] = [
-    "derive", "index", "refresh", "resume", "status", "check", "touch",
+pub const LOCAL_COMMANDS: [&str; 8] = [
+    "derive", "index", "refresh", "resume", "status", "check", "touch", "daemon",
 ];
 
 /// Read a local command from the argument list, or `None` when the first
@@ -162,6 +179,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
     let mut candidates = false;
+    let mut warm = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -187,6 +205,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--changed" => changed = true,
             "--all" => all = true,
             "--each" => each = true,
+            "--warm" => warm = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
             // Accepting the flag and ignoring it would hand a scaffold that
@@ -224,6 +243,21 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
         index += 1;
     }
 
+    if name == "daemon" {
+        let action = match positional.first().map(String::as_str) {
+            Some("start") => DaemonAction::Start { warm },
+            Some("stop") if !warm => DaemonAction::Stop,
+            Some("stop") => return Err("unknown option for `carrick daemon stop`: --warm".into()),
+            _ => return Err("`carrick daemon` takes `start` or `stop`".to_string()),
+        };
+        if json || recheck || changed || each || all || detach || dispatch {
+            return Err("`carrick daemon` takes only --workspace".into());
+        }
+        return Ok(LocalCommand::Daemon { action, workspace });
+    }
+    if warm {
+        return Err(format!("unknown option for `carrick {name}`: --warm"));
+    }
     // A hook-driven command that accepted `--detach` and ran in the foreground
     // anyway would be a promise nobody kept.
     if detach && name != "index" {
@@ -533,6 +567,22 @@ pub fn run(command: LocalCommand) -> i32 {
             all,
         ),
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
+        LocalCommand::Daemon { action, workspace } => {
+            let done = match action {
+                DaemonAction::Start { warm } => super::typed::start(workspace.as_deref(), warm),
+                DaemonAction::Stop => super::typed::stop(workspace.as_deref()),
+            };
+            match done {
+                Ok(line) => {
+                    crate::outln!("{line}");
+                    0
+                }
+                Err(message) => {
+                    crate::errln!("carrick daemon: {message}");
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -634,6 +684,10 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             output.running_scans = scans;
             output.last_scan = last_scan;
             output.analysing = analysing.clone();
+            // At most four lines, and only when a daemon has a record here or
+            // is backed off (carrick#2884, the lifecycle policy's L6).
+            let (daemon_lines, daemon_status) = super::typed::status_report(&root);
+            output.type_daemon = daemon_status;
             if json {
                 match serde_json::to_string_pretty(&output) {
                     Ok(text) => crate::outln!("{text}"),
@@ -648,6 +702,9 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                 }
             } else {
                 crate::out!("{}", output.render());
+                for line in &daemon_lines {
+                    crate::outln!("{line}");
+                }
             }
             0
         }

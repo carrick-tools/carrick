@@ -846,6 +846,11 @@ pub struct StatusOutput {
     /// the only part of any read command that touches the network.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub analysing: Vec<String>,
+    /// The resident type daemon's own `status`, when one serves this
+    /// workspace and answered (carrick#2884; its fields are the sidecar
+    /// README's, "Server mode"). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_daemon: Option<serde_json::Value>,
     pub services: Vec<StatusService>,
     /// What the last build's type check did: whether it ran, what it judged,
     /// and which verdicts are not in Carrick Cloud (carrick#1490). Absent
@@ -1543,6 +1548,7 @@ mod hosted_wire_tests {
     fn status_output() -> StatusOutput {
         StatusOutput {
             analysing: Vec::new(),
+            type_daemon: None,
             repos_detected_by: None,
             repos_added: Vec::new(),
             repos_excluded: Vec::new(),

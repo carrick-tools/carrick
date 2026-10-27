@@ -39,10 +39,12 @@ import {
 } from './check-classify.js';
 import { scrubPaths, type ScrubContext } from './check-scrub.js';
 import {
-  assembleWorkspace,
-  writeProbes,
+  planProbes,
+  planWorkspace,
+  writeWorkspace,
   type AssembledWorkspace,
 } from './check-workspace.js';
+import { JUDGE_BUILD_INFO } from './kept-judge.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
 import { openProbeProgram, probeDeepFindings } from './check-deep.js';
 import { onlyDeclaredOpenAny } from './deep-walk.js';
@@ -63,10 +65,11 @@ function runProcess(
   command: string,
   args: string[],
   cwd: string,
-  env?: NodeJS.ProcessEnv
+  env?: NodeJS.ProcessEnv,
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env, signal, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
@@ -257,16 +260,7 @@ export async function runCheck(
   }
 
   progress('assembling', 'assembling synthetic workspace');
-  const ws = assembleWorkspace({
-    stubs: opts.stubs,
-    workspaceRoot: opts.workspaceRoot,
-  });
-
-  const scrubCtx: ScrubContext = {
-    workspaceRoot: ws.workspaceDir,
-    workspaceRealRoot: fs.realpathSync(ws.workspaceDir),
-    packageLabelOf: ws.packageLabelOf,
-  };
+  const layout = planWorkspace(opts.stubs);
 
   // Generate probes. A pair naming a service with no stub is unverifiable.
   const aliasRecords = readStubAliasRecords(opts.stubs);
@@ -275,7 +269,7 @@ export async function runCheck(
   for (const spec of opts.pairs) {
     try {
       plans.push(
-        buildProbe(spec, ws.packageOf, unwidenedAliasIn(aliasRecords), absenceToleratedIn(aliasRecords))
+        buildProbe(spec, layout.packageOf, unwidenedAliasIn(aliasRecords), absenceToleratedIn(aliasRecords))
       );
     } catch {
       unresolved.push({
@@ -298,185 +292,222 @@ export async function runCheck(
   }
 
   const { preGated, probing } = preGate(plans, aliasRecords);
-  writeProbes(ws, probing);
+  planProbes(layout, probing);
 
-  const errors: string[] = [];
-  const degraded: DegradedService[] = [];
+  // A kept workspace (carrick#2883) is brought to this plan; a fresh one is
+  // written out. Either way the files on disk are the plan's.
+  const taken = opts.kept?.take(layout, opts.workspaceRoot) ?? null;
+  const ws = taken?.ws ?? writeWorkspace(layout, opts.workspaceRoot);
+  const kept = taken !== null;
+  // Whatever happens below, a kept workspace is released: kept when the
+  // check finished, dropped when it did not.
+  let settled = false;
+  const settle = (ok: boolean, installed: boolean): void => {
+    if (kept && !settled) opts.kept!.settle(ok, installed);
+    settled = true;
+  };
+  const dispose = (): void => {
+    if (!kept && cleanup) safeRm(ws);
+  };
+  const workspaceDirOut = kept || cleanup ? '' : ws.workspaceDir;
+  try {
+    const scrubCtx: ScrubContext = {
+      workspaceRoot: ws.workspaceDir,
+      workspaceRealRoot: fs.realpathSync(ws.workspaceDir),
+      packageLabelOf: ws.packageLabelOf,
+    };
 
-  // ---- Install (async, off the event loop) --------------------------------
-  progress('installing', 'installing pinned dependencies');
-  const install = await runProcess(pnpmPath, ['install'], ws.workspaceDir);
-  if (install.code !== 0) {
-    const installError = scrubPaths(
-      (install.stderr || install.stdout).trim().slice(0, 2000),
-      scrubCtx
-    );
-    // `errors` says why the run failed (carrick#1821); each pair the install
-    // stopped says it too, because the client reads every pair's own verdict
-    // on a failed check (carrick#1833).
-    errors.push(`workspace dependency install failed${installError ? `: ${installError}` : ''}`);
-    for (const s of opts.stubs) {
-      degraded.push({ service_name: s.service_name, reason: 'workspace install failed' });
+    const errors: string[] = [];
+    const degraded: DegradedService[] = [];
+
+    // ---- Install (async, off the event loop) --------------------------------
+    progress('installing', 'installing pinned dependencies');
+    const install = taken?.installSkipped
+      ? { code: 0, signal: null, stdout: '', stderr: '' }
+      : await runProcess(pnpmPath, ['install'], ws.workspaceDir, undefined, opts.signal);
+    if (install.code !== 0) {
+      const installError = scrubPaths(
+        (install.stderr || install.stdout).trim().slice(0, 2000),
+        scrubCtx
+      );
+      // `errors` says why the run failed (carrick#1821); each pair the install
+      // stopped says it too, because the client reads every pair's own verdict
+      // on a failed check (carrick#1833).
+      errors.push(`workspace dependency install failed${installError ? `: ${installError}` : ''}`);
+      for (const s of opts.stubs) {
+        degraded.push({ service_name: s.service_name, reason: 'workspace install failed' });
+      }
+      const verdicts = sortVerdicts([
+        ...unverifiableAll(
+          probing,
+          'install:failed',
+          'workspace dependency install failed; compatibility cannot be verified.' +
+            (installError ? ` Installer output: ${installError}` : '')
+        ),
+        // Capture-decay verdicts stand regardless of the install outcome.
+        ...preGated,
+        ...unresolved,
+      ]);
+      settle(false, false);
+      dispose();
+      return {
+        success: false,
+        workspace_dir: workspaceDirOut,
+        isolation: 'pnpm',
+        install_ok: false,
+        ts_version: tsVersion,
+        verdicts,
+        degraded_services: degraded,
+        errors,
+      };
     }
+
+    // ---- Judge (async, off the event loop) ----------------------------------
+    progress('checking', 'type-checking probes');
+    const heap = childHeap(
+      process.execArgv,
+      process.env.NODE_OPTIONS,
+      process.memoryUsage().rss / (1024 * 1024)
+    );
+    // On a kept workspace the compiler keeps its build info there and checks
+    // again only what changed since the last check (carrick#2883).
+    const incremental = kept
+      ? ['--incremental', '--tsBuildInfoFile', path.join(ws.workspaceDir, JUDGE_BUILD_INFO)]
+      : [];
+    const tsc = await runProcess(
+      tscPath,
+      ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json'), ...incremental],
+      ws.workspaceDir,
+      { ...process.env, NODE_OPTIONS: heap.nodeOptions },
+      opts.signal
+    );
+    const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
+
+    // Abnormal tsc termination: OOM/SIGKILL (exit code null), an internal
+    // crash, or a fileless config error (e.g. TS18003, printed without a
+    // (line,col) prefix) all yield ZERO parseable diagnostics — and an empty
+    // diagnostic set must never fall through to "compatible". A non-zero exit
+    // WITH parsed diagnostics is the legitimate incompatible path (tsc exits 1
+    // on ordinary type errors) and stays untouched. Mirrors the install step's
+    // `code === 0` guard.
+    // A compiler a signal ended never finished, so a pair with no diagnostic
+    // was never cleared, whatever it printed first (carrick#2209).
+    if (tsc.signal !== null || (tsc.code !== 0 && diagnostics.length === 0)) {
+      const excerpt = scrubPaths(
+        (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
+        scrubCtx
+      );
+      errors.push(
+        `tsc terminated abnormally (exit code ${tsc.code ?? 'null'}) ` +
+          `with no parseable diagnostics${excerpt ? `: ${excerpt}` : ''}`
+      );
+      for (const s of opts.stubs) {
+        degraded.push({
+          service_name: s.service_name,
+          reason: 'type checker terminated abnormally',
+        });
+      }
+      const verdicts = sortVerdicts([
+        ...unverifiableAll(
+          probing,
+          'tsc:abnormal-termination',
+          `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'}); ` +
+            'compatibility cannot be verified.' +
+            (excerpt ? ` Compiler output: ${excerpt}` : '')
+        ),
+        ...preGated,
+        ...unresolved,
+      ]);
+      // How the compiler ended, as fields, so the scanner can tell a memory
+      // death from any other abnormal end without reading the text
+      // (carrick#2209).
+      const compilerEnd: CompilerEnd = {
+        exit_code: tsc.code,
+        signal: tsc.signal,
+        heap_limit: carriesHeapLimitLine(tsc.stderr),
+        heap_cap_mb: heap.heapCapMb,
+      };
+      settle(false, true);
+      dispose();
+      return {
+        success: false,
+        workspace_dir: workspaceDirOut,
+        isolation: 'pnpm',
+        install_ok: true,
+        ts_version: tsVersion,
+        verdicts,
+        degraded_services: dedupeDegraded(degraded),
+        errors,
+        compiler_end: compilerEnd,
+      };
+    }
+
+    const { probeDiagsByPair, poison, globalErrors } = attributeDiagnostics(
+      diagnostics,
+      ws,
+      probing
+    );
+    for (const e of globalErrors) errors.push(scrubPaths(e, scrubCtx));
+    // Only SERVICE-WIDE poison (an unattributable stub diagnostic) degrades the
+    // whole service; contained alias-scoped poison rides its own verdicts.
+    for (const [service, scope] of poison) {
+      if (scope.all) degraded.push({ service_name: service, reason: scope.reason });
+    }
+    const poisonReason = (service: string, alias: string): string | undefined => {
+      const scope = poison.get(service);
+      if (!scope) return undefined;
+      return scope.all || scope.aliases.has(alias) ? scope.reason : undefined;
+    };
+
+    // Fact-ness walk (carrick#707, R1d): the probe gates are whole-type only,
+    // so a compared pair is only a fact about two known types when neither side
+    // carries a member-level any/unknown HERE — after install, where the capture
+    // could not look (carrick#450). It sets `resolved` and nothing else; no
+    // bucket depends on it.
+    const probeProgram = openProbeProgram(ws.probesDir, probing);
+    const deepByPair = probeDeepFindings(probeProgram, probing);
+    // The same program answers which FIELDS differ on a pair the judge called
+    // incompatible (carrick-tools/carrick-cloud#1118). It names what the verdict
+    // is about; it never decides one.
+    const fieldsByPair = pairFieldReports(probeProgram, probing);
+    // And which pairs compared a union the expected side takes only in part,
+    // the rest failing by nothing but the weak-type check (carrick#1995).
+    const unionsByPair = pairDispatchUnions(probeProgram, probing);
+
     const verdicts = sortVerdicts([
-      ...unverifiableAll(
-        probing,
-        'install:failed',
-        'workspace dependency install failed; compatibility cannot be verified.' +
-          (installError ? ` Installer output: ${installError}` : '')
+      ...probing.map((plan) =>
+        classifyPair({
+          plan,
+          probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
+          poisonReason,
+          scrubCtx,
+          deepFindings: deepByPair.get(plan.pairId),
+          fieldReport: fieldsByPair.get(plan.pairId),
+          dispatchUnion: unionsByPair.get(plan.pairId),
+          rawTextSide: rawTextSideOf(plan, aliasRecords),
+        })
       ),
-      // Capture-decay verdicts stand regardless of the install outcome.
       ...preGated,
       ...unresolved,
     ]);
-    if (cleanup) safeRm(ws);
-    return {
-      success: false,
-      workspace_dir: cleanup ? '' : ws.workspaceDir,
-      isolation: 'pnpm',
-      install_ok: false,
-      ts_version: tsVersion,
-      verdicts,
-      degraded_services: degraded,
-      errors,
-    };
-  }
 
-  // ---- Judge (async, off the event loop) ----------------------------------
-  progress('checking', 'type-checking probes');
-  const heap = childHeap(
-    process.execArgv,
-    process.env.NODE_OPTIONS,
-    process.memoryUsage().rss / (1024 * 1024)
-  );
-  const tsc = await runProcess(
-    tscPath,
-    ['--noEmit', '--pretty', 'false', '-p', path.join(ws.probesRel, 'tsconfig.json')],
-    ws.workspaceDir,
-    { ...process.env, NODE_OPTIONS: heap.nodeOptions }
-  );
-  const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
+    settle(true, true);
+    dispose();
 
-  // Abnormal tsc termination: OOM/SIGKILL (exit code null), an internal
-  // crash, or a fileless config error (e.g. TS18003, printed without a
-  // (line,col) prefix) all yield ZERO parseable diagnostics — and an empty
-  // diagnostic set must never fall through to "compatible". A non-zero exit
-  // WITH parsed diagnostics is the legitimate incompatible path (tsc exits 1
-  // on ordinary type errors) and stays untouched. Mirrors the install step's
-  // `code === 0` guard.
-  // A compiler a signal ended never finished, so a pair with no diagnostic
-  // was never cleared, whatever it printed first (carrick#2209).
-  if (tsc.signal !== null || (tsc.code !== 0 && diagnostics.length === 0)) {
-    const excerpt = scrubPaths(
-      (tsc.stderr || tsc.stdout).trim().slice(0, 2000),
-      scrubCtx
-    );
-    errors.push(
-      `tsc terminated abnormally (exit code ${tsc.code ?? 'null'}) ` +
-        `with no parseable diagnostics${excerpt ? `: ${excerpt}` : ''}`
-    );
-    for (const s of opts.stubs) {
-      degraded.push({
-        service_name: s.service_name,
-        reason: 'type checker terminated abnormally',
-      });
-    }
-    const verdicts = sortVerdicts([
-      ...unverifiableAll(
-        probing,
-        'tsc:abnormal-termination',
-        `the type checker terminated abnormally (exit code ${tsc.code ?? 'null'}); ` +
-          'compatibility cannot be verified.' +
-          (excerpt ? ` Compiler output: ${excerpt}` : '')
-      ),
-      ...preGated,
-      ...unresolved,
-    ]);
-    // How the compiler ended, as fields, so the scanner can tell a memory
-    // death from any other abnormal end without reading the text
-    // (carrick#2209).
-    const compilerEnd: CompilerEnd = {
-      exit_code: tsc.code,
-      signal: tsc.signal,
-      heap_limit: carriesHeapLimitLine(tsc.stderr),
-      heap_cap_mb: heap.heapCapMb,
-    };
-    if (cleanup) safeRm(ws);
     return {
-      success: false,
-      workspace_dir: cleanup ? '' : ws.workspaceDir,
+      success: true,
+      workspace_dir: workspaceDirOut,
       isolation: 'pnpm',
       install_ok: true,
       ts_version: tsVersion,
       verdicts,
       degraded_services: dedupeDegraded(degraded),
       errors,
-      compiler_end: compilerEnd,
     };
+  } finally {
+    // A throw part way leaves nothing kept that the check did not finish.
+    settle(false, false);
   }
-
-  const { probeDiagsByPair, poison, globalErrors } = attributeDiagnostics(
-    diagnostics,
-    ws,
-    probing
-  );
-  for (const e of globalErrors) errors.push(scrubPaths(e, scrubCtx));
-  // Only SERVICE-WIDE poison (an unattributable stub diagnostic) degrades the
-  // whole service; contained alias-scoped poison rides its own verdicts.
-  for (const [service, scope] of poison) {
-    if (scope.all) degraded.push({ service_name: service, reason: scope.reason });
-  }
-  const poisonReason = (service: string, alias: string): string | undefined => {
-    const scope = poison.get(service);
-    if (!scope) return undefined;
-    return scope.all || scope.aliases.has(alias) ? scope.reason : undefined;
-  };
-
-  // Fact-ness walk (carrick#707, R1d): the probe gates are whole-type only,
-  // so a compared pair is only a fact about two known types when neither side
-  // carries a member-level any/unknown HERE — after install, where the capture
-  // could not look (carrick#450). It sets `resolved` and nothing else; no
-  // bucket depends on it.
-  const probeProgram = openProbeProgram(ws.probesDir, probing);
-  const deepByPair = probeDeepFindings(probeProgram, probing);
-  // The same program answers which FIELDS differ on a pair the judge called
-  // incompatible (carrick-tools/carrick-cloud#1118). It names what the verdict
-  // is about; it never decides one.
-  const fieldsByPair = pairFieldReports(probeProgram, probing);
-  // And which pairs compared a union the expected side takes only in part,
-  // the rest failing by nothing but the weak-type check (carrick#1995).
-  const unionsByPair = pairDispatchUnions(probeProgram, probing);
-
-  const verdicts = sortVerdicts([
-    ...probing.map((plan) =>
-      classifyPair({
-        plan,
-        probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
-        poisonReason,
-        scrubCtx,
-        deepFindings: deepByPair.get(plan.pairId),
-        fieldReport: fieldsByPair.get(plan.pairId),
-        dispatchUnion: unionsByPair.get(plan.pairId),
-        rawTextSide: rawTextSideOf(plan, aliasRecords),
-      })
-    ),
-    ...preGated,
-    ...unresolved,
-  ]);
-
-  const workspaceDirOut = cleanup ? '' : ws.workspaceDir;
-  if (cleanup) safeRm(ws);
-
-  return {
-    success: true,
-    workspace_dir: workspaceDirOut,
-    isolation: 'pnpm',
-    install_ok: true,
-    ts_version: tsVersion,
-    verdicts,
-    degraded_services: dedupeDegraded(degraded),
-    errors,
-  };
 }
 
 /**

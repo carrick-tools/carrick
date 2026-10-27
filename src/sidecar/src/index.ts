@@ -17,8 +17,11 @@
  *   `progress` frames as it finishes units of work (writeProgress).
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import type { Project } from 'ts-morph';
 import { parseRequest } from './validators.js';
 import { ProjectLoader } from './project-loader.js';
 import { TypeBundler } from './bundler.js';
@@ -28,8 +31,12 @@ import {
   captureStub,
   findDisqualifyingTopTypes,
   jsonWireDeclarations,
+  KeptJudge,
   runCheck,
+  removeOrphanedJudgeWorkspaces,
 } from './capture/index.js';
+import * as os from 'node:os';
+import * as v8 from 'node:v8';
 import { Retyper, type TopTypeWalk } from './retype.js';
 import { LibraryClaimsVerifier, httpCheck, type LabelledMembers } from './library-claims.js';
 import { readServerLabels } from './server-labels.js';
@@ -51,7 +58,29 @@ import {
 } from './infer-cache.js';
 import { writePositionRows } from './position-rows.js';
 import { findImplementations } from './implementations.js';
+import { HeldFiles, answerWhileStable } from './held-freshness.js';
+import {
+  affectedFiles,
+  importGraphOf,
+  readAgain,
+  readsOf,
+  type FileChange,
+  type ImportGraph,
+  type Reached,
+} from './affected-set.js';
+import { couplingOf, dropReached, itemKeysOf, sameCoupling, type HeldItem } from './held-items.js';
+import {
+  Connection,
+  DEFAULT_IDLE_MS,
+  EXIT_ALREADY_RUNNING,
+  TypedServer,
+  buildIdOf,
+  type ConnectionMode,
+} from './typed-server.js';
+import { newVerifyCounts, spawnColdRunner, verifyAnswer, verifyEnabled, type ColdRunner } from './typed-verify.js';
 import type {
+  DaemonEvent,
+  HeldService,
   BundleResult,
   RetypeOutcome,
   SidecarRequest,
@@ -72,19 +101,17 @@ import type {
   AddProgramFilesResponse,
   PositionRowsResponse,
   ImplementationsResponse,
+  StatusResponse,
   ErrorResponse,
   ServerClaims,
   InferRequestItem,
+  InferItemOutcome,
+  InferTiming,
 } from './types.js';
 
 // ===========================================================================
 // Module-level state
 // ===========================================================================
-
-let projectLoader: ProjectLoader | null = null;
-let initTimeMs: number | null = null;
-/** `requestDigest` of the `init` request this process was last scoped with (carrick#2843). */
-let initDigest = '';
 
 /**
  * The components that read the init'd ts-morph project. Built together with
@@ -103,12 +130,71 @@ interface ProjectComponents {
   labelledMembers: Map<string, LabelledMembers>;
 }
 
+/** One init'd service: its project loader and everything built over it. */
+interface Session {
+  projectLoader: ProjectLoader | null;
+  initTimeMs: number | null;
+  /** `requestDigest` of the `init` request it was scoped with (carrick#2843). */
+  initDigest: string;
+  /**
+   * Components by project key (`ProjectLoader.projectKeyFor`): `''` is the
+   * default project, any other key the program of a project that owns some of
+   * the service's files (carrick#1604).
+   */
+  components: Map<string, ProjectComponents>;
+  /** The roots its `init` named, as `status` reports them. */
+  scope: { repo_root: string; scan_root: string | null } | null;
+  /** Server mode: the `init` that built it, to build it again from (carrick#2880). */
+  init: (SidecarRequest & { action: 'init' }) | null;
+  /** Server mode: the files its programs were built from, as last seen. */
+  held: HeldFiles | null;
+  /** Server mode: how often a sweep refreshed it or dropped it. */
+  freshness: { refreshes: number; drops: number };
+  /**
+   * Server mode: each `infer` item's answer, by item key, kept to answer it
+   * again while no edit reaches it (carrick#2881). Null over stdio.
+   */
+  items: Map<string, HeldItem> | null;
+  /** Server mode: `infer` items answered from `items`, and read again. */
+  answers: { replayed: number; recomputed: number };
+  /** Server mode: how often it was evicted to keep the heap under its cap. */
+  evictions: number;
+  /** Server mode: when it last answered a request (`performance.now()`). */
+  lastUsed: number;
+  /**
+   * Server mode: each held project's import graph, carried across edits with
+   * the files an edit changed read again on first use (carrick#2881).
+   */
+  graphs: Map<Project, { graph: ImportGraph; stale: Set<string> }>;
+  /** Server mode: the service it belongs to (`serviceKeyOf`), which the heap budget counts. */
+  service: string | null;
+}
+
+function newSession(): Session {
+  return {
+    projectLoader: null,
+    initTimeMs: null,
+    initDigest: '',
+    components: new Map(),
+    scope: null,
+    init: null,
+    held: null,
+    freshness: { refreshes: 0, drops: 0 },
+    items: null,
+    answers: { replayed: 0, recomputed: 0 },
+    evictions: 0,
+    lastUsed: 0,
+    graphs: new Map(),
+    service: null,
+  };
+}
+
 /**
- * Components by project key (`ProjectLoader.projectKeyFor`): `''` is the
- * default project, any other key the program of a project that owns some of
- * the service's files (carrick#1604).
+ * The service the request being handled reads. Over stdio there is one, and
+ * re-init replaces what it holds. In server mode each connection selects the
+ * held session its `init` names before each of its requests (carrick#2879).
  */
-let components = new Map<string, ProjectComponents>();
+let session: Session = newSession();
 
 /**
  * Reads a capture stub's own declaration tree and nothing of the init'd
@@ -120,10 +206,10 @@ const definitionResolver = new DefinitionResolver();
 
 /** The init'd project loader, or the error every project-backed action gives without one. */
 function initializedLoader(): ProjectLoader {
-  if (!projectLoader?.isInitialized()) {
+  if (!session.projectLoader?.isInitialized()) {
     throw new Error('Sidecar not initialized. Call init first.');
   }
-  return projectLoader;
+  return session.projectLoader;
 }
 
 /**
@@ -149,7 +235,7 @@ function projectComponents(key = ''): ProjectComponents {
   // a re-init drops `components` and points the slot at another service, and
   // nothing built over this project may follow it there.
   const loader = initializedLoader();
-  let built = components.get(key);
+  let built = session.components.get(key);
   if (!built) {
     const project = loader.getProjectFor(key);
     const repoRoot = loader.getRepoRoot();
@@ -185,7 +271,7 @@ function projectComponents(key = ''): ProjectComponents {
       }),
       labelledMembers: new Map(),
     };
-    components.set(key, built);
+    session.components.set(key, built);
   }
   return built;
 }
@@ -218,7 +304,7 @@ function byProject<T>(items: T[], fileOf: (item: T) => string | undefined): Map<
   // An empty request is still answered by the default project, as before.
   const groups = new Map<string, T[]>(items.length === 0 ? [['', []]] : []);
   for (const item of items) {
-    const key = projectLoader?.projectKeyFor(fileOf(item)) ?? '';
+    const key = session.projectLoader?.projectKeyFor(fileOf(item)) ?? '';
     groups.set(key, [...(groups.get(key) ?? []), item]);
   }
   return groups;
@@ -239,9 +325,9 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
 
     // Re-init re-scopes the sidecar to another root: drop everything built
     // over the previous project before resolving the new one.
-    components = new Map();
-    initDigest = requestDigest(request);
-    projectLoader = new ProjectLoader({
+    session.components = new Map();
+    session.initDigest = requestDigest(request);
+    session.projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
       scanRoot: request.scan_root,
@@ -249,7 +335,7 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
       pinnedDependencies: request.pinned_dependencies,
     });
 
-    const result = projectLoader.load();
+    const result = session.projectLoader.load();
 
     if (!result.success) {
       return {
@@ -264,14 +350,14 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
     // that needs them, so readiness costs the same on a bare checkout as on
     // one with its dependencies installed (carrick#749).
 
-    initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
+    session.initTimeMs = result.initTimeMs || Math.round(performance.now() - startTime);
 
-    log(`Initialization complete in ${initTimeMs}ms`);
+    log(`Initialization complete in ${session.initTimeMs}ms`);
 
     return {
       request_id: request.request_id,
       status: 'ready',
-      init_time_ms: initTimeMs,
+      init_time_ms: session.initTimeMs,
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -350,7 +436,8 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
     const withinStage = atMostEvery(PROGRESS_INTERVAL_MS, (phase: string, message: string) =>
       writeProgress(request.request_id, phase, message)
     );
-    const result = captureStub({
+    const result = captureStub(
+      {
       repoRoot: request.repo_root,
       serviceName: request.service_name,
       anchors: request.anchors,
@@ -362,7 +449,8 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
         stage = phase;
         writeProgress(request.request_id, phase, message);
       },
-    });
+      }
+    );
     return {
       request_id: request.request_id,
       status: result.success ? 'success' : 'error',
@@ -389,12 +477,20 @@ function handleCaptureV2(request: SidecarRequest & { action: 'capture_v2' }): Ca
  * install/check and one terminal `success`/`error` frame. Writes its own
  * frames, so processLine hands off and does not write a response for it.
  */
+/**
+ * A daemon's judge workspace, kept between checks (carrick#2883). Over stdio
+ * every check builds its own, as before.
+ */
+let keptJudge: KeptJudge | null = null;
+
 async function handleCheckV2Async(
-  request: SidecarRequest & { action: 'check_v2' }
+  request: SidecarRequest & { action: 'check_v2' },
+  signal?: AbortSignal
 ): Promise<void> {
+  const out = sink;
   let phase = 'assembling';
   const keepalive = setInterval(() => {
-    writeProgress(request.request_id, phase, `check ${phase}`);
+    writeProgress(request.request_id, phase, `check ${phase}`, out);
   }, 1500);
   keepalive.unref();
   try {
@@ -405,6 +501,9 @@ async function handleCheckV2Async(
         pairs: request.pairs,
         workspaceRoot: request.workspace_root,
         cleanup: request.keep_workspace !== true,
+        // A caller that asks for the workspace gets a fresh one of its own.
+        kept: request.keep_workspace === true ? undefined : keptJudge ?? undefined,
+        signal,
       },
       (p) => {
         phase = p;
@@ -417,16 +516,19 @@ async function handleCheckV2Async(
       result,
       errors: result.errors.length > 0 ? result.errors : undefined,
     };
-    writeResponse(response);
+    writeResponse(response, out);
   } catch (err) {
     clearInterval(keepalive);
     const error = err instanceof Error ? err.message : String(err);
     logError(`check_v2 failed: ${error}`);
-    writeResponse({
-      request_id: request.request_id,
-      status: 'error',
-      errors: [error],
-    });
+    writeResponse(
+      {
+        request_id: request.request_id,
+        status: 'error',
+        errors: [error],
+      },
+      out
+    );
   }
 }
 
@@ -438,6 +540,8 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
     log(`Inferring ${request.requests.length} type(s)`);
 
     const groups = byProject(request.requests, (item) => item.file_path);
+    // A daemon answers from the items it keeps, never from the kept file.
+    if (session.items) return inferHeld(request, groups, session.items);
     const cacheKey = inferAnswerKey(request, groups);
     if (cacheKey) {
       const served = servedAnswer(cacheKey);
@@ -506,6 +610,126 @@ function handleInfer(request: SidecarRequest & { action: 'infer' }): InferRespon
 }
 
 /**
+ * carrick#2881: answer `infer` in a daemon, reading again only the items it
+ * keeps no answer for (`held-items.ts`) and taking the rest from `items`.
+ * Each program's items are read in request order, in one batch, as a cold
+ * process reads them; an item coupled to one read again is read again with it.
+ */
+function inferHeld(
+  request: SidecarRequest & { action: 'infer' },
+  groups: Map<string, InferRequestItem[]>,
+  items: Map<string, HeldItem>
+): InferResponse {
+  const keys = itemKeysOf(request as unknown as { requests: InferRequestItem[] } & Record<string, unknown>);
+  const indexOf = new Map(request.requests.map((item, index) => [item, index]));
+  const outcomes = new Array<InferItemOutcome>(request.requests.length);
+  const timings: InferTiming[] = [];
+  let readAgainCount = 0;
+  let done = 0;
+  const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
+    writeProgress(request.request_id, 'infer', `${done} of ${request.requests.length}`)
+  );
+  for (const [key, group] of groups) {
+    const indices = group.map((item) => indexOf.get(item)!);
+    const readAgain = new Set(indices.filter((index) => !items.has(keys[index]!)));
+    const fresh = new Map<number, Set<string>>();
+    for (;;) {
+      if (readAgain.size > 0) {
+        const chosen = indices.filter((index) => readAgain.has(index));
+        const asked = chosen.map((index) => request.requests[index]!);
+        const built = projectComponents(key);
+        const result = built.typeInferrer.infer(
+          asked,
+          request.extraction_config,
+          () => {
+            done += 1;
+            report();
+          },
+          request.model_symbols,
+          labelledMembersFor(built, key, asked, request.server_claims)
+        );
+        timings.push(result.timing);
+        chosen.forEach((index, at) => {
+          outcomes[index] = result.items[at]!;
+        });
+        fresh.clear();
+        const reading = chosen.filter((index) => (outcomes[index]!.pathFiles?.length ?? 0) > 0);
+        if (reading.length > 0) {
+          const project = initializedLoader().getProjectFor(key);
+          const program = project.getProgram().compilerObject;
+          const graph = graphFor(project);
+          for (const index of reading) {
+            const asked = path.resolve(initializedLoader().getRepoRoot(), request.requests[index]!.file_path);
+            fresh.set(index, readsOf(graph, program.getSourceFile(asked)?.fileName ?? asked));
+          }
+        }
+      }
+      const coupled = couplingOf(
+        indices.map((index) =>
+          readAgain.has(index)
+            ? { key: keys[index]!, pathFiles: outcomes[index]!.pathFiles, reads: fresh.get(index) }
+            : { key: keys[index]!, pathFiles: items.get(keys[index]!)!.outcome.pathFiles, reads: items.get(keys[index]!)!.reads }
+        )
+      );
+      const readAgainKeys = new Set([...readAgain].map((index) => keys[index]!));
+      const moved = indices.filter(
+        (index) =>
+          !readAgain.has(index) &&
+          !sameCoupling(items.get(keys[index]!)!.coupled, coupled.get(keys[index]!) ?? [], readAgainKeys)
+      );
+      if (moved.length === 0) {
+        for (const index of readAgain) {
+          items.set(keys[index]!, {
+            file: heldFileOf(request.requests[index]!),
+            outcome: outcomes[index]!,
+            coupled: coupled.get(keys[index]!) ?? [],
+            reads: fresh.get(index),
+          });
+        }
+        for (const index of indices) {
+          if (!readAgain.has(index)) outcomes[index] = items.get(keys[index]!)!.outcome;
+        }
+        session.answers.replayed += indices.length - readAgain.size;
+        session.answers.recomputed += readAgain.size;
+        readAgainCount += readAgain.size;
+        break;
+      }
+      for (const index of moved) readAgain.add(index);
+    }
+  }
+  // Assembled as `handleInfer` assembles a cold answer: by program, in request order within each.
+  const ordered = [...groups.values()].flatMap((group) => group.map((item) => outcomes[indexOf.get(item)!]!));
+  const inferred_types = ordered.flatMap((outcome) => (outcome.inferred ? [outcome.inferred] : []));
+  const errors = ordered.flatMap((outcome) => outcome.errors);
+  const success = errors.length === 0 || inferred_types.length > 0;
+  log(`Inferred ${request.requests.length} type(s): ${readAgainCount} read again, the rest kept (carrick#2881)`);
+  return {
+    request_id: request.request_id,
+    status: success ? 'success' : 'error',
+    inferred_types: inferred_types.length > 0 ? inferred_types : undefined,
+    errors: errors.length > 0 ? errors : undefined,
+    infer_timing: mergeInferTimings(timings),
+  };
+}
+
+/**
+ * An item's file by its real path: a program names a root file as its config
+ * lists it and a file reached through a link by its real path, so kept items
+ * and the files an edit reaches meet on the real path.
+ */
+function heldFileOf(item: InferRequestItem): string {
+  return realFileOf(path.resolve(initializedLoader().getRepoRoot(), item.file_path));
+}
+
+function realFileOf(file: string): string {
+  try {
+    return fs.realpathSync.native(file);
+  } catch {
+    return file;
+  }
+}
+
+/**
  * carrick#2843: what a kept answer to `request` is read against, or
  * `undefined` when no answer to it is kept: the cache is off, the request
  * reads server-framework claims (in a program the record does not cover),
@@ -522,7 +746,7 @@ function inferAnswerKey(
   const loader = initializedLoader();
   if (loader.resolvesThroughModuleGraph()) return undefined;
   for (const [key, items] of groups) {
-    if (loader.isBuilt(key) || components.has(key)) return undefined;
+    if (loader.isBuilt(key) || session.components.has(key)) return undefined;
     if (
       request.server_claims &&
       request.server_claims.checks.length > 0 &&
@@ -531,7 +755,7 @@ function inferAnswerKey(
       return undefined;
     }
   }
-  return { dir, repoRoot: loader.getRepoRoot(), init: initDigest, request: requestDigest(request) };
+  return { dir, repoRoot: loader.getRepoRoot(), init: session.initDigest, request: requestDigest(request) };
 }
 
 /**
@@ -717,7 +941,7 @@ function handleVerifyClientSemantics(
 ): VerifyClientSemanticsResponse {
   try {
     const { claimsVerifier } = projectComponents();
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} client-semantics claim(s) from ${fromDir}`);
     const { semantics, modules } = claimsVerifier.run(
       fromDir,
@@ -750,7 +974,7 @@ function handleVerifyLibraryClaims(
     const { claimsVerifier } = projectComponents();
     // The verifier's budget starts now, and so does the scanner's wait.
     writeProgress(request.request_id, 'verify_library_claims', 'program ready');
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Verifying ${request.checks.length} library claim(s) from ${fromDir}`);
     const { semantics, modules } = claimsVerifier.run(
       fromDir,
@@ -785,7 +1009,7 @@ function handleListLibrarySurface(
 ): ListLibrarySurfaceResponse {
   try {
     const { claimsVerifier } = projectComponents();
-    const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
+    const fromDir = path.resolve(session.projectLoader!.getRepoRoot(), request.from_dir);
     log(`Listing the declared surface of ${request.packages.length} specifier(s) from ${fromDir}`);
     const { surfaces, surface_sha256 } = claimsVerifier.listSurface(
       fromDir,
@@ -937,7 +1161,7 @@ function handlePositionRows(
   try {
     const loader = initializedLoader();
     // Built over programs the walk releases; nothing may read them after it.
-    components = new Map();
+    session.components = new Map();
     let done = 0;
     const report = atMostEvery(PROGRESS_INTERVAL_MS, () =>
       writeProgress(request.request_id, 'positions', `${done} of ${request.files.length}`)
@@ -969,12 +1193,12 @@ function handlePositionRows(
  * Handle the 'health' action - report initialization status
  */
 function handleHealth(request: SidecarRequest & { action: 'health' }): HealthResponse {
-  const isReady = projectLoader?.isInitialized() ?? false;
+  const isReady = session.projectLoader?.isInitialized() ?? false;
 
   return {
     request_id: request.request_id,
     status: isReady ? 'ready' : 'not_ready',
-    init_time_ms: initTimeMs ?? undefined,
+    init_time_ms: session.initTimeMs ?? undefined,
   };
 }
 
@@ -1035,6 +1259,14 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleHealth(request);
     case 'shutdown':
       return handleShutdown(request);
+    case 'hello':
+    case 'status':
+    case 'stop':
+      return {
+        request_id: request.request_id,
+        status: 'error',
+        errors: [`${request.action} is answered in server mode only (--serve)`],
+      };
     default:
       // TypeScript should catch this, but just in case
       return {
@@ -1049,12 +1281,25 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
 // Response Writer
 // ===========================================================================
 
+/** Where the frames of the request being handled go. */
+type Sink = (frame: string) => void;
+
+const STDOUT: Sink = (frame) => {
+  process.stdout.write(frame);
+};
+
+/**
+ * The frames of the request being handled: stdout, or in server mode the
+ * connection that sent it. A request that answers later (`check_v2`) keeps the
+ * one it started with.
+ */
+let sink: Sink = STDOUT;
+
 /**
  * Write a JSON response to stdout
  */
-function writeResponse(response: SidecarResponse): void {
-  const json = JSON.stringify(response);
-  process.stdout.write(json + '\n');
+function writeResponse(response: SidecarResponse, out: Sink = sink): void {
+  out(JSON.stringify(response) + '\n');
 }
 
 /**
@@ -1068,10 +1313,8 @@ function writeResponse(response: SidecarResponse): void {
  * drains the pipe on its own thread, so there is room. It is written through
  * the same stream as every answer, so a frame can never land inside one.
  */
-function writeProgress(requestId: string, phase: string, message: string): void {
-  process.stdout.write(
-    JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n'
-  );
+function writeProgress(requestId: string, phase: string, message: string, out: Sink = sink): void {
+  out(JSON.stringify({ request_id: requestId, status: 'progress', phase, message }) + '\n');
 }
 
 /**
@@ -1103,12 +1346,13 @@ function logError(message: string): void {
 // ===========================================================================
 
 /**
- * Process a single line of input
+ * The request a line holds, or null when it is empty or invalid (an invalid
+ * one is answered with an error frame through the current sink).
  */
-function processLine(line: string): void {
+function requestOf(line: string): SidecarRequest | null {
   // Skip empty lines
   const trimmed = line.trim();
-  if (!trimmed) return;
+  if (!trimmed) return null;
 
   // Parse JSON
   let json: unknown;
@@ -1117,7 +1361,7 @@ function processLine(line: string): void {
   } catch (err) {
     logError(`Invalid JSON: ${trimmed}`);
     writeErrorResponse('unknown', `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
-    return;
+    return null;
   }
 
   // Validate request
@@ -1128,19 +1372,753 @@ function processLine(line: string): void {
       (json as { request_id?: string })?.request_id || 'unknown',
       parseResult.error
     );
+    return null;
+  }
+  return parseResult.request;
+}
+
+/**
+ * Answer one request through the current sink. `check_v2` runs async
+ * (spawned pnpm install + tsc) and writes its own progress and terminal
+ * frames; the promise settles once it has.
+ */
+function dispatch(request: SidecarRequest, signal?: AbortSignal): Promise<void> {
+  if (request.action === 'check_v2') return handleCheckV2Async(request, signal);
+  writeResponse(handleRequest(request));
+  return Promise.resolve();
+}
+
+/** Process a single line of stdin. */
+function processLine(line: string): void {
+  const request = requestOf(line);
+  // Over stdio a check runs beside the requests after it, as before.
+  if (request) void dispatch(request);
+}
+
+// ===========================================================================
+// Server mode (carrick#2879)
+// ===========================================================================
+
+/** Sessions a daemon holds, by what their `init` named. */
+const heldSessions = new Map<string, Session>();
+
+/** The key of the service an `init` names: every field that scopes its project. */
+function sessionKey(request: SidecarRequest & { action: 'init' }): string {
+  return JSON.stringify([
+    path.resolve(request.repo_root),
+    request.tsconfig_path ?? null,
+    request.scan_root ?? null,
+    request.tsconfig_snapshot ?? null,
+    request.pinned_dependencies ?? null,
+  ]);
+}
+
+/**
+ * In server mode, `init` selects the held session for its service, or builds
+ * one: a second client of the same service reads the project the first one
+ * built. Over stdio, `init` re-scopes the one session instead. A probe (a
+ * check) never builds: its `init` for a service with no built program, or one
+ * marked `cold_only`, is refused, and the client answers through a process of
+ * its own (L3).
+ */
+function initHeld(request: SidecarRequest & { action: 'init' }, mode: ConnectionMode): InitResponse {
+  const key = sessionKey(request);
+  const held = heldSessions.get(key);
+  const service = serviceKeyOf(request);
+  if (mode === 'probe') {
+    const state = services.get(service);
+    const refusal = state?.coldOnly ? `cold_only:${state.coldOnly}` : held && sessionBuilt(held) ? null : 'not_built';
+    if (refusal !== null) {
+      counters.init_refused += 1;
+      note('init_refused', service, { reason: refusal });
+      return { request_id: request.request_id, status: 'error', errors: [`not_held: ${refusal}`] };
+    }
+    serviceState(service, request.repo_root).probeUsed = true;
+  } else if (!(held && sessionBuilt(held)) && !roomToBuild()) {
+    // Fill, then refuse (carrick#2915): a warm-up that keeps building past a full heap evicts what it built.
+    const state = serviceState(service, request.repo_root);
+    state.coldOnly = 'no_room';
+    counters.init_refused += 1;
+    note('no_room', service, { heap_mb: Math.round(heapUsedMb()), cap_mb: heapCapMb() });
+    return { request_id: request.request_id, status: 'error', errors: ['not_held: cold_only:no_room'] };
+  }
+  if (held?.projectLoader?.isInitialized()) {
+    session = held;
+    return { request_id: request.request_id, status: 'ready', init_time_ms: held.initTimeMs ?? undefined };
+  }
+  session = held && !held.projectLoader ? held : newSession();
+  session.scope = { repo_root: path.resolve(request.repo_root), scan_root: request.scan_root ?? null };
+  session.init = request;
+  session.items = new Map();
+  session.service = service;
+  const response = handleInit(request);
+  if (response.status === 'ready') {
+    heldSessions.set(key, session);
+    serviceState(service, request.repo_root);
+  }
+  return response;
+}
+
+/** The service a request names: the fields that scope its programs. */
+function serviceKeyOf(request: { repo_root: string; tsconfig_path?: string | null; scan_root?: string | null }): string {
+  return JSON.stringify([path.resolve(request.repo_root), request.tsconfig_path ?? null, request.scan_root ?? null]);
+}
+
+/** A held service as the heap budget sees it (L2). */
+interface ServiceState {
+  repo_root: string;
+  /** Heap its building requests kept, after a collection (MB); null until built. */
+  footprintMb: number | null;
+  /** A probe (a check) has used it: a warm request never evicts it. */
+  probeUsed: boolean;
+  /** Never held again in this daemon's life; routed cold. */
+  coldOnly: 'too_big' | 'no_room' | null;
+  /** When a request last used it (`Date.now()`), or null. */
+  lastUsed: number | null;
+}
+
+const services = new Map<string, ServiceState>();
+
+function serviceState(service: string, repoRoot: string): ServiceState {
+  let state = services.get(service);
+  if (!state) {
+    state = { repo_root: path.resolve(repoRoot), footprintMb: null, probeUsed: false, coldOnly: null, lastUsed: null };
+    services.set(service, state);
+  }
+  return state;
+}
+
+/**
+ * Build a held session's program now, and watch its files from now on (as a
+ * rebuild after a drop does). A build that fails is left to the session's next
+ * request, which reports it as a cold process would.
+ */
+function buildHeld(held: Session): void {
+  const loader = held.projectLoader;
+  if (!loader?.isInitialized() || sessionBuilt(held)) return;
+  try {
+    // The compiler program too, so a check's first request does not pay for it (carrick#2915).
+    void loader.getProject().getProgram().compilerObject;
+  } catch (err) {
+    log(`building the service at init failed: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
+  held.held = heldFilesOf(held);
+  held.held.sweep();
+}
 
-  // check_v2 runs async (spawned pnpm install + tsc) and writes its own
-  // progress + terminal frames; hand off and return.
-  if (parseResult.request.action === 'check_v2') {
-    void handleCheckV2Async(parseResult.request);
+/** The share of the cap above which a warm `init` builds nothing (carrick#2915). */
+const BUILD_ROOM = 0.9;
+
+/** Whether the heap, collected when it reads full, leaves room under the cap to build a service. */
+function roomToBuild(): boolean {
+  const limit = heapCapMb() * BUILD_ROOM;
+  if (heapUsedMb() <= limit) return true;
+  collect();
+  return heapUsedMb() <= limit;
+}
+
+/** Whether a session's loader holds a built program: the one test for `status` and the probe refusal. */
+function sessionBuilt(held: Session): boolean {
+  return (held.projectLoader?.builtProjects().length ?? 0) > 0;
+}
+
+/** Whether `service` holds a built program. */
+function serviceBuilt(service: string): boolean {
+  for (const held of heldSessions.values()) if (held.service === service && sessionBuilt(held)) return true;
+  return false;
+}
+
+/** Release `service`'s programs. Its `init` stays; a warm request builds it again. */
+function releaseService(service: string): void {
+  const state = services.get(service);
+  if (state) state.footprintMb = null;
+  for (const held of heldSessions.values()) if (held.service === service && held.projectLoader !== null) releaseSession(held);
+}
+
+function statusOf(server: TypedServer, buildId: string, cliVersion: string | null): StatusResponse['daemon'] {
+  const memory = process.memoryUsage();
+  const now = Date.now();
+  return {
+    pid: process.pid,
+    build_id: buildId,
+    cli_version: cliVersion,
+    socket: server.socketPath,
+    started_at: server.startedAt.toISOString(),
+    uptime_ms: now - server.startedAt.getTime(),
+    idle_ms: server.idleMs(),
+    services: [
+      ...[...heldSessions.values()].map((held) => ({
+        repo_root: held.scope?.repo_root ?? '',
+        scan_root: held.scope?.scan_root ?? null,
+        built: sessionBuilt(held),
+        ...serviceReport(held, now),
+        freshness: { ...held.freshness },
+        items: { held: held.items?.size ?? 0, ...held.answers },
+        evictions: held.evictions,
+      })),
+      // Every service the daemon has seen, built or not: a refused one reads as cold_only, never as unseen (carrick#2928).
+      ...[...services.entries()]
+        .filter(([key]) => ![...heldSessions.values()].some((held) => held.service === key))
+        .map(([key, state]) => ({
+          repo_root: state.repo_root,
+          scan_root: (JSON.parse(key) as Array<string | null>)[2] ?? null,
+          built: false,
+          state: state.coldOnly ? (`cold_only:${state.coldOnly}` as const) : ('released' as const),
+          footprint_mb: null,
+          last_used_s: state.lastUsed != null ? Math.round((now - state.lastUsed) / 1000) : null,
+          freshness: { refreshes: 0, drops: 0 },
+          items: { held: 0, replayed: 0, recomputed: 0 },
+          evictions: 0,
+        })),
+    ],
+    heap_cap_mb: heapCapMb(),
+    heap_limit_mb: Math.round(v8.getHeapStatistics().heap_size_limit / 1048576),
+    judge: {
+      ...(keptJudge?.uses ?? { checks: 0, installs_skipped: 0 }),
+      workspace_dir: keptJudge?.workspaceDir ?? null,
+      size_mb: keptJudge?.sizeMb ?? null,
+    },
+    warming: server.warming(),
+    queued: server.queued(),
+    counters: { ...counters, abandoned: server.counts.abandoned, skipped: server.counts.skipped },
+    errors: [...events],
+    collections,
+    ...(verifyEnabled() ? { verify: { ...verifyCounts } } : {}),
+    heap_used_mb: Math.round(memory.heapUsed / 1048576),
+    rss_mb: Math.round(memory.rss / 1048576),
+  };
+}
+
+/**
+ * A held session's budget fields for `status`. `built` is the probe refusal's
+ * test (a built program).
+ */
+function serviceReport(
+  held: Session,
+  now: number
+): { state: HeldService['state']; footprint_mb: number | null; last_used_s: number | null } {
+  const state = held.service ? services.get(held.service) : undefined;
+  return {
+    state: state?.coldOnly ? `cold_only:${state.coldOnly}` : sessionBuilt(held) ? 'built' : 'released',
+    footprint_mb: state?.footprintMb != null ? Math.round(state.footprintMb) : null,
+    last_used_s: state?.lastUsed != null ? Math.round((now - state.lastUsed) / 1000) : null,
+  };
+}
+
+/** Daemon counters (L6); `abandoned` and `skipped` are the server's. */
+const counters = { warm_answers: 0, init_refused: 0, closed_for_cold: 0 };
+
+/** Full collections the daemon forced (each costs hundreds of ms on a GB heap). */
+let collections = 0;
+
+/** The last daemon-only events, oldest first (L6). */
+const events: DaemonEvent[] = [];
+const MAX_EVENTS = 20;
+
+/** The served workspace's real path: events name services relative to it. */
+let servedWorkspace = '';
+
+/** Record a daemon-only event. `detail` is counts and MB only. */
+function note(kind: DaemonEvent['kind'], service: string | null, detail: Record<string, number | string> = {}): void {
+  const root = service ? (services.get(service)?.repo_root ?? (JSON.parse(service) as string[])[0]) : null;
+  events.push({
+    at: new Date().toISOString(),
+    kind,
+    service: root === null ? null : path.relative(servedWorkspace, realPathOrSelf(root)) || '.',
+    detail,
+  });
+  if (events.length > MAX_EVENTS) events.splice(0, events.length - MAX_EVENTS);
+}
+
+function realPathOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * A daemon-only failure (L4): the connection is closed with no frame, and the
+ * client answers the request through a process of its own. Thrown from
+ * server-mode code; caught by `serveLine`.
+ */
+class CloseForCold extends Error {
+  constructor(reason: string) {
+    super(reason);
+  }
+}
+
+/** Answer one line from a connection, with its frames going back to it. */
+async function serveLine(
+  server: TypedServer,
+  buildId: string,
+  cliVersion: string | null,
+  conn: Connection,
+  line: string
+): Promise<void> {
+  sink = (frame) => conn.write(frame);
+  try {
+    const request = requestOf(line);
+    if (!request) return;
+    if (!conn.greeted) {
+      // The record's token stops the daemon from any build (L5).
+      if (request.action === 'stop' && request.token !== undefined && request.token === server.token) {
+        await conn.flush(JSON.stringify({ request_id: request.request_id, status: 'success' }) + '\n');
+        server.stop('stop requested with the record token');
+        return;
+      }
+      if (request.action !== 'hello' || request.build_id !== buildId) {
+        const saw = request.action === 'hello' ? `build ${request.build_id}` : `'${request.action}' first`;
+        await conn.flush(
+          JSON.stringify({
+            request_id: request.request_id,
+            status: 'error',
+            pid: process.pid,
+            workspace: server.workspaceReal,
+            errors: [`build_mismatch: this daemon is build ${buildId}; a connection must open with hello naming it, saw ${saw}`],
+          }) + '\n'
+        );
+        conn.close();
+        return;
+      }
+      conn.greeted = true;
+      conn.mode = request.mode;
+      writeResponse({ request_id: request.request_id, status: 'success', build_id: buildId, pid: process.pid, workspace: server.workspaceReal });
+      return;
+    }
+    switch (request.action) {
+      case 'hello':
+        conn.mode = request.mode;
+        writeResponse({ request_id: request.request_id, status: 'success', build_id: buildId, pid: process.pid, workspace: server.workspaceReal });
+        return;
+      case 'status':
+        writeResponse({ request_id: request.request_id, status: 'success', daemon: statusOf(server, buildId, cliVersion) });
+        return;
+      case 'stop':
+        await conn.flush(JSON.stringify({ request_id: request.request_id, status: 'success' }) + '\n');
+        server.stop('stop requested');
+        return;
+      case 'shutdown':
+        // The client is done; the daemon is not.
+        await conn.flush(JSON.stringify({ request_id: request.request_id, status: 'success' }) + '\n');
+        conn.close();
+        return;
+      case 'init': {
+        const mode = conn.mode ?? 'probe';
+        const service = mode === 'warm' ? serviceKeyOf(request) : null;
+        const budget = service === null ? null : underBudget(service, mode);
+        try {
+          const response = initHeld(request, mode);
+          // The warm-up builds the program now, as a cold process does on its first request, so a check finds it held.
+          if (response.status === 'ready' && mode === 'warm') buildHeld(session);
+          writeResponse(response);
+          if (response.status !== 'ready') return;
+          conn.slot = session;
+          session.lastUsed = performance.now();
+          if (service !== null) serviceState(service, request.repo_root).lastUsed = Date.now();
+        } finally {
+          budget?.end();
+        }
+        return;
+      }
+      default:
+        await serveRequest(conn, line, request);
+    }
+  } finally {
+    sink = STDOUT;
+    session = newSession();
+  }
+}
+
+/**
+ * Answer one request that is not a daemon control frame, under the heap budget
+ * (L2), closing the connection with no frame on a daemon-only failure (L4).
+ */
+async function serveRequest(conn: Connection, line: string, request: SidecarRequest): Promise<void> {
+  const mode = conn.mode ?? 'probe';
+  const held = conn.slot as Session | undefined;
+  const service = held?.service ?? null;
+  const budget = underBudget(service, mode);
+  let stopListening = (): void => {};
+  try {
+    // The daemon never changes a held program at a client's request.
+    if (request.action === 'add_program_files') throw new CloseForCold('add_program_files');
+    // A capture builds three programs of its own: the client's process runs it beside its other captures (carrick#2914).
+    if (request.action === 'capture_v2') throw new CloseForCold('capture_v2');
+    if (mode === 'probe') {
+      // A probe never builds: an evicted or cold_only service answers through a process of the client's own.
+      if (held && (held.projectLoader === null || (held.service && services.get(held.service)?.coldOnly))) {
+        throw new CloseForCold('the service is not held');
+      }
+    }
+    if (request.action === 'check_v2' && keptJudge?.inUse) throw new CloseForCold('the kept judge is in use');
+    session = held ?? newSession();
+    if (held) held.lastUsed = performance.now();
+    if (service) {
+      const state = services.get(service) ?? serviceState(service, (request as { repo_root?: string }).repo_root ?? JSON.parse(service)[0]);
+      state.lastUsed = Date.now();
+      if (mode === 'probe') state.probeUsed = true;
+    }
+    // A check whose client goes away kills its install or compiler.
+    const abort = new AbortController();
+    stopListening = conn.onClose(() => abort.abort());
+    const answer = async (): Promise<void> => {
+      if (held && READS_HELD_PROJECT.has(request.action)) writeResponse(answerFresh(request, mode));
+      else await dispatch(request, abort.signal);
+    };
+    if (verifyEnabled()) await answerVerified(conn, line, held?.init ?? null, answer);
+    else await answer();
+    if (!conn.closed) counters.warm_answers += 1;
+  } catch (err) {
+    if (!(err instanceof CloseForCold)) {
+      log(`closing for a cold answer: ${err instanceof Error ? err.message : String(err)}`);
+      note('exception', service);
+    }
+    counters.closed_for_cold += 1;
+    conn.destroy();
+  } finally {
+    stopListening();
+    budget.end();
+  }
+}
+
+/**
+ * The heap budget around one request on `service` (L2): the cap kept before
+ * and after; on a warm request, the heap it kept added to the service's
+ * footprint (collected before and after, so it counts what stays). A probe
+ * forces no collection unless the heap reads over the cap.
+ */
+function underBudget(service: string | null, mode: ConnectionMode): { end: () => void } {
+  keepUnderCap(service, mode, 'before');
+  const measured = mode === 'warm' && service !== null;
+  if (measured) collect();
+  const before = heapUsedMb();
+  return {
+    end: () => {
+      if (measured) {
+        collect();
+        const state = services.get(service);
+        if (state && serviceBuilt(service)) state.footprintMb = (state.footprintMb ?? 0) + Math.max(0, heapUsedMb() - before);
+      }
+      keepUnderCap(service, mode, 'after');
+    },
+  };
+}
+
+/** Verify mode (carrick#2886): what it has seen, and the cold runner it asks. */
+const verifyCounts = newVerifyCounts();
+let coldRunner: ColdRunner | null = null;
+
+/**
+ * Verify mode: run `answer` with its frames held back, answer the same request
+ * cold, and write the terminal frame that `verifyAnswer` picks. Progress frames
+ * go out as they are written.
+ */
+async function answerVerified(
+  conn: Connection,
+  line: string,
+  init: object | null,
+  answer: () => Promise<void>
+): Promise<void> {
+  const terminal: string[] = [];
+  sink = (frame) => {
+    if ((JSON.parse(frame) as { status?: string }).status === 'progress') conn.write(frame);
+    else terminal.push(frame);
+  };
+  await answer();
+  sink = (frame) => conn.write(frame);
+  if (terminal.length !== 1) {
+    log(`verify: ${terminal.length} terminal frames, not compared`);
+    for (const frame of terminal) conn.write(frame);
     return;
   }
+  coldRunner ??= spawnColdRunner(fileURLToPath(import.meta.url));
+  const outcome = await verifyAnswer(terminal[0], init, line, coldRunner, verifyCounts, log);
+  conn.write(outcome.frame);
+}
 
-  // Handle request
-  const response = handleRequest(parseResult.request);
-  writeResponse(response);
+
+/**
+ * The heap a daemon keeps its held services under (L2):
+ * `CARRICK_TYPED_HEAP_CAP_MB`, else min(3072, physical RAM / 8).
+ */
+function heapCapMb(): number {
+  const cap = Number(process.env.CARRICK_TYPED_HEAP_CAP_MB);
+  if (Number.isFinite(cap) && cap > 0) return cap;
+  return Math.min(3072, Math.floor(os.totalmem() / 1048576 / 8));
+}
+
+function heapUsedMb(): number {
+  return process.memoryUsage().heapUsed / 1048576;
+}
+
+/** A full collection, when the daemon runs with `--expose-gc` (as the CLI starts it). */
+function collect(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) return;
+  gc();
+  collections += 1;
+}
+
+/**
+ * Keep the heap under its cap around a request (L2). Collect, then while over
+ * the cap release the least recently used held service, never `current`
+ * (the request's own). A warm request (the warm-up)
+ * may release only services no probe has used. After the request: a service
+ * whose own footprint is over half the cap is released and marked
+ * `cold_only:too_big`; a warm request that is still over the cap releases the
+ * service it built and marks it `cold_only:no_room`. `cold_only` lasts the
+ * daemon's life.
+ */
+function keepUnderCap(current: string | null, mode: ConnectionMode, phase: 'before' | 'after'): void {
+  const cap = heapCapMb();
+  if (phase === 'after' && current !== null) {
+    const state = services.get(current);
+    if (state && !state.coldOnly && state.footprintMb !== null && state.footprintMb > cap / 2 && serviceBuilt(current)) {
+      log(`${current} needs ${Math.round(state.footprintMb)} MB, over half the cap of ${cap} MB: answered cold from now on`);
+      markColdOnly(current, 'too_big', { footprint_mb: Math.round(state.footprintMb), cap_mb: cap });
+      collect();
+    }
+  }
+  // A forced collection costs hundreds of ms on a GB heap: only when the heap reads over the cap.
+  if (heapUsedMb() <= cap) return;
+  collect();
+  while (heapUsedMb() > cap) {
+    const victim = [...services.entries()]
+      .filter(([key, state]) => key !== current && serviceBuilt(key) && !(mode === 'warm' && state.probeUsed))
+      .sort(([, a], [, b]) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0))[0];
+    if (!victim) break;
+    const [key] = victim;
+    const heap = Math.round(heapUsedMb());
+    log(`Heap ${heap} MB is over its cap of ${cap} MB: releasing ${key} (L2)`);
+    releaseService(key);
+    note('evicted', key, { heap_mb: heap, cap_mb: cap });
+    collect();
+  }
+  if (phase === 'after' && mode === 'warm' && current !== null && heapUsedMb() > cap && serviceBuilt(current)) {
+    markColdOnly(current, 'no_room', { heap_mb: Math.round(heapUsedMb()), cap_mb: cap });
+    collect();
+  }
+}
+
+function markColdOnly(service: string, why: 'too_big' | 'no_room', detail: Record<string, number>): void {
+  releaseService(service);
+  const state = services.get(service);
+  if (state) state.coldOnly = why;
+  note(why, service, detail);
+}
+
+function releaseSession(victim: Session): void {
+  victim.projectLoader = null;
+  victim.components = new Map();
+  victim.items = victim.items && new Map();
+  victim.held = null;
+  victim.graphs = new Map();
+  victim.evictions += 1;
+}
+
+/**
+ * The actions that read the held project (carrick#2880). The rest build what
+ * they read from the request (`capture_v2`, `check_v2`, `resolve_definitions`)
+ * or read nothing.
+ */
+const READS_HELD_PROJECT = new Set<SidecarRequest['action']>([
+  'bundle',
+  'infer',
+  'retype_check',
+  'verify_client_semantics',
+  'verify_library_claims',
+  'list_library_surface',
+  'list_program_files',
+  'add_program_files',
+  'position_rows',
+  'implementations',
+]);
+
+/** How many times a request is answered again when files change while it runs. */
+const MAX_ANSWERS = 3;
+
+/**
+ * Bring the current session up to date with the disk: nothing, a refresh of
+ * the changed files, or a rebuild from its `init` (`held-freshness.ts`).
+ */
+function freshen(mode: ConnectionMode = 'warm'): void {
+  if (session.init && session.projectLoader === null) {
+    // A probe never builds: the client answers through a process of its own.
+    if (mode === 'probe') throw new CloseForCold('the service was released');
+    // Evicted to keep the heap under its cap: built again as a cold process builds it.
+    log('rebuilding an evicted service (carrick#2881)');
+    handleInit(session.init);
+    session.items = new Map();
+    session.held = null;
+  }
+  if (!session.projectLoader?.isInitialized() || !session.init) return;
+  session.held ??= heldFilesOf(session);
+  const found = session.held.sweep();
+  if (found.outcome === 'refresh') {
+    log(`refreshing ${found.files.length} changed file(s)`);
+    const before = session.items ? textsHeld(found.files) : null;
+    session.held.refresh(found.files);
+    // Everything built over the programs reads them again.
+    session.components = new Map();
+    session.freshness.refreshes += 1;
+    if (session.items && before) {
+      const reached = reachedBy(before);
+      const dropped = dropReached(session.items, reached);
+      log(
+        `The edit reaches ${reached === 'all' ? 'every file' : `${reached.files.size} file(s)`}: ${dropped} kept infer item(s) dropped (carrick#2881)`
+      );
+    }
+  } else if (found.outcome === 'drop') {
+    if (mode === 'probe') {
+      // A probe never builds: released, and the client answers through a process of its own.
+      log(`releasing the service: ${found.reason}`);
+      session.freshness.drops += 1;
+      releaseSession(session);
+      note('released_on_drop', session.service);
+      throw new CloseForCold('the service was released on a drop');
+    }
+    log(`rebuilding the service: ${found.reason}`);
+    session.freshness.drops += 1;
+    session.items?.clear();
+    session.graphs = new Map();
+    handleInit(session.init);
+    // Watched from now on, so a change while the next request runs is found.
+    session.held = session.projectLoader?.isInitialized() ? heldFilesOf(session) : null;
+    session.held?.sweep();
+  }
+}
+
+/**
+ * carrick#2881: each held program, with the text it holds of each of `files`
+ * and its import graph, read before the files are read again.
+ */
+function textsHeld(files: string[]): Array<{ project: Project; graph: ImportGraph; before: Map<string, string> }> {
+  return initializedLoader()
+    .builtProjects()
+    .map((project) => {
+      const program = project.getProgram().compilerObject;
+      const before = new Map<string, string>();
+      for (const file of files) {
+        const text = program.getSourceFile(file)?.text;
+        if (text !== undefined) before.set(file, text);
+      }
+      return { project, graph: graphFor(project), before };
+    });
+}
+
+/**
+ * carrick#2881: what the refreshed files reach, in every held program. A
+ * carried graph reads the changed files again on its next use, and is read
+ * whole again after an edit that moved an export.
+ */
+function reachedBy(held: Array<{ project: Project; graph: ImportGraph; before: Map<string, string> }>): Reached {
+  const files = new Set<string>();
+  let exportsMoved = false;
+  let everything = false;
+  for (const { project, graph, before } of held) {
+    const changes: FileChange[] = [];
+    for (const [file, text] of before) {
+      changes.push({ file, before: text, after: project.getSourceFile(file)?.getFullText() ?? '' });
+    }
+    const reached = affectedFiles(graph, changes);
+    const carried = session.graphs.get(project);
+    if (reached === 'all' || reached.exportsMoved) session.graphs.delete(project);
+    else for (const file of before.keys()) carried?.stale.add(file);
+    if (reached === 'all') {
+      everything = true;
+      continue;
+    }
+    // Kept items name their file by its real path (`realFileOf`).
+    for (const file of reached.files) files.add(realFileOf(file));
+    exportsMoved ||= reached.exportsMoved;
+  }
+  return everything ? 'all' : { files, exportsMoved };
+}
+
+/** carrick#2881: `project`'s import graph as its program stands, carried across edits. */
+function graphFor(project: Project): ImportGraph {
+  const program = project.getProgram().compilerObject;
+  const carried = session.graphs.get(project);
+  if (!carried) {
+    const graph = importGraphOf(program);
+    session.graphs.set(project, { graph, stale: new Set() });
+    return graph;
+  }
+  if (carried.stale.size > 0) {
+    readAgain(carried.graph, program, carried.stale);
+    carried.stale.clear();
+  }
+  return carried.graph;
+}
+
+/** The files `held`'s current loader builds from, ready to sweep. */
+function heldFilesOf(held: Session): HeldFiles {
+  const loader = held.projectLoader!;
+  const scope = held.scope;
+  return new HeldFiles({
+    projects: () => loader.builtProjects(),
+    refreshable: () => loader.buildsFromTsconfigs(),
+    roots: () => [...new Set([scope?.repo_root, scope?.scan_root].filter((r): r is string => !!r))],
+  });
+}
+
+/**
+ * Answer a request that reads the held project from programs equal to the
+ * disk. Files that change while it runs make the answer stale: it is dropped
+ * and the request answered again, at most {@link MAX_ANSWERS} times.
+ */
+function answerFresh(request: SidecarRequest, mode: ConnectionMode): SidecarResponse {
+  const answer = answerWhileStable(
+    () => handleRequest(request),
+    () => freshen(mode),
+    () => {
+      const stable = !session.held || session.held.sweep().outcome === 'none';
+      if (!stable) log('files changed while the request ran; answering it again');
+      return stable;
+    },
+    MAX_ANSWERS
+  );
+  if (answer === null) {
+    // A cold process reads the files once and answers: the client asks one.
+    note('unstable', session.service, { answers_dropped: MAX_ANSWERS });
+    throw new CloseForCold(`files kept changing while the request ran (${MAX_ANSWERS} answers dropped)`);
+  }
+  return answer;
+}
+
+/** `--serve <workspace> [--cli-version <v>]`: run as the workspace's daemon. */
+async function serve(workspace: string, cliVersion: string | null): Promise<void> {
+  const buildId = buildIdOf(DIST_SRC);
+  const idle = Number(process.env.CARRICK_TYPED_IDLE_MS);
+  const server: TypedServer = new TypedServer({
+    workspace: path.resolve(workspace),
+    buildId,
+    cliVersion,
+    idleMs: Number.isFinite(idle) && idle > 0 ? idle : DEFAULT_IDLE_MS,
+    handleLine: (conn, line) => serveLine(server, buildId, cliVersion, conn, line),
+    onAbandoned: () => note('abandoned', null),
+    log,
+  });
+  servedWorkspace = server.workspaceReal;
+  const outcome = await server.start();
+  if (outcome === 'already_running') {
+    log(`a daemon already serves ${workspace}`);
+    process.exit(EXIT_ALREADY_RUNNING);
+  }
+  onFatal = () => server.noteCrash();
+  const stopOn = (signal: string) => () => server.stop(`${signal} received`);
+  process.on('SIGINT', stopOn('SIGINT'));
+  process.on('SIGTERM', stopOn('SIGTERM'));
+  // A daemon that aborted (out of heap) never removed its kept judge workspace: each is listed as it is made.
+  const orphans = removeOrphanedJudgeWorkspaces(server.listedJudges());
+  server.rewriteJudges(orphans.live);
+  if (orphans.removed > 0) log(`removed ${orphans.removed} judge workspace(s) a dead daemon kept`);
+  const judge = new KeptJudge((dir) => server.listJudge(dir));
+  keptJudge = judge;
+  process.on('exit', () => judge.discard());
 }
 
 /** How often the sidecar looks for the process that started it. */
@@ -1169,10 +2147,31 @@ function exitWhenParentIsGone(): void {
   }, PARENT_CHECK_MS).unref();
 }
 
+/** This build's compiled sources: what its build id hashes. */
+const DIST_SRC = path.dirname(fileURLToPath(import.meta.url));
+
+/** The value after `flag` on the command line, or null. */
+function argValue(flag: string): string | null {
+  const at = process.argv.indexOf(flag);
+  return at === -1 ? null : (process.argv[at + 1] ?? null);
+}
+
 /**
  * Start the message loop
  */
 function main(): void {
+  if (process.argv.includes('--build-id')) {
+    process.stdout.write(buildIdOf(DIST_SRC) + '\n');
+    return;
+  }
+  const workspace = argValue('--serve');
+  if (workspace !== null) {
+    log(`Process started in server mode`);
+    installFatalHandlers();
+    void serve(workspace, argValue('--cli-version'));
+    return;
+  }
+
   log('Process started');
 
   const rl = readline.createInterface({
@@ -1201,6 +2200,13 @@ function main(): void {
     process.exit(0);
   });
 
+  installFatalHandlers();
+}
+
+/** Server mode: what a fatal exit records first (the crash line). */
+let onFatal: (() => void) | null = null;
+
+function installFatalHandlers(): void {
   // Fail fast on uncaught errors. Continuing after one means serving later
   // requests from a possibly corrupted state and returning garbage types
   // with a success status; exiting surfaces as ProcessDied on the Rust side,
@@ -1209,6 +2215,7 @@ function main(): void {
   process.on('uncaughtException', (err) => {
     logError(`Uncaught exception (exiting): ${err.message}`);
     logError(err.stack || '');
+    onFatal?.();
     process.exit(1);
   });
 
@@ -1226,6 +2233,7 @@ function main(): void {
       }
     }
     logError(`Unhandled rejection (exiting): ${detail}`);
+    onFatal?.();
     process.exit(1);
   });
 }

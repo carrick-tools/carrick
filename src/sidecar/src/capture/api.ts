@@ -9,6 +9,7 @@
  */
 
 import type { ResultLabel } from './result-label.js';
+import type { KeptJudge } from './kept-judge.js';
 
 export type { ResultLabel };
 
@@ -663,6 +664,14 @@ export interface CheckOptions {
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */
   cleanup?: boolean;
+  /** A resident sidecar's kept judge workspace (carrick#2883): brought to
+   * this check's plan, its install skipped while the manifests are
+   * unchanged, its compiler run incrementally. Never handed out or cleaned
+   * up by the check. Absent, or held by another check: a fresh workspace. */
+  kept?: KeptJudge;
+  /** Aborted when nobody waits for the answer: the install or compiler child
+   * is killed and the check rejects (a kept workspace is dropped). */
+  signal?: AbortSignal;
 }
 
 /** Progress phases emitted over the async install protocol. */

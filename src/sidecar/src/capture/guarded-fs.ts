@@ -117,16 +117,27 @@ export class WriteGuard {
     this.check(p, landing(p), 'work in');
   }
 
-  writeFile(p: string, data: string | NodeJS.ArrayBufferView): void {
+  writeFile(p: string, data: string | NodeJS.ArrayBufferView, mode?: number): void {
     this.check(p, landing(p), 'write');
-    fs.writeFileSync(p, data);
+    fs.writeFileSync(p, data, mode === undefined ? undefined : { mode });
+  }
+
+  /** Set a file's or directory's permission bits. */
+  chmod(p: string, mode: number): void {
+    this.check(p, landing(p), 'change the mode of');
+    fs.chmodSync(p, mode);
+  }
+
+  appendFile(p: string, data: string): void {
+    this.check(p, landing(p), 'append to');
+    fs.appendFileSync(p, data);
   }
 
   /** `mkdir -p`. A directory that already exists is no write and passes unchecked. */
-  mkdir(p: string): void {
+  mkdir(p: string, mode?: number): void {
     if (isDirectory(p)) return;
     this.check(p, landing(p), 'create directory');
-    fs.mkdirSync(p, { recursive: true });
+    fs.mkdirSync(p, { recursive: true, ...(mode === undefined ? {} : { mode }) });
   }
 
   copyFile(from: string, to: string): void {
@@ -160,6 +171,16 @@ export class WriteGuard {
     this.check(from, entry(from), 'move');
     this.check(to, entry(to), 'move onto');
     fs.renameSync(from, to);
+  }
+
+  /**
+   * A hard link at `linkPath` onto the file `existing`; throws `EEXIST` when
+   * `linkPath` is taken. The one file operation two processes cannot both
+   * win, so it is how a file is claimed with its whole content in place.
+   */
+  link(existing: string, linkPath: string): void {
+    this.check(linkPath, entry(linkPath), 'link');
+    fs.linkSync(existing, linkPath);
   }
 
   symlink(target: string, linkPath: string, type?: fs.symlink.Type): void {

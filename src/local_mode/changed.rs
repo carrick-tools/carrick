@@ -305,6 +305,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &rescan,
         &generation,
         started + budget(),
+        super::typed::Mode::Probe,
         Some(&narrator),
     );
     // The temporary generation goes on every path, as the single-file
@@ -346,7 +347,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
 /// listed as the answer states them.
 type Changed = BTreeMap<String, (PathBuf, BTreeSet<String>)>;
 
-fn changed_files(
+pub(super) fn changed_files(
     workspace: &super::workspace::Workspace,
     index: &LocalIndex,
 ) -> (Vec<ChangedRepo>, Changed) {

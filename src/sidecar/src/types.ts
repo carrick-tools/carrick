@@ -322,6 +322,38 @@ export interface ShutdownRequest extends BaseRequest {
 }
 
 /**
+ * Server mode only (carrick#2879): the first frame on every connection. A
+ * daemon whose build id differs refuses it and closes the connection, so a
+ * client never reads an answer from another build.
+ */
+export interface HelloRequest extends BaseRequest {
+  action: 'hello';
+  /** The build id of the sidecar the client would have spawned (`--build-id`). */
+  build_id: string;
+  /**
+   * `probe`: a check, which never builds a program (an `init` for a service
+   * the daemon holds no built program for is refused). `warm`: the warm-up,
+   * which builds.
+   */
+  mode: 'probe' | 'warm';
+}
+
+/** Server mode only: what the daemon holds. */
+export interface StatusRequest extends BaseRequest {
+  action: 'status';
+}
+
+/**
+ * Server mode only: stop the daemon, removing its socket and record. As the
+ * first frame, before any `hello`, it is obeyed from any build when it carries
+ * the record's `token`.
+ */
+export interface StopRequest extends BaseRequest {
+  action: 'stop';
+  token?: string;
+}
+
+/**
  * List the root files the init'd project's program was built from, in order
  * (carrick#2027).
  */
@@ -777,6 +809,9 @@ export type SidecarRequest =
   | ResolveDefinitionsRequest
   | HealthRequest
   | ShutdownRequest
+  | HelloRequest
+  | StatusRequest
+  | StopRequest
   | ListProgramFilesRequest
   | AddProgramFilesRequest
   | PositionRowsRequest
@@ -992,6 +1027,89 @@ export interface HealthResponse extends BaseResponse {
  * Response for shutdown action
  */
 export interface ShutdownResponse extends BaseResponse {
+  status: 'success';
+}
+
+/** Response for hello: the daemon's build id, process and workspace (its real path). A `build_mismatch` refusal names `pid` and `workspace` too. */
+export interface HelloResponse extends BaseResponse {
+  status: 'success';
+  build_id: string;
+  pid: number;
+  workspace: string;
+}
+
+/** One daemon-only event (L6): counts, MB and the service's path relative to the workspace, never file or type text. */
+export interface DaemonEvent {
+  at: string;
+  kind: 'evicted' | 'released_on_drop' | 'unstable' | 'abandoned' | 'init_refused' | 'too_big' | 'no_room' | 'fatal' | 'exception';
+  service: string | null;
+  detail: Record<string, number | string>;
+}
+
+/** One service a daemon holds: the root and scan root its `init` named. */
+export interface HeldService {
+  repo_root: string;
+  scan_root: string | null;
+  /** Whether its loader holds a built program (`init` builds nothing). */
+  built: boolean;
+  /** `built`, `released` (nothing held; a warm request builds it again), or `cold_only:<too_big|no_room>` for the daemon's life. */
+  state: 'built' | 'released' | 'cold_only:too_big' | 'cold_only:no_room';
+  /** Heap its building request kept (program and capture), after a collection; null until built. */
+  footprint_mb: number | null;
+  /** Seconds since a request last used it; null when none has. */
+  last_used_s: number | null;
+  /**
+   * How often the files its programs were read from had changed before a
+   * request (carrick#2880): read again into the held programs (`refreshes`),
+   * or the service built again from its `init` (`drops`).
+   */
+  freshness: { refreshes: number; drops: number };
+  /**
+   * Its kept `infer` items (carrick#2881): how many are held, how many
+   * requests' items were answered from them (`replayed`) and read again
+   * (`recomputed`).
+   */
+  items: { held: number; replayed: number; recomputed: number };
+  /** How often it was released to keep the heap under its cap; its next request builds it again. */
+  evictions: number;
+}
+
+/** Response for status. */
+export interface StatusResponse extends BaseResponse {
+  status: 'success';
+  daemon: {
+    pid: number;
+    build_id: string;
+    cli_version: string | null;
+    socket: string;
+    started_at: string;
+    uptime_ms: number;
+    idle_ms: number;
+    services: HeldService[];
+    heap_used_mb: number;
+    rss_mb: number;
+    /** The heap held services are kept under (`CARRICK_TYPED_HEAP_CAP_MB`, default min(3072, RAM/8)). */
+    heap_cap_mb: number;
+    /** V8's heap size limit (`--max-old-space-size`). */
+    heap_limit_mb: number;
+    /** A warm-up connection is open. */
+    warming: boolean;
+    /** Lines waiting behind the one being answered. */
+    queued: number;
+    counters: { warm_answers: number; init_refused: number; closed_for_cold: number; abandoned: number; skipped: number };
+    /** The last 20 daemon-only events, oldest first. */
+    errors: DaemonEvent[];
+    /** Full collections the daemon forced: for a warm build's footprint, or with the heap over its cap. */
+    collections: number;
+    /** Checks run on the kept judge workspace (carrick#2883), those whose install was skipped, and the workspace kept now (its size measured when the last check released it). */
+    judge: { checks: number; installs_skipped: number; workspace_dir: string | null; size_mb: number | null };
+    /** Only under `CARRICK_TYPED_VERIFY=1` (carrick#2886): requests answered warm and cold, and how they compared. */
+    verify?: { checked: number; mismatches: number; order_only: number };
+  };
+}
+
+/** Response for stop, written before the daemon exits. */
+export interface StopResponse extends BaseResponse {
   status: 'success';
 }
 
@@ -1280,6 +1398,9 @@ export type SidecarResponse =
   | ResolveDefinitionsResponse
   | HealthResponse
   | ShutdownResponse
+  | HelloResponse
+  | StatusResponse
+  | StopResponse
   | ListProgramFilesResponse
   | AddProgramFilesResponse
   | PositionRowsResponse
@@ -1551,4 +1672,22 @@ export interface InferResult {
   timing: InferTiming;
   /** General error messages */
   errors?: string[];
+  /**
+   * What each request came to, in request order: its inferred type or the
+   * error it gave, and the files its unwidened reading rewrote and checked
+   * (carrick#2881). The daemon keeps each one to answer it again.
+   */
+  items: InferItemOutcome[];
+}
+
+/** What one `infer` request item came to (carrick#2881). */
+export interface InferItemOutcome {
+  inferred?: InferredType;
+  errors: string[];
+  /**
+   * The files holding a function on the item's unwidened path: the reading
+   * rewrote and type-checked them beside every other item's, so another
+   * item reaching them can change it. Absent when it had no reading to make.
+   */
+  pathFiles?: string[];
 }

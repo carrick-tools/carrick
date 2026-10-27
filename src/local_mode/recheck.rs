@@ -357,7 +357,15 @@ fn inside(
     deadline: Instant,
 ) -> Result<Fresh, String> {
     let name = repo_label(repo);
-    let rejoined = rejoin_held(workspace, held, &[repo], generation, deadline, None)?;
+    let rejoined = rejoin_held(
+        workspace,
+        held,
+        &[repo],
+        generation,
+        deadline,
+        super::typed::Mode::Probe,
+        None,
+    )?;
 
     let items = rejoined
         .index
@@ -409,6 +417,9 @@ pub(super) struct Rejoined {
 ///    incremental scan.
 /// 2. The join over every blob, re-scanned and retained, with the type check.
 ///
+/// `typed` says how the re-scans and the join's type check use the resident
+/// type daemon (carrick#2884, carrick#2883).
+///
 /// `narrator` is where the pass says what it is doing while it does it: the
 /// several-file check runs for minutes on a large repo, and a caller that kills
 /// a command after some seconds of silence read the silence as a hang. The
@@ -419,6 +430,7 @@ pub(super) fn rejoin(
     repos: &[&Path],
     generation: &Path,
     deadline: Instant,
+    typed: super::typed::Mode,
     narrator: Option<&Narrator>,
 ) -> Result<Rejoined, String> {
     rejoin_held(
@@ -427,6 +439,7 @@ pub(super) fn rejoin(
         repos,
         generation,
         deadline,
+        typed,
         narrator,
     )
 }
@@ -438,6 +451,27 @@ fn rejoin_held(
     repos: &[&Path],
     generation: &Path,
     deadline: Instant,
+    typed: super::typed::Mode,
+    narrator: Option<&Narrator>,
+) -> Result<Rejoined, String> {
+    let typed = super::typed::Session::open(&workspace.root, generation, typed);
+    let rejoined = rejoin_through(
+        workspace, held, repos, generation, deadline, &typed, narrator,
+    );
+    // After the answer is read, on every path: a daemon this run found
+    // missing, or that held none of the services it re-scanned, is warmed
+    // for the next run in the background.
+    typed.close();
+    rejoined
+}
+
+fn rejoin_through(
+    workspace: &Workspace,
+    held: Held,
+    repos: &[&Path],
+    generation: &Path,
+    deadline: Instant,
+    typed: &super::typed::Session,
     narrator: Option<&Narrator>,
 ) -> Result<Rejoined, String> {
     let exe =
@@ -503,6 +537,7 @@ fn rejoin_held(
         .map_err(|e| e.to_string())?;
         let scan_dir = generation.join(format!("scan-{position}"));
         let mut scan = rescan_command(&exe, repo, &scan_dir, &previous);
+        typed.apply(&mut scan);
         scan.env(JUDGE_ANSWERS_ENV, &judged);
         if let Some(narrator) = narrator {
             // The scan states its per-service counts on stderr only when a
@@ -527,6 +562,8 @@ fn rejoin_held(
     let mut join = join_command(&exe, anchor, &blobs, &out);
     join.env(JUDGE_ANSWERS_ENV, &judged);
     join.env_remove(crate::progress::PROGRESS_ENV);
+    // The join's type check asks the daemon first, when this run uses one.
+    typed.apply(&mut join);
     if let Some(narrator) = narrator {
         narrator.phase(
             Instant::now(),

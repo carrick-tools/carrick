@@ -122,6 +122,8 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 `capture_v2` builds a program of its own, so in a process that has already built the init'd project the two stand side by side. The Rust client therefore starts a fresh process, scoped to the same root, before each capture, and asks once more of another fresh process if that one dies. When both die, the service is recorded with how each process ended and the stage its last progress frame named. The `resolve_definitions` that follows a capture is answered by that fresh process, which reads the stub and builds nothing of the service (carrick#1927).
 
+A capture runs only over stdio: a daemon (`--serve`) closes a connection that sends one, with no frame, and the client captures in a process of its own (carrick#2914). Holding what a capture built cost a service more memory than its program (the parsed files of three programs), so a daemon held one or two services instead of all of them.
+
 ### Actions
 
 | Action | Needs `init` | Purpose |
@@ -141,7 +143,10 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `resolve_definitions` | no | As-written and structural form of captured aliases |
 | `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
 | `health` | no | Readiness and init cost |
-| `shutdown` | no | Graceful exit |
+| `shutdown` | no | Graceful exit (in server mode: ends the client's connection, not the daemon) |
+| `hello` | — | Server mode only: the build id handshake every connection opens with |
+| `status` | — | Server mode only: what the daemon holds |
+| `stop` | — | Server mode only: stop the daemon |
 
 #### `init` - Point the sidecar at a project
 
@@ -383,6 +388,8 @@ A check that fails part way (no vendored pnpm, a failed install, a compiler that
 A verdict's `diagnostic` (present on a mismatch) is the compiler's own text, followed by the fields that differ: which side does not send a field the other requires, which field is sent under a name the other does not declare, which are optional on one side and always present on the other, and where two member types disagree. The list is capped and says how many it did not name. It is walked over the same two types the judge compared, with the compiler's own assignability relation, so it never names a field the verdict does not rest on and never changes a verdict.
 
 An `http` pair is judged on the form JSON puts on the wire. A value with a `toJSON()` method travels as what it serialises to, so a producer returning `Date` where the consumer reads `string` is not a drift, and a consumer that sends a `Date` in a request body satisfies a producer declaring `string`. The transform applies to the SENDING side in each direction, which is where serialisation happens: a consumer declaring `Date` for a response is still a mismatch, because no `Date` ever arrives. `bigint` is left alone — `JSON.stringify` throws on one, so it is a real problem, not a wire difference.
+
+In server mode the daemon keeps one judge workspace between checks (carrick#2883). A check brings it to the new stubs and probes (changed files written, files no longer planned removed), skips `pnpm install` while every `package.json`, `.npmrc` and `pnpm-workspace.yaml` is unchanged, and runs `tsc --incremental` with its build info in the workspace. Changed manifests, a failed install or an abnormal compiler replace or drop it; the workspace is never installed over in place. Such a check answers `workspace_dir: ""`, as a cold check that cleans up does, and its whole answer equals a cold check's byte for byte; `status` counts the checks the kept workspace ran and the installs it skipped (`judge: { checks, installs_skipped }`). Over stdio, and when `keep_workspace` is set, every check builds its own workspace as before.
 
 A verdict that is not a fact (`resolved: false`) says which side is to blame in `unresolved_side` (`producer` or `consumer`) when one is: a gate, a missing export, poison or a deep `any`/`unknown` on that side. It is absent when neither side is to blame.
 
@@ -1021,6 +1028,84 @@ Response, written before the process exits:
 { "request_id": "11", "status": "success" }
 ```
 
+### Server mode
+
+`node dist/src/index.js --serve <workspace> [--cli-version <v>]` runs one resident sidecar for a workspace, so the programs a scan builds outlive the scan (carrick#2879). The protocol is the one above, one JSON frame per line, over a Unix socket instead of stdio. `node dist/src/index.js --build-id` prints the build id and exits: sha256 over every file under the running `dist/src`, by relative path in sorted order (`<path>\0<sha256>\n` each), then `pkg:<name>\0<version>\n` for `typescript`, `ts-morph` and `@ts-morph/common`, each version read from the first `node_modules/<name>/package.json` walking up from the sidecar root (`dist/..`), empty when absent. A reinstall that moves the compiler is another build. The Rust client hashes the same.
+
+- **Where:** it listens on `<workspace>/.carrick/typed.sock`, mode 0600, and writes `<workspace>/.carrick/typed.json` (0600): `pid`, `socket`, `build_id`, `cli_version`, `started_at` (when the process started, as `ps` reports it), `workspace` (its real path), `token` (128 random bits, hex) and `node_version`. A workspace whose socket path would pass the platform limit (104 bytes on macOS) listens on `carrick-typed-<hash>.sock` in this user's directory under the OS temp dir (`carrick-<uid>/`, created 0700) instead; read the path from `typed.json`, never derive it.
+- **Handshake:** every connection opens with `hello` naming the build id of the sidecar the client would have spawned and its `mode`: `probe` (a check) or `warm` (the warm-up). The answer names `pid` and `workspace`, and so does the refusal: any other first frame, or another build id, is answered with an error starting `build_mismatch` and the connection is closed, so a stale build never answers. The one exception is a first-frame `stop` carrying the record's `token`, obeyed from any build.
+- **One queue:** every request from every connection runs in arrival order, `check_v2` included; each request's frames go to the connection that sent it. A line whose client has gone by the time it is reached is skipped (`counters.skipped`) and counts as no activity. A request already running cannot be stopped (the compiler work is synchronous): it runs to its end and its answer is dropped (`counters.abandoned`); a `check_v2` whose client goes away kills its install or compiler.
+- **Probe and warm (L3):** a probe never builds a program. Its `init` for a service the daemon holds no built program for, or one marked `cold_only`, is refused with `errors: ["not_held: <not_built|cold_only:too_big|cold_only:no_room>"]`, and the client answers through a process of its own. Only warm connections build, and a warm `init` builds the service's project and compiler program at once (as a cold process does on its first request), so a later check finds it held. A warm `init` that would build while the heap, collected, is above 90% of the cap is refused as `cold_only:no_room` and builds nothing, so a warm-up stops once the cap is full instead of evicting what it just built (carrick#2915). `status.warming` is true while a warm connection is open.
+- **A daemon-only failure closes the connection (L4):** the daemon never sends an error frame a cold process would not send. When only the daemon would fail, it closes the connection with no frame and the client sends the request to a process of its own: a `capture_v2` (it runs only in the client's own process); a probe request on a service released since its `init`, or one an edit drops (below); files that keep changing while a request runs; `add_program_files` (the daemon never changes a held program at a client's request); a `check_v2` while the kept judge is in use; an exception in the daemon's own code. Errors a request's handler returns pass through, as a cold process returns them. Each is counted (`counters.closed_for_cold`) and most are a row in `errors`.
+- **Held services:** `init` selects the service its fields name (`repo_root`, `tsconfig_path`, `scan_root`, `tsconfig_snapshot`, `pinned_dependencies`), or resolves a new one; the connection's later requests read it. A second connection with the same `init` reads the project the first one built. Over stdio, `init` still re-scopes the one project.
+- **After edits (carrick#2880):** before and after every request that reads a held project (`infer`, `retype_check`, `bundle`, the library checks, `list_program_files`, `add_program_files`, `position_rows`, `implementations`), the files its programs were built from are checked against the disk by stat, and a changed stat against the text the program holds. Changed source files whose imports and references are as they were are read again into the held projects (`freshness.refreshes`). Anything else builds the service again from its `init` on a warm connection, and releases it on a probe (`freshness.drops`): a config in the `extends` chain, a `package.json`, lockfile or install record, a file added to or removed from a config's file list, a file gone, a changed import or reference, more than 200 changed files, or any change in a service not built from a tsconfig (default patterns, a snapshot, Deno). An answer read while files changed is dropped and the request answered again, at most 3 times, then the connection is closed.
+- **Kept `infer` items (carrick#2881):** a held service keeps each `infer` item's answer, keyed by the item and every request field beside the items, and answers it again while no edit reaches it (`items.replayed`); the rest are read again (`items.recomputed`), in one batch per program, in request order. An edit reaches its changed files and every file importing a declaration that reads a changed name, followed through re-exports to the declaring file, name by name: one changed export of a barrel reaches the files that name it, not every importer of the barrel. A namespace import, `import()`, `require()` and `typeof import('m')` read every export of the module; `import('m').T` reads `T`. Every item is read again when a changed name is a `declare global` or a module augmentation (or one reads a changed name), when a script, a non-source file or an installed package's file changes. When an export is added, removed or pointed at another local, the files importing that name are reached and every item with an unwidened reading is read again. Items whose unwidened readings can meet (one's path holds a file the other's types read) are read again together, and a kept reading answers only beside the items it was read beside. The heap budget (L2): before and after each request the daemon reads `heapUsed`; only when it is over the cap does it force a collection (it runs with `--expose-gc`; a collection costs hundreds of ms on a GB heap) and, while `heapUsed` stays over `CARRICK_TYPED_HEAP_CAP_MB` (default min(3072, physical RAM / 8)), releases the least recently used held service, never the request's own; a warm request releases only services no probe has used. A service's `footprint_mb` is the heap its warm requests kept, measured with a collection before and after each warm request (a probe forces none); it starts again from nothing when the service is released. A service whose footprint is over half the cap is released after its request and marked `cold_only:too_big`, so one service never fills the cap and pushes every other one out; a warm request still over the cap releases the service it built and marks it `cold_only:no_room`. `cold_only` lasts the daemon's life. A released service is built again by its next warm request (`evictions`).
+- **One daemon per workspace:** `typed.json` is claimed with a hard link. A second start while one answers exits with code 3. A record is live when its process lives and its socket's `hello` names that pid and this workspace's real path, or accepts and does not answer within 2 s (busy). A record whose process is dead, whose socket never accepts, or whose daemon names another workspace (a record copied with the workspace) is taken over.
+- **Stop:** on `stop`, SIGTERM or SIGINT, and after 15 minutes in which no line arrived and none ran (`CARRICK_TYPED_IDLE_MS` sets another idle time), it removes the socket and `typed.json` and exits 0. It exits without removing anything when `typed.json` is gone or names another process. `shutdown` ends only the client's connection. A client that disconnects mid-request does not stop it. A fatal exception appends `<unix secs> <build id>` to `.carrick/typed.crashes` before the exit. Each kept judge workspace is listed in `.carrick/typed.judges` as it is made, wherever the check's `workspace_root` put it; on start, a listed workspace whose owning daemon is dead (its `.carrick-judge-owner` names the pid) is removed, and the list keeps only live ones.
+- **Verify mode (carrick#2886):** with `CARRICK_TYPED_VERIFY=1` the daemon answers every request twice, warm and cold (a fresh stdio process given the service's `init` and the same request), compares the answers with timing taken out, and on a difference logs it and returns the cold answer. Union member order is compared canonicalised as a second reading, and an answer that differs only by it is counted apart (`order_only`) and logged. `status` carries `verify: { checked, mismatches, order_only }` while it is on. It costs a cold answer per request: for CI and proofs, off by default, and answers are unchanged when it is off.
+- **Status (L6):** one row for every service the daemon has seen, a refused one included (`built: false`, footprint null), with its `state` (`built` when its program is held, the same test as the probe `init`; `released`; `cold_only:<too_big|no_room>`), `footprint_mb` and `last_used_s`; `rss_mb`, `heap_used_mb`, `heap_cap_mb`, `heap_limit_mb` (V8's limit), `warming`, `queued`, `counters`, `collections` (forced collections), the kept judge workspace (`judge`), and `errors`: the last 20 daemon-only events `{ at, kind, service, detail }`, kinds `evicted`, `released_on_drop`, `unstable`, `abandoned`, `init_refused`, `too_big`, `no_room`, `exception`. `service` is the service's path relative to the workspace; `detail` holds counts and MB only, never file or type text.
+
+```json
+{ "request_id": "12", "action": "hello", "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5", "mode": "probe" }
+```
+
+```json
+{ "request_id": "12", "status": "success", "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5", "pid": 48121, "workspace": "/repo" }
+```
+
+```json
+{ "request_id": "13", "action": "status" }
+```
+
+```json
+{
+  "request_id": "13",
+  "status": "success",
+  "daemon": {
+    "pid": 48121,
+    "build_id": "3f1c0de2a9b84e7d6c5b4a3928170f6e5d4c3b2a19087f6e5d4c3b2a1908f6e5",
+    "cli_version": "0.3.133",
+    "socket": "/repo/.carrick/typed.sock",
+    "started_at": "2026-10-26T14:02:11.000Z",
+    "uptime_ms": 81234,
+    "idle_ms": 5120,
+    "services": [
+      {
+        "repo_root": "/repo/services/api",
+        "scan_root": "/repo",
+        "built": true,
+        "state": "built",
+        "footprint_mb": 236,
+        "last_used_s": 4,
+        "freshness": { "refreshes": 3, "drops": 1 },
+        "items": { "held": 608, "replayed": 1824, "recomputed": 612 },
+        "evictions": 0
+      }
+    ],
+    "heap_cap_mb": 2048,
+    "heap_limit_mb": 6144,
+    "judge": { "checks": 2, "installs_skipped": 1, "workspace_dir": "/tmp/carrick-check-v2-Qx81ab", "size_mb": 41 },
+    "warming": false,
+    "queued": 0,
+    "counters": { "warm_answers": 52, "init_refused": 1, "closed_for_cold": 1, "abandoned": 0, "skipped": 0 },
+    "errors": [
+      { "at": "2026-10-26T14:03:40.120Z", "kind": "released_on_drop", "service": "services/web", "detail": {} }
+    ],
+    "heap_used_mb": 412,
+    "rss_mb": 655
+  }
+}
+```
+
+```json
+{ "request_id": "14", "action": "stop" }
+```
+
+Response, written before the daemon exits:
+```json
+{ "request_id": "14", "status": "success" }
+```
+
 ## Architecture
 
 ```
@@ -1044,6 +1129,8 @@ Response, written before the process exits:
 | File | Description |
 |------|-------------|
 | `src/index.ts` | Entry point, message loop, dispatch, response/progress frames |
+| `src/typed-server.ts` | Server mode: the socket, `typed.json`, the build id, the request queue, idle stop and clean-up |
+| `src/held-freshness.ts` | Server mode: the sweep that keeps a held service equal to the disk (refresh or rebuild) |
 | `src/types.ts` | Request/response interfaces |
 | `src/validators.ts` | Zod schemas; the authority on request shape |
 | `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |

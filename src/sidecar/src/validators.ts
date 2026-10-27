@@ -327,6 +327,21 @@ export const ShutdownRequestSchema = BaseRequestSchema.extend({
   action: z.literal('shutdown'),
 });
 
+export const HelloRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('hello'),
+  build_id: z.string().min(1),
+  mode: z.enum(['probe', 'warm']),
+});
+
+export const StatusRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('status'),
+});
+
+export const StopRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('stop'),
+  token: z.string().min(1).optional(),
+});
+
 export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
   action: z.literal('list_program_files'),
 });
@@ -677,6 +692,9 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ListLibrarySurfaceRequestSchema,
   HealthRequestSchema,
   ShutdownRequestSchema,
+  HelloRequestSchema,
+  StatusRequestSchema,
+  StopRequestSchema,
   ListProgramFilesRequestSchema,
   AddProgramFilesRequestSchema,
   PositionRowsRequestSchema,

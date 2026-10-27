@@ -52,6 +52,11 @@ WORKSPACE:
                the index first, inside a ten-second budget.
     touch      The same without the verdicts, cheap enough for an editor to run
                it on every edit.
+    daemon     `daemon start` starts the resident type process a re-check
+               answers through, which keeps each service's TypeScript program
+               between checks, with CARRICK_TYPED=on. `daemon stop` stops it.
+               With the variable set a re-check starts one by itself, and it
+               stops after 15 minutes with no request.
 
     The workspace is a repository, or the folder holding sibling repositories.
     Each command takes --workspace <dir>; check and touch take a file path and
@@ -112,6 +117,9 @@ ENVIRONMENT VARIABLES:
     CARRICK_ALLOW_UNPREPARED        The --allow-unprepared flag as a variable,
                                     for a pipeline that sets the scan up rather
                                     than spelling the command
+    CARRICK_TYPED                   `on` lets a re-check answer through the
+                                    resident type daemon and start one; off
+                                    otherwise
     CARRICK_NO_KEEP_AWAKE           The --no-keep-awake flag as a variable, for
                                     a machine that should never be kept awake
     CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
