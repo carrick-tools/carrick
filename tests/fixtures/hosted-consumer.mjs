@@ -40,7 +40,10 @@ try {
   const env = fakeEnv({ CARRICK_FAKE_FIXTURE: checkFile, CARRICK_FAKE_REBASE: '0', CARRICK_CHANNEL: 'hooks', CARRICK_TOKEN: 'synthetic-unused' });
   const edited = await runHook('post-edit.ts', { payload: editPayload({ root, file }), env, cwd: root });
   assert.equal(edited.code, 0, edited.stderr);
-  assert.ok(JSON.parse(edited.stdout).hookSpecificOutput.additionalContext.includes(check.items[0].path));
+  // The edit names its file and lists only problems: these rows are compatible.
+  const told = JSON.parse(edited.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(told.includes(path.basename(check.file)), told);
+  assert.ok(!told.includes(check.items[0].path), told);
   const session = await runHook('session-start.ts', { env: { ...env, CARRICK_FAKE_FIXTURE: statusFile }, cwd: root });
   assert.equal(session.code, 0, session.stderr);
   assert.ok(session.stdout.includes(status.services[0].boundary_lines[0]));
