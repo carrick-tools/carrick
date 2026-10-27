@@ -277,6 +277,9 @@ export function toldKey(result: CheckResult, fallbackFile: string): string {
   return `${result.repo ?? ""}::${result.file ?? fallbackFile}`;
 }
 
+/** The `told` key for the post-edit "not re-checked here" line, said once per session. */
+export const NOTED_KEY = "carrick::noted-line";
+
 /** Whether this session has already been shown the uses lines under `key`. */
 export function wasTold(sessionId: string, key: string, home?: string): boolean {
   return readSession(sessionId, home).told.includes(key);

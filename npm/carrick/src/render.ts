@@ -304,10 +304,16 @@ export function answersTheEdit(result: CheckResult): boolean {
 const MAX_NOTED_FILES = 5;
 
 /**
+ * What every surface that asks for `carrick check --changed` adds: a Bash tool
+ * call times out at 120 s by default, and the check can run longer.
+ */
+export const CHECK_TAKES_MINUTES = "it can take a few minutes; allow up to five";
+
+/**
  * The ask both the post-edit "not re-checked" line and the Stop hook's check
  * line end on (carrick#2933), so the two say the same command the same way.
  */
-export const RUN_CHECK_CHANGED = "run `carrick check --changed` before you finish.";
+export const RUN_CHECK_CHANGED = `run \`carrick check --changed\` before you finish (${CHECK_TAKES_MINUTES}).`;
 
 /**
  * The one line for edited files the re-check did not answer for: the index's
@@ -595,7 +601,7 @@ export function renderSessionStart(status: StatusResult): string {
  * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
  */
 export const CHECK_BEFORE_DONE =
-  "Before you say a change is done, run `carrick check --changed`: it checks every changed file against the other services. Exit 1 means a contract problem, exit 2 means nothing could be checked.";
+  "Before you say a change is done, run `carrick check --changed` (" + CHECK_TAKES_MINUTES + "): it checks every changed file against the other services. Exit 1 means a contract problem, exit 2 means nothing could be checked.";
 
 /** Up to this many services, a session start states every one of them. */
 export const DETAILED_SERVICES = 3;

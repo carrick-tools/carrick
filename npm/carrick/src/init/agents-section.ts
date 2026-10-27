@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { CHECK_TAKES_MINUTES } from "../render.ts";
 import { writeIfChanged } from "./files.ts";
 
 export const AGENTS_FILE = "AGENTS.md";
@@ -26,7 +27,7 @@ export const CHECK_SECTION = [
   START,
   "## Carrick check",
   "",
-  "Before you say a change is done, run `carrick check --changed` alongside the tests. It checks the files changed on this branch against the other services. If it exits non-zero, fix what it reports, or say why it is wrong. When you added functions, use the carrick-reuse skill on them.",
+  `Before you say a change is done, run \`carrick check --changed\` alongside the tests (${CHECK_TAKES_MINUTES}). It checks the files changed on this branch against the other services. If it exits non-zero, fix what it reports, or say why it is wrong. When you added functions, use the carrick-reuse skill on them.`,
   END,
   "",
 ].join("\n");

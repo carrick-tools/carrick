@@ -26,7 +26,7 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markTold, record, toldKey, wasTold } from "./reuse.ts";
+import { markTold, NOTED_KEY, record, toldKey, wasTold } from "./reuse.ts";
 import type { CheckResult } from "../contract.ts";
 import type { NewFunction } from "./reuse.ts";
 
@@ -188,7 +188,13 @@ async function main(): Promise<void> {
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) contexts.push(context);
   }
-  if (unchecked.length > 0) contexts.unshift(notedLine(unchecked));
+  // Said once per session: the sentence is the same on every edit, and the
+  // Stop hook asks again if the check never ran.
+  const notedAlready = payload.session_id ? wasTold(payload.session_id, NOTED_KEY) : false;
+  if (unchecked.length > 0 && !notedAlready) {
+    contexts.unshift(notedLine(unchecked));
+    told.push(NOTED_KEY);
+  }
 
   // Silent and local: the names go to a file under the user's home directory
   // and nothing about them is printed here.

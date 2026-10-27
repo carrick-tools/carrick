@@ -535,11 +535,11 @@ test("a three-file patch is one binary call, and every file gets its answer", as
   // the patch names them, rather than the same sentence three times.
   assert.equal(
     contextOf(run.stdout),
-    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish.",
+    "Carrick noted the edits to order-service/src/clients/users.ts, order-service/src/server.ts and billing-service/src/lookup.ts. They were not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).",
   );
 });
 
-test("a repo whose re-check is known not to fit gets one pointer line per edit and still records", async (t) => {
+test("a repo whose re-check is known not to fit gets one pointer line per session and still records", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
@@ -568,9 +568,10 @@ test("a repo whose re-check is known not to fit gets one pointer line per edit a
   // The index's verdicts describe the file before the edit, so none is
   // printed: one line that sends the reader to the command that answers.
   const pointer =
-    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish.";
+    "Carrick noted the edit to user-service/src/routes/users.ts. It was not re-checked here, so run `carrick check --changed` before you finish (it can take a few minutes; allow up to five).";
   assert.equal(first, pointer);
-  assert.equal(second, pointer);
+  // Said once per session: the second edit's line would be the same sentence.
+  assert.equal(second, "");
   // The new function is recorded on every edit, the skipped re-scan or not.
   assert.deepEqual(
     sessionRecord(home, "sess-km").found.map((entry) => (entry as { name: string }).name),

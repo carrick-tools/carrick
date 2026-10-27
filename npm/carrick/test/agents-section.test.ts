@@ -25,7 +25,7 @@ test("a missing AGENTS.md is created holding the check section", () => {
     assert.equal(writeAgentsSection(dir), "written");
     const body = fs.readFileSync(file, "utf8");
     assert.equal(body, CHECK_SECTION);
-    assert.ok(body.includes("## Carrick check\n\nBefore you say a change is done, run `carrick check --changed` alongside the tests."));
+    assert.ok(body.includes("## Carrick check\n\nBefore you say a change is done, run `carrick check --changed` alongside the tests (it can take a few minutes; allow up to five)."));
     assert.ok(body.includes("use the carrick-reuse skill on them."));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

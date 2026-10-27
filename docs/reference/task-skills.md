@@ -213,14 +213,22 @@ re-checks one file at a time, so a shape changed across several files is only
 judged whole by `--changed`, and an agent that changed a response shape in ten
 files was measured calling the task done without running it. The Stop hook
 reads the session transcript (`transcript_path` in the payload) and finds the
-Edit, Write and MultiEdit calls on a source or config file (`.ts`, `.tsx`,
-`.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.json`, `.yaml`, `.yml`) made
+Edit, Write and MultiEdit calls on a file `carrick check --changed` judges:
+a source file the scanner reads (`.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`,
+`.mjs`, `.cjs`) that is not a test or story file (the rules in
+`src/file_finder.rs`). `package.json`, other `.json` and `.yaml` files,
+markdown and tests never count; API spec files are not counted either, because
+the hook cannot tell them from any other `.yaml` without reading the repo. These are the edits made
 after the last Bash command that runs `carrick check` (with any arguments,
 `npx` included). When there are any, the line reads:
 
 > This task edited 3 files and has not run `carrick check`. The per-edit
 > re-check covers only the file each edit touched, so run `carrick check
-> --changed` before you finish.
+> --changed` before you finish (it can take a few minutes; allow up to five).
+
+The same clause ends the post-edit "not re-checked here" line, the session-start
+check line and the AGENTS.md section, because a Bash call times out at 120 s by
+default. The post-edit line is said once per session.
 
 or, when a check ran earlier, "This task edited 2 files since its last `carrick
 check`." with the same second sentence. The edited file is read as the

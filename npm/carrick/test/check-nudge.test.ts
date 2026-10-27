@@ -43,12 +43,12 @@ test("edits with no check earn the check line, with the count of files", async (
   });
   assert.equal(run.code, 0);
   assert.ok(run.context, "expected the check line");
-  // Three distinct files (one edited twice), none of them markdown.
-  assert.match(run.context, /This task edited 3 files and has not run `carrick check`\./);
+  // Two source files (one edited twice); the .yaml edit is not judged by --changed.
+  assert.match(run.context, /This task edited 2 files and has not run `carrick check`\./);
   // Ends on the same ask as the post-edit "not re-checked" line (render.ts).
   assert.match(
     run.context,
-    /The per-edit re-check covers only the file each edit touched, so run `carrick check --changed` before you finish\.$/,
+    /The per-edit re-check covers only the file each edit touched, so run `carrick check --changed` before you finish \(it can take a few minutes; allow up to five\)\.$/,
   );
   // Same channel as the reuse line: never a block.
   const parsed = JSON.parse(run.stdout) as Record<string, unknown>;
@@ -75,7 +75,7 @@ test("an edit after a check earns the line, counting only the later edits", asyn
   assert.ok(run.context, "expected the check line");
   // The edit before the check is not counted; a MultiEdit that names its file
   // inside `edits` (the shape post-edit.ts also reads) is.
-  assert.match(run.context, /This task edited 2 files since its last `carrick check`\./);
+  assert.match(run.context, /This task edited 1 file since its last `carrick check`\./);
 });
 
 test("the line is said once per edit set, and again after a newer edit", async (t) => {
@@ -105,7 +105,7 @@ test("the line is said once per edit set, and again after a newer edit", async (
   );
   const third = await stop(home, { session_id: "chk-4", transcript_path: file });
   assert.ok(third.context, "a newer edit earns the line again");
-  assert.match(third.context, /This task edited 4 files and has not run `carrick check`\./);
+  assert.match(third.context, /This task edited 3 files and has not run `carrick check`\./);
 });
 
 test("a stop the hook itself caused is silent", async (t) => {
@@ -153,4 +153,23 @@ test("the channel off silences the check line too", async (t) => {
   });
   assert.equal(run.code, 0);
   assert.equal(run.stdout, "");
+});
+
+test("config, spec-data, test and story edits are not what --changed judges", async (t) => {
+  const home = tempDir(t, "carrick-home-");
+  const run = await stop(home, {
+    session_id: "chk-nc",
+    transcript_path: transcript("not-checked-files.jsonl"),
+  });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "");
+});
+
+test("the check line says how long the check takes", async (t) => {
+  const home = tempDir(t, "carrick-home-");
+  const run = await stop(home, {
+    session_id: "chk-time",
+    transcript_path: transcript("edit-no-check.jsonl"),
+  });
+  assert.ok(run.context?.includes("it can take a few minutes; allow up to five"), run.context ?? "");
 });
