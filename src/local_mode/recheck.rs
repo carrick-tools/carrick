@@ -805,7 +805,40 @@ struct Narration {
     repo: String,
     /// The service the last count was about, and its place.
     service: Option<(String, usize)>,
+    /// The services of this phase that have reported and not finished, by
+    /// their place, with the total they are among.
+    active: std::collections::BTreeMap<usize, String>,
+    active_total: usize,
     said_at: Option<Instant>,
+}
+
+impl Narration {
+    /// What the pass is at, for the still-working line: every service that
+    /// has reported and not finished when several run side by side, so the
+    /// line never names a service that is long done.
+    fn still_doing(&self) -> String {
+        if let (true, Some((index, name))) = (self.active_total > 1, self.active.first_key_value())
+            && self.active.len() == 1
+        {
+            return format!("re-reading {name} ({index}/{})", self.active_total);
+        }
+        if self.active.len() < 2 {
+            return self.doing.clone();
+        }
+        let names: Vec<&str> = self.active.values().map(String::as_str).collect();
+        let shown = names[..names.len().min(4)].join(", ");
+        let more = names.len().saturating_sub(4);
+        let tail = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        format!(
+            "re-reading {} of {} services: {shown}{tail}",
+            names.len(),
+            self.active_total
+        )
+    }
 }
 
 impl Narrator {
@@ -837,6 +870,7 @@ impl Narrator {
             let mut state = self.state.borrow_mut();
             state.doing = doing.clone();
             state.service = None;
+            state.active.clear();
         }
         self.say(now, &format!("{doing}..."));
     }
@@ -873,6 +907,14 @@ impl Narrator {
             let fresh = state.service != place;
             state.service = place;
             state.doing = doing.clone();
+            state.active_total = update.service_total;
+            if update.total > 0 && update.done >= update.total {
+                state.active.remove(&update.service_index);
+            } else {
+                state
+                    .active
+                    .insert(update.service_index, update.service.clone());
+            }
             let due = state
                 .said_at
                 .is_none_or(|said| now.duration_since(said) >= NARRATION_GAP);
@@ -894,7 +936,7 @@ impl Narrator {
             let due = state
                 .said_at
                 .is_none_or(|said| now.duration_since(said) >= NARRATION_HEARTBEAT);
-            (state.doing.clone(), due)
+            (state.still_doing(), due)
         };
         if due && !doing.is_empty() {
             let seconds = now.duration_since(self.started).as_secs();
@@ -1079,6 +1121,35 @@ mod tests {
                 "carrick check: re-reading orders (1/2): 300 of 400 files...",
                 "carrick check: re-reading billing (2/2): 1 of 400 files...",
                 "carrick check: comparing routes and calls across 5 services...",
+            ]
+        );
+    }
+
+    /// Services re-read side by side report in turn; the still-working line
+    /// names the ones that have not finished, not the first one to report.
+    #[test]
+    fn the_still_line_names_the_services_in_progress() {
+        let said = Said::default();
+        let start = Instant::now();
+        let narrator = Narrator::new(start, Box::new(said.clone()));
+        narrator.repo(start, "api", 1, 1);
+        narrator.update(start, &files("a", 1, 4, 5));
+        narrator.update(start, &files("b", 2, 4, 5));
+        narrator.update(start, &files("c", 3, 4, 5));
+        narrator.update(start, &files("a", 1, 4, 400));
+        narrator.quiet(start + Duration::from_secs(10));
+        narrator.update(start + Duration::from_secs(11), &files("b", 2, 4, 400));
+        narrator.quiet(start + Duration::from_secs(21));
+        let still: Vec<String> = said
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("still"))
+            .collect();
+        assert_eq!(
+            still,
+            vec![
+                "carrick check: still re-reading 2 of 4 services: b, c (10s so far)...",
+                "carrick check: still re-reading c (3/4) (21s so far)...",
             ]
         );
     }
