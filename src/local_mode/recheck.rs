@@ -647,6 +647,19 @@ fn bounded(mut command: Command, what: &str, deadline: Instant) -> Result<(), St
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("could not start the {what}: {e}"))?;
+    // A signal that ends this command reaches the phase too (carrick#1379).
+    super::index::waiting_on(Some(child.id()));
+    let outcome = wait_within(&mut child, what, deadline);
+    super::index::waiting_on(None);
+    outcome
+}
+
+/// Wait for `child` until `deadline`, and stop it there.
+fn wait_within(
+    child: &mut std::process::Child,
+    what: &str,
+    deadline: Instant,
+) -> Result<(), String> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
@@ -657,15 +670,37 @@ fn bounded(mut command: Command, what: &str, deadline: Instant) -> Result<(), St
             Err(e) => return Err(format!("could not wait for the {what}: {e}")),
         }
         if Instant::now() >= deadline {
-            // Killing the scan closes the pipes the sidecar it spawned reads,
-            // which is what ends that process too; waiting for the child here
-            // is what keeps it from being reaped by the shell later.
-            let _ = child.kill();
-            let _ = child.wait();
+            stop(child);
             return Err(format!("the {what} ran past the budget"));
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// How long a phase stopped at its deadline has to end its own sidecars.
+const STOP_GRACE: Duration = Duration::from_secs(1);
+
+/// End a phase that ran past its deadline: SIGTERM first, so the scan ends the
+/// type sidecars it started, then SIGKILL. A SIGKILL alone left them running:
+/// a sidecar building a program does not notice its pipes close until that
+/// work ends. Waiting here is what keeps the child from being reaped by the
+/// shell later.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: a signal to a child this process spawned and has not reaped.
+        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == 0 {
+            let asked = Instant::now();
+            while asked.elapsed() < STOP_GRACE {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]

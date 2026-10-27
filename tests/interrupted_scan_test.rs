@@ -473,6 +473,141 @@ fn a_signal_to_a_build_reaches_the_scan_it_is_waiting_on() {
     }
 }
 
+/// A type sidecar that is busy: it records its pid, installs the handlers the
+/// real one installs, and then runs synchronous work forever, the way the real
+/// one does while it builds a large program. Node runs a signal handler and
+/// notices its stdin close only between turns of its event loop, so such a
+/// process hears neither a SIGTERM nor its parent going away.
+///
+/// The first process, the one `main` starts, becomes ready; every process
+/// started for a service writes `busy-<pid>` into `marks` and goes busy.
+fn busy_sidecars(home: &Path, marks: &Path) {
+    let sidecar = home.join("sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    std::fs::create_dir_all(marks).expect("a directory for the marks");
+    std::fs::write(
+        sidecar.join("index.js"),
+        format!(
+            r#"const fs = require("fs");
+const path = require("path");
+process.on("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => process.exit(0));
+process.stdin.on("end", () => process.exit(0));
+let first = true;
+try {{ fs.writeFileSync(path.join({marks:?}, "main"), "", {{ flag: "wx" }}); }} catch (e) {{ first = false; }}
+if (!first) {{
+  fs.writeFileSync(path.join({marks:?}, `busy-${{process.pid}}`), "");
+  for (;;) {{}}
+}}
+let buffered = "";
+process.stdin.on("data", (chunk) => {{
+  buffered += chunk;
+  let end;
+  while ((end = buffered.indexOf("\n")) >= 0) {{
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    if (!line.trim()) continue;
+    let request;
+    try {{ request = JSON.parse(line); }} catch (e) {{ continue; }}
+    process.stdout.write(JSON.stringify({{ request_id: request.request_id, status: "ready", init_time_ms: 1 }}) + "\n");
+  }}
+}});
+process.stdin.resume();
+"#,
+            marks = marks.to_string_lossy()
+        ),
+    )
+    .expect("write the busy sidecars");
+}
+
+/// The pids of the busy sidecars started so far.
+fn busy_pids(marks: &Path) -> Vec<libc::pid_t> {
+    std::fs::read_dir(marks)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_prefix("busy-")?
+                        .parse()
+                        .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fail, and clean up, if `pid` outlives the grace.
+fn gone_within(pid: libc::pid_t, grace: Duration, what: &str) {
+    let start = Instant::now();
+    while alive(pid) {
+        if start.elapsed() > grace {
+            // SAFETY: a descendant this test started, left running by the
+            // failure it is about to report.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!(
+                "{what} was still running {:.0}s after its parent ended",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A scan stopped by SIGTERM ends its services' type sidecars too, even ones
+/// too busy to hear the signal or notice their stdin close. Before, the scan
+/// exited 143 and the sidecars its service threads held ran on until someone
+/// sent them SIGKILL.
+#[test]
+fn a_signalled_scan_ends_its_busy_type_sidecars() {
+    let home = tempfile::tempdir().expect("a home for the run");
+    let marks = home.path().join("marks");
+    busy_sidecars(home.path(), &marks);
+
+    let mut child = scan(
+        &repo_root().join("tests/fixtures/parallel-services"),
+        home.path(),
+    )
+    .env("CARRICK_SIDECAR_DIR", home.path().join("sidecar"))
+    .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+    .env("CARRICK_SERVICE_CONCURRENCY", "4")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("start a scan");
+
+    let start = Instant::now();
+    while busy_pids(&marks).is_empty() {
+        if start.elapsed() > DEADLINE {
+            let _ = child.kill();
+            panic!(
+                "no service sidecar started in {:.0}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    send(&child, libc::SIGTERM);
+
+    let code = code_within(&mut child, DEADLINE, "the signalled scan was still running");
+    assert_eq!(code, TERMINATED);
+    let busy = busy_pids(&marks);
+    for pid in &busy {
+        if let Err(failure) = std::panic::catch_unwind(|| {
+            gone_within(*pid, Duration::from_secs(10), "a busy sidecar")
+        }) {
+            for pid in &busy {
+                // SAFETY: descendants this test started, left running by
+                // the failure it is about to report.
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            }
+            std::panic::resume_unwind(failure);
+        }
+    }
+}
+
 /// Whether `pid` still names a process. `kill(pid, 0)` answers exactly that
 /// and sends nothing.
 fn alive(pid: libc::pid_t) -> bool {

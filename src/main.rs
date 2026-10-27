@@ -167,7 +167,7 @@ async fn main() {
                 // spinner are all noise in a hook's output, and the errors
                 // they can raise are printed directly.
                 if !command.writes() {
-                    std::process::exit(local_mode::cli::run(command));
+                    std::process::exit(run_read(command).await);
                 }
                 // `--verbose` is the log level and nothing else, so it is read
                 // off the argument list here rather than carried on every
@@ -407,6 +407,35 @@ async fn run_build(command: local_mode::cli::LocalCommand) -> i32 {
     // exactly as it is today.
     if local_mode::cli::forward_to_running_scan(signal) {
         let _ = tokio::time::timeout(local_mode::cli::forwarded_exit_grace(), build).await;
+    }
+    signal.exit_code()
+}
+
+/// Run a read-only command, passing a SIGTERM on to the subprocess it is
+/// waiting on.
+///
+/// `check --changed`, a several-file check and a re-check each run a re-scan
+/// and a join as subprocesses. Without a listener here a SIGTERM ended this
+/// process alone, and the re-scan ran on with the type sidecar it started,
+/// writing into a directory nobody would read. Forwarded, the re-scan hears
+/// it and ends its sidecars. A read-only command keeps no record, so unlike
+/// [`run_build`] nothing is marked interrupted.
+async fn run_read(command: local_mode::cli::LocalCommand) -> i32 {
+    let mut shutdown = shutdown::watch();
+    let mut read = tokio::task::spawn_blocking(move || local_mode::cli::run(command));
+    let signal = tokio::select! {
+        biased;
+        signal = shutdown.recv() => signal,
+        // A panic keeps its own exit code: 1 is `check`'s "a problem is a
+        // fact" (carrick#2850).
+        code = &mut read => return match code {
+            Ok(code) => code,
+            Err(failure) if failure.is_panic() => std::panic::resume_unwind(failure.into_panic()),
+            Err(_) => 1,
+        },
+    };
+    if local_mode::cli::forward_to_running_scan(signal) {
+        let _ = tokio::time::timeout(local_mode::cli::forwarded_exit_grace(), read).await;
     }
     signal.exit_code()
 }

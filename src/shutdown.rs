@@ -156,6 +156,13 @@ pub fn watch() -> ShutdownWatcher {
         loop {
             let signal = listener.recv().await;
             record(signal);
+            // The type sidecars go now, whatever the run does next: one busy
+            // building a program hears neither this signal nor this process
+            // exiting until that work ends, and was left running after the
+            // scan that started it was gone. A pass waiting on one reads a
+            // dead process and returns, which ends the run sooner.
+            let killed = crate::services::type_sidecar::kill_live_sidecars();
+            tracing::debug!("{} ended {killed} type sidecar(s)", signal.name());
             // Nobody is racing any more: this run is on its way out and the
             // recorded flag is what the passes read.
             if tx.send(signal).is_err() {

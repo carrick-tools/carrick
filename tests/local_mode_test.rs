@@ -2760,6 +2760,110 @@ fn check_changed_fails_on_a_new_call_to_a_route_that_does_not_exist() {
     assert_eq!(code, Some(1), "a fact fails the run:\n{text}");
 }
 
+/// A `check --changed` stopped by SIGTERM takes its re-scan and the re-scan's
+/// type sidecar with it, even a sidecar too busy to hear a signal. Before,
+/// only the check ended: the re-scan was a process of its own that nothing
+/// told, and it ran on with its sidecar.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_signalled_check_ends_its_re_scan_and_the_re_scans_sidecar() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    add_a_call_to_no_route(root, RELATIVE);
+
+    // Busy as the real one is while it builds a program: its handlers never
+    // run, because its event loop never turns.
+    let sidecar_dir = root.join(".busy-sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar_dir).expect("a directory for the sidecar");
+    let pid_file = root.join(".busy-sidecar.pid");
+    std::fs::write(
+        sidecar_dir.join("index.js"),
+        format!(
+            "require('fs').writeFileSync({:?}, String(process.pid));\n\
+             process.on('SIGTERM', () => process.exit(0));\n\
+             process.stdin.on('end', () => process.exit(0));\n\
+             for (;;) {{}}\n",
+            pid_file.display().to_string()
+        ),
+    )
+    .expect("write the busy sidecar");
+
+    let mut check = Command::new(carrick())
+        .args(["check", "--changed", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_CHECK_BUDGET_MS", "600000")
+        .env("CARRICK_SIDECAR_DIR", root.join(".busy-sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the check");
+
+    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) == 0 };
+    let started = Instant::now();
+    let sidecar = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            let _ = check.kill();
+            panic!("the check's re-scan started no sidecar in 120s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let listed = Command::new("pgrep")
+        .args(["-P", &check.id().to_string(), "-x", "carrick"])
+        .output()
+        .expect("pgrep lists a process's children");
+    let rescan: libc::pid_t = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse().ok())
+        .expect("the check is waiting on its re-scan");
+
+    // SAFETY: a signal to a child this test spawned and has not reaped.
+    assert_eq!(
+        unsafe { libc::kill(check.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let ended = Instant::now();
+    let status = loop {
+        if let Some(status) = check.try_wait().expect("poll the check") {
+            break status;
+        }
+        assert!(
+            ended.elapsed() < Duration::from_secs(60),
+            "the signalled check was still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    for (pid, what) in [(rescan, "the re-scan"), (sidecar, "the busy sidecar")] {
+        let start = Instant::now();
+        while alive(pid) {
+            if start.elapsed() > Duration::from_secs(15) {
+                // SAFETY: descendants this test started, left running by the
+                // failure it is about to report.
+                unsafe {
+                    libc::kill(rescan, libc::SIGKILL);
+                    libc::kill(sidecar, libc::SIGKILL);
+                }
+                panic!("{what} was still running 15s after the check ended ({status:?})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // It ended by passing the signal on, and says which signal it was.
+    assert_eq!(status.code(), Some(143), "{status:?}");
+}
+
 /// The same new call through a base set at run time: it could be a service
 /// of this workspace or an outside API, so it is printed as unconfirmed and
 /// does not fail the run.

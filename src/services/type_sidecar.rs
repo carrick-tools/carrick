@@ -2189,6 +2189,61 @@ fn max_old_space_arg() -> Option<String> {
 // The sidecar process
 // ============================================================================
 
+/// Every sidecar this process started that is still owned by a
+/// [`TypeSidecar`], so a signal that ends this process ends them too.
+///
+/// A sidecar building a program runs synchronous compiler work for minutes,
+/// and Node runs a signal handler or notices its stdin close only between
+/// turns of its event loop: a SIGTERM to it, or this process going away, is
+/// not heard until that work ends. A parent that exits on a signal without
+/// killing its sidecars leaves them running, and they then need a SIGKILL
+/// from whoever finds them. The parent's SIGKILL is the one signal a busy
+/// sidecar cannot defer, so the parent sends it ([`kill_live_sidecars`]).
+static LIVE_SIDECARS: Mutex<Vec<std::sync::Weak<Mutex<Child>>>> = Mutex::new(Vec::new());
+
+/// Hold `child` in [`LIVE_SIDECARS`] for as long as its sidecar owns it.
+/// Called again when a restart puts a fresh process behind the same handle.
+fn track(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut live) = LIVE_SIDECARS.lock() {
+        live.retain(|held| held.strong_count() > 0);
+        let weak = Arc::downgrade(child);
+        if !live.iter().any(|held| held.ptr_eq(&weak)) {
+            live.push(weak);
+        }
+    }
+    // Started after the signal's sweep, by a thread that had not yet
+    // noticed it: ended here, so no sidecar outlives the run.
+    if crate::shutdown::requested().is_some()
+        && let Ok(mut child) = child.lock()
+    {
+        let _ = child.kill();
+    }
+}
+
+/// SIGKILL every sidecar this process still owns. For a process that a
+/// signal is ending (carrick#1124 left the drop path to do this; a
+/// `process::exit` or a thread still holding a sidecar never reaches it).
+///
+/// A process already reaped is not signalled: `Child::kill` answers for a
+/// child it has waited on without sending anything, so a pid the system has
+/// since reused is never touched. A handle another thread holds locked at
+/// this moment is skipped rather than waited for: this runs on the way out.
+pub fn kill_live_sidecars() -> usize {
+    let held: Vec<Arc<Mutex<Child>>> = match LIVE_SIDECARS.lock() {
+        Ok(live) => live.iter().filter_map(std::sync::Weak::upgrade).collect(),
+        Err(_) => return 0,
+    };
+    let mut killed = 0;
+    for child in held {
+        if let Ok(mut child) = child.try_lock()
+            && child.kill().is_ok()
+        {
+            killed += 1;
+        }
+    }
+    killed
+}
+
 /// One running sidecar process and the two ends of its pipe.
 struct SidecarProcess {
     child: Child,
@@ -2415,8 +2470,9 @@ pub struct TypeSidecar {
     /// operation's deadline can be replaced by a fresh one (carrick#1914).
     sidecar_path: PathBuf,
     /// Child process handle. Behind a mutex because a timeout kills it, and
-    /// an operation's timeout replaces it, from a `&self` method.
-    child: Mutex<Child>,
+    /// an operation's timeout replaces it, from a `&self` method. Shared with
+    /// [`LIVE_SIDECARS`], so a signal that ends this process can end it too.
+    child: Arc<Mutex<Child>>,
     /// Stdin for sending requests (wrapped in mutex for thread safety)
     stdin: Mutex<ChildStdin>,
     /// Lines the sidecar wrote to stdout, in order, delivered by the reader
@@ -2564,9 +2620,12 @@ impl TypeSidecar {
             spawn_time.elapsed()
         );
 
+        let child = Arc::new(Mutex::new(child));
+        track(&child);
+
         Ok(Self {
             sidecar_path: sidecar_path.to_path_buf(),
-            child: Mutex::new(child),
+            child,
             stdin: Mutex::new(stdin),
             responses: Mutex::new(responses),
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
@@ -2649,6 +2708,15 @@ impl TypeSidecar {
     /// readiness, inference, bundling, the capture, the check.
     fn note_death(&self) {
         if self.death_noted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A signal ending this run killed it ([`kill_live_sidecars`]): that
+        // is the run stopping, not the type checker dying.
+        if let Some(signal) = crate::shutdown::requested() {
+            debug!(
+                "[type_sidecar] The sidecar process was ended by this run's {}",
+                signal.name()
+            );
             return;
         }
         let death = self.how_the_process_died();
@@ -2998,6 +3066,7 @@ impl TypeSidecar {
             Err(e) => return failed(e.to_string()),
         };
         *self.child.lock().unwrap() = process.child;
+        track(&self.child);
         *self.stdin.lock().unwrap() = process.stdin;
         *self.responses.lock().unwrap() = process.responses;
         *self.evidence.lock().unwrap() = process.evidence;
@@ -4411,7 +4480,7 @@ impl Drop for TypeSidecar {
         // Force kill if still running, and reap it: a scan starts a sidecar
         // per service, and each one left unreaped would stay in the process
         // table until the scan ends (carrick#1066).
-        if let Ok(child) = self.child.get_mut() {
+        if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
