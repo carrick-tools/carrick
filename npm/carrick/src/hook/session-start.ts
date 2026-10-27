@@ -23,7 +23,7 @@ import { createLogger } from "../log.ts";
 import { CHECK_BEFORE_DONE, renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
-import { refreshInBackground } from "./refresh.ts";
+import { forwardInBackground, refreshInBackground } from "./refresh.ts";
 import { versionMismatch } from "../init/outdated.ts";
 
 const log = createLogger("carrick-session");
@@ -127,6 +127,16 @@ async function main(): Promise<void> {
     log("background refresh not started", String(error));
   }
   if (started) lines.push(started);
+  // Otherwise move the hosted index forward along this checkout's history, so
+  // the next `check --changed` judges the branch and not every merge
+  // since. Silent and unwaited.
+  else {
+    try {
+      forwardInBackground(choice.root, outcome.result);
+    } catch (error) {
+      log("background hosted move not started", String(error));
+    }
+  }
   flush(lines, codex);
 }
 

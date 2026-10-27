@@ -480,6 +480,18 @@ impl Reader {
         repos: Vec<String>,
         old: Option<Snapshot>,
     ) -> Result<(Snapshot, Option<String>, Downloads), String> {
+        let resolution = self.resolve(credential, &repos).await?;
+        Ok(self.assemble(credential, &repos, resolution, old).await)
+    }
+
+    /// The `resolve-repos` answer for `repos`: which are connected, to which
+    /// project, and the commit and stored time of every service row. Metadata
+    /// only; no blob is downloaded.
+    async fn resolve(
+        &self,
+        credential: &Credential,
+        repos: &[String],
+    ) -> Result<Resolution, String> {
         if repos.len() > 200 {
             return Err("Hosted reads support at most 200 local repositories per workspace".into());
         }
@@ -507,6 +519,21 @@ impl Reader {
         {
             return Err("Carrick credential workspace changed. Run carrick login.".into());
         }
+        Ok(resolution)
+    }
+
+    /// The snapshot `resolution` describes: each connected project's blobs,
+    /// downloaded unless `old` already holds them as stored
+    /// ([`project_is_unchanged`]).
+    async fn assemble(
+        &self,
+        credential: &Credential,
+        repos: &[String],
+        resolution: Resolution,
+        old: Option<Snapshot>,
+    ) -> (Snapshot, Option<String>, Downloads) {
+        let requested: std::collections::BTreeSet<String> =
+            repos.iter().map(|r| r.to_ascii_lowercase()).collect();
         let old = old.filter(|s| s.resolution.workspace.slug == resolution.workspace.slug);
         let ids: std::collections::BTreeSet<_> = resolution
             .repos
@@ -556,7 +583,7 @@ impl Reader {
                 }
             }
         }
-        Ok((
+        (
             Snapshot {
                 identity: credential.identity(),
                 checked_at: chrono::Utc::now().to_rfc3339(),
@@ -566,7 +593,203 @@ impl Reader {
             },
             failure,
             downloads,
-        ))
+        )
+    }
+
+    /// Move `old` to the hosted index the cloud holds now, when that is the
+    /// same index further along this checkout's own history.
+    ///
+    /// `check --changed` re-reads a service when a file it reads changed since
+    /// the commit the snapshot's blobs were scanned at, and a manifest or
+    /// lockfile counts for every service. Nothing else moves that commit, so
+    /// on a busy main branch every check re-read the whole repository. The
+    /// move is all or nothing, and only forward along HEAD's history: for
+    /// every local repo whose hosted commit moved, the new commit must hold
+    /// the old one and be held by HEAD. A branch behind main keeps the base
+    /// it has, and so does a checkout that has not fetched the new commit.
+    ///
+    /// Asks `resolve-repos` first and downloads only when something moved and
+    /// every move passed, so a refusal costs one metadata request. Returns the
+    /// snapshot to persist with [`Forward::Moved`], and none otherwise.
+    async fn forward(
+        &self,
+        credential: &Credential,
+        remotes: &BTreeMap<PathBuf, String>,
+        old: Snapshot,
+    ) -> (Forward, Option<Snapshot>) {
+        let repos: Vec<String> = remotes.values().cloned().collect();
+        let resolution = match self.resolve(credential, &repos).await {
+            Ok(resolution) => resolution,
+            Err(reason) => return (Forward::Kept(reason), None),
+        };
+        if resolution.workspace.slug != old.resolution.workspace.slug {
+            return (
+                Forward::Kept(
+                    "the hosted workspace is not the one this index was read from".into(),
+                ),
+                None,
+            );
+        }
+        let before = HostedInput {
+            snapshot: Some(old.clone()),
+            remotes: remotes.clone(),
+            ..Default::default()
+        };
+        let one = |commits: std::collections::BTreeSet<String>| -> Option<String> {
+            (commits.len() == 1)
+                .then(|| commits.into_iter().next())
+                .flatten()
+        };
+        let mut approved: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut moved: Vec<(PathBuf, String)> = Vec::new();
+        for (path, name) in remotes {
+            let now: std::collections::BTreeSet<String> = resolution
+                .repos
+                .iter()
+                .filter(|repo| repo.connected && repo.full_name.eq_ignore_ascii_case(name))
+                .flat_map(|repo| repo.services.iter().flatten())
+                .filter_map(|service| service.hash.clone())
+                .collect();
+            let held: std::collections::BTreeSet<String> = before
+                .local_blobs(path)
+                .into_iter()
+                .map(|blob| blob.commit_hash)
+                .collect();
+            if now.is_empty() && held.is_empty() {
+                continue;
+            }
+            let (Some(to), Some(from)) = (one(now), one(held)) else {
+                return (
+                    Forward::Kept(format!(
+                        "{name}: the hosted index and this machine's copy are not one commit each"
+                    )),
+                    None,
+                );
+            };
+            if to == from {
+                approved.insert(path.clone(), to);
+                continue;
+            }
+            let repo = path.to_string_lossy();
+            let head = crate::git_state::head_commit(&repo).unwrap_or_default();
+            if !crate::git_state::is_ancestor(&repo, &to, &head) {
+                return (
+                    Forward::Kept(format!(
+                        "{name}: the hosted index is at {}, which this checkout's HEAD does not \
+                         hold",
+                        short(&to)
+                    )),
+                    None,
+                );
+            }
+            if !crate::git_state::is_ancestor(&repo, &from, &to) {
+                return (
+                    Forward::Kept(format!(
+                        "{name}: the hosted index at {} does not descend from {}",
+                        short(&to),
+                        short(&from)
+                    )),
+                    None,
+                );
+            }
+            approved.insert(path.clone(), to.clone());
+            moved.push((path.clone(), to));
+        }
+        if moved.is_empty() {
+            return (Forward::Current, None);
+        }
+        let (snapshot, failure, _) = self
+            .assemble(credential, &repos, resolution, Some(old))
+            .await;
+        if let Some(failure) = failure {
+            return (Forward::Kept(failure), None);
+        }
+        let after = HostedInput {
+            snapshot: Some(snapshot),
+            remotes: remotes.clone(),
+            ..Default::default()
+        };
+        // What came down must be what was checked: main may have moved again
+        // between the two requests, and a blob this build would not carry
+        // (another cache format, a dirty tree) would only re-read everything.
+        for (path, to) in &approved {
+            let blobs = after.local_blobs(path);
+            let is_moved = moved.iter().any(|(moved, _)| moved == path);
+            if blobs.is_empty()
+                || blobs.iter().any(|blob| {
+                    &blob.commit_hash != to
+                        || (is_moved
+                            && (blob.cache_version != Some(crate::engine::CACHE_VERSION)
+                                || blob.dirty == Some(true)))
+                })
+            {
+                return (
+                    Forward::Kept(
+                        "the downloaded hosted index is not the one that was checked".into(),
+                    ),
+                    None,
+                );
+            }
+        }
+        (Forward::Moved(moved), after.snapshot)
+    }
+}
+
+/// The first seven characters of a commit id, as a sentence names it.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// What one [`forward`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Forward {
+    /// The snapshot on disk now holds the hosted index at a newer commit for
+    /// each of these repos (path, commit).
+    Moved(Vec<(PathBuf, String)>),
+    /// The hosted index is at the commits this machine already holds.
+    Current,
+    /// Nothing moved, and why.
+    Kept(String),
+}
+
+/// Move this machine's copy of the hosted index forward to the one the cloud
+/// holds now, when that one is further along HEAD's history
+/// ([`Reader::forward`]). Writes only `.carrick/hosted/snapshot.json`: no
+/// scan, no join, no model. Run by `carrick refresh --hosted-only`, which the
+/// session-start hook starts in the background.
+pub(super) fn forward(workspace: &Workspace) -> Forward {
+    let (remotes, _) = origins_of(workspace);
+    let credential = match Credential::load() {
+        Ok(Some(credential)) => credential,
+        Ok(None) => return Forward::Kept("not signed in".into()),
+        Err(reason) => return Forward::Kept(reason),
+    };
+    let Some(old) = read_snapshot(workspace, &credential) else {
+        return Forward::Kept("this machine holds no hosted index to move".into());
+    };
+    let result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "Could not start hosted reader".to_string())?;
+        let reader = Reader::new()?;
+        Ok::<_, String>(runtime.block_on(reader.forward(&credential, &remotes, old)))
+    })
+    .join()
+    .unwrap_or_else(|_| Err("Hosted reader failed".into()));
+    match result {
+        Ok((Forward::Moved(moved), Some(snapshot))) => {
+            match persist(
+                &workspace.index_dir().join("hosted/snapshot.json"),
+                &snapshot,
+            ) {
+                Ok(()) => Forward::Moved(moved),
+                Err(reason) => Forward::Kept(reason),
+            }
+        }
+        Ok((Forward::Moved(_), None)) => Forward::Kept("no snapshot to write".into()),
+        Ok((outcome, _)) => outcome,
+        Err(reason) => Forward::Kept(reason),
     }
 }
 
@@ -2775,5 +2998,179 @@ mod tests {
             note.contains("Commit them and run `carrick index` again"),
             "{note}"
         );
+    }
+
+    /// A repo whose main branch moved on after the hosted index this machine
+    /// holds: commit A, then B changing a manifest (an input of every
+    /// service), then the branch's own work at C, checked out. Returns the
+    /// directory and the three commits.
+    fn moved_on_repo() -> (tempfile::TempDir, String, String, String) {
+        use crate::git_state::tests::git_in;
+        let (dir, a) = committed_repo(&[
+            ("package.json", r#"{"name":"api","dependencies":{}}"#),
+            ("src/app.ts", "export const value = 1;"),
+        ]);
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"api","dependencies":{"left-pad":"1.0.0"}}"#,
+        )
+        .unwrap();
+        git_in(dir.path(), &["commit", "-qam", "main moves on"]);
+        let b = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("src/app.ts"), "export const value = 2;").unwrap();
+        git_in(dir.path(), &["commit", "-qam", "the branch's own work"]);
+        let c = git_in(dir.path(), &["rev-parse", "HEAD"]);
+        (dir, a, b, c)
+    }
+
+    /// The `resolve-repos` answer for one connected repo, `example/api`, whose
+    /// one service is stored at `hash`.
+    fn resolved_at(hash: &str) -> serde_json::Value {
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([service_row("api", hash)]);
+        metadata
+    }
+
+    fn held_at(hash: &str) -> Snapshot {
+        snapshot(
+            resolved_at(hash),
+            BTreeMap::from([("p".to_string(), vec![named_blob("api", "api", hash)])]),
+        )
+    }
+
+    fn remotes_of(repo: &Path) -> BTreeMap<PathBuf, String> {
+        BTreeMap::from([(repo.to_path_buf(), "example/api".to_string())])
+    }
+
+    /// The hosted index moved from A to B, B is in HEAD's history: the
+    /// snapshot moves to B, and the change base of `check --changed` with it,
+    /// so the manifest main changed between A and B no longer re-reads every
+    /// service.
+    #[tokio::test]
+    async fn a_hosted_index_further_along_heads_history_moves_the_base_forward() {
+        let (dir, a, b, _) = moved_on_repo();
+        let (url, requests) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&resolved_at(&b)).unwrap()),
+            (
+                "200 OK",
+                answered(&[(named_blob("api", "api", &b), "2026-10-02T10:00:00.000Z")]),
+            ),
+        ]);
+        let remotes = remotes_of(dir.path());
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes, held_at(&a))
+            .await;
+        assert_eq!(
+            outcome,
+            Forward::Moved(vec![(dir.path().to_path_buf(), b.clone())])
+        );
+        assert_eq!(requests.join().unwrap().len(), 2);
+        let input = HostedInput {
+            snapshot,
+            remotes,
+            ..Default::default()
+        };
+        let base: Vec<String> = input
+            .local_blobs(dir.path())
+            .into_iter()
+            .map(|blob| blob.commit_hash)
+            .collect();
+        assert_eq!(base, vec![b.clone()]);
+        // What the change scope compares against each base: from A a
+        // manifest changed (every service is re-read), from B only source.
+        let repo_inputs_since = |commit: &str| -> Vec<String> {
+            crate::git_state::changed_paths(&dir.path().to_string_lossy(), commit, None)
+                .unwrap()
+                .into_iter()
+                .map(|change| change.path)
+                .filter(|path| crate::change_scope::is_repo_input(path))
+                .collect()
+        };
+        assert_eq!(repo_inputs_since(&a), vec!["package.json".to_string()]);
+        assert!(repo_inputs_since(&b).is_empty());
+    }
+
+    /// A hosted commit HEAD does not hold keeps the base, and costs one
+    /// metadata request: a branch behind main (HEAD at A, hosted at B), and a
+    /// hosted commit on a line this checkout does not descend from.
+    #[tokio::test]
+    async fn a_hosted_index_outside_heads_history_keeps_the_base() {
+        use crate::git_state::tests::git_in;
+        let (dir, a, b, c) = moved_on_repo();
+        git_in(dir.path(), &["checkout", "-q", "-b", "side", &a]);
+        std::fs::write(dir.path().join("src/app.ts"), "export const value = 3;").unwrap();
+        git_in(dir.path(), &["commit", "-qam", "a line HEAD will not hold"]);
+        let side = git_in(dir.path(), &["rev-parse", "HEAD"]);
+
+        // Behind main: HEAD at A, the hosted index at B.
+        git_in(dir.path(), &["checkout", "-q", &a]);
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&b)).unwrap(),
+        )]);
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        assert!(snapshot.is_none());
+        assert_eq!(requests.join().unwrap().len(), 1, "it downloaded anyway");
+
+        // Off HEAD's line: HEAD at C, the hosted index on the side branch.
+        git_in(dir.path(), &["checkout", "-q", &c]);
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&side)).unwrap(),
+        )]);
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        assert!(snapshot.is_none());
+        assert_eq!(requests.join().unwrap().len(), 1, "it downloaded anyway");
+    }
+
+    /// No answer from the hosted side moves nothing and is no error: the
+    /// check that follows runs on the base it had.
+    #[tokio::test]
+    async fn an_unreachable_hosted_index_keeps_the_base() {
+        let (dir, a, _, _) = moved_on_repo();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        assert!(snapshot.is_none());
+    }
+
+    /// A hosted index already at the commit held is current, with no
+    /// download; one whose blob came down at another commit than the one the
+    /// metadata named (main moved between the two requests) is not taken.
+    #[tokio::test]
+    async fn a_current_index_downloads_nothing_and_a_raced_download_is_refused() {
+        let (dir, a, b, c) = moved_on_repo();
+        let (url, requests) = serve_sequence(vec![(
+            "200 OK",
+            serde_json::to_vec(&resolved_at(&a)).unwrap(),
+        )]);
+        let (outcome, _) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert_eq!(outcome, Forward::Current);
+        assert_eq!(requests.join().unwrap().len(), 1);
+
+        let (url, _) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&resolved_at(&b)).unwrap()),
+            (
+                "200 OK",
+                answered(&[(named_blob("api", "api", &c), "2026-10-02T10:00:00.000Z")]),
+            ),
+        ]);
+        let (outcome, snapshot) = reader(url)
+            .forward(&credential("test"), &remotes_of(dir.path()), held_at(&a))
+            .await;
+        assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
+        assert!(snapshot.is_none());
     }
 }

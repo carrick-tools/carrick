@@ -109,10 +109,13 @@ pub enum LocalCommand {
     /// why this works at a later commit, on a dirty tree and on a machine that
     /// never ran the dispatch.
     Resume { workspace: Option<PathBuf> },
-    /// Re-scan one service (or every repo) and re-join.
+    /// Re-scan one service (or every repo) and re-join. With `hosted_only`,
+    /// scan nothing: move this machine's copy of the hosted index to the
+    /// cloud's newer one when HEAD holds its commit.
     Refresh {
         service: Option<String>,
         workspace: Option<PathBuf>,
+        hosted_only: bool,
     },
     /// What the workspace holds, with no file in the question.
     Status {
@@ -162,6 +165,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut allow_unprepared = false;
     let mut no_keep_awake = false;
     let mut candidates = false;
+    let mut hosted_only = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -183,6 +187,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             }
             "--json" => json = true,
             "--candidates" => candidates = true,
+            "--hosted-only" => hosted_only = true,
             "--recheck" => recheck = true,
             "--changed" => changed = true,
             "--all" => all = true,
@@ -224,6 +229,14 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
         index += 1;
     }
 
+    // Only `refresh` reads the hosted index, and a move scans no service, so
+    // there is no service to name.
+    if hosted_only && (name != "refresh" || service.is_some()) {
+        return Err(format!(
+            "unknown option for `carrick {name}`: --hosted-only (it belongs to `carrick \
+             refresh` with no --service)"
+        ));
+    }
     // A hook-driven command that accepted `--detach` and ran in the foreground
     // anyway would be a promise nobody kept.
     if detach && name != "index" {
@@ -346,7 +359,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 allow_unprepared,
             })
         }
-        "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
+        "refresh" => Ok(LocalCommand::Refresh {
+            service,
+            workspace,
+            hosted_only,
+        }),
         "resume" => {
             if workspace.is_none()
                 && let Some(first) = positional.first()
@@ -453,7 +470,16 @@ pub fn run(command: LocalCommand) -> i32 {
                 1
             }
         },
-        LocalCommand::Refresh { service, workspace } => {
+        LocalCommand::Refresh {
+            workspace,
+            hosted_only: true,
+            ..
+        } => forward(workspace.as_deref()),
+        LocalCommand::Refresh {
+            service,
+            workspace,
+            hosted_only: false,
+        } => {
             // Never inferred. `refresh` runs from a session-start hook, and a
             // hook that spends real money every time an editor opens is not a
             // feature.
@@ -747,6 +773,38 @@ fn analysing_lines(index_dir: &Path) -> Vec<String> {
 /// model comes from the run that produced it (carrick#956 §8.3). `index`
 /// always infers; `refresh` never does, which is the whole difference between
 /// them.
+/// `carrick refresh --hosted-only`: one line on stderr saying whether this
+/// machine's copy of the hosted index moved. Exit 0 unless there is no
+/// workspace: a move that did not happen leaves the index as it was, which is
+/// not a failure.
+fn forward(root: Option<&Path>) -> i32 {
+    let workspace = match resolve_root(root).and_then(|root| Workspace::load(&root)) {
+        Ok(workspace) => workspace,
+        Err(message) => {
+            crate::errln!("carrick refresh: {message}");
+            return 1;
+        }
+    };
+    match super::hosted::forward(&workspace) {
+        super::hosted::Forward::Moved(moved) => {
+            for (repo, commit) in moved {
+                crate::errln!(
+                    "carrick refresh: {} now compares against the hosted index at {}",
+                    super::index::repo_label(&repo),
+                    commit.get(..7).unwrap_or(&commit)
+                );
+            }
+        }
+        super::hosted::Forward::Current => {
+            crate::errln!("carrick refresh: the hosted index on this machine is current");
+        }
+        super::hosted::Forward::Kept(reason) => {
+            crate::errln!("carrick refresh: kept the hosted index on this machine: {reason}");
+        }
+    }
+    0
+}
+
 fn build(
     root: Option<&Path>,
     service: Option<&str>,
@@ -2768,8 +2826,30 @@ mod tests {
             LocalCommand::Refresh {
                 service: Some("api".to_string()),
                 workspace: None,
+                hosted_only: false,
             }
         );
+    }
+
+    #[test]
+    fn hosted_only_belongs_to_a_whole_refresh() {
+        assert_eq!(
+            parse(&args(&["refresh", "--hosted-only"]))
+                .unwrap()
+                .unwrap(),
+            LocalCommand::Refresh {
+                service: None,
+                workspace: None,
+                hosted_only: true,
+            }
+        );
+        for rejected in [
+            &["refresh", "--hosted-only", "--service", "api"][..],
+            &["index", "--hosted-only"][..],
+        ] {
+            let error = parse(&args(rejected)).unwrap().unwrap_err();
+            assert!(error.contains("--hosted-only"), "{error}");
+        }
     }
 
     #[test]

@@ -12,6 +12,8 @@ import path from "node:path";
 import {
   awaitingHostedIndex,
   claimRefresh,
+  forwardInBackground,
+  FORWARD_MARKER,
   markerPath,
   refreshInBackground,
 } from "../src/hook/refresh.ts";
@@ -183,6 +185,64 @@ test("the cooldown can be stated for a machine that wants it shorter", () => {
     refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now });
     refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now: now + 1 });
     assert.equal(started, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+// Moving the hosted index forward: a workspace that reads a
+// hosted index asks for the move in the background, at most once per cooldown,
+// and says nothing about it.
+test("a workspace reading a hosted index moves it forward in the background, once per cooldown", () => {
+  const { root, cleanup } = workspace();
+  try {
+    const started: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
+    const start = (command: string, args: string[], env: NodeJS.ProcessEnv): void => {
+      started.push({ command, args, env });
+    };
+    const env = { CARRICK_BIN: "carrick" };
+    const now = Date.parse("2026-10-27T09:00:00Z");
+    assert.equal(forwardInBackground(root, statusWith(["enriched"]), { now, start, env }), true);
+    assert.deepEqual(started, [
+      {
+        command: "carrick",
+        args: ["refresh", "--hosted-only", "--workspace", root],
+        env: { CARRICK_BIN: "carrick", CARRICK_NO_KEEP_AWAKE: "1" },
+      },
+    ]);
+    assert.ok(fs.existsSync(markerPath(root, FORWARD_MARKER)));
+    // Inside the cooldown, nothing.
+    assert.equal(
+      forwardInBackground(root, statusWith(["enriched"]), { now: now + 60_000, start, env }),
+      false,
+    );
+    // After it, again: main may have moved since.
+    assert.equal(
+      forwardInBackground(root, statusWith(["enriched"]), { now: now + 16 * 60_000, start, env }),
+      true,
+    );
+    assert.equal(started.length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a workspace with no hosted index asks for no move", () => {
+  const { root, cleanup } = workspace();
+  try {
+    let started = 0;
+    for (const state of ["no_index_yet", "not_connected", "not_signed_in", undefined] as const) {
+      assert.equal(
+        forwardInBackground(root, statusWith([state]), {
+          now: Date.parse("2026-10-27T09:00:00Z"),
+          start: () => { started += 1; },
+          env: {},
+        }),
+        false,
+      );
+    }
+    assert.equal(started, 0);
+    assert.equal(fs.existsSync(markerPath(root, FORWARD_MARKER)), false);
   } finally {
     cleanup();
   }

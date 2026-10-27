@@ -34,15 +34,23 @@ import type { StatusResult } from "../contract.ts";
 /** Default gap between unattended refreshes of one workspace. */
 export const REFRESH_COOLDOWN_MS = 60 * 60_000;
 
-/** The claim file, inside the ignored directory the index already owns. */
-export function markerPath(root: string): string {
-  return path.join(root, ".carrick", "last-hook-refresh");
+/**
+ * A claim file, inside the ignored directory the index already owns. Each
+ * background job has its own, so one never holds the other back.
+ */
+export function markerPath(root: string, name = "last-hook-refresh"): string {
+  return path.join(root, ".carrick", name);
 }
 
-export function cooldownMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env["CARRICK_REFRESH_COOLDOWN_MS"];
+/** A job's cooldown: `variable` from the environment, or `fallback`. */
+export function cooldownMs(
+  env: NodeJS.ProcessEnv = process.env,
+  variable = "CARRICK_REFRESH_COOLDOWN_MS",
+  fallback = REFRESH_COOLDOWN_MS,
+): number {
+  const raw = env[variable];
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : REFRESH_COOLDOWN_MS;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 /** Whether this workspace is waiting for a hosted index that may now exist. */
@@ -150,4 +158,53 @@ export function refreshInBackground(
     CARRICK_NO_KEEP_AWAKE: "1",
   });
   return "Carrick: a repo here is connected with no hosted index yet, so a refresh is running in the background. Its rows arrive in the next session.";
+}
+
+// Moving the hosted index forward.
+//
+// `carrick check --changed` re-reads every service a change since the hosted
+// index's commit can reach, and a manifest or lockfile reaches all of them. On
+// a busy main branch that commit falls behind within hours, so a branch's
+// one-line edit paid for every merge since. `carrick refresh --hosted-only`
+// moves this machine's copy of the hosted index to the cloud's newer one when
+// that commit is in HEAD's history: one metadata request, a download only when
+// it moves, no scan. Detached like the refresh above, and silent: nothing is
+// waiting on it, and the next check simply starts from the newer base.
+
+/**
+ * Default gap between two background moves of one workspace: shorter than the
+ * refresh's hour, because main moves many times a day and a move that finds
+ * nothing new costs one metadata request.
+ */
+export const FORWARD_COOLDOWN_MS = 15 * 60_000;
+
+/** The move's claim file, apart from the refresh's. */
+export const FORWARD_MARKER = "last-hook-forward";
+
+/** Whether this workspace reads any service from a hosted index. */
+export function readsHostedIndex(status: StatusResult): boolean {
+  return status.services.some((service) => service.hosted_state === "enriched");
+}
+
+/**
+ * Start a background `carrick refresh --hosted-only` when this workspace reads
+ * a hosted index and has not asked within the cooldown. Prints nothing:
+ * returns whether it started.
+ */
+export function forwardInBackground(
+  root: string,
+  status: StatusResult,
+  options: RefreshOptions = {},
+): boolean {
+  const env = options.env ?? process.env;
+  const now = options.now ?? Date.now();
+  if (!readsHostedIndex(status)) return false;
+  const cooldown = cooldownMs(env, "CARRICK_FORWARD_COOLDOWN_MS", FORWARD_COOLDOWN_MS);
+  if (!claimRefresh(markerPath(root, FORWARD_MARKER), now, cooldown)) return false;
+  (options.start ?? startDetached)(
+    binary(env),
+    ["refresh", "--hosted-only", "--workspace", root],
+    { ...env, CARRICK_NO_KEEP_AWAKE: "1" },
+  );
+  return true;
 }

@@ -43,7 +43,9 @@ WORKSPACE:
     resume     Collect a dispatched analysis and finish the index. Files that
                changed since the hand-off are analysed now.
     refresh    Re-scan one service, or every repo, and re-join the index.
-               What the session-start hook runs; it asks no model.
+               What the session-start hook runs; it asks no model. With
+               --hosted-only it scans nothing: it moves this machine's copy
+               of the hosted index to a newer one that HEAD's history holds.
     status     Every service the workspace holds, the commit each was indexed at,
                how far its repo has moved since, and its boundary.
     check      The routes and calls in one file, their counterparts in every

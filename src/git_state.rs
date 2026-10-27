@@ -595,6 +595,13 @@ pub fn merge_base(repo_path: &str, a: &str, b: &str) -> Result<String, String> {
     Ok(base)
 }
 
+/// Whether `ancestor` is `descendant` or a commit in its history. `false` when
+/// either is not a full commit id this clone holds: an answer git could not
+/// give is never a yes.
+pub fn is_ancestor(repo_path: &str, ancestor: &str, descendant: &str) -> bool {
+    merge_base(repo_path, ancestor, descendant).is_ok_and(|base| base == ancestor)
+}
+
 /// The repo's main branch, as a ref this clone can resolve: the remote's
 /// default (`origin/HEAD`) where the clone recorded one, and otherwise the
 /// first of `origin/main`, `origin/master`, `main`, `master` that exists.
